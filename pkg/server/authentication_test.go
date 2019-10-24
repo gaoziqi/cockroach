@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -34,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -706,11 +702,11 @@ func TestGRPCAuthentication(t *testing.T) {
 			return err
 		}},
 		{"distSQL", func(ctx context.Context, conn *grpc.ClientConn) error {
-			stream, err := distsqlpb.NewDistSQLClient(conn).RunSyncFlow(ctx)
+			stream, err := execinfrapb.NewDistSQLClient(conn).RunSyncFlow(ctx)
 			if err != nil {
 				return err
 			}
-			_ = stream.Send(&distsqlpb.ConsumerSignal{})
+			_ = stream.Send(&execinfrapb.ConsumerSignal{})
 			_, err = stream.Recv()
 			return err
 		}},
@@ -728,7 +724,7 @@ func TestGRPCAuthentication(t *testing.T) {
 		}},
 	}
 
-	conn, err := grpc.DialContext(ctx, s.Addr(),
+	conn, err := grpc.DialContext(ctx, s.ServingRPCAddr(),
 		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
 			InsecureSkipVerify: true,
 		})))
@@ -753,7 +749,7 @@ func TestGRPCAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err = grpc.DialContext(ctx, s.Addr(),
+	conn, err = grpc.DialContext(ctx, s.ServingRPCAddr(),
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	if err != nil {
 		t.Fatal(err)

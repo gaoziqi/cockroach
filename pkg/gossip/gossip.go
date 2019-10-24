@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 /*
 Each node attempts to contact peer nodes to gather all Infos in
@@ -66,19 +62,20 @@ import (
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/logtags"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -277,7 +274,7 @@ type Gossip struct {
 
 	lastConnectivity string
 
-	defaultZoneConfig *config.ZoneConfig
+	defaultZoneConfig *zonepb.ZoneConfig
 }
 
 // New creates an instance of a gossip node.
@@ -300,7 +297,7 @@ func New(
 	stopper *stop.Stopper,
 	registry *metric.Registry,
 	locality roachpb.Locality,
-	defaultZoneConfig *config.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig,
 ) *Gossip {
 	ambient.SetEventLog("gossip", "gossip")
 	g := &Gossip{
@@ -361,7 +358,7 @@ func NewTest(
 	grpcServer *grpc.Server,
 	stopper *stop.Stopper,
 	registry *metric.Registry,
-	defaultZoneConfig *config.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig,
 ) *Gossip {
 	return NewTestWithLocality(nodeID, rpcContext, grpcServer, stopper, registry, roachpb.Locality{}, defaultZoneConfig)
 }
@@ -374,7 +371,7 @@ func NewTestWithLocality(
 	stopper *stop.Stopper,
 	registry *metric.Registry,
 	locality roachpb.Locality,
-	defaultZoneConfig *config.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig,
 ) *Gossip {
 	c := &base.ClusterIDContainer{}
 	n := &base.NodeIDContainer{}
@@ -521,11 +518,18 @@ func (g *Gossip) GetResolvers() []resolver.Resolver {
 	return append([]resolver.Resolver(nil), g.resolvers...)
 }
 
-// GetNodeIDAddress looks up the address of the node by ID.
+// GetNodeIDAddress looks up the RPC address of the node by ID.
 func (g *Gossip) GetNodeIDAddress(nodeID roachpb.NodeID) (*util.UnresolvedAddr, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.getNodeIDAddressLocked(nodeID)
+}
+
+// GetNodeIDSQLAddress looks up the SQL address of the node by ID.
+func (g *Gossip) GetNodeIDSQLAddress(nodeID roachpb.NodeID) (*util.UnresolvedAddr, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.getNodeIDSQLAddressLocked(nodeID)
 }
 
 // GetNodeIDForStoreID looks up the NodeID by StoreID.
@@ -972,6 +976,18 @@ func (g *Gossip) getNodeIDAddressLocked(nodeID roachpb.NodeID) (*util.Unresolved
 	return &nd.Address, nil
 }
 
+// getNodeIDAddressLocked looks up the SQL address of the node by ID. The mutex is
+// assumed held by the caller. This method is called externally via
+// GetNodeIDSQLAddress or internally when looking up a "distant" node address to
+// connect directly to.
+func (g *Gossip) getNodeIDSQLAddressLocked(nodeID roachpb.NodeID) (*util.UnresolvedAddr, error) {
+	nd, err := g.getNodeDescriptorLocked(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return &nd.SQLAddress, nil
+}
+
 // AddInfo adds or updates an info object. Returns an error if info
 // couldn't be added.
 func (g *Gossip) AddInfo(key string, val []byte, ttl time.Duration) error {
@@ -1341,7 +1357,7 @@ func (g *Gossip) bootstrap() {
 			select {
 			case <-bootstrapTimer.C:
 				bootstrapTimer.Read = true
-				// break
+				// continue
 			case <-g.server.stopper.ShouldStop():
 				return
 			}
@@ -1350,7 +1366,7 @@ func (g *Gossip) bootstrap() {
 			select {
 			case <-g.stalledCh:
 				log.Eventf(ctx, "detected stall; commencing bootstrap")
-				// break
+				// continue
 			case <-g.server.stopper.ShouldStop():
 				return
 			}

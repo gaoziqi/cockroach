@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -37,18 +33,21 @@ func TestStandAloneShowCreateTable(t *testing.T) {
 			created TIMESTAMP NOT NULL DEFAULT now():::TIMESTAMP,
 			payload BYTES NOT NULL,
 			CONSTRAINT "primary" PRIMARY KEY (id ASC),
-			CONSTRAINT fk FOREIGN KEY (status) REFERENCES "[52 as ref]" ("???"),
+			CONSTRAINT fk FOREIGN KEY ("???") REFERENCES "[52 as ref]"("???"),
 			INDEX jobs_status_created_idx (status ASC, created ASC) INTERLEAVE IN PARENT "[51 as parent]" (status),
 			FAMILY fam_0_id_status_created_payload (id, status, created, payload)
 		)`
 
 	desc := sqlbase.JobsTable
 	desc.Indexes = []sqlbase.IndexDescriptor{sqlbase.JobsTable.Indexes[0]}
-	desc.Indexes[0].ForeignKey = sqlbase.ForeignKeyReference{Table: 52, Name: "fk", Index: 1, SharedPrefixLen: 1}
 	desc.Indexes[0].Interleave.Ancestors = []sqlbase.InterleaveDescriptor_Ancestor{{TableID: 51, IndexID: 10, SharedPrefixLen: 1}}
+	desc.OutboundFKs = []sqlbase.ForeignKeyConstraint{{
+		ReferencedTableID: 52,
+		Name:              "fk",
+	}}
 
 	name := tree.Name(desc.Name)
-	got, err := ShowCreateTable(context.TODO(), &name, "", &desc, nil, false)
+	got, err := ShowCreateTable(context.TODO(), &name, "", &desc, nil, IncludeFkClausesInCreate)
 	if err != nil {
 		t.Fatal(err)
 	}

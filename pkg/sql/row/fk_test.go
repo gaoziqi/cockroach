@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package row
 
@@ -63,33 +59,14 @@ func (t *testTables) createForeignKeyReference(
 	if !exists {
 		return errors.Errorf("Can't find table with ID:%d", referencedID)
 	}
-	// Create an index on both tables.
-	referencedIndexID := referenced.NextIndexID
-	referencingIndexID := referencing.NextIndexID
-	referencedIndex := sqlbase.IndexDescriptor{
-		ID: referencedIndexID,
-		ReferencedBy: []sqlbase.ForeignKeyReference{
-			{
-				Table: referencingID,
-				Index: referencingIndexID,
-			},
-		},
+	fk := sqlbase.ForeignKeyConstraint{
+		ReferencedTableID: referencedID,
+		OriginTableID:     referencingID,
+		OnDelete:          onDelete,
+		OnUpdate:          onUpdate,
 	}
-	referenced.Indexes = append(referenced.Indexes, referencedIndex)
-
-	referencingIndex := sqlbase.IndexDescriptor{
-		ID: referencingIndexID,
-		ForeignKey: sqlbase.ForeignKeyReference{
-			Table:    referencedID,
-			OnDelete: onDelete,
-			OnUpdate: onUpdate,
-			Index:    referencedIndexID,
-		},
-	}
-	referencing.Indexes = append(referencing.Indexes, referencingIndex)
-
-	referenced.NextIndexID++
-	referencing.NextIndexID++
+	referencing.OutboundFKs = append(referencing.OutboundFKs, fk)
+	referenced.InboundFKs = append(referenced.InboundFKs, fk)
 	return nil
 }
 
@@ -202,7 +179,7 @@ func TestMakeFkMetadata(t *testing.T) {
 		}
 		sort.Slice(actualIDs, func(i, j int) bool { return actualIDs[i] < actualIDs[j] })
 		if a, e := actualIDs, expectedIDs; !reflect.DeepEqual(a, e) {
-			t.Errorf("insert's expected table IDs did not match actual IDs diff:\n %v", pretty.Diff(e, a))
+			t.Errorf("insert's expected table IDs did not match actual IDs diff:\n %v %v %v", pretty.Diff(e, a), e, a)
 		}
 	}
 

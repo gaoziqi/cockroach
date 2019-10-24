@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package client
 
@@ -21,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -31,10 +28,15 @@ import (
 )
 
 // KeyValue represents a single key/value pair. This is similar to
-// roachpb.KeyValue except that the value may be nil.
+// roachpb.KeyValue except that the value may be nil. The timestamp
+// in the value will be populated with the MVCC timestamp at which this
+// value was read if this struct was produced by a GetRequest or
+// ScanRequest which uses the KEY_VALUES ScanFormat. Values created from
+// a ScanRequest which uses the BATCH_RESPONSE ScanFormat will contain a
+// zero Timestamp.
 type KeyValue struct {
 	Key   roachpb.Key
-	Value *roachpb.Value // Timestamp will always be zero
+	Value *roachpb.Value
 }
 
 func (kv *KeyValue) String() string {
@@ -322,11 +324,28 @@ func (db *DB) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 //
 // key can be either a byte slice or a string.
 func (db *DB) GetProto(ctx context.Context, key interface{}, msg protoutil.Message) error {
+	_, err := db.GetProtoTs(ctx, key, msg)
+	return err
+}
+
+// GetProtoTs retrieves the value for a key and decodes the result as a proto
+// message. It additionally returns the timestamp at which the key was read.
+// If the key doesn't exist, the proto will simply be reset and a zero timestamp
+// will be returned. A zero timestamp will also be returned if unmarshaling
+// fails.
+//
+// key can be either a byte slice or a string.
+func (db *DB) GetProtoTs(
+	ctx context.Context, key interface{}, msg protoutil.Message,
+) (hlc.Timestamp, error) {
 	r, err := db.Get(ctx, key)
 	if err != nil {
-		return err
+		return hlc.Timestamp{}, err
 	}
-	return r.ValueProto(msg)
+	if err := r.ValueProto(msg); err != nil || r.Value == nil {
+		return hlc.Timestamp{}, err
+	}
+	return r.Value.Timestamp, nil
 }
 
 // Put sets the value for a key.
@@ -361,7 +380,7 @@ func (db *DB) PutInline(ctx context.Context, key, value interface{}) error {
 //
 // key can be either a byte slice or a string. value can be any key type, a
 // protoutil.Message or any Go primitive type (bool, int, etc).
-func (db *DB) CPut(ctx context.Context, key, value, expValue interface{}) error {
+func (db *DB) CPut(ctx context.Context, key, value interface{}, expValue *roachpb.Value) error {
 	b := &Batch{}
 	b.CPut(key, value, expValue)
 	return getOneErr(db.Run(ctx, b), b)
@@ -455,10 +474,11 @@ func (db *DB) DelRange(ctx context.Context, begin, end interface{}) error {
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// AdminMerge merges the range containing key and the subsequent
-// range. After the merge operation is complete, the range containing
-// key will contain all of the key/value pairs of the subsequent range
-// and the subsequent range will no longer exist.
+// AdminMerge merges the range containing key and the subsequent range. After
+// the merge operation is complete, the range containing key will contain all of
+// the key/value pairs of the subsequent range and the subsequent range will no
+// longer exist. Neither range may contain learner replicas, if one does, an
+// error is returned.
 //
 // key can be either a byte slice or a string.
 func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
@@ -477,15 +497,36 @@ func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
 // #16008 for details, and #16344 for the tracking issue to clean this mess up
 // properly.
 //
-// When manual is true, the sticky bit associated with the split range is set.
-// Any ranges with the sticky bit set will be skipped by the merge queue when
-// scanning for potential ranges to merge.
+// expirationTime is the timestamp when the split expires and is eligible for
+// automatic merging by the merge queue. To specify that a split should
+// immediately be eligible for automatic merging, set expirationTime to
+// hlc.Timestamp{} (I.E. the zero timestamp). To specify that a split should
+// never be eligible, set expirationTime to hlc.MaxTimestamp.
 //
 // The keys can be either byte slices or a strings.
-func (db *DB) AdminSplit(ctx context.Context, spanKey, splitKey interface{}, manual bool) error {
+func (db *DB) AdminSplit(
+	ctx context.Context, spanKey, splitKey interface{}, expirationTime hlc.Timestamp,
+) error {
 	b := &Batch{}
-	b.adminSplit(spanKey, splitKey, manual)
+	b.adminSplit(spanKey, splitKey, expirationTime)
 	return getOneErr(db.Run(ctx, b), b)
+}
+
+// SplitAndScatter is a helper that wraps AdminSplit + AdminScatter.
+func (db *DB) SplitAndScatter(
+	ctx context.Context, key roachpb.Key, expirationTime hlc.Timestamp,
+) error {
+	if err := db.AdminSplit(ctx, key, key, expirationTime); err != nil {
+		return err
+	}
+	scatterReq := &roachpb.AdminScatterRequest{
+		RequestHeader:   roachpb.RequestHeaderFromSpan(roachpb.Span{Key: key, EndKey: key.Next()}),
+		RandomizeLeases: true,
+	}
+	if _, pErr := SendWrapped(ctx, db.NonTransactionalSender(), scatterReq); pErr != nil {
+		return pErr.GoError()
+	}
+	return nil
 }
 
 // AdminUnsplit removes the sticky bit of the range specified by splitKey.
@@ -519,16 +560,53 @@ func (db *DB) AdminTransferLease(
 	return getOneErr(db.Run(ctx, b), b)
 }
 
+// ChangeReplicasCanMixAddAndRemoveContext convinces
+// (*client.DB).AdminChangeReplicas that the caller is aware that 19.1 nodes
+// don't know how to handle requests that mix additions and removals; 19.2+
+// binaries understand this due to the work done in the context of atomic
+// replication changes. If 19.1 nodes received such a request they'd mistake the
+// removals for additions.
+//
+// In effect users of the RPC need to check the cluster version which in the
+// past has been a brittle pattern, so this time the DB disallows the new
+// behavior unless it can determine (via the ctx) that the caller went through
+// this method and is thus aware of the intricacies.
+//
+// See https://github.com/cockroachdb/cockroach/pull/39611.
+//
+// TODO(tbg): remove in 20.1.
+func ChangeReplicasCanMixAddAndRemoveContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, adminChangeReplicasMixHint{}, adminChangeReplicasMixHint{})
+}
+
+type adminChangeReplicasMixHint struct{}
+
 // AdminChangeReplicas adds or removes a set of replicas for a range.
 func (db *DB) AdminChangeReplicas(
 	ctx context.Context,
 	key interface{},
-	changeType roachpb.ReplicaChangeType,
-	targets []roachpb.ReplicationTarget,
 	expDesc roachpb.RangeDescriptor,
+	chgs []roachpb.ReplicationChange,
 ) (*roachpb.RangeDescriptor, error) {
+	if ctx.Value(adminChangeReplicasMixHint{}) == nil {
+		// Disallow trying to add and remove replicas in the same set of
+		// changes. This will only work when the node receiving the request is
+		// running 19.2 (code, not cluster version).
+		//
+		// TODO(tbg): remove this when 19.2 is released.
+		var typ *roachpb.ReplicaChangeType
+		for i := range chgs {
+			chg := &chgs[i]
+			if typ == nil {
+				typ = &chg.ChangeType
+			} else if *typ != chg.ChangeType {
+				return nil, errors.Errorf("can not mix %s and %s", *typ, chg.ChangeType)
+			}
+		}
+	}
+
 	b := &Batch{}
-	b.adminChangeReplicas(key, changeType, targets, expDesc)
+	b.adminChangeReplicas(key, expDesc, chgs)
 	if err := getOneErr(db.Run(ctx, b), b); err != nil {
 		return nil, err
 	}
@@ -541,7 +619,8 @@ func (db *DB) AdminChangeReplicas(
 		return nil, errors.Errorf("unexpected response of type %T for AdminChangeReplicas",
 			responses[0].GetInner())
 	}
-	return resp.Desc, nil
+	desc := resp.Desc
+	return &desc, nil
 }
 
 // AdminRelocateRange relocates the replicas for a range onto the specified
@@ -565,9 +644,15 @@ func (db *DB) WriteBatch(ctx context.Context, begin, end interface{}, data []byt
 
 // AddSSTable links a file into the RocksDB log-structured merge-tree. Existing
 // data in the range is cleared.
-func (db *DB) AddSSTable(ctx context.Context, begin, end interface{}, data []byte) error {
+func (db *DB) AddSSTable(
+	ctx context.Context,
+	begin, end interface{},
+	data []byte,
+	disallowShadowing bool,
+	stats *enginepb.MVCCStats,
+) error {
 	b := &Batch{}
-	b.addSSTable(begin, end, data)
+	b.addSSTable(begin, end, data, disallowShadowing, stats)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -607,6 +692,13 @@ func (db *DB) Run(ctx context.Context, b *Batch) error {
 		return err
 	}
 	return sendAndFill(ctx, db.send, b)
+}
+
+// NewTxn creates a new RootTxn.
+func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
+	txn := NewTxn(ctx, db, db.ctx.NodeID.Get(), RootTxn)
+	txn.SetDebugName(debugName)
+	return txn
 }
 
 // Txn executes retryable in the context of a distributed transaction. The

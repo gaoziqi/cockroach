@@ -27,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/ledger"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/linkedin/goavro"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
@@ -320,7 +320,6 @@ func TestAvroEncoder(t *testing.T) {
 
 	t.Run(`sinkless`, sinklessTest(testFn))
 	t.Run(`enterprise`, enterpriseTest(testFn))
-	t.Run(`poller`, pollerTest(sinklessTest, testFn))
 }
 
 func TestAvroMigrateToUnsupportedColumn(t *testing.T) {
@@ -351,7 +350,6 @@ func TestAvroMigrateToUnsupportedColumn(t *testing.T) {
 
 	t.Run(`sinkless`, sinklessTest(testFn))
 	t.Run(`enterprise`, enterpriseTest(testFn))
-	t.Run(`poller`, pollerTest(sinklessTest, testFn))
 }
 
 func TestAvroLedger(t *testing.T) {
@@ -363,7 +361,8 @@ func TestAvroLedger(t *testing.T) {
 
 		ctx := context.Background()
 		gen := ledger.FromFlags(`--customers=1`)
-		_, err := workload.Setup(ctx, db, gen, 0, 0)
+		var l workloadsql.InsertsDataLoader
+		_, err := workloadsql.Setup(ctx, db, gen, l)
 		require.NoError(t, err)
 
 		ledger := feed(t, f, `CREATE CHANGEFEED FOR customer, transaction, entry, session
@@ -389,5 +388,4 @@ func TestAvroLedger(t *testing.T) {
 
 	t.Run(`sinkless`, sinklessTest(testFn))
 	t.Run(`enterprise`, enterpriseTest(testFn))
-	t.Run(`poller`, pollerTest(sinklessTest, testFn))
 }

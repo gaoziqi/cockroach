@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This file includes test-only helper methods added to types in
 // package storage. These methods are only linked in to tests in this
@@ -31,19 +27,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
+	"go.etcd.io/etcd/raft"
 )
 
 // AddReplica adds the replica to the store's replica map and to the sorted
@@ -169,6 +167,11 @@ func (s *Store) ManualReplicaGC(repl *Replica) error {
 	return manualQueue(s, s.replicaGCQueue, repl)
 }
 
+// ManualRaftSnapshot will manually send a raft snapshot to the target replica.
+func (s *Store) ManualRaftSnapshot(repl *Replica, target roachpb.ReplicaID) error {
+	return s.raftSnapshotQueue.processRaftSnapshot(context.TODO(), repl, target)
+}
+
 func (s *Store) ReservationCount() int {
 	return len(s.snapshotApplySem)
 }
@@ -223,20 +226,6 @@ func NewTestStorePool(cfg StoreConfig) *StorePool {
 	)
 }
 
-func (r *Replica) ReplicaID() roachpb.ReplicaID {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.ReplicaIDLocked()
-}
-
-func (r *Replica) ReplicaIDLocked() roachpb.ReplicaID {
-	return r.mu.replicaID
-}
-
-func (r *Replica) DescLocked() *roachpb.RangeDescriptor {
-	return r.mu.state.Desc
-}
-
 func (r *Replica) AssertState(ctx context.Context, reader engine.Reader) {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
@@ -264,32 +253,40 @@ func (r *Replica) GetLastIndex() (uint64, error) {
 func (r *Replica) LastAssignedLeaseIndex() uint64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.mu.lastAssignedLeaseIndex
+	return r.mu.proposalBuf.LastAssignedLeaseIndexRLocked()
 }
 
 // SetQuotaPool allows the caller to set a replica's quota pool initialized to
 // a given quota. Additionally it initializes the replica's quota release queue
 // and its command sizes map. Only safe to call on the replica that is both
-// lease holder and raft leader.
-func (r *Replica) InitQuotaPool(quota int64) {
+// lease holder and raft leader while holding the raftMu.
+func (r *Replica) InitQuotaPool(quota uint64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	r.mu.proposalQuotaBaseIndex = r.mu.lastIndex
-	if r.mu.proposalQuota != nil {
-		r.mu.proposalQuota.close()
+	var appliedIndex uint64
+	err := r.withRaftGroupLocked(false, func(r *raft.RawNode) (unquiesceAndWakeLeader bool, err error) {
+		appliedIndex = r.BasicStatus().Applied
+		return false, nil
+	})
+	if err != nil {
+		return err
 	}
-	r.mu.proposalQuota = newQuotaPool(quota)
+
+	r.mu.proposalQuotaBaseIndex = appliedIndex
+	if r.mu.proposalQuota != nil {
+		r.mu.proposalQuota.Close("re-creating")
+	}
+	r.mu.proposalQuota = quotapool.NewIntPool(r.rangeStr.String(), quota)
 	r.mu.quotaReleaseQueue = nil
-	r.mu.commandSizes = make(map[storagebase.CmdIDKey]int)
+	return nil
 }
 
 // QuotaAvailable returns the quota available in the replica's quota pool. Only
 // safe to call on the replica that is both lease holder and raft leader.
-func (r *Replica) QuotaAvailable() int64 {
+func (r *Replica) QuotaAvailable() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.mu.proposalQuota.approximateQuota()
+	return r.mu.proposalQuota.ApproximateQuota()
 }
 
 func (r *Replica) QuotaReleaseQueueLen() int {
@@ -302,12 +299,6 @@ func (r *Replica) IsFollowerActive(ctx context.Context, followerID roachpb.Repli
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.mu.lastUpdateTimes.isFollowerActive(ctx, followerID, timeutil.Now())
-}
-
-func (r *Replica) CommandSizesLen() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.mu.commandSizes)
 }
 
 // GetTSCacheHighWater returns the high water mark of the replica's timestamp
@@ -350,15 +341,6 @@ func (r *Replica) IsRaftGroupInitialized() bool {
 	return r.mu.internalRaftGroup != nil
 }
 
-// HasQuorum returns true iff the range that this replica is part of
-// can achieve quorum.
-func (r *Replica) HasQuorum() bool {
-	desc := r.Desc()
-	liveReplicas, _ := r.store.allocator.storePool.liveAndDeadReplicas(desc.RangeID, desc.InternalReplicas)
-	quorum := computeQuorum(len(desc.InternalReplicas))
-	return len(liveReplicas) >= quorum
-}
-
 // GetStoreList exposes getStoreList for testing only, but with a hardcoded
 // storeFilter of storeFilterNone.
 func (sp *StorePool) GetStoreList(rangeID roachpb.RangeID) (StoreList, int, int) {
@@ -397,7 +379,7 @@ func MakeSSTable(key, value string, ts hlc.Timestamp) ([]byte, engine.MVCCKeyVal
 		Value: v.RawBytes,
 	}
 
-	if err := sst.Add(kv); err != nil {
+	if err := sst.Put(kv.Key, kv.Value); err != nil {
 		panic(errors.Wrap(err, "while finishing SSTable"))
 	}
 	b, err := sst.Finish()
@@ -477,21 +459,23 @@ func (r *Replica) UnquiesceAndWakeLeader() {
 }
 
 func (nl *NodeLiveness) SetDrainingInternal(
-	ctx context.Context, liveness *storagepb.Liveness, drain bool,
+	ctx context.Context, liveness storagepb.Liveness, drain bool,
 ) error {
 	return nl.setDrainingInternal(ctx, liveness, drain)
 }
 
 func (nl *NodeLiveness) SetDecommissioningInternal(
-	ctx context.Context, nodeID roachpb.NodeID, liveness *storagepb.Liveness, decommission bool,
+	ctx context.Context, nodeID roachpb.NodeID, liveness storagepb.Liveness, decommission bool,
 ) (changeCommitted bool, err error) {
 	return nl.setDecommissioningInternal(ctx, nodeID, liveness, decommission)
 }
 
 // GetCircuitBreaker returns the circuit breaker controlling
 // connection attempts to the specified node.
-func (t *RaftTransport) GetCircuitBreaker(nodeID roachpb.NodeID) *circuit.Breaker {
-	return t.dialer.GetCircuitBreaker(nodeID)
+func (t *RaftTransport) GetCircuitBreaker(
+	nodeID roachpb.NodeID, class rpc.ConnectionClass,
+) *circuit.Breaker {
+	return t.dialer.GetCircuitBreaker(nodeID, class)
 }
 
 func WriteRandomDataToRange(

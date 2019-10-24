@@ -1,23 +1,16 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
-import (
-	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-)
+import "github.com/cockroachdb/cockroach/pkg/settings"
 
 // SplitByLoadEnabled wraps "kv.range_split.by_load_enabled".
 var SplitByLoadEnabled = settings.RegisterBoolSetting(
@@ -30,7 +23,7 @@ var SplitByLoadEnabled = settings.RegisterBoolSetting(
 var SplitByLoadQPSThreshold = settings.RegisterIntSetting(
 	"kv.range_split.load_qps_threshold",
 	"the QPS over which, the range becomes a candidate for load based splitting",
-	250, // 250 req/s
+	2500, // 2500 req/s
 )
 
 // SplitByLoadQPSThreshold returns the QPS request rate for a given replica.
@@ -43,6 +36,5 @@ func (r *Replica) SplitByLoadQPSThreshold() float64 {
 // shared across all stores.
 func (r *Replica) SplitByLoadEnabled() bool {
 	return SplitByLoadEnabled.Get(&r.store.cfg.Settings.SV) &&
-		r.store.ClusterSettings().Version.IsActive(cluster.VersionLoadSplits) &&
 		!r.store.TestingKnobs().DisableLoadBasedSplitting
 }

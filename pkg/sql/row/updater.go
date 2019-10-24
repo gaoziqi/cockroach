@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package row
 
@@ -21,11 +17,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Updater abstracts the key/value operations for updating table rows.
@@ -82,27 +77,30 @@ func MakeUpdater(
 	updateCols []sqlbase.ColumnDescriptor,
 	requestedCols []sqlbase.ColumnDescriptor,
 	updateType rowUpdaterType,
+	checkFKs checkFKConstraints,
 	evalCtx *tree.EvalContext,
 	alloc *sqlbase.DatumAlloc,
 ) (Updater, error) {
 	rowUpdater, err := makeUpdaterWithoutCascader(
-		txn, tableDesc, fkTables, updateCols, requestedCols, updateType, alloc,
+		txn, tableDesc, fkTables, updateCols, requestedCols, updateType, checkFKs, alloc,
 	)
 	if err != nil {
 		return Updater{}, err
 	}
-	rowUpdater.cascader, err = makeUpdateCascader(
-		txn, tableDesc, fkTables, updateCols, evalCtx, alloc,
-	)
-	if err != nil {
-		return Updater{}, err
+	if checkFKs == CheckFKs {
+		rowUpdater.cascader, err = makeUpdateCascader(
+			txn, tableDesc, fkTables, updateCols, evalCtx, alloc,
+		)
+		if err != nil {
+			return Updater{}, err
+		}
 	}
 	return rowUpdater, nil
 }
 
 type returnTrue struct{}
 
-func (returnTrue) Error() string { panic(pgerror.AssertionFailedf("unimplemented")) }
+func (returnTrue) Error() string { panic(errors.AssertionFailedf("unimplemented")) }
 
 var returnTruePseudoError error = returnTrue{}
 
@@ -115,6 +113,7 @@ func makeUpdaterWithoutCascader(
 	updateCols []sqlbase.ColumnDescriptor,
 	requestedCols []sqlbase.ColumnDescriptor,
 	updateType rowUpdaterType,
+	checkFKs checkFKConstraints,
 	alloc *sqlbase.DatumAlloc,
 ) (Updater, error) {
 	updateColIDtoRowIndex := ColIDtoRowIndexFromCols(updateCols)
@@ -265,10 +264,15 @@ func makeUpdaterWithoutCascader(
 		}
 	}
 
-	var err error
-	if ru.Fks, err = makeFkExistenceCheckHelperForUpdate(txn, tableDesc, fkTables,
-		ru.FetchColIDtoRowIndex, alloc); err != nil {
-		return Updater{}, err
+	if checkFKs == CheckFKs {
+		var err error
+		if primaryKeyColChange {
+			updateCols = nil
+		}
+		if ru.Fks, err = makeFkExistenceCheckHelperForUpdate(txn, tableDesc, fkTables,
+			updateCols, ru.FetchColIDtoRowIndex, alloc); err != nil {
+			return Updater{}, err
+		}
 	}
 	return ru, nil
 }
@@ -359,30 +363,32 @@ func (ru *Updater) UpdateRow(
 			return nil, err
 		}
 
-		ru.Fks.addCheckForIndex(ru.Helper.TableDesc.PrimaryIndex.ID, ru.Helper.TableDesc.PrimaryIndex.Type)
-		for i := range ru.Helper.Indexes {
-			if !bytes.Equal(newSecondaryIndexEntries[i].Key, oldSecondaryIndexEntries[i].Key) {
-				ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID, ru.Helper.Indexes[i].Type)
+		if ru.Fks.checker != nil {
+			ru.Fks.addCheckForIndex(ru.Helper.TableDesc.PrimaryIndex.ID, ru.Helper.TableDesc.PrimaryIndex.Type)
+			for i := range ru.Helper.Indexes {
+				if !bytes.Equal(newSecondaryIndexEntries[i].Key, oldSecondaryIndexEntries[i].Key) {
+					ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID, ru.Helper.Indexes[i].Type)
+				}
+			}
+
+			if ru.cascader != nil {
+				if err := ru.cascader.txn.Run(ctx, batch); err != nil {
+					return nil, ConvertBatchError(ctx, ru.Helper.TableDesc, batch)
+				}
+				if err := ru.cascader.cascadeAll(
+					ctx,
+					ru.Helper.TableDesc,
+					tree.Datums(oldValues),
+					tree.Datums(ru.newValues),
+					ru.FetchColIDtoRowIndex,
+					traceKV,
+				); err != nil {
+					return nil, err
+				}
 			}
 		}
 
-		if ru.cascader != nil {
-			if err := ru.cascader.txn.Run(ctx, batch); err != nil {
-				return nil, ConvertBatchError(ctx, ru.Helper.TableDesc, batch)
-			}
-			if err := ru.cascader.cascadeAll(
-				ctx,
-				ru.Helper.TableDesc,
-				tree.Datums(oldValues),
-				tree.Datums(ru.newValues),
-				ru.FetchColIDtoRowIndex,
-				traceKV,
-			); err != nil {
-				return nil, err
-			}
-		}
-
-		if checkFKs == CheckFKs {
+		if checkFKs {
 			if err := ru.Fks.addIndexChecks(ctx, oldValues, ru.newValues, traceKV); err != nil {
 				return nil, err
 			}
@@ -426,7 +432,7 @@ func (ru *Updater) UpdateRow(
 			continue
 		}
 
-		var expValue interface{}
+		var expValue *roachpb.Value
 		if !bytes.Equal(newSecondaryIndexEntry.Key, oldSecondaryIndexEntry.Key) {
 			ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID, ru.Helper.Indexes[i].Type)
 			if traceKV {

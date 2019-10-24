@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ts_test
 
@@ -26,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -177,7 +174,8 @@ func TestServerQuery(t *testing.T) {
 		},
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID()).Connect(context.Background())
+	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
+		rpc.DefaultClass).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +270,8 @@ func TestServerQueryStarvation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID()).Connect(context.Background())
+	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
+		rpc.DefaultClass).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +326,8 @@ func TestServerQueryMemoryManagement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID()).Connect(context.Background())
+	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
+		rpc.DefaultClass).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,8 @@ func TestServerDump(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID()).Connect(context.Background())
+	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
+		rpc.DefaultClass).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,7 +453,8 @@ func BenchmarkServerQuery(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID()).Connect(context.Background())
+	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
+		rpc.DefaultClass).Connect(context.Background())
 	if err != nil {
 		b.Fatal(err)
 	}

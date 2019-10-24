@@ -20,16 +20,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	mysqltypes "vitess.io/vitess/go/sqltypes"
 	mysql "vitess.io/vitess/go/vt/sqlparser"
 )
@@ -42,27 +45,27 @@ import (
 // KVs using the mapped converter and sent to kvCh.
 type mysqldumpReader struct {
 	evalCtx  *tree.EvalContext
-	tables   map[string]*rowConverter
-	kvCh     chan []roachpb.KeyValue
+	tables   map[string]*row.DatumRowConverter
+	kvCh     chan row.KVBatch
 	debugRow func(tree.Datums)
 }
 
 var _ inputConverter = &mysqldumpReader{}
 
 func newMysqldumpReader(
-	kvCh chan []roachpb.KeyValue,
-	tables map[string]*sqlbase.TableDescriptor,
+	kvCh chan row.KVBatch,
+	tables map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
 	evalCtx *tree.EvalContext,
 ) (*mysqldumpReader, error) {
 	res := &mysqldumpReader{evalCtx: evalCtx, kvCh: kvCh}
 
-	converters := make(map[string]*rowConverter, len(tables))
+	converters := make(map[string]*row.DatumRowConverter, len(tables))
 	for name, table := range tables {
-		if table == nil {
+		if table.Desc == nil {
 			converters[name] = nil
 			continue
 		}
-		conv, err := newRowConverter(table, evalCtx, kvCh)
+		conv, err := row.NewDatumRowConverter(table.Desc, nil /* targetColNames */, evalCtx, kvCh)
 		if err != nil {
 			return nil, err
 		}
@@ -83,19 +86,23 @@ func (m *mysqldumpReader) readFiles(
 	ctx context.Context,
 	dataFiles map[int32]string,
 	format roachpb.IOFileFormat,
-	progressFn func(float32) error,
-	settings *cluster.Settings,
+	makeExternalStorage cloud.ExternalStorageFactory,
 ) error {
-	return readInputFiles(ctx, dataFiles, format, m.readFile, progressFn, settings)
+	return readInputFiles(ctx, dataFiles, format, m.readFile, makeExternalStorage)
 }
 
 func (m *mysqldumpReader) readFile(
-	ctx context.Context, input io.Reader, inputIdx int32, inputName string, progressFn progressFn,
+	ctx context.Context, input *fileReader, inputIdx int32, inputName string, rejected chan string,
 ) error {
 	var inserts, count int64
 	r := bufio.NewReaderSize(input, 1024*64)
 	tokens := mysql.NewTokenizer(r)
 	tokens.SkipSpecialComments = true
+
+	for _, conv := range m.tables {
+		conv.KvBatch.Source = inputIdx
+		conv.FractionFn = input.ReadFraction
+	}
 
 	for {
 		stmt, err := mysql.ParseNextStrictDDL(tokens)
@@ -129,22 +136,22 @@ func (m *mysqldumpReader) readFile(
 			startingCount := count
 			for _, inputRow := range rows {
 				count++
-				if expected, got := len(conv.visibleCols), len(inputRow); expected != got {
+				if expected, got := len(conv.VisibleCols), len(inputRow); expected != got {
 					return errors.Errorf("expected %d values, got %d: %v", expected, got, inputRow)
 				}
 				for i, raw := range inputRow {
-					converted, err := mysqlValueToDatum(raw, conv.visibleColTypes[i], conv.evalCtx)
+					converted, err := mysqlValueToDatum(raw, conv.VisibleColTypes[i], conv.EvalCtx)
 					if err != nil {
 						return errors.Wrapf(err, "reading row %d (%d in insert statement %d)",
 							count, count-startingCount, inserts)
 					}
-					conv.datums[i] = converted
+					conv.Datums[i] = converted
 				}
-				if err := conv.row(ctx, inputIdx, count); err != nil {
+				if err := conv.Row(ctx, inputIdx, count); err != nil {
 					return err
 				}
 				if m.debugRow != nil {
-					m.debugRow(conv.datums)
+					m.debugRow(conv.Datums)
 				}
 			}
 		default:
@@ -155,7 +162,7 @@ func (m *mysqldumpReader) readFile(
 		}
 	}
 	for _, conv := range m.tables {
-		if err := conv.sendBatch(ctx); err != nil {
+		if err := conv.SendBatch(ctx); err != nil {
 			return err
 		}
 	}
@@ -311,7 +318,7 @@ func readMysqlCreateTable(
 	if match != "" && !found {
 		return nil, errors.Errorf("table %q not found in file (found tables: %s)", match, strings.Join(names, ", "))
 	}
-	if err := addDelayedFKs(ctx, fkDefs, fks.resolver); err != nil {
+	if err := addDelayedFKs(ctx, fkDefs, fks.resolver, evalCtx.Settings); err != nil {
 		return nil, err
 	}
 	return ret, nil
@@ -490,10 +497,12 @@ type delayedFK struct {
 	def *tree.ForeignKeyConstraintTableDef
 }
 
-func addDelayedFKs(ctx context.Context, defs []delayedFK, resolver fkResolver) error {
+func addDelayedFKs(
+	ctx context.Context, defs []delayedFK, resolver fkResolver, settings *cluster.Settings,
+) error {
 	for _, def := range defs {
 		if err := sql.ResolveFK(
-			ctx, nil, resolver, def.tbl, def.def, map[sqlbase.ID]*sqlbase.MutableTableDescriptor{}, sql.NewTable,
+			ctx, nil, resolver, def.tbl, def.def, map[sqlbase.ID]*sqlbase.MutableTableDescriptor{}, sql.NewTable, tree.ValidationDefault, settings,
 		); err != nil {
 			return err
 		}
@@ -625,18 +634,18 @@ func mysqlColToCockroach(
 		def.Type = types.Jsonb
 
 	case mysqltypes.Set:
-		return nil, pgerror.UnimplementedWithIssueHint(32560,
+		return nil, unimplemented.NewWithIssueHint(32560,
 			"cannot import SET columns at this time",
 			"try converting the column to a 64-bit integer before import")
 	case mysqltypes.Geometry:
-		return nil, pgerror.UnimplementedWithIssuef(32559,
+		return nil, unimplemented.NewWithIssuef(32559,
 			"cannot import GEOMETRY columns at this time")
 	case mysqltypes.Bit:
-		return nil, pgerror.UnimplementedWithIssueHint(32561,
+		return nil, unimplemented.NewWithIssueHint(32561,
 			"cannot improt BIT columns at this time",
 			"try converting the column to a 64-bit integer before import")
 	default:
-		return nil, pgerror.Unimplementedf(fmt.Sprintf("import.mysqlcoltype.%s", typ), "unsupported mysql type %q", col.Type)
+		return nil, unimplemented.Newf(fmt.Sprintf("import.mysqlcoltype.%s", typ), "unsupported mysql type %q", col.Type)
 	}
 
 	if col.NotNull {
@@ -652,7 +661,7 @@ func mysqlColToCockroach(
 		} else {
 			expr, err := parser.ParseExpr(exprString)
 			if err != nil {
-				return nil, pgerror.Unimplementedf("import.mysql.default", "unsupported default expression %q for column %q: %v", exprString, name, err)
+				return nil, unimplemented.Newf("import.mysql.default", "unsupported default expression %q for column %q: %v", exprString, name, err)
 			}
 			def.DefaultExpr.Expr = expr
 		}

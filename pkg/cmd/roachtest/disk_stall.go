@@ -1,32 +1,26 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
-func registerDiskStalledDetection(r *registry) {
+func registerDiskStalledDetection(r *testRegistry) {
 	for _, affectsLogDir := range []bool{false, true} {
 		for _, affectsDataDir := range []bool{false, true} {
 			// Grab copies of the args because we'll pass them into a closure.
@@ -38,7 +32,7 @@ func registerDiskStalledDetection(r *registry) {
 					"disk-stalled/log=%t,data=%t",
 					affectsLogDir, affectsDataDir,
 				),
-				MinVersion: `v2.2.0`,
+				MinVersion: "v19.1.0",
 				Cluster:    makeClusterSpec(1),
 				Run: func(ctx context.Context, t *test, c *cluster) {
 					runDiskStalledDetection(ctx, t, c, affectsLogDir, affectsDataDir)
@@ -52,19 +46,12 @@ func runDiskStalledDetection(
 	ctx context.Context, t *test, c *cluster, affectsLogDir bool, affectsDataDir bool,
 ) {
 	n := c.Node(1)
-	tmpDir, err := ioutil.TempDir("", "stalled")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_ = os.RemoveAll(tmpDir)
-	}()
 
 	c.Put(ctx, cockroach, "./cockroach")
 	c.Run(ctx, n, "sudo umount -f {store-dir}/faulty || true")
 	c.Run(ctx, n, "mkdir -p {store-dir}/{real,faulty} || true")
 	// Make sure the actual logs are downloaded as artifacts.
-	c.Run(ctx, n, "rm -f logs/real && ln -s {store-dir}/real/logs logs/real || true")
+	c.Run(ctx, n, "rm -f logs && ln -s {store-dir}/real/logs logs || true")
 
 	t.Status("setting up charybdefs")
 

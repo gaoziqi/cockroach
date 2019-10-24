@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package norm
 
@@ -18,7 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/errors"
 )
 
 // RejectNullCols returns the set of columns that are candidates for NULL
@@ -57,11 +53,11 @@ func (c *CustomFuncs) NullRejectAggVar(
 	aggs memo.AggregationsExpr, nullRejectCols opt.ColSet,
 ) *memo.VariableExpr {
 	for i := range aggs {
-		if nullRejectCols.Contains(int(aggs[i].Col)) {
+		if nullRejectCols.Contains(aggs[i].Col) {
 			return memo.ExtractVarFromAggInput(aggs[i].Agg.Child(0).(opt.ScalarExpr))
 		}
 	}
-	panic(pgerror.AssertionFailedf("expected aggregation not found"))
+	panic(errors.AssertionFailedf("expected aggregation not found"))
 }
 
 // DeriveRejectNullCols returns the set of columns that are candidates for NULL
@@ -94,7 +90,7 @@ func DeriveRejectNullCols(in memo.RelExpr) opt.ColSet {
 		}
 		relProps.Rule.RejectNullCols.UnionWith(in.Child(1).(memo.RelExpr).Relational().OutputCols)
 
-	case opt.RightJoinOp, opt.RightJoinApplyOp:
+	case opt.RightJoinOp:
 		// Pass through null-rejection columns from right input, and request null-
 		// rejection on left columns.
 		relProps.Rule.RejectNullCols = in.Child(0).(memo.RelExpr).Relational().OutputCols
@@ -102,7 +98,7 @@ func DeriveRejectNullCols(in memo.RelExpr) opt.ColSet {
 			relProps.Rule.RejectNullCols.UnionWith(DeriveRejectNullCols(in.Child(1).(memo.RelExpr)))
 		}
 
-	case opt.FullJoinOp, opt.FullJoinApplyOp:
+	case opt.FullJoinOp:
 		// Request null-rejection on all output columns.
 		relProps.Rule.RejectNullCols = relProps.OutputCols
 
@@ -161,7 +157,7 @@ func deriveGroupByRejectNullCols(in memo.RelExpr) opt.ColSet {
 		}
 		savedInColID = inColID
 
-		if !DeriveRejectNullCols(input).Contains(int(inColID)) {
+		if !DeriveRejectNullCols(input).Contains(inColID) {
 			// Input has not requested null rejection on the input column.
 			return opt.ColSet{}
 		}
@@ -169,7 +165,7 @@ func deriveGroupByRejectNullCols(in memo.RelExpr) opt.ColSet {
 		// Can possibly reject column, but keep searching, since if
 		// multiple columns are used by aggregate functions, then nulls
 		// can't be rejected on any column.
-		rejectNullCols.Add(int(aggs[i].Col))
+		rejectNullCols.Add(aggs[i].Col)
 	}
 	return rejectNullCols
 }

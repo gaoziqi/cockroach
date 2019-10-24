@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package opt_test
 
@@ -19,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 func TestOrdering(t *testing.T) {
@@ -46,7 +41,7 @@ func TestOrdering(t *testing.T) {
 		t.Error("ordering should provide the empty ordering")
 	}
 
-	if !ordering.ColSet().Equals(util.MakeFastIntSet(1, 5)) {
+	if !ordering.ColSet().Equals(opt.MakeColSet(1, 5)) {
 		t.Error("ordering colset should equal the ordering columns")
 	}
 
@@ -114,22 +109,22 @@ func TestOrderingSet(t *testing.T) {
 	expect(s2, "")
 
 	s2 = s.Copy()
-	s2.RestrictToCols(util.MakeFastIntSet(1, 2, 3, 5))
+	s2.RestrictToCols(opt.MakeColSet(1, 2, 3, 5))
 	expect(s2, "(+1,+2,+5) (+1,-2,+3)")
 
 	s2 = s.Copy()
-	s2.RestrictToCols(util.MakeFastIntSet(1, 2, 3))
+	s2.RestrictToCols(opt.MakeColSet(1, 2, 3))
 	expect(s2, "(+1,+2) (+1,-2,+3)")
 
 	s2 = s.Copy()
-	s2.RestrictToCols(util.MakeFastIntSet(1, 2))
+	s2.RestrictToCols(opt.MakeColSet(1, 2))
 	expect(s2, "(+1,+2) (+1,-2)")
 
 	s2 = s.Copy()
-	s2.RestrictToCols(util.MakeFastIntSet(1, 3))
+	s2.RestrictToCols(opt.MakeColSet(1, 3))
 	expect(s2, "(+1)")
 
 	s2 = s.Copy()
-	s2.RestrictToCols(util.MakeFastIntSet(2, 3))
+	s2.RestrictToCols(opt.MakeColSet(2, 3))
 	expect(s2, "")
 }

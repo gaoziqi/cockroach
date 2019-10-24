@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -19,27 +15,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/pkg/errors"
 )
-
-// TestingKnobs groups testing knobs for the Server.
-type TestingKnobs struct {
-	// DisableAutomaticVersionUpgrade, if set, temporarily disables the server's
-	// automatic version upgrade mechanism.
-	DisableAutomaticVersionUpgrade int32 // accessed atomically
-	// DefaultZoneConfigOverride, if set, overrides the default zone config defined in `pkg/config/zone.go`
-	DefaultZoneConfigOverride *config.ZoneConfig
-	// DefaultSystemZoneConfigOverride, if set, overrides the default system zone config defined in `pkg/config/zone.go`
-	DefaultSystemZoneConfigOverride *config.ZoneConfig
-}
-
-// ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
-func (*TestingKnobs) ModuleTestingKnobs() {}
 
 // startAttemptUpgrade attempts to upgrade cluster version.
 func (s *Server) startAttemptUpgrade(ctx context.Context) {

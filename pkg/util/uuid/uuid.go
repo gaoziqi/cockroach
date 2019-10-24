@@ -1,3 +1,13 @@
+// Copyright 2019 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 // Copyright (C) 2013-2018 by Maxim Bublis <b@codemonkey.ru>
 // Use of this source code is governed by a MIT-style
 // license that can be found in licenses/MIT-gofrs.txt.
@@ -107,8 +117,17 @@ func (u UUID) Variant() byte {
 	}
 }
 
-// Bytes returns a byte slice representation of the UUID.
+// bytes returns a byte slice representation of the UUID. It incurs an
+// allocation if the return value escapes.
 func (u UUID) bytes() []byte {
+	return u[:]
+}
+
+// bytesMut returns a mutable byte slice representation of the UUID. Unlike
+// bytes, it does not necessarily incur an allocation if the return value
+// escapes. Instead, the return value escaping will cause the method's receiver
+// (and any struct that it is a part of) to escape.
+func (u *UUID) bytesMut() []byte {
 	return u[:]
 }
 

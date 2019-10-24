@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 syntax = "proto3";
 package cockroach.roachpb;
@@ -161,21 +157,47 @@ enum ReplicaChangeType {
   REMOVE_REPLICA = 1;
 }
 
+// ChangeReplicasTrigger carries out a replication change. The Added() and Removed()
+// methods return the replicas being added and removed, respectively. If more than
+// one change is specified (i.e. len(Added())+len(Removed()) exceeds one), this
+// initiates an atomic replication change in which the "removed" replicas are
+// of type VOTER_OUTGOING. This joint configuration is left via another
+// ChangeReplicasTrigger which does not specify any additions nor removals.
 message ChangeReplicasTrigger {
   option (gogoproto.equal) = true;
 
   option (gogoproto.goproto_stringer) = false;
 
-  // TODO(benesch): this trigger should just specify the updated descriptor,
-  // like the split and merge triggers, so that the receiver doesn't need to
-  // reconstruct the range descriptor update.
-
-  ReplicaChangeType change_type = 1;
+  // TODO(tbg): remove once we know that no trigger using this will ever be
+  // applied (this will require something like #39182).
+  //
+  // TODO(tbg): when removing this, also rename internal_x_replicas to just
+  // x_replicas and remove the getter.
+  ReplicaChangeType deprecated_change_type = 1;
   // The replica being modified.
-  ReplicaDescriptor replica = 2 [(gogoproto.nullable) = false];
+  // TODO(tbg): remove once we know that no trigger using this will ever be
+  // applied (this will require something like #39182).
+  ReplicaDescriptor deprecated_replica = 2 [(gogoproto.nullable) = false];
   // The new replica list with this change applied.
-  repeated ReplicaDescriptor updated_replicas = 3 [(gogoproto.nullable) = false];
-  int32 next_replica_id = 4 [(gogoproto.customname) = "NextReplicaID", (gogoproto.casttype) = "ReplicaID"];
+  repeated ReplicaDescriptor deprecated_updated_replicas = 3 [(gogoproto.nullable) = false];
+  // The next replica id to use with this change applied.
+  int32 deprecated_next_replica_id = 4 [(gogoproto.customname) = "DeprecatedNextReplicaID", (gogoproto.casttype) = "ReplicaID"];
+  // The updated range descriptor. If desc is non-nil, then it overrides
+  // updated_replicas and next_replica_id. This incremental addition is needed
+  // to maintain backwards compatibility.
+  // TODO(jeffreyxiao): Remove deprecated_updated_replicas and
+  // deprecated_next_replica_id in 20.1.
+  RangeDescriptor desc = 5;
+  // The new replicas added to the range descriptor in this change, exactly as
+  // they appear in the updated range descriptor.
+  repeated ReplicaDescriptor internal_added_replicas = 6 [(gogoproto.nullable) = false];
+  // The replicas whose removal is being initiated in this change. If the
+  // replica is still present as an outgoing voter in the updated descriptor
+  // (i.e. if this is a full atomic replication change), then the replica here
+  // must match that in the descriptor; otherwise it must match the replica
+  // removed from the descriptor in the course of this change (which is itself
+  // not visible to this trigger).
+  repeated ReplicaDescriptor internal_removed_replicas = 7 [(gogoproto.nullable) = false];
 }
 
 // ModifiedSpanTrigger indicates that a specific span has been modified.
@@ -196,11 +218,11 @@ message ModifiedSpanTrigger {
 // StickyBitTrigger indicates that the sticky bit of a range should be changed.
 // This trigger is used in two cases:
 // 1. Unsplitting a range. Note that unsplitting and merging are different
-//    operations. Unsplitting a range will only remove the sticky bit
-//    associated with the range.
+//    operations. Unsplitting a range will only update the expiration time
+//    associated with the range to hlc.Timestamp{}.
 // 2. Splitting at the start key of a range. In this case, no range is split but
-//    the sticky bit is still set, so we need to use this trigger instead of
-//    SplitTrigger.
+//    the sticky bit is might be updated, so we need to use this trigger instead
+//    of SplitTrigger.
 //
 // Note that the sticky_bit should always be set to the same timestamp used to
 // update the range descriptor and it's the client's responsibility that the
@@ -209,7 +231,7 @@ message StickyBitTrigger {
   option (gogoproto.equal) = true;
 
   // Set to nil to remove a RangeDescriptor's sticky bit.
-  util.hlc.Timestamp sticky_bit = 1;
+  util.hlc.Timestamp sticky_bit = 1 [(gogoproto.nullable) = false];
 }
 
 // InternalCommitTrigger encapsulates all of the internal-only commit triggers.
@@ -294,24 +316,21 @@ message Transaction {
   // coordinator to indicate client activity. Concurrent transactions will
   // avoid aborting a transaction if it observes recent-enough activity.
   util.hlc.Timestamp last_heartbeat = 5 [(gogoproto.nullable) = false];
-  // The original timestamp at which the transaction started. For serializable
-  // transactions, if the timestamp drifts from the original timestamp, the
-  // transaction will retry unless we manage to "refresh the reads" - see
-  // refreshed_timestamp.
+  // The timestamp at which the transaction's current epoch started. For
+  // serializable transactions, if the timestamp drifts from the original
+  // timestamp, the transaction will retry unless we manage to "refresh the
+  // reads" - see refreshed_timestamp.
   //
   // This timestamp is the one at which all reads occur, unless
-  // refreshed_timestamp is set.
-  //
-  // Note that writes do not occur at this timestamp; they instead occur at the
-  // provisional commit timestamp, meta.Timestamp.
+  // refreshed_timestamp is set. Intent writes do not occur at this timestamp;
+  // they instead occur at the provisional commit timestamp, meta.Timestamp.
   util.hlc.Timestamp orig_timestamp = 6 [(gogoproto.nullable) = false];
-  // Initial Timestamp + clock skew. Reads which encounter values with
-  // timestamps between timestamp and max_timestamp trigger a txn
-  // retry error, unless the node being read is listed in observed_timestamps
-  // (in which case no more read uncertainty can occur).
-  // The case max_timestamp < timestamp is possible for transactions which have
-  // been pushed; in this case, max_timestamp should be ignored.
-  util.hlc.Timestamp max_timestamp = 7 [(gogoproto.nullable) = false];
+  // This flag is set if the transaction's original timestamp was
+  // "leaked" beyond the transaction (i.e. if returned via NOW() or
+  // transaction_timestamp()). If true, this prevents optimizations
+  // which commit at a higher timestamp without resorting to a
+  // client-side retry.
+  bool orig_timestamp_was_observed = 16;
   // The refreshed timestamp is the timestamp at which the transaction
   // can commit without necessitating a serializable restart. This
   // value is forwarded to the transaction's current timestamp (meta.timestamp)
@@ -325,11 +344,38 @@ message Transaction {
   // orig_timestamp needs to be used as a lower bound timestamp for the
   // time-bound iterator used to resolve intents - i.e. there can be intents to
   // resolve up to the timestamp that the txn started with.
+  //
+  // TODO(nvanbenschoten): this second paragraph is no longer true. The only
+  // place that relies on orig_timestamp being fixed over an entire epoch is
+  // v19.1 nodes use of Transaction.InclusiveTimeBounds. In v20.1 we can remove
+  // this field and update orig_timestamp in place, removing a lot of awkward
+  // code where we forward orig_timestamp by refreshed_timestamp. Doing so will
+  // also address the TODOs in cmd_refresh.go and cmd_refresh_range.go.
+  // Additionally, it will present a good opportunity to rename the field to
+  // read_timestamp.
   util.hlc.Timestamp refreshed_timestamp = 15 [(gogoproto.nullable) = false];
+  // Deprecated min timestamp was used to keep track of the earliest timestamp
+  // that any epoch of the transaction used. This was set only if the
+  // transaction is restarted and the epoch is bumped. It was used during
+  // intent resolution to more efficiently scan for intents.
+  //
+  // The timestamp has since been replaced by TxnMeta.MinTimestamp.
+  //
+  // TODO(nvanbenschoten): remove in v20.1.
+  util.hlc.Timestamp deprecated_min_timestamp = 14 [(gogoproto.nullable) = false];
+  // Initial Timestamp + clock skew. Reads which encounter values with
+  // timestamps between timestamp and max_timestamp trigger a txn
+  // retry error, unless the node being read is listed in observed_timestamps
+  // (in which case no more read uncertainty can occur).
+  // The case max_timestamp < timestamp is possible for transactions which have
+  // been pushed; in this case, max_timestamp should be ignored.
+  util.hlc.Timestamp max_timestamp = 7 [(gogoproto.nullable) = false];
   // A list of <NodeID, timestamp> pairs. The list maps NodeIDs to timestamps
   // as observed from their local clock during this transaction. The purpose of
   // this list is to avoid uncertainty related restarts which normally occur
   // when reading a value in the near future as per the max_timestamp field.
+  //
+  // ### Meaning:
   //
   // Morally speaking, having an entry for a node in this list means that this
   // node has been visited before, and that no more uncertainty restarts are
@@ -347,6 +393,8 @@ message Transaction {
   // with a timestamp that is at least high as our entry in the list for node A,
   // so no future operation on node A will be uncertain.
   //
+  // ### Correctness:
+  //
   // Thus, expressed properly, we can say that when a node has been read from
   // successfully before by a transaction, uncertainty for values written by a
   // leaseholder on that node is restricted to values with timestamps in the
@@ -354,12 +402,14 @@ message Transaction {
   // placed on the uncertainty window because we are guaranteed that at the time
   // that the transaction first visited the node, none of the Ranges that it was
   // a leaseholder for had served any writes at higher timestamps than the clock
-  // reading we observe. This implies that any writes that the transaction may
-  // later see written by leaseholders on this node at higher timestamps than
-  // the observed timestamp could not have taken place causally before this
-  // transaction and can be ignored for the purposes of uncertainty.
+  // reading we observe. This implies the following property:
   //
-  // There are two invariants necessary for this guarantee to hold:
+  //    Any writes that the transaction may later see written by leaseholders on
+  //    this node at higher timestamps than the observed timestamp could not have
+  //    taken place causally before this transaction and can be ignored for the
+  //    purposes of uncertainty.
+  //
+  // There are two invariants necessary for this property to hold:
   // 1. a leaseholder's clock must always be equal to or greater than the timestamp
   //    of all writes that it has served. This is trivial to enforce for
   //    non-transactional writes. It is more complicated for transactional writes
@@ -379,11 +429,24 @@ message Transaction {
   //    invariant holds for all leaseholders, given that a Range's initial
   //    leaseholder assumes responsibility for an empty range with no writes.
   //
+  // ### Usage:
   //
-  // When this list holds a corresponding entry for the node who owns that lease
-  // that the current request is executing under, we can run the command with
-  // the list's timestamp as the top boundary of our uncertainty interval,
-  // limiting (and often avoiding) uncertainty restarts.
+  // The property ensures that when this list holds a corresponding entry for
+  // the node who owns the lease that the current request is executing under, we
+  // can run the request with the list's timestamp as the upper bound for its
+  // uncertainty interval, limiting (and often avoiding) uncertainty restarts.
+  // We do this by lowering the request's max_timestamp down to the timestamp in
+  // the observed timestamp entry, which is done in Replica.limitTxnMaxTimestamp.
+  //
+  // However, as stated, the correctness property only holds for values at
+  // higher timestamps than the observed timestamp written *by leaseholders on
+  // this node*. This is critical, as the property tells us nothing about values
+  // written by leaseholders on different nodes, even if a lease for one of
+  // those Ranges has since moved to a node that we have an observed timestamp
+  // entry for. To accommodate this limitation, Replica.limitTxnMaxTimestamp
+  // first forwards the timestamp in the observed timestamp entry by the start
+  // timestamp of the lease that the request is executing under before using it
+  // to limit the request's uncertainty interval.
   //
   // When a transaction is first initialized on a node, it may use a timestamp
   // from the local hybrid logical clock to initialize the corresponding entry
@@ -396,15 +459,6 @@ message Transaction {
   // slice should be treated as immutable and all updates should be performed
   // on a copy of the slice.
   repeated ObservedTimestamp observed_timestamps = 8 [(gogoproto.nullable) = false];
-  // Writing is true if the transaction has previously sent a Begin transaction
-  // (i.e. if it ever attempted to perform a write, so if it ever attempted to
-  // leave intents (across retries)). The flag will be set even if the BeginTxn
-  // batch failed.
-  // When set, the AbortCache must be checked by reads so that they don't miss
-  // to see the txn's previous writes.
-  // TODO(nvanbenschoten): This comment is only true when interacting with 2.1
-  // nodes. This field can be completely removed in 19.2.
-  bool deprecated_writing = 9;
   // If this is true, the transaction must retry. Relevant only for
   // SNAPSHOT transactions: a SERIALIZABLE transaction would have to
   // retry anyway due to its commit timestamp having moved forward (whenever
@@ -440,19 +494,8 @@ message Transaction {
   // treated as immutable and all updates should be performed on a copy of the
   // slice.
   repeated SequencedWrite in_flight_writes = 17 [(gogoproto.nullable) = false];
-  // Epoch zero timestamp is used to keep track of the earliest timestamp
-  // that any epoch of the transaction used. This is set only if the
-  // transaction is restarted and the epoch is bumped. It is used during
-  // intent resolution to more efficiently scan for intents.
-  util.hlc.Timestamp epoch_zero_timestamp = 14 [(gogoproto.nullable) = false];
-  // This flag is set if the transaction's original timestamp was
-  // "leaked" beyond the transaction (i.e. if returned via NOW() or
-  // transaction_timestamp()). If true, this prevents optimizations
-  // which commit at a higher timestamp without resorting to a
-  // client-side retry.
-  bool orig_timestamp_was_observed = 16;
 
-  reserved 3, 13;
+  reserved 3, 9, 13;
 }
 
 // A TransactionRecord message contains the subset of the fields in a
@@ -472,19 +515,14 @@ message TransactionRecord {
   option (gogoproto.populate) = true;
 
   // See comments on Transaction proto.
-  storage.engine.enginepb.TxnMeta meta = 1  [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  TransactionStatus status             = 4;
-  util.hlc.Timestamp last_heartbeat    = 5  [(gogoproto.nullable) = false];
-  // TODO(nvanbenschoten): We can't accurately determine this value from
-  // intents, so we'd like to avoid ever needing to synthesize it. 2.1 nodes
-  // will assert that it is set, so we set it for now, but we should stop doing
-  // that in the future. Removing this in 2.3 shouldn't cause any issues.
-  util.hlc.Timestamp orig_timestamp        = 6  [(gogoproto.nullable) = false];
+  storage.engine.enginepb.TxnMeta meta     = 1  [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  TransactionStatus status                 = 4;
+  util.hlc.Timestamp last_heartbeat        = 5  [(gogoproto.nullable) = false];
   repeated Span intent_spans               = 11 [(gogoproto.nullable) = false];
   repeated SequencedWrite in_flight_writes = 17 [(gogoproto.nullable) = false];
 
   // Fields on Transaction that are not present in a transaction record.
-  reserved 2, 3, 7, 8, 9, 10, 12, 13, 14, 15, 16;
+  reserved 2, 3, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16;
 }
 
 // A Intent is a Span together with a Transaction metadata and its status.
@@ -597,11 +635,10 @@ message TxnCoordMeta {
   repeated Span refresh_reads = 4 [(gogoproto.nullable) = false];
   repeated Span refresh_writes = 5 [(gogoproto.nullable) = false];
   reserved 6;
-  // refresh_invalid indicates that spans were discarded or not collected
-  // (i.e. because of a dist SQL processor running a version before refreshing
-  // was introduced). This is false if all spans encountered during the
-  // transaction which need refreshing have been collected to the refresh_reads
-  // and refresh_writes span slices.
+  // refresh_invalid indicates that spans were discarded or not collected (i.e.
+  // because the memory budget for tracking reads was exceeded). This is false
+  // if all spans encountered during the transaction which need refreshing have
+  // been collected to the refresh_reads and refresh_writes span slices.
   bool refresh_invalid = 7;
   // in_flight_writes stores all writes that are in-flight and have not yet
   // been proven to have succeeded. Any client wishing to send a request that

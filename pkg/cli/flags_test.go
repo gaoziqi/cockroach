@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -19,13 +15,16 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/buildutil"
@@ -66,7 +65,13 @@ func TestNoLinkForbidden(t *testing.T) {
 		},
 		[]string{
 			"github.com/cockroachdb/cockroach/pkg/testutils", // meant for testing code only
-		})
+		},
+		// Raven (Sentry) and the errors library use go/build to determine
+		// the list of source directories (used to strip the source prefix
+		// in stack trace reports).
+		"github.com/cockroachdb/cockroach/vendor/github.com/getsentry/raven-go",
+		"github.com/cockroachdb/cockroach/vendor/github.com/cockroachdb/errors/withstack",
+	)
 }
 
 func TestCacheFlagValue(t *testing.T) {
@@ -75,7 +80,7 @@ func TestCacheFlagValue(t *testing.T) {
 	// Avoid leaking configuration changes after the test ends.
 	defer initCLIDefaults()
 
-	f := StartCmd.Flags()
+	f := startCmd.Flags()
 	args := []string{"--cache", "100MB"}
 	if err := f.Parse(args); err != nil {
 		t.Fatal(err)
@@ -87,13 +92,54 @@ func TestCacheFlagValue(t *testing.T) {
 	}
 }
 
+func TestClusterNameFlag(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Avoid leaking configuration changes after the test ends.
+	defer initCLIDefaults()
+
+	testCases := []struct {
+		value       string
+		expectedErr string
+	}{
+		{"abc", ""},
+		{"a-b", ""},
+		{"a123", ""},
+		{"", "cluster name cannot be empty"},
+		{fmt.Sprintf("%*s", 1000, "a"), "cluster name can contain at most 256 characters"},
+		{"a-b.c", errClusterNameInvalidFormat.Error()},
+		{"a123.456", errClusterNameInvalidFormat.Error()},
+		{"...", errClusterNameInvalidFormat.Error()},
+		{"-abc", errClusterNameInvalidFormat.Error()},
+		{"123a", errClusterNameInvalidFormat.Error()},
+		{"abc.", errClusterNameInvalidFormat.Error()},
+		{"_abc", errClusterNameInvalidFormat.Error()},
+		{"a.b_c._.", errClusterNameInvalidFormat.Error()},
+	}
+
+	for _, c := range testCases {
+		baseCfg.ClusterName = ""
+		f := startCmd.Flags()
+		args := []string{"--cluster-name", c.value}
+		err := f.Parse(args)
+		if !testutils.IsError(err, c.expectedErr) {
+			t.Fatal(err)
+		}
+		if err == nil {
+			if baseCfg.ClusterName != c.value {
+				t.Errorf("expected %q, got %q", c.value, baseCfg.ClusterName)
+			}
+		}
+	}
+}
+
 func TestSQLMemoryPoolFlagValue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// Avoid leaking configuration changes after the test ends.
 	defer initCLIDefaults()
 
-	f := StartCmd.Flags()
+	f := startCmd.Flags()
 
 	// Check absolute values.
 	testCases := []struct {
@@ -140,7 +186,7 @@ func TestClockOffsetFlagValue(t *testing.T) {
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
 
-	f := StartCmd.Flags()
+	f := startCmd.Flags()
 	testData := []struct {
 		args     []string
 		expected time.Duration
@@ -192,66 +238,76 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 	anyNonSQLShell := []string{"dump", "quit"}
 
 	testData := []struct {
-		cmds    []string
-		flags   []string
-		refargs []string
-		expErr  string
+		cmds       []string
+		flags      []string
+		refargs    []string
+		expErr     string
+		reparseErr string
 	}{
 		// Check individual URL components.
-		{anyCmd, []string{"--url=http://foo"}, nil, `URL scheme must be "postgresql"`},
-		{anyCmd, []string{"--url=postgresql:foo/bar"}, nil, `unknown URL format`},
+		{anyCmd, []string{"--url=http://foo"}, nil, `URL scheme must be "postgresql"`, ""},
+		{anyCmd, []string{"--url=postgresql:foo/bar"}, nil, `unknown URL format`, ""},
 
-		{anyCmd, []string{"--url=postgresql://foo"}, []string{"--host=foo"}, ""},
-		{anyCmd, []string{"--url=postgresql://:foo"}, []string{"--port=foo"}, ""},
+		{anyCmd, []string{"--url=postgresql://foo"}, []string{"--host=foo"}, "", ""},
+		{anyCmd, []string{"--url=postgresql://:foo"}, []string{"--port=foo"}, "invalid port \":foo\" after host", ""},
+		{anyCmd, []string{"--url=postgresql://:12345"}, []string{"--port=12345"}, "", ""},
 
-		{sqlShell, []string{"--url=postgresql:///foo"}, []string{"--database=foo"}, ""},
-		{anyNonSQLShell, []string{"--url=postgresql://foo/bar"}, []string{"--host=foo" /*db ignored*/}, ""},
+		{sqlShell, []string{"--url=postgresql:///foo"}, []string{"--database=foo"}, "", ""},
+		{anyNonSQLShell, []string{"--url=postgresql://foo/bar"}, []string{"--host=foo" /*db ignored*/}, "", ""},
 
-		{anySQL, []string{"--url=postgresql://foo@"}, []string{"--user=foo"}, ""},
-		{anyNonSQL, []string{"--url=postgresql://foo@bar"}, []string{"--host=bar" /*user ignored*/}, ""},
+		{anySQL, []string{"--url=postgresql://foo@"}, []string{"--user=foo"}, "", ""},
+		{anyNonSQL, []string{"--url=postgresql://foo@bar"}, []string{"--host=bar" /*user ignored*/}, "", ""},
 
-		{sqlShell, []string{"--url=postgresql://a@b:c/d"}, []string{"--user=a", "--host=b", "--port=c", "--database=d"}, ""},
-		{anySQL, []string{"--url=postgresql://a@b:c"}, []string{"--user=a", "--host=b", "--port=c"}, ""},
-		{anyNonSQL, []string{"--url=postgresql://b:c"}, []string{"--host=b", "--port=c"}, ""},
+		{sqlShell, []string{"--url=postgresql://a@b:12345/d"}, []string{"--user=a", "--host=b", "--port=12345", "--database=d"}, "", ""},
+		{sqlShell, []string{"--url=postgresql://a@b:c/d"}, nil, `invalid port ":c" after host`, ""},
+		{anySQL, []string{"--url=postgresql://a@b:12345"}, []string{"--user=a", "--host=b", "--port=12345"}, "", ""},
+		{anySQL, []string{"--url=postgresql://a@b:c"}, nil, `invalid port ":c" after host`, ""},
+		{anyNonSQL, []string{"--url=postgresql://b:12345"}, []string{"--host=b", "--port=12345"}, "", ""},
+		{anyNonSQL, []string{"--url=postgresql://b:c"}, nil, `invalid port ":c" after host`, ""},
 
-		{anyCmd, []string{"--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo", "--insecure"}, ""},
-		{anySQL, []string{"--url=postgresql://foo?sslmode=require"}, []string{"--host=foo", "--insecure=false"}, ""},
-		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=require"}, nil, "command .* only supports sslmode=disable or sslmode=verify-full"},
-		{anyCmd, []string{"--url=postgresql://foo?sslmode=verify-full"}, []string{"--host=foo", "--insecure=false"}, ""},
+		{anyCmd, []string{"--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo", "--insecure"}, "", ""},
+		{anySQL, []string{"--url=postgresql://foo?sslmode=require"}, []string{"--host=foo", "--insecure=false"}, "", ""},
+		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=require"}, nil, "command .* only supports sslmode=disable or sslmode=verify-full", ""},
+		{anyCmd, []string{"--url=postgresql://foo?sslmode=verify-full"}, []string{"--host=foo", "--insecure=false"}, "", ""},
 
 		// URL picks up previous flags if component not specified.
-		{anyCmd, []string{"--host=baz", "--url=postgresql://:foo"}, []string{"--host=baz", "--port=foo"}, ""},
-		{anyCmd, []string{"--port=baz", "--url=postgresql://foo"}, []string{"--host=foo", "--port=baz"}, ""},
-		{sqlShell, []string{"--database=baz", "--url=postgresql://foo"}, []string{"--host=foo", "--database=baz"}, ""},
-		{anySQL, []string{"--user=baz", "--url=postgresql://foo"}, []string{"--host=foo", "--user=baz"}, ""},
-		{anyCmd, []string{"--insecure=false", "--url=postgresql://foo"}, []string{"--host=foo", "--insecure=false"}, ""},
-		{anyCmd, []string{"--insecure", "--url=postgresql://foo"}, []string{"--host=foo", "--insecure"}, ""},
+		{anyCmd, []string{"--host=baz", "--url=postgresql://:12345"}, []string{"--host=baz", "--port=12345"}, "", ""},
+		{anyCmd, []string{"--host=baz", "--url=postgresql://:foo"}, nil, `invalid port ":foo" after host`, ""},
+		{anyCmd, []string{"--port=12345", "--url=postgresql://foo"}, []string{"--host=foo", "--port=12345"}, "", ""},
+		{anyCmd, []string{"--port=baz", "--url=postgresql://foo"}, []string{"--host=foo", "--port=baz"}, "", `invalid port ":baz" after host`},
+		{sqlShell, []string{"--database=baz", "--url=postgresql://foo"}, []string{"--host=foo", "--database=baz"}, "", ""},
+		{anySQL, []string{"--user=baz", "--url=postgresql://foo"}, []string{"--host=foo", "--user=baz"}, "", ""},
+		{anyCmd, []string{"--insecure=false", "--url=postgresql://foo"}, []string{"--host=foo", "--insecure=false"}, "", ""},
+		{anyCmd, []string{"--insecure", "--url=postgresql://foo"}, []string{"--host=foo", "--insecure"}, "", ""},
 
 		// URL overrides previous flags if component specified.
-		{anyCmd, []string{"--host=baz", "--url=postgresql://bar"}, []string{"--host=bar"}, ""},
-		{anyCmd, []string{"--port=baz", "--url=postgresql://foo:bar"}, []string{"--host=foo", "--port=bar"}, ""},
-		{sqlShell, []string{"--database=baz", "--url=postgresql://foo/bar"}, []string{"--host=foo", "--database=bar"}, ""},
-		{anySQL, []string{"--user=baz", "--url=postgresql://bar@foo"}, []string{"--host=foo", "--user=bar"}, ""},
-		{anyCmd, []string{"--insecure=false", "--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo", "--insecure"}, ""},
-		{anyCmd, []string{"--insecure", "--url=postgresql://foo?sslmode=verify-full"}, []string{"--host=foo", "--insecure=false"}, ""},
+		{anyCmd, []string{"--host=baz", "--url=postgresql://bar"}, []string{"--host=bar"}, "", ""},
+		{anyCmd, []string{"--port=baz", "--url=postgresql://foo:12345"}, []string{"--host=foo", "--port=12345"}, "", ""},
+		{anyCmd, []string{"--port=baz", "--url=postgresql://foo:bar"}, nil, `invalid port ":bar" after host`, ""},
+		{sqlShell, []string{"--database=baz", "--url=postgresql://foo/bar"}, []string{"--host=foo", "--database=bar"}, "", ""},
+		{anySQL, []string{"--user=baz", "--url=postgresql://bar@foo"}, []string{"--host=foo", "--user=bar"}, "", ""},
+		{anyCmd, []string{"--insecure=false", "--url=postgresql://foo?sslmode=disable"}, []string{"--host=foo", "--insecure"}, "", ""},
+		{anyCmd, []string{"--insecure", "--url=postgresql://foo?sslmode=verify-full"}, []string{"--host=foo", "--insecure=false"}, "", ""},
 
 		// Discrete flag overrides URL if specified afterwards.
-		{anyCmd, []string{"--url=postgresql://bar", "--host=baz"}, []string{"--host=baz"}, ""},
-		{anyCmd, []string{"--url=postgresql://foo:bar", "--port=baz"}, []string{"--host=foo", "--port=baz"}, ""},
-		{sqlShell, []string{"--url=postgresql://foo/bar", "--database=baz"}, []string{"--host=foo", "--database=baz"}, ""},
-		{anySQL, []string{"--url=postgresql://bar@foo", "--user=baz"}, []string{"--host=foo", "--user=baz"}, ""},
-		{anyCmd, []string{"--url=postgresql://foo?sslmode=disable", "--insecure=false"}, []string{"--host=foo", "--insecure=false"}, ""},
-		{anyCmd, []string{"--url=postgresql://foo?sslmode=verify-full", "--insecure"}, []string{"--host=foo", "--insecure"}, ""},
+		{anyCmd, []string{"--url=postgresql://bar", "--host=baz"}, []string{"--host=baz"}, "", ""},
+		{anyCmd, []string{"--url=postgresql://foo:12345", "--port=5678"}, []string{"--host=foo", "--port=5678"}, "", ""},
+		{anyCmd, []string{"--url=postgresql://foo:12345", "--port=baz"}, []string{"--host=foo", "--port=baz"}, "", `invalid port ":baz" after host`},
+		{anyCmd, []string{"--url=postgresql://foo:bar", "--port=baz"}, nil, `invalid port ":bar" after host`, ""},
+		{sqlShell, []string{"--url=postgresql://foo/bar", "--database=baz"}, []string{"--host=foo", "--database=baz"}, "", ""},
+		{anySQL, []string{"--url=postgresql://bar@foo", "--user=baz"}, []string{"--host=foo", "--user=baz"}, "", ""},
+		{anyCmd, []string{"--url=postgresql://foo?sslmode=disable", "--insecure=false"}, []string{"--host=foo", "--insecure=false"}, "", ""},
+		{anyCmd, []string{"--url=postgresql://foo?sslmode=verify-full", "--insecure"}, []string{"--host=foo", "--insecure"}, "", ""},
 
 		// Check that the certs dir is extracted properly.
-		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslrootcert=" + testCertsDirPath + "/ca.crt"}, []string{"--host=foo", "--certs-dir=" + testCertsDirPath}, ""},
-		{anyNonSQL, []string{"--certs-dir=blah", "--url=postgresql://foo?sslmode=verify-full&sslrootcert=blih/ca.crt"}, nil, "non-homogeneous certificate directory"},
-		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslrootcert=blih/ca.crt&sslcert=blah/client.root.crt"}, nil, "non-homogeneous certificate directory"},
+		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslrootcert=" + testCertsDirPath + "/ca.crt"}, []string{"--host=foo", "--certs-dir=" + testCertsDirPath}, "", ""},
+		{anyNonSQL, []string{"--certs-dir=blah", "--url=postgresql://foo?sslmode=verify-full&sslrootcert=blih/ca.crt"}, nil, "non-homogeneous certificate directory", ""},
+		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslrootcert=blih/ca.crt&sslcert=blah/client.root.crt"}, nil, "non-homogeneous certificate directory", ""},
 
 		// Check the cert component file names are checked.
-		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslrootcert=blih/loh.crt"}, nil, `invalid file name for "sslrootcert": expected .* got .*`},
-		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslcert=blih/loh.crt"}, nil, `invalid file name for "sslcert": expected .* got .*`},
-		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslkey=blih/loh.crt"}, nil, `invalid file name for "sslkey": expected .* got .*`},
+		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslrootcert=blih/loh.crt"}, nil, `invalid file name for "sslrootcert": expected .* got .*`, ""},
+		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslcert=blih/loh.crt"}, nil, `invalid file name for "sslcert": expected .* got .*`, ""},
+		{anyNonSQL, []string{"--url=postgresql://foo?sslmode=verify-full&sslkey=blih/loh.crt"}, nil, `invalid file name for "sslkey": expected .* got .*`, ""},
 	}
 
 	type capturedFlags struct {
@@ -328,7 +384,10 @@ func TestClientURLFlagEquivalence(t *testing.T) {
 				initCLIDefaults()
 				cliCtx.SSLCertsDir = defCertsDirPath
 				if err := cmd.ParseFlags([]string{"--url=" + resultURL}); err != nil {
-					t.Fatal(err)
+					if !testutils.IsError(err, test.reparseErr) {
+						t.Fatal(err)
+					}
+					return
 				}
 				urlParams2 := capture(cmd)
 
@@ -361,54 +420,212 @@ func TestServerConnSettings(t *testing.T) {
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
 
-	f := StartCmd.Flags()
+	f := startCmd.Flags()
 	testData := []struct {
-		args                     []string
-		expectedAddr             string
-		expectedAdvertiseAddr    string
-		expLocalityAdvertiseAddr string
+		args                  []string
+		expectedAddr          string
+		expectedAdvertiseAddr string
+		expSQLAddr            string
+		expSQLAdvAddr         string
 	}{
-		{[]string{"start"}, ":" + base.DefaultPort, ":" + base.DefaultPort, "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1"}, "127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort, "[]"},
-		{[]string{"start", "--listen-addr", "192.168.0.111"}, "192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort, "[]"},
-		{[]string{"start", "--listen-addr", ":12345"}, ":12345", ":12345", "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1:12345"}, "127.0.0.1:12345", "127.0.0.1:12345", "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1:12345", "--port", "55555"}, "127.0.0.1:55555", "127.0.0.1:55555", "[]"},
-		{[]string{"start", "--advertise-addr", "192.168.0.111"}, ":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort, "[]"},
-		{[]string{"start", "--advertise-addr", "192.168.0.111:12345"}, ":" + base.DefaultPort, "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111"}, "127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort, "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1:12345", "--advertise-addr", "192.168.0.111"}, "127.0.0.1:12345", "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111:12345"}, "127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1:54321", "--advertise-addr", "192.168.0.111:12345"}, "127.0.0.1:54321", "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--advertise-addr", "192.168.0.111", "--listen-addr", ":12345"}, ":12345", "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--listen-addr", ":54321"}, ":54321", "192.168.0.111:12345", "[]"},
-		// confirm hostnames will work
-		{[]string{"start", "--listen-addr", "my.host.name"}, "my.host.name:" + base.DefaultPort, "my.host.name:" + base.DefaultPort, "[]"},
-		{[]string{"start", "--listen-addr", "myhostname"}, "myhostname:" + base.DefaultPort, "myhostname:" + base.DefaultPort, "[]"},
-		// confirm IPv6 works too
-		{[]string{"start", "--listen-addr", "[::1]"}, "[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort, "[]"},
+		{[]string{"start"},
+			":" + base.DefaultPort, ":" + base.DefaultPort,
+			":" + base.DefaultPort, ":" + base.DefaultPort,
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1"},
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
+		},
+		{[]string{"start", "--listen-addr", "192.168.0.111"},
+			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+		},
+		{[]string{"start", "--listen-addr", ":"},
+			":", ":",
+			":", ":",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1:"},
+			"127.0.0.1:", "127.0.0.1:",
+			"127.0.0.1:", "127.0.0.1:",
+		},
+		{[]string{"start", "--listen-addr", ":12345"},
+			":12345", ":12345",
+			":12345", ":12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1:12345"},
+			"127.0.0.1:12345", "127.0.0.1:12345",
+			"127.0.0.1:12345", "127.0.0.1:12345",
+		},
+		{[]string{"start", "--listen-addr", "[::1]"},
+			"[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort,
+			"[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort,
+		},
+		{[]string{"start", "--listen-addr", "[::1]:12345"},
+			"[::1]:12345", "[::1]:12345",
+			"[::1]:12345", "[::1]:12345",
+		},
 		{[]string{"start", "--listen-addr", "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]"},
-			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[]"},
+			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort,
+			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort,
+		},
+		// confirm hostnames will work
+		{[]string{"start", "--listen-addr", "my.host.name"},
+			"my.host.name:" + base.DefaultPort, "my.host.name:" + base.DefaultPort,
+			"my.host.name:" + base.DefaultPort, "my.host.name:" + base.DefaultPort,
+		},
+		{[]string{"start", "--listen-addr", "myhostname"},
+			"myhostname:" + base.DefaultPort, "myhostname:" + base.DefaultPort,
+			"myhostname:" + base.DefaultPort, "myhostname:" + base.DefaultPort,
+		},
+
+		// SQL address override.
+		{[]string{"start", "--sql-addr", "127.0.0.1"},
+			":" + base.DefaultPort, ":" + base.DefaultPort,
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
+		},
+		{[]string{"start", "--sql-addr", ":1234"},
+			":" + base.DefaultPort, ":" + base.DefaultPort,
+			":1234", ":1234",
+		},
+		{[]string{"start", "--sql-addr", "127.0.0.1:1234"},
+			":" + base.DefaultPort, ":" + base.DefaultPort,
+			"127.0.0.1:1234", "127.0.0.1:1234",
+		},
+		{[]string{"start", "--sql-addr", "[::2]"},
+			":" + base.DefaultPort, ":" + base.DefaultPort,
+			"[::2]:" + base.DefaultPort, "[::2]:" + base.DefaultPort,
+		},
+		{[]string{"start", "--sql-addr", "[::2]:1234"},
+			":" + base.DefaultPort, ":" + base.DefaultPort,
+			"[::2]:1234", "[::2]:1234",
+		},
+
+		// Configuring the components of the SQL address separately.
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--sql-addr", "127.0.0.2"},
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
+			"127.0.0.2:" + base.DefaultPort, "127.0.0.2:" + base.DefaultPort,
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--sql-addr", ":1234"},
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
+			"127.0.0.1:1234", "127.0.0.1:1234",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--sql-addr", "127.0.0.2:1234"},
+			"127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort,
+			"127.0.0.2:1234", "127.0.0.2:1234",
+		},
+		{[]string{"start", "--listen-addr", "[::2]", "--sql-addr", ":1234"},
+			"[::2]:" + base.DefaultPort, "[::2]:" + base.DefaultPort,
+			"[::2]:1234", "[::2]:1234"},
+
+		// --advertise-addr overrides.
+		{[]string{"start", "--advertise-addr", "192.168.0.111"},
+			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+		},
+		{[]string{"start", "--advertise-addr", "192.168.0.111:12345"},
+			":" + base.DefaultPort, "192.168.0.111:12345",
+			":" + base.DefaultPort, "192.168.0.111:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111"},
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1:12345", "--advertise-addr", "192.168.0.111"},
+			"127.0.0.1:12345", "192.168.0.111:12345",
+			"127.0.0.1:12345", "192.168.0.111:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111:12345"},
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1:54321", "--advertise-addr", "192.168.0.111:12345"},
+			"127.0.0.1:54321", "192.168.0.111:12345",
+			"127.0.0.1:54321", "192.168.0.111:12345",
+		},
+		{[]string{"start", "--advertise-addr", "192.168.0.111", "--listen-addr", ":12345"},
+			":12345", "192.168.0.111:12345",
+			":12345", "192.168.0.111:12345",
+		},
+		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--listen-addr", ":54321"},
+			":54321", "192.168.0.111:12345",
+			":54321", "192.168.0.111:12345",
+		},
+
+		// Show that if the SQL address does not have a name default, its
+		// advertised form picks up the RPC advertised address.
+		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--sql-addr", ":54321"},
+			":" + base.DefaultPort, "192.168.0.111:12345",
+			":54321", "192.168.0.111:54321",
+		},
+
+		// Show that if the SQL address is overridden, its advertised form picks the
+		// advertised RPC address but keeps the port.
+		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--sql-addr", "127.0.0.1:54321"},
+			":" + base.DefaultPort, "192.168.0.111:12345",
+			"127.0.0.1:54321", "192.168.0.111:54321",
+		},
+		{[]string{"start", "--advertise-addr", "192.168.0.111:12345", "--sql-addr", "127.0.0.1"},
+			":" + base.DefaultPort, "192.168.0.111:12345",
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+		},
+		{[]string{"start", "--advertise-addr", "192.168.0.111", "--sql-addr", "127.0.0.1:12345"},
+			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+			"127.0.0.1:12345", "192.168.0.111:12345",
+		},
 
 		// Backward-compatibility flag combinations.
-		{[]string{"start", "--host", "192.168.0.111"}, "192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort, "[]"},
-		{[]string{"start", "--port", "12345"}, ":12345", ":12345", "[]"},
-		{[]string{"start", "--advertise-host", "192.168.0.111"}, ":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort, "[]"},
-		{[]string{"start", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"}, ":" + base.DefaultPort, "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--listen-addr", "::1"}, "[::1]:" + base.DefaultPort, "[::1]:" + base.DefaultPort, "[]"},
-		{[]string{"start", "--listen-addr", "2622:6221:e663:4922:fc2b:788b:fadd:7b48", "[]"},
-			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort, "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1", "--port", "12345"}, "127.0.0.1:12345", "127.0.0.1:12345", "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "12345"}, "127.0.0.1:12345", "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "12345"}, "127.0.0.1:12345", "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"}, "127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "54321", "--advertise-port", "12345"}, "127.0.0.1:54321", "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--advertise-addr", "192.168.0.111", "--port", "12345"}, ":12345", "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"}, ":" + base.DefaultPort, "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--advertise-addr", "192.168.0.111", "--port", "54321", "--advertise-port", "12345"}, ":54321", "192.168.0.111:12345", "[]"},
-		{[]string{"start", "--host", "127.0.0.1", "--locality-advertise-addr", "zone=1@235.0.0.5"}, "127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort, "[{{tcp 235.0.0.5:26257} zone=1}]"},
-		{[]string{"start", "--host", "127.0.0.1", "--locality-advertise-addr", "zone=1@235.0.0.5,zone=2@123.0.0.5"}, "127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort, "[{{tcp 235.0.0.5:26257} zone=1} {{tcp 123.0.0.5:26257} zone=2}]"},
-		{[]string{"start", "--host", "127.0.0.1", "--locality-advertise-addr", "zone=1@235.0.0.5:1234"}, "127.0.0.1:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort, "[{{tcp 235.0.0.5:1234} zone=1}]"},
+		{[]string{"start", "--host", "192.168.0.111"},
+			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+			"192.168.0.111:" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+		},
+		{[]string{"start", "--port", "12345"},
+			":12345", ":12345",
+			":12345", ":12345",
+		},
+		{[]string{"start", "--advertise-host", "192.168.0.111"},
+			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+			":" + base.DefaultPort, "192.168.0.111:" + base.DefaultPort,
+		},
+		{[]string{"start", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"},
+			":" + base.DefaultPort, "192.168.0.111:12345",
+			":" + base.DefaultPort, "192.168.0.111:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--port", "12345"},
+			"127.0.0.1:12345", "127.0.0.1:12345",
+			"127.0.0.1:12345", "127.0.0.1:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1:12345", "--port", "55555"},
+			"127.0.0.1:55555", "127.0.0.1:55555",
+			"127.0.0.1:55555", "127.0.0.1:55555",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "12345"},
+			"127.0.0.1:12345", "192.168.0.111:12345",
+			"127.0.0.1:12345", "192.168.0.111:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "12345"},
+			"127.0.0.1:12345", "192.168.0.111:12345",
+			"127.0.0.1:12345", "192.168.0.111:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"},
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
+			"127.0.0.1:" + base.DefaultPort, "192.168.0.111:12345",
+		},
+		{[]string{"start", "--listen-addr", "127.0.0.1", "--advertise-addr", "192.168.0.111", "--port", "54321", "--advertise-port", "12345"},
+			"127.0.0.1:54321", "192.168.0.111:12345",
+			"127.0.0.1:54321", "192.168.0.111:12345",
+		},
+		{[]string{"start", "--advertise-addr", "192.168.0.111", "--port", "12345"},
+			":12345", "192.168.0.111:12345",
+			":12345", "192.168.0.111:12345",
+		},
+		{[]string{"start", "--advertise-addr", "192.168.0.111", "--advertise-port", "12345"},
+			":" + base.DefaultPort, "192.168.0.111:12345",
+			":" + base.DefaultPort, "192.168.0.111:12345",
+		},
+		{[]string{"start", "--advertise-addr", "192.168.0.111", "--port", "54321", "--advertise-port", "12345"},
+			":54321", "192.168.0.111:12345",
+			":54321", "192.168.0.111:12345",
+		},
 	}
 
 	for i, td := range testData {
@@ -418,7 +635,9 @@ func TestServerConnSettings(t *testing.T) {
 				t.Fatalf("Parse(%#v) got unexpected error: %v", td.args, err)
 			}
 
-			extraServerFlagInit()
+			if err := extraServerFlagInit(startCmd); err != nil {
+				t.Fatal(err)
+			}
 			if td.expectedAddr != serverCfg.Addr {
 				t.Errorf("%d. serverCfg.Addr expected '%s', but got '%s'. td.args was '%#v'.",
 					i, td.expectedAddr, serverCfg.Addr, td.args)
@@ -426,6 +645,64 @@ func TestServerConnSettings(t *testing.T) {
 			if td.expectedAdvertiseAddr != serverCfg.AdvertiseAddr {
 				t.Errorf("%d. serverCfg.AdvertiseAddr expected '%s', but got '%s'. td.args was '%#v'.",
 					i, td.expectedAdvertiseAddr, serverCfg.AdvertiseAddr, td.args)
+			}
+
+			wantSQLSplit := false
+			for _, r := range td.args {
+				if r == "--sql-addr" {
+					wantSQLSplit = true
+					break
+				}
+			}
+			if wantSQLSplit != serverCfg.SplitListenSQL {
+				t.Errorf("%d. expected combined RPC/SQL listen = %v, found %v", i, wantSQLSplit, serverCfg.SplitListenSQL)
+			}
+
+			if td.expSQLAddr != serverCfg.SQLAddr {
+				t.Errorf("%d. serverCfg.SQLAddr expected '%s', got '%s'. td.args was '%#v'.",
+					i, td.expSQLAddr, serverCfg.SQLAddr, td.args)
+			}
+			if td.expSQLAdvAddr != serverCfg.SQLAdvertiseAddr {
+				t.Errorf("%d. serverCfg.SQLAdvertiseAddr expected '%s', got '%s'. td.args was '%#v'.",
+					i, td.expSQLAdvAddr, serverCfg.SQLAdvertiseAddr, td.args)
+			}
+		})
+	}
+}
+
+func TestLocalityAdvAddrFlag(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Avoid leaking configuration changes after the tests end.
+	defer initCLIDefaults()
+
+	f := startCmd.Flags()
+	testData := []struct {
+		args                     []string
+		expLocalityAdvertiseAddr string
+	}{
+		{[]string{"start", "--host", "127.0.0.1", "--locality-advertise-addr", "zone=1@235.0.0.5"},
+			"[{{tcp 235.0.0.5:26257} zone=1}]"},
+		{[]string{"start", "--host", "127.0.0.1", "--locality-advertise-addr", "zone=1@235.0.0.5,zone=2@123.0.0.5"},
+			"[{{tcp 235.0.0.5:26257} zone=1} {{tcp 123.0.0.5:26257} zone=2}]"},
+		{[]string{"start", "--host", "127.0.0.1", "--locality-advertise-addr", "zone=1@235.0.0.5:1234"},
+			"[{{tcp 235.0.0.5:1234} zone=1}]"},
+		{[]string{"start", "--host", "127.0.0.1", "--locality-advertise-addr", "zone=1@[::2]"},
+			"[{{tcp [::2]:26257} zone=1}]"},
+		{[]string{"start", "--host", "127.0.0.1", "--locality-advertise-addr", "zone=1@[::2],zone=2@123.0.0.5"},
+			"[{{tcp [::2]:26257} zone=1} {{tcp 123.0.0.5:26257} zone=2}]"},
+		{[]string{"start", "--host", "127.0.0.1", "--locality-advertise-addr", "zone=1@[::2]:1234"},
+			"[{{tcp [::2]:1234} zone=1}]"},
+	}
+
+	for i, td := range testData {
+		t.Run(strings.Join(td.args, " "), func(t *testing.T) {
+			initCLIDefaults()
+			if err := f.Parse(td.args); err != nil {
+				t.Fatalf("Parse(%#v) got unexpected error: %v", td.args, err)
+			}
+			if err := extraServerFlagInit(startCmd); err != nil {
+				t.Fatal(err)
 			}
 			var locAddrStr strings.Builder
 			locAddrStr.WriteString("[")
@@ -444,6 +721,58 @@ func TestServerConnSettings(t *testing.T) {
 					i, td.expLocalityAdvertiseAddr, locAddrStr.String(), td.args)
 			}
 		})
+	}
+}
+
+func TestServerJoinSettings(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Avoid leaking configuration changes after the tests end.
+	defer initCLIDefaults()
+
+	f := startCmd.Flags()
+	testData := []struct {
+		args         []string
+		expectedJoin []string
+	}{
+		{[]string{"start", "--join=a"}, []string{"a:" + base.DefaultPort}},
+		{[]string{"start", "--join=:"}, []string{"HOSTNAME:" + base.DefaultPort}},
+		{[]string{"start", "--join=:123"}, []string{"HOSTNAME:123"}},
+		{[]string{"start", "--join=a,b,c"}, []string{"a:" + base.DefaultPort, "b:" + base.DefaultPort, "c:" + base.DefaultPort}},
+		{[]string{"start", "--join=a", "--join=b"}, []string{"a:" + base.DefaultPort, "b:" + base.DefaultPort}},
+		{[]string{"start", "--join=127.0.0.1"}, []string{"127.0.0.1:" + base.DefaultPort}},
+		{[]string{"start", "--join=127.0.0.1:"}, []string{"127.0.0.1:" + base.DefaultPort}},
+		{[]string{"start", "--join=127.0.0.1,abc"}, []string{"127.0.0.1:" + base.DefaultPort, "abc:" + base.DefaultPort}},
+		{[]string{"start", "--join=[::1],[::2]"}, []string{"[::1]:" + base.DefaultPort, "[::2]:" + base.DefaultPort}},
+		{[]string{"start", "--join=[::1]:123,[::2]"}, []string{"[::1]:123", "[::2]:" + base.DefaultPort}},
+		{[]string{"start", "--join=[::1],127.0.0.1"}, []string{"[::1]:" + base.DefaultPort, "127.0.0.1:" + base.DefaultPort}},
+		{[]string{"start", "--join=[::1]:123", "--join=[::2]"}, []string{"[::1]:123", "[::2]:" + base.DefaultPort}},
+	}
+
+	for i, td := range testData {
+		initCLIDefaults()
+		if err := f.Parse(td.args); err != nil {
+			t.Fatalf("Parse(%#v) got unexpected error: %v", td.args, err)
+		}
+
+		extraClientFlagInit()
+
+		var actual []string
+		myHostname, _ := os.Hostname()
+		for _, addr := range serverCfg.JoinList {
+			res, err := resolver.NewResolver(addr)
+			if err != nil {
+				t.Error(err)
+			}
+			actualAddr := res.Addr()
+			// Normalize the local hostname to make the test location-agnostic.
+			actualAddr = strings.ReplaceAll(actualAddr, myHostname, "HOSTNAME")
+			actual = append(actual, actualAddr)
+		}
+		if !reflect.DeepEqual(td.expectedJoin, actual) {
+			t.Errorf("%d. serverCfg.JoinList expected %#v, but got %#v. td.args was '%#v'.",
+				i, td.expectedJoin, actual, td.args)
+		}
 	}
 }
 
@@ -480,9 +809,6 @@ func TestClientConnSettings(t *testing.T) {
 		// Deprecated syntax.
 		{[]string{"quit", "--port", "12345"}, ":12345"},
 		{[]string{"quit", "--host", "127.0.0.1", "--port", "12345"}, "127.0.0.1:12345"},
-		{[]string{"quit", "--host", "::1"}, "[::1]:" + base.DefaultPort},
-		{[]string{"quit", "--host", "2622:6221:e663:4922:fc2b:788b:fadd:7b48"},
-			"[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultPort},
 	}
 
 	for i, td := range testData {
@@ -505,7 +831,7 @@ func TestHttpHostFlagValue(t *testing.T) {
 	// Avoid leaking configuration changes after the tests end.
 	defer initCLIDefaults()
 
-	f := StartCmd.Flags()
+	f := startCmd.Flags()
 	testData := []struct {
 		args     []string
 		expected string
@@ -522,8 +848,8 @@ func TestHttpHostFlagValue(t *testing.T) {
 		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "my.host.name"}, "my.host.name:" + base.DefaultHTTPPort},
 		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "myhostname"}, "myhostname:" + base.DefaultHTTPPort},
 		// confirm IPv6 works too
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "::1"}, "[::1]:" + base.DefaultHTTPPort},
-		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "2622:6221:e663:4922:fc2b:788b:fadd:7b48"}, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultHTTPPort},
+		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "[::1]"}, "[::1]:" + base.DefaultHTTPPort},
+		{[]string{"start", "--" + cliflags.ListenHTTPAddr.Name, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]"}, "[2622:6221:e663:4922:fc2b:788b:fadd:7b48]:" + base.DefaultHTTPPort},
 	}
 
 	for i, td := range testData {
@@ -533,7 +859,9 @@ func TestHttpHostFlagValue(t *testing.T) {
 			t.Fatalf("Parse(%#v) got unexpected error: %v", td.args, err)
 		}
 
-		extraServerFlagInit()
+		if err := extraServerFlagInit(startCmd); err != nil {
+			t.Fatal(err)
+		}
 		if td.expected != serverCfg.HTTPAddr {
 			t.Errorf("%d. serverCfg.HTTPAddr expected '%s', but got '%s'. td.args was '%#v'.", i, td.expected, serverCfg.HTTPAddr, td.args)
 		}

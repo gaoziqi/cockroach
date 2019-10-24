@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgwire
 
@@ -32,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/lib/pq/oid"
 )
 
@@ -268,7 +265,7 @@ func benchmarkWriteType(b *testing.B, d tree.Datum, format pgwirebase.FormatCode
 	}
 	if format == pgwirebase.FormatBinary {
 		writeMethod = func(ctx context.Context, d tree.Datum, loc *time.Location) {
-			buf.writeBinaryDatum(ctx, d, loc, 0)
+			buf.writeBinaryDatum(ctx, d, loc, d.ResolvedType().Oid())
 		}
 	}
 
@@ -282,6 +279,9 @@ func benchmarkWriteType(b *testing.B, d tree.Datum, format pgwirebase.FormatCode
 		// to take much longer. See http://stackoverflow.com/a/37624250/3435257.
 		// buf.wrapped.Reset() should be fast enough to be negligible.
 		writeMethod(ctx, d, nil)
+		if buf.err != nil {
+			b.Fatal(buf.err)
+		}
 		buf.wrapped.Reset()
 	}
 }
@@ -309,6 +309,11 @@ func benchmarkWriteDecimal(b *testing.B, format pgwirebase.FormatCode) {
 
 func benchmarkWriteBytes(b *testing.B, format pgwirebase.FormatCode) {
 	benchmarkWriteType(b, tree.NewDBytes("testing"), format)
+}
+
+func benchmarkWriteUUID(b *testing.B, format pgwirebase.FormatCode) {
+	u := uuid.MakeV4()
+	benchmarkWriteType(b, tree.NewDUuid(tree.DUuid{UUID: u}), format)
 }
 
 func benchmarkWriteString(b *testing.B, format pgwirebase.FormatCode) {
@@ -399,6 +404,13 @@ func BenchmarkWriteTextBytes(b *testing.B) {
 }
 func BenchmarkWriteBinaryBytes(b *testing.B) {
 	benchmarkWriteBytes(b, pgwirebase.FormatBinary)
+}
+
+func BenchmarkWriteTextUUID(b *testing.B) {
+	benchmarkWriteUUID(b, pgwirebase.FormatText)
+}
+func BenchmarkWriteBinaryUUID(b *testing.B) {
+	benchmarkWriteUUID(b, pgwirebase.FormatBinary)
 }
 
 func BenchmarkWriteTextString(b *testing.B) {

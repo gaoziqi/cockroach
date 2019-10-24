@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -20,12 +16,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
+	"github.com/cockroachdb/errors"
 )
 
 func declareKeysRequestLease(
@@ -44,6 +40,35 @@ func newFailedLeaseTrigger(isTransfer bool) result.Result {
 		trigger.Local.Metrics.LeaseRequestError = 1
 	}
 	return trigger
+}
+
+func checkCanReceiveLease(rec EvalContext) error {
+	repDesc, ok := rec.Desc().GetReplicaDescriptor(rec.StoreID())
+	if !ok {
+		return errors.AssertionFailedf(
+			`could not find replica for store %s in %s`, rec.StoreID(), rec.Desc())
+	} else if t := repDesc.GetType(); t != roachpb.VOTER_FULL {
+		// NB: there's no harm in transferring the lease to a VOTER_INCOMING,
+		// but we disallow it anyway. On the other hand, transferring to
+		// VOTER_OUTGOING would be a pretty bad idea since those voters are
+		// dropped when transitioning out of the joint config, which then
+		// amounts to removing the leaseholder without any safety precautions.
+		// This would either wedge the range or allow illegal reads to be
+		// served.
+		//
+		// Since the leaseholder can't remove itself and is a VOTER_FULL, we
+		// also know that in any configuration there's at least one VOTER_FULL.
+		//
+		// TODO(tbg): if this code path is hit during a lease transfer (we check
+		// upstream of raft, but this check has false negatives) then we are in
+		// a situation where the leaseholder is a node that has set its
+		// minProposedTS and won't be using its lease any more. Either the setting
+		// of minProposedTS needs to be "reversible" (tricky) or we make the
+		// lease evaluation succeed, though with a lease that's "invalid" so that
+		// a new lease can be requested right after.
+		return errors.Errorf(`replica of type %s cannot hold lease`, t)
+	}
+	return nil
 }
 
 // evalNewLease checks that the lease contains a valid interval and that
@@ -147,10 +172,7 @@ func evalNewLease(
 	pd.Replicated.State = &storagepb.ReplicaState{
 		Lease: &lease,
 	}
-
-	if rec.ClusterSettings().Version.IsActive(cluster.VersionProposedTSLeaseRequest) {
-		pd.Replicated.PrevLeaseProposal = prevLease.ProposedTS
-	}
+	pd.Replicated.PrevLeaseProposal = prevLease.ProposedTS
 
 	pd.Local.Metrics = new(result.Metrics)
 	if isTransfer {

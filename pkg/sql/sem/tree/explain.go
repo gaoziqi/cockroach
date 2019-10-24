@@ -1,25 +1,24 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // Explain represents an EXPLAIN statement.
@@ -85,12 +84,17 @@ const (
 	// ExplainOpt shows the optimized relational expression (from the cost-based
 	// optimizer).
 	ExplainOpt
+
+	// ExplainVec shows the physical vectorized plan for a query and whether a
+	// query would be run in "auto" vectorized mode.
+	ExplainVec
 )
 
 var explainModeStrings = map[string]ExplainMode{
 	"plan":    ExplainPlan,
 	"distsql": ExplainDistSQL,
 	"opt":     ExplainOpt,
+	"vec":     ExplainVec,
 }
 
 // ExplainModeName returns the human-readable name of a given ExplainMode.
@@ -100,7 +104,7 @@ func ExplainModeName(mode ExplainMode) (string, error) {
 			return k, nil
 		}
 	}
-	return "", fmt.Errorf("no name for explain mode %v", mode)
+	return "", errors.AssertionFailedf("no name for explain mode %v", log.Safe(mode))
 }
 
 // Explain flags.
@@ -108,22 +112,20 @@ const (
 	ExplainFlagVerbose = iota
 	ExplainFlagSymVars
 	ExplainFlagTypes
-	ExplainFlagNoExpand
 	ExplainFlagNoNormalize
-	ExplainFlagNoOptimize
 	ExplainFlagAnalyze
 	ExplainFlagEnv
+	ExplainFlagCatalog
 )
 
 var explainFlagStrings = map[string]int{
 	"verbose":     ExplainFlagVerbose,
 	"symvars":     ExplainFlagSymVars,
 	"types":       ExplainFlagTypes,
-	"noexpand":    ExplainFlagNoExpand,
 	"nonormalize": ExplainFlagNoNormalize,
-	"nooptimize":  ExplainFlagNoOptimize,
 	"analyze":     ExplainFlagAnalyze,
 	"env":         ExplainFlagEnv,
+	"catalog":     ExplainFlagCatalog,
 }
 
 // ParseOptions parses the options for an EXPLAIN statement.
@@ -135,7 +137,8 @@ func (node *Explain) ParseOptions() (ExplainOptions, error) {
 		optLower := strings.ToLower(opt)
 		if mode, ok := explainModeStrings[optLower]; ok {
 			if modeSet {
-				return ExplainOptions{}, fmt.Errorf("cannot set EXPLAIN mode more than once: %s", opt)
+				return ExplainOptions{}, pgerror.Newf(pgcode.Syntax,
+					"cannot set EXPLAIN mode more than once: %s", opt)
 			}
 			res.Mode = mode
 			modeSet = true
@@ -143,7 +146,8 @@ func (node *Explain) ParseOptions() (ExplainOptions, error) {
 		}
 		flag, ok := explainFlagStrings[optLower]
 		if !ok {
-			return ExplainOptions{}, fmt.Errorf("unsupported EXPLAIN option: %s", opt)
+			return ExplainOptions{}, pgerror.Newf(pgcode.Syntax,
+				"unsupported EXPLAIN option: %s", opt)
 		}
 		res.Flags.Add(flag)
 	}

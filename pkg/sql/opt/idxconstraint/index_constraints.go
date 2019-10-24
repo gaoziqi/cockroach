@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package idxconstraint
 
@@ -23,11 +19,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // Convenience aliases to avoid the constraint prefix everywhere.
@@ -432,7 +428,7 @@ func (c *indexConstraintCtx) makeSpansForTupleInequality(
 	case opt.GeOp:
 		less, boundary = false, includeBoundary
 	default:
-		panic(pgerror.AssertionFailedf("unsupported op %s", log.Safe(e.Op())))
+		panic(errors.AssertionFailedf("unsupported op %s", errors.Safe(e.Op())))
 	}
 
 	// The spans are "tight" unless we used just a prefix.
@@ -798,14 +794,14 @@ func (c *indexConstraintCtx) makeInvertedIndexSpansForExpr(
 			// First, check if there's more than one path through the datum.
 			paths, err := json.AllPaths(rd)
 			if err != nil {
-				log.Errorf(context.TODO(), "unexpected JSON error: %v", err)
+				log.Errorf(context.TODO(), "unexpected JSON error: %+v", err)
 				c.unconstrained(0 /* offset */, out)
 				return false, append(constraints, out)
 			}
 			for i := range paths {
 				hasContainerLeaf, err := paths[i].HasContainerLeaf()
 				if err != nil {
-					log.Errorf(context.TODO(), "unexpected JSON error: %v", err)
+					log.Errorf(context.TODO(), "unexpected JSON error: %+v", err)
 					c.unconstrained(0 /* offset */, out)
 					return false, append(constraints, out)
 				}
@@ -815,7 +811,7 @@ func (c *indexConstraintCtx) makeInvertedIndexSpansForExpr(
 				}
 				pathDatum, err := tree.MakeDJSON(paths[i])
 				if err != nil {
-					log.Errorf(context.TODO(), "unexpected JSON error: %v", err)
+					log.Errorf(context.TODO(), "unexpected JSON error: %+v", err)
 					c.unconstrained(0 /* offset */, out)
 					return false, append(constraints, out)
 				}
@@ -1213,7 +1209,7 @@ func (c *indexConstraintCtx) isIndexColumn(nd opt.Expr, offset int) bool {
 
 // isNullable returns true if the index column <offset> is nullable.
 func (c *indexConstraintCtx) isNullable(offset int) bool {
-	return !c.notNullCols.Contains(int(c.columns[offset].ID()))
+	return !c.notNullCols.Contains(c.columns[offset].ID())
 }
 
 // colType returns the type of the index column <offset>.

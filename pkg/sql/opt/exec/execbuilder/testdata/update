@@ -1,4 +1,4 @@
-# LogicTest: local-opt
+# LogicTest: local
 
 statement ok
 CREATE TABLE kv2 (
@@ -16,36 +16,38 @@ statement ok
 SET tracing = on,kv,results; SELECT * FROM kv2; SET tracing = off
 
 query T
-SELECT message FROM [SHOW KV TRACE FOR SESSION]
+SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+ ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
 fetched: /kv2/primary/'a' -> NULL
 fetched: /kv2/primary/'a'/v -> 'b'
-output row: ['a' 'b']
 fetched: /kv2/primary/'c' -> NULL
 fetched: /kv2/primary/'c'/v -> 'd'
-output row: ['c' 'd']
 fetched: /kv2/primary/'e' -> NULL
 fetched: /kv2/primary/'e'/v -> 'f'
-output row: ['e' 'f']
 fetched: /kv2/primary/'f' -> NULL
 fetched: /kv2/primary/'f'/v -> 'g'
+output row: ['a' 'b']
+output row: ['c' 'd']
+output row: ['e' 'f']
 output row: ['f' 'g']
 
 statement ok
 SET tracing = on,kv,results; SELECT * FROM kv2@a; SET tracing = off
 
 query T
-SELECT message FROM [SHOW KV TRACE FOR SESSION]
+SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+ ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
 fetched: /kv2/a/'b' -> /'a'
-output row: ['a' 'b']
 fetched: /kv2/a/'d' -> /'c'
-output row: ['c' 'd']
 fetched: /kv2/a/'f' -> /'e'
-output row: ['e' 'f']
 fetched: /kv2/a/'g' -> /'f'
+output row: ['a' 'b']
+output row: ['c' 'd']
+output row: ['e' 'f']
 output row: ['f' 'g']
 
 statement error duplicate key value \(v\)=\('g'\) violates unique constraint "a"
@@ -55,36 +57,38 @@ statement ok
 SET tracing = on,kv,results; SELECT * FROM kv2; SET tracing = off
 
 query T
-SELECT message FROM [SHOW KV TRACE FOR SESSION]
+SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+ ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
 fetched: /kv2/primary/'a' -> NULL
 fetched: /kv2/primary/'a'/v -> 'b'
-output row: ['a' 'b']
 fetched: /kv2/primary/'c' -> NULL
 fetched: /kv2/primary/'c'/v -> 'd'
-output row: ['c' 'd']
 fetched: /kv2/primary/'e' -> NULL
 fetched: /kv2/primary/'e'/v -> 'f'
-output row: ['e' 'f']
 fetched: /kv2/primary/'f' -> NULL
 fetched: /kv2/primary/'f'/v -> 'g'
+output row: ['a' 'b']
+output row: ['c' 'd']
+output row: ['e' 'f']
 output row: ['f' 'g']
 
 statement ok
 SET tracing = on,kv,results; SELECT * FROM kv2@a; SET tracing = off
 
 query T
-SELECT message FROM [SHOW KV TRACE FOR SESSION]
+SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+ ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
 fetched: /kv2/a/'b' -> /'a'
-output row: ['a' 'b']
 fetched: /kv2/a/'d' -> /'c'
-output row: ['c' 'd']
 fetched: /kv2/a/'f' -> /'e'
-output row: ['e' 'f']
 fetched: /kv2/a/'g' -> /'f'
+output row: ['a' 'b']
+output row: ['c' 'd']
+output row: ['e' 'f']
 output row: ['f' 'g']
 
 statement ok
@@ -97,74 +101,82 @@ CREATE TABLE xyz (
 query TTT
 EXPLAIN UPDATE xyz SET y = x
 ----
-count                ·         ·
- └── update          ·         ·
-      │              table     xyz
-      │              set       y
-      │              strategy  updater
-      └── render     ·         ·
-           └── scan  ·         ·
-·                    table     xyz@primary
-·                    spans     ALL
+·                    distributed  false
+·                    vectorized   false
+count                ·            ·
+ └── update          ·            ·
+      │              table        xyz
+      │              set          y
+      │              strategy     updater
+      └── render     ·            ·
+           └── scan  ·            ·
+·                    table        xyz@primary
+·                    spans        ALL
 
 query TTTTT
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (1, 2)
 ----
-count                ·         ·            ()                           ·
- └── update          ·         ·            ()                           ·
-      │              table     xyz          ·                            ·
-      │              set       x, y         ·                            ·
-      │              strategy  updater      ·                            ·
-      └── render     ·         ·            (x, y, z, column7, column8)  ·
-           │         render 0  x            ·                            ·
-           │         render 1  y            ·                            ·
-           │         render 2  z            ·                            ·
-           │         render 3  1            ·                            ·
-           │         render 4  2            ·                            ·
-           └── scan  ·         ·            (x, y, z)                    ·
-·                    table     xyz@primary  ·                            ·
-·                    spans     ALL          ·                            ·
+·                    distributed  false        ·                            ·
+·                    vectorized   false        ·                            ·
+count                ·            ·            ()                           ·
+ └── update          ·            ·            ()                           ·
+      │              table        xyz          ·                            ·
+      │              set          x, y         ·                            ·
+      │              strategy     updater      ·                            ·
+      └── render     ·            ·            (x, y, z, column7, column8)  ·
+           │         render 0     x            ·                            ·
+           │         render 1     y            ·                            ·
+           │         render 2     z            ·                            ·
+           │         render 3     1            ·                            ·
+           │         render 4     2            ·                            ·
+           └── scan  ·            ·            (x, y, z)                    ·
+·                    table        xyz@primary  ·                            ·
+·                    spans        ALL          ·                            ·
 
 query TTTTT
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (y, x)
 ----
-count                ·         ·            ()               ·
- └── update          ·         ·            ()               ·
-      │              table     xyz          ·                ·
-      │              set       x, y         ·                ·
-      │              strategy  updater      ·                ·
-      └── render     ·         ·            (x, y, z, y, x)  ·
-           │         render 0  x            ·                ·
-           │         render 1  y            ·                ·
-           │         render 2  z            ·                ·
-           │         render 3  y            ·                ·
-           │         render 4  x            ·                ·
-           └── scan  ·         ·            (x, y, z)        ·
-·                    table     xyz@primary  ·                ·
-·                    spans     ALL          ·                ·
+·                    distributed  false        ·                ·
+·                    vectorized   false        ·                ·
+count                ·            ·            ()               ·
+ └── update          ·            ·            ()               ·
+      │              table        xyz          ·                ·
+      │              set          x, y         ·                ·
+      │              strategy     updater      ·                ·
+      └── render     ·            ·            (x, y, z, y, x)  ·
+           │         render 0     x            ·                ·
+           │         render 1     y            ·                ·
+           │         render 2     z            ·                ·
+           │         render 3     y            ·                ·
+           │         render 4     x            ·                ·
+           └── scan  ·            ·            (x, y, z)        ·
+·                    table        xyz@primary  ·                ·
+·                    spans        ALL          ·                ·
 
 query TTTTT
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (2, 2)
 ----
-count                     ·         ·            ()                           ·
- └── update               ·         ·            ()                           ·
-      │                   table     xyz          ·                            ·
-      │                   set       x, y         ·                            ·
-      │                   strategy  updater      ·                            ·
-      └── render          ·         ·            (x, y, z, column7, column7)  ·
-           │              render 0  x            ·                            ·
-           │              render 1  y            ·                            ·
-           │              render 2  z            ·                            ·
-           │              render 3  column7      ·                            ·
-           │              render 4  column7      ·                            ·
-           └── render     ·         ·            (column7, x, y, z)           ·
-                │         render 0  2            ·                            ·
-                │         render 1  x            ·                            ·
-                │         render 2  y            ·                            ·
-                │         render 3  z            ·                            ·
-                └── scan  ·         ·            (x, y, z)                    ·
-·                         table     xyz@primary  ·                            ·
-·                         spans     ALL          ·                            ·
+·                         distributed  false        ·                            ·
+·                         vectorized   false        ·                            ·
+count                     ·            ·            ()                           ·
+ └── update               ·            ·            ()                           ·
+      │                   table        xyz          ·                            ·
+      │                   set          x, y         ·                            ·
+      │                   strategy     updater      ·                            ·
+      └── render          ·            ·            (x, y, z, column7, column7)  ·
+           │              render 0     x            ·                            ·
+           │              render 1     y            ·                            ·
+           │              render 2     z            ·                            ·
+           │              render 3     column7      ·                            ·
+           │              render 4     column7      ·                            ·
+           └── render     ·            ·            (column7, x, y, z)           ·
+                │         render 0     2            ·                            ·
+                │         render 1     x            ·                            ·
+                │         render 2     y            ·                            ·
+                │         render 3     z            ·                            ·
+                └── scan  ·            ·            (x, y, z)                    ·
+·                         table        xyz@primary  ·                            ·
+·                         spans        ALL          ·                            ·
 
 statement ok
 CREATE TABLE pks (
@@ -192,8 +204,9 @@ statement ok
 SET tracing = on,kv,results; SELECT * FROM pks WHERE k1 = 2; SET tracing = off
 
 query T
-SELECT message FROM [SHOW KV TRACE FOR SESSION]
+SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+ ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
 fetched: /pks/primary/2/2 -> NULL
 fetched: /pks/primary/2/2/v -> 3
@@ -210,34 +223,38 @@ CREATE TABLE kv (
 query TTT
 EXPLAIN UPDATE kv SET v = v + 1 ORDER BY v DESC LIMIT 10
 ----
-count                          ·         ·
- └── update                    ·         ·
-      │                        table     kv
-      │                        set       v
-      │                        strategy  updater
-      └── render               ·         ·
-           └── limit           ·         ·
-                │              count     10
-                └── sort       ·         ·
-                     │         order     -v
-                     └── scan  ·         ·
-·                              table     kv@primary
-·                              spans     ALL
+·                              distributed  false
+·                              vectorized   false
+count                          ·            ·
+ └── update                    ·            ·
+      │                        table        kv
+      │                        set          v
+      │                        strategy     updater
+      └── render               ·            ·
+           └── limit           ·            ·
+                │              count        10
+                └── sort       ·            ·
+                     │         order        -v
+                     └── scan  ·            ·
+·                              table        kv@primary
+·                              spans        ALL
 
 # Use case for UPDATE ... ORDER BY: renumbering a PK without unique violation.
 query TTT
 EXPLAIN UPDATE kv SET v = v - 1 WHERE k < 3 LIMIT 1
 ----
-count                ·         ·
- └── update          ·         ·
-      │              table     kv
-      │              set       v
-      │              strategy  updater
-      └── render     ·         ·
-           └── scan  ·         ·
-·                    table     kv@primary
-·                    spans     -/2/#
-·                    limit     1
+·                    distributed  false
+·                    vectorized   false
+count                ·            ·
+ └── update          ·            ·
+      │              table        kv
+      │              set          v
+      │              strategy     updater
+      └── render     ·            ·
+           └── scan  ·            ·
+·                    table        kv@primary
+·                    spans        -/2/#
+·                    limit        1
 
 # Check that updates on tables with multiple column families behave as
 # they should.
@@ -252,19 +269,21 @@ SELECT tree, field, description FROM [
 EXPLAIN (VERBOSE) UPDATE tu SET c=c+1
 ]
 ----
-count                ·         ·
- └── update          ·         ·
-      │              table     tu
-      │              set       c
-      │              strategy  updater
-      └── render     ·         ·
-           │         render 0  a
-           │         render 1  c
-           │         render 2  d
-           │         render 3  c + 1
-           └── scan  ·         ·
-·                    table     tu@primary
-·                    spans     ALL
+·                    distributed  false
+·                    vectorized   false
+count                ·            ·
+ └── update          ·            ·
+      │              table        tu
+      │              set          c
+      │              strategy     updater
+      └── render     ·            ·
+           │         render 0     a
+           │         render 1     c
+           │         render 2     d
+           │         render 3     c + 1
+           └── scan  ·            ·
+·                    table        tu@primary
+·                    spans        ALL
 
 statement ok
 SET tracing = on,kv,results; UPDATE tu SET c=c+1; SET tracing = off
@@ -306,22 +325,24 @@ CREATE TABLE abc (a INT, b INT, c INT, INDEX(c) STORING(a,b))
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM [ UPDATE abc SET a=c RETURNING a ] ORDER BY a
 ----
-render                    ·         ·              (a)                       +a
- │                        render 0  a              ·                         ·
- └── run                  ·         ·              (a, b, c, rowid[hidden])  ·
-      └── update          ·         ·              (a, b, c, rowid[hidden])  ·
-           │              table     abc            ·                         ·
-           │              set       a              ·                         ·
-           │              strategy  updater        ·                         ·
-           └── render     ·         ·              (a, b, c, rowid, c)       +c
-                │         render 0  a              ·                         ·
-                │         render 1  b              ·                         ·
-                │         render 2  c              ·                         ·
-                │         render 3  rowid          ·                         ·
-                │         render 4  c              ·                         ·
-                └── scan  ·         ·              (a, b, c, rowid[hidden])  +c
-·                         table     abc@abc_c_idx  ·                         ·
-·                         spans     ALL            ·                         ·
+·                         distributed  false          ·                         ·
+·                         vectorized   false          ·                         ·
+render                    ·            ·              (a)                       +a
+ │                        render 0     a              ·                         ·
+ └── run                  ·            ·              (a, rowid[hidden])        ·
+      └── update          ·            ·              (a, rowid[hidden])        ·
+           │              table        abc            ·                         ·
+           │              set          a              ·                         ·
+           │              strategy     updater        ·                         ·
+           └── render     ·            ·              (a, b, c, rowid, c)       +c
+                │         render 0     a              ·                         ·
+                │         render 1     b              ·                         ·
+                │         render 2     c              ·                         ·
+                │         render 3     rowid          ·                         ·
+                │         render 4     c              ·                         ·
+                └── scan  ·            ·              (a, b, c, rowid[hidden])  +c
+·                         table        abc@abc_c_idx  ·                         ·
+·                         spans        ALL            ·                         ·
 
 # ------------------------------------------------------------------------------
 # Regression for #35364. This tests behavior that is different between the CBO
@@ -345,3 +366,32 @@ query TTT
 UPDATE t35364 SET x=2.5 RETURNING *
 ----
 3  2  8
+
+# Ensure that index hints in UPDATE statements force the choice of a specific index
+# as described in #38799.
+statement ok
+CREATE TABLE t38799 (a INT PRIMARY KEY, b INT, c INT, INDEX foo(b), FAMILY "primary" (a, b, c))
+
+query TTTTT
+EXPLAIN (VERBOSE) UPDATE t38799@foo SET c=2 WHERE a=1
+----
+·                               distributed  false           ·                   ·
+·                               vectorized   false           ·                   ·
+count                           ·            ·               ()                  ·
+ └── update                     ·            ·               ()                  ·
+      │                         table        t38799          ·                   ·
+      │                         set          c               ·                   ·
+      │                         strategy     updater         ·                   ·
+      └── render                ·            ·               (a, b, c, column7)  ·
+           │                    render 0     a               ·                   ·
+           │                    render 1     b               ·                   ·
+           │                    render 2     c               ·                   ·
+           │                    render 3     2               ·                   ·
+           └── filter           ·            ·               (a, b, c)           ·
+                │               filter       a = 1           ·                   ·
+                └── index-join  ·            ·               (a, b, c)           ·
+                     │          table        t38799@primary  ·                   ·
+                     │          key columns  a               ·                   ·
+                     └── scan   ·            ·               (a, b)              ·
+·                               table        t38799@foo      ·                   ·
+·                               spans        ALL             ·                   ·

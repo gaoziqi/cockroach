@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
-
 query I
 SELECT generate_series FROM generate_series(1, 100) ORDER BY generate_series LIMIT 5;
 ----
@@ -151,3 +149,15 @@ query I
 SELECT SPAN FROM [SHOW TRACE FOR SESSION] WHERE span = 1 LIMIT 1
 ----
 1
+
+# Regression test for #38659: offset on top of limit was broken.
+
+query I
+SELECT * FROM (select * from generate_series(1,10) a LIMIT 5) OFFSET 3
+----
+4
+5
+
+query I
+SELECT * FROM (select * from generate_series(1,10) a LIMIT 5) OFFSET 6
+----

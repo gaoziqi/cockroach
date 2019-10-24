@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -20,9 +15,9 @@ import (
 	"fmt"
 )
 
-func registerYCSB(r *registry) {
+func registerYCSB(r *testRegistry) {
 	runYCSB := func(ctx context.Context, t *test, c *cluster, wl string, cpus int) {
-		nodes := c.nodes - 1
+		nodes := c.spec.NodeCount - 1
 
 		c.Put(ctx, cockroach, "./cockroach", c.Range(1, nodes))
 		c.Put(ctx, workload, "./workload", c.Node(nodes+1))
@@ -34,8 +29,8 @@ func registerYCSB(r *registry) {
 			ramp := " --ramp=" + ifLocal("0s", "1m")
 			duration := " --duration=" + ifLocal("10s", "10m")
 			cmd := fmt.Sprintf(
-				"./workload run ycsb --init --initial-rows=1000000 --splits=100"+
-					" --workload=%s --concurrency=64 --histograms=logs/stats.json"+
+				"./workload run ycsb --init --insert-count=1000000 --splits=100"+
+					" --workload=%s --concurrency=64 --histograms="+perfArtifactsDir+"/stats.json"+
 					ramp+duration+" {pgurl:1-%d}",
 				wl, nodes)
 			c.Run(ctx, c.Node(nodes+1), cmd)

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package logictest
 
@@ -34,18 +30,6 @@ import (
 func TestLogic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	RunLogicTest(t, "testdata/logic_test/[^.]*")
-}
-
-// TestPlannerLogic tests the heuristic planner by running EXPLAIN and SHOW
-// TRACE queries that show the plan that was produced. These tests are split
-// off from the TestLogic tests because the expected output is specific to how
-// the planner works. The cost-based optimizer will often return different
-// results for the same EXPLAIN statement, as it often chooses different ways
-// to execute the same logical query. Note that the cost-based optimizer tests
-// are housed in the various sql/opt packages.
-func TestPlannerLogic(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	RunLogicTest(t, "testdata/planner_test/[^.]*")
 }
 
 // TestSqlLiteLogic runs the subset of SqlLite logic tests that do not require

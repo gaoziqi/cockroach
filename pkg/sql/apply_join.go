@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -22,12 +18,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // applyJoinNode implements apply join: the execution component of correlated
@@ -116,9 +112,9 @@ func newApplyJoinNode(
 ) (planNode, error) {
 	switch joinType {
 	case sqlbase.JoinType_RIGHT_OUTER, sqlbase.JoinType_FULL_OUTER:
-		return nil, pgerror.AssertionFailedf("unsupported right outer apply join: %d", log.Safe(joinType))
+		return nil, errors.AssertionFailedf("unsupported right outer apply join: %d", log.Safe(joinType))
 	case sqlbase.JoinType_EXCEPT_ALL, sqlbase.JoinType_INTERSECT_ALL:
-		return nil, pgerror.AssertionFailedf("unsupported apply set op: %d", log.Safe(joinType))
+		return nil, errors.AssertionFailedf("unsupported apply set op: %d", log.Safe(joinType))
 	}
 
 	return &applyJoinNode{
@@ -266,10 +262,17 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 		}
 
 		execFactory := makeExecFactory(params.p)
-		eb := execbuilder.New(&execFactory, factory.Memo(), newRightSide, params.EvalContext())
+		eb := execbuilder.New(&execFactory, factory.Memo(), nil /* catalog */, newRightSide, params.EvalContext())
 		eb.DisableTelemetry()
 		p, err := eb.Build()
 		if err != nil {
+			if errors.IsAssertionFailure(err) {
+				// Enhance the error with the EXPLAIN (OPT, VERBOSE) of the inner
+				// expression.
+				fmtFlags := memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes
+				explainOpt := memo.FormatExpr(newRightSide, fmtFlags, nil /* catalog */)
+				err = errors.WithDetailf(err, "newRightSide:\n%s", explainOpt)
+			}
 			return false, err
 		}
 		plan := p.(*planTop)
@@ -291,7 +294,15 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 func (a *applyJoinNode) runRightSidePlan(params runParams, plan *planTop) error {
 	a.run.curRightRow = 0
 	a.run.rightRows.Clear(params.ctx)
-	rowResultWriter := NewRowResultWriter(a.run.rightRows)
+	return runPlanInsidePlan(params, plan, a.run.rightRows)
+}
+
+// runPlanInsidePlan is used to run a plan and gather the results in a row
+// container, as part of the execution of an "outer" plan.
+func runPlanInsidePlan(
+	params runParams, plan *planTop, rowContainer *rowcontainer.RowContainer,
+) error {
+	rowResultWriter := NewRowResultWriter(rowContainer)
 	recv := MakeDistSQLReceiver(
 		params.ctx, rowResultWriter, tree.Rows,
 		params.extendedEvalCtx.ExecCfg.RangeDescriptorCache,
@@ -330,12 +341,12 @@ func (a *applyJoinNode) runRightSidePlan(params runParams, plan *planTop) error 
 	planCtx.stmtType = recv.stmtType
 
 	params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.PlanAndRun(
-		params.ctx, evalCtx, planCtx, params.p.Txn(), plan.plan, recv)
+		params.ctx, evalCtx, planCtx, params.p.Txn(), plan.plan, recv,
+	)()
 	if recv.commErr != nil {
 		return recv.commErr
 	}
 	return rowResultWriter.err
-
 }
 
 func (a *applyJoinNode) Values() tree.Datums {

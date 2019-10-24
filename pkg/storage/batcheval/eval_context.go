@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -22,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
@@ -37,7 +34,6 @@ type Limiters struct {
 	BulkIOWriteRate              *rate.Limiter
 	ConcurrentImportRequests     limit.ConcurrentRequestLimiter
 	ConcurrentExportRequests     limit.ConcurrentRequestLimiter
-	AddSSTableRequestRate        *rate.Limiter
 	ConcurrentAddSSTableRequests limit.ConcurrentRequestLimiter
 	// concurrentRangefeedIters is a semaphore used to limit the number of
 	// rangefeeds in the "catch-up" state across the store. The "catch-up" state
@@ -63,6 +59,7 @@ type EvalContext interface {
 	NodeID() roachpb.NodeID
 	StoreID() roachpb.StoreID
 	GetRangeID() roachpb.RangeID
+	GetNodeLocality() roachpb.Locality
 
 	IsFirstRange() bool
 	GetFirstIndex() (uint64, error)
@@ -76,7 +73,7 @@ type EvalContext interface {
 	// for the provided transaction information. See Replica.CanCreateTxnRecord
 	// for details about its arguments, return values, and preconditions.
 	CanCreateTxnRecord(
-		txnID uuid.UUID, txnKey []byte, txnMinTSUpperBound hlc.Timestamp,
+		txnID uuid.UUID, txnKey []byte, txnMinTS hlc.Timestamp,
 	) (ok bool, minCommitTS hlc.Timestamp, reason roachpb.TransactionAbortedReason)
 
 	// GetMVCCStats returns a snapshot of the MVCC stats for the range.
@@ -93,9 +90,9 @@ type EvalContext interface {
 	GetSplitQPS() float64
 
 	GetGCThreshold() hlc.Timestamp
-	// TODO(nvanbenschoten): Remove this in 2.3, at which point no request type
-	// will ever need to consult the threshold.
-	GetTxnSpanGCThreshold() hlc.Timestamp
 	GetLastReplicaGCTimestamp(context.Context) (hlc.Timestamp, error)
 	GetLease() (roachpb.Lease, roachpb.Lease)
+
+	GetExternalStorage(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error)
+	GetExternalStorageFromURI(ctx context.Context, uri string) (cloud.ExternalStorage, error)
 }

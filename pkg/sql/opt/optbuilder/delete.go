@@ -1,21 +1,18 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -38,13 +35,13 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 	}
 
 	if del.OrderBy != nil && del.Limit == nil {
-		panic(pgerror.Newf(pgerror.CodeSyntaxError,
+		panic(pgerror.Newf(pgcode.Syntax,
 			"DELETE statement requires LIMIT when ORDER BY is used"))
 	}
 
+	var ctes []cteSource
 	if del.With != nil {
-		inScope = b.buildCTE(del.With.CTEList, inScope)
-		defer b.checkCTEUsage(inScope)
+		inScope, ctes = b.buildCTEs(del.With, inScope)
 	}
 
 	// DELETE FROM xx AS yy - we want to know about xx (tn) because
@@ -59,10 +56,10 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 	}
 
 	// Check Select permission as well, since existing values must be read.
-	b.checkPrivilege(tn, tab, privilege.SELECT)
+	b.checkPrivilege(opt.DepByName(tn), tab, privilege.SELECT)
 
 	var mb mutationBuilder
-	mb.init(b, opt.DeleteOp, tab, *alias)
+	mb.init(b, "delete", tab, *alias)
 
 	// Build the input expression that selects the rows that will be deleted:
 	//
@@ -71,7 +68,7 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 	//   ORDER BY <order-by> LIMIT <limit>
 	//
 	// All columns from the delete table will be projected.
-	mb.buildInputForUpdateOrDelete(inScope, del.Where, del.Limit, del.OrderBy)
+	mb.buildInputForDelete(inScope, del.Table, del.Where, del.Limit, del.OrderBy)
 
 	// Build the final delete statement, including any returned expressions.
 	if resultsNeeded(del.Returning) {
@@ -80,14 +77,18 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 		mb.buildDelete(nil /* returning */)
 	}
 
+	mb.outScope.expr = b.wrapWithCTEs(mb.outScope.expr, ctes)
+
 	return mb.outScope
 }
 
 // buildDelete constructs a Delete operator, possibly wrapped by a Project
 // operator that corresponds to the given RETURNING clause.
 func (mb *mutationBuilder) buildDelete(returning tree.ReturningExprs) {
+	mb.buildFKChecksForDelete()
+
 	private := mb.makeMutationPrivate(returning != nil)
-	mb.outScope.expr = mb.b.factory.ConstructDelete(mb.outScope.expr, private)
+	mb.outScope.expr = mb.b.factory.ConstructDelete(mb.outScope.expr, mb.checks, private)
 
 	mb.buildReturning(returning)
 }

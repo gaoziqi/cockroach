@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -31,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -57,17 +54,6 @@ var MergeQueueInterval = func() *settings.DurationSetting {
 	s.SetSensitive()
 	return s
 }()
-
-// ManualSplitTTL is the amount of time that the merge queue will not consider
-// a manually split range for merging if it is nonzero. If ManualSplitTTL is
-// zero, then no manual splits are considered for automatic merging. If a range
-// is split in a LHS and a RHS, then the merge queue will not consider to merge
-// the RHS with the range to its left until ManualSplitTTL time has passed.
-var ManualSplitTTL = settings.RegisterNonNegativeDurationSetting(
-	"kv.range_merge.manual_split.ttl",
-	"if nonzero, manual splits older than this duration will be considered for automatic range merging",
-	0,
-)
 
 // mergeQueue manages a queue of ranges slated to be merged with their right-
 // hand neighbor.
@@ -168,7 +154,7 @@ func (mq *mergeQueue) shouldQueue(
 		return false, 0
 	}
 
-	if sysCfg.NeedsSplit(desc.StartKey, desc.EndKey.Next()) {
+	if sysCfg.NeedsSplit(ctx, desc.StartKey, desc.EndKey.Next()) {
 		// This range would need to be split if it extended just one key further.
 		// There is thus no possible right-hand neighbor that it could be merged
 		// with.
@@ -202,22 +188,22 @@ var _ purgatoryError = rangeMergePurgatoryError{}
 
 func (mq *mergeQueue) requestRangeStats(
 	ctx context.Context, key roachpb.Key,
-) (roachpb.RangeDescriptor, enginepb.MVCCStats, float64, error) {
+) (*roachpb.RangeDescriptor, enginepb.MVCCStats, float64, error) {
 	res, pErr := client.SendWrappedWith(ctx, mq.db.NonTransactionalSender(), roachpb.Header{
 		ReturnRangeInfo: true,
 	}, &roachpb.RangeStatsRequest{
 		RequestHeader: roachpb.RequestHeader{Key: key},
 	})
 	if pErr != nil {
-		return roachpb.RangeDescriptor{}, enginepb.MVCCStats{}, 0, pErr.GoError()
+		return nil, enginepb.MVCCStats{}, 0, pErr.GoError()
 	}
 	rangeInfos := res.Header().RangeInfos
 	if len(rangeInfos) != 1 {
-		return roachpb.RangeDescriptor{}, enginepb.MVCCStats{}, 0, fmt.Errorf(
+		return nil, enginepb.MVCCStats{}, 0, fmt.Errorf(
 			"mergeQueue.requestRangeStats: response had %d range infos but exactly one was expected",
 			len(rangeInfos))
 	}
-	return rangeInfos[0].Desc, res.(*roachpb.RangeStatsResponse).MVCCStats,
+	return &rangeInfos[0].Desc, res.(*roachpb.RangeStatsResponse).MVCCStats,
 		res.(*roachpb.RangeStatsResponse).QueriesPerSecond, nil
 }
 
@@ -254,6 +240,15 @@ func (mq *mergeQueue) process(
 		return nil
 	}
 
+	// Range was manually split and not expired, so skip merging.
+	now := mq.store.Clock().Now()
+	if now.Less(rhsDesc.GetStickyBit()) {
+		log.VEventf(ctx, 2, "skipping merge: ranges were manually split and sticky bit was not expired")
+		// TODO(jeffreyxiao): Consider returning a purgatory error to avoid
+		// repeatedly processing ranges that cannot be merged.
+		return nil
+	}
+
 	mergedDesc := &roachpb.RangeDescriptor{
 		StartKey: lhsDesc.StartKey,
 		EndKey:   rhsDesc.EndKey,
@@ -271,7 +266,7 @@ func (mq *mergeQueue) process(
 	// in a situation where we keep merging ranges that would be split soon after
 	// by a small increase in load.
 	loadBasedSplitPossible := lhsRepl.SplitByLoadQPSThreshold() < 2*mergedQPS
-	if ok, _ := shouldSplitRange(mergedDesc, mergedStats, lhsRepl.GetMaxBytes(), sysCfg); ok || loadBasedSplitPossible {
+	if ok, _ := shouldSplitRange(ctx, mergedDesc, mergedStats, lhsRepl.GetMaxBytes(), sysCfg); ok || loadBasedSplitPossible {
 		log.VEventf(ctx, 2,
 			"skipping merge to avoid thrashing: merged range %s may split "+
 				"(estimated size, estimated QPS: %d, %v)",
@@ -279,13 +274,47 @@ func (mq *mergeQueue) process(
 		return nil
 	}
 
-	if !replicaSetsEqual(lhsDesc.Replicas().Unwrap(), rhsDesc.Replicas().Unwrap()) {
+	{
+		store := lhsRepl.store
+		// AdminMerge errors if there is a learner or joint config on either
+		// side and AdminRelocateRange removes any on the range it operates on.
+		// For the sake of obviousness, just fix this all upfront.
+		var err error
+		lhsDesc, err = removeNonFullVoters(ctx, store, lhsDesc)
+		if err != nil {
+			log.VEventf(ctx, 2, `%v`, err)
+			return err
+		}
+
+		rhsDesc, err = removeNonFullVoters(ctx, store, rhsDesc)
+		if err != nil {
+			log.VEventf(ctx, 2, `%v`, err)
+			return err
+		}
+	}
+	lhsReplicas, rhsReplicas := lhsDesc.Replicas().All(), rhsDesc.Replicas().All()
+
+	// Defensive sanity check that everything is now a voter.
+	for i := range lhsReplicas {
+		if lhsReplicas[i].GetType() != roachpb.VOTER_FULL {
+			return errors.Errorf(`cannot merge non-voter replicas on lhs: %v`, lhsReplicas)
+		}
+	}
+	for i := range rhsReplicas {
+		if rhsReplicas[i].GetType() != roachpb.VOTER_FULL {
+			return errors.Errorf(`cannot merge non-voter replicas on rhs: %v`, rhsReplicas)
+		}
+	}
+
+	if !replicaSetsEqual(lhsReplicas, rhsReplicas) {
 		var targets []roachpb.ReplicationTarget
-		for _, lhsReplDesc := range lhsDesc.Replicas().Unwrap() {
+		for _, lhsReplDesc := range lhsReplicas {
 			targets = append(targets, roachpb.ReplicationTarget{
 				NodeID: lhsReplDesc.NodeID, StoreID: lhsReplDesc.StoreID,
 			})
 		}
+		// AdminRelocateRange moves the lease to the first target in the list, so
+		// sort the existing leaseholder there to leave it unchanged.
 		lease, _ := lhsRepl.GetLease()
 		for i := range targets {
 			if targets[i].NodeID == lease.Replica.NodeID && targets[i].StoreID == lease.Replica.StoreID {
@@ -302,19 +331,6 @@ func (mq *mergeQueue) process(
 		}
 	}
 
-	// Range was manually split and not expired, so skip merging.
-	if rhsDesc.StickyBit != nil {
-		manualSplitTTL := ManualSplitTTL.Get(&mq.store.ClusterSettings().SV)
-		manualSplitExpired := manualSplitTTL != 0 && rhsDesc.StickyBit.GoTime().Add(manualSplitTTL).Before(mq.store.Clock().PhysicalTime())
-		if !manualSplitExpired {
-			log.VEventf(ctx, 2, "skipping merge: ranges were manually split and sticky bit was not expired")
-			// TODO(jeffreyxiao): Consider returning a purgatory error to avoid
-			// repeatedly processing ranges that cannot be merged.
-			return nil
-		}
-		log.VEventf(ctx, 2, "ranges were manually split, but sticky bit was expired")
-	}
-
 	log.VEventf(ctx, 2, "merging to produce range: %s-%s", mergedDesc.StartKey, mergedDesc.EndKey)
 	reason := fmt.Sprintf("lhs+rhs has (size=%s+%s qps=%.2f+%.2f --> %.2fqps) below threshold (size=%s, qps=%.2f)",
 		humanizeutil.IBytes(lhsStats.Total()),
@@ -325,7 +341,9 @@ func (mq *mergeQueue) process(
 		humanizeutil.IBytes(mergedStats.Total()),
 		mergedQPS,
 	)
-	_, pErr := lhsRepl.AdminMerge(ctx, roachpb.AdminMergeRequest{}, reason)
+	_, pErr := lhsRepl.AdminMerge(ctx, roachpb.AdminMergeRequest{
+		RequestHeader: roachpb.RequestHeader{Key: lhsRepl.Desc().StartKey.AsRawKey()},
+	}, reason)
 	switch err := pErr.GoError(); err.(type) {
 	case nil:
 	case *roachpb.ConditionFailedError:
@@ -334,7 +352,7 @@ func (mq *mergeQueue) process(
 		// On seeing a ConditionFailedError, don't return an error and enqueue
 		// this replica again in case it still needs to be merged.
 		log.Infof(ctx, "merge saw concurrent descriptor modification; maybe retrying")
-		mq.MaybeAddAsync(ctx, lhsRepl, mq.store.Clock().Now())
+		mq.MaybeAddAsync(ctx, lhsRepl, now)
 	default:
 		// While range merges are unstable, be extra cautious and mark every error
 		// as purgatory-worthy.

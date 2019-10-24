@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -21,7 +17,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -313,7 +309,7 @@ func (sp *StorePool) storeGossipUpdate(_ string, content roachpb.Value) {
 // updateLocalStoreAfterRebalance is used to update the local copy of the
 // target store immediately after a replica addition or removal.
 func (sp *StorePool) updateLocalStoreAfterRebalance(
-	storeID roachpb.StoreID, rangeInfo RangeInfo, changeType roachpb.ReplicaChangeType,
+	storeID roachpb.StoreID, rangeUsageInfo RangeUsageInfo, changeType roachpb.ReplicaChangeType,
 ) {
 	sp.detailsMu.Lock()
 	defer sp.detailsMu.Unlock()
@@ -327,19 +323,19 @@ func (sp *StorePool) updateLocalStoreAfterRebalance(
 	switch changeType {
 	case roachpb.ADD_REPLICA:
 		detail.desc.Capacity.RangeCount++
-		detail.desc.Capacity.LogicalBytes += rangeInfo.LogicalBytes
-		detail.desc.Capacity.WritesPerSecond += rangeInfo.WritesPerSecond
+		detail.desc.Capacity.LogicalBytes += rangeUsageInfo.LogicalBytes
+		detail.desc.Capacity.WritesPerSecond += rangeUsageInfo.WritesPerSecond
 	case roachpb.REMOVE_REPLICA:
 		detail.desc.Capacity.RangeCount--
-		if detail.desc.Capacity.LogicalBytes <= rangeInfo.LogicalBytes {
+		if detail.desc.Capacity.LogicalBytes <= rangeUsageInfo.LogicalBytes {
 			detail.desc.Capacity.LogicalBytes = 0
 		} else {
-			detail.desc.Capacity.LogicalBytes -= rangeInfo.LogicalBytes
+			detail.desc.Capacity.LogicalBytes -= rangeUsageInfo.LogicalBytes
 		}
-		if detail.desc.Capacity.WritesPerSecond <= rangeInfo.WritesPerSecond {
+		if detail.desc.Capacity.WritesPerSecond <= rangeUsageInfo.WritesPerSecond {
 			detail.desc.Capacity.WritesPerSecond = 0
 		} else {
-			detail.desc.Capacity.WritesPerSecond -= rangeInfo.WritesPerSecond
+			detail.desc.Capacity.WritesPerSecond -= rangeUsageInfo.WritesPerSecond
 		}
 	}
 	sp.detailsMu.storeDetails[storeID] = &detail
@@ -376,6 +372,21 @@ func (sp *StorePool) updateLocalStoresAfterLeaseTransfer(
 // ensure that it will be processed by a queue immediately.
 func newStoreDetail() *storeDetail {
 	return &storeDetail{}
+}
+
+// GetStores returns information on all the stores with descriptor in the pool.
+// Stores without descriptor (a node that didn't come up yet after a cluster
+// restart) will not be part of the returned set.
+func (sp *StorePool) GetStores() map[roachpb.StoreID]roachpb.StoreDescriptor {
+	sp.detailsMu.RLock()
+	defer sp.detailsMu.RUnlock()
+	stores := make(map[roachpb.StoreID]roachpb.StoreDescriptor, len(sp.detailsMu.storeDetails))
+	for _, s := range sp.detailsMu.storeDetails {
+		if s.desc != nil {
+			stores[s.desc.StoreID] = *s.desc
+		}
+	}
+	return stores
 }
 
 // getStoreDetailLocked returns the store detail for the given storeID.
@@ -550,7 +561,7 @@ func (sl StoreList) String() string {
 
 // filter takes a store list and filters it using the passed in constraints. It
 // maintains the original order of the passed in store list.
-func (sl StoreList) filter(constraints []config.Constraints) StoreList {
+func (sl StoreList) filter(constraints []zonepb.Constraints) StoreList {
 	if len(constraints) == 0 {
 		return sl
 	}
@@ -627,7 +638,11 @@ func (sp *StorePool) getStoreListFromIDsRLocked(
 	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
 
 	for _, storeID := range storeIDs {
-		detail := sp.detailsMu.storeDetails[storeID]
+		detail, ok := sp.detailsMu.storeDetails[storeID]
+		if !ok {
+			// Do nothing; this store is not in the StorePool.
+			continue
+		}
 		switch s := detail.status(now, timeUntilStoreDead, rangeID, sp.nodeLivenessFn); s {
 		case storeStatusThrottled:
 			aliveStoreCount++
@@ -641,7 +656,7 @@ func (sp *StorePool) getStoreListFromIDsRLocked(
 			aliveStoreCount++
 			storeDescriptors = append(storeDescriptors, *detail.desc)
 		case storeStatusDead, storeStatusUnknown, storeStatusDecommissioning:
-			// Do nothing; this node cannot be used.
+			// Do nothing; this store cannot be used.
 		default:
 			panic(fmt.Sprintf("unknown store status: %d", s))
 		}

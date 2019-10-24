@@ -1,22 +1,16 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rpc
 
 import (
-	"context"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -24,7 +18,36 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"google.golang.org/grpc"
 )
+
+// ContextTestingKnobs provides hooks to aid in testing the system. The testing
+// knob functions are called at various points in the Context life cycle if they
+// are non-nil.
+type ContextTestingKnobs struct {
+
+	// UnaryClientInterceptor if non-nil will be called at dial time to provide
+	// the base unary interceptor for client connections.
+	// This function may return a nil interceptor to avoid injecting behavior
+	// for a given target and class.
+	UnaryClientInterceptor func(target string, class ConnectionClass) grpc.UnaryClientInterceptor
+
+	// StreamClient if non-nil will be called at dial time to provide
+	// the base stream interceptor for client connections.
+	// This function may return a nil interceptor to avoid injecting behavior
+	// for a given target and class.
+	StreamClientInterceptor func(target string, class ConnectionClass) grpc.StreamClientInterceptor
+
+	// ArtificialLatencyMap if non-nil contains a map from target address
+	// (server.RPCServingAddr() of a remote node) to artificial latency in
+	// milliseconds to inject. Setting this will cause the server to pause for
+	// the given amount of milliseconds on every network write.
+	ArtificialLatencyMap map[string]int
+
+	// ClusterID initializes the Context's ClusterID container to this value if
+	// non-nil at construction time.
+	ClusterID *uuid.UUID
+}
 
 // NewInsecureTestingContext creates an insecure rpc Context suitable for tests.
 func NewInsecureTestingContext(clock *hlc.Clock, stopper *stop.Stopper) *Context {
@@ -37,16 +60,22 @@ func NewInsecureTestingContext(clock *hlc.Clock, stopper *stop.Stopper) *Context
 func NewInsecureTestingContextWithClusterID(
 	clock *hlc.Clock, stopper *stop.Stopper, clusterID uuid.UUID,
 ) *Context {
-	ctx := NewContext(
+	return NewInsecureTestingContextWithKnobs(clock, stopper, ContextTestingKnobs{
+		ClusterID: &clusterID,
+	})
+}
+
+// NewInsecureTestingContextWithKnobs creates an insecure rpc Context
+// suitable for tests configured with the provided knobs.
+func NewInsecureTestingContextWithKnobs(
+	clock *hlc.Clock, stopper *stop.Stopper, knobs ContextTestingKnobs,
+) *Context {
+	return NewContextWithTestingKnobs(
 		log.AmbientContext{Tracer: tracing.NewTracer()},
 		&base.Config{Insecure: true},
 		clock,
 		stopper,
 		&cluster.MakeTestingClusterSettings().Version,
+		knobs,
 	)
-	// Ensure that tests using this test context and restart/shut down
-	// their servers do not inadvertently start talking to servers from
-	// unrelated concurrent tests.
-	ctx.ClusterID.Set(context.TODO(), clusterID)
-	return ctx
 }

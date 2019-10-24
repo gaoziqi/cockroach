@@ -1,17 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -27,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/opentracing/opentracing-go"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
@@ -35,6 +30,7 @@ import (
 // more replicas, depending on error conditions and how many successful
 // responses are required.
 type SendOptions struct {
+	class   rpc.ConnectionClass
 	metrics *DistSenderMetrics
 }
 
@@ -56,7 +52,9 @@ type batchClient struct {
 //
 // TODO(bdarnell): clean up this crufty interface; it was extracted
 // verbatim from the non-abstracted code.
-type TransportFactory func(SendOptions, *nodedialer.Dialer, ReplicaSlice) (Transport, error)
+type TransportFactory func(
+	SendOptions, *nodedialer.Dialer, ReplicaSlice,
+) (Transport, error)
 
 // Transport objects can send RPCs to one or more replicas of a range.
 // All calls to Transport methods are made from a single thread, so
@@ -100,7 +98,7 @@ func grpcTransportFactoryImpl(
 ) (Transport, error) {
 	clients := make([]batchClient, 0, len(replicas))
 	for _, replica := range replicas {
-		healthy := nodeDialer.ConnHealth(replica.NodeID) == nil
+		healthy := nodeDialer.ConnHealth(replica.NodeID, opts.class) == nil
 		clients = append(clients, batchClient{
 			replica: replica.ReplicaDescriptor,
 			healthy: healthy,
@@ -113,6 +111,7 @@ func grpcTransportFactoryImpl(
 	return &grpcTransport{
 		opts:           opts,
 		nodeDialer:     nodeDialer,
+		class:          opts.class,
 		orderedClients: clients,
 	}, nil
 }
@@ -120,6 +119,7 @@ func grpcTransportFactoryImpl(
 type grpcTransport struct {
 	opts           SendOptions
 	nodeDialer     *nodedialer.Dialer
+	class          rpc.ConnectionClass
 	clientIndex    int
 	orderedClients []batchClient
 }
@@ -227,7 +227,7 @@ func (gt *grpcTransport) NextInternalClient(
 ) (context.Context, roachpb.InternalClient, error) {
 	client := gt.orderedClients[gt.clientIndex]
 	gt.clientIndex++
-	return gt.nodeDialer.DialInternalClient(ctx, client.replica.NodeID)
+	return gt.nodeDialer.DialInternalClient(ctx, client.replica.NodeID, gt.class)
 }
 
 func (gt *grpcTransport) NextReplica() roachpb.ReplicaDescriptor {

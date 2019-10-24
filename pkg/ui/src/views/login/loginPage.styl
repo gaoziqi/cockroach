@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 @require "~styl/base/palette.styl"
 
@@ -36,6 +32,7 @@
     width 486px
 
   .form-container
+    margin-top 120px
     padding-left 50px
     padding-right 50px
 
@@ -54,19 +51,10 @@
     width 350px
     font-size 14px
 
-  .version
-    color $body-color
-    text-align right
-    margin-top 10px
-    margin-bottom 100px
-
-  .version-tag
-    color #54b30e
-
   .logo
     height 32px
     position relative
-    margin-bottom 80px
+    margin-bottom 74px
 
   .input-text
     width 100%
@@ -109,17 +97,8 @@
     color $alert-color
     margin 12px 0
 
-.login-new-feature
-  margin-left 30px
-
-  &__blurb
-    margin-top 5px
-    line-height 24px
-    color $body-color
-
-.login-new-feature-heading
-  &__text
-    color $link-color
+  .info-box
+    margin-top 0px
 
 .login-note-box
   &__sql-command

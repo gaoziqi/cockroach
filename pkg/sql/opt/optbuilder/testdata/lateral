@@ -1,35 +1,23 @@
 exec-ddl
 CREATE TABLE x (a INT PRIMARY KEY)
 ----
-TABLE x
- ├── a int not null
- └── INDEX primary
-      └── a int not null
 
 exec-ddl
 CREATE TABLE y (b INT PRIMARY KEY)
 ----
-TABLE y
- ├── b int not null
- └── INDEX primary
-      └── b int not null
 
 exec-ddl
 CREATE TABLE z (c INT PRIMARY KEY)
 ----
-TABLE z
- ├── c int not null
- └── INDEX primary
-      └── c int not null
 
 build
 SELECT * FROM x, y, z
 ----
-inner-join
+inner-join (hash)
  ├── columns: a:1(int!null) b:2(int!null) c:3(int!null)
  ├── scan x
  │    └── columns: a:1(int!null)
- ├── inner-join
+ ├── inner-join (hash)
  │    ├── columns: b:2(int!null) c:3(int!null)
  │    ├── scan y
  │    │    └── columns: b:2(int!null)
@@ -106,7 +94,7 @@ project
                 ├── columns: y.b:3(int!null)
                 └── project
                      ├── columns: y.b:3(int!null)
-                     └── inner-join
+                     └── inner-join (hash)
                           ├── columns: c:2(int!null) y.b:3(int!null)
                           ├── scan z
                           │    └── columns: c:2(int!null)
@@ -180,11 +168,6 @@ CREATE TABLE j (
   j JSONB
 )
 ----
-TABLE j
- ├── id int not null
- ├── j jsonb
- └── INDEX primary
-      └── id int not null
 
 build
 SELECT * FROM j, jsonb_array_elements(j.j->'foo')
@@ -304,3 +287,49 @@ inner-join-apply
  │                                       ├── variable: j2.j [type=jsonb]
  │                                       └── const: 'members' [type=string]
  └── filters (true)
+
+build
+SELECT * FROM x JOIN LATERAL (SELECT * FROM y WHERE b = x.a) ON true
+----
+inner-join-apply
+ ├── columns: a:1(int!null) b:2(int!null)
+ ├── scan x
+ │    └── columns: a:1(int!null)
+ ├── select
+ │    ├── columns: b:2(int!null)
+ │    ├── scan y
+ │    │    └── columns: b:2(int!null)
+ │    └── filters
+ │         └── eq [type=bool]
+ │              ├── variable: b [type=int]
+ │              └── variable: a [type=int]
+ └── filters
+      └── true [type=bool]
+
+build
+SELECT * FROM x LEFT JOIN LATERAL (SELECT * FROM y WHERE b = x.a) ON true
+----
+left-join-apply
+ ├── columns: a:1(int!null) b:2(int)
+ ├── scan x
+ │    └── columns: a:1(int!null)
+ ├── select
+ │    ├── columns: b:2(int!null)
+ │    ├── scan y
+ │    │    └── columns: b:2(int!null)
+ │    └── filters
+ │         └── eq [type=bool]
+ │              ├── variable: b [type=int]
+ │              └── variable: a [type=int]
+ └── filters
+      └── true [type=bool]
+
+build
+SELECT * FROM x RIGHT JOIN LATERAL (SELECT * FROM y WHERE b = x.a) ON true
+----
+error (42601): The combining JOIN type must be INNER or LEFT for a LATERAL reference
+
+build
+SELECT * FROM x FULL OUTER JOIN LATERAL (SELECT * FROM y WHERE b = x.a) ON true
+----
+error (42601): The combining JOIN type must be INNER or LEFT for a LATERAL reference

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stats
 
@@ -47,8 +43,9 @@ type JSONStatistic struct {
 //
 // See HistogramData for a description of the fields.
 type JSONHistoBucket struct {
-	NumEq    int64 `json:"num_eq"`
-	NumRange int64 `json:"num_range"`
+	NumEq         int64   `json:"num_eq"`
+	NumRange      int64   `json:"num_range"`
+	DistinctRange float64 `json:"distinct_range"`
 	// UpperBound is the string representation of a datum; parsable with
 	// tree.ParseStringAs.
 	UpperBound string `json:"upper_bound"`
@@ -57,13 +54,14 @@ type JSONHistoBucket struct {
 // SetHistogram fills in the HistogramColumnType and HistogramBuckets fields.
 func (js *JSONStatistic) SetHistogram(h *HistogramData) error {
 	typ := &h.ColumnType
-	js.HistogramColumnType = typ.String()
+	js.HistogramColumnType = typ.SQLString()
 	js.HistogramBuckets = make([]JSONHistoBucket, len(h.Buckets))
 	var a sqlbase.DatumAlloc
 	for i := range h.Buckets {
 		b := &h.Buckets[i]
 		js.HistogramBuckets[i].NumEq = b.NumEq
 		js.HistogramBuckets[i].NumRange = b.NumRange
+		js.HistogramBuckets[i].DistinctRange = b.DistinctRange
 
 		datum, _, err := sqlbase.DecodeTableKey(&a, typ, b.UpperBound, encoding.Ascending)
 		if err != nil {
@@ -71,9 +69,10 @@ func (js *JSONStatistic) SetHistogram(h *HistogramData) error {
 		}
 
 		js.HistogramBuckets[i] = JSONHistoBucket{
-			NumEq:      b.NumEq,
-			NumRange:   b.NumRange,
-			UpperBound: datum.String(),
+			NumEq:         b.NumEq,
+			NumRange:      b.NumRange,
+			DistinctRange: b.DistinctRange,
+			UpperBound:    tree.AsStringWithFlags(datum, tree.FmtBareStrings),
 		}
 	}
 	return nil
@@ -106,9 +105,6 @@ func (js *JSONStatistic) GetHistogram(evalCtx *tree.EvalContext) (*HistogramData
 		return nil, err
 	}
 	h.ColumnType = *colType
-	if err != nil {
-		return nil, err
-	}
 	h.Buckets = make([]HistogramData_Bucket, len(js.HistogramBuckets))
 	for i := range h.Buckets {
 		hb := &js.HistogramBuckets[i]
@@ -118,6 +114,7 @@ func (js *JSONStatistic) GetHistogram(evalCtx *tree.EvalContext) (*HistogramData
 		}
 		h.Buckets[i].NumEq = hb.NumEq
 		h.Buckets[i].NumRange = hb.NumRange
+		h.Buckets[i].DistinctRange = hb.DistinctRange
 		h.Buckets[i].UpperBound, err = sqlbase.EncodeTableKey(nil, upperVal, encoding.Ascending)
 		if err != nil {
 			return nil, err

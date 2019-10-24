@@ -1,24 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -26,11 +22,11 @@ import (
 )
 
 type metadataForwarder interface {
-	forwardMetadata(metadata *distsqlpb.ProducerMetadata)
+	forwardMetadata(metadata *execinfrapb.ProducerMetadata)
 }
 
 type planNodeToRowSource struct {
-	distsqlrun.ProcessorBase
+	execinfra.ProcessorBase
 
 	started bool
 
@@ -66,11 +62,11 @@ func makePlanNodeToRowSource(
 	}, nil
 }
 
-var _ distsqlrun.LocalProcessor = &planNodeToRowSource{}
+var _ execinfra.LocalProcessor = &planNodeToRowSource{}
 
 // InitWithOutput implements the LocalProcessor interface.
 func (p *planNodeToRowSource) InitWithOutput(
-	post *distsqlpb.PostProcessSpec, output distsqlrun.RowReceiver,
+	post *execinfrapb.PostProcessSpec, output execinfra.RowReceiver,
 ) error {
 	return p.InitWithEvalCtx(
 		p,
@@ -81,7 +77,7 @@ func (p *planNodeToRowSource) InitWithOutput(
 		0, /* processorID */
 		output,
 		nil, /* memMonitor */
-		distsqlrun.ProcStateOpts{},
+		execinfra.ProcStateOpts{},
 	)
 }
 
@@ -90,7 +86,7 @@ func (p *planNodeToRowSource) InitWithOutput(
 // drain this row source of its metadata in case the planNode tree we're
 // wrapping returned an error, since planNodes don't know how to drain trailing
 // metadata.
-func (p *planNodeToRowSource) SetInput(ctx context.Context, input distsqlrun.RowSource) error {
+func (p *planNodeToRowSource) SetInput(ctx context.Context, input execinfra.RowSource) error {
 	if p.firstNotWrapped == nil {
 		// Short-circuit if we never set firstNotWrapped - indicating this planNode
 		// tree had no DistSQL-plannable subtrees.
@@ -132,8 +128,8 @@ func (p *planNodeToRowSource) InternalClose() {
 	}
 }
 
-func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
-	if p.State == distsqlrun.StateRunning && p.fastPath {
+func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+	if p.State == execinfra.StateRunning && p.fastPath {
 		var count int
 		// If our node is a "fast path node", it means that we're set up to just
 		// return a row count. So trigger the fast path and return the row count as
@@ -171,7 +167,7 @@ func (p *planNodeToRowSource) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMe
 		return sqlbase.EncDatumRow{sqlbase.EncDatum{Datum: tree.NewDInt(tree.DInt(count))}}, nil
 	}
 
-	for p.State == distsqlrun.StateRunning {
+	for p.State == execinfra.StateRunning {
 		valid, err := p.node.Next(p.params)
 		if err != nil || !valid {
 			p.MoveToDraining(err)
@@ -201,7 +197,7 @@ func (p *planNodeToRowSource) ConsumerClosed() {
 	p.InternalClose()
 }
 
-// IsException implements the vectorizeAlwaysException interface.
+// IsException implements the VectorizeAlwaysException interface.
 func (p *planNodeToRowSource) IsException() bool {
 	_, ok := p.node.(*setVarNode)
 	return ok
@@ -211,6 +207,6 @@ func (p *planNodeToRowSource) IsException() bool {
 // that need to forward metadata to the end of the flow. They can't pass
 // metadata through local processors, so they instead add the metadata to our
 // trailing metadata and expect us to forward it further.
-func (p *planNodeToRowSource) forwardMetadata(metadata *distsqlpb.ProducerMetadata) {
+func (p *planNodeToRowSource) forwardMetadata(metadata *execinfrapb.ProducerMetadata) {
 	p.ProcessorBase.AppendTrailingMeta(*metadata)
 }

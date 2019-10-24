@@ -1,20 +1,17 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"runtime/debug"
@@ -31,13 +28,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/logtags"
 	"github.com/pkg/errors"
 )
 
@@ -45,8 +42,8 @@ const (
 	opTxnCoordSender = "txn coordinator send"
 )
 
-// txnState represents states relating to whether Begin/EndTxn requests need to
-// be sent.
+// txnState represents states relating to whether an EndTransaction request
+// needs to be sent.
 //go:generate stringer -type=txnState
 type txnState int
 
@@ -121,11 +118,6 @@ type TxnCoordSender struct {
 		// client sends anything other than a rollback, it will get an error
 		// (a retryable TransactionAbortedError in case of the async abort).
 		closed bool
-
-		// systemConfigTrigger is set to true when modifying keys from the
-		// SystemConfig span. This sets the SystemConfigTrigger on
-		// EndTransactionRequest.
-		systemConfigTrigger bool
 
 		// txn is the Transaction proto attached to all the requests and updated on
 		// all the responses.
@@ -459,7 +451,7 @@ func NewTxnCoordSenderFactory(
 		tcf.st = cluster.MakeTestingClusterSettings()
 	}
 	if tcf.heartbeatInterval == 0 {
-		tcf.heartbeatInterval = base.DefaultHeartbeatInterval
+		tcf.heartbeatInterval = base.DefaultTxnHeartbeatInterval
 	}
 	if tcf.metrics == (TxnMetrics{}) {
 		tcf.metrics = MakeTxnMetrics(metric.TestSampleInterval)
@@ -469,7 +461,7 @@ func NewTxnCoordSenderFactory(
 
 // TransactionalSender is part of the TxnSenderFactory interface.
 func (tcf *TxnCoordSenderFactory) TransactionalSender(
-	typ client.TxnType, meta roachpb.TxnCoordMeta,
+	typ client.TxnType, meta roachpb.TxnCoordMeta, pri roachpb.UserPriority,
 ) client.TxnSender {
 	meta.Txn.AssertInitialized(context.TODO())
 	tcs := &TxnCoordSender{
@@ -477,6 +469,7 @@ func (tcf *TxnCoordSenderFactory) TransactionalSender(
 		TxnCoordSenderFactory: tcf,
 	}
 	tcs.mu.txnState = txnPending
+	tcs.mu.userPriority = pri
 
 	// Create a stack of request/response interceptors. All of the objects in
 	// this stack are pre-allocated on the TxnCoordSender struct, so this just
@@ -484,23 +477,21 @@ func (tcf *TxnCoordSenderFactory) TransactionalSender(
 	// txnLockGatekeeper at the bottom of the stack to connect it with the
 	// TxnCoordSender's wrapped sender. First, each of the interceptor objects
 	// is initialized.
-	var ri *RangeIterator
+	var riGen RangeIteratorGen
 	if ds, ok := tcf.wrapped.(*DistSender); ok {
-		ri = NewRangeIterator(ds)
+		riGen = ds.rangeIteratorGen
 	}
 	// Some interceptors are only needed by roots.
 	if typ == client.RootTxn {
 		tcs.interceptorAlloc.txnHeartbeater.init(
 			tcf.AmbientContext,
-			&tcs.mu.Mutex,
-			&tcs.mu.txn,
-			tcf.st,
+			tcs.stopper,
 			tcs.clock,
+			&tcs.metrics,
 			tcs.heartbeatInterval,
 			&tcs.interceptorAlloc.txnLockGatekeeper,
-			&tcs.metrics,
-			tcs.stopper,
-			tcs.cleanupTxnLocked,
+			&tcs.mu.Mutex,
+			&tcs.mu.txn,
 		)
 		tcs.interceptorAlloc.txnCommitter = txnCommitter{
 			st:      tcf.st,
@@ -514,8 +505,8 @@ func (tcf *TxnCoordSenderFactory) TransactionalSender(
 		}
 	}
 	tcs.interceptorAlloc.txnPipeliner = txnPipeliner{
-		st: tcf.st,
-		ri: ri,
+		st:    tcf.st,
+		riGen: riGen,
 	}
 	tcs.interceptorAlloc.txnSpanRefresher = txnSpanRefresher{
 		st:    tcf.st,
@@ -618,12 +609,17 @@ func (tc *TxnCoordSender) GetMeta(
 	for _, reqInt := range tc.interceptorStack {
 		reqInt.populateMetaLocked(&meta)
 	}
-	if opt == client.OnlyPending && meta.Txn.Status != roachpb.PENDING {
+	switch opt {
+	case client.AnyTxnStatus:
+		// Nothing to check.
+	case client.OnlyPending:
+		// Check the coordinator's proto status.
 		rejectErr := tc.maybeRejectClientLocked(ctx, nil /* ba */)
-		if rejectErr == nil {
-			log.Fatal(ctx, "expected non-nil rejectErr")
+		if rejectErr != nil {
+			return roachpb.TxnCoordMeta{}, rejectErr.GoError()
 		}
-		return roachpb.TxnCoordMeta{}, rejectErr.GoError()
+	default:
+		panic("unreachable")
 	}
 	return meta, nil
 }
@@ -744,6 +740,7 @@ func (tc *TxnCoordSender) Send(
 	// comes, and unlock again in the defer below.
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
+	tc.mu.active = true
 
 	if pErr := tc.maybeRejectClientLocked(ctx, &ba); pErr != nil {
 		return nil, pErr
@@ -786,17 +783,6 @@ func (tc *TxnCoordSender) Send(
 		return nil, nil
 	}
 
-	if !tc.mu.active {
-		tc.mu.active = true
-		// If we haven't generate a transaction priority before, do it now.
-		//
-		// NOTE(andrei): Unfortunately, as of August 2018, txn.Priority == 0 is also
-		// true when the priority has been generated from MinUserPriority. In that
-		// case, we'll generate it again.
-		if tc.mu.txn.Priority == 0 {
-			tc.mu.txn.Priority = roachpb.MakePriority(tc.mu.userPriority)
-		}
-	}
 	// Clone the Txn's Proto so that future modifications can be made without
 	// worrying about synchronization.
 	ba.Txn = tc.mu.txn.Clone()
@@ -872,9 +858,7 @@ func (tc *TxnCoordSender) maybeSleepForLinearizable(
 func (tc *TxnCoordSender) maybeRejectClientLocked(
 	ctx context.Context, ba *roachpb.BatchRequest,
 ) *roachpb.Error {
-	if singleRollback := ba != nil &&
-		ba.IsSingleEndTransactionRequest() &&
-		!ba.Requests[0].GetInner().(*roachpb.EndTransactionRequest).Commit; singleRollback {
+	if ba != nil && ba.IsSingleAbortTransactionRequest() {
 		// As a special case, we allow rollbacks to be sent at any time. Any
 		// rollback attempt moves the TxnCoordSender state to txnFinalized, but higher
 		// layers are free to retry rollbacks if they want (and they do, for
@@ -882,17 +866,33 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 		return nil
 	}
 
-	if tc.mu.txnState == txnFinalized {
+	// Check the transaction coordinator state.
+	switch tc.mu.txnState {
+	case txnPending:
+		// All good.
+	case txnError:
+		return tc.mu.storedErr
+	case txnFinalized:
 		msg := fmt.Sprintf("client already committed or rolled back the transaction. "+
-			"Trying to execute: %s", ba)
+			"Trying to execute: %s", ba.Summary())
 		stack := string(debug.Stack())
 		log.Errorf(ctx, "%s. stack:\n%s", msg, stack)
 		return roachpb.NewErrorWithTxn(roachpb.NewTransactionStatusError(msg), &tc.mu.txn)
 	}
-	if tc.mu.txnState == txnError {
-		return tc.mu.storedErr
-	}
-	if tc.mu.txn.Status == roachpb.ABORTED {
+
+	// Check the transaction proto state, along with any finalized transaction
+	// status observed by the transaction heartbeat loop.
+	protoStatus := tc.mu.txn.Status
+	hbObservedStatus := tc.interceptorAlloc.txnHeartbeater.mu.finalObservedStatus
+	switch {
+	case protoStatus == roachpb.ABORTED:
+		// The transaction was rolled back synchronously.
+		fallthrough
+	case protoStatus != roachpb.COMMITTED && hbObservedStatus == roachpb.ABORTED:
+		// The transaction heartbeat observed an aborted transaction record and
+		// this was not due to a synchronous transaction commit and transaction
+		// record garbage collection.
+		// See the comment on txnHeartbeater.mu.finalizedStatus for more details.
 		abortedErr := roachpb.NewErrorWithTxn(
 			roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_CLIENT_REJECT), &tc.mu.txn)
 		if tc.typ == client.LeafTxn {
@@ -900,16 +900,17 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 			// root) rather than TransactionRetryWithProtoRefreshError.
 			return abortedErr
 		}
+		// Root txns handle retriable errors.
 		newTxn := roachpb.PrepareTransactionForRetry(
-			ctx, abortedErr,
-			// priority is not used for aborted errors
-			roachpb.NormalUserPriority,
-			tc.clock)
+			ctx, abortedErr, roachpb.NormalUserPriority, tc.clock)
 		return roachpb.NewError(roachpb.NewTransactionRetryWithProtoRefreshError(
 			abortedErr.Message, tc.mu.txn.ID, newTxn))
-	}
-	if tc.mu.txn.Status != roachpb.PENDING {
-		return roachpb.NewErrorf("(see issue #37866) unexpected txn state: %s", tc.mu.txn)
+	case protoStatus != roachpb.PENDING || hbObservedStatus != roachpb.PENDING:
+		// The transaction proto is in an unexpected state.
+		return roachpb.NewErrorf(
+			"unexpected txn state: %s; heartbeat observed status: %s", tc.mu.txn, hbObservedStatus)
+	default:
+		// All good.
 	}
 	return nil
 }
@@ -1013,6 +1014,7 @@ func (tc *TxnCoordSender) handleRetryableErrLocked(
 		// Abort the old txn. The client is not supposed to use use this
 		// TxnCoordSender any more.
 		tc.interceptorAlloc.txnHeartbeater.abortTxnAsyncLocked(ctx)
+		tc.cleanupTxnLocked(ctx)
 		return retErr
 	}
 
@@ -1115,18 +1117,18 @@ func (tc *TxnCoordSender) setTxnAnchorKeyLocked(key roachpb.Key) error {
 	return nil
 }
 
-// SetSystemConfigTrigger is part of the client.TxnSender interface.
-func (tc *TxnCoordSender) SetSystemConfigTrigger() error {
+// AnchorOnSystemConfigRange is part of the client.TxnSender interface.
+func (tc *TxnCoordSender) AnchorOnSystemConfigRange() error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
-	if !tc.mu.systemConfigTrigger {
-		tc.mu.systemConfigTrigger = true
-		// The system-config trigger must be run on the system-config range which
-		// means any transaction with the trigger set needs to be anchored to the
-		// system-config range.
-		return tc.setTxnAnchorKeyLocked(keys.SystemConfigSpan.Key)
+	// Allow this to be called more than once.
+	if bytes.Equal(tc.mu.txn.Key, keys.SystemConfigSpan.Key) {
+		return nil
 	}
-	return nil
+	// The system-config trigger must be run on the system-config range which
+	// means any transaction with the trigger set needs to be anchored to the
+	// system-config range.
+	return tc.setTxnAnchorKeyLocked(keys.SystemConfigSpan.Key)
 }
 
 // TxnStatus is part of the client.TxnSender interface.
@@ -1140,9 +1142,7 @@ func (tc *TxnCoordSender) TxnStatus() roachpb.TransactionStatus {
 func (tc *TxnCoordSender) SetUserPriority(pri roachpb.UserPriority) error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
-
-	// Negative priorities come from txn.InternalSetPriority.
-	if tc.mu.active && pri > 0 {
+	if tc.mu.active && pri != tc.mu.userPriority {
 		return errors.Errorf("cannot change the user priority of a running transaction")
 	}
 	tc.mu.userPriority = pri
@@ -1176,8 +1176,11 @@ func (tc *TxnCoordSender) OrigTimestamp() hlc.Timestamp {
 func (tc *TxnCoordSender) CommitTimestamp() hlc.Timestamp {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
+	txn := &tc.mu.txn
 	tc.mu.txn.OrigTimestampWasObserved = true
-	return tc.mu.txn.OrigTimestamp
+	commitTS := txn.OrigTimestamp
+	commitTS.Forward(txn.RefreshedTimestamp)
+	return commitTS
 }
 
 // CommitTimestampFixed is part of the client.TxnSender interface.
@@ -1247,4 +1250,11 @@ func (tc *TxnCoordSender) SerializeTxn() *roachpb.Transaction {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.mu.txn.Clone()
+}
+
+// IsTracking returns true if the heartbeat loop is running.
+func (tc *TxnCoordSender) IsTracking() bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.interceptorAlloc.txnHeartbeater.heartbeatLoopRunningLocked()
 }

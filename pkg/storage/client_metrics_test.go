@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -30,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func checkGauge(t *testing.T, id string, g *metric.Gauge, e int64) {
@@ -294,7 +291,9 @@ func TestStoreMetrics(t *testing.T) {
 	// Create a transaction statement that fails. Regression test for #4969.
 	if err := mtc.dbs[0].Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		b := txn.NewBatch()
-		b.CPut(dataKey, 7, 6)
+		var expVal roachpb.Value
+		expVal.SetInt(6)
+		b.CPut(dataKey, 7, &expVal)
 		return txn.Run(ctx, b)
 	}); err == nil {
 		t.Fatal("Expected transaction error, but none received")
@@ -315,8 +314,9 @@ func TestStoreMetrics(t *testing.T) {
 		return mtc.unreplicateRangeNonFatal(replica.RangeID, 0)
 	})
 
-	// Force GC Scan on store 0 in order to fully remove range.
-	mtc.stores[1].MustForceReplicaGCScanAndProcess()
+	// Wait until we're sure that store 0 has successfully processed its removal.
+	require.NoError(t, mtc.waitForUnreplicated(replica.RangeID, 0))
+
 	mtc.waitForValues(roachpb.Key("z"), []int64{0, 5, 5})
 
 	// Verify range count is as expected.

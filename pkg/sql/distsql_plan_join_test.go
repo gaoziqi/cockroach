@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -70,8 +66,8 @@ func setTestEqCols(n *joinNode, colNames []string) error {
 	}
 
 	n.mergeJoinOrdering = computeMergeJoinOrdering(
-		planPhysicalProps(n.left.plan),
-		planPhysicalProps(n.right.plan),
+		left.reqOrdering,
+		right.reqOrdering,
 		n.pred.leftEqualityIndices,
 		n.pred.rightEqualityIndices,
 	)
@@ -303,8 +299,8 @@ func TestUseInterleavedJoin(t *testing.T) {
 						t.Fatal(err)
 					}
 					join.mergeJoinOrdering = computeMergeJoinOrdering(
-						planPhysicalProps(join.left.plan),
-						planPhysicalProps(join.right.plan),
+						planReqOrdering(join.left.plan),
+						planReqOrdering(join.right.plan),
 						join.pred.leftEqualityIndices,
 						join.pred.rightEqualityIndices,
 					)
@@ -760,5 +756,112 @@ func TestAlignInterleavedSpans(t *testing.T) {
 				t.Errorf("unexpected partition results after aligning.\nexpected:\t%v\nactual:\t%v", expected, actual)
 			}
 		})
+	}
+}
+
+// computeMergeJoinOrdering determines if merge-join can be used to perform a join.
+//
+// It takes the orderings of the two data sources that are to be joined on a set
+// of equality columns (the join condition is that the value for the column
+// colA[i] equals the value for column colB[i]).
+//
+// If merge-join can be used, the function returns a ColumnOrdering that refers
+// to the equality columns by their index in colA/colB. Specifically column i in
+// the returned ordering refers to column colA[i] for A and colB[i] for B. This
+// is the ordering that must be used by the merge-join.
+//
+// The returned ordering can be partial, i.e. only contains a subset of the
+// equality columns.
+func computeMergeJoinOrdering(
+	a, b sqlbase.ColumnOrdering, colA, colB []int,
+) sqlbase.ColumnOrdering {
+	if len(colA) != len(colB) {
+		panic(fmt.Sprintf("invalid column lists %v; %v", colA, colB))
+	}
+	var result sqlbase.ColumnOrdering
+	for i := 0; i < len(a) && i < len(b); i++ {
+		found := false
+		if a[i].Direction != b[i].Direction {
+			break
+		}
+		for j := range colA {
+			if colA[j] == a[i].ColIdx && colB[j] == b[i].ColIdx {
+				result = append(result, sqlbase.ColumnOrderInfo{
+					ColIdx:    j,
+					Direction: a[i].Direction,
+				})
+				found = true
+				break
+			}
+		}
+		if !found {
+			break
+		}
+	}
+	return result
+}
+
+func TestInterleavedNodes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	sqlutils.CreateTestInterleavedHierarchy(t, sqlDB)
+
+	for _, tc := range []struct {
+		table1     string
+		table2     string
+		ancestor   string
+		descendant string
+	}{
+		// Refer to comment above CreateTestInterleavedHierarchy for
+		// table schemas.
+
+		{"parent1", "child1", "parent1", "child1"},
+		{"parent1", "child2", "parent1", "child2"},
+		{"parent1", "grandchild1", "parent1", "grandchild1"},
+		{"child1", "child2", "", ""},
+		{"child1", "grandchild1", "child1", "grandchild1"},
+		{"child2", "grandchild1", "", ""},
+		{"parent1", "parent2", "", ""},
+		{"parent2", "child1", "", ""},
+		{"parent2", "grandchild1", "", ""},
+		{"parent2", "child2", "", ""},
+	} {
+		// Run the subtests with the tables in both positions (left
+		// and right).
+		for i := 0; i < 2; i++ {
+			testName := fmt.Sprintf("%s-%s", tc.table1, tc.table2)
+			t.Run(testName, func(t *testing.T) {
+				join, err := newTestJoinNode(kvDB, tc.table1, tc.table2)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				ancestor, descendant := join.interleavedNodes()
+
+				if tc.ancestor == tc.descendant && tc.ancestor == "" {
+					if ancestor != nil || descendant != nil {
+						t.Errorf("expected ancestor and descendant to both be nil")
+					}
+					return
+				}
+
+				if ancestor == nil || descendant == nil {
+					t.Fatalf("expected ancestor and descendant to not be nil")
+				}
+
+				if tc.ancestor != ancestor.desc.Name || tc.descendant != descendant.desc.Name {
+					t.Errorf(
+						"unexpected ancestor and descendant nodes.\nexpected: %s (ancestor), %s (descendant)\nactual: %s (ancestor), %s (descendant)",
+						tc.ancestor, tc.descendant,
+						ancestor.desc.Name, descendant.desc.Name,
+					)
+				}
+			})
+			// Rerun the same subtests but flip the tables
+			tc.table1, tc.table2 = tc.table2, tc.table1
+		}
 	}
 }

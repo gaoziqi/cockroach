@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgdate
 
@@ -22,7 +18,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/errors"
 )
 
 // numberChunk associates a value with a leading separator,
@@ -675,7 +671,7 @@ func (fe *fieldExtract) matchedSentinel(value time.Time, match string) error {
 // Reset replaces a value of an already-set field.
 func (fe *fieldExtract) Reset(field field, v int) error {
 	if !fe.has.Has(field) {
-		return pgerror.AssertionFailedf("field %s is not already set", field.Pretty())
+		return errors.AssertionFailedf("field %s is not already set", errors.Safe(field.Pretty()))
 	}
 	fe.data[field] = v
 	return nil
@@ -685,7 +681,7 @@ func (fe *fieldExtract) Reset(field field, v int) error {
 // the field has already been set.
 func (fe *fieldExtract) Set(field field, v int) error {
 	if !fe.wanted.Has(field) {
-		return pgerror.AssertionFailedf("field %s is not wanted in %v", field.Pretty(), fe.wanted)
+		return errors.AssertionFailedf("field %s is not wanted in %v", errors.Safe(field.Pretty()), errors.Safe(fe.wanted))
 	}
 	fe.data[field] = v
 	fe.has = fe.has.Add(field)
@@ -755,7 +751,7 @@ func (fe *fieldExtract) SetDayOfYear(chunk numberChunk) error {
 
 	y, ok := fe.Get(fieldYear)
 	if !ok {
-		return pgerror.AssertionFailedf("year must be set before day of year")
+		return errors.AssertionFailedf("year must be set before day of year")
 	}
 	y, m, d := julianDayToDate(dateToJulianDay(y, 1, 1) + chunk.v - 1)
 	if err := fe.Reset(fieldYear, y); err != nil {

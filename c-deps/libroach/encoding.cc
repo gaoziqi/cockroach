@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "encoding.h"
 #include <rocksdb/slice.h>
@@ -158,9 +154,7 @@ std::string EncodeTimestamp(DBTimestamp ts) {
   return s;
 }
 
-bool EmptyTimestamp(DBTimestamp ts) {
-  return ts.wall_time == 0 && ts.logical == 0;
-}
+bool EmptyTimestamp(DBTimestamp ts) { return ts.wall_time == 0 && ts.logical == 0; }
 
 // MVCC keys are encoded as <key>\x00[<wall_time>[<logical>]]<#timestamp-bytes>. A
 // custom RocksDB comparator (DBComparator) is used to maintain the desired
@@ -274,4 +268,18 @@ rocksdb::Slice KeyPrefix(const rocksdb::Slice& src) {
   return rocksdb::Slice(key.data(), key.size() + 1);
 }
 
+WARN_UNUSED_RESULT bool IsInt(rocksdb::Slice* buf) {
+  if (buf->size() > 0) {
+    return uint8_t((*buf)[0]) >= kIntMin && uint8_t((*buf)[0]) <= kIntMax;
+  }
+
+  return false;
+}
+
+WARN_UNUSED_RESULT bool DecodeTablePrefix(rocksdb::Slice* buf, uint64_t* tbl) {
+  if (!IsInt(buf) || !DecodeUvarint64(buf, tbl)) {
+    return false;
+  }
+  return true;
+}
 }  // namespace cockroach

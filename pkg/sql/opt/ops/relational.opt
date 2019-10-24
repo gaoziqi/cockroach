@@ -42,9 +42,9 @@ define ScanPrivate {
     Table TableID
 
     # Index identifies the index to scan (whether primary or secondary). It
-    # can be passed to the cat.Table.Index(i int) method in order to fetch the
+    # can be passed to the cat.Table.Index() method in order to fetch the
     # cat.Index metadata.
-    Index int
+    Index IndexOrdinal
 
     # Cols specifies the set of columns that the scan operator projects. This
     # may be a subset of the columns that the table/index contains.
@@ -64,6 +64,11 @@ define ScanPrivate {
 
     # Flags modify how the table is scanned, such as which index is used to scan.
     Flags ScanFlags
+
+    # PartitionConstrainedScan records whether or not we were able to use partitions
+    # to constrain the lookup spans further. This flag is used to record telemetry
+    # about how often this optimization is getting applied.
+    PartitionConstrainedScan bool
 }
 
 # VirtualScan returns a result set containing every row in a virtual table.
@@ -278,9 +283,9 @@ define LookupJoinPrivate {
     Table TableID
 
     # Index identifies the index to do lookups in (whether primary or secondary).
-    # It can be passed to the cat.Table.Index(i int) method in order to fetch the
+    # It can be passed to the cat.Table.Index() method in order to fetch the
     # cat.Index metadata.
-    Index int
+    Index IndexOrdinal
 
     # KeyCols are the columns (produced by the input) used to create lookup keys.
     # The key columns must be non-empty, and are listed in the same order as the
@@ -368,10 +373,10 @@ define ZigzagJoinPrivate {
     RightTable TableID
 
     # LeftIndex and RightIndex identifies the index to do lookups in (whether
-    # primary or secondary). It can be passed to the cat.Table.Index(i int)
-    # method in order to fetch the cat.Index metadata.
-    LeftIndex int
-    RightIndex int
+    # primary or secondary). It can be passed to the cat.Table.Index() method in
+    # order to fetch the cat.Index metadata.
+    LeftIndex IndexOrdinal
+    RightIndex IndexOrdinal
 
     # LeftEqCols and RightEqCols contains lists of columns on the left and
     # right sides that are being equated. Both lists must be of equal length.
@@ -418,24 +423,6 @@ define InnerJoinApply {
 
 [Relational, Join, JoinApply, Telemetry]
 define LeftJoinApply {
-    Left  RelExpr
-    Right RelExpr
-    On    FiltersExpr
-
-    _ JoinPrivate
-}
-
-[Relational, Join, JoinApply, Telemetry]
-define RightJoinApply {
-    Left  RelExpr
-    Right RelExpr
-    On    FiltersExpr
-
-    _ JoinPrivate
-}
-
-[Relational, Join, JoinApply, Telemetry]
-define FullJoinApply {
     Left  RelExpr
     Right RelExpr
     On    FiltersExpr
@@ -752,48 +739,6 @@ define Max1Row {
     Input RelExpr
 }
 
-# Explain returns information about the execution plan of the "input"
-# expression.
-[Relational]
-define Explain {
-    Input RelExpr
-
-    _ ExplainPrivate
-}
-
-[Private]
-define ExplainPrivate {
-    # Options contains settings that control the output of the explain statement.
-    Options ExplainOptions
-
-    # ColList stores the column IDs for the explain columns.
-    ColList ColList
-
-    # Props stores the required physical properties for the enclosed expression.
-    Props PhysProps
-
-    # StmtType stores the type of the statement we are explaining.
-    StmtType StatementType
-}
-
-# ShowTraceForSession returns the current session traces.
-[Relational]
-define ShowTraceForSession {
-    _ ShowTracePrivate
-}
-
-[Private]
-define ShowTracePrivate {
-    TraceType ShowTraceType
-
-    # Compact indicates that we output a smaller set of columns; set
-    # when SHOW COMPACT [KV] TRACE is used.
-    Compact bool
-
-    # ColList stores the column IDs for the SHOW TRACE columns.
-    ColList ColList
-}
-
 # Ordinality adds a column to each row in its input containing a unique,
 # increasing number.
 [Relational]
@@ -863,6 +808,100 @@ define WindowPrivate {
     # Ordering is the ordering that the window function is computed relative to
     # within each partition.
     Ordering OrderingChoice
+}
+
+# With executes Binding, making its results available to Main. Within Main, the
+# results of Binding may be referenced by a WithScan expression containing the
+# ID of this With.
+[Relational]
+define With {
+    Binding RelExpr
+    Main    RelExpr
+
+    _ WithPrivate
+}
+
+[Private]
+define WithPrivate {
+    ID WithID
+
+    # OriginalExpr contains the original CTE expression (so that we can display
+    # it in the EXPLAIN plan).
+    OriginalExpr Statement
+
+    # Name is used to identify the with for debugging purposes.
+    Name string
+}
+
+# WithScan returns the results present in the With expression referenced
+# by ID.
+[Relational]
+define WithScan {
+    _ WithScanPrivate
+}
+
+[Private]
+define WithScanPrivate {
+    ID WithID
+
+    # BindingProps stores the relational properties of the referenced expression.
+    BindingProps RelPropsPtr
+
+    # Name is used to identify the with being referenced for debugging purposes.
+    Name string
+
+    # InCols are the columns output by the expression referenced by this
+    # expression. They correspond elementwise to the columns listed in OutCols.
+    InCols ColList
+
+    # OutCols contains a list of columns which correspond elementwise to the
+    # columns in InCols, which are the IDs output by the referenced With
+    # expression. WithScan cannot reuse the column IDs used in the original With
+    # expression, since multiple WithScans referencing the same With can occur in
+    # the same tree, so we maintain a mapping from the columns returned from
+    # the referenced expression to the referencing expression.
+    OutCols ColList
+}
+
+# RecursiveCTE implements the logic of a recursive CTE:
+#  * the Initial query is evaluated; the results are emitted and also saved into
+#    a "working table".
+#  * so long as the working table is not empty:
+#    - the Recursive query (which refers to the working table using a specific
+#      WithID) is evaluated; the results are emitted and also saved into a new
+#      "working table" for the next iteration.
+[Relational]
+define RecursiveCTE {
+    Initial RelExpr
+    Recursive RelExpr
+
+    _ RecursiveCTEPrivate
+}
+
+[Private]
+define RecursiveCTEPrivate {
+    # Name is used to identify the CTE being referenced for debugging purposes.
+    Name string
+
+    # WithID is the ID through which the Recursive expression refers to the
+    # current working table.
+    WithID WithID
+
+    # InitialCols are the columns produced by the initial expression.
+    InitialCols ColList
+
+    # RecursiveCols are the columns produced by the recursive expression, that
+    # map 1-1 to InitialCols.
+    RecursiveCols ColList
+
+    # OutCols are the columns produced by the RecursiveCTE operator; they map
+    # 1-1 to InitialCols and to RecursiveCols. Similar to Union, we don't want
+    # to reuse column IDs from one side because the columns contain values from
+    # both sides.
+    #
+    # These columns are also used by the Recursive query to refer to the working
+    # table (see WithID).
+    OutCols ColList
 }
 
 # FakeRel is a mock relational operator used for testing; its logical properties

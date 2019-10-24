@@ -1,22 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package base
 
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net/http"
 	"net/url"
 	"sync"
@@ -39,6 +36,9 @@ const (
 
 	// From IANA Service Name and Transport Protocol Port Number Registry. See
 	// https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml?search=cockroachdb
+	//
+	// This is used for both RPC and SQL connections unless --sql-addr
+	// is used on the command line and/or SQLAddr is set in the Config object.
 	DefaultPort = "26257"
 
 	// The default port for HTTP-for-humans.
@@ -47,6 +47,7 @@ const (
 	// NB: net.JoinHostPort is not a constant.
 	defaultAddr     = ":" + DefaultPort
 	defaultHTTPAddr = ":" + DefaultHTTPPort
+	defaultSQLAddr  = ":" + DefaultPort
 
 	// NetworkTimeout is the timeout used for network operations.
 	NetworkTimeout = 3 * time.Second
@@ -61,9 +62,9 @@ const (
 	// leader lease active duration should be of the raft election timeout.
 	defaultRangeLeaseRaftElectionTimeoutMultiplier = 3
 
-	// defaultHeartbeatInterval is the default value of HeartbeatInterval used
-	// by the rpc context.
-	defaultHeartbeatInterval = 3 * time.Second
+	// defaultRPCHeartbeatInterval is the default value of RPCHeartbeatInterval
+	// used by the rpc context.
+	defaultRPCHeartbeatInterval = 3 * time.Second
 
 	// rangeLeaseRenewalFraction specifies what fraction the range lease
 	// renewal duration should be of the range lease active time. For example,
@@ -101,8 +102,10 @@ var (
 		"COCKROACH_RAFT_ELECTION_TIMEOUT_TICKS", 15)
 
 	// defaultRaftLogTruncationThreshold specifies the upper bound that a single
-	// Range's Raft log can grow to before log truncations are triggered, even
-	// if that means a snapshot will be required for a straggling follower.
+	// Range's Raft log can grow to before log truncations are triggered while at
+	// least one follower is missing. If all followers are active, the quota pool
+	// is responsible for ensuring the raft log doesn't grow without bound by
+	// making sure the leader doesn't get too far ahead.
 	defaultRaftLogTruncationThreshold = envutil.EnvOrDefaultInt64(
 		"COCKROACH_RAFT_LOG_TRUNCATION_THRESHOLD", 4<<20 /* 4 MB */)
 
@@ -135,6 +138,45 @@ type lazyCertificateManager struct {
 	err  error
 }
 
+// EngineType specifies type of storage engine (eg. rocksdb, pebble).
+type EngineType int
+
+// Engine types.
+const (
+	// Denotes RocksDB as the underlying storage engine type.
+	EngineTypeRocksDB EngineType = iota
+	// Denotes Pebble as the underlying storage engine type.
+	EngineTypePebble
+)
+
+// Type implements the pflag.Value interface.
+func (e *EngineType) Type() string { return "string" }
+
+// String implements the pflag.Value interface.
+func (e *EngineType) String() string {
+	switch *e {
+	case EngineTypeRocksDB:
+		return "rocksdb"
+	case EngineTypePebble:
+		return "pebble"
+	}
+	return ""
+}
+
+// Set implements the pflag.Value interface.
+func (e *EngineType) Set(s string) error {
+	switch s {
+	case "rocksdb":
+		*e = EngineTypeRocksDB
+	case "pebble":
+		*e = EngineTypePebble
+	default:
+		return fmt.Errorf("invalid storage engine: %s "+
+			"(possible values: rocksdb, pebble)", s)
+	}
+	return nil
+}
+
 // Config is embedded by server.Config. A base config is not meant to be used
 // directly, but embedding configs should call cfg.InitDefaults().
 type Config struct {
@@ -159,12 +201,32 @@ type Config struct {
 	// route to an interface that Addr is listening on.
 	AdvertiseAddr string
 
+	// ClusterName is the name used as a sanity check when a node joins
+	// an uninitialized cluster, or when an uninitialized node joins an
+	// initialized cluster. The initial RPC handshake verifies that the
+	// name matches on both sides. Once the cluster ID has been
+	// negotiated on both sides, the cluster name is not used any more.
+	ClusterName string
+
+	// DisableClusterNameVerification, when set, alters the cluster name
+	// verification to only verify that a non-empty cluster name on
+	// both sides match. This is meant for use while rolling an
+	// existing cluster into using a new cluster name.
+	DisableClusterNameVerification bool
+
+	// SplitListenSQL indicates whether to listen for SQL
+	// clients on a separate address from RPC requests.
+	SplitListenSQL bool
+
+	// SQLAddr is the configured SQL listen address.
+	// This is used if SplitListenSQL is set to true.
+	SQLAddr string
+
+	// SQLAdvertiseAddr is the advertised SQL address.
+	// This is computed from SQLAddr if specified otherwise Addr.
+	SQLAdvertiseAddr string
+
 	// HTTPAddr is the configured HTTP listen address.
-	//
-	// This is temporary, and will be removed when grpc.(*Server).ServeHTTP
-	// performance problems are addressed upstream.
-	//
-	// See https://github.com/grpc/grpc-go/issues/586.
 	HTTPAddr string
 
 	// HTTPAdvertiseAddr is the advertised HTTP address.
@@ -183,10 +245,10 @@ type Config struct {
 	// See the comment in server.Config for more details.
 	HistogramWindowInterval time.Duration
 
-	// HeartbeatInterval controls how often a Ping request is sent on peer
+	// RPCHeartbeatInterval controls how often a Ping request is sent on peer
 	// connections to determine connection health and update the local view
 	// of remote clocks.
-	HeartbeatInterval time.Duration
+	RPCHeartbeatInterval time.Duration
 }
 
 func wrapError(err error) error {
@@ -207,9 +269,15 @@ func (cfg *Config) InitDefaults() {
 	cfg.Addr = defaultAddr
 	cfg.AdvertiseAddr = cfg.Addr
 	cfg.HTTPAddr = defaultHTTPAddr
+	cfg.HTTPAdvertiseAddr = ""
+	cfg.SplitListenSQL = false
+	cfg.SQLAddr = defaultSQLAddr
+	cfg.SQLAdvertiseAddr = cfg.SQLAddr
 	cfg.SSLCertsDir = DefaultCertsDirectory
 	cfg.certificateManager = lazyCertificateManager{}
-	cfg.HeartbeatInterval = defaultHeartbeatInterval
+	cfg.RPCHeartbeatInterval = defaultRPCHeartbeatInterval
+	cfg.ClusterName = ""
+	cfg.DisableClusterNameVerification = false
 }
 
 // HTTPRequestScheme returns "http" or "https" based on the value of Insecure.
@@ -300,7 +368,7 @@ func (cfg *Config) PGURL(user *url.Userinfo) (*url.URL, error) {
 	return &url.URL{
 		Scheme:   "postgresql",
 		User:     user,
-		Host:     cfg.AdvertiseAddr,
+		Host:     cfg.SQLAdvertiseAddr,
 		RawQuery: options.Encode(),
 	}, nil
 }

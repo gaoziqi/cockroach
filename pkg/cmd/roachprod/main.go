@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -26,6 +21,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -70,33 +66,37 @@ destroy the cluster.
 }
 
 var (
-	numNodes       int
-	numRacks       int
-	username       string
-	dryrun         bool
-	extendLifetime time.Duration
-	listDetails    bool
-	listJSON       bool
-	listMine       bool
-	clusterType    = "cockroach"
-	secure         = false
-	nodeEnv        = "COCKROACH_ENABLE_RPC_COMPRESSION=false"
-	nodeArgs       []string
-	tag            string
-	external       = false
-	adminurlOpen   = false
-	adminurlPath   = ""
-	adminurlIPs    = false
-	useTreeDist    = true
-	encrypt        = false
-	quiet          = false
-	sig            = 9
-	waitFlag       = false
-	logsDir        string
-	logsFilter     string
-	logsFrom       time.Time
-	logsTo         time.Time
-	logsInterval   time.Duration
+	numNodes          int
+	numRacks          int
+	username          string
+	dryrun            bool
+	destroyAllMine    bool
+	extendLifetime    time.Duration
+	wipePreserveCerts bool
+	listDetails       bool
+	listJSON          bool
+	listMine          bool
+	clusterType       = "cockroach"
+	secure            = false
+	nodeEnv           = "COCKROACH_ENABLE_RPC_COMPRESSION=false"
+	nodeArgs          []string
+	tag               string
+	external          = false
+	adminurlOpen      = false
+	adminurlPath      = ""
+	adminurlIPs       = false
+	useTreeDist       = true
+	encrypt           = false
+	quiet             = false
+	sig               = 9
+	waitFlag          = false
+	stageOS           string
+	logsDir           string
+	logsFilter        string
+	logsProgramFilter string
+	logsFrom          time.Time
+	logsTo            time.Time
+	logsInterval      time.Duration
 
 	monitorIgnoreEmptyNodes bool
 	monitorOneShot          bool
@@ -113,7 +113,7 @@ func sortedClusters() []string {
 	return r
 }
 
-func newCluster(name string, reserveLoadGen bool) (*install.SyncedCluster, error) {
+func newCluster(name string) (*install.SyncedCluster, error) {
 	nodeNames := "all"
 	{
 		parts := strings.Split(name, ":")
@@ -176,13 +176,6 @@ Hint: use "roachprod sync" to update the list of available clusters.
 		}
 	}
 	c.Nodes = nodes
-	if reserveLoadGen {
-		// TODO(marc): make loadgen node configurable. For now, we always use the
-		// last ID (1-indexed).
-		c.LoadGen = len(c.VMs)
-	} else {
-		c.LoadGen = -1
-	}
 	c.Secure = secure
 	c.Env = nodeEnv
 	c.Args = nodeArgs
@@ -439,9 +432,16 @@ func setupSSH(clusterName string) error {
 	if err := loadClusters(); err != nil {
 		return err
 	}
-	installCluster, err := newCluster(clusterName, false)
+	installCluster, err := newCluster(clusterName)
 	if err != nil {
 		return err
+	}
+	// For GCP clusters we need to use the config.OSUser even if the client
+	// requested the shared user.
+	for i := range installCluster.VMs {
+		if cloudCluster.VMs[i].Provider == gce.ProviderName {
+			installCluster.Users[i] = config.OSUser.Username
+		}
 	}
 	if err := installCluster.Wait(); err != nil {
 		return err
@@ -470,67 +470,116 @@ func cleanupFailedCreate(clusterName string) error {
 }
 
 var destroyCmd = &cobra.Command{
-	Use:   "destroy <cluster 1> [<cluster 2> ...]",
+	Use:   "destroy [ --all-mine | <cluster 1> [<cluster 2> ...] ]",
 	Short: "destroy clusters",
 	Long: `Destroy one or more local or cloud-based clusters.
+
+The destroy command accepts the names of the clusters to destroy. Alternatively,
+the --all-mine flag can be provided to destroy all clusters that are owned by the
+current user.
 
 Destroying a cluster releases the resources for a cluster. For a cloud-based
 cluster the machine and associated disk resources are freed. For a local
 cluster, any processes started by roachprod are stopped, and the ${HOME}/local
 directory is removed.
 `,
-	Args: cobra.MinimumNArgs(1),
+	Args: cobra.ArbitraryArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		for _, arg := range args {
-			clusterName, err := verifyClusterName(arg)
+		switch len(args) {
+		case 0:
+			if !destroyAllMine {
+				return errors.New("no cluster name provided")
+			}
+
+			destroyPattern, err := userClusterNameRegexp()
 			if err != nil {
 				return err
 			}
 
-			if clusterName != config.Local {
-				cloud, err := cld.ListCloud()
-				if err != nil {
-					return err
-				}
+			cloud, err := cld.ListCloud()
+			if err != nil {
+				return err
+			}
 
-				c, ok := cloud.Clusters[clusterName]
-				if !ok {
-					return fmt.Errorf("cluster %s does not exist", clusterName)
+			var names []string
+			for name := range cloud.Clusters {
+				if destroyPattern.MatchString(name) {
+					names = append(names, name)
 				}
+			}
+			sort.Strings(names)
 
-				fmt.Printf("Destroying cluster %s with %d nodes\n", clusterName, len(c.VMs))
-				if err := cld.DestroyCluster(c); err != nil {
-					return err
-				}
-			} else {
-				if _, ok := install.Clusters[clusterName]; !ok {
-					return fmt.Errorf("cluster %s does not exist", clusterName)
-				}
-				c, err := newCluster(clusterName, false /* reserveLoadGen */)
-				if err != nil {
-					return err
-				}
-				c.Wipe()
-				for _, i := range c.Nodes {
-					err := os.RemoveAll(fmt.Sprintf(os.ExpandEnv("${HOME}/local/%d"), i))
-					if err != nil {
-						return err
-					}
-				}
-				if err := os.Remove(filepath.Join(os.ExpandEnv(config.DefaultHostDir), c.Name)); err != nil {
+			for _, clusterName := range names {
+				if err := destroyCluster(cloud, clusterName); err != nil {
 					return err
 				}
 			}
-		}
+		default:
+			if destroyAllMine {
+				return errors.New("--all-mine cannot be combined with cluster names")
+			}
 
+			var cloud *cld.Cloud
+			for _, arg := range args {
+				clusterName, err := verifyClusterName(arg)
+				if err != nil {
+					return err
+				}
+
+				if clusterName != config.Local {
+					if cloud == nil {
+						cloud, err = cld.ListCloud()
+						if err != nil {
+							return err
+						}
+					}
+
+					if err := destroyCluster(cloud, clusterName); err != nil {
+						return err
+					}
+				} else {
+					if err := destroyLocalCluster(); err != nil {
+						return err
+					}
+				}
+			}
+		}
 		fmt.Println("OK")
 		return nil
 	}),
 }
 
+func destroyCluster(cloud *cld.Cloud, clusterName string) error {
+	c, ok := cloud.Clusters[clusterName]
+	if !ok {
+		return fmt.Errorf("cluster %s does not exist", clusterName)
+	}
+	fmt.Printf("Destroying cluster %s with %d nodes\n", clusterName, len(c.VMs))
+	return cld.DestroyCluster(c)
+}
+
+func destroyLocalCluster() error {
+	if _, ok := install.Clusters[config.Local]; !ok {
+		return fmt.Errorf("cluster %s does not exist", config.Local)
+	}
+	c, err := newCluster(config.Local)
+	if err != nil {
+		return err
+	}
+	c.Wipe(false)
+	for _, i := range c.Nodes {
+		err := os.RemoveAll(fmt.Sprintf(os.ExpandEnv("${HOME}/local/%d"), i))
+		if err != nil {
+			return err
+		}
+	}
+	return os.Remove(filepath.Join(os.ExpandEnv(config.DefaultHostDir), c.Name))
+}
+
 var cachedHostsCmd = &cobra.Command{
 	Use:   "cached-hosts",
 	Short: "list all clusters (and optionally their host numbers) from local cache",
+	Args:  cobra.NoArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
 		if err := loadClusters(); err != nil {
 			return err
@@ -606,31 +655,14 @@ The --json flag sets the format of the command output to json.
 Listing clusters has the side-effect of syncing ssh keys/configs and the local
 hosts file.
 `,
+	Args: cobra.RangeArgs(0, 1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
 		listPattern := regexp.MustCompile(".*")
 		switch len(args) {
 		case 0:
 			if listMine {
-				// In general, we expect that users will have the same
-				// account name across the services they're using,
-				// but we still want to function even if this is not
-				// the case.
-				seenAccounts := map[string]bool{}
-				accounts, err := vm.FindActiveAccounts()
-				if err != nil {
-					return err
-				}
-				pattern := ""
-				for _, account := range accounts {
-					if !seenAccounts[account] {
-						seenAccounts[account] = true
-						if len(pattern) > 0 {
-							pattern += "|"
-						}
-						pattern += fmt.Sprintf("(^%s-)", regexp.QuoteMeta(account))
-					}
-				}
-				listPattern, err = regexp.Compile(pattern)
+				var err error
+				listPattern, err = userClusterNameRegexp()
 				if err != nil {
 					return err
 				}
@@ -716,6 +748,31 @@ hosts file.
 	}),
 }
 
+// userClusterNameRegexp returns a regexp that matches all clusters owned by the
+// current user.
+func userClusterNameRegexp() (*regexp.Regexp, error) {
+	// In general, we expect that users will have the same
+	// account name across the services they're using,
+	// but we still want to function even if this is not
+	// the case.
+	seenAccounts := map[string]bool{}
+	accounts, err := vm.FindActiveAccounts()
+	if err != nil {
+		return nil, err
+	}
+	pattern := ""
+	for _, account := range accounts {
+		if !seenAccounts[account] {
+			seenAccounts[account] = true
+			if len(pattern) > 0 {
+				pattern += "|"
+			}
+			pattern += fmt.Sprintf("(^%s-)", regexp.QuoteMeta(account))
+		}
+	}
+	return regexp.Compile(pattern)
+}
+
 // TODO(peter): Do we need this command given that the "list" command syncs as
 // a side-effect. If you don't care about the list output, just "roachprod list
 // &>/dev/null".
@@ -723,6 +780,7 @@ var syncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "sync ssh keys/config and hosts files",
 	Long:  ``,
+	Args:  cobra.NoArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
 		_, err := syncCloud(quiet)
 		return err
@@ -828,6 +886,7 @@ var gcCmd = &cobra.Command{
 Destroys expired clusters, sending email if properly configured. Usually run
 hourly by a cronjob so it is not necessary to run manually.
 `,
+	Args: cobra.NoArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
 		cloud, err := cld.ListCloud()
 		if err != nil {
@@ -920,7 +979,7 @@ cluster setting will be set to its value.
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -951,7 +1010,7 @@ other signals.
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -965,7 +1024,7 @@ other signals.
 }
 
 var statusCmd = &cobra.Command{
-	Use:   "status",
+	Use:   "status <cluster>",
 	Short: "retrieve the status of nodes in a cluster",
 	Long: `Retrieve the status of nodes in a cluster.
 
@@ -980,7 +1039,7 @@ The "status" command outputs the binary and PID for the specified nodes:
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1000,7 +1059,7 @@ into a single stream.
 `,
 	Args: cobra.RangeArgs(1, 2),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1010,7 +1069,7 @@ into a single stream.
 		} else {
 			dest = c.Name + ".logs"
 		}
-		return c.Logs(logsDir, dest, username, logsFilter, logsInterval, logsFrom, logsTo, cmd.OutOrStdout())
+		return c.Logs(logsDir, dest, username, logsFilter, logsProgramFilter, logsInterval, logsFrom, logsTo, cmd.OutOrStdout())
 	}),
 }
 
@@ -1033,7 +1092,7 @@ of nodes, outputting a line whenever a change is detected:
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1066,11 +1125,11 @@ nodes.
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
-		c.Wipe()
+		c.Wipe(wipePreserveCerts)
 		return nil
 	}),
 }
@@ -1101,7 +1160,7 @@ the 'zfs rollback' command:
 
 	Args: cobra.ExactArgs(2),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1145,7 +1204,7 @@ var runCmd = &cobra.Command{
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: wrap(func(_ *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1165,31 +1224,6 @@ var runCmd = &cobra.Command{
 	}),
 }
 
-var testCmd = &cobra.Command{
-	Use:   "test <cluster> <name>...",
-	Short: "run one or more tests on a cluster",
-	Long: `Run one or more tests on a cluster. The test <name> must be one of:
-
-    ` + strings.Join(allTests(), "\n    ") + `
-
-Alternately, an interrupted test can be resumed by specifying the output
-directory of a previous test. For example:
-
-	roachprod test denim kv_0.cockroach-6151ae1
-
-will restart the kv_0 test on denim using the cockroach binary with the build
-tag 6151ae1.`,
-	Args: cobra.MinimumNArgs(2),
-	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		for _, arg := range args[1:] {
-			if err := runTest(arg, args[0]); err != nil {
-				return err
-			}
-		}
-		return nil
-	}),
-}
-
 var installCmd = &cobra.Command{
 	Use:   "install <cluster> <software>",
 	Short: "install 3rd party software",
@@ -1199,7 +1233,7 @@ var installCmd = &cobra.Command{
 `,
 	Args: cobra.MinimumNArgs(2),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1231,9 +1265,27 @@ Some examples of usage:
 `,
 	Args: cobra.RangeArgs(2, 3),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
+		}
+
+		os := "linux"
+		if stageOS != "" {
+			os = stageOS
+		} else if c.IsLocal() {
+			os = runtime.GOOS
+		}
+		var debugArch, releaseArch string
+		switch os {
+		case "linux":
+			debugArch, releaseArch = "linux-gnu-amd64", "linux-amd64"
+		case "darwin":
+			debugArch, releaseArch = "darwin-amd64", "darwin-10.9-amd64"
+		case "windows":
+			debugArch, releaseArch = "windows-amd64", "windows-6.2-amd64"
+		default:
+			return errors.Errorf("cannot stage binary on %s", os)
 		}
 
 		applicationName := args[1]
@@ -1244,17 +1296,36 @@ Some examples of usage:
 		switch applicationName {
 		case "cockroach":
 			return install.StageRemoteBinary(
-				c, applicationName, "cockroach/cockroach.linux-gnu-amd64", versionArg,
+				c, applicationName, "cockroach/cockroach", versionArg, debugArch,
 			)
 		case "workload":
 			return install.StageRemoteBinary(
-				c, applicationName, "cockroach/workload", versionArg,
+				c, applicationName, "cockroach/workload", versionArg, "", /* arch */
 			)
 		case "release":
-			return install.StageCockroachRelease(c, versionArg)
+			return install.StageCockroachRelease(c, versionArg, releaseArch)
 		default:
 			return fmt.Errorf("unknown application %s", applicationName)
 		}
+	}),
+}
+
+var distributeCertsCmd = &cobra.Command{
+	Use:   "distribute-certs <cluster>",
+	Short: "distribute certificates to the nodes in a cluster",
+	Long: `Distribute certificates to the nodes in a cluster.
+If the certificates already exist, no action is taken. Note that this command is
+invoked automatically when a secure cluster is bootstrapped by "roachprod
+start."
+`,
+	Args: cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		c, err := newCluster(args[0])
+		if err != nil {
+			return err
+		}
+		c.DistributeCerts()
+		return nil
 	}),
 }
 
@@ -1270,7 +1341,7 @@ var putCmd = &cobra.Command{
 		if len(args) == 3 {
 			dest = args[2]
 		}
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1292,7 +1363,7 @@ multiple nodes the destination file name will be prefixed with the node number.
 		if len(args) == 3 {
 			dest = args[2]
 		}
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1307,7 +1378,7 @@ var sqlCmd = &cobra.Command{
 	Long:  "Run `cockroach sql` on a remote cluster.\n",
 	Args:  cobra.MinimumNArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1326,7 +1397,7 @@ var pgurlCmd = &cobra.Command{
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1362,7 +1433,7 @@ var adminurlCmd = &cobra.Command{
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1409,7 +1480,7 @@ var ipCmd = &cobra.Command{
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		c, err := newCluster(args[0], false /* reserveLoadGen */)
+		c, err := newCluster(args[0])
 		if err != nil {
 			return err
 		}
@@ -1436,34 +1507,6 @@ var ipCmd = &cobra.Command{
 	}),
 }
 
-var webCmd = &cobra.Command{
-	Use:   "web <testdir> [<testdir>]",
-	Short: "visualize and compare test output",
-	Long: `Visualize test output.
-
-The "web" command can visualize the output of a single test or compare the
-output of two or more tests.
-`,
-	Args: cobra.MinimumNArgs(1),
-	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return web(args)
-	}),
-}
-
-var dumpCmd = &cobra.Command{
-	Use:   "dump <testdir> [<testdir>]",
-	Short: "dump test output",
-	Long: `Display test output.
-
-The "dump" command can display the output of a single test or compare the
-output of two tests.
-`,
-	Args: cobra.RangeArgs(1, 2),
-	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return dump(args)
-	}),
-}
-
 func main() {
 	// The commands are displayed in the order they are added to rootCmd. Note
 	// that gcCmd and adminurlCmd contain a trailing \n in their Short help in
@@ -1485,8 +1528,8 @@ func main() {
 		runCmd,
 		wipeCmd,
 		reformatCmd,
-		testCmd,
 		installCmd,
+		distributeCertsCmd,
 		putCmd,
 		getCmd,
 		stageCmd,
@@ -1496,8 +1539,6 @@ func main() {
 		adminurlCmd,
 		logsCmd,
 
-		webCmd,
-		dumpCmd,
 		cachedHostsCmd,
 	)
 	rootCmd.BashCompletionFunction = fmt.Sprintf(`__custom_func()
@@ -1525,7 +1566,7 @@ func main() {
 				s = append(s, fmt.Sprintf("%s_%s", rootCmd.Name(), cmd.Name()))
 			}
 			return s
-		}(createCmd, listCmd, syncCmd, gcCmd, webCmd, dumpCmd), " | "),
+		}(createCmd, listCmd, syncCmd, gcCmd), " | "),
 	)
 
 	rootCmd.PersistentFlags().BoolVarP(
@@ -1537,7 +1578,7 @@ func main() {
 	}
 
 	for _, cmd := range []*cobra.Command{statusCmd, monitorCmd, startCmd,
-		stopCmd, runCmd, wipeCmd, reformatCmd, testCmd, installCmd, putCmd, getCmd,
+		stopCmd, runCmd, wipeCmd, reformatCmd, installCmd, putCmd, getCmd,
 		sqlCmd, pgurlCmd, adminurlCmd, ipCmd,
 	} {
 		cmd.Flags().BoolVar(
@@ -1572,6 +1613,9 @@ func main() {
 		// commands.
 		p.Flags().ConfigureClusterFlags(createCmd.Flags(), vm.SingleProject)
 	}
+
+	destroyCmd.Flags().BoolVarP(&destroyAllMine,
+		"all-mine", "m", false, "Destroy all clusters belonging to the current user")
 
 	extendCmd.Flags().DurationVarP(&extendLifetime,
 		"lifetime", "l", 12*time.Hour, "Lifetime of the cluster")
@@ -1609,10 +1653,7 @@ func main() {
 	stopCmd.Flags().IntVar(&sig, "sig", sig, "signal to pass to kill")
 	stopCmd.Flags().BoolVar(&waitFlag, "wait", waitFlag, "wait for processes to exit")
 
-	testCmd.Flags().DurationVarP(
-		&duration, "duration", "d", 5*time.Minute, "the duration to run each test")
-	testCmd.Flags().StringVarP(
-		&concurrency, "concurrency", "c", "1-64", "the concurrency to run each test")
+	wipeCmd.Flags().BoolVar(&wipePreserveCerts, "preserve-certs", false, "do not wipe certificates")
 
 	for _, cmd := range []*cobra.Command{
 		startCmd, statusCmd, stopCmd, runCmd,
@@ -1630,6 +1671,8 @@ func main() {
 
 	putCmd.Flags().BoolVar(&useTreeDist, "treedist", useTreeDist, "use treedist copy algorithm")
 
+	stageCmd.Flags().StringVar(&stageOS, "os", "", "operating system override for staged binaries")
+
 	logsCmd.Flags().StringVar(
 		&logsFilter, "filter", "", "re to filter log messages")
 	logsCmd.Flags().Var(
@@ -1640,6 +1683,8 @@ func main() {
 		&logsInterval, "interval", 200*time.Millisecond, "interval to poll logs from host")
 	logsCmd.Flags().StringVar(
 		&logsDir, "logs-dir", "logs", "path to the logs dir, if remote, relative to username's home dir, ignored if local")
+	logsCmd.Flags().StringVar(
+		&logsProgramFilter, "logs-program", "^cockroach$", "regular expression of the name of program in log files to search")
 
 	monitorCmd.Flags().BoolVar(
 		&monitorIgnoreEmptyNodes,
@@ -1658,11 +1703,11 @@ func main() {
 	cachedHostsCmd.Flags().StringVar(&cachedHostsCluster, "cluster", "", "print hosts matching cluster")
 
 	for _, cmd := range []*cobra.Command{
-		getCmd, putCmd, runCmd, startCmd, statusCmd, stopCmd, testCmd,
+		getCmd, putCmd, runCmd, startCmd, statusCmd, stopCmd,
 		wipeCmd, pgurlCmd, adminurlCmd, sqlCmd, installCmd,
 	} {
 		switch cmd {
-		case startCmd, testCmd:
+		case startCmd:
 			cmd.Flags().BoolVar(
 				&install.StartOpts.Sequential, "sequential", true,
 				"start nodes sequentially so node IDs match hostnames")

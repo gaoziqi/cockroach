@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -26,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 )
 
@@ -51,6 +48,7 @@ func prepareExpr(t *testing.T, datumExpr string) tree.TypedExpr {
 }
 
 func TestDatumOrdering(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	const valIsMin = `min`
 	const valIsMax = `max`
 	const noPrev = ``
@@ -303,6 +301,7 @@ func TestDatumOrdering(t *testing.T) {
 }
 
 func TestDFloatCompare(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	values := []tree.Datum{tree.DNull}
 	for _, x := range []float64{math.NaN(), math.Inf(-1), -1, 0, 1, math.Inf(1)} {
 		values = append(values, tree.NewDFloat(tree.DFloat(x)))
@@ -328,6 +327,7 @@ func TestDFloatCompare(t *testing.T) {
 // TestParseDIntervalWithField tests that the additional features available
 // to tree.ParseDIntervalWithField beyond those in tree.ParseDInterval behave as expected.
 func TestParseDIntervalWithField(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		str      string
 		field    tree.DurationField
@@ -374,6 +374,7 @@ func TestParseDIntervalWithField(t *testing.T) {
 }
 
 func TestParseDDate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		str      string
 		expected string
@@ -415,6 +416,7 @@ func TestParseDDate(t *testing.T) {
 }
 
 func TestParseDBool(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		str      string
 		expected *tree.DBool
@@ -476,6 +478,7 @@ func TestParseDBool(t *testing.T) {
 }
 
 func TestParseDTime(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	// Since ParseDTime mostly delegates parsing logic to ParseDTimestamp, we only test a subset of
 	// the timestamp test cases.
 	testData := []struct {
@@ -503,6 +506,7 @@ func TestParseDTime(t *testing.T) {
 }
 
 func TestParseDTimeError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []string{
 		"",
 		"foo",
@@ -517,6 +521,7 @@ func TestParseDTimeError(t *testing.T) {
 }
 
 func TestParseDTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		str      string
 		expected time.Time
@@ -568,6 +573,7 @@ func TestParseDTimestamp(t *testing.T) {
 }
 
 func TestMakeDJSON(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	j1, err := tree.MakeDJSON(1)
 	if err != nil {
 		t.Fatal(err)
@@ -582,6 +588,7 @@ func TestMakeDJSON(t *testing.T) {
 }
 
 func TestIsDistinctFrom(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		a        string // comma separated list of strings, `NULL` is converted to a NULL
 		b        string // same as a
@@ -678,6 +685,7 @@ func TestIsDistinctFrom(t *testing.T) {
 }
 
 func TestAllTypesAsJSON(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for _, typ := range types.Scalar {
 		d := tree.SampleDatum(typ)
 		_, err := tree.AsJSON(d)

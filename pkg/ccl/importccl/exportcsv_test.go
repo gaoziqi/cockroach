@@ -18,14 +18,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/gogo/protobuf/proto"
 )
 
@@ -41,7 +42,8 @@ func setupExportableBank(t *testing.T, nodes, rows int) (*sqlutils.SQLRunner, st
 	db.Exec(t, "CREATE DATABASE test")
 
 	wk := bank.FromRows(rows)
-	if _, err := workload.Setup(ctx, conn, wk, 100, 3); err != nil {
+	l := workloadsql.InsertsDataLoader{BatchSize: 100, Concurrency: 3}
+	if _, err := workloadsql.Setup(ctx, conn, wk, l); err != nil {
 		t.Fatal(err)
 	}
 
@@ -51,12 +53,9 @@ func setupExportableBank(t *testing.T, nodes, rows int) (*sqlutils.SQLRunner, st
 		t.Fatal(err)
 	}
 	last := uint32(v.ValueInt())
-	zoneConfig := config.DefaultZoneConfig()
+	zoneConfig := zonepb.DefaultZoneConfig()
 	zoneConfig.RangeMaxBytes = proto.Int64(5000)
 	config.TestingSetZoneConfig(last+1, zoneConfig)
-	if err := workload.Split(ctx, conn, wk.Tables()[0], 1 /* concurrency */); err != nil {
-		t.Fatal(err)
-	}
 	db.Exec(t, "ALTER TABLE bank SCATTER")
 	db.Exec(t, "SELECT 'force a scan to repopulate range cache' FROM [SELECT count(*) FROM bank]")
 
@@ -210,7 +209,7 @@ func TestExportShow(t *testing.T) {
 	defer srv.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
-	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal:///show' FROM SELECT * FROM [SHOW DATABASES]`)
+	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal:///show' FROM SELECT * FROM [SHOW DATABASES] ORDER BY database_name`)
 	content, err := ioutil.ReadFile(filepath.Join(dir, "show", "n1.0.csv"))
 	if err != nil {
 		t.Fatal(err)

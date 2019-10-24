@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -21,9 +17,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestParseArray(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		str      string
 		typ      *types.T
@@ -106,6 +104,7 @@ const randomArrayMaxLength = 10
 const randomStringMaxLength = 1000
 
 func TestParseArrayRandomParseArray(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for i := 0; i < randomArrayIterations; i++ {
 		numElems := rand.Intn(randomArrayMaxLength)
 		ary := make([][]byte, numElems)
@@ -154,29 +153,30 @@ func TestParseArrayRandomParseArray(t *testing.T) {
 }
 
 func TestParseArrayError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		str           string
 		typ           *types.T
 		expectedError string
 	}{
-		{``, types.Int, "array must be enclosed in { and }"},
-		{`1`, types.Int, "array must be enclosed in { and }"},
-		{`1,2`, types.Int, "array must be enclosed in { and }"},
-		{`{1,2`, types.Int, "malformed array"},
-		{`{1,2,`, types.Int, "malformed array"},
-		{`{`, types.Int, "malformed array"},
-		{`{,}`, types.Int, "malformed array"},
-		{`{}{}`, types.Int, "extra text after closing right brace"},
-		{`{} {}`, types.Int, "extra text after closing right brace"},
-		{`{{}}`, types.Int, "unimplemented: nested arrays not supported"},
-		{`{1, {1}}`, types.Int, "unimplemented: nested arrays not supported"},
-		{`{hello}`, types.Int, `could not parse "hello" as type int: strconv.ParseInt: parsing "hello": invalid syntax`},
-		{`{"hello}`, types.String, `malformed array`},
+		{``, types.Int, `could not parse "" as type int[]: array must be enclosed in { and }`},
+		{`1`, types.Int, `could not parse "1" as type int[]: array must be enclosed in { and }`},
+		{`1,2`, types.Int, `could not parse "1,2" as type int[]: array must be enclosed in { and }`},
+		{`{1,2`, types.Int, `could not parse "{1,2" as type int[]: malformed array`},
+		{`{1,2,`, types.Int, `could not parse "{1,2," as type int[]: malformed array`},
+		{`{`, types.Int, `could not parse "{" as type int[]: malformed array`},
+		{`{,}`, types.Int, `could not parse "{,}" as type int[]: malformed array`},
+		{`{}{}`, types.Int, `could not parse "{}{}" as type int[]: extra text after closing right brace`},
+		{`{} {}`, types.Int, `could not parse "{} {}" as type int[]: extra text after closing right brace`},
+		{`{{}}`, types.Int, `could not parse "{{}}" as type int[]: unimplemented: nested arrays not supported`},
+		{`{1, {1}}`, types.Int, `could not parse "{1, {1}}" as type int[]: unimplemented: nested arrays not supported`},
+		{`{hello}`, types.Int, `could not parse "{hello}" as type int[]: could not parse "hello" as type int: strconv.ParseInt: parsing "hello": invalid syntax`},
+		{`{"hello}`, types.String, `could not parse "{\"hello}" as type string[]: malformed array`},
 		// It might be unnecessary to disallow this, but Postgres does.
-		{`{he"lo}`, types.String, "malformed array"},
+		{`{he"lo}`, types.String, `could not parse "{he\"lo}" as type string[]: malformed array`},
 
-		{string([]byte{200}), types.String, "array must be enclosed in { and }"},
-		{string([]byte{'{', 'a', 200}), types.String, "malformed array"},
+		{string([]byte{200}), types.String, `could not parse "\xc8" as type string[]: array must be enclosed in { and }`},
+		{string([]byte{'{', 'a', 200}), types.String, `could not parse "{a\xc8" as type string[]: malformed array`},
 	}
 	for _, td := range testData {
 		t.Run(td.str, func(t *testing.T) {

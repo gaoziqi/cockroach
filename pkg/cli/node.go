@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -50,7 +46,7 @@ To retrieve the IDs for inactive members, see 'node status --decommission'.
 }
 
 func runLsNodes(cmd *cobra.Command, args []string) error {
-	conn, err := getPasswordAndMakeSQLClient("cockroach node ls")
+	conn, err := makeSQLClient("cockroach node ls", useSystemDb)
 	if err != nil {
 		return err
 	}
@@ -78,9 +74,11 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 var baseNodeColumnHeaders = []string{
 	"id",
 	"address",
+	"sql_address",
 	"build",
 	"started_at",
 	"updated_at",
+	"locality",
 	"is_available",
 	"is_live",
 }
@@ -129,7 +127,6 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 }
 
 func runStatusNodeInner(showDecommissioned bool, args []string) ([]string, [][]string, error) {
-
 	joinUsingID := func(queries []string) (query string) {
 		for i, q := range queries {
 			if i == 0 {
@@ -151,14 +148,16 @@ func runStatusNodeInner(showDecommissioned bool, args []string) ([]string, [][]s
 	baseQuery := maybeAddActiveNodesFilter(
 		`SELECT node_id AS id,
             address,
+            sql_address,
             build_tag AS build,
             started_at,
-            updated_at,
+			updated_at,
+			locality,
             CASE WHEN split_part(expiration,',',1)::decimal > now()::decimal
                  THEN true
                  ELSE false
                  END AS is_available,
-            ifnull(is_live, false)
+			ifnull(is_live, false)
      FROM crdb_internal.gossip_liveness LEFT JOIN crdb_internal.gossip_nodes USING (node_id)`,
 	)
 
@@ -189,7 +188,7 @@ SELECT node_id AS id,
        draining AS is_draining
 FROM crdb_internal.gossip_liveness LEFT JOIN crdb_internal.gossip_nodes USING (node_id)`
 
-	conn, err := getPasswordAndMakeSQLClient("cockroach node status")
+	conn, err := makeSQLClient("cockroach node status", useSystemDb)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -254,7 +253,7 @@ func getStatusNodeHeaders() []string {
 }
 
 func getStatusNodeAlignment() string {
-	align := "rllll"
+	align := "rlllll"
 	if nodeCtx.statusShowAll || nodeCtx.statusShowRanges {
 		align += "rrrrrr"
 	}

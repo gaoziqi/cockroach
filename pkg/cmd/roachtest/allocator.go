@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -27,7 +22,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-func registerAllocator(r *registry) {
+func registerAllocator(r *testRegistry) {
 	runAllocator := func(ctx context.Context, t *test, c *cluster, start int, maxStdDev float64) {
 		const fixturePath = `gs://cockroach-fixtures/workload/tpch/scalefactor=10/backup`
 		c.Put(ctx, cockroach, "./cockroach")
@@ -50,10 +45,10 @@ func registerAllocator(r *registry) {
 		m.Wait()
 
 		// Start the remaining nodes to kick off upreplication/rebalancing.
-		c.Start(ctx, t, c.Range(start+1, c.nodes), args)
+		c.Start(ctx, t, c.Range(start+1, c.spec.NodeCount), args)
 
 		c.Run(ctx, c.Node(1), `./workload init kv --drop`)
-		for node := 1; node <= c.nodes; node++ {
+		for node := 1; node <= c.spec.NodeCount; node++ {
 			node := node
 			// TODO(dan): Ideally, the test would fail if this queryload failed,
 			// but we can't put it in monitor as-is because the test deadlocks.
@@ -252,7 +247,7 @@ func waitForRebalance(ctx context.Context, l *logger, db *gosql.DB, maxStdDev fl
 }
 
 func runWideReplication(ctx context.Context, t *test, c *cluster) {
-	nodes := c.nodes
+	nodes := c.spec.NodeCount
 	if nodes != 9 {
 		t.Fatalf("9-node cluster required")
 	}
@@ -265,7 +260,14 @@ func runWideReplication(ctx context.Context, t *test, c *cluster) {
 	defer db.Close()
 
 	zones := func() []string {
-		rows, err := db.Query(`SELECT zone_name FROM crdb_internal.zones`)
+		oldVersion := false
+		rows, err := db.Query(`SELECT target FROM crdb_internal.zones`)
+		// TODO(solon): Remove this block once we are no longer running roachtest
+		// against version 19.1 and earlier.
+		if err != nil && strings.Contains(err.Error(), `column "target" does not exist`) {
+			oldVersion = true
+			rows, err = db.Query(`SELECT zone_name FROM crdb_internal.zones`)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -275,6 +277,19 @@ func runWideReplication(ctx context.Context, t *test, c *cluster) {
 			var name string
 			if err := rows.Scan(&name); err != nil {
 				t.Fatal(err)
+			}
+			// TODO(solon): Remove this block once we are no longer running roachtest
+			// against version 19.1 and earlier.
+			if oldVersion {
+				which := "RANGE"
+				if name[0] == '.' {
+					name = name[1:]
+				} else if strings.Count(name, ".") == 0 {
+					which = "DATABASE"
+				} else {
+					which = "TABLE"
+				}
+				name = fmt.Sprintf("%s %s", which, name)
 			}
 			results = append(results, name)
 		}
@@ -292,16 +307,7 @@ func runWideReplication(ctx context.Context, t *test, c *cluster) {
 		// Change every zone to have the same number of replicas as the number of
 		// nodes in the cluster.
 		for _, zone := range zones() {
-			which := "RANGE"
-			if zone[0] == '.' {
-				zone = zone[1:]
-			} else if strings.Count(zone, ".") == 0 {
-				which = "DATABASE"
-			} else {
-				which = "TABLE"
-			}
-			run(fmt.Sprintf(`ALTER %s %s CONFIGURE ZONE USING num_replicas = %d`,
-				which, zone, width))
+			run(fmt.Sprintf(`ALTER %s CONFIGURE ZONE USING num_replicas = %d`, zone, width))
 		}
 	}
 	setReplication(nodes)

@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -27,13 +22,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func registerHotSpotSplits(r *registry) {
+func registerHotSpotSplits(r *testRegistry) {
 	// This test sets up a cluster and runs kv on it with high concurrency and a large block size
 	// to force a large range. We then make sure that the largest range isn't larger than a threshold and
 	// that backpressure is working correctly.
 	runHotSpot := func(ctx context.Context, t *test, c *cluster, duration time.Duration, concurrency int) {
-		roachNodes := c.Range(1, c.nodes-1)
-		appNode := c.Node(c.nodes)
+		roachNodes := c.Range(1, c.spec.NodeCount-1)
+		appNode := c.Node(c.spec.NodeCount)
 
 		c.Put(ctx, cockroach, "./cockroach", roachNodes)
 		c.Start(ctx, t, roachNodes)
@@ -53,9 +48,11 @@ func registerHotSpotSplits(r *registry) {
 			}
 			defer quietL.close()
 
-			const blockSize = 1 << 19 // 512 KB
+			// TODO(rytaft): reset this to 1 << 19 (512 KB) once we can dynamically
+			// size kv batches.
+			const blockSize = 1 << 18 // 256 KB
 			return c.RunL(ctx, quietL, appNode, fmt.Sprintf(
-				"./workload run kv --read-percent=0 --splits=0 --tolerate-errors --concurrency=%d "+
+				"./workload run kv --read-percent=0 --tolerate-errors --concurrency=%d "+
 					"--min-block-bytes=%d --max-block-bytes=%d --duration=%s {pgurl:1-3}",
 				concurrency, blockSize, blockSize, duration.String()))
 		})

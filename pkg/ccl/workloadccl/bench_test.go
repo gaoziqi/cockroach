@@ -6,7 +6,7 @@
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
-package workloadccl
+package workloadccl_test
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/workloadccl"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/workload"
@@ -33,9 +34,9 @@ func benchmarkImportFixture(b *testing.B, gen workload.Generator) {
 
 		b.StartTimer()
 		const filesPerNode = 1
-		const directIngest, noInjectStats, skipPostLoad, csvServer = true, false, true, ``
-		importBytes, err := ImportFixture(
-			ctx, db, gen, `d`, directIngest, filesPerNode, noInjectStats, skipPostLoad, csvServer,
+		const noInjectStats, csvServer = false, ``
+		importBytes, err := workloadccl.ImportFixture(
+			ctx, db, gen, `d`, filesPerNode, noInjectStats, csvServer,
 		)
 		require.NoError(b, err)
 		bytes += importBytes

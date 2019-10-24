@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -20,8 +16,8 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -74,18 +70,13 @@ type scanNode struct {
 
 	spans   []roachpb.Span
 	reverse bool
-	props   physicalProps
+
+	reqOrdering ReqOrdering
 
 	// filter that can be evaluated using only this table/index; it contains
 	// tree.IndexedVar leaves generated using filterVars.
 	filter     tree.TypedExpr
 	filterVars tree.IndexedVarHelper
-
-	// origFilter is the original filtering expression, which might have gotten
-	// simplified during index selection. For example "k > 0" is converted to a
-	// span and the filter is nil. But we still want to deduce not-null columns
-	// from the original filter.
-	origFilter tree.TypedExpr
 
 	// if non-zero, hardLimit indicates that the scanNode only needs to provide
 	// this many rows (after applying any filter). It is a "hard" guarantee that
@@ -123,6 +114,11 @@ type scanNode struct {
 
 	// Indicates if this scan is the source for a delete node.
 	isDeleteSource bool
+
+	// estimatedRowCount is the estimated number of rows that this scanNode will
+	// output. When there are no statistics to make the estimation, it will be
+	// set to zero.
+	estimatedRowCount uint64
 }
 
 // scanVisibility represents which table columns should be included in a scan.
@@ -136,12 +132,12 @@ const (
 	publicAndNonPublicColumns scanVisibility = 1
 )
 
-func (s scanVisibility) toDistSQLScanVisibility() distsqlpb.ScanVisibility {
+func (s scanVisibility) toDistSQLScanVisibility() execinfrapb.ScanVisibility {
 	switch s {
 	case publicColumns:
-		return distsqlpb.ScanVisibility_PUBLIC
+		return execinfrapb.ScanVisibility_PUBLIC
 	case publicAndNonPublicColumns:
-		return distsqlpb.ScanVisibility_PUBLIC_AND_NOT_PUBLIC
+		return execinfrapb.ScanVisibility_PUBLIC_AND_NOT_PUBLIC
 	default:
 		panic(fmt.Sprintf("Unknown visibility %+v", s))
 	}
@@ -227,7 +223,7 @@ func (n *scanNode) canParallelize() bool {
 	// We can't parallelize if we have a non-zero limit hint, since DistSender
 	// is limited to running limited batches serially.
 	return n.maxResults != 0 &&
-		n.maxResults < distsqlrun.ParallelScanResultThreshold &&
+		n.maxResults < execinfra.ParallelScanResultThreshold &&
 		n.limitHint() == 0 &&
 		n.parallelScansEnabled
 }
@@ -411,56 +407,4 @@ func (n *scanNode) initDescDefaults(planDeps planDependencies, colCfg scanColumn
 	}
 	n.filterVars = tree.MakeIndexedVarHelper(n, len(n.cols))
 	return nil
-}
-
-// initOrdering initializes the ordering info using the selected index. This
-// must be called after index selection is performed.
-func (n *scanNode) initOrdering(exactPrefix int, evalCtx *tree.EvalContext) {
-	if n.index == nil {
-		return
-	}
-	n.props = n.computePhysicalProps(n.index, exactPrefix, n.reverse, evalCtx)
-}
-
-// computePhysicalProps calculates ordering information for table columns
-// assuming that:
-//   - we scan a given index (potentially in reverse order), and
-//   - the first `exactPrefix` columns of the index each have a constant value
-//     (see physicalProps).
-func (n *scanNode) computePhysicalProps(
-	index *sqlbase.IndexDescriptor, exactPrefix int, reverse bool, evalCtx *tree.EvalContext,
-) physicalProps {
-	var pp physicalProps
-
-	columnIDs, dirs := index.FullColumnIDs()
-
-	var keySet util.FastIntSet
-	for i, colID := range columnIDs {
-		idx, ok := n.colIdxMap[colID]
-		if !ok {
-			panic(fmt.Sprintf("index refers to unknown column id %d", colID))
-		}
-		if i < exactPrefix {
-			pp.addConstantColumn(idx)
-		} else {
-			dir, err := dirs[i].ToEncodingDirection()
-			if err != nil {
-				panic(err)
-			}
-			if reverse {
-				dir = dir.Reverse()
-			}
-			pp.addOrderColumn(idx, dir)
-		}
-		if !n.cols[idx].Nullable {
-			pp.addNotNullColumn(idx)
-		}
-		keySet.Add(idx)
-	}
-
-	// We included any implicit columns, so the columns form a (possibly weak)
-	// key.
-	pp.addWeakKey(keySet)
-	pp.applyExpr(evalCtx, n.origFilter)
-	return pp
 }

@@ -1,21 +1,18 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package client
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -108,16 +105,16 @@ type TxnSender interface {
 	// is the only one which will be invoked.
 	OnFinish(func(error))
 
-	// SetSystemConfigTrigger sets the system db trigger to true on this transaction.
-	// This will impact the EndTransactionRequest.
+	// AnchorOnSystemConfigRange ensures that the transaction record, if/when it
+	// will be created, will be created on the system config range. This is useful
+	// because some commit triggers only work when the EndTransaction is evaluated
+	// on that range.
 	//
-	// NOTE: The system db trigger will only execute correctly if the transaction
-	// record is located on the range that contains the system span. If a
-	// transaction is created which modifies both system *and* non-system data, it
-	// should be ensured that the transaction record itself is on the system span.
-	// This can be done by making sure a system key is the first key touched in the
-	// transaction.
-	SetSystemConfigTrigger() error
+	// An error is returned if the transaction's key has already been set by
+	// anything other than a previous call to this function (i.e. if the
+	// transaction already performed any writes).
+	// It is allowed to call this method multiple times.
+	AnchorOnSystemConfigRange() error
 
 	// GetMeta retrieves a copy of the TxnCoordMeta, which can be sent from root
 	// to leaf transactions or the other way around. Can be combined via
@@ -234,7 +231,9 @@ type TxnSenderFactory interface {
 	// DistSQL flow.
 	// coordMeta is the TxnCoordMeta which contains the transaction whose requests
 	// this sender will carry.
-	TransactionalSender(typ TxnType, coordMeta roachpb.TxnCoordMeta) TxnSender
+	TransactionalSender(
+		typ TxnType, coordMeta roachpb.TxnCoordMeta, pri roachpb.UserPriority,
+	) TxnSender
 	// NonTransactionalSender returns a sender to be used for non-transactional
 	// requests. Generally this is a sender that TransactionalSender() wraps.
 	NonTransactionalSender() Sender
@@ -298,8 +297,10 @@ func (m *MockTransactionalSender) OnFinish(f func(error)) {
 	}
 }
 
-// SetSystemConfigTrigger is part of the TxnSender interface.
-func (m *MockTransactionalSender) SetSystemConfigTrigger() error { panic("unimplemented") }
+// AnchorOnSystemConfigRange is part of the TxnSender interface.
+func (m *MockTransactionalSender) AnchorOnSystemConfigRange() error {
+	return fmt.Errorf("unimplemented")
+}
 
 // TxnStatus is part of the TxnSender interface.
 func (m *MockTransactionalSender) TxnStatus() roachpb.TransactionStatus {
@@ -393,7 +394,7 @@ func MakeMockTxnSenderFactory(
 
 // TransactionalSender is part of TxnSenderFactory.
 func (f MockTxnSenderFactory) TransactionalSender(
-	_ TxnType, coordMeta roachpb.TxnCoordMeta,
+	_ TxnType, coordMeta roachpb.TxnCoordMeta, _ roachpb.UserPriority,
 ) TxnSender {
 	return NewMockTransactionalSender(f.senderFunc, &coordMeta.Txn)
 }
@@ -411,9 +412,9 @@ var _ TxnSenderFactory = NonTransactionalFactoryFunc(nil)
 
 // TransactionalSender is part of the TxnSenderFactory.
 func (f NonTransactionalFactoryFunc) TransactionalSender(
-	typ TxnType, _ roachpb.TxnCoordMeta,
+	_ TxnType, _ roachpb.TxnCoordMeta, _ roachpb.UserPriority,
 ) TxnSender {
-	panic("not supported ")
+	panic("not supported")
 }
 
 // NonTransactionalSender is part of the TxnSenderFactory.

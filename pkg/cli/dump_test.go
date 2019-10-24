@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -29,7 +25,6 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
@@ -39,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/datadriven"
 	"github.com/spf13/pflag"
 )
 
@@ -122,7 +118,7 @@ func TestDumpBytes(t *testing.T) {
 	c := newCLITest(cliTestParams{t: t})
 	defer c.cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -186,7 +182,7 @@ func TestDumpRandom(t *testing.T) {
 	c := newCLITest(cliTestParams{t: t})
 	defer c.cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -443,5 +439,54 @@ INSERT INTO t (i, j) VALUES
 		t.Fatal(err)
 	} else if !strings.Contains(out, `relation d.public.t does not exist`) {
 		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
+func TestDumpInterleavedTables(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	const create = `
+CREATE DATABASE d;
+CREATE TABLE d.customers (id INT PRIMARY KEY, name STRING(50));
+CREATE TABLE d.orders (
+	customer INT,
+	id INT,
+	total DECIMAL(20, 5),
+	PRIMARY KEY (customer, id),
+	CONSTRAINT fk_customer FOREIGN KEY (customer) REFERENCES d.customers
+) INTERLEAVE IN PARENT d.customers (customer);
+`
+
+	_, err := c.RunWithCaptureArgs([]string{"sql", "-e", create})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dump1, err := c.RunWithCaptureArgs([]string{"dump", "d", "orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const want1 = `dump d orders
+CREATE TABLE orders (
+	customer INT8 NOT NULL,
+	id INT8 NOT NULL,
+	total DECIMAL(20,5) NULL,
+	CONSTRAINT "primary" PRIMARY KEY (customer ASC, id ASC),
+	FAMILY "primary" (customer, id, total)
+) INTERLEAVE IN PARENT customers (customer);
+
+ALTER TABLE orders ADD CONSTRAINT fk_customer FOREIGN KEY (customer) REFERENCES customers(id);
+CREATE UNIQUE INDEX "primary" ON orders (customer ASC, id ASC) INTERLEAVE IN PARENT customers (customer);
+
+-- Validate foreign key constraints. These can fail if there was unvalidated data during the dump.
+ALTER TABLE orders VALIDATE CONSTRAINT fk_customer;
+`
+
+	if dump1 != want1 {
+		t.Fatalf("expected: %s\ngot: %s", want1, dump1)
 	}
 }

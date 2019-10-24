@@ -15,10 +15,11 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -47,74 +48,62 @@ func TestValidIndexPartitionSetShowZones(t *testing.T) {
 	yamlDefault := fmt.Sprintf("gc: {ttlseconds: %d}", s.(*server.TestServer).Cfg.DefaultZoneConfig.GC.TTLSeconds)
 	yamlOverride := "gc: {ttlseconds: 42}"
 	zoneOverride := s.(*server.TestServer).Cfg.DefaultZoneConfig
-	zoneOverride.GC = &config.GCPolicy{TTLSeconds: 42}
-	partialZoneOverride := *config.NewZoneConfig()
-	partialZoneOverride.GC = &config.GCPolicy{TTLSeconds: 42}
+	zoneOverride.GC = &zonepb.GCPolicy{TTLSeconds: 42}
+	partialZoneOverride := *zonepb.NewZoneConfig()
+	partialZoneOverride.GC = &zonepb.GCPolicy{TTLSeconds: 42}
 
 	dbID := sqlutils.QueryDatabaseID(t, db, "d")
 	tableID := sqlutils.QueryTableID(t, db, "d", "t")
 
 	defaultRow := sqlutils.ZoneRow{
-		ID:           keys.RootNamespaceID,
-		CLISpecifier: ".default",
-		Config:       s.(*server.TestServer).Cfg.DefaultZoneConfig,
+		ID:     keys.RootNamespaceID,
+		Config: s.(*server.TestServer).Cfg.DefaultZoneConfig,
 	}
 	defaultOverrideRow := sqlutils.ZoneRow{
-		ID:           keys.RootNamespaceID,
-		CLISpecifier: ".default",
-		Config:       zoneOverride,
+		ID:     keys.RootNamespaceID,
+		Config: zoneOverride,
 	}
 	dbRow := sqlutils.ZoneRow{
-		ID:           dbID,
-		CLISpecifier: "d",
-		Config:       zoneOverride,
+		ID:     dbID,
+		Config: zoneOverride,
 	}
 	tableRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t",
-		Config:       zoneOverride,
+		ID:     tableID,
+		Config: zoneOverride,
 	}
 	primaryRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t@primary",
-		Config:       zoneOverride,
+		ID:     tableID,
+		Config: zoneOverride,
 	}
 	p0Row := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t.p0",
-		Config:       zoneOverride,
+		ID:     tableID,
+		Config: zoneOverride,
 	}
 	p1Row := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t.p1",
-		Config:       zoneOverride,
+		ID:     tableID,
+		Config: zoneOverride,
 	}
 
 	// Partially filled config rows
 	partialDbRow := sqlutils.ZoneRow{
-		ID:           dbID,
-		CLISpecifier: "d",
-		Config:       partialZoneOverride,
+		ID:     dbID,
+		Config: partialZoneOverride,
 	}
 	partialTableRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t",
-		Config:       partialZoneOverride,
+		ID:     tableID,
+		Config: partialZoneOverride,
 	}
 	partialPrimaryRow := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t@primary",
-		Config:       partialZoneOverride,
+		ID:     tableID,
+		Config: partialZoneOverride,
 	}
 	partialP0Row := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t.p0",
-		Config:       partialZoneOverride,
+		ID:     tableID,
+		Config: partialZoneOverride,
 	}
 	partialP1Row := sqlutils.ZoneRow{
-		ID:           tableID,
-		CLISpecifier: "d.t.p1",
-		Config:       partialZoneOverride,
+		ID:     tableID,
+		Config: partialZoneOverride,
 	}
 
 	// Remove stock zone configs installed at cluster bootstrap. Otherwise this
@@ -299,7 +288,7 @@ func TestGenerateSubzoneSpans(t *testing.T) {
 			}
 			clusterID := uuid.MakeV4()
 			hasNewSubzones := false
-			spans, err := GenerateSubzoneSpans(
+			spans, err := sql.GenerateSubzoneSpans(
 				cluster.NoSettings, clusterID, test.parsed.tableDesc, test.parsed.subzones, hasNewSubzones)
 			if err != nil {
 				t.Fatalf("generating subzone spans: %+v", err)

@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
 
+# Set this to 1 to require a "release justification" note in the commit message
+# or the PR description.
+require_justification=0
+
 set -euo pipefail
 
 source "$(dirname "${0}")/teamcity-support.sh"
 
 tc_prepare
+
+if [ "$require_justification" = 1 ]; then
+  tc_start_block "Ensure commit message contains a release justification"
+  # Ensure master branch commits have a release justification.
+  if [[ $(git log -n1 | grep -ci "Release justification: \S\+") == 0 ]]; then
+    echo "Build Failed. No Release justification in the commit message or in the PR description." >&2
+    echo "Commits must have a Release justification of the form:" >&2
+    echo "Release justification: <some description of why this commit is safe to add to the release branch.>" >&2
+    exit 1
+  fi
+  tc_end_block "Ensure commit message contains a release justification"
+fi
 
 tc_start_block "Ensure dependencies are up-to-date"
 run build/builder.sh go install ./vendor/github.com/golang/dep/cmd/dep ./pkg/cmd/github-pull-request-make
@@ -12,7 +28,9 @@ run build/builder.sh env BUILD_VCS_NUMBER="$BUILD_VCS_NUMBER" TARGET=checkdeps g
 tc_end_block "Ensure dependencies are up-to-date"
 
 tc_start_block "Ensure generated code is up-to-date"
-run build/builder.sh make generate buildshort
+# Buffer noisy output and only print it on failure.
+run build/builder.sh make generate buildshort &> artifacts/generate.log || (cat artifacts/generate.log && false)
+rm artifacts/generate.log
 # The workspace is clean iff `git status --porcelain` produces no output. Any
 # output is either an error message or a listing of an untracked/dirty file.
 if [[ "$(git status --porcelain 2>&1)" != "" ]]; then

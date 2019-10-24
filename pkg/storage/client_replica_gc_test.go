@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -74,7 +70,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 				return nil
 			}
 			crt := et.InternalCommitTrigger.GetChangeReplicasTrigger()
-			if crt == nil || crt.ChangeType != roachpb.REMOVE_REPLICA {
+			if crt == nil || crt.DeprecatedChangeType != roachpb.REMOVE_REPLICA {
 				return nil
 			}
 			testutils.SucceedsSoon(t, func() error {
@@ -152,8 +148,11 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 // removes a range from a store that no longer should have a replica.
 func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
 	mtc := &multiTestContext{}
+	cfg := storage.TestStoreConfig(nil)
+	cfg.TestingKnobs.DisableEagerReplicaRemoval = true
+	mtc.storeConfig = &cfg
+
 	defer mtc.Stop()
 	mtc.Start(t, 3)
 	// Disable the replica gc queue to prevent direct removal of replica.

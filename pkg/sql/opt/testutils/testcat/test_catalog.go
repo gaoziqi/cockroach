@@ -1,35 +1,34 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package testcat
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -41,6 +40,11 @@ const (
 type Catalog struct {
 	testSchema Schema
 	counter    int
+}
+
+type dataSource interface {
+	cat.DataSource
+	fqName() cat.DataSourceName
 }
 
 var _ cat.Catalog = &Catalog{}
@@ -56,7 +60,7 @@ func New() *Catalog {
 				ExplicitSchema:  true,
 				ExplicitCatalog: true,
 			},
-			dataSources: make(map[string]cat.DataSource),
+			dataSources: make(map[string]dataSource),
 		},
 	}
 }
@@ -152,14 +156,14 @@ func (tc *Catalog) ResolveDataSource(
 
 // ResolveDataSourceByID is part of the cat.Catalog interface.
 func (tc *Catalog) ResolveDataSourceByID(
-	ctx context.Context, id cat.StableID,
-) (cat.DataSource, error) {
+	ctx context.Context, flags cat.Flags, id cat.StableID,
+) (_ cat.DataSource, isAdding bool, _ error) {
 	for _, ds := range tc.testSchema.dataSources {
-		if tab, ok := ds.(*Table); ok && tab.TabID == id {
-			return ds, nil
+		if ds.ID() == id {
+			return ds, false, nil
 		}
 	}
-	return nil, pgerror.Newf(pgerror.CodeUndefinedTableError,
+	return nil, false, pgerror.Newf(pgcode.UndefinedTable,
 		"relation [%d] does not exist", id)
 }
 
@@ -173,19 +177,19 @@ func (tc *Catalog) CheckAnyPrivilege(ctx context.Context, o cat.Object) error {
 	switch t := o.(type) {
 	case *Schema:
 		if t.Revoked {
-			return pgerror.Newf(pgerror.CodeInsufficientPrivilegeError, "user does not have privilege to access %v", t.SchemaName)
+			return pgerror.Newf(pgcode.InsufficientPrivilege, "user does not have privilege to access %v", t.SchemaName)
 		}
 	case *Table:
 		if t.Revoked {
-			return pgerror.Newf(pgerror.CodeInsufficientPrivilegeError, "user does not have privilege to access %v", t.TabName)
+			return pgerror.Newf(pgcode.InsufficientPrivilege, "user does not have privilege to access %v", t.TabName)
 		}
 	case *View:
 		if t.Revoked {
-			return pgerror.Newf(pgerror.CodeInsufficientPrivilegeError, "user does not have privilege to access %v", t.ViewName)
+			return pgerror.Newf(pgcode.InsufficientPrivilege, "user does not have privilege to access %v", t.ViewName)
 		}
 	case *Sequence:
 		if t.Revoked {
-			return pgerror.Newf(pgerror.CodeInsufficientPrivilegeError, "user does not have privilege to access %v", t.SeqName)
+			return pgerror.Newf(pgcode.InsufficientPrivilege, "user does not have privilege to access %v", t.SeqName)
 		}
 	default:
 		panic("invalid Object")
@@ -193,19 +197,31 @@ func (tc *Catalog) CheckAnyPrivilege(ctx context.Context, o cat.Object) error {
 	return nil
 }
 
-// RequireSuperUser is part of the cat.Catalog interface.
-func (tc *Catalog) RequireSuperUser(ctx context.Context, action string) error {
+// HasAdminRole is part of the cat.Catalog interface.
+func (tc *Catalog) HasAdminRole(ctx context.Context) (bool, error) {
+	return true, nil
+}
+
+// RequireAdminRole is part of the cat.Catalog interface.
+func (tc *Catalog) RequireAdminRole(ctx context.Context, action string) error {
 	return nil
+}
+
+// FullyQualifiedName is part of the cat.Catalog interface.
+func (tc *Catalog) FullyQualifiedName(
+	ctx context.Context, ds cat.DataSource,
+) (cat.DataSourceName, error) {
+	return ds.(dataSource).fqName(), nil
 }
 
 func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.SchemaName, error) {
 	if string(toResolve.CatalogName) != testDB {
-		return nil, cat.SchemaName{}, pgerror.Newf(pgerror.CodeInvalidSchemaNameError,
+		return nil, cat.SchemaName{}, pgerror.Newf(pgcode.InvalidSchemaName,
 			"target database or schema does not exist")
 	}
 
 	if string(toResolve.SchemaName) != tree.PublicSchema {
-		return nil, cat.SchemaName{}, pgerror.Newf(pgerror.CodeInvalidNameError,
+		return nil, cat.SchemaName{}, pgerror.Newf(pgcode.InvalidName,
 			"schema cannot be modified: %q", tree.ErrString(toResolve))
 	}
 
@@ -219,7 +235,7 @@ func (tc *Catalog) resolveDataSource(toResolve *cat.DataSourceName) (cat.DataSou
 	if table, ok := tc.testSchema.dataSources[toResolve.FQString()]; ok {
 		return table, nil
 	}
-	return nil, pgerror.Newf(pgerror.CodeUndefinedTableError,
+	return nil, pgerror.Newf(pgcode.UndefinedTable,
 		"no data source matches prefix: %q", tree.ErrString(toResolve))
 }
 
@@ -237,7 +253,7 @@ func (tc *Catalog) Table(name *tree.TableName) *Table {
 	if tab, ok := ds.(*Table); ok {
 		return tab
 	}
-	panic(pgerror.Newf(pgerror.CodeWrongObjectTypeError,
+	panic(pgerror.Newf(pgcode.WrongObjectType,
 		"\"%q\" is not a table", tree.ErrString(name)))
 }
 
@@ -245,7 +261,7 @@ func (tc *Catalog) Table(name *tree.TableName) *Table {
 func (tc *Catalog) AddTable(tab *Table) {
 	fq := tab.TabName.FQString()
 	if _, ok := tc.testSchema.dataSources[fq]; ok {
-		panic(pgerror.Newf(pgerror.CodeDuplicateObjectError,
+		panic(pgerror.Newf(pgcode.DuplicateObject,
 			"table %q already exists", tree.ErrString(&tab.TabName)))
 	}
 	tc.testSchema.dataSources[fq] = tab
@@ -260,7 +276,7 @@ func (tc *Catalog) View(name *cat.DataSourceName) *View {
 	if vw, ok := ds.(*View); ok {
 		return vw
 	}
-	panic(pgerror.Newf(pgerror.CodeWrongObjectTypeError,
+	panic(pgerror.Newf(pgcode.WrongObjectType,
 		"\"%q\" is not a view", tree.ErrString(name)))
 }
 
@@ -268,7 +284,7 @@ func (tc *Catalog) View(name *cat.DataSourceName) *View {
 func (tc *Catalog) AddView(view *View) {
 	fq := view.ViewName.FQString()
 	if _, ok := tc.testSchema.dataSources[fq]; ok {
-		panic(pgerror.Newf(pgerror.CodeDuplicateObjectError,
+		panic(pgerror.Newf(pgcode.DuplicateObject,
 			"view %q already exists", tree.ErrString(&view.ViewName)))
 	}
 	tc.testSchema.dataSources[fq] = view
@@ -278,7 +294,7 @@ func (tc *Catalog) AddView(view *View) {
 func (tc *Catalog) AddSequence(seq *Sequence) {
 	fq := seq.SeqName.FQString()
 	if _, ok := tc.testSchema.dataSources[fq]; ok {
-		panic(pgerror.Newf(pgerror.CodeDuplicateObjectError,
+		panic(pgerror.Newf(pgcode.DuplicateObject,
 			"sequence %q already exists", tree.ErrString(&seq.SeqName)))
 	}
 	tc.testSchema.dataSources[fq] = seq
@@ -310,20 +326,14 @@ func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
 		return "", err
 	}
 
-	switch stmt.AST.StatementType() {
-	case tree.DDL, tree.RowsAffected:
-	default:
-		return "", pgerror.AssertionFailedf("statement type is not DDL or RowsAffected: %v", log.Safe(stmt.AST.StatementType()))
-	}
-
 	switch stmt := stmt.AST.(type) {
 	case *tree.CreateTable:
-		tab := tc.CreateTable(stmt)
-		return tab.String(), nil
+		tc.CreateTable(stmt)
+		return "", nil
 
 	case *tree.CreateView:
-		view := tc.CreateView(stmt)
-		return view.String(), nil
+		tc.CreateView(stmt)
+		return "", nil
 
 	case *tree.AlterTable:
 		tc.AlterTable(stmt)
@@ -334,17 +344,23 @@ func (tc *Catalog) ExecuteDDL(sql string) (string, error) {
 		return "", nil
 
 	case *tree.CreateSequence:
-		seq := tc.CreateSequence(stmt)
-		return seq.String(), nil
+		tc.CreateSequence(stmt)
+		return "", nil
 
 	case *tree.SetZoneConfig:
-		zone := tc.SetZoneConfig(stmt)
-		tp := treeprinter.New()
-		cat.FormatZone(zone, tp)
-		return tp.String(), nil
+		tc.SetZoneConfig(stmt)
+		return "", nil
+
+	case *tree.ShowCreate:
+		tn := stmt.Name.ToTableName()
+		ds, _, err := tc.ResolveDataSource(context.Background(), cat.Flags{}, &tn)
+		if err != nil {
+			return "", err
+		}
+		return ds.(fmt.Stringer).String(), nil
 
 	default:
-		return "", pgerror.AssertionFailedf("unsupported statement: %v", stmt)
+		return "", errors.AssertionFailedf("unsupported statement: %v", stmt)
 	}
 }
 
@@ -397,7 +413,7 @@ type Schema struct {
 	// If Revoked is true, then the user has had privileges on the schema revoked.
 	Revoked bool
 
-	dataSources map[string]cat.DataSource
+	dataSources map[string]dataSource
 }
 
 var _ cat.Schema = &Schema{}
@@ -427,7 +443,7 @@ func (s *Schema) GetDataSourceNames(ctx context.Context) ([]cat.DataSourceName, 
 	sort.Strings(keys)
 	var res []cat.DataSourceName
 	for _, k := range keys {
-		res = append(res, *s.dataSources[k].Name())
+		res = append(res, s.dataSources[k].fqName())
 	}
 	return res, nil
 }
@@ -467,8 +483,18 @@ func (tv *View) Equals(other cat.Object) bool {
 }
 
 // Name is part of the cat.DataSource interface.
-func (tv *View) Name() *cat.DataSourceName {
-	return &tv.ViewName
+func (tv *View) Name() tree.Name {
+	return tv.ViewName.TableName
+}
+
+// fqName is part of the dataSource interface.
+func (tv *View) fqName() cat.DataSourceName {
+	return tv.ViewName
+}
+
+// IsSystemView is part of the cat.View interface.
+func (tv *View) IsSystemView() bool {
+	return false
 }
 
 // Query is part of the cat.View interface.
@@ -538,8 +564,13 @@ func (tt *Table) Equals(other cat.Object) bool {
 }
 
 // Name is part of the cat.DataSource interface.
-func (tt *Table) Name() *cat.DataSourceName {
-	return &tt.TabName
+func (tt *Table) Name() tree.Name {
+	return tt.TabName.TableName
+}
+
+// fqName is part of the dataSource interface.
+func (tt *Table) fqName() cat.DataSourceName {
+	return tt.TabName
 }
 
 // IsVirtualTable is part of the cat.Table interface.
@@ -588,7 +619,7 @@ func (tt *Table) DeletableIndexCount() int {
 }
 
 // Index is part of the cat.Table interface.
-func (tt *Table) Index(i int) cat.Index {
+func (tt *Table) Index(i cat.IndexOrdinal) cat.Index {
 	return tt.Indexes[i]
 }
 
@@ -649,7 +680,7 @@ func (tt *Table) FindOrdinal(name string) int {
 			return i
 		}
 	}
-	panic(pgerror.Newf(pgerror.CodeUndefinedColumnError,
+	panic(pgerror.Newf(pgcode.UndefinedColumn,
 		"cannot find column %q in table %q",
 		tree.ErrString((*tree.Name)(&name)),
 		tree.ErrString(&tt.TabName),
@@ -659,9 +690,6 @@ func (tt *Table) FindOrdinal(name string) int {
 // Index implements the cat.Index interface for testing purposes.
 type Index struct {
 	IdxName string
-
-	// Ordinal is the ordinal of this index in the table.
-	Ordinal int
 
 	// KeyCount is the number of columns that make up the unique key for the
 	// index. See the cat.Index.KeyColumnCount for more details.
@@ -682,15 +710,22 @@ type Index struct {
 
 	// IdxZone is the zone associated with the index. This may be inherited from
 	// the parent table, database, or even the default zone.
-	IdxZone *config.ZoneConfig
+	IdxZone *zonepb.ZoneConfig
+
+	// Ordinal is the ordinal of this index in the table.
+	ordinal int
 
 	// table is a back reference to the table this index is on.
 	table *Table
+
+	// partitionBy is the partitioning clause that corresponds to this index. Used
+	// to implement PartitionByListPrefixes.
+	partitionBy *tree.PartitionBy
 }
 
 // ID is part of the cat.Index interface.
 func (ti *Index) ID() cat.StableID {
-	return 1 + cat.StableID(ti.Ordinal)
+	return 1 + cat.StableID(ti.ordinal)
 }
 
 // Name is part of the cat.Index interface.
@@ -701,6 +736,11 @@ func (ti *Index) Name() tree.Name {
 // Table is part of the cat.Index interface.
 func (ti *Index) Table() cat.Table {
 	return ti.table
+}
+
+// Ordinal is part of the cat.Index interface.
+func (ti *Index) Ordinal() int {
+	return ti.ordinal
 }
 
 // IsUnique is part of the cat.Index interface.
@@ -743,6 +783,66 @@ func (ti *Index) Span() roachpb.Span {
 	panic("not implemented")
 }
 
+// PartitionByListPrefixes is part of the cat.Index interface.
+func (ti *Index) PartitionByListPrefixes() []tree.Datums {
+	p := ti.partitionBy
+	if p == nil {
+		return nil
+	}
+	if len(p.List) == 0 {
+		return nil
+	}
+	var res []tree.Datums
+	semaCtx := tree.MakeSemaContext()
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	for i := range p.Fields {
+		if i >= len(ti.Columns) || p.Fields[i] != ti.Columns[i].ColName() {
+			panic("partition by columns must be a prefix of the index columns")
+		}
+	}
+	for i := range p.List {
+		// Exprs contains a list of values.
+		for _, e := range p.List[i].Exprs {
+			var vals []tree.Expr
+			switch t := e.(type) {
+			case *tree.Tuple:
+				vals = t.Exprs
+			default:
+				vals = []tree.Expr{e}
+			}
+
+			// Cut off at DEFAULT, if present.
+			for i := range vals {
+				if _, ok := vals[i].(tree.DefaultVal); ok {
+					vals = vals[:i]
+				}
+			}
+			if len(vals) == 0 {
+				continue
+			}
+			d := make(tree.Datums, len(vals))
+			for i := range vals {
+				c := tree.CastExpr{Expr: vals[i], Type: ti.Columns[i].DatumType()}
+				cTyped, err := c.TypeCheck(&semaCtx, nil)
+				if err != nil {
+					panic(err)
+				}
+				d[i], err = cTyped.Eval(&evalCtx)
+				if err != nil {
+					panic(err)
+				}
+			}
+
+			// TODO(radu): split into multiple prefixes if Subpartition is also by list.
+			// Note that this functionality should be kept in sync with the real catalog
+			// implementation (opt_catalog.go).
+
+			res = append(res, d)
+		}
+	}
+	return res
+}
+
 // Column implements the cat.Column interface for testing purposes.
 type Column struct {
 	Ordinal      int
@@ -781,7 +881,7 @@ func (tc *Column) DatumType() *types.T {
 func (tc *Column) ColTypePrecision() int {
 	if tc.ColType.Family() == types.ArrayFamily {
 		if tc.ColType.ArrayContents().Family() == types.ArrayFamily {
-			panic(pgerror.AssertionFailedf("column type should never be a nested array"))
+			panic(errors.AssertionFailedf("column type should never be a nested array"))
 		}
 		return int(tc.ColType.ArrayContents().Precision())
 	}
@@ -792,7 +892,7 @@ func (tc *Column) ColTypePrecision() int {
 func (tc *Column) ColTypeWidth() int {
 	if tc.ColType.Family() == types.ArrayFamily {
 		if tc.ColType.ArrayContents().Family() == types.ArrayFamily {
-			panic(pgerror.AssertionFailedf("column type should never be a nested array"))
+			panic(errors.AssertionFailedf("column type should never be a nested array"))
 		}
 		return int(tc.ColType.ArrayContents().Width())
 	}
@@ -871,6 +971,33 @@ func (ts *TableStat) NullCount() uint64 {
 	return ts.js.NullCount
 }
 
+// Histogram is part of the cat.TableStatistic interface.
+func (ts *TableStat) Histogram() []cat.HistogramBucket {
+	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	if ts.js.HistogramColumnType == "" {
+		return nil
+	}
+	colType, err := parser.ParseType(ts.js.HistogramColumnType)
+	if err != nil {
+		panic(err)
+	}
+	histogram := make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
+	for i := range histogram {
+		bucket := &ts.js.HistogramBuckets[i]
+		datum, err := tree.ParseStringAs(colType, bucket.UpperBound, &evalCtx)
+		if err != nil {
+			panic(err)
+		}
+		histogram[i] = cat.HistogramBucket{
+			NumEq:         float64(bucket.NumEq),
+			NumRange:      float64(bucket.NumRange),
+			DistinctRange: bucket.DistinctRange,
+			UpperBound:    datum,
+		}
+	}
+	return histogram
+}
+
 // TableStats is a slice of TableStat pointers.
 type TableStats []*TableStat
 
@@ -898,8 +1025,10 @@ type ForeignKeyConstraint struct {
 	originColumnOrdinals     []int
 	referencedColumnOrdinals []int
 
-	validated   bool
-	matchMethod tree.CompositeKeyMatchMethod
+	validated    bool
+	matchMethod  tree.CompositeKeyMatchMethod
+	deleteAction tree.ReferenceAction
+	updateAction tree.ReferenceAction
 }
 
 var _ cat.ForeignKeyConstraint = &ForeignKeyConstraint{}
@@ -927,7 +1056,7 @@ func (fk *ForeignKeyConstraint) ColumnCount() int {
 // OriginColumnOrdinal is part of the cat.ForeignKeyConstraint interface.
 func (fk *ForeignKeyConstraint) OriginColumnOrdinal(originTable cat.Table, i int) int {
 	if originTable.ID() != fk.originTableID {
-		panic(pgerror.AssertionFailedf(
+		panic(errors.AssertionFailedf(
 			"invalid table %d passed to OriginColumnOrdinal (expected %d)",
 			originTable.ID(), fk.originTableID,
 		))
@@ -939,7 +1068,7 @@ func (fk *ForeignKeyConstraint) OriginColumnOrdinal(originTable cat.Table, i int
 // ReferencedColumnOrdinal is part of the cat.ForeignKeyConstraint interface.
 func (fk *ForeignKeyConstraint) ReferencedColumnOrdinal(referencedTable cat.Table, i int) int {
 	if referencedTable.ID() != fk.referencedTableID {
-		panic(pgerror.AssertionFailedf(
+		panic(errors.AssertionFailedf(
 			"invalid table %d passed to ReferencedColumnOrdinal (expected %d)",
 			referencedTable.ID(), fk.referencedTableID,
 		))
@@ -955,6 +1084,16 @@ func (fk *ForeignKeyConstraint) Validated() bool {
 // MatchMethod is part of the cat.ForeignKeyConstraint interface.
 func (fk *ForeignKeyConstraint) MatchMethod() tree.CompositeKeyMatchMethod {
 	return fk.matchMethod
+}
+
+// DeleteReferenceAction is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) DeleteReferenceAction() tree.ReferenceAction {
+	return fk.deleteAction
+}
+
+// UpdateReferenceAction is part of the cat.ForeignKeyConstraint interface.
+func (fk *ForeignKeyConstraint) UpdateReferenceAction() tree.ReferenceAction {
+	return fk.updateAction
 }
 
 // Sequence implements the cat.Sequence interface for testing purposes.
@@ -985,14 +1124,17 @@ func (ts *Sequence) Equals(other cat.Object) bool {
 }
 
 // Name is part of the cat.DataSource interface.
-func (ts *Sequence) Name() *tree.TableName {
-	return &ts.SeqName
+func (ts *Sequence) Name() tree.Name {
+	return ts.SeqName.TableName
 }
 
-// SequenceName is part of the cat.Sequence interface.
-func (ts *Sequence) SequenceName() *tree.TableName {
-	return ts.Name()
+// fqName is part of the dataSource interface.
+func (ts *Sequence) fqName() cat.DataSourceName {
+	return ts.SeqName
 }
+
+// SequenceMarker is part of the cat.Sequence interface.
+func (ts *Sequence) SequenceMarker() {}
 
 func (ts *Sequence) String() string {
 	tp := treeprinter.New()

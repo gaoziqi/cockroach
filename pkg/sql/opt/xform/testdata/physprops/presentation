@@ -1,21 +1,10 @@
 exec-ddl
 CREATE TABLE a (x INT PRIMARY KEY, y INT)
 ----
-TABLE a
- ├── x int not null
- ├── y int
- └── INDEX primary
-      └── x int not null
 
 exec-ddl
 CREATE TABLE t.b (x INT, y FLOAT)
 ----
-TABLE b
- ├── x int
- ├── y float
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 # Scan operator.
 opt
@@ -50,7 +39,7 @@ project
 opt
 SELECT b.x, rowid, a.y, a.x, a.y y2, b.y FROM a, b
 ----
-inner-join
+inner-join (hash)
  ├── columns: x:3(int) rowid:5(int!null) y:2(int) x:1(int!null) y2:2(int) y:4(float)
  ├── scan a
  │    └── columns: a.x:1(int!null) a.y:2(int)

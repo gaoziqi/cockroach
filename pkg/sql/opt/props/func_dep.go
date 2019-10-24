@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package props
 
@@ -19,9 +15,9 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // FuncDepSet is a set of functional dependencies (FDs) that encode useful
@@ -617,7 +613,7 @@ func (f *FuncDepSet) ComputeEquivClosure(cols opt.ColSet) opt.ColSet {
 // the new key is adopted in its place.
 func (f *FuncDepSet) AddStrictKey(keyCols, allCols opt.ColSet) {
 	if !keyCols.SubsetOf(allCols) {
-		panic(pgerror.AssertionFailedf("allCols does not include keyCols"))
+		panic(errors.AssertionFailedf("allCols does not include keyCols"))
 	}
 
 	// Ensure we have candidate key (i.e. has no columns that are functionally
@@ -639,7 +635,7 @@ func (f *FuncDepSet) AddStrictKey(keyCols, allCols opt.ColSet) {
 //
 func (f *FuncDepSet) AddLaxKey(keyCols, allCols opt.ColSet) {
 	if !keyCols.SubsetOf(allCols) {
-		panic(pgerror.AssertionFailedf("allCols does not include keyCols"))
+		panic(errors.AssertionFailedf("allCols does not include keyCols"))
 	}
 
 	// Ensure we have candidate key (i.e. has no columns that are functionally
@@ -733,8 +729,8 @@ func (f *FuncDepSet) AddEquivalency(a, b opt.ColumnID) {
 	}
 
 	var equiv opt.ColSet
-	equiv.Add(int(a))
-	equiv.Add(int(b))
+	equiv.Add(a)
+	equiv.Add(b)
 	f.addEquivalency(equiv)
 }
 
@@ -813,12 +809,12 @@ func (f *FuncDepSet) AddConstants(cols opt.ColSet) {
 //   ()-->(c)
 //
 func (f *FuncDepSet) AddSynthesizedCol(from opt.ColSet, col opt.ColumnID) {
-	if from.Contains(int(col)) {
-		panic(pgerror.AssertionFailedf("synthesized column cannot depend upon itself"))
+	if from.Contains(col) {
+		panic(errors.AssertionFailedf("synthesized column cannot depend upon itself"))
 	}
 
 	var colSet opt.ColSet
-	colSet.Add(int(col))
+	colSet.Add(col)
 	f.addDependency(from, colSet, true /* strict */, false /* equiv */)
 }
 
@@ -936,10 +932,10 @@ func (f *FuncDepSet) ProjectCols(cols opt.ColSet) {
 			foundAll := true
 			for c, ok := beforeCols.Next(0); ok; c, ok = beforeCols.Next(c + 1) {
 				var id opt.ColumnID
-				if id, foundAll = equivMap[opt.ColumnID(c)]; !foundAll {
+				if id, foundAll = equivMap[c]; !foundAll {
 					break
 				}
-				afterCols.Add(int(id))
+				afterCols.Add(id)
 			}
 			if foundAll {
 				// Dependency can be remapped using equivalencies.
@@ -1206,7 +1202,7 @@ func (f *FuncDepSet) EquivReps() opt.ColSet {
 // ComputeEquivGroup returns the group of columns that are equivalent to the
 // given column. See ComputeEquivClosure for more details.
 func (f *FuncDepSet) ComputeEquivGroup(rep opt.ColumnID) opt.ColSet {
-	return f.ComputeEquivClosure(util.MakeFastIntSet(int(rep)))
+	return f.ComputeEquivClosure(opt.MakeColSet(rep))
 }
 
 // ensureKeyClosure checks whether the closure for this FD set's key (if there
@@ -1243,45 +1239,45 @@ func (f *FuncDepSet) Verify() {
 		fd := &f.deps[i]
 
 		if fd.from.Intersects(fd.to) {
-			panic(pgerror.AssertionFailedf("expected FD determinant and dependants to be disjoint: %s (%d)", log.Safe(f), log.Safe(i)))
+			panic(errors.AssertionFailedf("expected FD determinant and dependants to be disjoint: %s (%d)", log.Safe(f), log.Safe(i)))
 		}
 
 		if fd.strict && fd.from.Empty() {
 			if i != 0 {
-				panic(pgerror.AssertionFailedf("expected strict constant FD to be first FD in set: %s (%d)", log.Safe(f), log.Safe(i)))
+				panic(errors.AssertionFailedf("expected strict constant FD to be first FD in set: %s (%d)", log.Safe(f), log.Safe(i)))
 			}
 		}
 
 		if fd.equiv {
 			if !fd.strict {
-				panic(pgerror.AssertionFailedf("unexpected lax equivalency: %s (%d)", f, i))
+				panic(errors.AssertionFailedf("unexpected lax equivalency: %s (%d)", f, i))
 			}
 
 			if fd.from.Len() != 1 {
-				panic(pgerror.AssertionFailedf("expected equivalence determinant to be single col: %s (%d)", log.Safe(f), log.Safe(i)))
+				panic(errors.AssertionFailedf("expected equivalence determinant to be single col: %s (%d)", log.Safe(f), log.Safe(i)))
 			}
 
 			if !f.ComputeEquivClosure(fd.from).Equals(fd.from.Union(fd.to)) {
-				panic(pgerror.AssertionFailedf("expected equivalence dependants to be its closure: %s (%d)", log.Safe(f), log.Safe(i)))
+				panic(errors.AssertionFailedf("expected equivalence dependants to be its closure: %s (%d)", log.Safe(f), log.Safe(i)))
 			}
 		}
 	}
 
 	if f.hasKey != noKey {
 		if reduced := f.ReduceCols(f.key); !reduced.Equals(f.key) {
-			panic(pgerror.AssertionFailedf("expected FD to have candidate key: %s", f))
+			panic(errors.AssertionFailedf("expected FD to have candidate key: %s", f))
 		}
 
 		if f.hasKey == strictKey {
 			allCols := f.ColSet()
 			allCols.UnionWith(f.key)
 			if !f.ComputeClosure(f.key).Equals(allCols) {
-				panic(pgerror.AssertionFailedf("expected closure of FD key to include all known cols: %s", log.Safe(f)))
+				panic(errors.AssertionFailedf("expected closure of FD key to include all known cols: %s", log.Safe(f)))
 			}
 		}
 	} else {
 		if !f.key.Empty() {
-			panic(pgerror.AssertionFailedf("expected empty key columns since no key: %s", f))
+			panic(errors.AssertionFailedf("expected empty key columns since no key: %s", f))
 		}
 	}
 }
@@ -1320,7 +1316,7 @@ func (f FuncDepSet) formatFDs(b *strings.Builder) {
 		}
 		if fd.equiv {
 			if !fd.strict {
-				panic(pgerror.AssertionFailedf("lax equivalent columns are not supported"))
+				panic(errors.AssertionFailedf("lax equivalent columns are not supported"))
 			}
 			fmt.Fprintf(b, "%s==%s", fd.from, fd.to)
 		} else {
@@ -1583,7 +1579,7 @@ func (f *FuncDepSet) makeEquivMap(from, to opt.ColSet) map[opt.ColumnID]opt.Colu
 				equivMap = make(map[opt.ColumnID]opt.ColumnID)
 			}
 			id, _ := closure.Next(0)
-			equivMap[opt.ColumnID(i)] = opt.ColumnID(id)
+			equivMap[i] = id
 		}
 	}
 	return equivMap

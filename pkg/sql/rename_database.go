@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -43,7 +39,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 		return nil, pgerror.DangerousStatementf("RENAME DATABASE on current database")
 	}
 
-	if err := p.RequireSuperUser(ctx, "ALTER DATABASE ... RENAME"); err != nil {
+	if err := p.RequireAdminRole(ctx, "ALTER DATABASE ... RENAME"); err != nil {
 		return nil, err
 	}
 
@@ -79,19 +75,19 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 	phyAccessor := p.PhysicalSchemaAccessor()
 	lookupFlags := p.CommonLookupFlags(true /*required*/)
 	// DDL statements bypass the cache.
-	lookupFlags.avoidCached = true
+	lookupFlags.AvoidCached = true
 	tbNames, err := phyAccessor.GetObjectNames(
-		ctx, p.txn, dbDesc, tree.PublicSchema, DatabaseListFlags{
+		ctx, p.txn, dbDesc, tree.PublicSchema, tree.DatabaseListFlags{
 			CommonLookupFlags: lookupFlags,
-			explicitPrefix:    true,
+			ExplicitPrefix:    true,
 		})
 	if err != nil {
 		return err
 	}
-	lookupFlags.required = false
+	lookupFlags.Required = false
 	for i := range tbNames {
 		objDesc, err := phyAccessor.GetObjectDesc(ctx, p.txn, &tbNames[i],
-			ObjectLookupFlags{CommonLookupFlags: lookupFlags})
+			tree.ObjectLookupFlags{CommonLookupFlags: lookupFlags})
 		if err != nil {
 			return err
 		}

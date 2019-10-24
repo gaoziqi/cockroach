@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package issues
 
@@ -102,10 +98,13 @@ func trimIssueRequestBody(message string, usedCharacters int) string {
 
 // If the assignee would be the key in this map, assign to the value instead.
 // Helpful to avoid pinging former employees.
+// An "" value means that issues that would have gone to the key are left
+// unassigned.
 var oldFriendsMap = map[string]string{
-	"a-robinson": "andreimatei",
-	"benesch":    "nvanbenschoten",
-	"tamird":     "tschottdorf",
+	"a-robinson":   "andreimatei",
+	"benesch":      "nvanbenschoten",
+	"tamird":       "tbg",
+	"vivekmenezes": "",
 }
 
 func getAssignee(
@@ -136,6 +135,9 @@ func getAssignee(
 	assignee := *commits[0].Author.Login
 
 	if newAssignee, ok := oldFriendsMap[assignee]; ok {
+		if newAssignee == "" {
+			return "", fmt.Errorf("old friend %s is friendless", assignee)
+		}
 		assignee = newAssignee
 	}
 	return assignee, nil
@@ -251,7 +253,7 @@ func DefaultStressFailureTitle(packageName, testName string) string {
 
 func (p *poster) post(
 	ctx context.Context,
-	title, packageName, testName, message, authorEmail string,
+	title, packageName, testName, message, artifacts, authorEmail string,
 	extraLabels []string,
 ) error {
 	const bodyTemplate = `SHA: https://github.com/cockroachdb/cockroach/commits/%[1]s
@@ -275,7 +277,15 @@ Failed test: %[3]s`
 	const messageTemplate = "\n\n```\n%s\n```"
 
 	body := func(packageName, testName, message string) string {
-		body := fmt.Sprintf(bodyTemplate, p.sha, p.parameters(), p.teamcityURL(), packageName, testName) + messageTemplate
+		// If the test has artifacts, link straight to them.
+		// Otherwise, link to the build log in TeamCity.
+		var testURL *url.URL
+		if artifacts != "" {
+			testURL = p.teamcityArtifactsURL(artifacts)
+		} else {
+			testURL = p.teamcityBuildLogURL()
+		}
+		body := fmt.Sprintf(bodyTemplate, p.sha, p.parameters(), testURL, packageName, testName) + messageTemplate
 		// We insert a raw "%s" above so we can figure out the length of the
 		// body so far, without the actual error text. We need this length so we
 		// can calculate the maximum amount of error text we can include in the
@@ -304,9 +314,6 @@ Failed test: %[3]s`
 
 	assignee, err := getAssignee(ctx, authorEmail, p.listCommits)
 	if err != nil {
-		// if we *can't* assign anyone, sigh, feel free to hard-code me.
-		// -- tbg, 11/3/2017
-		assignee = "tbg"
 		message += fmt.Sprintf("\n\nFailed to find issue assignee: \n%s", err)
 	}
 
@@ -348,10 +355,10 @@ Failed test: %[3]s`
 	return nil
 }
 
-func (p *poster) teamcityURL() *url.URL {
+func (p *poster) teamcityURL(tab, fragment string) *url.URL {
 	options := url.Values{}
 	options.Add("buildId", p.buildID)
-	options.Add("tab", "buildLog")
+	options.Add("tab", tab)
 
 	u, err := url.Parse(p.serverURL)
 	if err != nil {
@@ -360,7 +367,16 @@ func (p *poster) teamcityURL() *url.URL {
 	u.Scheme = "https"
 	u.Path = "viewLog.html"
 	u.RawQuery = options.Encode()
+	u.Fragment = fragment
 	return u
+}
+
+func (p *poster) teamcityBuildLogURL() *url.URL {
+	return p.teamcityURL("buildLog", "")
+}
+
+func (p *poster) teamcityArtifactsURL(artifacts string) *url.URL {
+	return p.teamcityURL("artifacts", artifacts)
 }
 
 func (p *poster) parameters() string {
@@ -406,18 +422,18 @@ var defaultP struct {
 // existing open issue.
 func Post(
 	ctx context.Context,
-	title, packageName, testName, message, authorEmail string,
+	title, packageName, testName, message, artifacts, authorEmail string,
 	extraLabels []string,
 ) error {
 	defaultP.Do(func() {
 		defaultP.poster = newPoster()
 		defaultP.init()
 	})
-	err := defaultP.post(ctx, title, packageName, testName, message, authorEmail, extraLabels)
+	err := defaultP.post(ctx, title, packageName, testName, message, artifacts, authorEmail, extraLabels)
 	if !isInvalidAssignee(err) {
 		return err
 	}
-	return defaultP.post(ctx, title, packageName, testName, message, "tobias.schottdorf@gmail.com", extraLabels)
+	return defaultP.post(ctx, title, packageName, testName, message, artifacts, "tobias.schottdorf@gmail.com", extraLabels)
 }
 
 // CanPost returns true if the github API token environment variable is set.

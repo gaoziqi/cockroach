@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -28,6 +24,9 @@ import (
 // decide on an error-by-error basis whether the corruption is limited to the
 // range, store, node or cluster with corresponding actions taken.
 //
+// Despite the fatal log call below this message we still return for the
+// sake of testing.
+//
 // TODO(d4l3k): when marking a Replica corrupt, must subtract its stats from
 // r.store.metrics. Errors which happen between committing a batch and sending
 // a stats delta from the store are going to be particularly tricky and the
@@ -36,14 +35,22 @@ import (
 // to just recompute its stats in the background when one occurs.
 func (r *Replica) maybeSetCorrupt(ctx context.Context, pErr *roachpb.Error) *roachpb.Error {
 	if cErr, ok := pErr.GetDetail().(*roachpb.ReplicaCorruptionError); ok {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-
-		log.Errorf(ctx, "stalling replica due to: %s", cErr.ErrorMsg)
-		cErr.Processed = true
-		r.mu.destroyStatus.Set(cErr, destroyReasonRemoved)
-		log.Fatalf(ctx, "replica is corrupted: %s", cErr)
-		return roachpb.NewError(cErr)
+		r.raftMu.Lock()
+		defer r.raftMu.Unlock()
+		return r.setCorruptRaftMuLocked(ctx, cErr)
 	}
 	return pErr
+}
+
+func (r *Replica) setCorruptRaftMuLocked(
+	ctx context.Context, cErr *roachpb.ReplicaCorruptionError,
+) *roachpb.Error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	log.ErrorfDepth(ctx, 1, "stalling replica due to: %s", cErr.ErrorMsg)
+	cErr.Processed = true
+	r.mu.destroyStatus.Set(cErr, destroyReasonRemoved)
+	log.FatalfDepth(ctx, 1, "replica is corrupted: %s", cErr)
+	return roachpb.NewError(cErr)
 }

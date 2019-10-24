@@ -1,22 +1,19 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -57,19 +54,19 @@ func MakeIndexDescriptor(n *tree.CreateIndex) (*sqlbase.IndexDescriptor, error) 
 
 	if n.Inverted {
 		if n.Interleave != nil {
-			return nil, pgerror.New(pgerror.CodeInvalidSQLStatementNameError, "inverted indexes don't support interleaved tables")
+			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support interleaved tables")
 		}
 
 		if n.PartitionBy != nil {
-			return nil, pgerror.New(pgerror.CodeInvalidSQLStatementNameError, "inverted indexes don't support partitioning")
+			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support partitioning")
 		}
 
 		if len(indexDesc.StoreColumnNames) > 0 {
-			return nil, pgerror.New(pgerror.CodeInvalidSQLStatementNameError, "inverted indexes don't support stored columns")
+			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support stored columns")
 		}
 
 		if n.Unique {
-			return nil, pgerror.New(pgerror.CodeInvalidSQLStatementNameError, "inverted indexes can't be unique")
+			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes can't be unique")
 		}
 		indexDesc.Type = sqlbase.IndexDescriptor_INVERTED
 	}
@@ -84,12 +81,19 @@ func (n *createIndexNode) startExec(params runParams) error {
 	_, dropped, err := n.tableDesc.FindIndexByName(string(n.n.Name))
 	if err == nil {
 		if dropped {
-			return pgerror.Newf(pgerror.CodeObjectNotInPrerequisiteStateError,
+			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 				"index %q being dropped, try again later", string(n.n.Name))
 		}
 		if n.n.IfNotExists {
 			return nil
 		}
+	}
+
+	// Guard against creating a non-partitioned index on a partitioned table,
+	// which is undesirable in most cases.
+	if params.SessionData().SafeUpdates && n.n.PartitionBy == nil &&
+		n.tableDesc.PrimaryIndex.Partitioning.NumColumns > 0 {
+		return pgerror.DangerousStatementf("non-partitioned index on partitioned table")
 	}
 
 	indexDesc, err := MakeIndexDescriptor(n.n)

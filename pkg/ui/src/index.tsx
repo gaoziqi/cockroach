@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 import "nvd3/build/nv.d3.min.css";
 import "react-select/dist/react-select.css";
@@ -25,7 +21,7 @@ import { Provider } from "react-redux";
 import { Router, Route, IndexRoute, IndexRedirect, Redirect } from "react-router";
 
 import {
-  tableNameAttr, databaseNameAttr, nodeIDAttr, dashboardNameAttr, rangeIDAttr, statementAttr, appAttr,
+  tableNameAttr, databaseNameAttr, nodeIDAttr, dashboardNameAttr, rangeIDAttr, statementAttr, appAttr, implicitTxnAttr,
 } from "src/util/constants";
 
 import { alertDataSync } from "src/redux/alerts";
@@ -139,10 +135,12 @@ ReactDOM.render(
           <IndexRoute component={ StatementsPage } />
           <Route path={ `:${appAttr}` } component={ StatementsPage } />
           <Route path={ `:${appAttr}/:${statementAttr}` } component={ StatementDetails } />
+          <Route path={ `:${appAttr}/:${implicitTxnAttr}/:${statementAttr}` } component={ StatementDetails } />
         </Route>
         <Route path="statement">
           <IndexRedirect to="/statements" />
           <Route path={ `:${statementAttr}` } component={ StatementDetails } />
+          <Route path={ `:${implicitTxnAttr}/:${statementAttr}` } component={ StatementDetails } />
         </Route>
 
         { /* debug pages */ }

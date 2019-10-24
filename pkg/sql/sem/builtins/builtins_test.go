@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package builtins
 
@@ -23,9 +19,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestCategory(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	if expected, actual := categoryString, builtins["lower"].props.Category; expected != actual {
 		t.Fatalf("bad category: expected %q got %q", expected, actual)
 	}
@@ -43,6 +41,7 @@ func TestCategory(t *testing.T) {
 // TestGenerateUniqueIDOrder verifies the expected ordering of
 // GenerateUniqueID.
 func TestGenerateUniqueIDOrder(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	tests := []tree.DInt{
 		GenerateUniqueID(0, 0),
 		GenerateUniqueID(1, 0),
@@ -60,6 +59,7 @@ func TestGenerateUniqueIDOrder(t *testing.T) {
 }
 
 func TestStringToArrayAndBack(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	// s allows us to have a string pointer literal.
 	s := func(x string) *string { return &x }
 	fs := func(x *string) string {
@@ -139,6 +139,7 @@ func TestStringToArrayAndBack(t *testing.T) {
 }
 
 func TestEscapeFormat(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		bytes []byte
 		str   string
@@ -174,6 +175,7 @@ func TestEscapeFormat(t *testing.T) {
 }
 
 func TestEscapeFormatRandom(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for i := 0; i < 1000; i++ {
 		b := make([]byte, rand.Intn(100))
 		for j := 0; j < len(b); j++ {
@@ -191,6 +193,7 @@ func TestEscapeFormatRandom(t *testing.T) {
 }
 
 func TestLPadRPad(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		padFn    func(string, int, string) (string, error)
 		str      string
@@ -235,6 +238,35 @@ func TestLPadRPad(t *testing.T) {
 		}
 		if out != tc.expected {
 			t.Errorf("expected %s, found %s", tc.expected, out)
+		}
+	}
+}
+
+func TestFloatWidthBucket(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testCases := []struct {
+		operand  float64
+		b1       float64
+		b2       float64
+		count    int
+		expected int
+	}{
+		{0.5, 2, 3, 5, 0},
+		{8, 2, 3, 5, 6},
+		{1.5, 1, 3, 2, 1},
+		{5.35, 0.024, 10.06, 5, 3},
+		{-3.0, -5, 5, 10, 3},
+		{1, 1, 10, 2, 1},  // minimum should be inclusive
+		{10, 1, 10, 2, 3}, // maximum should be exclusive
+		{4, 10, 1, 4, 3},
+		{11, 10, 1, 4, 0},
+		{0, 10, 1, 4, 5},
+	}
+
+	for _, tc := range testCases {
+		got := widthBucket(tc.operand, tc.b1, tc.b2, tc.count)
+		if got != tc.expected {
+			t.Errorf("expected %d, found %d", tc.expected, got)
 		}
 	}
 }

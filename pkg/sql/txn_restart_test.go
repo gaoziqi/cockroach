@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -216,7 +212,7 @@ func checkRestarts(t *testing.T, magicVals *filterVals) {
 //		s, sqlDB, _ := serverutils.StartServer(t, params)
 //		defer s.Stopper().Stop(context.TODO())
 //		{
-//			pgURL, cleanup := sqlutils.PGUrl(t, s.ServingAddr(), "TestTxnAutoRetry", url.User(security.RootUser)
+//			pgURL, cleanup := sqlutils.PGUrl(t, s.ServingRPCAddr(), "TestTxnAutoRetry", url.User(security.RootUser)
 //			defer cleanup()
 //			if err := aborter.Init(pgURL); err != nil {
 //				t.Fatal(err)
@@ -454,7 +450,7 @@ func TestTxnAutoRetry(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	{
-		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingAddr(), "TestTxnAutoRetry", url.User(security.RootUser))
+		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestTxnAutoRetry", url.User(security.RootUser))
 		defer cleanup()
 		if err := aborter.Init(pgURL); err != nil {
 			t.Fatal(err)
@@ -634,7 +630,7 @@ func TestAbortedTxnOnlyRetriedOnce(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	{
-		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingAddr(), "TestAbortedTxnOnlyRetriedOnce", url.User(security.RootUser))
+		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestAbortedTxnOnlyRetriedOnce", url.User(security.RootUser))
 		defer cleanup()
 		if err := aborter.Init(pgURL); err != nil {
 			t.Fatal(err)
@@ -789,7 +785,7 @@ func TestTxnUserRestart(t *testing.T) {
 				s, sqlDB, _ := serverutils.StartServer(t, params)
 				defer s.Stopper().Stop(context.TODO())
 				{
-					pgURL, cleanup := sqlutils.PGUrl(t, s.ServingAddr(), "TestTxnUserRestart", url.User(security.RootUser))
+					pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestTxnUserRestart", url.User(security.RootUser))
 					defer cleanup()
 					if err := aborter.Init(pgURL); err != nil {
 						t.Fatal(err)
@@ -903,7 +899,7 @@ func TestErrorOnCommitFinalizesTxn(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	{
-		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingAddr(), "TestErrorOnCommitFinalizesTxn", url.User(security.RootUser))
+		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestErrorOnCommitFinalizesTxn", url.User(security.RootUser))
 		defer cleanup()
 		if err := aborter.Init(pgURL); err != nil {
 			t.Fatal(err)
@@ -989,7 +985,7 @@ func TestRollbackInRestartWait(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	{
-		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingAddr(), "TestRollbackInRestartWait", url.User(security.RootUser))
+		pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestRollbackInRestartWait", url.User(security.RootUser))
 		defer cleanup()
 		if err := aborter.Init(pgURL); err != nil {
 			t.Fatal(err)
@@ -1486,7 +1482,7 @@ func TestRollbackToSavepointFromUnusualStates(t *testing.T) {
 	checkState(tx, ts)
 
 	// ROLLBACK TO SAVEPOINT from an Aborted txn should work.
-	if _, err := tx.Exec("BOGUS SQL STATEMENT"); !testutils.IsError(err, `syntax error at or near "bogus"`) {
+	if _, err := tx.Exec("BOGUS SQL STATEMENT"); !testutils.IsError(err, `at or near "bogus": syntax error`) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if _, err := tx.Exec("ROLLBACK TO SAVEPOINT cockroach_restart"); err != nil {

@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -31,7 +27,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -653,7 +649,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	// Function to verify the zone for table "test.tbl" as returned by the Admin
 	// API.
 	verifyTblZone := func(
-		expectedZone config.ZoneConfig, expectedLevel serverpb.ZoneConfigurationLevel,
+		expectedZone zonepb.ZoneConfig, expectedLevel serverpb.ZoneConfigurationLevel,
 	) {
 		var resp serverpb.TableDetailsResponse
 		if err := getAdminJSONProto(s, "databases/test/tables/tbl", &resp); err != nil {
@@ -673,7 +669,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	// Function to verify the zone for database "test" as returned by the Admin
 	// API.
 	verifyDbZone := func(
-		expectedZone config.ZoneConfig, expectedLevel serverpb.ZoneConfigurationLevel,
+		expectedZone zonepb.ZoneConfig, expectedLevel serverpb.ZoneConfigurationLevel,
 	) {
 		var resp serverpb.DatabaseDetailsResponse
 		if err := getAdminJSONProto(s, "databases/test", &resp); err != nil {
@@ -691,7 +687,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	}
 
 	// Function to store a zone config for a given object ID.
-	setZone := func(zoneCfg config.ZoneConfig, id sqlbase.ID) {
+	setZone := func(zoneCfg zonepb.ZoneConfig, id sqlbase.ID) {
 		zoneBytes, err := protoutil.Marshal(&zoneCfg)
 		if err != nil {
 			t.Fatal(err)
@@ -714,7 +710,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	}
 
 	// Apply zone configuration to database and check again.
-	dbZone := config.ZoneConfig{
+	dbZone := zonepb.ZoneConfig{
 		RangeMinBytes: proto.Int64(456),
 	}
 	setZone(dbZone, idPath[1])
@@ -722,7 +718,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	verifyTblZone(dbZone, serverpb.ZoneConfigurationLevel_DATABASE)
 
 	// Apply zone configuration to table and check again.
-	tblZone := config.ZoneConfig{
+	tblZone := zonepb.ZoneConfig{
 		RangeMinBytes: proto.Int64(789),
 	}
 	setZone(tblZone, idPath[2])
@@ -799,7 +795,7 @@ func TestAdminAPIEvents(t *testing.T) {
 		{sql.EventLogCreateDatabase, false, 0, 3},
 		{sql.EventLogDropTable, false, 0, 2},
 		{sql.EventLogCreateTable, false, 0, 3},
-		{sql.EventLogSetClusterSetting, false, 0, 5},
+		{sql.EventLogSetClusterSetting, false, 0, 4},
 		{sql.EventLogCreateTable, true, 0, 3},
 		{sql.EventLogCreateTable, true, -1, 3},
 		{sql.EventLogCreateTable, true, 2, 2},

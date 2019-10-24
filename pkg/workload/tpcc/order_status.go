@@ -1,23 +1,17 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
 import (
 	"context"
-	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -90,18 +84,12 @@ func createOrderStatus(
 		WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3`,
 	)
 
-	// TODO(radu): this is only useful for the heuristic planner.
-	indexStr := "@customer_idx"
-	if o.config.usePostgres {
-		indexStr = ""
-	}
-
 	// Pick the middle row, rounded up, from the selection by last name.
-	o.selectByLastName = o.sr.Define(fmt.Sprintf(`
+	o.selectByLastName = o.sr.Define(`
 		SELECT c_id, c_balance, c_first, c_middle
-		FROM customer%s
+		FROM customer
 		WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3
-		ORDER BY c_first ASC`, indexStr),
+		ORDER BY c_first ASC`,
 	)
 
 	// Select the customer's order.
@@ -139,10 +127,10 @@ func (o *orderStatus) run(ctx context.Context, wID int) (interface{}, error) {
 	// 2.6.1.2: The customer is randomly selected 60% of the time by last name
 	// and 40% by number.
 	if rng.Intn(100) < 60 {
-		d.cLast = string(randCLast(rng, &o.a))
+		d.cLast = string(o.config.randCLast(rng, &o.a))
 		atomic.AddUint64(&o.config.auditor.orderStatusByLastName, 1)
 	} else {
-		d.cID = randCustomerID(rng)
+		d.cID = o.config.randCustomerID(rng)
 	}
 
 	tx, err := o.mcp.Get().BeginEx(ctx, o.config.txOpts)

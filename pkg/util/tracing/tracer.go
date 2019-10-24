@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tracing
 
@@ -29,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
+	"github.com/cockroachdb/logtags"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"golang.org/x/net/trace"
@@ -59,11 +55,7 @@ const (
 var enableNetTrace = settings.RegisterBoolSetting(
 	"trace.debug.enable",
 	"if set, traces for recent requests can be seen in the /debug page",
-	// This setting defaults to true, but there is a sql migration that sets it
-	// to false. The effect is that we have tracing when the server starts and
-	// gets stuck there, without paying the overhead of having it on all the
-	// time (unless that's how the operator explicitly configures the cluster).
-	true,
+	false,
 )
 
 var lightstepToken = settings.RegisterStringSetting(
@@ -378,6 +370,7 @@ func (t *Tracer) StartRootSpan(
 		tracer:    t,
 		operation: opName,
 		startTime: time.Now(),
+		startTags: logTags,
 	}
 	s.mu.duration = -1
 
@@ -389,15 +382,16 @@ func (t *Tracer) StartRootSpan(
 	}
 
 	if t.useNetTrace() {
+		var tags []logtags.Tag
+		if logTags != nil {
+			tags = logTags.Get()
+		}
+
 		s.netTr = trace.New("tracing", opName)
 		s.netTr.SetMaxEvents(maxLogsPerSpan)
-	}
-
-	if logTags != nil {
-		for _, t := range logTags.Get() {
-			s.setTagInner(
-				tagName(t.Key()), t.ValueStr(),
-				true /* locked - we're lying but we're just creating the span */)
+		for i := range tags {
+			tag := &tags[i]
+			s.netTr.LazyPrintf("%s:%v", tag.Key(), tag.Value())
 		}
 	}
 
@@ -432,6 +426,7 @@ func StartChildSpan(
 		operation:    opName,
 		startTime:    time.Now(),
 		parentSpanID: pSpan.SpanID,
+		startTags:    logTags,
 	}
 
 	// Copy baggage from parent.
@@ -462,17 +457,19 @@ func StartChildSpan(
 	if pSpan.netTr != nil {
 		s.netTr = trace.New("tracing", opName)
 		s.netTr.SetMaxEvents(maxLogsPerSpan)
+		if startTags := s.startTags; startTags != nil {
+			tags := startTags.Get()
+			for i := range tags {
+				tag := &tags[i]
+				s.netTr.LazyPrintf("%s:%v", tag.Key(), tag.Value())
+			}
+		}
 	}
 
 	if pSpan.netTr != nil || pSpan.shadowTr != nil {
 		// Copy baggage items to tags so they show up in the shadow tracer UI or x/net/trace.
 		for k, v := range s.mu.Baggage {
 			s.SetTag(k, v)
-		}
-	}
-	if logTags != nil {
-		for _, t := range logTags.Get() {
-			s.SetTag(tagName(t.Key()), t.ValueStr())
 		}
 	}
 
@@ -828,17 +825,17 @@ func matchesWithoutFileLine(msg string, expected string) bool {
 // be called before cancel()).
 //
 // Note that to convert the recorded spans into text, you can use
-// FormatRecordedSpans. Tests can also use FindMsgInRecording().
+// Recording.String(). Tests can also use FindMsgInRecording().
 func ContextWithRecordingSpan(
 	ctx context.Context, opName string,
-) (retCtx context.Context, getRecording func() []RecordedSpan, cancel func()) {
+) (retCtx context.Context, getRecording func() Recording, cancel func()) {
 	tr := NewTracer()
 	sp := tr.StartSpan(opName, Recordable, LogTagsFromCtx(ctx))
 	StartRecording(sp, SingleNodeRecording)
 	ctx, cancelCtx := context.WithCancel(ctx)
 	ctx = opentracing.ContextWithSpan(ctx, sp)
 
-	getRecording = func() []RecordedSpan {
+	getRecording = func() Recording {
 		return GetRecording(sp)
 	}
 	cancel = func() {

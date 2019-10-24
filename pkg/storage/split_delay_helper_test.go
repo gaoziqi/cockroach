@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -23,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/assert"
 	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/tracker"
 )
 
 type testSplitDelayHelper struct {
@@ -88,8 +85,8 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 			numAttempts: 5,
 			rangeID:     1,
 			raftStatus: &raft.Status{
-				Progress: map[uint64]raft.Progress{
-					2: {State: raft.ProgressStateProbe},
+				Progress: map[uint64]tracker.Progress{
+					2: {State: tracker.StateProbe},
 				},
 			},
 		}
@@ -100,23 +97,27 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 		assert.Equal(t, 1, h.emptyProposed)
 	})
 
-	for _, state := range []raft.ProgressStateType{raft.ProgressStateProbe, raft.ProgressStateSnapshot} {
+	for _, state := range []tracker.StateType{tracker.StateProbe, tracker.StateSnapshot} {
 		t.Run(state.String(), func(t *testing.T) {
 			h := &testSplitDelayHelper{
 				numAttempts: 5,
 				rangeID:     1,
 				raftStatus: &raft.Status{
-					Progress: map[uint64]raft.Progress{
-						2: {State: state, RecentActive: true, Paused: true /* unifies string output below */},
+					Progress: map[uint64]tracker.Progress{
+						2: {
+							State:        state,
+							RecentActive: true,
+							ProbeSent:    true, // Unifies string output below.
+							Inflights:    &tracker.Inflights{},
+						},
 						// Healthy follower just for kicks.
-						3: {State: raft.ProgressStateReplicate},
+						3: {State: tracker.StateReplicate},
 					},
 				},
 			}
 			s := maybeDelaySplitToAvoidSnapshot(ctx, h)
-			assert.Equal(t, "; replica r1/2 not caught up: next = 0, match = 0, state = "+
-				state.String()+
-				", waiting = true, pendingSnapshot = 0; delayed split for 5.0s to avoid Raft snapshot (without success)", s)
+			assert.Equal(t, "; replica r1/2 not caught up: "+state.String()+
+				" match=0 next=0 paused; delayed split for 5.0s to avoid Raft snapshot (without success)", s)
 			assert.Equal(t, 5, h.slept)
 			assert.Equal(t, 5, h.emptyProposed)
 		})
@@ -127,8 +128,8 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 			numAttempts: 5,
 			rangeID:     1,
 			raftStatus: &raft.Status{
-				Progress: map[uint64]raft.Progress{
-					2: {State: raft.ProgressStateReplicate}, // intentionally not recently active
+				Progress: map[uint64]tracker.Progress{
+					2: {State: tracker.StateReplicate}, // intentionally not recently active
 				},
 			},
 		}
@@ -143,8 +144,8 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 			numAttempts: 5,
 			rangeID:     1,
 			raftStatus: &raft.Status{
-				Progress: map[uint64]raft.Progress{
-					2: {State: raft.ProgressStateProbe, RecentActive: true},
+				Progress: map[uint64]tracker.Progress{
+					2: {State: tracker.StateProbe, RecentActive: true, Inflights: &tracker.Inflights{}},
 				},
 			},
 		}
@@ -152,7 +153,7 @@ func TestSplitDelayToAvoidSnapshot(t *testing.T) {
 		h.sleep = func() {
 			if h.slept == 2 {
 				pr := h.raftStatus.Progress[2]
-				pr.State = raft.ProgressStateReplicate
+				pr.State = tracker.StateReplicate
 				h.raftStatus.Progress[2] = pr
 			}
 		}

@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package row
 
@@ -69,16 +65,18 @@ func makeFkExistenceCheckHelperForUpdate(
 	txn *client.Txn,
 	table *sqlbase.ImmutableTableDescriptor,
 	otherTables FkTableMetadata,
+	updateCols []sqlbase.ColumnDescriptor,
 	colMap map[sqlbase.ColumnID]int,
 	alloc *sqlbase.DatumAlloc,
 ) (fkExistenceCheckForUpdate, error) {
 	ret := fkExistenceCheckForUpdate{
-		indexIDsToCheck: make(map[sqlbase.IndexID]struct{}),
+		indexIDsToCheck: map[sqlbase.IndexID]struct{}{0: {}},
 	}
 
 	// Instantiate a helper for the referencing tables.
 	var err error
-	if ret.inbound, err = makeFkExistenceCheckHelperForDelete(txn, table, otherTables, colMap, alloc); err != nil {
+	if ret.inbound, err = makeFkExistenceCheckHelperForDelete(txn, table, otherTables, colMap,
+		alloc); err != nil {
 		return ret, err
 	}
 
@@ -99,6 +97,9 @@ func makeFkExistenceCheckHelperForUpdate(
 func (fks fkExistenceCheckForUpdate) addCheckForIndex(
 	indexID sqlbase.IndexID, descriptorType sqlbase.IndexDescriptor_Type,
 ) {
+	if fks.checker == nil {
+		return
+	}
 	if descriptorType == sqlbase.IndexDescriptor_FORWARD {
 		// We ignore FK existence checks for inverted indexes.
 		//
@@ -120,10 +121,10 @@ func (fks fkExistenceCheckForUpdate) addIndexChecks(
 	ctx context.Context, oldValues, newValues tree.Datums, traceKV bool,
 ) error {
 	for indexID := range fks.indexIDsToCheck {
-		if err := queueFkExistenceChecksForRow(ctx, fks.checker, fks.inbound.fks, indexID, oldValues, traceKV); err != nil {
+		if err := queueFkExistenceChecksForRow(ctx, fks.checker, fks.inbound.fks[indexID], oldValues, traceKV); err != nil {
 			return err
 		}
-		if err := queueFkExistenceChecksForRow(ctx, fks.checker, fks.outbound.fks, indexID, newValues, traceKV); err != nil {
+		if err := queueFkExistenceChecksForRow(ctx, fks.checker, fks.outbound.fks[indexID], newValues, traceKV); err != nil {
 			return err
 		}
 	}

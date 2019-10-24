@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package provider
 
@@ -26,10 +22,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/logtags"
 )
 
 // Config holds the information necessary to create a Provider.
@@ -151,7 +147,7 @@ func (p *Provider) runCloser(ctx context.Context) {
 		next.WallTime -= int64(targetDuration)
 		if err != nil {
 			if p.everyClockLog.ShouldLog() {
-				log.Warningf(ctx, "unable to move closed timestamp forward: %s", err)
+				log.Warningf(ctx, "unable to move closed timestamp forward: %+v", err)
 			}
 			// Broadcast even if nothing new was queued, so that the subscribers
 			// loop to check their client's context.
@@ -275,6 +271,8 @@ func (p *Provider) Subscribe(ctx context.Context, ch chan<- ctpb.Entry) {
 		for _, entry := range entries {
 			select {
 			case ch <- entry:
+			case <-p.cfg.Stopper.ShouldQuiesce():
+				return
 			case <-ctx.Done():
 				return
 			}
@@ -324,6 +322,8 @@ func (p *Provider) Subscribe(ctx context.Context, ch chan<- ctpb.Entry) {
 
 			select {
 			case ch <- entry:
+			case <-p.cfg.Stopper.ShouldQuiesce():
+				return
 			case <-ctx.Done():
 				return
 			}

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // This file implements the select code that deals with column references
 // and resolving column names in expressions.
@@ -21,6 +17,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -257,7 +254,7 @@ func expandStar(
 	ctx context.Context, src MultiSourceInfo, v tree.VarName, ivarHelper tree.IndexedVarHelper,
 ) (columns ResultColumns, exprs []tree.TypedExpr, err error) {
 	if len(src) == 0 || len(src[0].SourceColumns) == 0 {
-		return nil, nil, pgerror.Newf(pgerror.CodeInvalidNameError,
+		return nil, nil, pgerror.Newf(pgcode.InvalidName,
 			"cannot use %q without a FROM clause", tree.ErrString(v))
 	}
 
@@ -292,82 +289,4 @@ func expandStar(
 	}
 
 	return columns, exprs, nil
-}
-
-// expandTupleStar returns the array of column metadata and
-// name expressions that correspond to the expansion of a column
-// access star, e.g. `(E).*`.
-func expandTupleStar(
-	ctx context.Context,
-	analyzeExpr AnalyzeExprFunction,
-	t *tree.TupleStar,
-	info MultiSourceInfo,
-	ivarHelper tree.IndexedVarHelper,
-) (columns ResultColumns, exprs []tree.TypedExpr, err error) {
-	// Star expansion will bypass computeRender(), so we are responsible
-	// for expression analysis.
-	normalized, err := analyzeExpr(ctx, t.Expr,
-		info, ivarHelper,
-		types.Any /* desiredType */, false, /* requireType */
-		"SELECT" /* typingContext */)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	typ := normalized.ResolvedType()
-	if typ.Family() != types.TupleFamily || typ.TupleLabels() == nil {
-		return nil, nil, tree.NewTypeIsNotCompositeError(typ)
-	}
-
-	// If the sub-expression is a tuple constructor, we'll de-tuplify below.
-	// Otherwise we'll re-evaluate the expression multiple times.
-	tTuple, isTuple := normalized.(*tree.Tuple)
-
-	columns = make(ResultColumns, len(typ.TupleContents()))
-	exprs = make([]tree.TypedExpr, len(typ.TupleContents()))
-	for i := range typ.TupleContents() {
-		columns[i].Typ = &typ.TupleContents()[i]
-		columns[i].Name = typ.TupleLabels()[i]
-		if isTuple {
-			// De-tuplify: ((a,b,c)).* -> a, b, c
-			exprs[i] = tTuple.Exprs[i].(tree.TypedExpr)
-		} else {
-			// Can't de-tuplify: (Expr).* -> (Expr).a, (Expr).b, (Expr).c
-			exprs[i] = tree.NewTypedColumnAccessExpr(normalized, typ.TupleLabels()[i], i)
-		}
-	}
-	return columns, exprs, nil
-}
-
-// CheckRenderStar handles the case where the target specification contains a
-// SQL star (UnqualifiedStar or AllColumnsSelector). We match the prefix of the
-// name to one of the tables in the query and then expand the "*" into a list
-// of columns. A ResultColumns and Expr pair is returned for each column.
-func CheckRenderStar(
-	ctx context.Context,
-	analyzeExpr AnalyzeExprFunction,
-	target tree.SelectExpr,
-	info MultiSourceInfo,
-	ivarHelper tree.IndexedVarHelper,
-) (isStar bool, columns ResultColumns, exprs []tree.TypedExpr, err error) {
-	v, ok := target.Expr.(tree.VarName)
-	if !ok {
-		return false, nil, nil, nil
-	}
-
-	switch t := v.(type) {
-	case *tree.TupleStar:
-		columns, exprs, err = expandTupleStar(ctx, analyzeExpr, t, info, ivarHelper)
-		return true, columns, exprs, err
-
-	case tree.UnqualifiedStar, *tree.AllColumnsSelector:
-		if target.As != "" {
-			return false, nil, nil, pgerror.Newf(pgerror.CodeSyntaxError,
-				"%q cannot be aliased", tree.ErrString(v))
-		}
-
-		columns, exprs, err = expandStar(ctx, info, v, ivarHelper)
-		return true, columns, exprs, err
-	}
-	return false, nil, nil, nil
 }

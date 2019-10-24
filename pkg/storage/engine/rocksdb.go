@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
@@ -18,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math"
 	"os"
@@ -33,19 +30,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	humanize "github.com/dustin/go-humanize"
-	"github.com/elastic/gosigar"
+	"github.com/cockroachdb/logtags"
 	"github.com/pkg/errors"
 )
 
@@ -89,7 +82,7 @@ var ingestDelayL0Threshold = settings.RegisterIntSetting(
 var ingestDelayPendingLimit = settings.RegisterByteSizeSetting(
 	"rocksdb.ingest_backpressure.pending_compaction_threshold",
 	"pending compaction estimate above which to backpressure SST ingestions",
-	64<<30,
+	2<<30, /* 2 GiB */
 )
 
 var ingestDelayTime = settings.RegisterDurationSetting(
@@ -104,19 +97,38 @@ var ingestDelayTime = settings.RegisterDurationSetting(
 // traces of every iterator allocated. DO NOT ENABLE in production code.
 const debugIteratorLeak = false
 
-//export rocksDBV
-func rocksDBV(sevLvl C.int, infoVerbosity C.int) bool {
-	sev := log.Severity(sevLvl)
-	return sev == log.Severity_INFO && log.V(int32(infoVerbosity)) ||
-		sev == log.Severity_WARNING ||
-		sev == log.Severity_ERROR ||
-		sev == log.Severity_FATAL
+var rocksdbLogger *log.SecondaryLogger
+
+// InitRocksDBLogger initializes the logger to use for RocksDB log messages. If
+// not called, WARNING, ERROR, and FATAL logs will be output to the normal
+// CockroachDB log.
+func InitRocksDBLogger(ctx context.Context) {
+	rocksdbLogger = log.NewSecondaryLogger(ctx, nil, "rocksdb",
+		true /* enableGC */, false /* forceSyncWrites */, false /* enableMsgCount */)
 }
 
 //export rocksDBLog
-func rocksDBLog(sevLvl C.int, s *C.char, n C.int) {
+func rocksDBLog(usePrimaryLog C.bool, sevLvl C.int, s *C.char, n C.int) {
+	sev := log.Severity(sevLvl)
+	if !usePrimaryLog {
+		if rocksdbLogger != nil {
+			// NB: No need for the rocksdb tag if we're logging to a rocksdb specific
+			// file.
+			rocksdbLogger.LogSev(context.Background(), sev, C.GoStringN(s, n))
+			return
+		}
+
+		// Only log INFO logs to the normal CockroachDB log at --v=3 and
+		// above. This only applies when we're not using the primary log for
+		// RocksDB generated messages (which is utilized by the encryption-at-rest
+		// code).
+		if sev == log.Severity_INFO && !log.V(3) {
+			return
+		}
+	}
+
 	ctx := logtags.AddTag(context.Background(), "rocksdb", nil)
-	switch log.Severity(sevLvl) {
+	switch sev {
 	case log.Severity_WARNING:
 		log.Warning(ctx, C.GoStringN(s, n))
 	case log.Severity_ERROR:
@@ -878,83 +890,7 @@ func (r *RocksDB) Iterate(start, end MVCCKey, f func(MVCCKeyValue) (bool, error)
 
 // Capacity queries the underlying file system for disk capacity information.
 func (r *RocksDB) Capacity() (roachpb.StoreCapacity, error) {
-	fileSystemUsage := gosigar.FileSystemUsage{}
-	dir := r.cfg.Dir
-	if dir == "" {
-		// This is an in-memory instance. Pretend we're empty since we
-		// don't know better and only use this for testing. Using any
-		// part of the actual file system here can throw off allocator
-		// rebalancing in a hard-to-trace manner. See #7050.
-		return roachpb.StoreCapacity{
-			Capacity:  r.cfg.MaxSizeBytes,
-			Available: r.cfg.MaxSizeBytes,
-		}, nil
-	}
-	if err := fileSystemUsage.Get(dir); err != nil {
-		return roachpb.StoreCapacity{}, err
-	}
-
-	if fileSystemUsage.Total > math.MaxInt64 {
-		return roachpb.StoreCapacity{}, fmt.Errorf("unsupported disk size %s, max supported size is %s",
-			humanize.IBytes(fileSystemUsage.Total), humanizeutil.IBytes(math.MaxInt64))
-	}
-	if fileSystemUsage.Avail > math.MaxInt64 {
-		return roachpb.StoreCapacity{}, fmt.Errorf("unsupported disk size %s, max supported size is %s",
-			humanize.IBytes(fileSystemUsage.Avail), humanizeutil.IBytes(math.MaxInt64))
-	}
-	fsuTotal := int64(fileSystemUsage.Total)
-	fsuAvail := int64(fileSystemUsage.Avail)
-
-	// Find the total size of all the files in the r.dir and all its
-	// subdirectories.
-	var totalUsedBytes int64
-	if errOuter := filepath.Walk(r.cfg.Dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// This can happen if rocksdb removes files out from under us - just keep
-			// going to get the best estimate we can.
-			if os.IsNotExist(err) {
-				return nil
-			}
-			// Special-case: if the store-dir is configured using the root of some fs,
-			// e.g. "/mnt/db", we might have special fs-created files like lost+found
-			// that we can't read, so just ignore them rather than crashing.
-			if os.IsPermission(err) && filepath.Base(path) == "lost+found" {
-				return nil
-			}
-			return err
-		}
-		if info.Mode().IsRegular() {
-			totalUsedBytes += info.Size()
-		}
-		return nil
-	}); errOuter != nil {
-		return roachpb.StoreCapacity{}, errOuter
-	}
-
-	// If no size limitation have been placed on the store size or if the
-	// limitation is greater than what's available, just return the actual
-	// totals.
-	if r.cfg.MaxSizeBytes == 0 || r.cfg.MaxSizeBytes >= fsuTotal || r.cfg.Dir == "" {
-		return roachpb.StoreCapacity{
-			Capacity:  fsuTotal,
-			Available: fsuAvail,
-			Used:      totalUsedBytes,
-		}, nil
-	}
-
-	available := r.cfg.MaxSizeBytes - totalUsedBytes
-	if available > fsuAvail {
-		available = fsuAvail
-	}
-	if available < 0 {
-		available = 0
-	}
-
-	return roachpb.StoreCapacity{
-		Capacity:  r.cfg.MaxSizeBytes,
-		Available: available,
-		Used:      totalUsedBytes,
-	}, nil
+	return computeCapacity(r.cfg.Dir, r.cfg.MaxSizeBytes)
 }
 
 // Compact forces compaction over the entire database.
@@ -1087,8 +1023,8 @@ func (r *rocksDBReadOnly) NewIterator(opts IterOptions) Iterator {
 	return iter
 }
 
-// Writer methods are not implemented for rocksDBReadOnly. Ideally, the code could be refactored so that
-// a Reader could be supplied to evaluateBatch
+// Writer methods are not implemented for rocksDBReadOnly. Ideally, the code
+// could be refactored so that a Reader could be supplied to evaluateBatch
 
 // Writer is the write interface to an engine's data.
 func (r *rocksDBReadOnly) ApplyBatchRepr(repr []byte, sync bool) error {
@@ -1497,6 +1433,12 @@ func (r *distinctBatch) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOp
 }
 
 func (r *distinctBatch) close() {
+	if r.prefixIter.inuse {
+		panic("iterator still inuse")
+	}
+	if r.normalIter.inuse {
+		panic("iterator still inuse")
+	}
 	if i := &r.prefixIter.rocksDBIterator; i.iter != nil {
 		i.destroy()
 	}
@@ -1581,7 +1523,7 @@ func (r *batchIterator) MVCCGet(
 
 func (r *batchIterator) MVCCScan(
 	start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts MVCCScanOptions,
-) (kvData []byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
+) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
 	r.batch.flushMutations()
 	return r.iter.MVCCScan(start, end, max, timestamp, opts)
 }
@@ -1679,6 +1621,12 @@ func (r *rocksDBBatch) Close() {
 		panic("this batch was already closed")
 	}
 	r.distinct.close()
+	if r.prefixIter.batch != nil {
+		panic("iterator still inuse")
+	}
+	if r.normalIter.batch != nil {
+		panic("iterator still inuse")
+	}
 	if i := &r.prefixIter.iter; i.iter != nil {
 		i.destroy()
 	}
@@ -1690,10 +1638,25 @@ func (r *rocksDBBatch) Close() {
 		r.batch = nil
 	}
 	r.builder.reset()
-	*r = rocksDBBatch{
-		builder: r.builder,
-		closed:  true,
-	}
+	r.closed = true
+
+	// Zero all the remaining fields individually. We can't just copy a new
+	// struct onto r, since r.builder has a sync.NoCopy.
+	r.batch = nil
+	r.parent = nil
+	r.flushes = 0
+	r.flushedCount = 0
+	r.flushedSize = 0
+	r.prefixIter = reusableBatchIterator{}
+	r.normalIter = reusableBatchIterator{}
+	r.distinctOpen = false
+	r.distinctNeedsFlush = false
+	r.writeOnly = false
+	r.syncCommit = false
+	r.committed = false
+	r.commitErr = nil
+	r.commitWG = sync.WaitGroup{}
+
 	batchPool.Put(r)
 }
 
@@ -2024,8 +1987,8 @@ func (r *rocksDBBatch) commitInternal(sync bool) error {
 		}
 		r.batch = nil
 		count, size = r.flushedCount, r.flushedSize
-	} else if len(r.builder.repr) > 0 {
-		count, size = r.builder.count, len(r.builder.repr)
+	} else if r.builder.Len() > 0 {
+		count, size = int(r.builder.Count()), r.builder.Len()
 
 		// Fast-path which avoids flushing mutations to the C++ batch. Instead, we
 		// directly apply the mutations to the database.
@@ -2051,7 +2014,7 @@ func (r *rocksDBBatch) commitInternal(sync bool) error {
 }
 
 func (r *rocksDBBatch) Empty() bool {
-	return r.flushes == 0 && r.builder.count == 0 && !r.builder.logData
+	return r.flushes == 0 && r.builder.Count() == 0 && !r.builder.logData
 }
 
 func (r *rocksDBBatch) Len() int {
@@ -2093,14 +2056,14 @@ func (r *rocksDBBatch) Distinct() ReadWriter {
 }
 
 func (r *rocksDBBatch) flushMutations() {
-	if r.builder.count == 0 {
+	if r.builder.Count() == 0 {
 		return
 	}
 	r.ensureBatch()
 	r.distinctNeedsFlush = false
 	r.flushes++
-	r.flushedCount += r.builder.count
-	r.flushedSize += len(r.builder.repr)
+	r.flushedCount += int(r.builder.Count())
+	r.flushedSize += r.builder.Len()
 	if err := dbApplyBatchRepr(r.batch, r.builder.Finish(), false); err != nil {
 		panic(err)
 	}
@@ -2203,8 +2166,8 @@ func (r *rocksDBIterator) destroy() {
 func (r *rocksDBIterator) Stats() IteratorStats {
 	stats := C.DBIterStats(r.iter)
 	return IteratorStats{
-		TimeBoundNumSSTs:           int(C.ulonglong(stats.timebound_num_ssts)),
-		InternalDeleteSkippedCount: int(C.ulonglong(stats.internal_delete_skipped_count)),
+		TimeBoundNumSSTs:           int(stats.timebound_num_ssts),
+		InternalDeleteSkippedCount: int(stats.internal_delete_skipped_count),
 	}
 }
 
@@ -2349,7 +2312,7 @@ func (r *rocksDBIterator) FindSplitKey(
 ) (MVCCKey, error) {
 	var splitKey C.DBString
 	r.clearState()
-	status := C.MVCCFindSplitKey(r.iter, goToCKey(start), goToCKey(end), goToCKey(minSplitKey),
+	status := C.MVCCFindSplitKey(r.iter, goToCKey(start), goToCKey(minSplitKey),
 		C.int64_t(targetSize), &splitKey)
 	if err := statusToError(status); err != nil {
 		return MVCCKey{}, err
@@ -2421,7 +2384,7 @@ func (r *rocksDBIterator) MVCCGet(
 
 func (r *rocksDBIterator) MVCCScan(
 	start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts MVCCScanOptions,
-) (kvData []byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
+) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
 	if opts.Inconsistent && opts.Txn != nil {
 		return nil, 0, nil, nil, errors.Errorf("cannot allow inconsistent reads within a transaction")
 	}
@@ -2449,7 +2412,7 @@ func (r *rocksDBIterator) MVCCScan(
 		return nil, 0, nil, nil, err
 	}
 
-	kvData = copyFromSliceVector(state.data.bufs, state.data.len)
+	kvData = [][]byte{copyFromSliceVector(state.data.bufs, state.data.len)}
 	numKVs = int64(state.data.count)
 
 	if resumeKey := cSliceToGoBytes(state.resume_key); resumeKey != nil {
@@ -2615,7 +2578,7 @@ func goToCTimestamp(ts hlc.Timestamp) C.DBTimestamp {
 func goToCTxn(txn *roachpb.Transaction) C.DBTxn {
 	var r C.DBTxn
 	if txn != nil {
-		r.id = goToCSlice(txn.ID.GetBytes())
+		r.id = goToCSlice(txn.ID.GetBytesMut())
 		r.epoch = C.uint32_t(txn.Epoch)
 		r.sequence = C.int32_t(txn.Sequence)
 		r.max_timestamp = goToCTimestamp(txn.MaxTimestamp)
@@ -2744,7 +2707,7 @@ func dbGetProto(
 		// Make a byte slice that is backed by result.data. This slice
 		// cannot live past the lifetime of this method, but we're only
 		// using it to unmarshal the roachpb.
-		data := cSliceToUnsafeGoBytes(C.DBSlice(result))
+		data := cSliceToUnsafeGoBytes(result)
 		err = protoutil.Unmarshal(data, msg)
 	}
 	C.free(unsafe.Pointer(result.data))
@@ -2902,13 +2865,44 @@ func (fr *RocksDBSstFileReader) Close() {
 	fr.rocksDB.RocksDB = nil
 }
 
+// CheckForKeyCollisions indicates if the two iterators collide on any keys.
+func CheckForKeyCollisions(existingIter Iterator, sstIter Iterator) (enginepb.MVCCStats, error) {
+	existingIterGetter := existingIter.(dbIteratorGetter)
+	sstableIterGetter := sstIter.(dbIteratorGetter)
+	var intentErr C.DBString
+	var skippedKVStats C.MVCCStatsResult
+	emptyStats := enginepb.MVCCStats{}
+
+	state := C.DBCheckForKeyCollisions(existingIterGetter.getIter(), sstableIterGetter.getIter(), &skippedKVStats, &intentErr)
+
+	err := statusToError(state.status)
+	if err != nil {
+		if err.Error() == "WriteIntentError" {
+			var e roachpb.WriteIntentError
+			if err := protoutil.Unmarshal(cStringToGoBytes(intentErr), &e); err != nil {
+				return emptyStats, errors.Wrap(err, "failed to decode write intent error")
+			}
+			return emptyStats, &e
+		} else if err.Error() == "InlineError" {
+			return emptyStats, errors.Errorf("inline values are unsupported when checking for key collisions")
+		}
+		err = errors.Wrap(&RocksDBError{msg: cToGoKey(state.key).String()}, "ingested key collides with an existing one")
+		return emptyStats, err
+	}
+
+	skippedStats, err := cStatsToGoStats(skippedKVStats, 0)
+	return skippedStats, err
+}
+
 // RocksDBSstFileWriter creates a file suitable for importing with
-// RocksDBSstFileReader.
+// RocksDBSstFileReader. It implements the Writer interface.
 type RocksDBSstFileWriter struct {
 	fw *C.DBSstFileWriter
 	// DataSize tracks the total key and value bytes added so far.
 	DataSize int64
 }
+
+var _ Writer = &RocksDBSstFileWriter{}
 
 // MakeRocksDBSstFileWriter creates a new RocksDBSstFileWriter with the default
 // configuration.
@@ -2918,28 +2912,106 @@ func MakeRocksDBSstFileWriter() (RocksDBSstFileWriter, error) {
 	return RocksDBSstFileWriter{fw: fw}, err
 }
 
-// Add puts a kv entry into the sstable being built. An error is returned if it
-// is not greater than any previously added entry (according to the comparator
-// configured during writer creation). `Close` cannot have been called.
-func (fw *RocksDBSstFileWriter) Add(kv MVCCKeyValue) error {
-	if fw.fw == nil {
-		return errors.New("cannot call Open on a closed writer")
-	}
-	fw.DataSize += int64(len(kv.Key.Key)) + int64(len(kv.Value))
-	return statusToError(C.DBSstFileWriterAdd(fw.fw, goToCKey(kv.Key), goToCSlice(kv.Value)))
+// ApplyBatchRepr implements the Writer interface.
+func (fw *RocksDBSstFileWriter) ApplyBatchRepr(repr []byte, sync bool) error {
+	panic("unimplemented")
 }
 
-// Delete puts a deletion tombstone into the sstable being built. See
-// the Add method for more.
-func (fw *RocksDBSstFileWriter) Delete(k MVCCKey) error {
+// Clear implements the Writer interface. Note that it inserts a tombstone
+// rather than actually remove the entry from the storage engine. An error is
+// returned if it is not greater than any previous key used in Put or Clear
+// (according to the comparator configured during writer creation). Close
+// cannot have been called.
+func (fw *RocksDBSstFileWriter) Clear(key MVCCKey) error {
 	if fw.fw == nil {
-		return errors.New("cannot call Delete on a closed writer")
+		return errors.New("cannot call Clear on a closed writer")
 	}
-	fw.DataSize += int64(len(k.Key))
-	return statusToError(C.DBSstFileWriterDelete(fw.fw, goToCKey(k)))
+	fw.DataSize += int64(len(key.Key))
+	return statusToError(C.DBSstFileWriterDelete(fw.fw, goToCKey(key)))
 }
 
-var _ = (*RocksDBSstFileWriter).Delete
+// SingleClear implements the Writer interface.
+func (fw *RocksDBSstFileWriter) SingleClear(key MVCCKey) error {
+	panic("unimplemented")
+}
+
+// ClearRange implements the Writer interface. Note that it inserts a range deletion
+// tombstone rather than actually remove the entries from the storage engine.
+// It can be called at any time with respect to Put and Clear.
+func (fw *RocksDBSstFileWriter) ClearRange(start, end MVCCKey) error {
+	if fw.fw == nil {
+		return errors.New("cannot call ClearRange on a closed writer")
+	}
+	fw.DataSize += int64(len(start.Key)) + int64(len(end.Key))
+	return statusToError(C.DBSstFileWriterDeleteRange(fw.fw, goToCKey(start), goToCKey(end)))
+}
+
+// ClearIterRange implements the Writer interface.
+//
+// NOTE: This method is fairly expensive as it performs a Cgo call for every
+// key deleted.
+func (fw *RocksDBSstFileWriter) ClearIterRange(iter Iterator, start, end MVCCKey) error {
+	if fw.fw == nil {
+		return errors.New("cannot call ClearIterRange on a closed writer")
+	}
+	iter.Seek(start)
+	for {
+		valid, err := iter.Valid()
+		if err != nil {
+			return err
+		}
+		if !valid || !iter.Key().Less(end) {
+			break
+		}
+		if err := fw.Clear(iter.Key()); err != nil {
+			return err
+		}
+		iter.Next()
+	}
+	return nil
+}
+
+// Merge implements the Writer interface.
+func (fw *RocksDBSstFileWriter) Merge(key MVCCKey, value []byte) error {
+	panic("unimplemented")
+}
+
+// Put implements the Writer interface. It puts a kv entry into the sstable
+// being built. An error is returned if it is not greater than any previous key
+// used in Put or Clear (according to the comparator configured during writer
+// creation). Close cannot have been called.
+func (fw *RocksDBSstFileWriter) Put(key MVCCKey, value []byte) error {
+	if fw.fw == nil {
+		return errors.New("cannot call Put on a closed writer")
+	}
+	fw.DataSize += int64(len(key.Key)) + int64(len(value))
+	return statusToError(C.DBSstFileWriterAdd(fw.fw, goToCKey(key), goToCSlice(value)))
+}
+
+// LogData implements the Writer interface.
+func (fw *RocksDBSstFileWriter) LogData(data []byte) error {
+	panic("unimplemented")
+}
+
+// LogLogicalOp implements the Writer interface.
+func (fw *RocksDBSstFileWriter) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails) {
+	// No-op. Logical logging disabled.
+}
+
+// Truncate truncates the writer's current memory buffer and returns the
+// contents it contained. May be called multiple times. The function may not
+// truncate and return all keys if the underlying RocksDB blocks have not been
+// flushed. Close cannot have been called.
+func (fw *RocksDBSstFileWriter) Truncate() ([]byte, error) {
+	if fw.fw == nil {
+		return nil, errors.New("cannot call Truncate on a closed writer")
+	}
+	var contents C.DBString
+	if err := statusToError(C.DBSstFileWriterTruncate(fw.fw, &contents)); err != nil {
+		return nil, err
+	}
+	return cStringToGoBytes(contents), nil
+}
 
 // Finish finalizes the writer and returns the constructed file's contents. At
 // least one kv entry must have been added.
@@ -3126,10 +3198,10 @@ func (r *RocksDB) DeleteFile(filename string) error {
 
 // DeleteDirAndFiles deletes the directory and any files it contains but
 // not subdirectories from this RocksDB's env. If dir does not exist,
-// DeleteDirAndFiles returns nil (no error).
+// return os.ErrNotExist.
 func (r *RocksDB) DeleteDirAndFiles(dir string) error {
-	if err := statusToError(C.DBEnvDeleteDirAndFiles(r.rdb, goToCSlice([]byte(dir)))); err != nil && notFoundErrOrDefault(err) != os.ErrNotExist {
-		return err
+	if err := statusToError(C.DBEnvDeleteDirAndFiles(r.rdb, goToCSlice([]byte(dir)))); err != nil {
+		return notFoundErrOrDefault(err)
 	}
 	return nil
 }
@@ -3146,16 +3218,6 @@ func (r *RocksDB) LinkFile(oldname, newname string) error {
 		}
 	}
 	return nil
-}
-
-// NewSortedDiskMap implements the MapProvidingEngine interface.
-func (r *RocksDB) NewSortedDiskMap() diskmap.SortedDiskMap {
-	return NewRocksDBMap(r)
-}
-
-// NewSortedDiskMultiMap implements the MapProvidingEngine interface.
-func (r *RocksDB) NewSortedDiskMultiMap() diskmap.SortedDiskMap {
-	return NewRocksDBMultiMap(r)
 }
 
 // IsValidSplitKey returns whether the key is a valid split key. Certain key
@@ -3190,11 +3252,58 @@ func MVCCScanDecodeKeyValue(repr []byte) (key MVCCKey, value []byte, orepr []byt
 	return MVCCKey{k, ts}, value, orepr, err
 }
 
+// ExportToSst exports changes to the keyrange [start.Key, end.Key) over the
+// interval (start.Timestamp, end.Timestamp]. Passing exportAllRevisions exports
+// every revision of a key for the interval, otherwise only the latest value
+// within the interval is exported. Deletions are included if all revisions are
+// requested or if the start.Timestamp is non-zero. Returns the bytes of an
+// SSTable containing the exported keys, the size of exported data, or an error.
+func ExportToSst(
+	ctx context.Context, e Reader, start, end MVCCKey, exportAllRevisions bool, io IterOptions,
+) ([]byte, roachpb.BulkOpSummary, error) {
+
+	var cdbEngine *C.DBEngine
+	switch v := e.(type) {
+	case *RocksDB:
+		cdbEngine = v.rdb
+	case *rocksDBReadOnly:
+		cdbEngine = v.parent.rdb
+	default:
+		panic(errors.Errorf("Not a rocksdb or rocksdbReadOnly engine but a %T", e))
+	}
+
+	var data C.DBString
+	var intentErr C.DBString
+	var bulkopSummary C.DBString
+
+	err := statusToError(C.DBExportToSst(goToCKey(start), goToCKey(end), C.bool(exportAllRevisions),
+		goToCIterOptions(io), cdbEngine, &data, &intentErr, &bulkopSummary))
+
+	if err != nil {
+		if err.Error() == "WriteIntentError" {
+			var e roachpb.WriteIntentError
+			if err := protoutil.Unmarshal(cStringToGoBytes(intentErr), &e); err != nil {
+				return nil, roachpb.BulkOpSummary{}, errors.Wrap(err, "failed to decode write intent error")
+			}
+
+			return nil, roachpb.BulkOpSummary{}, &e
+		}
+		return nil, roachpb.BulkOpSummary{}, err
+	}
+
+	var summary roachpb.BulkOpSummary
+	if err := protoutil.Unmarshal(cStringToGoBytes(bulkopSummary), &summary); err != nil {
+		return nil, roachpb.BulkOpSummary{}, errors.Wrap(err, "failed to decode BulkopSummary")
+	}
+
+	return cStringToGoBytes(data), summary, nil
+}
+
 func notFoundErrOrDefault(err error) error {
 	errStr := err.Error()
-	if strings.Contains(errStr, "No such file or directory") ||
-		strings.Contains(errStr, "File not found") ||
-		strings.Contains(errStr, "The system cannot find the path specified") {
+	if strings.Contains(errStr, "No such") ||
+		strings.Contains(errStr, "not found") ||
+		strings.Contains(errStr, "cannot find") {
 		return os.ErrNotExist
 	}
 	return err
@@ -3202,10 +3311,8 @@ func notFoundErrOrDefault(err error) error {
 
 // DBFile is an interface for interacting with DBWritableFile in RocksDB.
 type DBFile interface {
-	// Append appends data to this DBFile.
-	Append(data []byte) error
-	// Close closes this DBFile.
-	Close() error
+	io.Writer
+	io.Closer
 	// Sync synchronously flushes this DBFile's data to disk.
 	Sync() error
 }
@@ -3217,9 +3324,10 @@ type rocksdbFile struct {
 	rdb  *C.DBEngine
 }
 
-// Append implements the DBFile interface.
-func (f *rocksdbFile) Append(data []byte) error {
-	return statusToError(C.DBEnvAppendFile(f.rdb, f.file, goToCSlice(data)))
+// Write implements the DBFile interface.
+func (f *rocksdbFile) Write(data []byte) (int, error) {
+	err := statusToError(C.DBEnvAppendFile(f.rdb, f.file, goToCSlice(data)))
+	return len(data), err
 }
 
 // Close implements the DBFile interface.

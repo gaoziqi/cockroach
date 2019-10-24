@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // This file implements data structures used by index constraints generation.
 
@@ -52,6 +48,11 @@ func TestSpanSet(t *testing.T) {
 			MakeCompositeKey(tree.NewDInt(5), tree.NewDInt(1)), ExcludeBoundary,
 			"[/5 - /5/1)",
 		},
+		{ // 4
+			MakeKey(tree.DNull), IncludeBoundary,
+			MakeCompositeKey(tree.NewDInt(5), tree.NewDInt(1)), ExcludeBoundary,
+			"[/NULL - /5/1)",
+		},
 	}
 
 	for i, tc := range testCases {
@@ -66,7 +67,6 @@ func TestSpanSet(t *testing.T) {
 
 	testPanic := func(t *testing.T, fn func(), expected string) {
 		t.Helper()
-		expected = fmt.Sprintf("internal error: %s", expected)
 		defer func() {
 			if r := recover(); r == nil {
 				t.Errorf("panic expected with message: %s", expected)
@@ -98,6 +98,12 @@ func TestSpanUnconstrained(t *testing.T) {
 
 	if unconstrained.String() != "[ - ]" {
 		t.Errorf("unexpected string value for unconstrained span: %s", unconstrained.String())
+	}
+
+	unconstrained.startBoundary = IncludeBoundary
+	unconstrained.start = MakeKey(tree.DNull)
+	if !unconstrained.IsUnconstrained() {
+		t.Errorf("span beginning with NULL is not unconstrained")
 	}
 
 	// Test constrained span's IsUnconstrained method.

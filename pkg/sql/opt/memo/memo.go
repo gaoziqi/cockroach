@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo
 
@@ -19,11 +15,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // Memo is a data structure for efficiently storing a forest of query plans.
@@ -138,11 +135,15 @@ type Memo struct {
 	dataConversion    sessiondata.DataConversionConfig
 	reorderJoinsLimit int
 	zigzagJoinEnabled bool
+	optimizerFKs      bool
 	safeUpdates       bool
 	saveTablesPrefix  string
 
 	// curID is the highest currently in-use scalar expression ID.
 	curID opt.ScalarID
+
+	// curWithID is the highest currently in-use WITH ID.
+	curWithID opt.WithID
 
 	// WARNING: if you add more members, add initialization code in Init.
 }
@@ -164,10 +165,12 @@ func (m *Memo) Init(evalCtx *tree.EvalContext) {
 	m.dataConversion = evalCtx.SessionData.DataConversion
 	m.reorderJoinsLimit = evalCtx.SessionData.ReorderJoinsLimit
 	m.zigzagJoinEnabled = evalCtx.SessionData.ZigzagJoinEnabled
+	m.optimizerFKs = evalCtx.SessionData.OptimizerFKs
 	m.safeUpdates = evalCtx.SessionData.SafeUpdates
 	m.saveTablesPrefix = evalCtx.SessionData.SaveTablesPrefix
 
 	m.curID = 0
+	m.curWithID = 0
 }
 
 // IsEmpty returns true if there are no expressions in the memo.
@@ -222,7 +225,7 @@ func (m *Memo) SetRoot(e RelExpr, phys *physical.Required) {
 // SetScalarRoot stores the root memo expression when it is a scalar expression.
 func (m *Memo) SetScalarRoot(scalar opt.ScalarExpr) {
 	if m.rootExpr != nil {
-		panic(pgerror.AssertionFailedf("cannot set scalar root multiple times"))
+		panic(errors.AssertionFailedf("cannot set scalar root multiple times"))
 	}
 	m.rootExpr = scalar
 }
@@ -232,7 +235,7 @@ func (m *Memo) SetScalarRoot(scalar opt.ScalarExpr) {
 func (m *Memo) HasPlaceholders() bool {
 	rel, ok := m.rootExpr.(RelExpr)
 	if !ok {
-		panic(pgerror.AssertionFailedf("placeholders only supported when memo root is relational"))
+		panic(errors.AssertionFailedf("placeholders only supported when memo root is relational"))
 	}
 
 	return rel.Relational().HasPlaceholder
@@ -264,6 +267,7 @@ func (m *Memo) IsStale(
 	if !m.dataConversion.Equals(&evalCtx.SessionData.DataConversion) ||
 		m.reorderJoinsLimit != evalCtx.SessionData.ReorderJoinsLimit ||
 		m.zigzagJoinEnabled != evalCtx.SessionData.ZigzagJoinEnabled ||
+		m.optimizerFKs != evalCtx.SessionData.OptimizerFKs ||
 		m.safeUpdates != evalCtx.SessionData.SafeUpdates ||
 		m.saveTablesPrefix != evalCtx.SessionData.SaveTablesPrefix {
 		return true, nil
@@ -303,7 +307,7 @@ func (m *Memo) SetBestProps(
 		if e.RequiredPhysical() != required ||
 			!e.ProvidedPhysical().Equals(provided) ||
 			e.Cost() != cost {
-			panic(pgerror.AssertionFailedf(
+			panic(errors.AssertionFailedf(
 				"cannot overwrite %s / %s (%.9g) with %s / %s (%.9g)",
 				e.RequiredPhysical(),
 				e.ProvidedPhysical(),
@@ -339,4 +343,49 @@ func (m *Memo) IsOptimized() bool {
 func (m *Memo) NextID() opt.ScalarID {
 	m.curID++
 	return m.curID
+}
+
+// RequestColStat calculates and returns the column statistic calculated on the
+// relational expression.
+func (m *Memo) RequestColStat(
+	expr RelExpr, cols opt.ColSet,
+) (colStat *props.ColumnStatistic, ok bool) {
+	// When SetRoot is called, the statistics builder may have been cleared.
+	// If this happens, we can't serve the request anymore.
+	if m.logPropsBuilder.sb.md != nil {
+		return m.logPropsBuilder.sb.colStat(cols, expr), true
+	}
+	return nil, false
+}
+
+// RowsProcessed calculates and returns the number of rows processed by the
+// relational expression. It is currently only supported for joins.
+func (m *Memo) RowsProcessed(expr RelExpr) (_ float64, ok bool) {
+	// When SetRoot is called, the statistics builder may have been cleared.
+	// If this happens, we can't serve the request anymore.
+	if m.logPropsBuilder.sb.md != nil {
+		return m.logPropsBuilder.sb.rowsProcessed(expr), true
+	}
+	return 0, false
+}
+
+// NextWithID returns a not-yet-assigned identifier for a WITH expression.
+func (m *Memo) NextWithID() opt.WithID {
+	m.curWithID++
+	return m.curWithID
+}
+
+// ClearColStats clears all column statistics from every relational expression
+// in the memo. This is used to free up the potentially large amount of memory
+// used by histograms.
+func (m *Memo) ClearColStats(parent opt.Expr) {
+	for i, n := 0, parent.ChildCount(); i < n; i++ {
+		child := parent.Child(i)
+		m.ClearColStats(child)
+	}
+
+	switch t := parent.(type) {
+	case RelExpr:
+		t.Relational().Stats.ColStats = props.ColStatsMap{}
+	}
 }

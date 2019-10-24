@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rowcontainer
 
@@ -20,7 +16,6 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -77,6 +72,15 @@ type ReorderableRowContainer interface {
 	Reorder(context.Context, sqlbase.ColumnOrdering) error
 }
 
+// IndexedRowContainer is a ReorderableRowContainer which also implements
+// tree.IndexedRows. It allows retrieving a row at a particular index.
+type IndexedRowContainer interface {
+	ReorderableRowContainer
+
+	// GetRow returns a row at the given index or an error.
+	GetRow(ctx context.Context, idx int) (tree.IndexedRow, error)
+}
+
 // RowIterator is a simple iterator used to iterate over sqlbase.EncDatumRows.
 // Example use:
 // 	var i RowIterator
@@ -128,7 +132,7 @@ type MemRowContainer struct {
 }
 
 var _ heap.Interface = &MemRowContainer{}
-var _ SortableRowContainer = &MemRowContainer{}
+var _ IndexedRowContainer = &MemRowContainer{}
 
 // Init initializes the MemRowContainer. The MemRowContainer uses evalCtx.Mon
 // to track memory usage.
@@ -300,6 +304,11 @@ func (mc *MemRowContainer) NewFinalIterator(_ context.Context) RowIterator {
 	return memRowFinalIterator{MemRowContainer: mc}
 }
 
+// GetRow implements IndexedRowContainer.
+func (mc *MemRowContainer) GetRow(ctx context.Context, pos int) (tree.IndexedRow, error) {
+	return IndexedRow{Idx: pos, Row: mc.EncRow(pos)}, nil
+}
+
 var _ RowIterator = memRowFinalIterator{}
 
 // Rewind implements the RowIterator interface.
@@ -346,7 +355,7 @@ type DiskBackedRowContainer struct {
 	diskMonitor *mon.BytesMonitor
 }
 
-var _ SortableRowContainer = &DiskBackedRowContainer{}
+var _ ReorderableRowContainer = &DiskBackedRowContainer{}
 
 // Init initializes a DiskBackedRowContainer.
 // Arguments:
@@ -470,7 +479,7 @@ func (f *DiskBackedRowContainer) UsingDisk() bool {
 // memory error. Returns whether the DiskBackedRowContainer spilled to disk and
 // an error if one occurred while doing so.
 func (f *DiskBackedRowContainer) spillIfMemErr(ctx context.Context, err error) (bool, error) {
-	if pgErr, ok := pgerror.GetPGCause(err); !(ok && pgErr.Code == pgerror.CodeOutOfMemoryError) {
+	if !sqlbase.IsOutOfMemoryError(err) {
 		return false, nil
 	}
 	if spillErr := f.SpillToDisk(ctx); spillErr != nil {
@@ -544,9 +553,15 @@ type DiskBackedIndexedRowContainer struct {
 	// error is encountered.
 	maxCacheSize int
 	cacheMemAcc  mon.BoundAccount
+
+	// DisableCache is intended for testing only. It can be set to true to
+	// disable reading and writing from the row cache.
+	DisableCache bool
 }
 
-// MakeDiskBackedIndexedRowContainer creates a DiskBackedIndexedRowContainer
+var _ IndexedRowContainer = &DiskBackedIndexedRowContainer{}
+
+// NewDiskBackedIndexedRowContainer creates a DiskBackedIndexedRowContainer
 // with the given engine as the underlying store that rows are stored on when
 // it spills to disk.
 // Arguments:
@@ -560,7 +575,7 @@ type DiskBackedIndexedRowContainer struct {
 //  - diskMonitor is used to monitor this container's disk usage.
 //  - rowCapacity (if not 0) specifies the number of rows in-memory container
 //    should be preallocated for.
-func MakeDiskBackedIndexedRowContainer(
+func NewDiskBackedIndexedRowContainer(
 	ordering sqlbase.ColumnOrdering,
 	typs []types.T,
 	evalCtx *tree.EvalContext,
@@ -656,6 +671,9 @@ func (f *DiskBackedIndexedRowContainer) GetRow(
 	var rowWithIdx sqlbase.EncDatumRow
 	var err error
 	if f.UsingDisk() {
+		if f.DisableCache {
+			return f.getRowWithoutCache(ctx, pos), nil
+		}
 		// The cache contains all contiguous rows up to the biggest pos requested
 		// so far (even if the rows were not requested explicitly). For example,
 		// if the cache is empty and the request comes for a row at pos 3, the

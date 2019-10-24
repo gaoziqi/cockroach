@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo
 
@@ -20,10 +16,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // Convenience aliases to avoid the constraint prefix everywhere.
@@ -384,7 +380,7 @@ func (cb *constraintsBuilder) buildConstraintForTupleInequality(
 	case opt.GeOp:
 		less, boundary = false, includeBoundary
 	default:
-		panic(pgerror.AssertionFailedf("unsupported operator type %s", log.Safe(e.Op())))
+		panic(errors.AssertionFailedf("unsupported operator type %s", log.Safe(e.Op())))
 	}
 	// Disallow NULLs on the first column.
 	startKey, startBoundary := constraint.MakeKey(tree.DNull), excludeBoundary
@@ -436,6 +432,18 @@ func (cb *constraintsBuilder) buildConstraints(e opt.ScalarExpr) (_ *constraint.
 		cl = cl.Intersect(cb.evalCtx, cr)
 		tightl = tightl && tightr
 		return cl, (tightl || cl == contradiction)
+
+	case *OrExpr:
+		cl, _ := cb.buildConstraints(t.Left)
+		cr, _ := cb.buildConstraints(t.Right)
+		cl = cl.Union(cb.evalCtx, cr)
+
+		// The union may not be "tight" because the  new constraint set might allow
+		// additional combinations of values that neither of the input sets allowed. For
+		// example:
+		//   (x > 1 AND y > 10) OR (x < 5 AND y < 50)
+		// the union is unconstrained (and thus allows combinations like x,y = 10,0).
+		return cl, false
 
 	case *RangeExpr:
 		return cb.buildConstraints(t.And)

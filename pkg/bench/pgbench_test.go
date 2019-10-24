@@ -1,22 +1,17 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package bench
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
 	"math/rand"
 	"net"
@@ -37,14 +32,14 @@ import (
 // in its TPC-B(ish) mode.
 func BenchmarkPgbenchQuery(b *testing.B) {
 	defer log.Scope(b).Close(b)
-	ForEachDB(b, func(b *testing.B, db *gosql.DB) {
-		if err := SetupBenchDB(db, 20000, true /*quiet*/); err != nil {
+	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		if err := SetupBenchDB(db.DB, 20000, true /*quiet*/); err != nil {
 			b.Fatal(err)
 		}
 		src := rand.New(rand.NewSource(5432))
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			if err := RunOne(db, src, 20000); err != nil {
+			if err := RunOne(db.DB, src, 20000); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -56,8 +51,8 @@ func BenchmarkPgbenchQuery(b *testing.B) {
 // in its TPC-B(ish) mode.
 func BenchmarkPgbenchQueryParallel(b *testing.B) {
 	defer log.Scope(b).Close(b)
-	ForEachDB(b, func(b *testing.B, db *gosql.DB) {
-		if err := SetupBenchDB(db, 20000, true /*quiet*/); err != nil {
+	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		if err := SetupBenchDB(db.DB, 20000, true /*quiet*/); err != nil {
 			b.Fatal(err)
 		}
 
@@ -75,7 +70,7 @@ func BenchmarkPgbenchQueryParallel(b *testing.B) {
 			for pb.Next() {
 				r.Reset()
 				for r.Next() {
-					err = RunOne(db, src, 20000)
+					err = RunOne(db.DB, src, 20000)
 					if err == nil {
 						break
 					}
@@ -117,7 +112,7 @@ func BenchmarkPgbenchExec(b *testing.B) {
 		defer s.Stopper().Stop(context.TODO())
 
 		pgURL, cleanupFn := sqlutils.PGUrl(
-			b, s.ServingAddr(), "benchmarkCockroach", url.User(security.RootUser))
+			b, s.ServingSQLAddr(), "benchmarkCockroach", url.User(security.RootUser))
 		pgURL.RawQuery = "sslmode=disable"
 		defer cleanupFn()
 

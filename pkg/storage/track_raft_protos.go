@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -22,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/apply"
 	"github.com/cockroachdb/cockroach/pkg/storage/compactor"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
@@ -37,8 +34,8 @@ func funcName(f interface{}) string {
 // marshaled downstream of raft. It returns a function that removes the
 // instrumentation and returns the list of downstream-of-raft protos.
 func TrackRaftProtos() func() []reflect.Type {
-	// Grab the name of the function that roots all raft operations.
-	processRaftFunc := funcName((*Replica).processRaftCommand)
+	// Grab the name of the function that roots all raft application.
+	applyRaftEntryFunc := funcName((*apply.Task).ApplyCommittedEntries)
 	// We only need to track protos that could cause replica divergence
 	// by being written to disk downstream of raft.
 	whitelist := []string{
@@ -108,7 +105,7 @@ func TrackRaftProtos() func() []reflect.Type {
 				break
 			}
 
-			if strings.Contains(f.Function, processRaftFunc) {
+			if strings.Contains(f.Function, applyRaftEntryFunc) {
 				belowRaftProtos.Lock()
 				belowRaftProtos.inner[t] = struct{}{}
 				belowRaftProtos.Unlock()

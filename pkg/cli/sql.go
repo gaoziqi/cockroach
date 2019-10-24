@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -18,7 +14,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -29,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
@@ -39,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	readline "github.com/knz/go-libedit"
 	"github.com/lib/pq"
 	isatty "github.com/mattn/go-isatty"
@@ -46,17 +43,36 @@ import (
 )
 
 const (
-	infoMessage = `# Welcome to the cockroach SQL interface.
+	welcomeMessage = `#
+# Welcome to the CockroachDB SQL shell.
 # All statements must be terminated by a semicolon.
-# To exit: CTRL + D.
+# To exit, type: \q.
 #
 `
+	helpMessageFmt = `You are using 'cockroach sql', CockroachDB's lightweight SQL client.
+Type:
+  \? or "help"      print this help.
+  \q, quit, exit    exit the shell (Ctrl+C/Ctrl+D also supported).
+  \! CMD            run an external command and print its results on standard output.
+  \| CMD            run an external command and run its output as SQL statements.
+  \set [NAME]       set a client-side flag or (without argument) print the current settings.
+  \unset NAME       unset a flag.
+  \show             during a multi-line statement or transaction, show the SQL entered so far.
+  \h [NAME]         help on syntax of SQL commands.
+  \hf [NAME]        help on SQL built-in functions.
+  \l                list all databases in the CockroachDB cluster.
+  \dt               show the tables of the current schema in the current database.
+  \du               list the users for all databases.
+  \d [TABLE]        show details about columns in the specified table, or alias for '\dt' if no table is specified.
+More documentation about our SQL dialect and the CLI shell is available online:
+%s
+%s`
+
+	defaultPromptPattern = "%n@%M/%/%x>"
+
+	// debugPromptPattern avoids substitution patterns that require a db roundtrip.
+	debugPromptPattern = "%n@%M>"
 )
-
-const defaultPromptPattern = "%n@%M/%/%x>"
-
-// debugPromptPattern avoids substitution patterns that require a db roundtrip.
-const debugPromptPattern = "%n@%M>"
 
 // sqlShellCmd opens a sql shell.
 var sqlShellCmd = &cobra.Command{
@@ -191,21 +207,7 @@ const (
 
 // printCliHelp prints a short inline help about the CLI.
 func printCliHelp() {
-	fmt.Printf(`You are using 'cockroach sql', CockroachDB's lightweight SQL client.
-Type:
-  \q, quit, exit    exit the shell (Ctrl+C/Ctrl+D also supported)
-  \! CMD            run an external command and print its results on standard output.
-  \| CMD            run an external command and run its output as SQL statements.
-  \set [NAME]       set a client-side flag or (without argument) print the current settings.
-  \unset NAME       unset a flag.
-  \show             during a multi-line statement or transaction, show the SQL entered so far.
-  \? or "help"      print this help.
-  \h [NAME]         help on syntax of SQL commands.
-  \hf [NAME]        help on SQL built-in functions.
-
-More documentation about our SQL dialect and the CLI shell is available online:
-%s
-%s`,
+	fmt.Printf(helpMessageFmt,
 		base.DocsURL("sql-statements.html"),
 		base.DocsURL("use-the-built-in-sql-client.html"),
 	)
@@ -218,8 +220,7 @@ func (c *cliState) hasEditor() bool {
 	return c.ins != noLineEditor
 }
 
-// addHistory persists a line of input to the readline history
-// file.
+// addHistory persists a line of input to the readline history file.
 func (c *cliState) addHistory(line string) {
 	if !c.hasEditor() || len(line) == 0 {
 		return
@@ -491,14 +492,14 @@ func (c *cliState) handleFunctionHelp(cmd []string, nextState, errState cliState
 		}
 		fmt.Println()
 	} else {
-		_, err := parser.Parse(fmt.Sprintf("select %s(??", funcName))
-		pgerr, ok := pgerror.GetPGCause(err)
-		if !ok || !strings.HasPrefix(pgerr.Hint, "help:") {
+		_, helpText, _ := c.serverSideParse(fmt.Sprintf("select %s(??", funcName))
+		if helpText != "" {
+			fmt.Println(helpText)
+		} else {
 			fmt.Fprintf(stderr,
 				"no help available for %q.\nTry \\hf with no argument to see available help.\n", funcName)
 			return errState
 		}
-		fmt.Println(pgerr.Hint[6:])
 	}
 	return nextState
 }
@@ -749,20 +750,21 @@ func (c *cliState) GetCompletions(_ string) []string {
 
 	if !strings.HasSuffix(sql, "??") {
 		fmt.Fprintf(c.ins.Stdout(),
-			"\ntab completion not supported; append '??' and press tab for contextual help\n\n%s", sql)
-		return nil
+			"\ntab completion not supported; append '??' and press tab for contextual help\n\n")
+	} else {
+		_, helpText, err := c.serverSideParse(sql)
+		if helpText != "" {
+			// We have a completion suggestion. Use that.
+			fmt.Fprintf(c.ins.Stdout(), "\nSuggestion:\n%s\n", helpText)
+		} else if err != nil {
+			// Some other error. Display it.
+			fmt.Fprintf(c.ins.Stdout(), "\n%v\n", err)
+			maybeShowErrorDetails(c.ins.Stdout(), err, false)
+		}
 	}
 
-	_, pgErr := c.serverSideParse(sql)
-	if pgErr != nil {
-		if pgErr.Message == "help token in input" && strings.HasPrefix(pgErr.Hint, "help:") {
-			fmt.Fprintf(c.ins.Stdout(), "\nSuggestion:\n%s\n", pgErr.Hint[6:])
-		} else {
-			fmt.Fprintf(c.ins.Stdout(), "\n%v\n", pgErr)
-			maybeShowErrorDetails(c.ins.Stdout(), pgErr, false)
-		}
-		fmt.Fprint(c.ins.Stdout(), c.currentPrompt, sql)
-	}
+	// After the suggestion or error, re-display the prompt and current entry.
+	fmt.Fprint(c.ins.Stdout(), c.currentPrompt, sql)
 	return nil
 }
 
@@ -1023,6 +1025,28 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	case `\hf`:
 		return c.handleFunctionHelp(cmd[1:], loopState, errState)
 
+	case `\l`:
+		c.concatLines = `SHOW DATABASES`
+		return cliRunStatement
+
+	case `\dt`:
+		c.concatLines = `SHOW TABLES`
+		return cliRunStatement
+
+	case `\du`:
+		c.concatLines = `SHOW USERS`
+		return cliRunStatement
+
+	case `\d`:
+		if len(cmd) == 1 {
+			c.concatLines = `SHOW TABLES`
+			return cliRunStatement
+		} else if len(cmd) == 2 {
+			c.concatLines = `SHOW COLUMNS FROM ` + cmd[1]
+			return cliRunStatement
+		}
+		return c.invalidSyntax(errState, `%s. Try \? for help.`, c.lastInputLine)
+
 	default:
 		if strings.HasPrefix(cmd[0], `\d`) {
 			// Unrecognized command for now, but we want to be helpful.
@@ -1092,18 +1116,19 @@ func (c *cliState) doPrepareStatementLine(
 
 func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnum) cliStateEnum {
 	// From here on, client-side syntax checking is enabled.
-	parsedStmts, pgErr := c.serverSideParse(c.concatLines)
-	if pgErr != nil {
-		if pgErr.Message == "help token in input" && strings.HasPrefix(pgErr.Hint, "help:") {
-			fmt.Println(pgErr.Hint[6:])
-		} else {
-			_ = c.invalidSyntax(0, "statement ignored: %v", pgErr)
-			maybeShowErrorDetails(stderr, pgErr, false)
+	parsedStmts, helpText, err := c.serverSideParse(c.concatLines)
+	if err != nil {
+		if helpText != "" {
+			// There was a help text included. Use it.
+			fmt.Println(helpText)
+		}
 
-			// Stop here if exiterr is set.
-			if c.errExit {
-				return cliStop
-			}
+		_ = c.invalidSyntax(0, "statement ignored: %v", err)
+		maybeShowErrorDetails(stderr, err, false)
+
+		// Stop here if exiterr is set.
+		if c.errExit {
+			return cliStop
 		}
 
 		// Remove the erroneous lines from the buffered input,
@@ -1219,10 +1244,12 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 // a newline character is printed before anything else.
 func maybeShowErrorDetails(w io.Writer, err error, printNewline bool) {
 	var hint, detail string
-	if pqErr, ok := err.(*pq.Error); ok {
+	if pqErr, ok := errors.UnwrapAll(err).(*pq.Error); ok {
 		hint, detail = pqErr.Hint, pqErr.Detail
-	} else if pgErr, ok := pgerror.GetPGCause(err); ok {
-		hint, detail = pgErr.Hint, pgErr.Detail
+	} else {
+		// Extract the standard hint and details.
+		hint = errors.FlattenHints(err)
+		detail = errors.FlattenDetails(err)
 	}
 	if detail != "" {
 		if printNewline {
@@ -1363,22 +1390,31 @@ func runInteractive(conn *sqlConn) (exitErr error) {
 // runOneStatement executes one statement and terminates
 // on error.
 func (c *cliState) runStatements(stmts []string) error {
-	for i, stmt := range stmts {
-		// We do not use the logic from doRunStatement here
-		// because we need a different error handling mechanism:
-		// the error, if any, must not be printed to stderr if
-		// we are returning directly.
-		c.exitErr = runQueryAndFormatResults(c.conn, os.Stdout, makeQuery(stmt))
-		if c.exitErr != nil {
-			if !c.errExit && i < len(stmts)-1 {
-				// Print the error now because we don't get a chance later.
-				fmt.Fprintln(stderr, c.exitErr)
-				maybeShowErrorDetails(stderr, c.exitErr, false)
-			}
-			if c.errExit {
-				break
+	for {
+		for i, stmt := range stmts {
+			// We do not use the logic from doRunStatement here
+			// because we need a different error handling mechanism:
+			// the error, if any, must not be printed to stderr if
+			// we are returning directly.
+			c.exitErr = runQueryAndFormatResults(c.conn, os.Stdout, makeQuery(stmt))
+			if c.exitErr != nil {
+				if !c.errExit && i < len(stmts)-1 {
+					// Print the error now because we don't get a chance later.
+					fmt.Fprintln(stderr, c.exitErr)
+					maybeShowErrorDetails(stderr, c.exitErr, false)
+				}
+				if c.errExit {
+					break
+				}
 			}
 		}
+		// If --watch was specified and no error was encountered,
+		// repeat.
+		if sqlCtx.repeatDelay > 0 && c.exitErr == nil {
+			time.Sleep(sqlCtx.repeatDelay)
+			continue
+		}
+		break
 	}
 
 	if c.exitErr != nil {
@@ -1408,11 +1444,11 @@ func runTerm(cmd *cobra.Command, args []string) error {
 	checkInteractive()
 
 	if cliCtx.isInteractive {
-		// The user only gets to see the info screen on interactive sessions.
-		fmt.Print(infoMessage)
+		// The user only gets to see the welcome message on interactive sessions.
+		fmt.Print(welcomeMessage)
 	}
 
-	conn, err := getPasswordAndMakeSQLClient("cockroach sql")
+	conn, err := makeSQLClient("cockroach sql", useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -1476,26 +1512,18 @@ func (c *cliState) tryEnableCheckSyntax() {
 // serverSideParse uses the SHOW SYNTAX statement to analyze the given string.
 // If the syntax is correct, the function returns the statement
 // decomposition in the first return value. If it is not, the function
-// assembles a pgerror.Error with suitable Detail and Hint fields.
-func (c *cliState) serverSideParse(sql string) (stmts []string, pgErr *pgerror.Error) {
+// extracts a help string if available.
+func (c *cliState) serverSideParse(sql string) (stmts []string, helpText string, err error) {
 	cols, rows, err := runQuery(c.conn, makeQuery("SHOW SYNTAX "+lex.EscapeSQLString(sql)), true)
 	if err != nil {
 		// The query failed with some error. This is not a syntax error
 		// detected by SHOW SYNTAX (those show up as valid rows) but
-		// instead something else. Do our best to convert that something
-		// else back to a pgerror.Error.
-		if pgErr, ok := err.(*pgerror.Error); ok {
-			return nil, pgErr
-		} else if pqErr, ok := err.(*pq.Error); ok {
-			return nil, pgerror.New(
-				string(pqErr.Code), pqErr.Message).SetHintf("%s", pqErr.Hint).SetDetailf("%s", pqErr.Detail)
-		}
-		return nil, pgerror.Newf(pgerror.CodeDataExceptionError,
-			"unexpected error: %v", err)
+		// instead something else.
+		return nil, "", errors.Wrap(err, "unexpected error")
 	}
 
 	if len(cols) < 2 {
-		return nil, pgerror.Newf(pgerror.CodeDataExceptionError,
+		return nil, "", errors.Newf(
 			"invalid results for SHOW SYNTAX: %q %q", cols, rows)
 	}
 
@@ -1514,17 +1542,32 @@ func (c *cliState) serverSideParse(sql string) (stmts []string, pgErr *pgerror.E
 				code = row[1]
 			}
 		}
-		return nil, pgerror.New(code, message).SetHintf("%s", hint).SetDetailf("%s", detail)
+		// Is it a help text?
+		if strings.HasPrefix(message, "help token in input") && strings.HasPrefix(hint, "help:") {
+			// Yes: return it.
+			helpText = hint[6:]
+			hint = ""
+		}
+		// In any case report that there was an error while parsing.
+		err := errors.New(message)
+		err = pgerror.WithCandidateCode(err, code)
+		if hint != "" {
+			err = errors.WithHint(err, hint)
+		}
+		if detail != "" {
+			err = errors.WithDetail(err, detail)
+		}
+		return nil, helpText, err
 	}
 
 	// Otherwise, hopefully we got some SQL statements.
 	stmts = make([]string, len(rows))
 	for i := range rows {
 		if rows[i][0] != "sql" {
-			return nil, pgerror.Newf(pgerror.CodeDataExceptionError,
+			return nil, "", errors.Newf(
 				"invalid results for SHOW SYNTAX: %q %q", cols, rows)
 		}
 		stmts[i] = rows[i][1]
 	}
-	return stmts, nil
+	return stmts, "", nil
 }

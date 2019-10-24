@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rowcontainer
 
@@ -24,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -190,7 +187,7 @@ func TestDiskBackedRowContainer(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
-	tempEngine, err := engine.NewTempEngine(base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
+	tempEngine, err := engine.NewTempEngine(engine.TestStorageEngine, base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,9 +320,9 @@ func TestDiskBackedRowContainer(t *testing.T) {
 		}()
 
 		err := rc.AddRow(ctx, rows[0])
-		if pgErr, ok := pgerror.GetPGCause(err); !(ok && pgErr.Code == pgerror.CodeDiskFullError) {
+		if code := pgerror.GetPGCode(err); code != pgcode.DiskFull {
 			t.Fatalf(
-				"unexpected error %v, expected disk full error %s", err, pgerror.CodeDiskFullError,
+				"unexpected error %v, expected disk full error %s", err, pgcode.DiskFull,
 			)
 		}
 		if !rc.Spilled() {
@@ -382,7 +379,7 @@ func TestDiskBackedIndexedRowContainer(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
-	tempEngine, err := engine.NewTempEngine(base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
+	tempEngine, err := engine.NewTempEngine(engine.TestStorageEngine, base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +429,7 @@ func TestDiskBackedIndexedRowContainer(t *testing.T) {
 			}
 
 			func() {
-				rc := MakeDiskBackedIndexedRowContainer(ordering, types, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
+				rc := NewDiskBackedIndexedRowContainer(ordering, types, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
 				defer rc.Close(ctx)
 				mid := numRows / 2
 				for i := 0; i < mid; i++ {
@@ -496,7 +493,7 @@ func TestDiskBackedIndexedRowContainer(t *testing.T) {
 			}
 
 			func() {
-				rc := MakeDiskBackedIndexedRowContainer(ordering, types, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
+				rc := NewDiskBackedIndexedRowContainer(ordering, types, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
 				defer rc.Close(ctx)
 				for _, row := range rows {
 					if err := rc.AddRow(ctx, row); err != nil {
@@ -591,7 +588,7 @@ func TestDiskBackedIndexedRowContainer(t *testing.T) {
 			}
 
 			func() {
-				rc := MakeDiskBackedIndexedRowContainer(ordering, types, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
+				rc := NewDiskBackedIndexedRowContainer(ordering, types, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
 				defer rc.Close(ctx)
 				if err := rc.SpillToDisk(ctx); err != nil {
 					t.Fatal(err)
@@ -657,7 +654,7 @@ func TestDiskBackedIndexedRowContainer(t *testing.T) {
 			storedTypes[len(typs)] = sqlbase.OneIntCol[0]
 
 			func() {
-				rc := MakeDiskBackedIndexedRowContainer(ordering, typs, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
+				rc := NewDiskBackedIndexedRowContainer(ordering, typs, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
 				defer rc.Close(ctx)
 				for i := 0; i < numRows; i++ {
 					if err := rc.AddRow(ctx, rows[i]); err != nil {
@@ -698,7 +695,7 @@ func TestDiskBackedIndexedRowContainer(t *testing.T) {
 			storedTypes[len(typs)] = sqlbase.OneIntCol[0]
 
 			func() {
-				d := MakeDiskBackedIndexedRowContainer(ordering, typs, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
+				d := NewDiskBackedIndexedRowContainer(ordering, typs, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
 				defer d.Close(ctx)
 				if err := d.SpillToDisk(ctx); err != nil {
 					t.Fatal(err)
@@ -825,7 +822,7 @@ func BenchmarkDiskBackedIndexedRowContainer(b *testing.B) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
-	tempEngine, err := engine.NewTempEngine(base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
+	tempEngine, err := engine.NewTempEngine(engine.TestStorageEngine, base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -858,7 +855,7 @@ func BenchmarkDiskBackedIndexedRowContainer(b *testing.B) {
 	accessPattern := generateAccessPattern(numRows)
 
 	b.Run("InMemory", func(b *testing.B) {
-		rc := MakeDiskBackedIndexedRowContainer(nil, sqlbase.OneIntCol, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
+		rc := NewDiskBackedIndexedRowContainer(nil, sqlbase.OneIntCol, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
 		defer rc.Close(ctx)
 		for i := 0; i < len(rows); i++ {
 			if err := rc.AddRow(ctx, rows[i]); err != nil {
@@ -880,7 +877,7 @@ func BenchmarkDiskBackedIndexedRowContainer(b *testing.B) {
 	})
 
 	b.Run("OnDiskWithCache", func(b *testing.B) {
-		rc := MakeDiskBackedIndexedRowContainer(nil, sqlbase.OneIntCol, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
+		rc := NewDiskBackedIndexedRowContainer(nil, sqlbase.OneIntCol, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
 		defer rc.Close(ctx)
 		if err := rc.SpillToDisk(ctx); err != nil {
 			b.Fatal(err)
@@ -905,7 +902,7 @@ func BenchmarkDiskBackedIndexedRowContainer(b *testing.B) {
 	})
 
 	b.Run("OnDiskWithoutCache", func(b *testing.B) {
-		rc := MakeDiskBackedIndexedRowContainer(nil, sqlbase.OneIntCol, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
+		rc := NewDiskBackedIndexedRowContainer(nil, sqlbase.OneIntCol, &evalCtx, tempEngine, &memoryMonitor, &diskMonitor, 0 /* rowCapacity */)
 		defer rc.Close(ctx)
 		if err := rc.SpillToDisk(ctx); err != nil {
 			b.Fatal(err)

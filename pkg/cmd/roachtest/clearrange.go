@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -23,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
-func registerClearRange(r *registry) {
+func registerClearRange(r *testRegistry) {
 	for _, checks := range []bool{true, false} {
 		checks := checks
 		r.Add(testSpec{
@@ -31,7 +26,7 @@ func registerClearRange(r *registry) {
 			// 5h for import, 90 for the test. The import should take closer
 			// to <3:30h but it varies.
 			Timeout:    5*time.Hour + 90*time.Minute,
-			MinVersion: `v2.2.0`,
+			MinVersion: "v19.1.0",
 			Cluster:    makeClusterSpec(10),
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runClearRange(ctx, t, c, checks)
@@ -43,31 +38,16 @@ func registerClearRange(r *registry) {
 func runClearRange(ctx context.Context, t *test, c *cluster, aggressiveChecks bool) {
 	c.Put(ctx, cockroach, "./cockroach")
 
-	if err := c.RunE(ctx, c.Node(1), "test -d /mnt/data1/.zfs/snapshot/pristine"); err != nil {
-		// Use ZFS so the data directories can instantly be rolled back to
-		// their pristine state. Useful for iterating quickly on the test.
-		if !local {
-			c.Reformat(ctx, c.All(), "zfs")
-		}
+	t.Status("restoring fixture")
+	c.Start(ctx, t)
 
-		t.Status("restoring fixture")
-		c.Start(ctx, t)
-
-		// NB: on a 10 node cluster, this should take well below 3h.
-		tBegin := timeutil.Now()
-		c.Run(ctx, c.Node(1), "./cockroach", "workload", "fixtures", "import", "bank",
-			"--payload-bytes=10240", "--ranges=10", "--rows=65104166", "--seed=4", "--db=bigbank")
-		c.l.Printf("import took %.2fs", timeutil.Since(tBegin).Seconds())
-		c.Stop(ctx)
-		t.Status()
-
-		if !local {
-			c.Run(ctx, c.All(), "test -e /sbin/zfs && sudo zfs snapshot data1@pristine")
-		}
-	} else {
-		t.Status(`restoring store directories from zfs snapshot`)
-		c.Run(ctx, c.All(), "sudo zfs rollback data1@pristine")
-	}
+	// NB: on a 10 node cluster, this should take well below 3h.
+	tBegin := timeutil.Now()
+	c.Run(ctx, c.Node(1), "./cockroach", "workload", "fixtures", "import", "bank",
+		"--payload-bytes=10240", "--ranges=10", "--rows=65104166", "--seed=4", "--db=bigbank")
+	c.l.Printf("import took %.2fs", timeutil.Since(tBegin).Seconds())
+	c.Stop(ctx)
+	t.Status()
 
 	if aggressiveChecks {
 		// Run with an env var that runs a synchronous consistency check after each rebalance and merge.
@@ -75,7 +55,7 @@ func runClearRange(ctx context.Context, t *test, c *cluster, aggressiveChecks bo
 		//
 		// NB: the below invocation was found to actually make it to the server at the time of writing.
 		c.Start(ctx, t, startArgs(
-			"--env", "COCKROACH_CONSISTENCY_AGGRESSIVE=true COCKROACH_FATAL_ON_STATS_MISMATCH=true",
+			"--env", "COCKROACH_CONSISTENCY_AGGRESSIVE=true COCKROACH_ENFORCE_CONSISTENT_STATS=true",
 		))
 	} else {
 		c.Start(ctx, t)

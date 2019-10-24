@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -23,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/stretchr/testify/assert"
 )
 
 // Example_sql_lex tests the usage of the lexer in the sql subcommand.
@@ -31,7 +28,7 @@ func Example_sql_lex() {
 	defer c.cleanup()
 
 	conn := makeSQLConn(fmt.Sprintf("postgres://%s@%s/?sslmode=disable",
-		security.RootUser, c.ServingAddr()))
+		security.RootUser, c.ServingSQLAddr()))
 	defer conn.Close()
 
 	tests := []string{`
@@ -191,4 +188,52 @@ func TestIsEndOfStatement(t *testing.T) {
 			t.Errorf("%q: isEnd expected %v, got %v", test.in, test.isEnd, isEnd)
 		}
 	}
+}
+
+// Test handleCliCmd cases for client-side commands that are aliases for sql
+// statements.
+func TestHandleCliCmdSqlAlias(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	clientSideCommandTestsTable := []struct {
+		commandString string
+		wantSQLStmt   string
+	}{
+		{`\l`, `SHOW DATABASES`},
+		{`\dt`, `SHOW TABLES`},
+		{`\du`, `SHOW USERS`},
+		{`\d mytable`, `SHOW COLUMNS FROM mytable`},
+		{`\d`, `SHOW TABLES`},
+	}
+
+	var c cliState
+	for _, tt := range clientSideCommandTestsTable {
+		c = setupTestCliState()
+		c.lastInputLine = tt.commandString
+		gotState := c.doHandleCliCmd(cliStateEnum(0), cliStateEnum(1))
+
+		assert.Equal(t, cliRunStatement, gotState)
+		assert.Equal(t, tt.wantSQLStmt, c.concatLines)
+	}
+}
+
+func TestHandleCliCmdSlashDInvalidSyntax(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	clientSideCommandTests := []string{`\d goodarg badarg`, `\dz`}
+
+	var c cliState
+	for _, tt := range clientSideCommandTests {
+		c = setupTestCliState()
+		c.lastInputLine = tt
+		gotState := c.doHandleCliCmd(cliStateEnum(0), cliStateEnum(1))
+
+		assert.Equal(t, cliStateEnum(0), gotState)
+		assert.Equal(t, errInvalidSyntax, c.exitErr)
+	}
+}
+
+func setupTestCliState() cliState {
+	c := cliState{}
+	c.ins = noLineEditor
+	return c
 }

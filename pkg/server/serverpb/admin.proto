@@ -1,27 +1,24 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 syntax = "proto3";
 package cockroach.server.serverpb;
 option go_package = "serverpb";
 
-import "config/zone.proto";
+import "config/zonepb/zone.proto";
 import "jobs/jobspb/jobs.proto";
 import "server/serverpb/status.proto";
 import "storage/engine/enginepb/mvcc.proto";
 import "storage/storagepb/liveness.proto";
 import "storage/storagepb/log.proto";
+import "ts/catalog/chart_catalog.proto";
 import "util/metric/metric.proto";
 import "gogoproto/gogo.proto";
 import "google/api/annotations.proto";
@@ -79,7 +76,7 @@ message DatabaseDetailsResponse {
   // the 'target_id' field of events.
   int64 descriptor_id = 3 [(gogoproto.customname) = "DescriptorID"];
   // The zone configuration in effect for this database.
-  cockroach.config.ZoneConfig zone_config = 4 [(gogoproto.nullable) = false];
+  cockroach.config.zonepb.ZoneConfig zone_config = 4 [(gogoproto.nullable) = false];
   // The level at which this object's zone configuration is set.
   ZoneConfigurationLevel zone_config_level = 5;
 }
@@ -165,7 +162,7 @@ message TableDetailsResponse {
   // executed.
   string create_table_statement = 5;
   // The zone configuration in effect for this table.
-  cockroach.config.ZoneConfig zone_config = 6 [(gogoproto.nullable) = false];
+  cockroach.config.zonepb.ZoneConfig zone_config = 6 [(gogoproto.nullable) = false];
   // The level at which this object's zone configuration is set.
   ZoneConfigurationLevel zone_config_level = 7;
   // descriptor_id is an identifier used to uniquely identify this table.
@@ -539,11 +536,11 @@ message DataDistributionRequest {
 
 message DataDistributionResponse {
   message ZoneConfig {
-    // zone_name is ".default" for the default zone config.
-    // Otherwise, it's of the form [database.]table[@index[.partition]]
-    string zone_name = 1;
+    // target is the object the zone config applies to, e.g. "DATABASE db" or
+    // "PARTITION north_america OF TABLE users".
+    string target = 1;
 
-    config.ZoneConfig config = 2 [(gogoproto.nullable) = false];
+    config.zonepb.ZoneConfig config = 2 [(gogoproto.nullable) = false];
 
     reserved 3;
 
@@ -607,6 +604,15 @@ message EnqueueRangeResponse {
     string error = 3;
   }
   repeated Details details = 1;
+}
+
+// ChartCatalogRequest requests returns a catalog of Admin UI charts.
+message ChartCatalogRequest {
+}
+
+// ChartCatalogResponse returns a catalog of Admin UI charts useful for debugging.
+message ChartCatalogResponse {
+  repeated cockroach.ts.catalog.ChartSection catalog = 1 [(gogoproto.nullable) = false];
 }
 
 // Admin is the gRPC API for the admin UI. Through grpc-gateway, we offer
@@ -793,6 +799,13 @@ service Admin {
   rpc AllMetricMetadata(MetricMetadataRequest) returns (MetricMetadataResponse) {
     option (google.api.http) = {
       get: "/_admin/v1/metricmetadata"
+    };
+  }
+
+  // URL: /_admin/v1/chartcatalog
+  rpc ChartCatalog(ChartCatalogRequest) returns (ChartCatalogResponse) {
+    option (google.api.http) = {
+      get: "/_admin/v1/chartcatalog"
     };
   }
 

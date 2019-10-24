@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
@@ -18,7 +14,6 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -101,25 +96,34 @@ type Iterator interface {
 	// the split is roughly targetSize bytes. The returned key will never be
 	// chosen from the key ranges listed in keys.NoSplitSpans and will always
 	// sort equal to or after minSplitKey.
+	//
+	// DO NOT CALL directly (except in wrapper Iterator implementations). Use the
+	// package-level MVCCFindSplitKey instead. For correct operation, the caller
+	// must set the upper bound on the iterator before calling this method.
 	FindSplitKey(start, end, minSplitKey MVCCKey, targetSize int64) (MVCCKey, error)
 	// MVCCGet is the internal implementation of the family of package-level
 	// MVCCGet functions.
 	//
-	// There is little reason to use this function directly. Use the package-level
-	// MVCCGet, or one of its variants, instead.
+	// DO NOT CALL directly (except in wrapper Iterator implementations). Use the
+	// package-level MVCCGet, or one of its variants, instead.
 	MVCCGet(
 		key roachpb.Key, timestamp hlc.Timestamp, opts MVCCGetOptions,
 	) (*roachpb.Value, *roachpb.Intent, error)
 	// MVCCScan is the internal implementation of the family of package-level
 	// MVCCScan functions. The notable difference is that key/value pairs are
-	// returned raw, as a buffer of varint-prefixed slices, alternating from key
-	// to value, where numKVs specifies the number of pairs in the buffer.
+	// returned raw, as a series of buffers of length-prefixed slices,
+	// alternating from key to value, where numKVs specifies the number of pairs
+	// in the buffer.
 	//
-	// There is little reason to use this function directly. Use the package-level
-	// MVCCScan, or one of its variants, instead.
+	// DO NOT CALL directly (except in wrapper Iterator implementations). Use the
+	// package-level MVCCScan, or one of its variants, instead. For correct
+	// operation, the caller must set the lower and upper bounds on the iterator
+	// before calling this method.
+	//
+	// TODO(peter): unexport this method.
 	MVCCScan(
 		start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts MVCCScanOptions,
-	) (kvData []byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error)
+	) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error)
 	// SetUpperBound installs a new upper bound for this iterator.
 	SetUpperBound(roachpb.Key)
 
@@ -187,7 +191,12 @@ type Reader interface {
 	// function f on each key value pair. If f returns an error or if the scan
 	// itself encounters an error, the iteration will stop and return the error.
 	// If the first result of f is true, the iteration stops and returns a nil
-	// error.
+	// error. Note that this method is not expected take into account the
+	// timestamp of the end key; all MVCCKeys at end.Key are considered excluded
+	// in the iteration.
+	//
+	// TODO(itsbilal): Change type of start and end to roachpb.Key instead of
+	// MVCCKey. All keys passed in have zero timestamps anyway.
 	Iterate(start, end MVCCKey, f func(MVCCKeyValue) (stop bool, err error)) error
 	// NewIterator returns a new instance of an Iterator over this
 	// engine. The caller must invoke Iterator.Close() when finished
@@ -227,6 +236,9 @@ type Writer interface {
 	// (exclusive). Similar to Clear, this method actually removes entries from
 	// the storage engine.
 	//
+	// Note that when used on batches, subsequent reads may not reflect the result
+	// of the ClearRange.
+	//
 	// It is safe to modify the contents of the arguments after ClearRange
 	// returns.
 	ClearRange(start, end MVCCKey) error
@@ -238,6 +250,10 @@ type Writer interface {
 	//
 	// It is safe to modify the contents of the arguments after ClearIterRange
 	// returns.
+	//
+	// TODO(itsbilal): All calls to ClearIterRange pass in metadata keys for
+	// start and end that have a zero timestamp. Change the type of those args
+	// to roachpb.Key to make this expectation explicit.
 	ClearIterRange(iter Iterator, start, end MVCCKey) error
 	// Merge is a high-performance write operation used for values which are
 	// accumulated over several writes. Multiple values can be merged
@@ -310,6 +326,9 @@ type Engine interface {
 	// this engine. A write-only batch accumulates all mutations and applies them
 	// atomically on a call to Commit(). Read operations return an error.
 	//
+	// Note that a distinct write-only batch allows reads. Distinct batches are a
+	// means of indicating that the user does not need to read its own writes.
+	//
 	// TODO(peter): This should return a WriteBatch interface, but there are mild
 	// complications in both defining that interface and implementing it. In
 	// particular, Batch.Close would no longer come from Reader and we'd need to
@@ -339,7 +358,8 @@ type Engine interface {
 	// that the key range is compacted all the way to the bottommost level of
 	// SSTables, which is necessary to pick up changes to bloom filters.
 	CompactRange(start, end roachpb.Key, forceBottommost bool) error
-	// OpenFile opens a DBFile with the given filename.
+	// OpenFile opens a DBFile with the given filename. The file should be created
+	// if it doesn't exist already, and should be writable.
 	OpenFile(filename string) (DBFile, error)
 	// ReadFile reads the content from the file with the given filename int this RocksDB's env.
 	ReadFile(filename string) ([]byte, error)
@@ -358,13 +378,6 @@ type Engine interface {
 	// which must not exist. The directory should be on the same file system so
 	// that hard links can be used.
 	CreateCheckpoint(dir string) error
-}
-
-// MapProvidingEngine is an Engine that also provides facilities for making a
-// sorted map that's persisted by the Engine.
-type MapProvidingEngine interface {
-	Engine
-	diskmap.Factory
 }
 
 // WithSSTables extends the Engine interface with a method to get info
@@ -398,6 +411,9 @@ type Batch interface {
 	// TODO(tbg): it seems insane that you cannot read from a WriteOnlyBatch but
 	// you can read from a Distinct on top of a WriteOnlyBatch but randomly don't
 	// see the batch at all. I was personally just bitten by this.
+	//
+	// TODO(itsbilal): Improve comments around how/why distinct batches are an
+	// optimization in the rocksdb write path.
 	Distinct() ReadWriter
 	// Empty returns whether the batch has been written to or not.
 	Empty() bool
@@ -509,6 +525,56 @@ func WriteSyncNoop(ctx context.Context, eng Engine) error {
 	}
 
 	if err := batch.Commit(true /* sync */); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ClearRangeWithHeuristic clears the keys from start (inclusive) to end
+// (exclusive). Depending on the number of keys, it will either use ClearRange
+// or ClearRangeIter.
+func ClearRangeWithHeuristic(eng Reader, writer Writer, start, end MVCCKey) error {
+	iter := eng.NewIterator(IterOptions{UpperBound: end.Key})
+	defer iter.Close()
+
+	// It is expensive for there to be many range deletion tombstones in the same
+	// sstable because all of the tombstones in an sstable are loaded whenever the
+	// sstable is accessed. So we avoid using range deletion unless there is some
+	// minimum number of keys. The value here was pulled out of thin air. It might
+	// be better to make this dependent on the size of the data being deleted. Or
+	// perhaps we should fix RocksDB to handle large numbers of tombstones in an
+	// sstable better.
+	const clearRangeMinKeys = 64
+	// Peek into the range to see whether it's large enough to justify
+	// ClearRange. Note that the work done here is bounded by
+	// clearRangeMinKeys, so it will be fairly cheap even for large
+	// ranges.
+	//
+	// TODO(bdarnell): Move this into ClearIterRange so we don't have
+	// to do this scan twice.
+	count := 0
+	iter.Seek(start)
+	for {
+		valid, err := iter.Valid()
+		if err != nil {
+			return err
+		}
+		if !valid || !iter.Key().Less(end) {
+			break
+		}
+		count++
+		if count > clearRangeMinKeys {
+			break
+		}
+		iter.Next()
+	}
+	var err error
+	if count > clearRangeMinKeys {
+		err = writer.ClearRange(start, end)
+	} else {
+		err = writer.ClearIterRange(iter, start, end)
+	}
+	if err != nil {
 		return err
 	}
 	return nil

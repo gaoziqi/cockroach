@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package jobs
 
@@ -28,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
@@ -60,7 +57,7 @@ var (
 // NodeLiveness is the subset of storage.NodeLiveness's interface needed
 // by Registry.
 type NodeLiveness interface {
-	Self() (*storagepb.Liveness, error)
+	Self() (storagepb.Liveness, error)
 	GetLivenesses() []storagepb.Liveness
 }
 
@@ -116,6 +113,8 @@ type Registry struct {
 		// used to cancel a job in that way.
 		jobs map[int64]context.CancelFunc
 	}
+
+	TestingResumerCreationKnobs map[jobspb.Type]func(Resumer) Resumer
 }
 
 // planHookMaker is a wrapper around sql.NewInternalPlanner. It returns an
@@ -202,7 +201,7 @@ func (r *Registry) StartJob(
 	ctx context.Context, resultsCh chan<- tree.Datums, record Record,
 ) (*Job, <-chan error, error) {
 	j := r.NewJob(record)
-	resumer, err := createResumer(j, r.settings)
+	resumer, err := r.createResumer(j, r.settings)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -269,7 +268,7 @@ func (r *Registry) LoadJobWithTxn(ctx context.Context, jobID int64, txn *client.
 
 // DefaultCancelInterval is a reasonable interval at which to poll this node
 // for liveness failures and cancel running jobs.
-var DefaultCancelInterval = base.DefaultHeartbeatInterval
+var DefaultCancelInterval = base.DefaultTxnHeartbeatInterval
 
 // DefaultAdoptInterval is a reasonable interval at which to poll system.jobs
 // for jobs with expired leases.
@@ -365,11 +364,36 @@ func (r *Registry) maybeCancelJobs(ctx context.Context, nl NodeLiveness) {
 	}
 }
 
+// isOrphaned tries to detect if there are no mutations left to be done for the
+// job which will make it a candidate for garbage collection. Jobs can be left
+// in such inconsistent state if they fail before being removed from the jobs table.
+func (r *Registry) isOrphaned(ctx context.Context, payload *jobspb.Payload) (bool, error) {
+	if payload.Type() != jobspb.TypeSchemaChange {
+		return false, nil
+	}
+	for _, id := range payload.DescriptorIDs {
+		pendingMutations := false
+		if err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+			td, err := sqlbase.GetTableDescFromID(ctx, txn, id)
+			if err != nil {
+				return err
+			}
+			pendingMutations = len(td.GetMutations()) != 0
+			return nil
+		}); err != nil {
+			return false, err
+		}
+		if pendingMutations {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) error {
-	const stmt = `SELECT id, payload FROM system.jobs WHERE status IN ($1, $2, $3) AND created < $4 ORDER BY created LIMIT 1000`
-	rows, err := r.ex.Query(
-		ctx, "gc-jobs", nil /* txn */, stmt, StatusFailed, StatusSucceeded, StatusCanceled, olderThan,
-	)
+	const stmt = `SELECT id, payload, status, created FROM system.jobs WHERE created < $1
+		      ORDER BY created LIMIT 1000`
+	rows, err := r.ex.Query(ctx, "gc-jobs", nil /* txn */, stmt, olderThan)
 	if err != nil {
 		return err
 	}
@@ -382,18 +406,33 @@ func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) erro
 		if err != nil {
 			return err
 		}
-		if payload.FinishedMicros < oldMicros {
+		remove := false
+		switch Status(*row[2].(*tree.DString)) {
+		case StatusRunning, StatusPending:
+			done, err := r.isOrphaned(ctx, payload)
+			if err != nil {
+				return err
+			}
+			remove = done && row[3].(*tree.DTimestamp).Time.Before(olderThan)
+		case StatusSucceeded, StatusCanceled, StatusFailed:
+			remove = payload.FinishedMicros < oldMicros
+		}
+		if remove {
 			toDelete.Array = append(toDelete.Array, row[0])
 		}
 	}
 	if len(toDelete.Array) > 0 {
-
 		log.Infof(ctx, "cleaning up %d expired job records", len(toDelete.Array))
 		const stmt = `DELETE FROM system.jobs WHERE id = ANY($1)`
-		if _ /* cols */, err := r.ex.Exec(
+		var nDeleted int
+		if nDeleted, err = r.ex.Exec(
 			ctx, "gc-jobs", nil /* txn */, stmt, toDelete,
 		); err != nil {
 			return errors.Wrap(err, "deleting old jobs")
+		}
+		if nDeleted != len(toDelete.Array) {
+			return errors.Errorf("asked to delete %d rows but %d were actually deleted",
+				len(toDelete.Array), nDeleted)
 		}
 	}
 	return nil
@@ -406,7 +445,7 @@ func (r *Registry) getJobFn(ctx context.Context, txn *client.Txn, id int64) (*Jo
 	if err != nil {
 		return nil, nil, err
 	}
-	resumer, err := createResumer(job, r.settings)
+	resumer, err := r.createResumer(job, r.settings)
 	if err != nil {
 		return job, nil, errors.Errorf("job %d is not controllable", id)
 	}
@@ -510,11 +549,14 @@ func RegisterConstructor(typ jobspb.Type, fn Constructor) {
 	constructors[typ] = fn
 }
 
-func createResumer(job *Job, settings *cluster.Settings) (Resumer, error) {
+func (r *Registry) createResumer(job *Job, settings *cluster.Settings) (Resumer, error) {
 	payload := job.Payload()
 	fn := constructors[payload.Type()]
 	if fn == nil {
 		return nil, errors.Errorf("no resumer are available for %s", payload.Type())
+	}
+	if wrapper := r.TestingResumerCreationKnobs[payload.Type()]; wrapper != nil {
+		return wrapper(fn(job, settings)), nil
 	}
 	return fn(job, settings), nil
 }
@@ -739,7 +781,7 @@ func (r *Registry) maybeAdoptJob(ctx context.Context, nl NodeLiveness) error {
 		r.register(*id, cancel)
 
 		resultsCh := make(chan tree.Datums)
-		resumer, err := createResumer(job, r.settings)
+		resumer, err := r.createResumer(job, r.settings)
 		if err != nil {
 			return err
 		}

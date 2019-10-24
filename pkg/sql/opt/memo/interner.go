@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo
 
@@ -22,12 +18,14 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -233,7 +231,7 @@ func (c *internCache) Next() bool {
 // checked that the item is not yet in the cache.
 func (c *internCache) Add(item interface{}) {
 	if item == nil {
-		panic(pgerror.AssertionFailedf("cannot add the nil value to the cache"))
+		panic(errors.AssertionFailedf("cannot add the nil value to the cache"))
 	}
 
 	if c.prev.item == nil {
@@ -397,8 +395,21 @@ func (h *hasher) HashTypedExpr(val tree.TypedExpr) {
 	h.HashUint64(uint64(reflect.ValueOf(val).Pointer()))
 }
 
+func (h *hasher) HashStatement(val tree.Statement) {
+	h.HashUint64(uint64(reflect.ValueOf(val).Pointer()))
+}
+
 func (h *hasher) HashColumnID(val opt.ColumnID) {
 	h.HashUint64(uint64(val))
+}
+
+func (h *hasher) HashFastIntSet(val util.FastIntSet) {
+	hash := h.hash
+	for c, ok := val.Next(0); ok; c, ok = val.Next(c + 1) {
+		hash ^= internHash(c)
+		hash *= prime64
+	}
+	h.hash = hash
 }
 
 func (h *hasher) HashColSet(val opt.ColSet) {
@@ -454,6 +465,10 @@ func (h *hasher) HashValuesID(val opt.ValuesID) {
 	h.HashUint64(uint64(val))
 }
 
+func (h *hasher) HashWithID(val opt.WithID) {
+	h.HashUint64(uint64(val))
+}
+
 func (h *hasher) HashScanLimit(val ScanLimit) {
 	h.HashUint64(uint64(val))
 }
@@ -471,7 +486,7 @@ func (h *hasher) HashJoinFlags(val JoinFlags) {
 }
 
 func (h *hasher) HashExplainOptions(val tree.ExplainOptions) {
-	h.HashColSet(val.Flags)
+	h.HashFastIntSet(val.Flags)
 	h.HashUint64(uint64(val.Mode))
 }
 
@@ -483,16 +498,27 @@ func (h *hasher) HashShowTraceType(val tree.ShowTraceType) {
 	h.HashString(string(val))
 }
 
-func (h *hasher) HashWindowFrame(val *tree.WindowFrame) {
-	// TODO(justin): remove when we support OFFSET.
-	if val.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
-		val.Bounds.EndBound.BoundType == tree.OffsetFollowing {
-		panic(pgerror.AssertionFailedf("expected to have rejected offset"))
-	}
+func (h *hasher) HashJobCommand(val tree.JobCommand) {
+	h.HashInt(int(val))
+}
 
-	h.HashInt(int(val.Bounds.StartBound.BoundType))
-	h.HashInt(int(val.Bounds.EndBound.BoundType))
+func (h *hasher) HashIndexOrdinal(val cat.IndexOrdinal) {
+	h.HashInt(val)
+}
+
+func (h *hasher) HashViewDeps(val opt.ViewDeps) {
+	// Hash the length and address of the first element.
+	h.HashInt(len(val))
+	if len(val) > 0 {
+		h.HashPointer(unsafe.Pointer(&val[0]))
+	}
+}
+
+func (h *hasher) HashWindowFrame(val WindowFrame) {
+	h.HashInt(int(val.StartBoundType))
+	h.HashInt(int(val.EndBoundType))
 	h.HashInt(int(val.Mode))
+	h.HashInt(int(val.FrameExclusion))
 }
 
 func (h *hasher) HashTupleOrdinal(val TupleOrdinal) {
@@ -500,10 +526,14 @@ func (h *hasher) HashTupleOrdinal(val TupleOrdinal) {
 }
 
 func (h *hasher) HashPhysProps(val *physical.Required) {
-	for i := range val.Presentation {
-		col := &val.Presentation[i]
-		h.HashString(col.Alias)
-		h.HashColumnID(col.ID)
+	// Note: the Any presentation is not the same as the 0-column presentation.
+	if !val.Presentation.Any() {
+		h.HashInt(len(val.Presentation))
+		for i := range val.Presentation {
+			col := &val.Presentation[i]
+			h.HashString(col.Alias)
+			h.HashColumnID(col.ID)
+		}
 	}
 	h.HashOrderingChoice(val.Ordering)
 }
@@ -549,6 +579,7 @@ func (h *hasher) HashWindowsExpr(val WindowsExpr) {
 		item := &val[i]
 		h.HashColumnID(item.Col)
 		h.HashScalarExpr(item.Function)
+		h.HashWindowFrame(item.Frame)
 	}
 }
 
@@ -560,12 +591,29 @@ func (h *hasher) HashZipExpr(val ZipExpr) {
 	}
 }
 
+func (h *hasher) HashFKChecksExpr(val FKChecksExpr) {
+	for i := range val {
+		h.HashRelExpr(val[i].Check)
+	}
+}
+
+func (h *hasher) HashKVOptionsExpr(val KVOptionsExpr) {
+	for i := range val {
+		h.HashString(val[i].Key)
+		h.HashScalarExpr(val[i].Value)
+	}
+}
+
 func (h *hasher) HashPresentation(val physical.Presentation) {
 	for i := range val {
 		col := &val[i]
 		h.HashString(col.Alias)
 		h.HashColumnID(col.ID)
 	}
+}
+
+func (h *hasher) HashOpaqueMetadata(val opt.OpaqueMetadata) {
+	h.HashUint64(uint64(reflect.ValueOf(val).Pointer()))
 }
 
 func (h *hasher) HashPointer(val unsafe.Pointer) {
@@ -705,6 +753,10 @@ func (h *hasher) IsTypedExprEqual(l, r tree.TypedExpr) bool {
 	return l == r
 }
 
+func (h *hasher) IsStatementEqual(l, r tree.Statement) bool {
+	return l == r
+}
+
 func (h *hasher) IsColumnIDEqual(l, r opt.ColumnID) bool {
 	return l == r
 }
@@ -741,6 +793,10 @@ func (h *hasher) IsValuesIDEqual(l, r opt.ValuesID) bool {
 	return l == r
 }
 
+func (h *hasher) IsWithIDEqual(l, r opt.WithID) bool {
+	return l == r
+}
+
 func (h *hasher) IsScanLimitEqual(l, r ScanLimit) bool {
 	return l == r
 }
@@ -765,18 +821,26 @@ func (h *hasher) IsShowTraceTypeEqual(l, r tree.ShowTraceType) bool {
 	return l == r
 }
 
-func (h *hasher) IsWindowFrameEqual(l, r *tree.WindowFrame) bool {
-	// TODO(justin): remove when we support OFFSET.
-	if l.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
-		l.Bounds.EndBound.BoundType == tree.OffsetFollowing ||
-		r.Bounds.StartBound.BoundType == tree.OffsetPreceding ||
-		r.Bounds.EndBound.BoundType == tree.OffsetFollowing {
-		panic(pgerror.AssertionFailedf("expected to have rejected offset"))
-	}
+func (h *hasher) IsJobCommandEqual(l, r tree.JobCommand) bool {
+	return l == r
+}
 
-	return l.Bounds.StartBound.BoundType == r.Bounds.StartBound.BoundType &&
-		l.Bounds.EndBound.BoundType == r.Bounds.EndBound.BoundType &&
-		l.Mode == r.Mode
+func (h *hasher) IsIndexOrdinalEqual(l, r cat.IndexOrdinal) bool {
+	return l == r
+}
+
+func (h *hasher) IsViewDepsEqual(l, r opt.ViewDeps) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	return len(l) == 0 || &l[0] == &r[0]
+}
+
+func (h *hasher) IsWindowFrameEqual(l, r WindowFrame) bool {
+	return l.StartBoundType == r.StartBoundType &&
+		l.EndBoundType == r.EndBoundType &&
+		l.Mode == r.Mode &&
+		l.FrameExclusion == r.FrameExclusion
 }
 
 func (h *hasher) IsTupleOrdinalEqual(l, r TupleOrdinal) bool {
@@ -852,7 +916,9 @@ func (h *hasher) IsWindowsExprEqual(l, r WindowsExpr) bool {
 		return false
 	}
 	for i := range l {
-		if l[i].Col != r[i].Col || l[i].Function != r[i].Function {
+		if l[i].Col != r[i].Col ||
+			l[i].Function != r[i].Function ||
+			l[i].Frame != r[i].Frame {
 			return false
 		}
 	}
@@ -871,6 +937,30 @@ func (h *hasher) IsZipExprEqual(l, r ZipExpr) bool {
 	return true
 }
 
+func (h *hasher) IsFKChecksExprEqual(l, r FKChecksExpr) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		if l[i].Check != r[i].Check {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *hasher) IsKVOptionsExprEqual(l, r KVOptionsExpr) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		if l[i].Key != r[i].Key || l[i].Value != r[i].Value {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *hasher) IsPresentationEqual(l, r physical.Presentation) bool {
 	if len(l) != len(r) {
 		return false
@@ -881,6 +971,10 @@ func (h *hasher) IsPresentationEqual(l, r physical.Presentation) bool {
 		}
 	}
 	return true
+}
+
+func (h *hasher) IsOpaqueMetadataEqual(l, r opt.OpaqueMetadata) bool {
+	return l == r
 }
 
 // encodeDatum turns the given datum into an encoded string of bytes. If two

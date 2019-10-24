@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package gossip
 
@@ -24,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -50,7 +46,7 @@ func TestGossipInfoStore(t *testing.T) {
 	defer stopper.Stop(context.TODO())
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
-	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	slice := []byte("b")
 	if err := g.AddInfo("s", slice, time.Hour); err != nil {
 		t.Fatal(err)
@@ -71,7 +67,7 @@ func TestGossipMoveNode(t *testing.T) {
 	defer stopper.Stop(context.TODO())
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
-	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+	g := NewTest(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	var nodes []*roachpb.NodeDescriptor
 	for i := 1; i <= 3; i++ {
 		node := &roachpb.NodeDescriptor{
@@ -133,7 +129,7 @@ func TestGossipGetNextBootstrapAddress(t *testing.T) {
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
 	server := rpc.NewServer(rpcContext)
-	g := NewTest(0, nil, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+	g := NewTest(0, nil, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	g.setResolvers(resolvers)
 
 	// Using specified resolvers, fetch bootstrap addresses 3 times
@@ -175,8 +171,9 @@ func TestGossipLocalityResolver(t *testing.T) {
 	node1PrivateAddress := util.MakeUnresolvedAddr("tcp", "1.0.0.1")
 	node2PrivateAddress := util.MakeUnresolvedAddr("tcp", "2.0.0.1")
 
-	node1PublicAddress := util.MakeUnresolvedAddr("tcp", "1.1.1.1:1")
-	node2PublicAddress := util.MakeUnresolvedAddr("tcp", "2.2.2.2:2")
+	node1PublicAddressRPC := util.MakeUnresolvedAddr("tcp", "1.1.1.1:1")
+	node2PublicAddressRPC := util.MakeUnresolvedAddr("tcp", "2.2.2.2:3")
+	node2PublicAddressSQL := util.MakeUnresolvedAddr("tcp", "2.2.2.2:4")
 
 	var node1LocalityList []roachpb.LocalityAddress
 	nodeLocalityAddress := roachpb.LocalityAddress{}
@@ -193,9 +190,18 @@ func TestGossipLocalityResolver(t *testing.T) {
 	var node2LocalityList []roachpb.LocalityAddress
 	node2LocalityList = append(node2LocalityList, nodeLocalityAddress2)
 
-	g := NewTestWithLocality(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), gossipLocalityAdvertiseList, config.DefaultZoneConfigRef())
-	node1 := &roachpb.NodeDescriptor{NodeID: 1, Address: node1PublicAddress, LocalityAddress: node1LocalityList}
-	node2 := &roachpb.NodeDescriptor{NodeID: 2, Address: node2PublicAddress, LocalityAddress: node2LocalityList}
+	g := NewTestWithLocality(1, rpcContext, rpc.NewServer(rpcContext), stopper, metric.NewRegistry(), gossipLocalityAdvertiseList, zonepb.DefaultZoneConfigRef())
+	node1 := &roachpb.NodeDescriptor{
+		NodeID:          1,
+		Address:         node1PublicAddressRPC,
+		LocalityAddress: node1LocalityList,
+	}
+	node2 := &roachpb.NodeDescriptor{
+		NodeID:          2,
+		Address:         node2PublicAddressRPC,
+		SQLAddress:      node2PublicAddressSQL,
+		LocalityAddress: node2LocalityList,
+	}
 
 	if err := g.SetNodeDescriptor(node1); err != nil {
 		t.Fatal(err)
@@ -217,8 +223,17 @@ func TestGossipLocalityResolver(t *testing.T) {
 		t.Error(err)
 	}
 
-	if *nodeAddress != node2PublicAddress {
-		t.Fatalf("expected: %s but got: %s address", node2PublicAddress, *nodeAddress)
+	if *nodeAddress != node2PublicAddressRPC {
+		t.Fatalf("expected: %s but got: %s address", node2PublicAddressRPC, *nodeAddress)
+	}
+
+	nodeAddressSQL, err := g.GetNodeIDSQLAddress(node2.NodeID)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if *nodeAddressSQL != node2PublicAddressSQL {
+		t.Fatalf("expected: %s but got: %s address", node2PublicAddressSQL, *nodeAddressSQL)
 	}
 }
 
@@ -706,7 +721,7 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 
 		// node ID must be non-zero
 		gnode := NewTest(
-			roachpb.NodeID(i+1), rpcContext, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+			roachpb.NodeID(i+1), rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 		g = append(g, gnode)
 		gnode.SetStallInterval(interval)
 		gnode.SetBootstrapInterval(interval)

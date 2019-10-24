@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -141,7 +137,8 @@ func newCLITest(params cliTestParams) cliTest {
 		}
 		c.TestServer = s.(*server.TestServer)
 
-		log.Infof(context.TODO(), "server started at %s", c.ServingAddr())
+		log.Infof(context.TODO(), "server started at %s", c.ServingRPCAddr())
+		log.Infof(context.TODO(), "SQL listener at %s", c.ServingSQLAddr())
 	}
 
 	baseCfg.User = security.NodeUser
@@ -169,7 +166,8 @@ func setCLIDefaultsForTests() {
 // stopServer stops the test server.
 func (c *cliTest) stopServer() {
 	if c.TestServer != nil {
-		log.Infof(context.TODO(), "stopping server at %s", c.ServingAddr())
+		log.Infof(context.TODO(), "stopping server at %s / %s",
+			c.ServingRPCAddr(), c.ServingSQLAddr())
 		select {
 		case <-c.Stopper().ShouldStop():
 			// If ShouldStop() doesn't block, that means someone has already
@@ -181,7 +179,7 @@ func (c *cliTest) stopServer() {
 	}
 }
 
-// restartServer stops and restarts the test server. The ServingAddr() may
+// restartServer stops and restarts the test server. The ServingRPCAddr() may
 // have changed after this method returns.
 func (c *cliTest) restartServer(params cliTestParams) {
 	c.stopServer()
@@ -195,7 +193,8 @@ func (c *cliTest) restartServer(params cliTestParams) {
 		c.fail(err)
 	}
 	c.TestServer = s.(*server.TestServer)
-	log.Infof(context.TODO(), "restarted server at %s", c.ServingAddr())
+	log.Infof(context.TODO(), "restarted server at %s / %s",
+		c.ServingRPCAddr(), c.ServingSQLAddr())
 }
 
 // cleanup cleans up after the test, stopping the server if necessary.
@@ -354,23 +353,49 @@ func (c cliTest) RunWithArgs(origArgs []string) {
 	redirectOutput(func() { c.runWithArgsUnredirected(origArgs) })
 }
 
+func isSQLCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "user", "sql", "dump", "workload":
+		return true
+	case "node":
+		if len(args) == 0 {
+			return false
+		}
+		switch args[1] {
+		case "status", "ls":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
 func (c cliTest) runWithArgsUnredirected(origArgs []string) {
 	TestingReset()
 
 	if err := func() error {
 		args := append([]string(nil), origArgs[:1]...)
 		if c.TestServer != nil {
-			h, p, err := net.SplitHostPort(c.ServingAddr())
+			addr := c.ServingRPCAddr()
+			if isSQLCommand(origArgs) {
+				addr = c.ServingSQLAddr()
+			}
+			h, p, err := net.SplitHostPort(addr)
 			if err != nil {
 				return err
 			}
+			args = append(args, fmt.Sprintf("--host=%s", net.JoinHostPort(h, p)))
 			if c.Cfg.Insecure {
 				args = append(args, "--insecure")
 			} else {
 				args = append(args, "--insecure=false")
 				args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
 			}
-			args = append(args, fmt.Sprintf("--host=%s:%s", h, p))
 		}
 		args = append(args, origArgs[1:]...)
 
@@ -382,6 +407,7 @@ func (c cliTest) runWithArgsUnredirected(origArgs []string) {
 		return Run(args)
 	}(); err != nil {
 		fmt.Println(err)
+		maybeShowErrorDetails(os.Stdout, err, false /*printNewLine*/)
 	}
 }
 
@@ -444,320 +470,13 @@ func Example_logging() {
 	// 1
 }
 
-func Example_zone() {
-	storeSpec := base.DefaultTestStoreSpec
-	storeSpec.Attributes = roachpb.Attributes{Attrs: []string{"ssd"}}
-	c := newCLITest(cliTestParams{
-		storeSpecs: []base.StoreSpec{storeSpec},
-		locality: roachpb.Locality{
-			Tiers: []roachpb.Tier{
-				{Key: "region", Value: "us-east-1"},
-				{Key: "zone", Value: "us-east-1a"},
-			},
-		},
-	})
-	defer c.cleanup()
-
-	c.Run("zone ls")
-	c.Run("zone set system --file=./testdata/zone_attrs.yaml")
-	c.Run("zone ls")
-	c.Run("zone get .liveness")
-	c.Run("zone get .meta")
-	c.Run("zone get system.nonexistent")
-	c.Run("zone get system.descriptor")
-	c.Run("zone set system.descriptor --file=./testdata/zone_attrs.yaml")
-	c.Run("zone set system.namespace --file=./testdata/zone_attrs.yaml")
-	c.Run("zone set system.nonexistent --file=./testdata/zone_attrs.yaml")
-	c.Run("zone set system --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone get system")
-	c.Run("zone rm system")
-	c.Run("zone ls")
-	c.Run("zone rm .default")
-	c.Run("zone set .liveness --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone set .meta --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone set .system --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone set .timeseries --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone get .system")
-	c.Run("zone ls")
-	c.Run("zone set .default --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone get system")
-	c.Run("zone set .default --disable-replication")
-	c.Run("zone get system")
-	c.Run("zone rm .liveness")
-	c.Run("zone rm .meta")
-	c.Run("zone rm .system")
-	c.Run("zone ls")
-	c.Run("zone rm .timeseries")
-	c.Run("zone ls")
-	c.Run("zone rm .liveness")
-	c.Run("zone rm .meta")
-	c.Run("zone rm .system")
-	c.Run("zone rm .timeseries")
-	c.Run("zone set system.jobs@primary --file=./testdata/zone_attrs.yaml")
-	c.Run("zone set system --file=./testdata/zone_attrs_advanced.yaml")
-	c.Run("zone set system --file=./testdata/zone_attrs_experimental.yaml")
-	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int)"})
-	c.Run("zone set t --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone ls")
-	c.Run("zone set t.f --file=./testdata/zone_range_max_bytes.yaml")
-	c.Run("zone ls")
-	c.RunWithArgs([]string{"sql", "-e", "drop database t cascade"})
-	c.Run("zone ls")
-
-	// Output:
-	// zone ls
-	// .default
-	// .liveness
-	// .meta
-	// .system
-	// system
-	// system.jobs
-	// zone set system --file=./testdata/zone_attrs.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 67108864
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 1
-	// constraints: [+zone=us-east-1a, +ssd]
-	// lease_preferences: []
-	//
-	// zone ls
-	// .default
-	// .liveness
-	// .meta
-	// .system
-	// system
-	// system.jobs
-	// zone get .liveness
-	// .liveness
-	// range_min_bytes: 16777216
-	// range_max_bytes: 67108864
-	// gc:
-	//   ttlseconds: 600
-	// num_replicas: 5
-	// constraints: []
-	// lease_preferences: []
-	// zone get .meta
-	// .meta
-	// range_min_bytes: 16777216
-	// range_max_bytes: 67108864
-	// gc:
-	//   ttlseconds: 3600
-	// num_replicas: 5
-	// constraints: []
-	// lease_preferences: []
-	// zone get system.nonexistent
-	// pq: relation "system.public.nonexistent" does not exist
-	// zone get system.descriptor
-	// system
-	// range_min_bytes: 16777216
-	// range_max_bytes: 67108864
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 1
-	// constraints: [+zone=us-east-1a, +ssd]
-	// lease_preferences: []
-	// zone set system.descriptor --file=./testdata/zone_attrs.yaml
-	// pq: cannot set zone configs for system config tables; try setting your config on the entire "system" database instead
-	// zone set system.namespace --file=./testdata/zone_attrs.yaml
-	// pq: cannot set zone configs for system config tables; try setting your config on the entire "system" database instead
-	// zone set system.nonexistent --file=./testdata/zone_attrs.yaml
-	// pq: relation "system.public.nonexistent" does not exist
-	// zone set system --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: [+zone=us-east-1a, +ssd]
-	// lease_preferences: []
-	//
-	// zone get system
-	// system
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: [+zone=us-east-1a, +ssd]
-	// lease_preferences: []
-	// zone rm system
-	// zone ls
-	// .default
-	// .liveness
-	// .meta
-	// .system
-	// system.jobs
-	// zone rm .default
-	// pq: cannot remove default zone
-	// zone set .liveness --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 600
-	// num_replicas: 3
-	// constraints: []
-	// lease_preferences: []
-	//
-	// zone set .meta --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 3600
-	// num_replicas: 3
-	// constraints: []
-	// lease_preferences: []
-	//
-	// zone set .system --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// lease_preferences: []
-	//
-	// zone set .timeseries --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// lease_preferences: []
-	//
-	// zone get .system
-	// .system
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// lease_preferences: []
-	// zone ls
-	// .default
-	// .liveness
-	// .meta
-	// .system
-	// .timeseries
-	// system.jobs
-	// zone set .default --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// lease_preferences: []
-	//
-	// zone get system
-	// .default
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// lease_preferences: []
-	// zone set .default --disable-replication
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 1
-	// constraints: []
-	// lease_preferences: []
-	//
-	// zone get system
-	// .default
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 1
-	// constraints: []
-	// lease_preferences: []
-	// zone rm .liveness
-	// zone rm .meta
-	// zone rm .system
-	// zone ls
-	// .default
-	// .timeseries
-	// system.jobs
-	// zone rm .timeseries
-	// zone ls
-	// .default
-	// system.jobs
-	// zone rm .liveness
-	// zone rm .meta
-	// zone rm .system
-	// zone rm .timeseries
-	// zone set system.jobs@primary --file=./testdata/zone_attrs.yaml
-	// pq: setting zone configs on indexes or partitions requires a CCL binary
-	// zone set system --file=./testdata/zone_attrs_advanced.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: {+region=us-east-1: 1, '+zone=us-east-1a,+ssd': 1}
-	// lease_preferences: [[+region=us-east-1], [+zone=us-east-1a]]
-	//
-	// zone set system --file=./testdata/zone_attrs_experimental.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: {+region=us-east-1: 1, '+zone=us-east-1a,+ssd': 1}
-	// lease_preferences: [[+zone=us-east-1a]]
-	//
-	// sql -e create database t; create table t.f (x int, y int)
-	// CREATE TABLE
-	// zone set t --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// lease_preferences: []
-	//
-	// zone ls
-	// .default
-	// system
-	// system.jobs
-	// t
-	// zone set t.f --file=./testdata/zone_range_max_bytes.yaml
-	// range_min_bytes: 16777216
-	// range_max_bytes: 134217728
-	// gc:
-	//   ttlseconds: 90000
-	// num_replicas: 3
-	// constraints: []
-	// lease_preferences: []
-	//
-	// zone ls
-	// .default
-	// system
-	// system.jobs
-	// t
-	// t.f
-	// sql -e drop database t cascade
-	// DROP DATABASE
-	// zone ls
-	// .default
-	// system
-	// system.jobs
-}
-
 func Example_demo() {
 	c := newCLITest(cliTestParams{noServer: true})
 	defer c.cleanup()
 
 	testData := [][]string{
 		{`demo`, `-e`, `show database`},
+		{`demo`, `-e`, `show database`, `--empty`},
 		{`demo`, `-e`, `show application_name`},
 		{`demo`, `--format=table`, `-e`, `show database`},
 		{`demo`, `-e`, `select 1 as "1"`, `-e`, `select 3 as "3"`},
@@ -766,6 +485,7 @@ func Example_demo() {
 		{`demo`, `startrek`, `-e`, `show databases`},
 		{`demo`, `startrek`, `-e`, `show databases`, `--format=table`},
 	}
+	setCLIDefaultsForTests()
 	for _, cmd := range testData {
 		c.RunWithArgs(cmd)
 	}
@@ -773,14 +493,17 @@ func Example_demo() {
 	// Output:
 	// demo -e show database
 	// database
+	// movr
+	// demo -e show database --empty
+	// database
 	// defaultdb
 	// demo -e show application_name
 	// application_name
 	// $ cockroach demo
 	// demo --format=table -e show database
 	//   database
-	// +-----------+
-	//   defaultdb
+	// +----------+
+	//   movr
 	// (1 row)
 	// demo -e select 1 as "1" -e select 3 as "3"
 	// 1
@@ -878,7 +601,7 @@ func Example_sql() {
 	// sql -e create table t.g1 (x int)
 	// CREATE TABLE
 	// sql -e create table t.g2 as select * from generate_series(1,10)
-	// SELECT 10
+	// CREATE TABLE AS
 	// sql -d nonexistent -e select count(*) from "".information_schema.tables limit 0
 	// count
 	// sql -d nonexistent -e create database nonexistent; create table foo(x int); select * from foo
@@ -886,6 +609,7 @@ func Example_sql() {
 	// sql -e copy t.f from stdin
 	// woops! COPY has confused this client! Suggestion: use 'psql' for COPY
 	// user ls --echo-sql
+	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
 	// > SHOW USERS
 	// user_name
 	// root
@@ -900,6 +624,24 @@ func Example_sql() {
 	// sql --set unknownoption -e select 123 as "123"
 	// invalid syntax: \set unknownoption. Try \? for help.
 	// invalid syntax
+}
+
+func Example_sql_watch() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{`sql`, `-e`, `create table d(x int); insert into d values(3)`})
+	c.RunWithArgs([]string{`sql`, `--watch`, `.1s`, `-e`, `update d set x=x-1 returning 1/x as dec`})
+
+	// Output:
+	// sql -e create table d(x int); insert into d values(3)
+	// INSERT 1
+	// sql --watch .1s -e update d set x=x-1 returning 1/x as dec
+	// dec
+	// 0.5
+	// dec
+	// 1
+	// pq: division by zero
 }
 
 func Example_sql_format() {
@@ -1651,13 +1393,15 @@ func Example_misc_table() {
 	//     hai
 	// (1 row)
 	// sql --format=table -e explain select s, 'foo' from t.t
-	//     tree    | field | description
-	// +-----------+-------+-------------+
-	//   render    |       |
-	//    └── scan |       |
-	//             | table | t@primary
-	//             | spans | ALL
-	// (4 rows)
+	//     tree    |    field    | description
+	// +-----------+-------------+-------------+
+	//             | distributed | true
+	//             | vectorized  | false
+	//   render    |             |
+	//    └── scan |             |
+	//             | table       | t@primary
+	//             | spans       | ALL
+	// (6 rows)
 }
 
 func Example_user() {
@@ -1693,60 +1437,85 @@ func Example_user() {
 	c.Run("user ls --format=table")
 	c.Run("user rm foo")
 	c.Run("user ls --format=table")
+	c.RunWithArgs([]string{"sql", "-e", "drop database defaultdb"})
+	c.Run("user set foo")
 
 	// Output:
 	// user ls
+	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
 	// user_name
 	// root
 	// user ls --format=table
+	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
 	//   user_name
 	// +-----------+
 	//   root
 	// (1 row)
 	// user ls --format=tsv
+	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
 	// user_name
 	// root
 	// user set FOO
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// sql -e create user if not exists 'FOO'
 	// CREATE USER 0
 	// user set Foo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 0
 	// user set fOo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 0
 	// user set foO
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 0
 	// user set foo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 0
 	// user set _foo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// user set f_oo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// user set foo_
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// user set ,foo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// pq: username ",foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
 	// user set f,oo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// pq: username "f,oo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
 	// user set foo,
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// pq: username "foo," invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
 	// user set 0foo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// pq: username "0foo" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
 	// user set foo0
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// user set f0oo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// pq: username "foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof" invalid; usernames are case insensitive, must start with a letter or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
 	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// user set Ομηρος
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// user set and
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// user set table
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
 	// CREATE USER 1
 	// user ls --format=table
+	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
 	//                              user_name
 	// +-----------------------------------------------------------------+
 	//   _foo
@@ -1762,8 +1531,10 @@ func Example_user() {
 	//   ομηρος
 	// (11 rows)
 	// user rm foo
+	// warning: This command is deprecated. Use DROP USER or DROP ROLE in a SQL session.
 	// DROP USER 1
 	// user ls --format=table
+	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
 	//                              user_name
 	// +-----------------------------------------------------------------+
 	//   _foo
@@ -1777,6 +1548,11 @@ func Example_user() {
 	//   table
 	//   ομηρος
 	// (10 rows)
+	// sql -e drop database defaultdb
+	// DROP DATABASE
+	// user set foo
+	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
+	// CREATE USER 1
 }
 
 func Example_cert() {
@@ -1803,24 +1579,25 @@ func TestFlagUsage(t *testing.T) {
   cockroach [command]
 
 Available Commands:
-  start       start a node
-  init        initialize a cluster
-  cert        create ca, node, and client certs
-  quit        drain and shutdown node
+  start             start a node in a multi-node cluster
+  start-single-node start a single-node cluster
+  init              initialize a cluster
+  cert              create ca, node, and client certs
+  quit              drain and shutdown node
 
-  sql         open a sql shell
-  user        get, set, list and remove users
-  node        list, inspect or remove nodes
-  dump        dump sql tables
+  sql               open a sql shell
+  user              get, set, list and remove users (deprecated)
+  node              list, inspect or remove nodes
+  dump              dump sql tables
 
-  demo        open a demo sql shell
-  gen         generate auxiliary files
-  version     output version information
-  debug       debugging commands
-  sqlfmt      format SQL statements
-  workload    [experimental] generators for data and query loads
-  systembench Run systembench
-  help        Help about any command
+  demo              open a demo sql shell
+  gen               generate auxiliary files
+  version           output version information
+  debug             debugging commands
+  sqlfmt            format SQL statements
+  workload          [experimental] generators for data and query loads
+  systembench       Run systembench
+  help              Help about any command
 
 Flags:
   -h, --help                             help for cockroach
@@ -1859,8 +1636,11 @@ Use "cockroach [command] --help" for more information about a command.
 				done <- err
 			}()
 
-			if err := Run(test.flags); err != nil && !test.expErr {
-				t.Error(err)
+			if err := Run(test.flags); err != nil {
+				fmt.Fprintln(w, "Error:", err)
+				if !test.expErr {
+					t.Error(err)
+				}
 			}
 
 			// back to normal state
@@ -1898,6 +1678,8 @@ func Example_node() {
 	c.Run("node ls")
 	c.Run("node ls --format=table")
 	c.Run("node status 10000")
+	c.RunWithArgs([]string{"sql", "-e", "drop database defaultdb"})
+	c.Run("node ls")
 
 	// Output:
 	// node ls
@@ -1910,6 +1692,11 @@ func Example_node() {
 	// (1 row)
 	// node status 10000
 	// Error: node 10000 doesn't exist
+	// sql -e drop database defaultdb
+	// DROP DATABASE
+	// node ls
+	// id
+	// 1
 }
 
 func TestCLITimeout(t *testing.T) {
@@ -1942,6 +1729,8 @@ pq: query execution canceled due to statement timeout
 
 func TestNodeStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	t.Skip("currently flaky: #38151")
 
 	start := timeutil.Now()
 	c := newCLITest(cliTestParams{})
@@ -2053,15 +1842,23 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 		t.Errorf("node address (%s) != expected (%s)", a, e)
 	}
 
+	nodeSQLAddr, err := c.Gossip().GetNodeIDSQLAddress(nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, e := fields[2], nodeSQLAddr.String(); a != e {
+		t.Errorf("node SQL address (%s) != expected (%s)", a, e)
+	}
+
 	// Verify Build Tag.
-	if a, e := fields[2], build.GetInfo().Tag; a != e {
+	if a, e := fields[3], build.GetInfo().Tag; a != e {
 		t.Errorf("build tag (%s) != expected (%s)", a, e)
 	}
 
 	// Verify that updated_at and started_at are reasonably recent.
 	// CircleCI can be very slow. This was flaky at 5s.
-	checkTimeElapsed(t, fields[3], 15*time.Second, start)
 	checkTimeElapsed(t, fields[4], 15*time.Second, start)
+	checkTimeElapsed(t, fields[5], 15*time.Second, start)
 
 	testcases := []testCase{}
 
@@ -2327,6 +2124,8 @@ ORDER BY name ASC`)
 		assert.NoError(t, rows.Scan(&table))
 		tables = append(tables, table)
 	}
+	tables = append(tables, "system.jobs", "system.descriptor", "system.namespace")
+	sort.Strings(tables)
 
 	var exp []string
 	exp = append(exp, debugZipTablesPerNode...)
@@ -2365,6 +2164,9 @@ writing ` + os.DevNull + `
   debug/crdb_internal.cluster_sessions.txt
   debug/crdb_internal.cluster_settings.txt
   debug/crdb_internal.jobs.txt
+  debug/system.jobs.txt
+  debug/system.descriptor.txt
+  debug/system.namespace.txt
   debug/crdb_internal.kv_node_status.txt
   debug/crdb_internal.kv_store_status.txt
   debug/crdb_internal.schema_changes.txt
@@ -2377,12 +2179,13 @@ writing ` + os.DevNull + `
   debug/nodes/1/crdb_internal.gossip_network.txt
   debug/nodes/1/crdb_internal.gossip_nodes.txt
   debug/nodes/1/crdb_internal.leases.txt
-  debug/nodes/1/crdb_internal.node_statement_statistics.txt
   debug/nodes/1/crdb_internal.node_build_info.txt
   debug/nodes/1/crdb_internal.node_metrics.txt
   debug/nodes/1/crdb_internal.node_queries.txt
   debug/nodes/1/crdb_internal.node_runtime_info.txt
   debug/nodes/1/crdb_internal.node_sessions.txt
+  debug/nodes/1/crdb_internal.node_statement_statistics.txt
+  debug/nodes/1/crdb_internal.node_txn_stats.txt
   debug/nodes/1/details.json
   debug/nodes/1/gossip.json
   debug/nodes/1/enginestats.json
@@ -2408,6 +2211,10 @@ writing ` + os.DevNull + `
   debug/nodes/1/ranges/18.json
   debug/nodes/1/ranges/19.json
   debug/nodes/1/ranges/20.json
+  debug/nodes/1/ranges/21.json
+  debug/nodes/1/ranges/22.json
+  debug/nodes/1/ranges/23.json
+  debug/nodes/1/ranges/24.json
   debug/schema/defaultdb@details.json
   debug/schema/postgres@details.json
   debug/schema/system@details.json
@@ -2419,6 +2226,10 @@ writing ` + os.DevNull + `
   debug/schema/system/locations.json
   debug/schema/system/namespace.json
   debug/schema/system/rangelog.json
+  debug/schema/system/replication_constraint_stats.json
+  debug/schema/system/replication_critical_localities.json
+  debug/schema/system/replication_stats.json
+  debug/schema/system/reports_meta.json
   debug/schema/system/role_members.json
   debug/schema/system/settings.json
   debug/schema/system/table_statistics.json
@@ -2551,4 +2362,24 @@ func Example_sqlfmt() {
 	// SELECT 1 + 2 + 3
 	// sqlfmt --no-simplify -e select (1+2)+3
 	// SELECT (1 + 2) + 3
+}
+
+func Example_dump_no_visible_columns() {
+	c := newCLITest(cliTestParams{})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sql", "-e", "create table t(x int); set sql_safe_updates=false; alter table t drop x"})
+	c.RunWithArgs([]string{"dump", "defaultdb"})
+
+	// Output:
+	// sql -e create table t(x int); set sql_safe_updates=false; alter table t drop x
+	// ALTER TABLE
+	// dump defaultdb
+	// CREATE TABLE t (,
+	// 	FAMILY "primary" (rowid)
+	// );
+	// table "defaultdb.public.t" has no visible columns
+	// HINT: To proceed with the dump, either omit this table from the list of tables to dump, drop the table, or add some visible columns.
+	// --
+	// See: https://github.com/cockroachdb/cockroach/issues/37768
 }

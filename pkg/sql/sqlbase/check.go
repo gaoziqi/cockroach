@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -18,11 +14,12 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // CheckHelper validates check constraints on rows, on INSERT and UPDATE.
@@ -197,7 +194,7 @@ func (c *CheckHelper) CheckEval(ctx *tree.EvalContext) error {
 			return err
 		} else if !res && d != tree.DNull {
 			// Failed to satisfy CHECK constraint.
-			return pgerror.Newf(pgerror.CodeCheckViolationError,
+			return pgerror.Newf(pgcode.CheckViolation,
 				"failed to satisfy CHECK constraint (%s)", expr)
 		}
 	}
@@ -209,7 +206,7 @@ func (c *CheckHelper) CheckEval(ctx *tree.EvalContext) error {
 // CheckInput reports a constraint violation error.
 func (c *CheckHelper) CheckInput(checkVals tree.Datums) error {
 	if len(checkVals) != c.checkSet.Len() {
-		return pgerror.AssertionFailedf(
+		return errors.AssertionFailedf(
 			"mismatched check constraint columns: expected %d, got %d", c.checkSet.Len(), len(checkVals))
 	}
 
@@ -222,7 +219,7 @@ func (c *CheckHelper) CheckInput(checkVals tree.Datums) error {
 			return err
 		} else if !res && checkVals[i] != tree.DNull {
 			// Failed to satisfy CHECK constraint.
-			return pgerror.Newf(pgerror.CodeCheckViolationError,
+			return pgerror.Newf(pgcode.CheckViolation,
 				"failed to satisfy CHECK constraint (%s)", check.Expr)
 		}
 	}

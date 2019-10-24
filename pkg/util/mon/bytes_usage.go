@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package mon
 
@@ -219,8 +215,13 @@ type BytesMonitor struct {
 	// become reported in the logs.
 	noteworthyUsageBytes int64
 
+	// curBytesCount is the metric object used to track number of bytes reserved
+	// by the monitor during its lifetime.
 	curBytesCount *metric.Gauge
-	maxBytesHist  *metric.Histogram
+
+	// maxBytesHist is the metric object used to track the high watermark of bytes
+	// allocated by the monitor during its lifetime.
+	maxBytesHist *metric.Histogram
 
 	settings *cluster.Settings
 }
@@ -430,6 +431,12 @@ func (mm *BytesMonitor) AllocBytes() int64 {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 	return mm.mu.curAllocated
+}
+
+// SetMetrics sets the metric objects for the monitor.
+func (mm *BytesMonitor) SetMetrics(curCount *metric.Gauge, maxHist *metric.Histogram) {
+	mm.curBytesCount = curCount
+	mm.maxBytesHist = maxHist
 }
 
 // BoundAccount tracks the cumulated allocations for one client of a pool or

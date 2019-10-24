@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package opt
 
@@ -140,6 +136,7 @@ var ComparisonOpReverseMap = map[Operator]tree.ComparisonOperator{
 	JsonExistsOp:     tree.JSONExists,
 	JsonSomeExistsOp: tree.JSONSomeExists,
 	JsonAllExistsOp:  tree.JSONAllExists,
+	OverlapsOp:       tree.Overlaps,
 }
 
 // BinaryOpReverseMap maps from an optimizer operator type to a semantic tree
@@ -176,6 +173,8 @@ var UnaryOpReverseMap = map[Operator]tree.UnaryOperator{
 var AggregateOpReverseMap = map[Operator]string{
 	ArrayAggOp:        "array_agg",
 	AvgOp:             "avg",
+	BitAndAggOp:       "bit_and",
+	BitOrAggOp:        "bit_or",
 	BoolAndOp:         "bool_and",
 	BoolOrOp:          "bool_or",
 	ConcatAggOp:       "concat_agg",
@@ -252,24 +251,13 @@ func BoolOperatorRequiresNotNullArgs(op Operator) bool {
 	return false
 }
 
-// AggregateIsOrderingSensitive returns true if the given aggregate operator is
-// non-commutative. That is, it can give different results based on the order
-// values are fed to it.
-func AggregateIsOrderingSensitive(op Operator) bool {
-	switch op {
-	case ArrayAggOp, ConcatAggOp, JsonAggOp, JsonbAggOp, StringAggOp:
-		return true
-	}
-	return false
-}
-
 // AggregateIgnoresNulls returns true if the given aggregate operator has a
 // single input, and if it always evaluates to the same result regardless of
 // how many NULL values are included in that input, in any order.
 func AggregateIgnoresNulls(op Operator) bool {
 	switch op {
-	case AvgOp, BoolAndOp, BoolOrOp, CountOp, MaxOp, MinOp, SumIntOp, SumOp,
-		SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, ConstNotNullAggOp,
+	case AvgOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp, CountOp, MaxOp, MinOp,
+		SumIntOp, SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, ConstNotNullAggOp,
 		AnyNotNullAggOp, StringAggOp:
 		return true
 	}
@@ -283,12 +271,22 @@ func AggregateIgnoresNulls(op Operator) bool {
 // NULL when its input is empty.
 func AggregateIsNullOnEmpty(op Operator) bool {
 	switch op {
-	case AvgOp, BoolAndOp, BoolOrOp, MaxOp, MinOp, SumIntOp, SumOp, SqrDiffOp,
-		VarianceOp, StdDevOp, XorAggOp, ConstAggOp, ConstNotNullAggOp, ArrayAggOp,
+	case AvgOp, BitAndAggOp, BitOrAggOp, BoolAndOp, BoolOrOp, MaxOp, MinOp, SumIntOp,
+		SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, ConstAggOp, ConstNotNullAggOp, ArrayAggOp,
 		ConcatAggOp, JsonAggOp, JsonbAggOp, AnyNotNullAggOp, StringAggOp:
 		return true
 	}
 	return false
+}
+
+// OpaqueMetadata is an object stored in OpaqueRelExpr and passed
+// through to the exec factory.
+type OpaqueMetadata interface {
+	ImplementsOpaqueMetadata()
+
+	// String is a short description used when printing optimizer trees and when
+	// forming error messages; it should be the SQL statement tag.
+	String() string
 }
 
 func init() {

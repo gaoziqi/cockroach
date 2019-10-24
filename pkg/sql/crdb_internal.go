@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -24,8 +20,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -41,10 +38,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"gopkg.in/yaml.v2"
 )
 
 const crdbInternalName = "crdb_internal"
@@ -96,12 +96,12 @@ var crdbInternal = virtualSchema{
 		sqlbase.CrdbInternalTableColumnsTableID:         crdbInternalTableColumnsTable,
 		sqlbase.CrdbInternalTableIndexesTableID:         crdbInternalTableIndexesTable,
 		sqlbase.CrdbInternalTablesTableID:               crdbInternalTablesTable,
+		sqlbase.CrdbInternalTxnStatsTableID:             crdbInternalTxnStatsTable,
 		sqlbase.CrdbInternalZonesTableID:                crdbInternalZonesTable,
 	},
 	validWithNoDatabaseContext: true,
 }
 
-// TODO(tbg): prefix with node_.
 var crdbInternalBuildInfoTable = virtualSchemaTable{
 	comment: `detailed identification strings (RAM, local node only)`,
 	schema: `
@@ -135,7 +135,6 @@ CREATE TABLE crdb_internal.node_build_info (
 	},
 }
 
-// TODO(tbg): prefix with node_.
 var crdbInternalRuntimeInfoTable = virtualSchemaTable{
 	comment: `server parameters, useful to construct connection URLs (RAM, local node only)`,
 	schema: `
@@ -146,7 +145,7 @@ CREATE TABLE crdb_internal.node_runtime_info (
   value     STRING NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireSuperUser(ctx, "access the node runtime information"); err != nil {
+		if err := p.RequireAdminRole(ctx, "access the node runtime information"); err != nil {
 			return err
 		}
 
@@ -375,9 +374,9 @@ CREATE TABLE crdb_internal.leases (
   deleted     BOOL NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		leaseMgr := p.LeaseMgr()
-		nodeID := tree.NewDInt(tree.DInt(int64(leaseMgr.nodeIDContainer.Get())))
+		nodeID := tree.NewDInt(tree.DInt(int64(p.execCfg.NodeID.Get())))
 
+		leaseMgr := p.LeaseMgr()
 		leaseMgr.mu.Lock()
 		defer leaseMgr.mu.Unlock()
 
@@ -566,9 +565,9 @@ func (s stmtList) Less(i, j int) bool {
 	return s[i].stmt < s[j].stmt
 }
 
-// TODO(tbg): prefix with node_.
 var crdbInternalStmtStatsTable = virtualSchemaTable{
-	comment: `statement statistics (RAM; local node only)`,
+	comment: `statement statistics (in-memory, not durable; local node only). ` +
+		`This table is wiped periodically (by default, at least every two hours)`,
 	schema: `
 CREATE TABLE crdb_internal.node_statement_statistics (
   node_id             INT NOT NULL,
@@ -591,21 +590,23 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   service_lat_avg     FLOAT NOT NULL,
   service_lat_var     FLOAT NOT NULL,
   overhead_lat_avg    FLOAT NOT NULL,
-  overhead_lat_var    FLOAT NOT NULL
+  overhead_lat_var    FLOAT NOT NULL,
+  bytes_read          INT NOT NULL,
+  rows_read           INT NOT NULL,
+  implicit_txn        BOOL NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireSuperUser(ctx, "access application statistics"); err != nil {
+		if err := p.RequireAdminRole(ctx, "access application statistics"); err != nil {
 			return err
 		}
 
-		sqlStats := p.statsCollector.SQLStats()
+		sqlStats := p.extendedEvalCtx.sqlStatsCollector.sqlStats
 		if sqlStats == nil {
-			return pgerror.AssertionFailedf(
+			return errors.AssertionFailedf(
 				"cannot access sql statistics from this context")
 		}
 
-		leaseMgr := p.LeaseMgr()
-		nodeID := tree.NewDInt(tree.DInt(int64(leaseMgr.nodeIDContainer.Get())))
+		nodeID := tree.NewDInt(tree.DInt(int64(p.execCfg.NodeID.Get())))
 
 		// Retrieve the application names and sort them to ensure the
 		// output is deterministic.
@@ -629,6 +630,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				stmtKeys = append(stmtKeys, k)
 			}
 			appStats.Unlock()
+			sort.Sort(stmtKeys)
 
 			// Now retrieve the per-stmt stats proper.
 			for _, stmtKey := range stmtKeys {
@@ -667,11 +669,70 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 					tree.NewDFloat(tree.DFloat(s.data.ServiceLat.GetVariance(s.data.Count))),
 					tree.NewDFloat(tree.DFloat(s.data.OverheadLat.Mean)),
 					tree.NewDFloat(tree.DFloat(s.data.OverheadLat.GetVariance(s.data.Count))),
+					tree.NewDInt(tree.DInt(s.data.BytesRead)),
+					tree.NewDInt(tree.DInt(s.data.RowsRead)),
+					tree.MakeDBool(tree.DBool(stmtKey.implicitTxn)),
 				)
 				s.Unlock()
 				if err != nil {
 					return err
 				}
+			}
+		}
+		return nil
+	},
+}
+
+var crdbInternalTxnStatsTable = virtualSchemaTable{
+	comment: `per-application transaction statistics (in-memory, not durable; local node only). ` +
+		`This table is wiped periodically (by default, at least every two hours)`,
+	schema: `
+CREATE TABLE crdb_internal.node_txn_stats (
+  node_id            INT NOT NULL,
+  application_name   STRING NOT NULL,
+  txn_count          INT NOT NULL,
+  txn_time_avg_sec   FLOAT NOT NULL,
+  txn_time_var_sec   FLOAT NOT NULL,
+  committed_count    INT NOT NULL,
+  implicit_count     INT NOT NULL
+)`,
+	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		if err := p.RequireAdminRole(ctx, "access application statistics"); err != nil {
+			return err
+		}
+
+		sqlStats := p.extendedEvalCtx.sqlStatsCollector.sqlStats
+		if sqlStats == nil {
+			return errors.AssertionFailedf(
+				"cannot access sql statistics from this context")
+		}
+
+		nodeID := tree.NewDInt(tree.DInt(int64(p.execCfg.NodeID.Get())))
+
+		// Retrieve the application names and sort them to ensure the
+		// output is deterministic.
+		var appNames []string
+		sqlStats.Lock()
+		for n := range sqlStats.apps {
+			appNames = append(appNames, n)
+		}
+		sqlStats.Unlock()
+		sort.Strings(appNames)
+
+		for _, appName := range appNames {
+			appStats := sqlStats.getStatsForApplication(appName)
+			txnCount, txnTimeAvg, txnTimeVar, committedCount, implicitCount := appStats.txns.getStats()
+			err := addRow(
+				nodeID,
+				tree.NewDString(appName),
+				tree.NewDInt(tree.DInt(txnCount)),
+				tree.NewDFloat(tree.DFloat(txnTimeAvg)),
+				tree.NewDFloat(tree.DFloat(txnTimeVar)),
+				tree.NewDInt(tree.DInt(committedCount)),
+				tree.NewDInt(tree.DInt(implicitCount)),
+			)
+			if err != nil {
+				return err
 			}
 		}
 		return nil
@@ -727,7 +788,7 @@ CREATE TABLE crdb_internal.cluster_settings (
   description   STRING NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireSuperUser(ctx, "read crdb_internal.cluster_settings"); err != nil {
+		if err := p.RequireAdminRole(ctx, "read crdb_internal.cluster_settings"); err != nil {
 			return err
 		}
 		for _, k := range settings.Keys() {
@@ -785,7 +846,7 @@ CREATE TABLE crdb_internal.%s (
 
 func (p *planner) makeSessionsRequest(ctx context.Context) serverpb.ListSessionsRequest {
 	req := serverpb.ListSessionsRequest{Username: p.SessionData().User}
-	if err := p.RequireSuperUser(ctx, "list sessions"); err == nil {
+	if err := p.RequireAdminRole(ctx, "list sessions"); err == nil {
 		// The root user can see all sessions.
 		req.Username = ""
 	}
@@ -1029,7 +1090,7 @@ var crdbInternalLocalMetricsTable = virtualSchemaTable{
   value							 FLOAT NOT NULL    -- value of the metric
 )`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireSuperUser(ctx, "read crdb_internal.node_metrics"); err != nil {
+		if err := p.RequireAdminRole(ctx, "read crdb_internal.node_metrics"); err != nil {
 			return err
 		}
 
@@ -1096,17 +1157,18 @@ var crdbInternalCreateStmtsTable = virtualSchemaTable{
 	comment: `CREATE and ALTER statements for all tables accessible by current user in current database (KV scan)`,
 	schema: `
 CREATE TABLE crdb_internal.create_statements (
-  database_id         INT,
-  database_name       STRING,
-  schema_name         STRING NOT NULL,
-  descriptor_id       INT,
-  descriptor_type     STRING NOT NULL,
-  descriptor_name     STRING NOT NULL,
-  create_statement    STRING NOT NULL,
-  state               STRING NOT NULL,
-  create_nofks        STRING NOT NULL,
-  alter_statements    STRING[] NOT NULL,
-  validate_statements STRING[] NOT NULL
+  database_id                   INT,
+  database_name                 STRING,
+  schema_name                   STRING NOT NULL,
+  descriptor_id                 INT,
+  descriptor_type               STRING NOT NULL,
+  descriptor_name               STRING NOT NULL,
+  create_statement              STRING NOT NULL,
+  state                         STRING NOT NULL,
+  create_nofks                  STRING NOT NULL,
+  alter_statements              STRING[] NOT NULL,
+  validate_statements           STRING[] NOT NULL,
+  zone_configuration_statements STRING[] NOT NULL
 )
 `,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
@@ -1119,6 +1181,48 @@ CREATE TABLE crdb_internal.create_statements (
 		typeView := tree.NewDString("view")
 		typeTable := tree.NewDString("table")
 		typeSequence := tree.NewDString("sequence")
+
+		// Hold the configuration statements for each table
+		zoneConfigStmts := make(map[string][]string)
+		// Prepare a query used to see zones configuations on this table.
+		configStmtsQuery := `
+			SELECT
+				table_name, raw_config_yaml, raw_config_sql
+			FROM
+				crdb_internal.zones
+			WHERE
+				database_name = '%[1]s'
+				AND table_name IS NOT NULL
+				AND raw_config_yaml IS NOT NULL
+				AND raw_config_sql IS NOT NULL
+			ORDER BY
+				database_name, table_name, index_name, partition_name
+		`
+		// The create_statements table is used at times where other internal
+		// tables have not been created, or are unaccessible (perhaps during
+		// certain tests (TestDumpAsOf in pkg/cli/dump_test.go)). So if something
+		// goes wrong querying this table, proceed without any constraint data.
+		zoneConstraintRows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+			ctx, "zone-constraints-for-show-create-table", p.txn,
+			fmt.Sprintf(configStmtsQuery, contextName))
+		if err != nil {
+			log.VEventf(ctx, 1, "%q", err)
+		} else {
+			for _, row := range zoneConstraintRows {
+				tableName := string(tree.MustBeDString(row[0]))
+				var zoneConfig zonepb.ZoneConfig
+				yamlString := string(tree.MustBeDString(row[1]))
+				err := yaml.UnmarshalStrict([]byte(yamlString), &zoneConfig)
+				if err != nil {
+					return err
+				}
+				// If all constraints are default, then don't show anything.
+				if !zoneConfig.Equal(zonepb.ZoneConfig{}) {
+					sqlString := string(tree.MustBeDString(row[2]))
+					zoneConfigStmts[tableName] = append(zoneConfigStmts[tableName], sqlString)
+				}
+			}
+		}
 
 		return forEachTableDescWithTableLookupInternal(ctx, p, dbContext, virtualOnce, true, /*allowAdding*/
 			func(db *DatabaseDescriptor, scName string, table *TableDescriptor, lCtx tableLookupFn) error {
@@ -1142,42 +1246,40 @@ CREATE TABLE crdb_internal.create_statements (
 				} else {
 					descType = typeTable
 					tn := (*tree.Name)(&table.Name)
-					createNofk, err = ShowCreateTable(ctx, tn, contextName, table, lCtx, true /* ignoreFKs */)
+					createNofk, err = ShowCreateTable(ctx, tn, contextName, table, lCtx, OmitFKClausesFromCreate)
 					if err != nil {
 						return err
 					}
 					allIdx := append(table.Indexes, table.PrimaryIndex)
-					for i := range allIdx {
-						idx := &allIdx[i]
-						if fk := &idx.ForeignKey; fk.IsSet() {
-							f := tree.NewFmtCtx(tree.FmtSimple)
-							f.WriteString("ALTER TABLE ")
-							f.FormatNode(tn)
-							f.WriteString(" ADD CONSTRAINT ")
-							f.FormatNameP(&fk.Name)
-							f.WriteByte(' ')
-							if err := printForeignKeyConstraint(ctx, &f.Buffer, contextName, idx, lCtx); err != nil {
-								return err
-							}
-							if err := alterStmts.Append(tree.NewDString(f.CloseAndGetString())); err != nil {
-								return err
-							}
-
-							f = tree.NewFmtCtx(tree.FmtSimple)
-							f.WriteString("ALTER TABLE ")
-							f.FormatNode(tn)
-							f.WriteString(" VALIDATE CONSTRAINT ")
-							f.FormatNameP(&fk.Name)
-
-							if err := validateStmts.Append(tree.NewDString(f.CloseAndGetString())); err != nil {
-								return err
-							}
-						}
+					if err := showAlterStatementWithInterleave(ctx, tn, contextName, lCtx, allIdx, table, alterStmts, validateStmts); err != nil {
+						return err
 					}
-					stmt, err = ShowCreateTable(ctx, tn, contextName, table, lCtx, false /* ignoreFKs */)
+					stmt, err = ShowCreateTable(ctx, tn, contextName, table, lCtx, IncludeFkClausesInCreate)
 				}
 				if err != nil {
 					return err
+				}
+
+				zoneRows := tree.NewDArray(types.String)
+				if val, ok := zoneConfigStmts[table.Name]; ok {
+					for _, s := range val {
+						if err := zoneRows.Append(tree.NewDString(s)); err != nil {
+							return err
+						}
+					}
+				} else {
+					// If there are partitions applied to this table and no zone configurations, display a warning.
+					hasPartitions := false
+					for i := range table.Indexes {
+						if table.Indexes[i].Partitioning.NumColumns != 0 {
+							hasPartitions = true
+							break
+						}
+					}
+					hasPartitions = hasPartitions || table.PrimaryIndex.Partitioning.NumColumns != 0
+					if hasPartitions {
+						stmt += "\n-- Warning: Partitioned table with no zone configurations."
+					}
 				}
 
 				descID := tree.NewDInt(tree.DInt(table.ID))
@@ -1197,9 +1299,114 @@ CREATE TABLE crdb_internal.create_statements (
 					tree.NewDString(createNofk),
 					alterStmts,
 					validateStmts,
+					zoneRows,
 				)
 			})
 	},
+}
+
+func showAlterStatementWithInterleave(
+	ctx context.Context,
+	tn *tree.Name,
+	contextName string,
+	lCtx tableLookupFn,
+	allIdx []sqlbase.IndexDescriptor,
+	table *sqlbase.TableDescriptor,
+	alterStmts *tree.DArray,
+	validateStmts *tree.DArray,
+) error {
+	for i := range table.OutboundFKs {
+		fk := &table.OutboundFKs[i]
+		f := tree.NewFmtCtx(tree.FmtSimple)
+		f.WriteString("ALTER TABLE ")
+		f.FormatNode(tn)
+		f.WriteString(" ADD CONSTRAINT ")
+		f.FormatNameP(&fk.Name)
+		f.WriteByte(' ')
+		if err := showForeignKeyConstraint(&f.Buffer, contextName, table, fk, lCtx); err != nil {
+			return err
+		}
+		if err := alterStmts.Append(tree.NewDString(f.CloseAndGetString())); err != nil {
+			return err
+		}
+
+		f = tree.NewFmtCtx(tree.FmtSimple)
+		f.WriteString("ALTER TABLE ")
+		f.FormatNode(tn)
+		f.WriteString(" VALIDATE CONSTRAINT ")
+		f.FormatNameP(&fk.Name)
+
+		if err := validateStmts.Append(tree.NewDString(f.CloseAndGetString())); err != nil {
+			return err
+		}
+	}
+
+	for i := range allIdx {
+		idx := &allIdx[i]
+		// Create CREATE INDEX commands for INTERLEAVE tables. These commands
+		// are included in the ALTER TABLE statements.
+		if len(idx.Interleave.Ancestors) > 0 {
+			f := tree.NewFmtCtx(tree.FmtSimple)
+			intl := idx.Interleave
+			parentTableID := intl.Ancestors[len(intl.Ancestors)-1].TableID
+			var err error
+			var parentName tree.TableName
+			if lCtx != nil {
+				parentName, err = lCtx.getParentAsTableName(parentTableID, contextName)
+				if err != nil {
+					return err
+				}
+			} else {
+				parentName = tree.MakeTableName(tree.Name(""), tree.Name(fmt.Sprintf("[%d as parent]", parentTableID)))
+				parentName.ExplicitCatalog = false
+				parentName.ExplicitSchema = false
+			}
+
+			var tableName tree.TableName
+			if lCtx != nil {
+				tableName, err = lCtx.getTableAsTableName(table, contextName)
+				if err != nil {
+					return err
+				}
+			} else {
+				tableName = tree.MakeTableName(tree.Name(""), tree.Name(fmt.Sprintf("[%d as parent]", table.ID)))
+				tableName.ExplicitCatalog = false
+				tableName.ExplicitSchema = false
+			}
+			var sharedPrefixLen int
+			for _, ancestor := range intl.Ancestors {
+				sharedPrefixLen += int(ancestor.SharedPrefixLen)
+			}
+			// Write the CREATE INDEX statements.
+			showCreateIndexWithInterleave(f, idx, tableName, parentName, sharedPrefixLen)
+			if err := alterStmts.Append(tree.NewDString(f.CloseAndGetString())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func showCreateIndexWithInterleave(
+	f *tree.FmtCtx,
+	idx *sqlbase.IndexDescriptor,
+	tableName tree.TableName,
+	parentName tree.TableName,
+	sharedPrefixLen int,
+) {
+	f.WriteString("CREATE ")
+	f.WriteString(idx.SQLString(&tableName))
+	f.WriteString(" INTERLEAVE IN PARENT ")
+	parentName.Format(f)
+	f.WriteString(" (")
+	// Get all of the columns and write them.
+	comma := ""
+	for _, name := range idx.ColumnNames[:sharedPrefixLen] {
+		f.WriteString(comma)
+		f.FormatNameP(&name)
+		comma = ", "
+	}
+	f.WriteString(")")
 }
 
 // crdbInternalTableColumnsTable exposes the column descriptors.
@@ -1435,33 +1642,17 @@ CREATE TABLE crdb_internal.backward_dependencies (
 		viewDep := tree.NewDString("view")
 		sequenceDep := tree.NewDString("sequence")
 		interleaveDep := tree.NewDString("interleave")
-		return forEachTableDescAll(ctx, p, dbContext, hideVirtual, /* virtual tables have no backward/forward dependencies*/
-			func(db *DatabaseDescriptor, _ string, table *TableDescriptor) error {
+		return forEachTableDescAllWithTableLookup(ctx, p, dbContext, hideVirtual,
+			/* virtual tables have no backward/forward dependencies*/
+			func(db *DatabaseDescriptor, _ string, table *TableDescriptor, tableLookup tableLookupFn) error {
 				tableID := tree.NewDInt(tree.DInt(table.ID))
 				tableName := tree.NewDString(table.Name)
 
 				reportIdxDeps := func(idx *sqlbase.IndexDescriptor) error {
-					idxID := tree.NewDInt(tree.DInt(idx.ID))
-					if idx.ForeignKey.Table != 0 {
-						fkRef := &idx.ForeignKey
-						if err := addRow(
-							tableID, tableName,
-							idxID,
-							tree.DNull,
-							tree.NewDInt(tree.DInt(fkRef.Table)),
-							fkDep,
-							tree.NewDInt(tree.DInt(fkRef.Index)),
-							tree.NewDString(fkRef.Name),
-							tree.NewDString(fmt.Sprintf("SharedPrefixLen: %d", fkRef.SharedPrefixLen)),
-						); err != nil {
-							return err
-						}
-					}
-
 					for _, interleaveParent := range idx.Interleave.Ancestors {
 						if err := addRow(
 							tableID, tableName,
-							idxID,
+							tree.NewDInt(tree.DInt(idx.ID)),
 							tree.DNull,
 							tree.NewDInt(tree.DInt(interleaveParent.TableID)),
 							interleaveDep,
@@ -1474,6 +1665,22 @@ CREATE TABLE crdb_internal.backward_dependencies (
 						}
 					}
 					return nil
+				}
+
+				for i := range table.OutboundFKs {
+					fk := &table.OutboundFKs[i]
+					if err := addRow(
+						tableID, tableName,
+						tree.DNull,
+						tree.DNull,
+						tree.NewDInt(tree.DInt(fk.ReferencedTableID)),
+						fkDep,
+						tree.NewDInt(tree.DInt(fk.LegacyReferencedIndex)),
+						tree.NewDString(fk.Name),
+						tree.DNull,
+					); err != nil {
+						return err
+					}
 				}
 
 				// Record the backward references of the primary index.
@@ -1582,25 +1789,10 @@ CREATE TABLE crdb_internal.forward_dependencies (
 				tableName := tree.NewDString(table.Name)
 
 				reportIdxDeps := func(idx *sqlbase.IndexDescriptor) error {
-					idxID := tree.NewDInt(tree.DInt(idx.ID))
-					for _, fkRef := range idx.ReferencedBy {
-						if err := addRow(
-							tableID, tableName,
-							idxID,
-							tree.NewDInt(tree.DInt(fkRef.Table)),
-							fkDep,
-							tree.NewDInt(tree.DInt(fkRef.Index)),
-							tree.NewDString(fkRef.Name),
-							tree.NewDString(fmt.Sprintf("SharedPrefixLen: %d", fkRef.SharedPrefixLen)),
-						); err != nil {
-							return err
-						}
-					}
-
 					for _, interleaveRef := range idx.InterleavedBy {
 						if err := addRow(
 							tableID, tableName,
-							idxID,
+							tree.NewDInt(tree.DInt(idx.ID)),
 							tree.NewDInt(tree.DInt(interleaveRef.Table)),
 							interleaveDep,
 							tree.NewDInt(tree.DInt(interleaveRef.Index)),
@@ -1612,6 +1804,21 @@ CREATE TABLE crdb_internal.forward_dependencies (
 						}
 					}
 					return nil
+				}
+
+				for i := range table.InboundFKs {
+					fk := &table.InboundFKs[i]
+					if err := addRow(
+						tableID, tableName,
+						tree.DNull,
+						tree.NewDInt(tree.DInt(fk.OriginTableID)),
+						fkDep,
+						tree.DNull,
+						tree.DNull,
+						tree.DNull,
+					); err != nil {
+						return err
+					}
 				}
 
 				// Record the backward references of the primary index.
@@ -1675,8 +1882,12 @@ CREATE VIEW crdb_internal.ranges AS SELECT
 	table_name,
 	index_name,
 	replicas,
-	manual_split_time,
-	crdb_internal.lease_holder(start_key) AS lease_holder
+	replica_localities,
+	learner_replicas,
+	split_enforced_until,
+	crdb_internal.lease_holder(start_key) AS lease_holder,
+	(crdb_internal.range_stats(start_key)->>'key_bytes')::INT +
+	(crdb_internal.range_stats(start_key)->>'val_bytes')::INT AS range_size
 FROM crdb_internal.ranges_no_leases
 `,
 	resultColumns: sqlbase.ResultColumns{
@@ -1689,8 +1900,11 @@ FROM crdb_internal.ranges_no_leases
 		{Name: "table_name", Typ: types.String},
 		{Name: "index_name", Typ: types.String},
 		{Name: "replicas", Typ: types.Int2Vector},
-		{Name: "manual_split_time", Typ: types.Timestamp},
+		{Name: "replica_localities", Typ: types.StringArray},
+		{Name: "learner_replicas", Typ: types.Int2Vector},
+		{Name: "split_enforced_until", Typ: types.Timestamp},
 		{Name: "lease_holder", Typ: types.Int},
+		{Name: "range_size", Typ: types.Int},
 	},
 }
 
@@ -1702,20 +1916,22 @@ var crdbInternalRangesNoLeasesTable = virtualSchemaTable{
 	comment: `range metadata without leaseholder details (KV join; expensive!)`,
 	schema: `
 CREATE TABLE crdb_internal.ranges_no_leases (
-  range_id          INT NOT NULL,
-  start_key         BYTES NOT NULL,
-  start_pretty      STRING NOT NULL,
-  end_key           BYTES NOT NULL,
-  end_pretty        STRING NOT NULL,
-  database_name     STRING NOT NULL,
-  table_name        STRING NOT NULL,
-  index_name        STRING NOT NULL,
-  replicas          INT[] NOT NULL,
-  manual_split_time TIMESTAMP
+  range_id             INT NOT NULL,
+  start_key            BYTES NOT NULL,
+  start_pretty         STRING NOT NULL,
+  end_key              BYTES NOT NULL,
+  end_pretty           STRING NOT NULL,
+  database_name        STRING NOT NULL,
+  table_name           STRING NOT NULL,
+  index_name           STRING NOT NULL,
+  replicas             INT[] NOT NULL,	
+  replica_localities   STRING[] NOT NULL,
+	learner_replicas     INT[] NOT NULL,
+	split_enforced_until TIMESTAMP
 )
 `,
 	generator: func(ctx context.Context, p *planner, _ *DatabaseDescriptor) (virtualTableGenerator, error) {
-		if err := p.RequireSuperUser(ctx, "read crdb_internal.ranges_no_leases"); err != nil {
+		if err := p.RequireAdminRole(ctx, "read crdb_internal.ranges_no_leases"); err != nil {
 			return nil, err
 		}
 		descs, err := p.Tables().getAllDescriptors(ctx, p.txn)
@@ -1748,6 +1964,17 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 		if err != nil {
 			return nil, err
 		}
+
+		// Map node descriptors to localities
+		descriptors, err := getAllNodeDescriptors(p)
+		if err != nil {
+			return nil, err
+		}
+		nodeIDToLocality := make(map[roachpb.NodeID]roachpb.Locality)
+		for _, desc := range descriptors {
+			nodeIDToLocality[desc.NodeID] = desc.Locality
+		}
+
 		var desc roachpb.RangeDescriptor
 
 		i := 0
@@ -1764,14 +1991,32 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				return nil, err
 			}
 
-			var replicas []int
-			for _, rd := range desc.Replicas().Unwrap() {
-				replicas = append(replicas, int(rd.StoreID))
+			var voterReplicas, learnerReplicas []int
+			for _, rd := range desc.Replicas().Voters() {
+				voterReplicas = append(voterReplicas, int(rd.StoreID))
 			}
-			sort.Ints(replicas)
-			arr := tree.NewDArray(types.Int)
-			for _, replica := range replicas {
-				if err := arr.Append(tree.NewDInt(tree.DInt(replica))); err != nil {
+			for _, rd := range desc.Replicas().Learners() {
+				learnerReplicas = append(learnerReplicas, int(rd.StoreID))
+			}
+			sort.Ints(voterReplicas)
+			sort.Ints(learnerReplicas)
+			votersArr := tree.NewDArray(types.Int)
+			for _, replica := range voterReplicas {
+				if err := votersArr.Append(tree.NewDInt(tree.DInt(replica))); err != nil {
+					return nil, err
+				}
+			}
+			learnersArr := tree.NewDArray(types.Int)
+			for _, replica := range learnerReplicas {
+				if err := learnersArr.Append(tree.NewDInt(tree.DInt(replica))); err != nil {
+					return nil, err
+				}
+			}
+
+			replicaLocalityArr := tree.NewDArray(types.String)
+			for _, id := range voterReplicas {
+				replicaLocality := nodeIDToLocality[roachpb.NodeID(id)].String()
+				if err := replicaLocalityArr.Append(tree.NewDString(replicaLocality)); err != nil {
 					return nil, err
 				}
 			}
@@ -1790,9 +2035,9 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				}
 			}
 
-			manualSplitTime := tree.DNull
-			if desc.StickyBit != nil {
-				manualSplitTime = tree.TimestampToInexactDTimestamp(*desc.StickyBit)
+			splitEnforcedUntil := tree.DNull
+			if (desc.GetStickyBit() != hlc.Timestamp{}) {
+				splitEnforcedUntil = tree.TimestampToInexactDTimestamp(*desc.StickyBit)
 			}
 
 			return tree.Datums{
@@ -1804,8 +2049,10 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				tree.NewDString(dbName),
 				tree.NewDString(tableName),
 				tree.NewDString(indexName),
-				arr,
-				manualSplitTime,
+				votersArr,
+				replicaLocalityArr,
+				learnersArr,
+				splitEnforcedUntil,
 			}, nil
 		}, nil
 	},
@@ -1839,9 +2086,6 @@ func (p *planner) getAllNames(ctx context.Context) (map[sqlbase.ID]namespaceKey,
 
 // crdbInternalZonesTable decodes and exposes the zone configs in the
 // system.zones table.
-// The cli_specifier column is deprecated and only exists to be used
-// as a hidden field by the CLI for backwards compatibility. Use zone_name
-// instead.
 //
 // TODO(tbg): prefix with kv_.
 var crdbInternalZonesTable = virtualSchemaTable{
@@ -1849,13 +2093,19 @@ var crdbInternalZonesTable = virtualSchemaTable{
 	schema: `
 CREATE TABLE crdb_internal.zones (
   zone_id          INT NOT NULL,
-  zone_name        STRING,
-  cli_specifier    STRING, -- this column is deprecated in favor of zone_name.
-                           -- It is kept for backwards compatibility with the CLI.
-  config_yaml      STRING NOT NULL,
-  config_sql       STRING, -- this column can be NULL if there is no specifier syntax
+  subzone_id       INT NOT NULL,
+  target           STRING,
+  range_name       STRING,
+  database_name    STRING,
+  table_name       STRING,
+  index_name       STRING,
+  partition_name   STRING,
+  raw_config_yaml      STRING NOT NULL,
+  raw_config_sql       STRING, -- this column can be NULL if there is no specifier syntax
                            -- possible (e.g. the object was deleted).
-  config_protobuf  BYTES NOT NULL
+	raw_config_protobuf  BYTES NOT NULL,
+	full_config_yaml STRING NOT NULL,
+	full_config_sql STRING
 )
 `,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
@@ -1867,8 +2117,16 @@ CREATE TABLE crdb_internal.zones (
 			if entry, ok := namespace[sqlbase.ID(id)]; ok {
 				return uint32(entry.parentID), entry.name, nil
 			}
-			return 0, "", pgerror.AssertionFailedf(
-				"object with ID %d does not exist", log.Safe(id))
+			return 0, "", errors.AssertionFailedf(
+				"object with ID %d does not exist", errors.Safe(id))
+		}
+
+		getKey := func(key roachpb.Key) (*roachpb.Value, error) {
+			kv, err := p.txn.Get(ctx, key)
+			if err != nil {
+				return nil, err
+			}
+			return kv.Value, nil
 		}
 
 		rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
@@ -1881,31 +2139,50 @@ CREATE TABLE crdb_internal.zones (
 			id := uint32(tree.MustBeDInt(r[0]))
 
 			var zoneSpecifier *tree.ZoneSpecifier
-			zs, err := config.ZoneSpecifierFromID(id, resolveID)
+			zs, err := zonepb.ZoneSpecifierFromID(id, resolveID)
 			if err != nil {
-				// The database or table has been deleted so there is no way
-				// to refer to it anymore. We are still going to show
-				// something but the CLI specifier part will become NULL.
-				zoneSpecifier = nil
+				// We can have valid zoneSpecifiers whose table/database has been
+				// deleted because zoneSpecifiers are collected asynchronously.
+				// In this case, just don't show the zoneSpecifier in the
+				// output of the table.
+				continue
 			} else {
 				zoneSpecifier = &zs
 			}
 
 			configBytes := []byte(*r[1].(*tree.DBytes))
-			var configProto config.ZoneConfig
+			var configProto zonepb.ZoneConfig
 			if err := protoutil.Unmarshal(configBytes, &configProto); err != nil {
 				return err
 			}
 			subzones := configProto.Subzones
 
+			// Inherit full information about this zone.
+			fullZone := configProto
+			if err := completeZoneConfig(&fullZone, uint32(tree.MustBeDInt(r[0])), getKey); err != nil {
+				return err
+			}
+
+			// Write down information about the zone in the table.
+			// TODO (rohany): We would like to just display information about these
+			//  subzone placeholders, but there are a few tests that depend on this
+			//  behavior, so leave it in for now.
 			if !configProto.IsSubzonePlaceholder() {
 				// Ensure subzones don't infect the value of the config_proto column.
 				configProto.Subzones = nil
 				configProto.SubzoneSpans = nil
 
-				if err := generateZoneConfigIntrospectionValues(values, r[0], zoneSpecifier, &configProto); err != nil {
+				if err := generateZoneConfigIntrospectionValues(
+					values,
+					r[0],
+					tree.NewDInt(tree.DInt(0)),
+					zoneSpecifier,
+					&configProto,
+					&fullZone,
+				); err != nil {
 					return err
 				}
+
 				if err := addRow(values...); err != nil {
 					return err
 				}
@@ -1916,7 +2193,7 @@ CREATE TABLE crdb_internal.zones (
 				if err != nil {
 					return err
 				}
-				for _, s := range subzones {
+				for i, s := range subzones {
 					index, err := table.FindIndexByID(sqlbase.IndexID(s.IndexID))
 					if err != nil {
 						if err == sqlbase.ErrIndexGCMutationsList {
@@ -1931,9 +2208,35 @@ CREATE TABLE crdb_internal.zones (
 						zoneSpecifier = &zs
 					}
 
-					if err := generateZoneConfigIntrospectionValues(values, r[0], zoneSpecifier, &s.Config); err != nil {
+					// Generate information about full / inherited constraints.
+					// There are two cases -- the subzone we are looking at refers
+					// to an index, or to a partition.
+					subZoneConfig := s.Config
+
+					// In this case, we have an index. Inherit from the parent zone.
+					if s.PartitionName == "" {
+						subZoneConfig.InheritFromParent(&fullZone)
+					} else {
+						// We have a partition. Get the parent index partition from the zone and
+						// have it inherit constraints.
+						if indexSubzone := fullZone.GetSubzone(uint32(index.ID), ""); indexSubzone != nil {
+							subZoneConfig.InheritFromParent(&indexSubzone.Config)
+						}
+						// Inherit remaining fields from the full parent zone.
+						subZoneConfig.InheritFromParent(&fullZone)
+					}
+
+					if err := generateZoneConfigIntrospectionValues(
+						values,
+						r[0],
+						tree.NewDInt(tree.DInt(i+1)),
+						zoneSpecifier,
+						&s.Config,
+						&subZoneConfig,
+					); err != nil {
 						return err
 					}
+
 					if err := addRow(values...); err != nil {
 						return err
 					}
@@ -1944,53 +2247,66 @@ CREATE TABLE crdb_internal.zones (
 	},
 }
 
+func getAllNodeDescriptors(p *planner) ([]roachpb.NodeDescriptor, error) {
+	g := p.ExecCfg().Gossip
+	var descriptors []roachpb.NodeDescriptor
+	if err := g.IterateInfos(gossip.KeyNodeIDPrefix, func(key string, i gossip.Info) error {
+		bytes, err := i.Value.GetBytes()
+		if err != nil {
+			return errors.NewAssertionErrorWithWrappedErrf(err,
+				"failed to extract bytes for key %q", key)
+		}
+
+		var d roachpb.NodeDescriptor
+		if err := protoutil.Unmarshal(bytes, &d); err != nil {
+			return errors.NewAssertionErrorWithWrappedErrf(err,
+				"failed to parse value for key %q", key)
+		}
+
+		// Don't use node descriptors with NodeID 0, because that's meant to
+		// indicate that the node has been removed from the cluster.
+		if d.NodeID != 0 {
+			descriptors = append(descriptors, d)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return descriptors, nil
+}
+
 // crdbInternalGossipNodesTable exposes local information about the cluster nodes.
 var crdbInternalGossipNodesTable = virtualSchemaTable{
 	comment: "locally known gossiped node details (RAM; local node only)",
 	schema: `
 CREATE TABLE crdb_internal.gossip_nodes (
-  node_id         		INT NOT NULL,
-  network         		STRING NOT NULL,
-  address         		STRING NOT NULL,
-  advertise_address   STRING NOT NULL,
-  attrs           		JSON NOT NULL,
-  locality        		JSON NOT NULL,
-  server_version  		STRING NOT NULL,
-  build_tag       		STRING NOT NULL,
-  started_at     	 		TIMESTAMP NOT NULL,
-  is_live          BOOL NOT NULL,
-  ranges          		INT NOT NULL,
-  leases        	  	INT NOT NULL
+  node_id               INT NOT NULL,
+  network               STRING NOT NULL,
+  address               STRING NOT NULL,
+  advertise_address     STRING NOT NULL,
+  sql_network           STRING NOT NULL,
+  sql_address           STRING NOT NULL,
+  advertise_sql_address STRING NOT NULL,
+  attrs                 JSON NOT NULL,
+  locality              STRING NOT NULL,
+  cluster_name          STRING NOT NULL,
+  server_version        STRING NOT NULL,
+  build_tag             STRING NOT NULL,
+  started_at            TIMESTAMP NOT NULL,
+  is_live               BOOL NOT NULL,
+  ranges                INT NOT NULL,
+  leases                INT NOT NULL
 )
 	`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireSuperUser(ctx, "read crdb_internal.gossip_nodes"); err != nil {
+		if err := p.RequireAdminRole(ctx, "read crdb_internal.gossip_nodes"); err != nil {
 			return err
 		}
 
 		g := p.ExecCfg().Gossip
-		var descriptors []roachpb.NodeDescriptor
-		if err := g.IterateInfos(gossip.KeyNodeIDPrefix, func(key string, i gossip.Info) error {
-			bytes, err := i.Value.GetBytes()
-			if err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err,
-					"failed to extract bytes for key %q", key)
-			}
-
-			var d roachpb.NodeDescriptor
-			if err := protoutil.Unmarshal(bytes, &d); err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err,
-					"failed to parse value for key %q", key)
-			}
-
-			// Don't use node descriptors with NodeID 0, because that's meant to
-			// indicate that the node has been removed from the cluster.
-			if d.NodeID != 0 {
-				descriptors = append(descriptors, d)
-			}
+		descriptors, err := getAllNodeDescriptors(p)
+		if err != nil {
 			return nil
-		}); err != nil {
-			return err
 		}
 
 		alive := make(map[roachpb.NodeID]tree.DBool)
@@ -2013,13 +2329,13 @@ CREATE TABLE crdb_internal.gossip_nodes (
 		if err := g.IterateInfos(gossip.KeyStorePrefix, func(key string, i gossip.Info) error {
 			bytes, err := i.Value.GetBytes()
 			if err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+				return errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to extract bytes for key %q", key)
 			}
 
 			var desc roachpb.StoreDescriptor
 			if err := protoutil.Unmarshal(bytes, &desc); err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+				return errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to parse value for key %q", key)
 			}
 
@@ -2038,23 +2354,33 @@ CREATE TABLE crdb_internal.gossip_nodes (
 				attrs.Add(json.FromString(a))
 			}
 
-			locality := json.NewObjectBuilder(len(d.Locality.Tiers))
-			for _, t := range d.Locality.Tiers {
-				locality.Add(t.Key, json.FromString(t.Value))
+			listenAddrRPC := d.Address
+			listenAddrSQL := d.SQLAddress
+			if listenAddrSQL.IsEmpty() {
+				// Pre-19.2 node or same address for both.
+				listenAddrSQL = listenAddrRPC
 			}
 
-			addr, err := g.GetNodeIDAddress(d.NodeID)
+			advAddrRPC, err := g.GetNodeIDAddress(d.NodeID)
+			if err != nil {
+				return err
+			}
+			advAddrSQL, err := g.GetNodeIDSQLAddress(d.NodeID)
 			if err != nil {
 				return err
 			}
 
 			if err := addRow(
 				tree.NewDInt(tree.DInt(d.NodeID)),
-				tree.NewDString(d.Address.NetworkField),
-				tree.NewDString(d.Address.AddressField),
-				tree.NewDString(addr.String()),
+				tree.NewDString(listenAddrRPC.NetworkField),
+				tree.NewDString(listenAddrRPC.AddressField),
+				tree.NewDString(advAddrRPC.String()),
+				tree.NewDString(listenAddrSQL.NetworkField),
+				tree.NewDString(listenAddrSQL.AddressField),
+				tree.NewDString(advAddrSQL.String()),
 				tree.NewDJSON(attrs.Build()),
-				tree.NewDJSON(locality.Build()),
+				tree.NewDString(d.Locality.String()),
+				tree.NewDString(d.ClusterName),
 				tree.NewDString(d.ServerVersion.String()),
 				tree.NewDString(d.BuildTag),
 				tree.MakeDTimestamp(timeutil.Unix(0, d.StartedAt), time.Microsecond),
@@ -2089,7 +2415,7 @@ CREATE TABLE crdb_internal.gossip_liveness (
 		// which is highly available. DO NOT CALL functions which require the
 		// cluster to be healthy, such as StatusServer.Nodes().
 
-		if err := p.RequireSuperUser(ctx, "read crdb_internal.gossip_liveness"); err != nil {
+		if err := p.RequireAdminRole(ctx, "read crdb_internal.gossip_liveness"); err != nil {
 			return err
 		}
 
@@ -2104,13 +2430,13 @@ CREATE TABLE crdb_internal.gossip_liveness (
 		if err := g.IterateInfos(gossip.KeyNodeLivenessPrefix, func(key string, i gossip.Info) error {
 			bytes, err := i.Value.GetBytes()
 			if err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+				return errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to extract bytes for key %q", key)
 			}
 
 			var l storagepb.Liveness
 			if err := protoutil.Unmarshal(bytes, &l); err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+				return errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to parse value for key %q", key)
 			}
 			nodes = append(nodes, nodeInfo{
@@ -2157,7 +2483,7 @@ CREATE TABLE crdb_internal.gossip_alerts (
 )
 	`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireSuperUser(ctx, "read crdb_internal.gossip_alerts"); err != nil {
+		if err := p.RequireAdminRole(ctx, "read crdb_internal.gossip_alerts"); err != nil {
 			return err
 		}
 
@@ -2171,18 +2497,18 @@ CREATE TABLE crdb_internal.gossip_alerts (
 		if err := g.IterateInfos(gossip.KeyNodeHealthAlertPrefix, func(key string, i gossip.Info) error {
 			bytes, err := i.Value.GetBytes()
 			if err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+				return errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to extract bytes for key %q", key)
 			}
 
 			var d statuspb.HealthCheckResult
 			if err := protoutil.Unmarshal(bytes, &d); err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+				return errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to parse value for key %q", key)
 			}
 			nodeID, err := gossip.NodeIDFromKey(key, gossip.KeyNodeHealthAlertPrefix)
 			if err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+				return errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to parse node ID from key %q", key)
 			}
 			results = append(results, resultWithNodeID{nodeID, d})
@@ -2223,7 +2549,7 @@ CREATE TABLE crdb_internal.gossip_network (
 )
 	`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireSuperUser(ctx, "read crdb_internal.gossip_network"); err != nil {
+		if err := p.RequireAdminRole(ctx, "read crdb_internal.gossip_network"); err != nil {
 			return err
 		}
 
@@ -2240,7 +2566,14 @@ CREATE TABLE crdb_internal.gossip_network (
 	},
 }
 
+// addPartitioningRows adds the rows in crdb_internal.partitions for each partition.
+// None of the arguments can be nil, and it is used recursively when a list partition
+// has subpartitions. In that case, the colOffset argument is incremented to represent
+// how many columns of the index have been partitioned already.
 func addPartitioningRows(
+	ctx context.Context,
+	p *planner,
+	database string,
 	table *sqlbase.TableDescriptor,
 	index *sqlbase.IndexDescriptor,
 	partitioning *sqlbase.PartitioningDescriptor,
@@ -2252,31 +2585,125 @@ func addPartitioningRows(
 	indexID := tree.NewDInt(tree.DInt(index.ID))
 	numColumns := tree.NewDInt(tree.DInt(partitioning.NumColumns))
 
+	var buf bytes.Buffer
+	for i := uint32(colOffset); i < uint32(colOffset)+partitioning.NumColumns; i++ {
+		if i != uint32(colOffset) {
+			buf.WriteString(`, `)
+		}
+		buf.WriteString(index.ColumnNames[i])
+	}
+	colNames := tree.NewDString(buf.String())
+
+	var datumAlloc sqlbase.DatumAlloc
+
+	// We don't need real prefixes in the DecodePartitionTuple calls because we
+	// only use the tree.Datums part of the output.
+	fakePrefixDatums := make([]tree.Datum, colOffset)
+	for i := range fakePrefixDatums {
+		fakePrefixDatums[i] = tree.DNull
+	}
+
+	// This produces the list_value column.
 	for _, l := range partitioning.List {
+		var buf bytes.Buffer
+		for j, values := range l.Values {
+			if j != 0 {
+				buf.WriteString(`, `)
+			}
+			tuple, _, err := sqlbase.DecodePartitionTuple(
+				&datumAlloc, table, index, partitioning, values, fakePrefixDatums,
+			)
+			if err != nil {
+				return err
+			}
+			buf.WriteString(tuple.String())
+		}
+
+		partitionValue := tree.NewDString(buf.String())
 		name := tree.NewDString(l.Name)
+
+		// Figure out which zone and subzone this partition should correspond to.
+		zoneID, zone, subzone, err := GetZoneConfigInTxn(
+			ctx, p.txn, uint32(table.ID), index, l.Name, false /* getInheritedDefault */)
+		if err != nil {
+			return err
+		}
+		subzoneID := base.SubzoneID(0)
+		if subzone != nil {
+			for i, s := range zone.Subzones {
+				if s.IndexID == subzone.IndexID && s.PartitionName == subzone.PartitionName {
+					subzoneID = base.SubzoneIDFromIndex(i)
+				}
+			}
+		}
+
 		if err := addRow(
 			tableID,
 			indexID,
 			parentName,
 			name,
 			numColumns,
+			colNames,
+			partitionValue,
+			tree.DNull, /* null value for partition range */
+			tree.NewDInt(tree.DInt(zoneID)),
+			tree.NewDInt(tree.DInt(subzoneID)),
 		); err != nil {
 			return err
 		}
-		err := addPartitioningRows(table, index, &l.Subpartitioning, name,
+		err = addPartitioningRows(ctx, p, database, table, index, &l.Subpartitioning, name,
 			colOffset+int(partitioning.NumColumns), addRow)
 		if err != nil {
 			return err
 		}
 	}
 
+	// This produces the range_value column.
 	for _, r := range partitioning.Range {
+		var buf bytes.Buffer
+		fromTuple, _, err := sqlbase.DecodePartitionTuple(
+			&datumAlloc, table, index, partitioning, r.FromInclusive, fakePrefixDatums,
+		)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(fromTuple.String())
+		buf.WriteString(" TO ")
+		toTuple, _, err := sqlbase.DecodePartitionTuple(
+			&datumAlloc, table, index, partitioning, r.ToExclusive, fakePrefixDatums,
+		)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(toTuple.String())
+		partitionRange := tree.NewDString(buf.String())
+
+		// Figure out which zone and subzone this partition should correspond to.
+		zoneID, zone, subzone, err := GetZoneConfigInTxn(
+			ctx, p.txn, uint32(table.ID), index, r.Name, false /* getInheritedDefault */)
+		if err != nil {
+			return err
+		}
+		subzoneID := base.SubzoneID(0)
+		if subzone != nil {
+			for i, s := range zone.Subzones {
+				if s.IndexID == subzone.IndexID && s.PartitionName == subzone.PartitionName {
+					subzoneID = base.SubzoneIDFromIndex(i)
+				}
+			}
+		}
+
 		if err := addRow(
 			tableID,
 			indexID,
 			parentName,
 			tree.NewDString(r.Name),
 			numColumns,
+			colNames,
+			tree.DNull, /* null value for partition list */
+			partitionRange,
+			tree.NewDInt(tree.DInt(zoneID)),
+			tree.NewDInt(tree.DInt(subzoneID)),
 		); err != nil {
 			return err
 		}
@@ -2297,14 +2724,23 @@ CREATE TABLE crdb_internal.partitions (
 	index_id    INT NOT NULL,
 	parent_name STRING,
 	name        STRING NOT NULL,
-	columns     INT NOT NULL
+	columns     INT NOT NULL,
+	column_names STRING,
+	list_value  STRING,
+	range_value STRING,
+	zone_id INT, -- references a zone id in the crdb_internal.zones table
+	subzone_id INT -- references a subzone id in the crdb_internal.zones table
 )
 	`,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		dbName := ""
+		if dbContext != nil {
+			dbName = dbContext.Name
+		}
 		return forEachTableDescAll(ctx, p, dbContext, hideVirtual, /* virtual tables have no partitions*/
 			func(db *DatabaseDescriptor, _ string, table *TableDescriptor) error {
 				return table.ForeachNonDropIndex(func(index *sqlbase.IndexDescriptor) error {
-					return addPartitioningRows(table, index, &index.Partitioning,
+					return addPartitioningRows(ctx, p, dbName, table, index, &index.Partitioning,
 						tree.DNull /* parentName */, 0 /* colOffset */, addRow)
 				})
 			})
@@ -2322,7 +2758,7 @@ CREATE TABLE crdb_internal.kv_node_status (
   network        STRING NOT NULL,
   address        STRING NOT NULL,
   attrs          JSON NOT NULL,
-  locality       JSON NOT NULL,
+  locality       STRING NOT NULL,
   server_version STRING NOT NULL,
   go_version     STRING NOT NULL,
   tag            STRING NOT NULL,
@@ -2342,7 +2778,7 @@ CREATE TABLE crdb_internal.kv_node_status (
 )
 	`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireSuperUser(ctx, "read crdb_internal.kv_node_status"); err != nil {
+		if err := p.RequireAdminRole(ctx, "read crdb_internal.kv_node_status"); err != nil {
 			return err
 		}
 
@@ -2355,11 +2791,6 @@ CREATE TABLE crdb_internal.kv_node_status (
 			attrs := json.NewArrayBuilder(len(n.Desc.Attrs.Attrs))
 			for _, a := range n.Desc.Attrs.Attrs {
 				attrs.Add(json.FromString(a))
-			}
-
-			locality := json.NewObjectBuilder(len(n.Desc.Locality.Tiers))
-			for _, t := range n.Desc.Locality.Tiers {
-				locality.Add(t.Key, json.FromString(t.Value))
 			}
 
 			var dependencies string
@@ -2402,7 +2833,7 @@ CREATE TABLE crdb_internal.kv_node_status (
 				tree.NewDString(n.Desc.Address.NetworkField),
 				tree.NewDString(n.Desc.Address.AddressField),
 				tree.NewDJSON(attrs.Build()),
-				tree.NewDJSON(locality.Build()),
+				tree.NewDString(n.Desc.Locality.String()),
 				tree.NewDString(n.Desc.ServerVersion.String()),
 				tree.NewDString(n.BuildInfo.GoVersion),
 				tree.NewDString(n.BuildInfo.Tag),
@@ -2450,7 +2881,7 @@ CREATE TABLE crdb_internal.kv_store_status (
 )
 	`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireSuperUser(ctx, "read crdb_internal.kv_store_status"); err != nil {
+		if err := p.RequireAdminRole(ctx, "read crdb_internal.kv_store_status"); err != nil {
 			return err
 		}
 

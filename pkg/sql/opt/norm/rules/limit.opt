@@ -14,6 +14,15 @@
 =>
 $input
 
+# EliminateOffset discards an Offset operator if its offset value is zero.
+[EliminateOffset, Normalize]
+(Offset
+    $input:*
+    (Const 0)
+)
+=>
+$input
+
 # PushLimitIntoProject pushes the Limit operator into its Project input. It is
 # desirable to push the Limit operator as low in the query as possible, in order
 # to minimize the number of rows that other operators need to process.
@@ -44,4 +53,29 @@ $input
     (Offset $input $offset (PruneOrdering $ordering (OutputCols $input)))
     $projections
     $passthrough
+)
+
+# PushLimitIntoOffset pushes the Limit operator into the offset. This should
+# not have a negative impact but it would allow the use of the GenerateLimitedScans
+# rule.
+[PushLimitIntoOffset, Normalize]
+(Limit
+    (Offset
+        $input:*
+        (Const $offset:* & (IsPositiveLimit $offset))
+        $offsetOrdering:*
+    )
+    (Const $limit:* & (IsPositiveLimit $limit))
+    $limitOrdering:* & (IsSameOrdering $offsetOrdering $limitOrdering) &
+        (CanAddConstInts $limit $offset)
+)
+=>
+(Offset
+    (Limit
+        $input
+        (Const (AddConstInts $offset $limit))
+        $limitOrdering
+     )
+    (Const $offset)
+    $offsetOrdering
 )

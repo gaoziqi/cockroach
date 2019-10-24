@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package nodedialer
 
@@ -47,11 +43,63 @@ func TestNodedialerPositive(t *testing.T) {
 	stopper, _, _, _, nd := setUpNodedialerTest(t, staticNodeID)
 	defer stopper.Stop(context.TODO())
 	// Ensure that dialing works.
-	breaker := nd.GetCircuitBreaker(1)
+	breaker := nd.GetCircuitBreaker(1, rpc.DefaultClass)
 	assert.True(t, breaker.Ready())
 	ctx := context.Background()
-	_, err := nd.Dial(ctx, staticNodeID)
+	_, err := nd.Dial(ctx, staticNodeID, rpc.DefaultClass)
 	assert.Nil(t, err, "failed to dial")
+	assert.True(t, breaker.Ready())
+	assert.Equal(t, breaker.Failures(), int64(0))
+}
+
+func TestDialNoBreaker(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+
+	// Don't use setUpNodedialerTest because we want access to the underlying clock and rpcContext.
+	stopper := stop.NewStopper()
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	rpcCtx := newTestContext(clock, stopper)
+	rpcCtx.NodeID.Set(ctx, staticNodeID)
+	_, ln, _ := newTestServer(t, clock, stopper, true /* useHeartbeat */)
+	defer stopper.Stop(ctx)
+
+	// Test that DialNoBreaker is successful normally.
+	nd := New(rpcCtx, newSingleNodeResolver(staticNodeID, ln.Addr()))
+	testutils.SucceedsSoon(t, func() error {
+		return nd.ConnHealth(staticNodeID, rpc.DefaultClass)
+	})
+	breaker := nd.GetCircuitBreaker(staticNodeID, rpc.DefaultClass)
+	assert.True(t, breaker.Ready())
+	_, err := nd.DialNoBreaker(ctx, staticNodeID, rpc.DefaultClass)
+	assert.Nil(t, err, "failed to dial")
+	assert.True(t, breaker.Ready())
+	assert.Equal(t, breaker.Failures(), int64(0))
+
+	// Test that resolver errors don't trip the breaker.
+	boom := fmt.Errorf("boom")
+	nd = New(rpcCtx, func(roachpb.NodeID) (net.Addr, error) {
+		return nil, boom
+	})
+	breaker = nd.GetCircuitBreaker(staticNodeID, rpc.DefaultClass)
+	_, err = nd.DialNoBreaker(ctx, staticNodeID, rpc.DefaultClass)
+	assert.Equal(t, errors.Cause(err), boom)
+	assert.True(t, breaker.Ready())
+	assert.Equal(t, breaker.Failures(), int64(0))
+
+	// Test that connection errors don't trip the breaker either.
+	// To do this, we have to trick grpc into never successfully dialing
+	// the server, because if it succeeds once then it doesn't try again
+	// to perform a connection. To trick grpc in this way, we have to
+	// set up a server without the heartbeat service running. Without
+	// getting a heartbeat, the nodedialer will throw an error thinking
+	// that it wasn't able to successfully make a connection.
+	_, ln, _ = newTestServer(t, clock, stopper, false /* useHeartbeat */)
+	nd = New(rpcCtx, newSingleNodeResolver(staticNodeID, ln.Addr()))
+	breaker = nd.GetCircuitBreaker(staticNodeID, rpc.DefaultClass)
+	_, err = nd.DialNoBreaker(ctx, staticNodeID, rpc.DefaultClass)
+	assert.NotNil(t, err, "expected dial error")
 	assert.True(t, breaker.Ready())
 	assert.Equal(t, breaker.Failures(), int64(0))
 }
@@ -61,7 +109,7 @@ func TestConcurrentCancellationAndTimeout(t *testing.T) {
 	stopper, _, _, _, nd := setUpNodedialerTest(t, staticNodeID)
 	defer stopper.Stop(context.TODO())
 	ctx := context.Background()
-	breaker := nd.GetCircuitBreaker(staticNodeID)
+	breaker := nd.GetCircuitBreaker(staticNodeID, rpc.DefaultClass)
 	// Test that when a context is canceled during dialing we always return that
 	// error but we never trip the breaker.
 	const N = 1000
@@ -78,7 +126,7 @@ func TestConcurrentCancellationAndTimeout(t *testing.T) {
 		}()
 		go func() {
 			time.Sleep(randDuration(time.Millisecond))
-			_, err := nd.Dial(iCtx, 1)
+			_, err := nd.Dial(iCtx, 1, rpc.DefaultClass)
 			if err != nil &&
 				err != context.Canceled &&
 				err != context.DeadlineExceeded {
@@ -99,9 +147,9 @@ func TestResolverErrorsTrip(t *testing.T) {
 	nd := New(rpcCtx, func(id roachpb.NodeID) (net.Addr, error) {
 		return nil, boom
 	})
-	_, err := nd.Dial(context.Background(), staticNodeID)
+	_, err := nd.Dial(context.Background(), staticNodeID, rpc.DefaultClass)
 	assert.Equal(t, errors.Cause(err), boom)
-	breaker := nd.GetCircuitBreaker(staticNodeID)
+	breaker := nd.GetCircuitBreaker(staticNodeID, rpc.DefaultClass)
 	assert.False(t, breaker.Ready())
 }
 
@@ -110,7 +158,7 @@ func TestDisconnectsTrip(t *testing.T) {
 	stopper, _, ln, hb, nd := setUpNodedialerTest(t, staticNodeID)
 	defer stopper.Stop(context.TODO())
 	ctx := context.Background()
-	breaker := nd.GetCircuitBreaker(staticNodeID)
+	breaker := nd.GetCircuitBreaker(staticNodeID, rpc.DefaultClass)
 
 	// Now close the underlying connection from the server side and set the
 	// heartbeat service to return errors. This will eventually lead to the client
@@ -144,7 +192,7 @@ func TestDisconnectsTrip(t *testing.T) {
 		}()
 		go func() {
 			time.Sleep(randDuration(time.Millisecond))
-			_, err := nd.Dial(iCtx, 1)
+			_, err := nd.Dial(iCtx, 1, rpc.DefaultClass)
 			if shouldTrip(err) {
 				errChan <- err
 			}
@@ -174,7 +222,7 @@ func TestDisconnectsTrip(t *testing.T) {
 	// service is not returning errors.
 	hb.setErr(nil) // reset in case there were no errors
 	testutils.SucceedsSoon(t, func() error {
-		return nd.ConnHealth(staticNodeID)
+		return nd.ConnHealth(staticNodeID, rpc.DefaultClass)
 	})
 }
 
@@ -192,10 +240,10 @@ func setUpNodedialerTest(
 	// Create an rpc Context and then
 	rpcCtx = newTestContext(clock, stopper)
 	rpcCtx.NodeID.Set(context.TODO(), nodeID)
-	_, ln, hb = newTestServer(t, clock, stopper)
+	_, ln, hb = newTestServer(t, clock, stopper, true /* useHeartbeat */)
 	nd = New(rpcCtx, newSingleNodeResolver(nodeID, ln.Addr()))
 	testutils.SucceedsSoon(t, func() error {
-		return nd.ConnHealth(nodeID)
+		return nd.ConnHealth(nodeID, rpc.DefaultClass)
 	})
 	return stopper, rpcCtx, ln, hb, nd
 }
@@ -206,7 +254,7 @@ func randDuration(max time.Duration) time.Duration {
 }
 
 func newTestServer(
-	t testing.TB, clock *hlc.Clock, stopper *stop.Stopper,
+	t testing.TB, clock *hlc.Clock, stopper *stop.Stopper, useHeartbeat bool,
 ) (*grpc.Server, *interceptingListener, *heartbeatService) {
 	ctx := context.Background()
 	localAddr := "127.0.0.1:0"
@@ -217,11 +265,14 @@ func newTestServer(
 	il := &interceptingListener{Listener: ln}
 	s := grpc.NewServer()
 	serverVersion := cluster.MakeTestingClusterSettings().Version.ServerVersion
-	hb := &heartbeatService{
-		clock:         clock,
-		serverVersion: serverVersion,
+	var hb *heartbeatService
+	if useHeartbeat {
+		hb = &heartbeatService{
+			clock:         clock,
+			serverVersion: serverVersion,
+		}
+		rpc.RegisterHeartbeatServer(s, hb)
 	}
-	rpc.RegisterHeartbeatServer(s, hb)
 	if err := stopper.RunAsyncTask(ctx, "localServer", func(ctx context.Context) {
 		if err := s.Serve(il); err != nil {
 			log.Infof(ctx, "server stopped: %v", err)
@@ -236,7 +287,7 @@ func newTestServer(
 func newTestContext(clock *hlc.Clock, stopper *stop.Stopper) *rpc.Context {
 	cfg := testutils.NewNodeTestBaseContext()
 	cfg.Insecure = true
-	cfg.HeartbeatInterval = 10 * time.Millisecond
+	cfg.RPCHeartbeatInterval = 10 * time.Millisecond
 	rctx := rpc.NewContext(
 		log.AmbientContext{Tracer: tracing.NewTracer()},
 		cfg,

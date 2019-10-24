@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -25,7 +21,6 @@ import (
 	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -48,8 +43,9 @@ import (
 // GetTableDescriptor retrieves a table descriptor directly from the KV layer.
 func GetTableDescriptor(kvDB *client.DB, database string, table string) *TableDescriptor {
 	// log.VEventf(context.TODO(), 2, "GetTableDescriptor %q %q", database, table)
-	dbNameKey := MakeNameMetadataKey(keys.RootNamespaceID, database)
-	gr, err := kvDB.Get(context.TODO(), dbNameKey)
+	dKey := NewDatabaseKey(database)
+	ctx := context.TODO()
+	gr, err := kvDB.Get(ctx, dKey.Key())
 	if err != nil {
 		panic(err)
 	}
@@ -58,8 +54,8 @@ func GetTableDescriptor(kvDB *client.DB, database string, table string) *TableDe
 	}
 	dbDescID := ID(gr.ValueInt())
 
-	tableNameKey := MakeNameMetadataKey(dbDescID, table)
-	gr, err = kvDB.Get(context.TODO(), tableNameKey)
+	tKey := NewTableKey(dbDescID, table)
+	gr, err = kvDB.Get(ctx, tKey.Key())
 	if err != nil {
 		panic(err)
 	}
@@ -69,10 +65,19 @@ func GetTableDescriptor(kvDB *client.DB, database string, table string) *TableDe
 
 	descKey := MakeDescMetadataKey(ID(gr.ValueInt()))
 	desc := &Descriptor{}
-	if err := kvDB.GetProto(context.TODO(), descKey, desc); err != nil || (*desc == Descriptor{}) {
-		log.Fatalf(context.TODO(), "proto with id %d missing. err: %v", gr.ValueInt(), err)
+	ts, err := kvDB.GetProtoTs(ctx, descKey, desc)
+	if err != nil || (*desc == Descriptor{}) {
+		log.Fatalf(ctx, "proto with id %d missing. err: %v", gr.ValueInt(), err)
 	}
-	return desc.GetTable()
+	tableDesc := desc.Table(ts)
+	if tableDesc == nil {
+		return nil
+	}
+	err = tableDesc.MaybeFillInDescriptor(ctx, kvDB)
+	if err != nil {
+		log.Fatalf(ctx, "failure to fill in descriptor. err: %v", err)
+	}
+	return tableDesc
 }
 
 // GetImmutableTableDescriptor retrieves an immutable table descriptor directly from the KV layer.
@@ -107,19 +112,39 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 	}
 	// Sometimes pick from a predetermined list of known interesting datums.
 	if rng.Intn(10) == 0 {
-		specials := randInterestingDatums[typ.Family()]
-		if len(specials) > 0 {
-			return specials[rng.Intn(len(specials))]
+		if special := randInterestingDatum(rng, typ); special != nil {
+			return special
 		}
 	}
 	switch typ.Family() {
 	case types.BoolFamily:
 		return tree.MakeDBool(rng.Intn(2) == 1)
 	case types.IntFamily:
-		// int64(rng.Uint64()) to get negative numbers, too
-		return tree.NewDInt(tree.DInt(int64(rng.Uint64())))
+		switch typ.Width() {
+		case 64:
+			// int64(rng.Uint64()) to get negative numbers, too
+			return tree.NewDInt(tree.DInt(int64(rng.Uint64())))
+		case 32:
+			// int32(rng.Uint64()) to get negative numbers, too
+			return tree.NewDInt(tree.DInt(int32(rng.Uint64())))
+		case 16:
+			// int16(rng.Uint64()) to get negative numbers, too
+			return tree.NewDInt(tree.DInt(int16(rng.Uint64())))
+		case 8:
+			// int8(rng.Uint64()) to get negative numbers, too
+			return tree.NewDInt(tree.DInt(int8(rng.Uint64())))
+		default:
+			panic(fmt.Sprintf("int with an unexpected width %d", typ.Width()))
+		}
 	case types.FloatFamily:
-		return tree.NewDFloat(tree.DFloat(rng.NormFloat64()))
+		switch typ.Width() {
+		case 64:
+			return tree.NewDFloat(tree.DFloat(rng.NormFloat64()))
+		case 32:
+			return tree.NewDFloat(tree.DFloat(float32(rng.NormFloat64())))
+		default:
+			panic(fmt.Sprintf("float with an unexpected width %d", typ.Width()))
+		}
 	case types.DecimalFamily:
 		d := &tree.DDecimal{}
 		// int64(rng.Uint64()) to get negative numbers, too
@@ -143,7 +168,8 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 			sign*rng.Int63n(1000),
 		)}
 	case types.UuidFamily:
-		return tree.NewDUuid(tree.DUuid{UUID: uuid.MakeV4()})
+		gen := uuid.NewGenWithReader(rng)
+		return tree.NewDUuid(tree.DUuid{UUID: uuid.Must(gen.NewV4())})
 	case types.INetFamily:
 		ipAddr := ipaddr.RandIPAddr(rng)
 		return tree.NewDIPAddr(tree.DIPAddr{IPAddr: ipAddr})
@@ -228,6 +254,10 @@ var (
 			tree.NewDInt(tree.DInt(0)),
 			tree.NewDInt(tree.DInt(-1)),
 			tree.NewDInt(tree.DInt(1)),
+			tree.NewDInt(tree.DInt(math.MaxInt8)),
+			tree.NewDInt(tree.DInt(math.MinInt8)),
+			tree.NewDInt(tree.DInt(math.MaxInt16)),
+			tree.NewDInt(tree.DInt(math.MinInt16)),
 			tree.NewDInt(tree.DInt(math.MaxInt32)),
 			tree.NewDInt(tree.DInt(math.MinInt32)),
 			tree.NewDInt(tree.DInt(math.MaxInt64)),
@@ -368,6 +398,43 @@ func init() {
 		}
 
 		arrayContentsTypes = append(arrayContentsTypes, typ)
+	}
+}
+
+// randInterestingDatum returns an interesting Datum of type typ. If there are
+// no such Datums, it returns nil. Note that it pays attention to the width of
+// the requested type for Int and Float type families.
+func randInterestingDatum(rng *rand.Rand, typ *types.T) tree.Datum {
+	specials := randInterestingDatums[typ.Family()]
+	if len(specials) == 0 {
+		return nil
+	}
+	special := specials[rng.Intn(len(specials))]
+	switch typ.Family() {
+	case types.IntFamily:
+		switch typ.Width() {
+		case 64:
+			return special
+		case 32:
+			return tree.NewDInt(tree.DInt(int32(tree.MustBeDInt(special))))
+		case 16:
+			return tree.NewDInt(tree.DInt(int16(tree.MustBeDInt(special))))
+		case 8:
+			return tree.NewDInt(tree.DInt(int8(tree.MustBeDInt(special))))
+		default:
+			panic(fmt.Sprintf("int with an unexpected width %d", typ.Width()))
+		}
+	case types.FloatFamily:
+		switch typ.Width() {
+		case 64:
+			return special
+		case 32:
+			return tree.NewDFloat(tree.DFloat(float32(*special.(*tree.DFloat))))
+		default:
+			panic(fmt.Sprintf("float with an unexpected width %d", typ.Width()))
+		}
+	default:
+		return special
 	}
 }
 
@@ -800,6 +867,8 @@ var (
 	TwoIntCols = []types.T{*types.Int, *types.Int}
 	// ThreeIntCols is a slice of three IntTypes.
 	ThreeIntCols = []types.T{*types.Int, *types.Int, *types.Int}
+	// FourIntCols is a slice of four IntTypes.
+	FourIntCols = []types.T{*types.Int, *types.Int, *types.Int, *types.Int}
 )
 
 // MakeIntCols makes a slice of numCols IntTypes.

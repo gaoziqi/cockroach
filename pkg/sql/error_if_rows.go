@@ -1,23 +1,18 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -25,6 +20,10 @@ import (
 // node produces any rows.
 type errorIfRowsNode struct {
 	plan planNode
+
+	// mkErr creates the error message, given the values of the first row
+	// produced.
+	mkErr func(values tree.Datums) error
 
 	nexted bool
 }
@@ -44,9 +43,7 @@ func (n *errorIfRowsNode) Next(params runParams) (bool, error) {
 		return false, err
 	}
 	if ok {
-		// TODO(yuzefovich): update the error once the optimizer plans this node.
-		return false, pgerror.Newf(pgerror.CodeForeignKeyViolationError,
-			"foreign key violation: values %s", n.plan.Values())
+		return false, n.mkErr(n.plan.Values())
 	}
 	return false, nil
 }

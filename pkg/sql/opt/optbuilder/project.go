@@ -1,22 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -45,20 +42,30 @@ func (b *Builder) constructProject(input memo.RelExpr, cols []scopeColumn) memo.
 	colSet := opt.ColSet{}
 	for i := range cols {
 		id, scalar := cols[i].id, cols[i].scalar
-		if !colSet.Contains(int(id)) {
+		if !colSet.Contains(id) {
 			if scalar == nil {
-				passthrough.Add(int(id))
+				passthrough.Add(id)
 			} else {
 				projections = append(projections, memo.ProjectionsItem{
 					Element:    scalar,
 					ColPrivate: memo.ColPrivate{Col: id},
 				})
 			}
-			colSet.Add(int(id))
+			colSet.Add(id)
 		}
 	}
 
 	return b.factory.ConstructProject(input, projections, passthrough)
+}
+
+// dropOrderingAndExtraCols removes the ordering in the scope and projects away
+// any extra columns.
+func (b *Builder) dropOrderingAndExtraCols(s *scope) {
+	s.ordering = nil
+	if len(s.extraCols) > 0 {
+		s.extraCols = nil
+		s.expr = b.constructProject(s.expr, s.cols)
+	}
 }
 
 // analyzeProjectionList analyzes the given list of SELECT clause expressions,
@@ -115,7 +122,7 @@ func (b *Builder) analyzeSelectList(
 			// Fall back to slow path. Pre-normalize any VarName so the work is
 			// not done twice below.
 			if err := e.NormalizeTopLevelVarName(); err != nil {
-				panic(builderError{err})
+				panic(err)
 			}
 
 			// Special handling for "*", "<table>.*" and "(Expr).*".
@@ -123,7 +130,7 @@ func (b *Builder) analyzeSelectList(
 				switch v.(type) {
 				case tree.UnqualifiedStar, *tree.AllColumnsSelector, *tree.TupleStar:
 					if e.As != "" {
-						panic(pgerror.Newf(pgerror.CodeSyntaxError,
+						panic(pgerror.Newf(pgcode.Syntax,
 							"%q cannot be aliased", tree.ErrString(v)))
 					}
 
@@ -180,7 +187,7 @@ func (b *Builder) resolveColRef(e tree.Expr, inScope *scope) tree.TypedExpr {
 		colName := unresolved.Parts[0]
 		_, srcMeta, _, err := inScope.FindSourceProvidingColumn(b.ctx, tree.Name(colName))
 		if err != nil {
-			panic(builderError{err})
+			panic(err)
 		}
 		return srcMeta.(tree.TypedExpr)
 	}
@@ -191,7 +198,7 @@ func (b *Builder) resolveColRef(e tree.Expr, inScope *scope) tree.TypedExpr {
 func (b *Builder) getColName(expr tree.SelectExpr) string {
 	s, err := tree.GetRenderColName(b.semaCtx.SearchPath, expr)
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
 	return s
 }
@@ -251,13 +258,13 @@ func (b *Builder) finishBuildScalarRef(
 ) (out opt.ScalarExpr) {
 	// Update the sets of column references and outer columns if needed.
 	if colRefs != nil {
-		colRefs.Add(int(col.id))
+		colRefs.Add(col.id)
 	}
 
 	// Collect the outer columns of the current subquery, if any.
 	isOuterColumn := inScope == nil || inScope.isOuterColumn(col.id)
 	if isOuterColumn && b.subquery != nil {
-		b.subquery.outerCols.Add(int(col.id))
+		b.subquery.outerCols.Add(col.id)
 	}
 
 	// If this is not a projection context, then wrap the column reference with

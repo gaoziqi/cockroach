@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package spanset
 
@@ -182,7 +177,7 @@ func (s *Iterator) MVCCGet(
 // MVCCScan is part of the engine.Iterator interface.
 func (s *Iterator) MVCCScan(
 	start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts engine.MVCCScanOptions,
-) (kvData []byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
+) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
 	if err := s.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start, EndKey: end}); err != nil {
 		return nil, 0, nil, nil, err
 	}
@@ -238,6 +233,28 @@ func (s spanSetReader) Iterate(
 
 func (s spanSetReader) NewIterator(opts engine.IterOptions) engine.Iterator {
 	return &Iterator{s.r.NewIterator(opts), s.spans, nil, false}
+}
+
+// GetDBEngine recursively searches for the underlying rocksDB engine.
+func GetDBEngine(e engine.Reader, span roachpb.Span) engine.Reader {
+	switch v := e.(type) {
+	case ReadWriter:
+		return GetDBEngine(getSpanReader(v, span), span)
+	case *spanSetBatch:
+		return GetDBEngine(getSpanReader(v.ReadWriter, span), span)
+	default:
+		return e
+	}
+}
+
+// getSpanReader is a getter to access the engine.Reader field of the
+// spansetReader.
+func getSpanReader(r ReadWriter, span roachpb.Span) engine.Reader {
+	if err := r.spanSetReader.spans.CheckAllowed(SpanReadOnly, span); err != nil {
+		panic("Not in the span")
+	}
+
+	return r.spanSetReader.r
 }
 
 type spanSetWriter struct {
@@ -304,15 +321,16 @@ func (s spanSetWriter) LogLogicalOp(
 	s.w.LogLogicalOp(op, details)
 }
 
-type spanSetReadWriter struct {
+// ReadWriter is used outside of the spanset package internally, in ccl.
+type ReadWriter struct {
 	spanSetReader
 	spanSetWriter
 }
 
-var _ engine.ReadWriter = spanSetReadWriter{}
+var _ engine.ReadWriter = ReadWriter{}
 
-func makeSpanSetReadWriter(rw engine.ReadWriter, spans *SpanSet) spanSetReadWriter {
-	return spanSetReadWriter{
+func makeSpanSetReadWriter(rw engine.ReadWriter, spans *SpanSet) ReadWriter {
+	return ReadWriter{
 		spanSetReader{
 			r:     rw,
 			spans: spans,
@@ -331,7 +349,7 @@ func NewReadWriter(rw engine.ReadWriter, spans *SpanSet) engine.ReadWriter {
 }
 
 type spanSetBatch struct {
-	spanSetReadWriter
+	ReadWriter
 	b     engine.Batch
 	spans *SpanSet
 }

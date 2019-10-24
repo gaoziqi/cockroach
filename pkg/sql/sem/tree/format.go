@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -20,9 +16,9 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // FmtFlags carries options for the pretty-printer.
@@ -120,6 +116,16 @@ const (
 	// representation like -Inf. Negative values are preserved "inside"
 	// the numeric by enclosing them within parentheses.
 	FmtParsableNumerics
+
+	// FmtPGAttrdefAdbin is used to produce expressions formatted in a way that's
+	// as close as possible to what clients expect to live in the pg_attrdef.adbin
+	// column. Specifically, this strips type annotations, since Postgres doesn't
+	// know what those are.
+	FmtPGAttrdefAdbin
+
+	// FmtPGIndexDef is used to produce CREATE INDEX statements that are
+	// compatible with pg_get_indexdef.
+	FmtPGIndexDef
 )
 
 // Composite/derived flag definitions follow.
@@ -209,7 +215,7 @@ func NewFmtCtx(f FmtFlags) *FmtCtx {
 // NewFmtCtxEx creates a FmtCtx.
 func NewFmtCtxEx(f FmtFlags, ann *Annotations) *FmtCtx {
 	if ann == nil && f&flagsRequiringAnnotations != 0 {
-		panic(pgerror.AssertionFailedf("no Annotations provided"))
+		panic(errors.AssertionFailedf("no Annotations provided"))
 	}
 	ctx := fmtCtxPool.Get().(*FmtCtx)
 	ctx.flags = f
@@ -238,7 +244,7 @@ func (ctx *FmtCtx) WithReformatTableNames(tableNameFmt func(*FmtCtx, *TableName)
 // restores the old flags.
 func (ctx *FmtCtx) WithFlags(flags FmtFlags, fn func()) {
 	if ctx.ann == nil && flags&flagsRequiringAnnotations != 0 {
-		panic(pgerror.AssertionFailedf("no Annotations provided"))
+		panic(errors.AssertionFailedf("no Annotations provided"))
 	}
 	oldFlags := ctx.flags
 	ctx.flags = flags

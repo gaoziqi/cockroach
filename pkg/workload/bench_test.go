@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package workload_test
 
@@ -18,8 +14,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
@@ -28,14 +24,15 @@ import (
 
 func columnByteSize(col coldata.Vec) int64 {
 	switch col.Type() {
-	case types.Int64:
+	case coltypes.Int64:
 		return int64(len(col.Int64()) * 8)
-	case types.Float64:
+	case coltypes.Float64:
 		return int64(len(col.Float64()) * 8)
-	case types.Bytes:
+	case coltypes.Bytes:
 		var bytes int64
-		for _, b := range col.Bytes() {
-			bytes += int64(len(b))
+		colBytes := col.Bytes()
+		for i := 0; i < colBytes.Len(); i++ {
+			bytes += int64(len(colBytes.Get(i)))
 		}
 		return bytes
 	default:

@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -35,9 +31,9 @@ func (r *Replica) quiesce() bool {
 
 func (r *Replica) quiesceLocked() bool {
 	ctx := r.AnnotateCtx(context.TODO())
-	if len(r.mu.proposals) != 0 {
+	if r.hasPendingProposalsRLocked() {
 		if log.V(3) {
-			log.Infof(ctx, "not quiescing: %d pending commands", len(r.mu.proposals))
+			log.Infof(ctx, "not quiescing: pending commands")
 		}
 		return false
 	}
@@ -80,7 +76,7 @@ func (r *Replica) unquiesceWithOptionsLocked(campaignOnWake bool) {
 		}
 		// NB: we know there's a non-nil RaftStatus because internalRaftGroup isn't nil.
 		r.mu.lastUpdateTimes.updateOnUnquiesce(
-			r.mu.state.Desc.Replicas().Unwrap(), r.raftStatusRLocked().Progress, timeutil.Now(),
+			r.mu.state.Desc.Replicas().All(), r.raftStatusRLocked().Progress, timeutil.Now(),
 		)
 	}
 }
@@ -160,7 +156,7 @@ func (r *Replica) unquiesceAndWakeLeaderLocked() {
 // elections which will cause throughput hiccups to the range, but not
 // correctness issues.
 func (r *Replica) maybeQuiesceLocked(ctx context.Context, livenessMap IsLiveMap) bool {
-	status, ok := shouldReplicaQuiesce(ctx, r, r.store.Clock().Now(), len(r.mu.proposals), livenessMap)
+	status, ok := shouldReplicaQuiesce(ctx, r, r.store.Clock().Now(), livenessMap)
 	if !ok {
 		return false
 	}
@@ -172,6 +168,7 @@ type quiescer interface {
 	raftStatusRLocked() *raft.Status
 	raftLastIndexLocked() (uint64, error)
 	hasRaftReadyRLocked() bool
+	hasPendingProposalsRLocked() bool
 	ownsValidLeaseRLocked(ts hlc.Timestamp) bool
 	mergeInProgressRLocked() bool
 	isDestroyedRLocked() (DestroyReason, error)
@@ -182,14 +179,14 @@ type quiescer interface {
 // facilitate testing. Returns the raft.Status and true on success, and (nil,
 // false) on failure.
 func shouldReplicaQuiesce(
-	ctx context.Context, q quiescer, now hlc.Timestamp, numProposals int, livenessMap IsLiveMap,
+	ctx context.Context, q quiescer, now hlc.Timestamp, livenessMap IsLiveMap,
 ) (*raft.Status, bool) {
 	if testingDisableQuiescence {
 		return nil, false
 	}
-	if numProposals != 0 {
+	if q.hasPendingProposalsRLocked() {
 		if log.V(4) {
-			log.Infof(ctx, "not quiescing: %d pending commands", numProposals)
+			log.Infof(ctx, "not quiescing: proposals pending")
 		}
 		return nil, false
 	}
@@ -258,7 +255,7 @@ func shouldReplicaQuiesce(
 	}
 
 	var foundSelf bool
-	for _, rep := range q.descRLocked().Replicas().Unwrap() {
+	for _, rep := range q.descRLocked().Replicas().All() {
 		if uint64(rep.ReplicaID) == status.ID {
 			foundSelf = true
 		}

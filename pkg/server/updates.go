@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -21,6 +17,7 @@ import (
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -31,7 +28,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
@@ -40,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/cloudinfo"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -213,6 +211,9 @@ func fillHardwareInfo(ctx context.Context, n *diagnosticspb.NodeInfo) {
 	if l, err := load.AvgWithContext(ctx); err == nil {
 		n.Hardware.Loadavg15 = float32(l.Load15)
 	}
+
+	n.Hardware.Provider, n.Hardware.InstanceClass = cloudinfo.GetInstanceClass()
+	n.Topology.Provider, n.Topology.Region = cloudinfo.GetInstanceRegion()
 }
 
 // checkForUpdates calls home to check for new versions for the current platform
@@ -281,7 +282,7 @@ func (s *Server) maybeReportDiagnostics(
 	if log.DiagnosticsReportingEnabled.Get(&s.st.SV) {
 		s.reportDiagnostics(ctx)
 	}
-	s.pgServer.SQLServer.ResetStatementStats(ctx)
+	s.pgServer.SQLServer.ResetSQLStats(ctx)
 
 	return scheduled.Add(diagnosticReportFrequency.Get(&s.st.SV))
 }
@@ -369,10 +370,10 @@ func (s *Server) getReportingInfo(
 	); err != nil {
 		log.Warning(ctx, err)
 	} else {
-		info.ZoneConfigs = make(map[int64]config.ZoneConfig)
+		info.ZoneConfigs = make(map[int64]zonepb.ZoneConfig)
 		for _, row := range datums {
 			id := int64(tree.MustBeDInt(row[0]))
-			var zone config.ZoneConfig
+			var zone zonepb.ZoneConfig
 			if bytes, ok := row[1].(*tree.DBytes); !ok {
 				continue
 			} else {
@@ -381,7 +382,7 @@ func (s *Server) getReportingInfo(
 					continue
 				}
 			}
-			var anonymizedZone config.ZoneConfig
+			var anonymizedZone zonepb.ZoneConfig
 			anonymizeZoneConfig(&anonymizedZone, zone, secret)
 			info.ZoneConfigs[id] = anonymizedZone
 		}
@@ -391,7 +392,7 @@ func (s *Server) getReportingInfo(
 	return &info
 }
 
-func anonymizeZoneConfig(dst *config.ZoneConfig, src config.ZoneConfig, secret string) {
+func anonymizeZoneConfig(dst *zonepb.ZoneConfig, src zonepb.ZoneConfig, secret string) {
 	if src.RangeMinBytes != nil {
 		dst.RangeMinBytes = proto.Int64(*src.RangeMinBytes)
 	}
@@ -399,15 +400,15 @@ func anonymizeZoneConfig(dst *config.ZoneConfig, src config.ZoneConfig, secret s
 		dst.RangeMaxBytes = proto.Int64(*src.RangeMaxBytes)
 	}
 	if src.GC != nil {
-		dst.GC = &config.GCPolicy{TTLSeconds: src.GC.TTLSeconds}
+		dst.GC = &zonepb.GCPolicy{TTLSeconds: src.GC.TTLSeconds}
 	}
 	if src.NumReplicas != nil {
 		dst.NumReplicas = proto.Int32(*src.NumReplicas)
 	}
-	dst.Constraints = make([]config.Constraints, len(src.Constraints))
+	dst.Constraints = make([]zonepb.Constraints, len(src.Constraints))
 	for i := range src.Constraints {
 		dst.Constraints[i].NumReplicas = src.Constraints[i].NumReplicas
-		dst.Constraints[i].Constraints = make([]config.Constraint, len(src.Constraints[i].Constraints))
+		dst.Constraints[i].Constraints = make([]zonepb.Constraint, len(src.Constraints[i].Constraints))
 		for j := range src.Constraints[i].Constraints {
 			dst.Constraints[i].Constraints[j].Type = src.Constraints[i].Constraints[j].Type
 			if key := src.Constraints[i].Constraints[j].Key; key != "" {
@@ -418,9 +419,9 @@ func anonymizeZoneConfig(dst *config.ZoneConfig, src config.ZoneConfig, secret s
 			}
 		}
 	}
-	dst.LeasePreferences = make([]config.LeasePreference, len(src.LeasePreferences))
+	dst.LeasePreferences = make([]zonepb.LeasePreference, len(src.LeasePreferences))
 	for i := range src.LeasePreferences {
-		dst.LeasePreferences[i].Constraints = make([]config.Constraint, len(src.LeasePreferences[i].Constraints))
+		dst.LeasePreferences[i].Constraints = make([]zonepb.Constraint, len(src.LeasePreferences[i].Constraints))
 		for j := range src.LeasePreferences[i].Constraints {
 			dst.LeasePreferences[i].Constraints[j].Type = src.LeasePreferences[i].Constraints[j].Type
 			if key := src.LeasePreferences[i].Constraints[j].Key; key != "" {
@@ -431,7 +432,7 @@ func anonymizeZoneConfig(dst *config.ZoneConfig, src config.ZoneConfig, secret s
 			}
 		}
 	}
-	dst.Subzones = make([]config.Subzone, len(src.Subzones))
+	dst.Subzones = make([]zonepb.Subzone, len(src.Subzones))
 	for i := range src.Subzones {
 		dst.Subzones[i].IndexID = src.Subzones[i].IndexID
 		dst.Subzones[i].PartitionName = sql.HashForReporting(secret, src.Subzones[i].PartitionName)
@@ -453,7 +454,19 @@ func (s *Server) reportDiagnostics(ctx context.Context) {
 		return
 	}
 	addInfoToURL(ctx, reportingURL, s, report.Node)
-	res, err := http.Post(reportingURL.String(), "application/x-protobuf", bytes.NewReader(b))
+
+	const timeout = 3 * time.Second
+	client := &http.Client{
+		Transport: &http.Transport{
+			// Don't leak a goroutine on OSX (the TCP level timeout is probably
+			// much higher than on linux) when the connection fails in weird ways.
+			DialContext:       (&net.Dialer{Timeout: timeout}).DialContext,
+			DisableKeepAlives: true,
+		},
+		Timeout: timeout,
+	}
+
+	res, err := client.Post(reportingURL.String(), "application/x-protobuf", bytes.NewReader(b))
 	if err != nil {
 		if log.V(2) {
 			// This is probably going to be relatively common in production
@@ -463,9 +476,8 @@ func (s *Server) reportDiagnostics(ctx context.Context) {
 		return
 	}
 	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		b, err := ioutil.ReadAll(res.Body)
+	b, err = ioutil.ReadAll(res.Body)
+	if err != nil || res.StatusCode != http.StatusOK {
 		log.Warningf(ctx, "failed to report node usage metrics: status: %s, body: %s, "+
 			"error: %v", res.Status, b, err)
 	}
@@ -485,7 +497,7 @@ func (s *Server) collectSchemaInfo(ctx context.Context) ([]sqlbase.TableDescript
 		if err := kv.ValueProto(&desc); err != nil {
 			return nil, errors.Wrapf(err, "%s: unable to unmarshal SQL descriptor", kv.Key)
 		}
-		if t := desc.GetTable(); t != nil && t.ID > keys.MaxReservedDescID {
+		if t := desc.Table(kv.Value.Timestamp); t != nil && t.ID > keys.MaxReservedDescID {
 			if err := reflectwalk.Walk(t, redactor); err != nil {
 				panic(err) // stringRedactor never returns a non-nil err
 			}

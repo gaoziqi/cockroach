@@ -1,17 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
-
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -27,16 +22,18 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -52,10 +49,9 @@ import (
 )
 
 // SplitTable splits a range in the table, creates a replica for the right
-// side of the split on targetNodeIdx, and moves the lease for the right
-// side of the split to targetNodeIdx. This forces the querying against
-// the table to be distributed. vals is a list of values forming a primary
-// key for the table.
+// side of the split on TargetNodeIdx, and moves the lease for the right
+// side of the split to TargetNodeIdx for each SplitPoint. This forces the
+// querying against the table to be distributed.
 //
 // TODO(radu): SplitTable or its equivalent should be added to TestCluster.
 //
@@ -65,32 +61,68 @@ func SplitTable(
 	t *testing.T,
 	tc serverutils.TestClusterInterface,
 	desc *sqlbase.TableDescriptor,
-	targetNodeIdx int,
-	vals ...interface{},
+	sps []SplitPoint,
 ) {
 	if tc.ReplicationMode() != base.ReplicationManual {
 		t.Fatal("SplitTable called on a test cluster that was not in manual replication mode")
 	}
 
-	pik, err := sqlbase.TestingMakePrimaryIndexKey(desc, vals...)
-	if err != nil {
-		t.Fatal(err)
+	rkts := make(map[roachpb.RangeID]rangeAndKT)
+	for _, sp := range sps {
+		pik, err := sqlbase.TestingMakePrimaryIndexKey(desc, sp.Vals...)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, rightRange, err := tc.Server(0).SplitRange(pik)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rightRangeStartKey := rightRange.StartKey.AsRawKey()
+		target := tc.Target(sp.TargetNodeIdx)
+
+		rkts[rightRange.RangeID] = rangeAndKT{
+			rightRange,
+			serverutils.KeyAndTargets{StartKey: rightRangeStartKey, Targets: []roachpb.ReplicationTarget{target}}}
 	}
 
-	_, rightRange, err := tc.Server(0).SplitRange(pik)
-	if err != nil {
-		t.Fatal(err)
+	var kts []serverutils.KeyAndTargets
+	for _, rkt := range rkts {
+		kts = append(kts, rkt.KT)
+	}
+	descs, errs := tc.AddReplicasMulti(kts...)
+	for _, err := range errs {
+		if err != nil && !testutils.IsError(err, "is already present") {
+			t.Fatal(err)
+		}
 	}
 
-	rightRangeStartKey := rightRange.StartKey.AsRawKey()
-	rightRange, err = tc.AddReplicas(rightRangeStartKey, tc.Target(targetNodeIdx))
-	if err != nil && !testutils.IsError(err, "is already present") {
-		t.Fatal(err)
-	}
+	for _, desc := range descs {
+		rkt, ok := rkts[desc.RangeID]
+		if !ok {
+			continue
+		}
 
-	if err := tc.TransferRangeLease(rightRange, tc.Target(targetNodeIdx)); err != nil {
-		t.Fatal(err)
+		for _, target := range rkt.KT.Targets {
+			if err := tc.TransferRangeLease(desc, target); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
+}
+
+// SplitPoint describes a split point that is passed to SplitTable.
+type SplitPoint struct {
+	// TargetNodeIdx is the node that will have the lease for the new range.
+	TargetNodeIdx int
+	// Vals is list of values forming a primary key for the table.
+	Vals []interface{}
+}
+
+type rangeAndKT struct {
+	Range roachpb.RangeDescriptor
+	KT    serverutils.KeyAndTargets
 }
 
 // TestPlanningDuringSplits verifies that table reader planning (resolving
@@ -160,7 +192,7 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 
 			// Create a gosql.DB for this worker.
 			pgURL, cleanupGoDB := sqlutils.PGUrl(
-				t, tc.Server(0).ServingAddr(), fmt.Sprintf("%d", idx), url.User(security.RootUser),
+				t, tc.Server(0).ServingSQLAddr(), fmt.Sprintf("%d", idx), url.User(security.RootUser),
 			)
 			defer cleanupGoDB()
 
@@ -234,7 +266,7 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 	}
 
 	// Push some metadata and check that the caches are updated with it.
-	status := r.Push(nil /* row */, &distsqlpb.ProducerMetadata{
+	status := r.Push(nil /* row */, &execinfrapb.ProducerMetadata{
 		Ranges: []roachpb.RangeInfo{
 			{
 				Desc: descs[0],
@@ -247,10 +279,10 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 					NodeID: 2, StoreID: 2, ReplicaID: 2}},
 			},
 		}})
-	if status != distsqlrun.NeedMoreRows {
+	if status != execinfra.NeedMoreRows {
 		t.Fatalf("expected status NeedMoreRows, got: %d", status)
 	}
-	status = r.Push(nil /* row */, &distsqlpb.ProducerMetadata{
+	status = r.Push(nil /* row */, &execinfrapb.ProducerMetadata{
 		Ranges: []roachpb.RangeInfo{
 			{
 				Desc: descs[2],
@@ -258,7 +290,7 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 					NodeID: 3, StoreID: 3, ReplicaID: 3}},
 			},
 		}})
-	if status != distsqlrun.NeedMoreRows {
+	if status != execinfra.NeedMoreRows {
 		t.Fatalf("expected status NeedMoreRows, got: %d", status)
 	}
 
@@ -315,7 +347,7 @@ func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 	//
 	// TODO(andrei): This is super hacky. What this test really wants to do is to
 	// precisely control the contents of the range cache on node 4.
-	tc.Server(3).DistSender().DisableFirstRangeUpdates()
+	tc.Server(3).DistSenderI().(*kv.DistSender).DisableFirstRangeUpdates()
 	db3 := tc.ServerConn(3)
 	// Do a query on node 4 so that it populates the its cache with an initial
 	// descriptor containing all the SQL key space. If we don't do this, the state
@@ -340,7 +372,7 @@ func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 	}
 
 	// Ensure that the range cache is populated (see #31235).
-	_, err = db0.Exec(`SHOW EXPERIMENTAL_RANGES FROM TABLE "right"`)
+	_, err = db0.Exec(`SHOW RANGES FROM TABLE "right"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,9 +396,9 @@ func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 	if err := row.Scan(&json); err != nil {
 		t.Fatal(err)
 	}
-	exp := `{"nodeNames":["1","4"]`
-	if !strings.HasPrefix(json, exp) {
-		t.Fatalf("expected prefix %s, but json is: %s", exp, json)
+	exp := `"nodeNames":["1","4"]`
+	if !strings.Contains(json, exp) {
+		t.Fatalf("expected json to contain %s, but json is: %s", exp, json)
 	}
 
 	// Run a non-trivial query to force the "wrong range" metadata to flow through
@@ -390,9 +422,9 @@ func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 	if err := row.Scan(&json); err != nil {
 		t.Fatal(err)
 	}
-	exp = `{"nodeNames":["1","2","3","4"]`
-	if !strings.HasPrefix(json, exp) {
-		t.Fatalf("expected prefix %q, but json is: %s", exp, json)
+	exp = `"nodeNames":["1","2","3","4"]`
+	if !strings.Contains(json, exp) {
+		t.Fatalf("expected json to contain %s, but json is: %s", exp, json)
 	}
 }
 
@@ -428,7 +460,7 @@ func TestDistSQLDeadHosts(t *testing.T) {
 		))
 	}
 
-	r.Exec(t, "SHOW EXPERIMENTAL_RANGES FROM TABLE t")
+	r.Exec(t, "SHOW RANGES FROM TABLE t")
 
 	r.Exec(t, fmt.Sprintf("INSERT INTO t SELECT i, i*i FROM generate_series(1, %d) AS g(i)", n))
 
@@ -487,7 +519,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 		numNodes,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
-			ServerArgs:      base.TestServerArgs{Knobs: base.TestingKnobs{DistSQL: &distsqlrun.TestingKnobs{DrainFast: true}}, UseDatabase: "test"},
+			ServerArgs:      base.TestServerArgs{Knobs: base.TestingKnobs{DistSQL: &execinfra.TestingKnobs{DrainFast: true}}, UseDatabase: "test"},
 		},
 	)
 	ctx := context.TODO()
@@ -524,7 +556,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 	})
 
 	// Ensure that the range cache is populated (see #31235).
-	r.Exec(t, "SHOW EXPERIMENTAL_RANGES FROM TABLE nums")
+	r.Exec(t, "SHOW RANGES FROM TABLE nums")
 
 	const query = "SELECT count(*) FROM NUMS"
 	expectPlan := func(expectedPlan [][]string) {
@@ -539,14 +571,14 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 	}
 
 	// Verify distribution.
-	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html#eJyskT9r8zAQh_f3U4Sb8oKCIyddNKV0ylC75A8digmqdRhDIpmTBC3B373YGhKHRE1LR935d8_juyNoozCTB7Qg3oADgxQKBg2ZEq011JXDR0v1AWLKoNaNd125YFAaQhBHcLXbIwjYyPc9rlAqpGQKDBQ6We_70Q3VB0mfC-0PFhisG6mtGE2SDpl7J0aZ0QhFy8B4dyJYJysEwVt2v8VjVRFW0hlK0qHEU77NNrtV_roe_7_JSm-yTgivDSkkVIP5RRu3mQ9t1tvn3TLbjBf8tsxsIMPvXz-_Z_0Jn_xi_d9YnP3w7E_Xf4W1QtsYbfHiDNcnT7vzoKow3NIaTyW-kCl7THjmfa4vKLQudHl4LHVodYLnYR4Np4Mwvwyn0fBDnDyLhufx8PxH2kX77ysAAP__gSRfcA=="}})
+	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html#eJyskd-Lm0AQx9_7V8g8mbKHWZO-7NMd1xSEnF7Vo4UgYesOIphduz-gJfi_F7WQGBKblj46O9_5fJw5gvneAINss908557TjfcpTV683ebr6_Ypij3_Y5Tl2eftwvvdUionrf9-MfZJdzAFEJBKYMwPaIDtgAKBEAoCrVYlGqN0Xz4OTZH4AWxJoJats325IFAqjcCOYGvbIDDI-bcGU-QCdbAEAgItr5thdKvrA9c_H3suEMhaLg3zHoIemTjLvFhJhKIjoJw9EYzlFQKjHbnf4qmqNFbcKh2EU4nn5C3O92nyJfMXN1nhTdYJ4aTSAjWKyfyim7dZT22yt5d9FOf-I70ts5rI0PvXT-9Zf0Af_mH9f7A4--HVf13_FVaKplXS4MUZrk9e9udBUeF4S6OcLvFVq3LAjJ_JkBsKAo0dX-n4EcnxqRc8D9PZcDgJ08twOBv-ME9ezYbX8-H1X2kX3btfAQAA__9aiHOO"}})
 
 	// Drain the second node and expect the query to be planned on only the
 	// first node.
-	distServer := tc.Server(1).DistSQLServer().(*distsqlrun.ServerImpl)
+	distServer := tc.Server(1).DistSQLServer().(*distsql.ServerImpl)
 	distServer.Drain(ctx, 0 /* flowDrainWait */)
 
-	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkDFLxEAUhHt_xTGVwsolV26lWF2TSO7EQoKs2UcIJPvCextQjvx3SbbQE060fDM78w17QmBPhRtIYV-QozYYhRtSZVmk9GDv32Ezgy6MU1zk2qBhIdgTYhd7gsXRvfVUkfMk2wwGnqLr-rV2lG5w8nEXpkFhcBhdULu5hUE5RbspOBDq2YCn-NWv0bUEm8_m7xvu21aodZFlm59PeCifiuNrVT4frm8usnb_YVWkIwelM86l5myuDci3lP5UeZKGHoWbFZPOcs2tgieNyc3TsQ_JWgZ-D-e_hnc_wvV89RkAAP__weakAA=="}})
+	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkM9Kw0AYxO8-xTKnVlba9LgnS60QqElNIgolyJp8hEC6G_cPKCHvLkkErVDR4843M79hO9jXBgLpdrfdZMybht0m8R07bJ_2u3UYsdlNmGbp_W7OPi2F9srNLueTT_mjzcGhdEmRPJKFOCBAztEaXZC12gxSNxrC8g1iyVGr1rtBzjkKbQiig6tdQxDI5EtDCcmSzGIJjpKcrJuxtjX1UZr364EJjrSVygp2BY7YO8EirQh5z6G9--q3TlYEEfT87xvWVWWokk6bRXA6YRM_RNlzEj-ms_lZ1uo_rIRsq5WlE8655mWfc1BZ0fSnVntT0N7oYsRMz3jMjUJJ1k3XYHqEajoNA7-Hg1_Dqx_hvL_4CAAA__-ln7ge"}})
 
 	// Verify correctness.
 	var res int
@@ -575,7 +607,7 @@ type testSpanResolver struct {
 // NewSpanResolverIterator is part of the SpanResolver interface.
 func (tsr *testSpanResolver) NewSpanResolverIterator(
 	_ *client.Txn,
-) distsqlplan.SpanResolverIterator {
+) physicalplan.SpanResolverIterator {
 	return &testSpanResolverIterator{tsr: tsr}
 }
 
@@ -585,7 +617,7 @@ type testSpanResolverIterator struct {
 	endKey      string
 }
 
-var _ distsqlplan.SpanResolverIterator = &testSpanResolverIterator{}
+var _ physicalplan.SpanResolverIterator = &testSpanResolverIterator{}
 
 // Seek is part of the SpanResolverIterator interface.
 func (it *testSpanResolverIterator) Seek(
@@ -750,7 +782,7 @@ func TestPartitionSpans(t *testing.T) {
 	testStopper := stop.NewStopper()
 	defer testStopper.Stop(context.TODO())
 	mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
-		testStopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+		testStopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	var nodeDescs []*roachpb.NodeDescriptor
 	for i := 1; i <= 10; i++ {
 		nodeID := roachpb.NodeID(i)
@@ -763,9 +795,9 @@ func TestPartitionSpans(t *testing.T) {
 		}
 		if err := mockGossip.AddInfoProto(
 			gossip.MakeDistSQLNodeVersionKey(nodeID),
-			&distsqlpb.DistSQLVersionGossipInfo{
-				MinAcceptedVersion: distsqlrun.MinAcceptedVersion,
-				Version:            distsqlrun.Version,
+			&execinfrapb.DistSQLVersionGossipInfo{
+				MinAcceptedVersion: execinfra.MinAcceptedVersion,
+				Version:            execinfra.Version,
 			},
 			0, // ttl - no expiration
 		); err != nil {
@@ -786,7 +818,7 @@ func TestPartitionSpans(t *testing.T) {
 			}
 
 			dsp := DistSQLPlanner{
-				planVersion:  distsqlrun.Version,
+				planVersion:  execinfra.Version,
 				st:           cluster.MakeTestingClusterSettings(),
 				nodeDesc:     *tsp.nodes[tc.gatewayNode-1],
 				stopper:      stopper,
@@ -794,7 +826,7 @@ func TestPartitionSpans(t *testing.T) {
 				gossip:       mockGossip,
 				nodeHealth: distSQLNodeHealth{
 					gossip: mockGossip,
-					connHealth: func(node roachpb.NodeID) error {
+					connHealth: func(node roachpb.NodeID, _ rpc.ConnectionClass) error {
 						for _, n := range tc.deadNodes {
 							if int(node) == n {
 								return fmt.Errorf("test node is unhealthy")
@@ -856,10 +888,10 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 		// planVersion is the DistSQL version that this plan is targeting.
 		// We'll play with this version and expect nodes to be skipped because of
 		// this.
-		planVersion distsqlpb.DistSQLVersion
+		planVersion execinfrapb.DistSQLVersion
 
 		// The versions accepted by each node.
-		nodeVersions map[roachpb.NodeID]distsqlpb.DistSQLVersionGossipInfo
+		nodeVersions map[roachpb.NodeID]execinfrapb.DistSQLVersionGossipInfo
 
 		// nodesNotAdvertisingDistSQLVersion is the set of nodes for which gossip is
 		// not going to have information about the supported DistSQL version. This
@@ -873,7 +905,7 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 			// In the first test, all nodes are compatible.
 			name:        "current_version",
 			planVersion: 2,
-			nodeVersions: map[roachpb.NodeID]distsqlpb.DistSQLVersionGossipInfo{
+			nodeVersions: map[roachpb.NodeID]execinfrapb.DistSQLVersionGossipInfo{
 				1: {
 					MinAcceptedVersion: 1,
 					Version:            2,
@@ -894,7 +926,7 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 			// Remember that the gateway is node 2.
 			name:        "next_version",
 			planVersion: 3,
-			nodeVersions: map[roachpb.NodeID]distsqlpb.DistSQLVersionGossipInfo{
+			nodeVersions: map[roachpb.NodeID]execinfrapb.DistSQLVersionGossipInfo{
 				1: {
 					MinAcceptedVersion: 1,
 					Version:            2,
@@ -913,7 +945,7 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 			// a crdb 1.0 node).
 			name:        "crdb_1.0",
 			planVersion: 3,
-			nodeVersions: map[roachpb.NodeID]distsqlpb.DistSQLVersionGossipInfo{
+			nodeVersions: map[roachpb.NodeID]execinfrapb.DistSQLVersionGossipInfo{
 				2: {
 					MinAcceptedVersion: 3,
 					Version:            3,
@@ -940,7 +972,7 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 			testStopper := stop.NewStopper()
 			defer testStopper.Stop(context.TODO())
 			mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
-				testStopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+				testStopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 			var nodeDescs []*roachpb.NodeDescriptor
 			for i := 1; i <= 2; i++ {
 				nodeID := roachpb.NodeID(i)
@@ -978,7 +1010,7 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 				gossip:       mockGossip,
 				nodeHealth: distSQLNodeHealth{
 					gossip: mockGossip,
-					connHealth: func(roachpb.NodeID) error {
+					connHealth: func(roachpb.NodeID, rpc.ConnectionClass) error {
 						// All the nodes are healthy.
 						return nil
 					},
@@ -1029,7 +1061,7 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 	defer stopper.Stop(context.TODO())
 
 	mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
-		stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+		stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	var nodeDescs []*roachpb.NodeDescriptor
 	for i := 1; i <= 2; i++ {
 		nodeID := roachpb.NodeID(i)
@@ -1048,9 +1080,9 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 		// the gossip data, but other datums it advertised are left in place.
 		if err := mockGossip.AddInfoProto(
 			gossip.MakeDistSQLNodeVersionKey(nodeID),
-			&distsqlpb.DistSQLVersionGossipInfo{
-				MinAcceptedVersion: distsqlrun.MinAcceptedVersion,
-				Version:            distsqlrun.Version,
+			&execinfrapb.DistSQLVersionGossipInfo{
+				MinAcceptedVersion: execinfra.MinAcceptedVersion,
+				Version:            execinfra.Version,
 			},
 			0, // ttl - no expiration
 		); err != nil {
@@ -1065,7 +1097,7 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 	}
 
 	dsp := DistSQLPlanner{
-		planVersion:  distsqlrun.Version,
+		planVersion:  execinfra.Version,
 		st:           cluster.MakeTestingClusterSettings(),
 		nodeDesc:     *tsp.nodes[gatewayNode-1],
 		stopper:      stopper,
@@ -1073,7 +1105,7 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 		gossip:       mockGossip,
 		nodeHealth: distSQLNodeHealth{
 			gossip: mockGossip,
-			connHealth: func(node roachpb.NodeID) error {
+			connHealth: func(node roachpb.NodeID, _ rpc.ConnectionClass) error {
 				_, err := mockGossip.GetNodeIDAddress(node)
 				return err
 			},
@@ -1119,7 +1151,7 @@ func TestCheckNodeHealth(t *testing.T) {
 	const nodeID = roachpb.NodeID(5)
 
 	mockGossip := gossip.NewTest(nodeID, nil /* rpcContext */, nil, /* grpcServer */
-		stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+		stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 
 	desc := &roachpb.NodeDescriptor{
 		NodeID:  nodeID,
@@ -1130,9 +1162,9 @@ func TestCheckNodeHealth(t *testing.T) {
 	}
 	if err := mockGossip.AddInfoProto(
 		gossip.MakeDistSQLNodeVersionKey(nodeID),
-		&distsqlpb.DistSQLVersionGossipInfo{
-			MinAcceptedVersion: distsqlrun.MinAcceptedVersion,
-			Version:            distsqlrun.Version,
+		&execinfrapb.DistSQLVersionGossipInfo{
+			MinAcceptedVersion: execinfra.MinAcceptedVersion,
+			Version:            execinfra.Version,
 		},
 		0, // ttl - no expiration
 	); err != nil {
@@ -1149,10 +1181,10 @@ func TestCheckNodeHealth(t *testing.T) {
 		return true, nil
 	}
 
-	connHealthy := func(roachpb.NodeID) error {
+	connHealthy := func(roachpb.NodeID, rpc.ConnectionClass) error {
 		return nil
 	}
-	connUnhealthy := func(roachpb.NodeID) error {
+	connUnhealthy := func(roachpb.NodeID, rpc.ConnectionClass) error {
 		return errors.New("injected conn health error")
 	}
 	_ = connUnhealthy
@@ -1180,7 +1212,7 @@ func TestCheckNodeHealth(t *testing.T) {
 	}
 
 	connHealthTests := []struct {
-		connHealth func(roachpb.NodeID) error
+		connHealth func(roachpb.NodeID, rpc.ConnectionClass) error
 		exp        string
 	}{
 		{connHealthy, ""},

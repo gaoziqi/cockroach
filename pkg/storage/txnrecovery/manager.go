@@ -1,27 +1,21 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package txnrecovery
 
 import (
 	"context"
 	"sort"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -54,11 +48,6 @@ const (
 	// run concurrently. Once this limit is reached, future attempts to resolve
 	// indeterminate transaction commits will wait until other attempts complete.
 	defaultTaskLimit = 1024
-
-	// defaultTimeout is the timeout when querying a single batch of intents
-	// during recovery processing. The timeout prevents recovery from getting
-	// stuck.
-	defaultTimeout = 30 * time.Second
 
 	// defaultBatchSize is the maximum number of intents that will be queried in
 	// a single batch. Batches that span many ranges will be split into many
@@ -256,10 +245,7 @@ func (m *manager) resolveIndeterminateCommitForTxnProbe(
 			queryIntentReqs = queryIntentReqs[1:]
 		}
 
-		if err := contextutil.RunWithTimeout(
-			ctx, "querying in-flight writes for indeterminate commit", defaultTimeout,
-			func(ctx context.Context) error { return m.db.Run(ctx, &b) },
-		); err != nil {
+		if err := m.db.Run(ctx, &b); err != nil {
 			// Bail out on the first error.
 			return false, nil, err
 		}
@@ -314,10 +300,7 @@ func (m *manager) resolveIndeterminateCommitForTxnRecover(
 		ImplicitlyCommitted: !preventedIntent,
 	})
 
-	if err := contextutil.RunWithTimeout(
-		ctx, "recovering from indeterminate commit", defaultTimeout,
-		func(ctx context.Context) error { return m.db.Run(ctx, &b) },
-	); err != nil {
+	if err := m.db.Run(ctx, &b); err != nil {
 		return nil, err
 	}
 

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -154,12 +150,14 @@ func newMetadata(compiled *lang.CompiledExpr, pkg string) *metadata {
 		"SchemaID":       {fullName: "opt.SchemaID", passByVal: true},
 		"SequenceID":     {fullName: "opt.SequenceID", passByVal: true},
 		"ValuesID":       {fullName: "opt.ValuesID", passByVal: true},
+		"WithID":         {fullName: "opt.WithID", passByVal: true},
 		"Ordering":       {fullName: "opt.Ordering", passByVal: true},
 		"OrderingChoice": {fullName: "physical.OrderingChoice", passByVal: true},
 		"TupleOrdinal":   {fullName: "memo.TupleOrdinal", passByVal: true},
 		"ScanLimit":      {fullName: "memo.ScanLimit", passByVal: true},
 		"ScanFlags":      {fullName: "memo.ScanFlags", passByVal: true},
 		"JoinFlags":      {fullName: "memo.JoinFlags", passByVal: true},
+		"WindowFrame":    {fullName: "memo.WindowFrame", passByVal: true},
 		"ExplainOptions": {fullName: "tree.ExplainOptions", passByVal: true},
 		"StatementType":  {fullName: "tree.StatementType", passByVal: true},
 		"ShowTraceType":  {fullName: "tree.ShowTraceType", passByVal: true},
@@ -169,17 +167,21 @@ func newMetadata(compiled *lang.CompiledExpr, pkg string) *metadata {
 		"Type":           {fullName: "*types.T", isPointer: true},
 		"Datum":          {fullName: "tree.Datum", isPointer: true},
 		"TypedExpr":      {fullName: "tree.TypedExpr", isPointer: true},
+		"Statement":      {fullName: "tree.Statement", isPointer: true},
 		"Subquery":       {fullName: "*tree.Subquery", isPointer: true, usePointerIntern: true},
 		"CreateTable":    {fullName: "*tree.CreateTable", isPointer: true, usePointerIntern: true},
 		"Constraint":     {fullName: "*constraint.Constraint", isPointer: true, usePointerIntern: true},
 		"FuncProps":      {fullName: "*tree.FunctionProperties", isPointer: true, usePointerIntern: true},
 		"FuncOverload":   {fullName: "*tree.Overload", isPointer: true, usePointerIntern: true},
-		"WindowFrame":    {fullName: "*tree.WindowFrame", isPointer: true},
 		"PhysProps":      {fullName: "*physical.Required", isPointer: true},
 		"Presentation":   {fullName: "physical.Presentation", passByVal: true},
 		"RelProps":       {fullName: "props.Relational"},
 		"RelPropsPtr":    {fullName: "*props.Relational", isPointer: true, usePointerIntern: true},
 		"ScalarProps":    {fullName: "props.Scalar"},
+		"OpaqueMetadata": {fullName: "opt.OpaqueMetadata", isPointer: true},
+		"JobCommand":     {fullName: "tree.JobCommand", passByVal: true},
+		"IndexOrdinal":   {fullName: "cat.IndexOrdinal", passByVal: true},
+		"ViewDeps":       {fullName: "opt.ViewDeps", passByVal: true},
 	}
 
 	// Add types of generated op and private structs.
@@ -216,8 +218,7 @@ func newMetadata(compiled *lang.CompiledExpr, pkg string) *metadata {
 
 		if define.Tags.Contains("List") {
 			listTyp := md.typeOf(define)
-			itemTyp := md.lookupType(fmt.Sprintf("%sItem", define.Name))
-			if itemTyp != nil {
+			if itemTyp, ok := md.types[fmt.Sprintf("%sItem", define.Name)]; ok {
 				listTyp.listItemType = itemTyp
 			} else {
 				listTyp.listItemType = md.lookupType("ScalarExpr")
@@ -256,7 +257,11 @@ func (m *metadata) typeOf(e lang.Expr) *typeDef {
 // lookupType returns the type definition with the given friendly name (e.g.
 // RelExpr, DatumType, ScanExpr, etc.).
 func (m *metadata) lookupType(friendlyName string) *typeDef {
-	return m.types[friendlyName]
+	res, ok := m.types[friendlyName]
+	if !ok {
+		panic(fmt.Sprintf("%s is not registered as a valid type in metadata.go", friendlyName))
+	}
+	return res
 }
 
 // fieldName maps the Optgen field name to the corresponding Go field name. In

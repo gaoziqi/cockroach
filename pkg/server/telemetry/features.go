@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package telemetry
 
@@ -18,10 +14,11 @@ import (
 	"fmt"
 	"sync/atomic"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
 // Bucket10 buckets a number by order of magnitude base 10, eg 637 -> 100.
@@ -64,6 +61,11 @@ func Inc(c Counter) {
 	atomic.AddInt32(c, 1)
 }
 
+// Read reads the current value of the counter.
+func Read(c Counter) int32 {
+	return atomic.LoadInt32(c)
+}
+
 // GetCounterOnce returns a counter from the global registry,
 // and asserts it didn't exist previously.
 func GetCounterOnce(feature string) Counter {
@@ -81,13 +83,16 @@ func GetCounter(feature string) Counter {
 	counters.RLock()
 	i, ok := counters.m[feature]
 	counters.RUnlock()
+	if ok {
+		return i
+	}
 
+	counters.Lock()
+	defer counters.Unlock()
+	i, ok = counters.m[feature]
 	if !ok {
-		counters.Lock()
-		var n int32
-		counters.m[feature] = &n
-		i = &n
-		counters.Unlock()
+		i = new(int32)
+		counters.m[feature] = i
 	}
 	return i
 }
@@ -171,7 +176,7 @@ type ResetCounters bool
 const (
 	// Quantized returns counts quantized to order of magnitude.
 	Quantized QuantizeCounts = true
-	// Raw returns the raw, unquanitzed counter values.
+	// Raw returns the raw, unquantized counter values.
 	Raw QuantizeCounts = false
 	// ResetCounts resets the counter to zero after fetching its value.
 	ResetCounts ResetCounters = true
@@ -221,26 +226,23 @@ func RecordError(err error) {
 		return
 	}
 
-	if pgErr, ok := pgerror.GetPGCause(err); ok {
-		Count("errorcodes." + pgErr.Code)
+	code := pgerror.GetPGCode(err)
+	Count("errorcodes." + code)
 
-		if details := pgErr.TelemetryKey; details != "" {
-			var prefix string
-			switch pgErr.Code {
-			case pgerror.CodeFeatureNotSupportedError:
-				prefix = "unimplemented."
-			case pgerror.CodeInternalError:
-				prefix = "internalerror."
-			default:
-				prefix = "othererror." + pgErr.Code + "."
-			}
-			Count(prefix + details)
+	tkeys := errors.GetTelemetryKeys(err)
+	if len(tkeys) > 0 {
+		var prefix string
+		switch code {
+		case pgcode.FeatureNotSupported:
+			prefix = "unimplemented."
+		case pgcode.Internal:
+			prefix = "internalerror."
+		default:
+			prefix = "othererror." + code + "."
 		}
-	} else {
-		typ := log.ErrorSource(err)
-		if typ == "" {
-			typ = "unknown"
+
+		for _, tk := range tkeys {
+			Count(prefix + tk)
 		}
-		Count("othererror." + typ)
 	}
 }

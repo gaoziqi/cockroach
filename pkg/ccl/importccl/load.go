@@ -18,8 +18,7 @@ import (
 	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -30,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -54,7 +54,7 @@ func Load(
 	tempPrefix string,
 ) (backupccl.BackupDescriptor, error) {
 	if loadChunkBytes == 0 {
-		loadChunkBytes = *config.DefaultZoneConfig().RangeMaxBytes / 2
+		loadChunkBytes = *zonepb.DefaultZoneConfig().RangeMaxBytes / 2
 	}
 
 	var txCtx transform.ExprTransformContext
@@ -63,11 +63,11 @@ func Load(
 	evalCtx.SetTxnTimestamp(curTime)
 	evalCtx.SetStmtTimestamp(curTime)
 
-	conf, err := storageccl.ExportStorageConfFromURI(uri)
+	conf, err := cloud.ExternalStorageConfFromURI(uri)
 	if err != nil {
 		return backupccl.BackupDescriptor{}, err
 	}
-	dir, err := storageccl.MakeExportStorage(ctx, conf, cluster.NoSettings)
+	dir, err := cloud.MakeExternalStorage(ctx, conf, cluster.NoSettings)
 	if err != nil {
 		return backupccl.BackupDescriptor{}, errors.Wrap(err, "export storage from URI")
 	}
@@ -163,8 +163,8 @@ func Load(
 			var txn *client.Txn
 			// At this point the CREATE statements in the loaded SQL do not
 			// use the SERIAL type so we need not process SERIAL types here.
-			desc, err := sql.MakeTableDesc(ctx, txn, nil /* vt */, st, s, dbDesc.ID,
-				0 /* table ID */, ts, privs, affected, nil, evalCtx)
+			desc, err := sql.MakeTableDesc(ctx, txn, nil /* vt */, st, s, dbDesc.ID, 0, /* table ID */
+				ts, privs, affected, nil, evalCtx, false /* temporary */)
 			if err != nil {
 				return backupccl.BackupDescriptor{}, errors.Wrap(err, "make table desc")
 			}
@@ -288,7 +288,7 @@ func insertStmtToKVs(
 		return errors.Errorf("load insert: expected VALUES clause: %q", stmt)
 	}
 
-	b := inserter(f)
+	b := row.KVInserter(f)
 	computedIVarContainer := sqlbase.RowIndexedVarContainer{
 		Mapping: ri.InsertColIDtoRowIndex,
 		Cols:    tableDesc.Columns,
@@ -315,7 +315,7 @@ func insertStmtToKVs(
 		var computeExprs []tree.TypedExpr
 		var computedCols []sqlbase.ColumnDescriptor
 
-		insertRow, err := sql.GenerateInsertRow(
+		insertRow, err := row.GenerateInsertRow(
 			defaultExprs, computeExprs, cols, computedCols, evalCtx, tableDesc, insertRow, &computedIVarContainer,
 		)
 		if err != nil {
@@ -330,34 +330,10 @@ func insertStmtToKVs(
 	return nil
 }
 
-type inserter func(roachpb.KeyValue)
-
-func (i inserter) CPut(key, value, expValue interface{}) {
-	panic("unimplemented")
-}
-
-func (i inserter) Del(key ...interface{}) {
-	panic("unimplemented")
-}
-
-func (i inserter) Put(key, value interface{}) {
-	i(roachpb.KeyValue{
-		Key:   *key.(*roachpb.Key),
-		Value: *value.(*roachpb.Value),
-	})
-}
-
-func (i inserter) InitPut(key, value interface{}, failOnTombstones bool) {
-	i(roachpb.KeyValue{
-		Key:   *key.(*roachpb.Key),
-		Value: *value.(*roachpb.Value),
-	})
-}
-
 func writeSST(
 	ctx context.Context,
 	backup *backupccl.BackupDescriptor,
-	base storageccl.ExportStorage,
+	base cloud.ExternalStorage,
 	tempPrefix string,
 	kvs []engine.MVCCKeyValue,
 	ts hlc.Timestamp,
@@ -376,7 +352,7 @@ func writeSST(
 	defer sst.Close()
 	for _, kv := range kvs {
 		kv.Key.Timestamp = ts
-		if err := sst.Add(kv); err != nil {
+		if err := sst.Put(kv.Key, kv.Value); err != nil {
 			return err
 		}
 	}

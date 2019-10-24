@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -64,17 +60,10 @@ func newSQLForeignKeyCheckOperation(
 func (o *sqlForeignKeyCheckOperation) Start(params runParams) error {
 	ctx := params.ctx
 
-	prefix := len(o.constraint.Index.ColumnNames)
-	if o.constraint.FK.SharedPrefixLen > 0 {
-		prefix = int(o.constraint.FK.SharedPrefixLen)
-	}
-
 	checkQuery, _, err := nonMatchingRowQuery(
-		prefix,
 		&o.tableDesc.TableDescriptor,
-		o.constraint.Index,
-		o.constraint.ReferencedTable.ID,
-		o.constraint.ReferencedIndex,
+		o.constraint.FK,
+		o.constraint.ReferencedTable,
 		false, /* limitResults */
 	)
 	if err != nil {
@@ -89,13 +78,12 @@ func (o *sqlForeignKeyCheckOperation) Start(params runParams) error {
 	}
 	o.run.rows = rows
 
-	if prefix > 1 && o.constraint.FK.Match == sqlbase.ForeignKeyReference_FULL {
+	if len(o.constraint.FK.OriginColumnIDs) > 1 && o.constraint.FK.Match == sqlbase.ForeignKeyReference_FULL {
 		// Check if there are any disallowed references where some columns are NULL
 		// and some aren't.
 		checkNullsQuery, _, err := matchFullUnacceptableKeyQuery(
-			prefix,
 			&o.tableDesc.TableDescriptor,
-			o.constraint.Index,
+			o.constraint.FK,
 			false, /* limitResults */
 		)
 		if err != nil {
@@ -119,7 +107,22 @@ func (o *sqlForeignKeyCheckOperation) Start(params runParams) error {
 		columnsByID[o.tableDesc.Columns[i].ID] = &o.tableDesc.Columns[i]
 	}
 
-	colIDs, _ := o.constraint.Index.FullColumnIDs()
+	// Get primary key columns not included in the FK.
+	var colIDs []sqlbase.ColumnID
+	colIDs = append(colIDs, o.constraint.FK.OriginColumnIDs...)
+	for _, pkColID := range o.tableDesc.PrimaryIndex.ColumnIDs {
+		found := false
+		for _, id := range o.constraint.FK.OriginColumnIDs {
+			if pkColID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			colIDs = append(colIDs, pkColID)
+		}
+	}
+
 	o.colIDToRowIdx = make(map[sqlbase.ColumnID]int, len(colIDs))
 	for i, id := range colIDs {
 		o.colIDToRowIdx[id] = i
@@ -149,18 +152,30 @@ func (o *sqlForeignKeyCheckOperation) Next(params runParams) (tree.Datums, error
 
 	// Collect all of the values fetched from the index to generate a
 	// pretty JSON dictionary for row_data.
-	for _, id := range o.constraint.Index.ColumnIDs {
-		idx := o.colIDToRowIdx[id]
-		name := o.constraint.Index.ColumnNames[idx]
-		rowDetails[name] = row[idx].String()
-	}
-	for _, id := range o.constraint.Index.ExtraColumnIDs {
+	for _, id := range o.constraint.FK.OriginColumnIDs {
 		idx := o.colIDToRowIdx[id]
 		col, err := o.tableDesc.FindActiveColumnByID(id)
 		if err != nil {
 			return nil, err
 		}
 		rowDetails[col.Name] = row[idx].String()
+	}
+	for _, id := range o.tableDesc.PrimaryIndex.ColumnIDs {
+		found := false
+		for _, fkID := range o.constraint.FK.OriginColumnIDs {
+			if id == fkID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			idx := o.colIDToRowIdx[id]
+			col, err := o.tableDesc.FindActiveColumnByID(id)
+			if err != nil {
+				return nil, err
+			}
+			rowDetails[col.Name] = row[idx].String()
+		}
 	}
 
 	detailsJSON, err := tree.MakeDJSON(details)

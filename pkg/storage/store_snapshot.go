@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -18,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -26,22 +21,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	crdberrors "github.com/cockroachdb/errors"
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft/raftpb"
 	"golang.org/x/time/rate"
 )
 
 const (
-	// preemptiveSnapshotRaftGroupID is a bogus ID for which a Raft group is
-	// temporarily created during the application of a preemptive snapshot.
-	preemptiveSnapshotRaftGroupID = math.MaxUint64
-
 	// Messages that provide detail about why a preemptive snapshot was rejected.
 	snapshotStoreTooFullMsg = "store almost out of disk space"
 	snapshotApplySemBusyMsg = "store busy applying snapshots"
@@ -86,6 +79,9 @@ type snapshotStrategy interface {
 	// Status provides a status report on the work performed during the
 	// snapshot. Only valid if the strategy succeeded.
 	Status() string
+
+	// Close cleans up any resources associated with the snapshot strategy.
+	Close(context.Context)
 }
 
 func assertStrategy(
@@ -102,55 +98,244 @@ type kvBatchSnapshotStrategy struct {
 	raftCfg *base.RaftConfig
 	status  string
 
-	// Fields used when sending snapshots.
+	// The size of the batches of PUT operations to send to the receiver of the
+	// snapshot. Only used on the sender side.
 	batchSize int64
-	limiter   *rate.Limiter
-	newBatch  func() engine.Batch
+	// Limiter for sending KV batches. Only used on the sender side.
+	limiter *rate.Limiter
+	// Only used on the sender side.
+	newBatch func() engine.Batch
+
+	// The approximate size of the SST chunk to buffer in memory on the receiver
+	// before flushing to disk. Only used on the receiver side.
+	sstChunkSize int64
+	// Only used on the receiver side.
+	ssss *SSTSnapshotStorageScratch
 }
 
-// Send implements the snapshotStrategy interface.
+// multiSSTWriter is a wrapper around RocksDBSstFileWriter and
+// SSTSnapshotStorageScratch that handles chunking SSTs and persisting them to
+// disk.
+type multiSSTWriter struct {
+	ssss        *SSTSnapshotStorageScratch
+	currSST     engine.RocksDBSstFileWriter
+	currSSTFile *SSTSnapshotStorageFile
+	keyRanges   []rditer.KeyRange
+	currRange   int
+	// The size of the SST the last time the SST file writer was truncated. This
+	// size is used to determine the size of the SST chunk buffered in-memory.
+	truncatedSize int64
+	// The approximate size of the SST chunk to buffer in memory on the receiver
+	// before flushing to disk.
+	sstChunkSize int64
+}
+
+func newMultiSSTWriter(
+	ssss *SSTSnapshotStorageScratch, keyRanges []rditer.KeyRange, sstChunkSize int64,
+) (multiSSTWriter, error) {
+	msstw := multiSSTWriter{
+		ssss:         ssss,
+		keyRanges:    keyRanges,
+		sstChunkSize: sstChunkSize,
+	}
+	if err := msstw.initSST(); err != nil {
+		return msstw, err
+	}
+	return msstw, nil
+}
+
+func (msstw *multiSSTWriter) initSST() error {
+	newSSTFile, err := msstw.ssss.NewFile()
+	if err != nil {
+		return errors.Wrap(err, "failed to create new sst file")
+	}
+	msstw.currSSTFile = newSSTFile
+	newSST, err := engine.MakeRocksDBSstFileWriter()
+	if err != nil {
+		return errors.Wrap(err, "failed to create sst file writer")
+	}
+	msstw.currSST = newSST
+	if err := msstw.currSST.ClearRange(msstw.keyRanges[msstw.currRange].Start, msstw.keyRanges[msstw.currRange].End); err != nil {
+		msstw.currSST.Close()
+		return errors.Wrap(err, "failed to clear range on sst file writer")
+	}
+	msstw.truncatedSize = 0
+	return nil
+}
+
+func (msstw *multiSSTWriter) finalizeSST(ctx context.Context) error {
+	chunk, err := msstw.currSST.Finish()
+	if err != nil {
+		return errors.Wrap(err, "failed to finish sst")
+	}
+	if err := msstw.currSSTFile.Write(ctx, chunk); err != nil {
+		return errors.Wrap(err, "failed to write to sst file")
+	}
+	if err := msstw.currSSTFile.Close(); err != nil {
+		return errors.Wrap(err, "failed to close sst file")
+	}
+	msstw.currRange++
+	msstw.currSST.Close()
+	return nil
+}
+
+func (msstw *multiSSTWriter) Put(ctx context.Context, key engine.MVCCKey, value []byte) error {
+	for msstw.keyRanges[msstw.currRange].End.Key.Compare(key.Key) <= 0 {
+		// Finish the current SST, write to the file, and move to the next key
+		// range.
+		if err := msstw.finalizeSST(ctx); err != nil {
+			return err
+		}
+		if err := msstw.initSST(); err != nil {
+			return err
+		}
+	}
+	if msstw.keyRanges[msstw.currRange].Start.Key.Compare(key.Key) > 0 {
+		return crdberrors.AssertionFailedf("client error: expected %s to fall in one of %s", key.Key, msstw.keyRanges)
+	}
+	if err := msstw.currSST.Put(key, value); err != nil {
+		return errors.Wrap(err, "failed to put in sst")
+	}
+	if msstw.currSST.DataSize-msstw.truncatedSize > msstw.sstChunkSize {
+		msstw.truncatedSize = msstw.currSST.DataSize
+		chunk, err := msstw.currSST.Truncate()
+		if err != nil {
+			return errors.Wrap(err, "failed to truncate sst")
+		}
+		// NOTE: Chunk may be empty due to the semantics of Truncate(), but Write()
+		// handles an empty chunk as a noop.
+		if err := msstw.currSSTFile.Write(ctx, chunk); err != nil {
+			return errors.Wrap(err, "failed to write to sst file")
+		}
+	}
+	return nil
+}
+
+func (msstw *multiSSTWriter) Finish(ctx context.Context) error {
+	if msstw.currRange < len(msstw.keyRanges) {
+		for {
+			if err := msstw.finalizeSST(ctx); err != nil {
+				return err
+			}
+			if msstw.currRange >= len(msstw.keyRanges) {
+				break
+			}
+			if err := msstw.initSST(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (msstw *multiSSTWriter) Close() error {
+	msstw.currSST.Close()
+	return msstw.currSSTFile.Close()
+}
+
+// Receive implements the snapshotStrategy interface.
+//
+// NOTE: This function assumes that the key-value pairs are sent in sorted
+// order. The key-value pairs are sent in the following sorted order:
+//
+// 1. Replicated range-id local key range
+// 2. Range-local key range
+// 3. User key range
 func (kvSS *kvBatchSnapshotStrategy) Receive(
 	ctx context.Context, stream incomingSnapshotStream, header SnapshotRequest_Header,
 ) (IncomingSnapshot, error) {
 	assertStrategy(ctx, header, SnapshotRequest_KV_BATCH)
 
-	var batches [][]byte
+	// At the moment we'll write at most three SSTs.
+	// TODO(jeffreyxiao): Re-evaluate as the default range size grows.
+	keyRanges := rditer.MakeReplicatedKeyRanges(header.State.Desc)
+	msstw, err := newMultiSSTWriter(kvSS.ssss, keyRanges, kvSS.sstChunkSize)
+	if err != nil {
+		return noSnap, err
+	}
+	defer func() {
+		// Nothing actionable if closing multiSSTWriter. Closing the same SST and
+		// SST file multiple times is idempotent.
+		if err := msstw.Close(); err != nil {
+			log.Warningf(ctx, "failed to close multiSSTWriter: %v", err)
+		}
+	}()
 	var logEntries [][]byte
+
 	for {
 		req, err := stream.Recv()
 		if err != nil {
-			return IncomingSnapshot{}, err
+			return noSnap, err
 		}
 		if req.Header != nil {
 			err := errors.New("client error: provided a header mid-stream")
-			return IncomingSnapshot{}, sendSnapshotError(stream, err)
+			return noSnap, sendSnapshotError(stream, err)
 		}
 
 		if req.KVBatch != nil {
-			batches = append(batches, req.KVBatch)
+			batchReader, err := engine.NewRocksDBBatchReader(req.KVBatch)
+			if err != nil {
+				return noSnap, errors.Wrap(err, "failed to decode batch")
+			}
+			// All operations in the batch are guaranteed to be puts.
+			for batchReader.Next() {
+				if batchReader.BatchType() != engine.BatchTypeValue {
+					return noSnap, crdberrors.AssertionFailedf("expected type %d, found type %d", engine.BatchTypeValue, batchReader.BatchType())
+				}
+				key, err := batchReader.MVCCKey()
+				if err != nil {
+					return noSnap, errors.Wrap(err, "failed to decode mvcc key")
+				}
+				if err := msstw.Put(ctx, key, batchReader.Value()); err != nil {
+					return noSnap, err
+				}
+			}
 		}
 		if req.LogEntries != nil {
 			logEntries = append(logEntries, req.LogEntries...)
 		}
 		if req.Final {
+			// We finished receiving all batches and log entries. It's possible that
+			// we did not receive any key-value pairs for some of the key ranges, but
+			// we must still construct SSTs with range deletion tombstones to remove
+			// the data.
+			if err := msstw.Finish(ctx); err != nil {
+				return noSnap, err
+			}
+
+			if err := msstw.Close(); err != nil {
+				return noSnap, err
+			}
+
 			snapUUID, err := uuid.FromBytes(header.RaftMessageRequest.Message.Snapshot.Data)
 			if err != nil {
-				err = errors.Wrap(err, "invalid snapshot")
-				return IncomingSnapshot{}, sendSnapshotError(stream, err)
+				err = errors.Wrap(err, "client error: invalid snapshot")
+				return noSnap, sendSnapshotError(stream, err)
 			}
 
 			inSnap := IncomingSnapshot{
 				UsesUnreplicatedTruncatedState: header.UnreplicatedTruncatedState,
 				SnapUUID:                       snapUUID,
-				Batches:                        batches,
+				SSSS:                           kvSS.ssss,
 				LogEntries:                     logEntries,
 				State:                          &header.State,
-				snapType:                       snapTypeRaft,
+				snapType:                       header.Type,
 			}
-			if header.RaftMessageRequest.ToReplica.ReplicaID == 0 {
-				inSnap.snapType = snapTypePreemptive
+
+			// 19.1 nodes don't set the Type field on the SnapshotRequest_Header proto
+			// when sending this RPC, so in a mixed cluster setting we may have gotten
+			// the zero value of RAFT. Since the RPC didn't have type information
+			// previously, a 19.1 node receiving a snapshot distinguished between RAFT
+			// and PREEMPTIVE (19.1 nodes never sent LEARNER snapshots) by checking
+			// whether the replica was a placeholder (ReplicaID == 0).
+			//
+			// This adjustment can be removed after 19.2.
+			if inSnap.snapType == SnapshotRequest_RAFT &&
+				header.RaftMessageRequest.ToReplica.ReplicaID == 0 {
+				inSnap.snapType = SnapshotRequest_PREEMPTIVE
 			}
-			kvSS.status = fmt.Sprintf("kv batches: %d, log entries: %d", len(batches), len(logEntries))
+
+			kvSS.status = fmt.Sprintf("log entries: %d, ssts: %d", len(logEntries), len(kvSS.ssss.SSTs()))
 			return inSnap, nil
 		}
 	}
@@ -187,10 +372,7 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 		}
 
 		if int64(b.Len()) >= kvSS.batchSize {
-			if err := kvSS.limiter.WaitN(ctx, 1); err != nil {
-				return err
-			}
-			if err := kvSS.sendBatch(stream, b); err != nil {
+			if err := kvSS.sendBatch(ctx, stream, b); err != nil {
 				return err
 			}
 			b = nil
@@ -201,10 +383,7 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 		}
 	}
 	if b != nil {
-		if err := kvSS.limiter.WaitN(ctx, 1); err != nil {
-			return err
-		}
-		if err := kvSS.sendBatch(stream, b); err != nil {
+		if err := kvSS.sendBatch(ctx, stream, b); err != nil {
 			return err
 		}
 	}
@@ -231,7 +410,7 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 		if err == nil {
 			logEntries = append(logEntries, bytes)
 			raftLogBytes += int64(len(bytes))
-			if snap.snapType == snapTypePreemptive &&
+			if snap.snapType == SnapshotRequest_PREEMPTIVE &&
 				raftLogBytes > 4*kvSS.raftCfg.RaftLogTruncationThreshold {
 				// If the raft log is too large, abort the snapshot instead of
 				// potentially running out of memory. However, if this is a
@@ -327,8 +506,11 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 }
 
 func (kvSS *kvBatchSnapshotStrategy) sendBatch(
-	stream outgoingSnapshotStream, batch engine.Batch,
+	ctx context.Context, stream outgoingSnapshotStream, batch engine.Batch,
 ) error {
+	if err := kvSS.limiter.WaitN(ctx, 1); err != nil {
+		return err
+	}
 	repr := batch.Repr()
 	batch.Close()
 	return stream.Send(&SnapshotRequest{KVBatch: repr})
@@ -336,6 +518,18 @@ func (kvSS *kvBatchSnapshotStrategy) sendBatch(
 
 // Status implements the snapshotStrategy interface.
 func (kvSS *kvBatchSnapshotStrategy) Status() string { return kvSS.status }
+
+// Close implements the snapshotStrategy interface.
+func (kvSS *kvBatchSnapshotStrategy) Close(ctx context.Context) {
+	if kvSS.ssss != nil {
+		// A failure to clean up the storage is benign except that it will leak
+		// disk space (which is reclaimed on node restart). It is unexpected
+		// though, so log a warning.
+		if err := kvSS.ssss.Clear(); err != nil {
+			log.Warningf(ctx, "error closing kvBatchSnapshotStrategy: %v", err)
+		}
+	}
+}
 
 // reserveSnapshot throttles incoming snapshots. The returned closure is used
 // to cleanup the reservation and release its resources. A nil cleanup function
@@ -401,153 +595,88 @@ func (s *Store) reserveSnapshot(
 	}, "", nil
 }
 
-// canApplySnapshot returns (_, nil) if the snapshot can be applied to
+// canApplySnapshotLocked returns (_, nil) if the snapshot can be applied to
 // this store's replica (i.e. the snapshot is not from an older incarnation of
 // the replica) and a placeholder can be added to the replicasByKey map (if
 // necessary). If a placeholder is required, it is returned as the first value.
-// The authoritative bool determines whether the check is carried out with the
-// intention of actually applying the snapshot (in which case an existing replica
-// must exist and have its raftMu locked) or as a preliminary check.
-func (s *Store) canApplySnapshot(
-	ctx context.Context, snapHeader *SnapshotRequest_Header, authoritative bool,
-) (*ReplicaPlaceholder, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.canApplySnapshotLocked(ctx, snapHeader, authoritative)
-}
-
+//
+// Both the store mu (and the raft mu for an existing replica if there is one)
+// must be held.
 func (s *Store) canApplySnapshotLocked(
-	ctx context.Context, snapHeader *SnapshotRequest_Header, authoritative bool,
+	ctx context.Context, snapHeader *SnapshotRequest_Header,
 ) (*ReplicaPlaceholder, error) {
+	if snapHeader.IsPreemptive() {
+		return nil, crdberrors.AssertionFailedf(`expected a raft or learner snapshot`)
+	}
+
 	// TODO(tbg): see the comment on desc.Generation for what seems to be a much
 	// saner way to handle overlap via generational semantics.
 	desc := *snapHeader.State.Desc
 
 	// First, check for an existing Replica.
-	//
-	// We call canApplySnapshotLocked twice for each snapshot application. In
-	// the first case, it's an optimization early before having received any
-	// data (and we don't use the placeholder if one is returned), and the
-	// replica may or may not be present.
-	//
-	// The second call happens right before we actually plan to apply the
-	// snapshot (and a Replica is always in place at that point). This means
-	// that without a Replica, we can have false positives, but if we have a
-	// replica it needs to take everything into account.
-	//
-	// TODO(tbg): untangle these two use cases.
-	if v, ok := s.mu.replicas.Load(
+	v, ok := s.mu.replicas.Load(
 		int64(desc.RangeID),
-	); !ok {
-		if authoritative {
-			return nil, errors.Errorf("authoritative call requires a replica present")
-		}
-	} else {
-		existingRepl := (*Replica)(v)
-		// The raftMu is held which allows us to use the existing replica as a
-		// placeholder when we decide that the snapshot can be applied. As long
-		// as the caller releases the raftMu only after feeding the snapshot
-		// into the replica, this is safe.
-		if authoritative {
-			existingRepl.raftMu.AssertHeld()
-		}
+	)
+	if !ok {
+		return nil, errors.Errorf("canApplySnapshotLocked requires a replica present")
+	}
+	existingRepl := (*Replica)(v)
+	// The raftMu is held which allows us to use the existing replica as a
+	// placeholder when we decide that the snapshot can be applied. As long
+	// as the caller releases the raftMu only after feeding the snapshot
+	// into the replica, this is safe.
+	existingRepl.raftMu.AssertHeld()
 
-		existingRepl.mu.RLock()
-		existingDesc := existingRepl.descRLocked()
-		existingIsInitialized := existingRepl.isInitializedRLocked()
-		existingIsPreemptive := existingRepl.mu.replicaID == 0
-		existingRepl.mu.RUnlock()
+	existingRepl.mu.RLock()
+	existingDesc := existingRepl.mu.state.Desc
+	existingIsInitialized := existingDesc.IsInitialized()
+	existingDestroyStatus := existingRepl.mu.destroyStatus
+	existingRepl.mu.RUnlock()
 
-		if existingIsInitialized {
-			if !snapHeader.IsPreemptive() {
-				// Regular Raft snapshots can't be refused at this point,
-				// even if they widen the existing replica. See the comments
-				// in Replica.maybeAcquireSnapshotMergeLock for how this is
-				// made safe.
-				//
-				// NB: we expect the replica to know its replicaID at this point
-				// (i.e. !existingIsPreemptive), though perhaps it's possible
-				// that this isn't true if the leader initiates a Raft snapshot
-				// (that would provide a range descriptor with this replica in
-				// it) but this node reboots (temporarily forgetting its
-				// replicaID) before the snapshot arrives.
-				return nil, nil
-			}
+	if existingIsInitialized {
+		// Regular Raft snapshots can't be refused at this point,
+		// even if they widen the existing replica. See the comments
+		// in Replica.maybeAcquireSnapshotMergeLock for how this is
+		// made safe.
+		//
+		// NB: The snapshot must be intended for this replica as
+		// withReplicaForRequest ensures that requests with a non-zero replica
+		// id are passed to a replica with a matching id. Given this is not a
+		// preemptive snapshot we know that its id must be non-zero.
+		return nil, nil
+	}
 
-			if existingIsPreemptive {
-				// Allow applying a preemptive snapshot on top of another
-				// preemptive snapshot. We only need to acquire a placeholder
-				// for the part (if any) of the new snapshot that extends past
-				// the old one. If there's no such overlap, return early; if
-				// there is, "forward" the descriptor's StartKey so that the
-				// later code will only check the overlap.
-				//
-				// NB: morally it would be cleaner to ask for the existing
-				// replica to be GC'ed first, but consider that the preemptive
-				// snapshot was likely left behind by a failed attempt to
-				// up-replicate. This is a relatively common scenario and not
-				// worth discarding and resending another snapshot for. Let the
-				// snapshot through, which means "pretending that it doesn't
-				// intersect the existing replica".
-				if !existingDesc.EndKey.Less(desc.EndKey) {
-					return nil, nil
-				}
-				desc.StartKey = existingDesc.EndKey
-			}
-			// NB: If the existing snapshot is *not* preemptive (i.e. the above
-			// branch wasn't taken), the overlap check below will hit an error.
-			// This path is hit after a rapid up-down-upreplication to the same
-			// store and will resolve as the replicaGCQueue removes the existing
-			// replica. We are pretty sure that the existing replica is gc'able,
-			// because a preemptive snapshot implies that someone is trying to
-			// add this replica to the group at the moment. (We are not however,
-			// sure enough that this couldn't happen by accident to GC the
-			// replica ourselves - the replica GC queue will perform the proper
-			// check).
-		} else if snapHeader.IsPreemptive() {
-			// Morally, the existing replica now has a nonzero replica ID
-			// because we already know that it is not initialized (i.e. has no
-			// data). Interestingly, the case in which it has a zero replica ID
-			// is also possible and should see the snapshot accepted as it
-			// occurs when a preemptive snapshot is handled: we first create a
-			// Replica in this state, run this check, and then apply the
-			// preemptive snapshot.
-			if !existingIsPreemptive {
-				// This is similar to the case of a preemptive snapshot hitting
-				// a fully initialized replica (i.e. not a preemptive snapshot)
-				// at the end of the last branch (which we don't allow), so we
-				// want to reject the snapshot. There is a tricky problem to
-				// to solve here, though: existingRepl doesn't know anything
-				// about its key bounds, and so to check whether it is actually
-				// gc'able would require a full scan of the meta2 entries (and
-				// we would also need to teach the queues how to deal with un-
-				// initialized replicas).
-				//
-				// So we let the snapshot through (by falling through to the
-				// overlap check, where it either picks up placeholders or
-				// fails). This is safe (or at least we assume so) because we
-				// carry out all snapshot decisions through Raft (though it
-				// still is an odd path that we would be wise to avoid if it
-				// weren't so difficult).
-				//
-				// A consequence of letting this snapshot through is opening this
-				// replica up to the possibility of erroneous replicaGC. This is
-				// because it will retain the replicaID of the current replica,
-				// which is going to be initialized after the snapshot (and thus
-				// gc'able).
-				_ = 0 // avoid staticcheck failure
-			}
-		}
+	// If we are not alive then we should not apply a snapshot as our removal
+	// is imminent.
+	if existingDestroyStatus.Removed() {
+		return nil, existingDestroyStatus.err
 	}
 
 	// We have a key range [desc.StartKey,desc.EndKey) which we want to apply a
 	// snapshot for. Is there a conflicting existing placeholder or an
 	// overlapping range?
+	if err := s.checkSnapshotOverlapLocked(ctx, snapHeader); err != nil {
+		return nil, err
+	}
+
+	placeholder := &ReplicaPlaceholder{
+		rangeDesc: desc,
+	}
+	return placeholder, nil
+}
+
+// checkSnapshotOverlapLocked returns an error if the snapshot overlaps an
+// existing replica or placeholder. Any replicas that do overlap have a good
+// chance of being abandoned, so they're proactively handed to the GC queue .
+func (s *Store) checkSnapshotOverlapLocked(
+	ctx context.Context, snapHeader *SnapshotRequest_Header,
+) error {
+	desc := *snapHeader.State.Desc
 
 	// NB: this check seems redundant since placeholders are also represented in
 	// replicasByKey (and thus returned in getOverlappingKeyRangeLocked).
 	if exRng, ok := s.mu.replicaPlaceholders[desc.RangeID]; ok {
-		return nil, errors.Errorf("%s: canApplySnapshotLocked: cannot add placeholder, have an existing placeholder %s", s, exRng)
+		return errors.Errorf("%s: canApplySnapshotLocked: cannot add placeholder, have an existing placeholder %s %v", s, exRng, snapHeader.RaftMessageRequest.FromReplica)
 	}
 
 	// TODO(benesch): consider discovering and GC'ing *all* overlapping ranges,
@@ -589,25 +718,67 @@ func (s *Store) canApplySnapshotLocked(
 			// inactive and thus unlikely to be about to process a split.
 			gcPriority := replicaGCPriorityDefault
 			if inactive(exReplica) {
-				gcPriority = replicaGCPriorityCandidate
+				gcPriority = replicaGCPrioritySuspect
 			}
 
 			msg += "; initiated GC:"
 			s.replicaGCQueue.AddAsync(ctx, exReplica, gcPriority)
 		}
-		return nil, errors.Errorf("%s %v (incoming %v)", msg, exReplica, snapHeader.State.Desc.RSpan()) // exReplica can be nil
+		return errors.Errorf("%s %v (incoming %v)", msg, exReplica, snapHeader.State.Desc.RSpan()) // exReplica can be nil
 	}
+	return nil
+}
 
-	placeholder := &ReplicaPlaceholder{
-		rangeDesc: desc,
+// shouldAcceptSnapshotData is an optimization to check whether we should even
+// bother to read the data for an incoming snapshot. If the snapshot overlaps an
+// existing replica or placeholder, we'd error during application anyway, so do
+// it before transferring all the data. This method is a guess and may have
+// false positives. If the snapshot should be rejected, an error is returned
+// with a description of why. Otherwise, nil means we should accept the
+// snapshot.
+func (s *Store) shouldAcceptSnapshotData(
+	ctx context.Context, snapHeader *SnapshotRequest_Header,
+) error {
+	if snapHeader.IsPreemptive() {
+		return crdberrors.AssertionFailedf(`expected a raft or learner snapshot`)
 	}
-	return placeholder, nil
+	pErr := s.withReplicaForRequest(ctx, &snapHeader.RaftMessageRequest,
+		func(ctx context.Context, r *Replica) *roachpb.Error {
+			// If the current replica is not initialized then we should accept this
+			// snapshot if it doesn't overlap existing ranges.
+			if !r.IsInitialized() {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				return roachpb.NewError(s.checkSnapshotOverlapLocked(ctx, snapHeader))
+			}
+			// If the current range is initialized then we need to accept this
+			// snapshot.
+			return nil
+		})
+	return pErr.GoError()
 }
 
 // receiveSnapshot receives an incoming snapshot via a pre-opened GRPC stream.
 func (s *Store) receiveSnapshot(
 	ctx context.Context, header *SnapshotRequest_Header, stream incomingSnapshotStream,
 ) error {
+	if fn := s.cfg.TestingKnobs.ReceiveSnapshot; fn != nil {
+		if err := fn(header); err != nil {
+			return sendSnapshotError(stream, err)
+		}
+	}
+
+	// Defensive check that any non-preemptive snapshot contains this store in the
+	// descriptor.
+	if !header.IsPreemptive() {
+		storeID := s.StoreID()
+		if _, ok := header.State.Desc.GetReplicaDescriptor(storeID); !ok {
+			return crdberrors.AssertionFailedf(
+				`snapshot of type %s was sent to s%d which did not contain it as a replica: %s`,
+				header.Type, storeID, header.State.Desc.Replicas())
+		}
+	}
+
 	cleanup, rejectionMsg, err := s.reserveSnapshot(ctx, header)
 	if err != nil {
 		return err
@@ -625,10 +796,18 @@ func (s *Store) receiveSnapshot(
 	// We'll perform this check again later after receiving the rest of the
 	// snapshot data - this is purely an optimization to prevent downloading
 	// a snapshot that we know we won't be able to apply.
-	if _, err := s.canApplySnapshot(ctx, header, false /* authoritative */); err != nil {
-		return sendSnapshotError(stream,
-			errors.Wrapf(err, "%s,r%d: cannot apply snapshot", s, header.State.Desc.RangeID),
-		)
+	if header.IsPreemptive() {
+		if _, err := s.canApplyPreemptiveSnapshot(ctx, header, false /* authoritative */); err != nil {
+			return sendSnapshotError(stream,
+				errors.Wrapf(err, "%s,r%d: cannot apply snapshot", s, header.State.Desc.RangeID),
+			)
+		}
+	} else {
+		if err := s.shouldAcceptSnapshotData(ctx, header); err != nil {
+			return sendSnapshotError(stream,
+				errors.Wrapf(err, "%s,r%d: cannot apply snapshot", s, header.State.Desc.RangeID),
+			)
+		}
 	}
 
 	// Determine which snapshot strategy the sender is using to send this
@@ -637,9 +816,18 @@ func (s *Store) receiveSnapshot(
 	var ss snapshotStrategy
 	switch header.Strategy {
 	case SnapshotRequest_KV_BATCH:
-		ss = &kvBatchSnapshotStrategy{
-			raftCfg: &s.cfg.RaftConfig,
+		snapUUID, err := uuid.FromBytes(header.RaftMessageRequest.Message.Snapshot.Data)
+		if err != nil {
+			err = errors.Wrap(err, "invalid snapshot")
+			return sendSnapshotError(stream, err)
 		}
+
+		ss = &kvBatchSnapshotStrategy{
+			raftCfg:      &s.cfg.RaftConfig,
+			ssss:         s.sss.NewSSTSnapshotStorageScratch(header.State.Desc.RangeID, snapUUID),
+			sstChunkSize: snapshotSSTWriteSyncRate.Get(&s.cfg.Settings.SV),
+		}
+		defer ss.Close(ctx)
 	default:
 		return sendSnapshotError(stream,
 			errors.Errorf("%s,r%d: unknown snapshot strategy: %s",
@@ -658,8 +846,14 @@ func (s *Store) receiveSnapshot(
 	if err != nil {
 		return err
 	}
-	if err := s.processRaftSnapshotRequest(ctx, header, inSnap); err != nil {
-		return sendSnapshotError(stream, errors.Wrap(err.GoError(), "failed to apply snapshot"))
+	if header.IsPreemptive() {
+		if err := s.processPreemptiveSnapshotRequest(ctx, header, inSnap); err != nil {
+			return sendSnapshotError(stream, errors.Wrap(err.GoError(), "failed to apply snapshot"))
+		}
+	} else {
+		if err := s.processRaftSnapshotRequest(ctx, header, inSnap); err != nil {
+			return sendSnapshotError(stream, errors.Wrap(err.GoError(), "failed to apply snapshot"))
+		}
 	}
 
 	return stream.Send(&SnapshotResponse{Status: SnapshotResponse_APPLIED})
@@ -695,6 +889,15 @@ var recoverySnapshotRate = settings.RegisterByteSizeSetting(
 	"kv.snapshot_recovery.max_rate",
 	"the rate limit (bytes/sec) to use for recovery snapshots",
 	envutil.EnvOrDefaultBytes("COCKROACH_RAFT_SNAPSHOT_RATE", 8<<20),
+)
+
+// snapshotSSTWriteSyncRate is the size of chunks to write before fsync-ing.
+// The default of 2 MiB was chosen to be in line with the behavior in bulk-io.
+// See sstWriteSyncRate.
+var snapshotSSTWriteSyncRate = settings.RegisterByteSizeSetting(
+	"kv.snapshot_sst.sync_size",
+	"threshold after which snapshot SST writes must fsync",
+	2<<20, /* 2 MiB */
 )
 
 func snapshotRateLimit(

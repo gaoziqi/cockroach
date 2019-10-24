@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package vtable
 
@@ -88,6 +84,18 @@ CREATE TABLE information_schema.applicable_roles (
 	GRANTEE      STRING NOT NULL,
 	ROLE_NAME    STRING NOT NULL,
 	IS_GRANTABLE STRING NOT NULL
+)`
+
+// InformationSchemaCheckConstraints describes the schema of the
+// information_schema.check_constraints table.
+// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-check-constraints.html
+// MySQL:    missing
+const InformationSchemaCheckConstraints = `
+CREATE TABLE information_schema.check_constraints (
+	CONSTRAINT_CATALOG STRING NOT NULL,
+	CONSTRAINT_SCHEMA  STRING NOT NULL,
+	CONSTRAINT_NAME    STRING NOT NULL,
+	CHECK_CLAUSE       STRING NOT NULL
 )`
 
 // InformationSchemaColumnPrivileges describes the schema of the

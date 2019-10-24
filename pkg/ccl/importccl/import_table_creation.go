@@ -14,19 +14,19 @@ import (
 	"io/ioutil"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -38,9 +38,9 @@ const (
 )
 
 func readCreateTableFromStore(
-	ctx context.Context, filename string, settings *cluster.Settings,
+	ctx context.Context, filename string, externalStorageFromURI cloud.ExternalStorageFromURIFactory,
 ) (*tree.CreateTable, error) {
-	store, err := storageccl.ExportStorageFromURI(ctx, filename, settings)
+	store, err := externalStorageFromURI(ctx, filename)
 	if err != nil {
 		return nil, err
 	}
@@ -92,13 +92,13 @@ func MakeSimpleTableDescriptor(
 ) (*sqlbase.MutableTableDescriptor, error) {
 	create.HoistConstraints()
 	if create.IfNotExists {
-		return nil, pgerror.Unimplemented("import.if-no-exists", "unsupported IF NOT EXISTS")
+		return nil, unimplemented.New("import.if-no-exists", "unsupported IF NOT EXISTS")
 	}
 	if create.Interleave != nil {
-		return nil, pgerror.Unimplemented("import.interleave", "interleaved not supported")
+		return nil, unimplemented.New("import.interleave", "interleaved not supported")
 	}
 	if create.AsSource != nil {
-		return nil, pgerror.Unimplemented("import.create-as", "CREATE AS not supported")
+		return nil, unimplemented.New("import.create-as", "CREATE AS not supported")
 	}
 
 	filteredDefs := create.Defs[:0]
@@ -111,7 +111,7 @@ func MakeSimpleTableDescriptor(
 			// ignore
 		case *tree.ColumnTableDef:
 			if def.Computed.Expr != nil {
-				return nil, pgerror.Unimplementedf("import.computed", "computed columns not supported: %s", tree.AsString(def))
+				return nil, unimplemented.Newf("import.computed", "computed columns not supported: %s", tree.AsString(def))
 			}
 
 			if err := sql.SimplifySerialInColumnDefWithRowID(ctx, def, &create.Table); err != nil {
@@ -120,7 +120,7 @@ func MakeSimpleTableDescriptor(
 
 		case *tree.ForeignKeyConstraintTableDef:
 			if !fks.allowed {
-				return nil, pgerror.Unimplemented("import.fk", "this IMPORT format does not support foreign keys")
+				return nil, unimplemented.New("import.fk", "this IMPORT format does not support foreign keys")
 			}
 			if fks.skip {
 				continue
@@ -129,7 +129,7 @@ func MakeSimpleTableDescriptor(
 			def.Table = tree.MakeUnqualifiedTableName(def.Table.TableName)
 
 		default:
-			return nil, pgerror.Unimplementedf(fmt.Sprintf("import.%T", def), "unsupported table definition: %s", tree.AsString(def))
+			return nil, unimplemented.Newf(fmt.Sprintf("import.%T", def), "unsupported table definition: %s", tree.AsString(def))
 		}
 		// only append this def after we make it past the error checks and continues
 		filteredDefs = append(filteredDefs, create.Defs[i])
@@ -156,6 +156,7 @@ func MakeSimpleTableDescriptor(
 		affected,
 		&semaCtx,
 		&evalCtx,
+		false, /* temporary */
 	)
 	if err != nil {
 		return nil, err
@@ -173,12 +174,10 @@ func MakeSimpleTableDescriptor(
 // and the FKs to unvalidated.
 func fixDescriptorFKState(tableDesc *sqlbase.TableDescriptor) error {
 	tableDesc.State = sqlbase.TableDescriptor_PUBLIC
-	return tableDesc.ForeachNonDropIndex(func(idx *sqlbase.IndexDescriptor) error {
-		if idx.ForeignKey.IsSet() {
-			idx.ForeignKey.Validity = sqlbase.ConstraintValidity_Unvalidated
-		}
-		return nil
-	})
+	for i := range tableDesc.OutboundFKs {
+		tableDesc.OutboundFKs[i].Validity = sqlbase.ConstraintValidity_Unvalidated
+	}
+	return nil
 }
 
 var (
@@ -203,8 +202,10 @@ func (so *importSequenceOperators) ParseQualifiedTableName(
 }
 
 // Implements the tree.EvalDatabase interface.
-func (so *importSequenceOperators) ResolveTableName(ctx context.Context, tn *tree.TableName) error {
-	return errSequenceOperators
+func (so *importSequenceOperators) ResolveTableName(
+	ctx context.Context, tn *tree.TableName,
+) (tree.ID, error) {
+	return 0, errSequenceOperators
 }
 
 // Implements the tree.EvalDatabase interface.
@@ -260,18 +261,21 @@ func (r fkResolver) CurrentSearchPath() sessiondata.SearchPath {
 }
 
 // Implements the sql.SchemaResolver interface.
-func (r fkResolver) CommonLookupFlags(required bool) sql.CommonLookupFlags {
-	return sql.CommonLookupFlags{}
+func (r fkResolver) CommonLookupFlags(required bool) tree.CommonLookupFlags {
+	return tree.CommonLookupFlags{}
 }
 
 // Implements the sql.SchemaResolver interface.
-func (r fkResolver) ObjectLookupFlags(required bool, requireMutable bool) sql.ObjectLookupFlags {
-	return sql.ObjectLookupFlags{}
+func (r fkResolver) ObjectLookupFlags(required bool, requireMutable bool) tree.ObjectLookupFlags {
+	return tree.ObjectLookupFlags{
+		CommonLookupFlags: tree.CommonLookupFlags{Required: required},
+		RequireMutable:    requireMutable,
+	}
 }
 
 // Implements the tree.TableNameExistingResolver interface.
 func (r fkResolver) LookupObject(
-	ctx context.Context, requireMutable bool, dbName, scName, obName string,
+	ctx context.Context, lookupFlags tree.ObjectLookupFlags, dbName, scName, obName string,
 ) (found bool, objMeta tree.NameResolutionResult, err error) {
 	if scName != "" {
 		obName = strings.TrimPrefix(obName, scName+".")

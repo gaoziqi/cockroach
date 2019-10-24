@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -25,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -37,9 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/logtags"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 )
@@ -284,13 +281,13 @@ func TestNodeLivenessEpochIncrement(t *testing.T) {
 	}
 	if err := mtc.nodeLivenesses[0].IncrementEpoch(
 		context.Background(), oldLiveness); !testutils.IsError(err, "cannot increment epoch on live node") {
-		t.Fatalf("expected error incrementing a live node: %v", err)
+		t.Fatalf("expected error incrementing a live node: %+v", err)
 	}
 
 	// Advance clock past liveness threshold & increment epoch.
 	mtc.manualClock.Increment(mtc.nodeLivenesses[0].GetLivenessThreshold().Nanoseconds() + 1)
 	if err := mtc.nodeLivenesses[0].IncrementEpoch(context.Background(), oldLiveness); err != nil {
-		t.Fatalf("unexpected error incrementing a non-live node: %s", err)
+		t.Fatalf("unexpected error incrementing a non-live node: %+v", err)
 	}
 
 	// Verify that the epoch has been advanced.
@@ -318,14 +315,14 @@ func TestNodeLivenessEpochIncrement(t *testing.T) {
 
 	// Verify error on incrementing an already-incremented epoch.
 	if err := mtc.nodeLivenesses[0].IncrementEpoch(context.Background(), oldLiveness); err != storage.ErrEpochAlreadyIncremented {
-		t.Fatalf("unexpected error incrementing a non-live node: %s", err)
+		t.Fatalf("unexpected error incrementing a non-live node: %+v", err)
 	}
 
 	// Verify error incrementing with a too-high expectation for liveness epoch.
 	oldLiveness.Epoch = 3
 	if err := mtc.nodeLivenesses[0].IncrementEpoch(
 		context.Background(), oldLiveness); !testutils.IsError(err, "unexpected liveness epoch 2; expected >= 3") {
-		t.Fatalf("expected error incrementing with a too-high expected epoch: %v", err)
+		t.Fatalf("expected error incrementing with a too-high expected epoch: %+v", err)
 	}
 }
 
@@ -404,7 +401,7 @@ func TestNodeLivenessSelf(t *testing.T) {
 	// Verify liveness is properly initialized. This needs to be wrapped in a
 	// SucceedsSoon because node liveness gets initialized via an async gossip
 	// callback.
-	var liveness *storagepb.Liveness
+	var liveness storagepb.Liveness
 	testutils.SucceedsSoon(t, func() error {
 		var err error
 		liveness, err = mtc.nodeLivenesses[0].GetLiveness(g.NodeID.Get())
@@ -422,7 +419,7 @@ func TestNodeLivenessSelf(t *testing.T) {
 		atomic.AddInt32(&count, 1)
 	})
 	testutils.SucceedsSoon(t, func() error {
-		fakeBehindLiveness := *liveness
+		fakeBehindLiveness := liveness
 		fakeBehindLiveness.Epoch-- // almost certainly results in zero
 
 		if err := g.AddInfoProto(key, &fakeBehindLiveness, 0); err != nil {
@@ -578,7 +575,7 @@ func TestNodeLivenessConcurrentHeartbeats(t *testing.T) {
 	}
 	for i := 0; i < concurrency; i++ {
 		if err := <-errCh; err != nil {
-			t.Fatalf("concurrent heartbeat %d failed: %s", i, err)
+			t.Fatalf("concurrent heartbeat %d failed: %+v", i, err)
 		}
 	}
 }
@@ -611,7 +608,7 @@ func TestNodeLivenessConcurrentIncrementEpochs(t *testing.T) {
 	}
 	for i := 0; i < concurrency; i++ {
 		if err := <-errCh; err != nil && err != storage.ErrEpochAlreadyIncremented {
-			t.Fatalf("concurrent increment epoch %d failed: %s", i, err)
+			t.Fatalf("concurrent increment epoch %d failed: %+v", i, err)
 		}
 	}
 }
@@ -643,7 +640,7 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 
 	// Verify success on failed update of a liveness record that already has the
 	// given draining setting.
-	if err := mtc.nodeLivenesses[drainingNodeIdx].SetDrainingInternal(ctx, &storagepb.Liveness{}, false); err != nil {
+	if err := mtc.nodeLivenesses[drainingNodeIdx].SetDrainingInternal(ctx, storagepb.Liveness{}, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -810,7 +807,7 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 	// Allow for inserting zone configs without having to go through (or
 	// duplicate the logic from) the CLI.
 	config.TestingSetupZoneConfigHook(tc.Stopper())
-	zoneConfig := config.DefaultZoneConfig()
+	zoneConfig := zonepb.DefaultZoneConfig()
 	// Force just one replica per range to ensure that we can shut down
 	// nodes without endangering the liveness range.
 	zoneConfig.NumReplicas = proto.Int32(1)
@@ -915,7 +912,7 @@ func testNodeLivenessSetDecommissioning(t *testing.T, decommissionNodeIdx int) {
 
 	// Verify success on failed update of a liveness record that already has the
 	// given decommissioning setting.
-	if _, err := callerNodeLiveness.SetDecommissioningInternal(ctx, nodeID, &storagepb.Liveness{}, false); err != nil {
+	if _, err := callerNodeLiveness.SetDecommissioningInternal(ctx, nodeID, storagepb.Liveness{}, false); err != nil {
 		t.Fatal(err)
 	}
 

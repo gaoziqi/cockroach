@@ -1,4 +1,4 @@
-# LogicTest: local-opt fakedist-opt
+# LogicTest: local fakedist
 
 # ------------------------------------------------------------------------------
 # Create a simple schema that models customers and orders. Each customer has an
@@ -1150,3 +1150,68 @@ ORDER BY
 statement ok
 DROP TABLE stuff;
 DROP TABLE users;
+
+# Regression test for #38867.
+query T
+SELECT (
+		SELECT
+			ARRAY (
+			  SELECT c.relname
+			  FROM pg_inherits AS i JOIN pg_class AS c ON c.oid = i.inhparent
+			  WHERE i.inhrelid = rel.oid
+			  ORDER BY inhseqno
+			)
+)
+FROM pg_class AS rel
+LIMIT 5;
+----
+{}
+{}
+{}
+{}
+{}
+
+# Customers, their billing address, and all orders not going to their billing address
+query ITT rowsort
+SELECT
+    c_id, bill, states
+FROM
+    c
+    JOIN LATERAL (
+            SELECT
+                COALESCE(array_agg(o.ship), '{}') AS states
+            FROM
+                o
+            WHERE
+                o.c_id = c.c_id AND o.ship != c.bill
+        ) ON true;
+----
+1  CA    {}
+3  MA    {}
+4  TX    {WY}
+5  NULL  {}
+6  FL    {WA}
+2  TX    {CA}
+
+# Customers that have billing addresses and all orders not going to their billing address
+query IT rowsort
+SELECT
+    c_id, states
+FROM
+    c
+    LEFT JOIN LATERAL (
+            SELECT
+                COALESCE(array_agg(o.ship), '{}') AS states
+            FROM
+                o
+            WHERE
+                o.c_id = c.c_id AND o.ship != c.bill
+        ) ON true
+WHERE
+    bill IS NOT NULL;
+----
+1  {}
+3  {}
+2  {CA}
+4  {WY}
+6  {WA}

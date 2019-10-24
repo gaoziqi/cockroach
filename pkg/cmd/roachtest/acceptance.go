@@ -1,41 +1,27 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
 import (
 	"context"
-	"fmt"
 	"time"
-
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 )
 
-func registerAcceptance(r *registry) {
-	// The acceptance tests all share a cluster and run sequentially. In
-	// local mode the acceptance tests should be configured to run within a
-	// minute or so as these tests are run on every merge to master.
-
+func registerAcceptance(r *testRegistry) {
 	testCases := []struct {
-		name string
-		fn   func(ctx context.Context, t *test, c *cluster)
-		skip string
-		// roachtest needs to be taught about MinVersion for subtests.
-		// See https://github.com/cockroachdb/cockroach/issues/36752.
-		//
-		// minVersion string
+		name       string
+		fn         func(ctx context.Context, t *test, c *cluster)
+		skip       string
+		minVersion string
+		timeout    time.Duration
 	}{
 		// Sorted. Please keep it that way.
 		{name: "bank/cluster-recovery", fn: runBankClusterRecovery},
@@ -47,6 +33,7 @@ func registerAcceptance(r *registry) {
 		},
 		// {"bank/zerosum-restart", runBankZeroSumRestart},
 		{name: "build-info", fn: runBuildInfo},
+		{name: "build-analyze", fn: runBuildAnalyze},
 		{name: "cli/node-status", fn: runCLINodeStatus},
 		{name: "decommission", fn: runDecommissionAcceptance},
 		{name: "cluster-init", fn: runClusterInit},
@@ -57,16 +44,11 @@ func registerAcceptance(r *registry) {
 		{name: "gossip/locality-address", fn: runCheckLocalityIPAddress},
 		{name: "rapid-restart", fn: runRapidRestart},
 		{name: "status-server", fn: runStatusServer},
-		{
-			name: "version-upgrade",
-			fn:   runVersionUpgrade,
-			// NB: this is hacked back in below.
-			// minVersion: "v19.2.0",
-		},
+		{name: "version-upgrade", fn: runVersionUpgrade, minVersion: "v19.1.0", timeout: 30 * time.Minute},
 	}
 	tags := []string{"default", "quick"}
 	const numNodes = 4
-	spec := testSpec{
+	specTemplate := testSpec{
 		// NB: teamcity-post-failures.py relies on the acceptance tests
 		// being named acceptance/<testname> and will avoid posting a
 		// blank issue for the "acceptance" parent test. Make sure to
@@ -74,26 +56,23 @@ func registerAcceptance(r *registry) {
 		// this naming scheme ever change (or issues such as #33519)
 		// will be posted.
 		Name:    "acceptance",
+		Timeout: 10 * time.Minute,
 		Tags:    tags,
 		Cluster: makeClusterSpec(numNodes),
 	}
 
 	for _, tc := range testCases {
-		tc := tc
-		minV := "v19.2.0-0"
-		if tc.name == "version-upgrade" && !r.buildVersion.AtLeast(version.MustParse(minV)) {
-			tc.skip = fmt.Sprintf("skipped on %s (want at least %s)", r.buildVersion, minV)
+		tc := tc // copy for closure
+		spec := specTemplate
+		spec.Skip = tc.skip
+		spec.Name = specTemplate.Name + "/" + tc.name
+		spec.MinVersion = tc.minVersion
+		if tc.timeout != 0 {
+			spec.Timeout = tc.timeout
 		}
-		spec.SubTests = append(spec.SubTests, testSpec{
-			Skip:    tc.skip,
-			Name:    tc.name,
-			Timeout: 10 * time.Minute,
-			Tags:    tags,
-			Run: func(ctx context.Context, t *test, c *cluster) {
-				c.Wipe(ctx)
-				tc.fn(ctx, t, c)
-			},
-		})
+		spec.Run = func(ctx context.Context, t *test, c *cluster) {
+			tc.fn(ctx, t, c)
+		}
+		r.Add(spec)
 	}
-	r.Add(spec)
 }

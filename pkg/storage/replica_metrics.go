@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -18,7 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -93,7 +89,7 @@ func calcReplicaMetrics(
 	_ context.Context,
 	_ hlc.Timestamp,
 	raftCfg *base.RaftConfig,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	livenessMap IsLiveMap,
 	clusterNodes int,
 	desc *roachpb.RangeDescriptor,
@@ -160,7 +156,10 @@ func calcRangeCounter(
 	numReplicas int32,
 	clusterNodes int,
 ) (rangeCounter, unavailable, underreplicated, overreplicated bool) {
-	for _, rd := range desc.Replicas().Unwrap() {
+	// It seems unlikely that a learner replica would be the first live one, but
+	// there's no particular reason to exclude them. Note that `All` returns the
+	// voters first.
+	for _, rd := range desc.Replicas().All() {
 		if livenessMap[rd.NodeID].IsLive {
 			rangeCounter = rd.StoreID == storeID
 			break
@@ -169,25 +168,28 @@ func calcRangeCounter(
 	// We also compute an estimated per-range count of under-replicated and
 	// unavailable ranges for each range based on the liveness table.
 	if rangeCounter {
-		liveReplicas := calcLiveReplicas(desc, livenessMap)
-		if liveReplicas < desc.Replicas().QuorumSize() {
-			unavailable = true
-		}
+		unavailable = !desc.Replicas().CanMakeProgress(func(rDesc roachpb.ReplicaDescriptor) bool {
+			_, live := livenessMap[rDesc.NodeID]
+			return live
+		})
 		needed := GetNeededReplicas(numReplicas, clusterNodes)
-		if needed > liveReplicas {
+		liveVoterReplicas := calcLiveVoterReplicas(desc, livenessMap)
+		if needed > liveVoterReplicas {
 			underreplicated = true
-		} else if needed < liveReplicas {
+		} else if needed < liveVoterReplicas {
 			overreplicated = true
 		}
 	}
 	return
 }
 
-// calcLiveReplicas returns a count of the live replicas; a live replica is
-// determined by checking its node in the provided liveness map.
-func calcLiveReplicas(desc *roachpb.RangeDescriptor, livenessMap IsLiveMap) int {
+// calcLiveVoterReplicas returns a count of the live voter replicas; a live
+// replica is determined by checking its node in the provided liveness map. This
+// method is used when indicating under-replication so only voter replicas are
+// considered.
+func calcLiveVoterReplicas(desc *roachpb.RangeDescriptor, livenessMap IsLiveMap) int {
 	var live int
-	for _, rd := range desc.Replicas().Unwrap() {
+	for _, rd := range desc.Replicas().Voters() {
 		if livenessMap[rd.NodeID].IsLive {
 			live++
 		}
@@ -201,7 +203,7 @@ func calcBehindCount(
 	raftStatus *raft.Status, desc *roachpb.RangeDescriptor, livenessMap IsLiveMap,
 ) int64 {
 	var behindCount int64
-	for _, rd := range desc.Replicas().Unwrap() {
+	for _, rd := range desc.Replicas().All() {
 		if progress, ok := raftStatus.Progress[uint64(rd.ReplicaID)]; ok {
 			if progress.Match > 0 &&
 				progress.Match < raftStatus.Commit {
@@ -235,14 +237,6 @@ func (r *Replica) QueriesPerSecond() float64 {
 func (r *Replica) WritesPerSecond() float64 {
 	wps, _ := r.writeStats.avgQPS()
 	return wps
-}
-
-// needsSplitBySize returns true if the size of the range requires it
-// to be split.
-func (r *Replica) needsSplitBySize() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.needsSplitBySizeRLocked()
 }
 
 func (r *Replica) needsSplitBySizeRLocked() bool {

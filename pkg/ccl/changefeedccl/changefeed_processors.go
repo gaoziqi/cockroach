@@ -18,9 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -30,13 +29,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 type changeAggregator struct {
-	distsqlrun.ProcessorBase
+	execinfra.ProcessorBase
 
-	flowCtx *distsqlrun.FlowCtx
-	spec    distsqlpb.ChangeAggregatorSpec
+	flowCtx *execinfra.FlowCtx
+	spec    execinfrapb.ChangeAggregatorSpec
 	memAcc  mon.BoundAccount
 
 	// cancel shuts down the processor, both the `Next()` flow and the poller.
@@ -68,17 +68,46 @@ type changeAggregator struct {
 	resolvedSpanBuf encDatumRowBuffer
 }
 
-var _ distsqlrun.Processor = &changeAggregator{}
-var _ distsqlrun.RowSource = &changeAggregator{}
+type timestampLowerBoundOracle interface {
+	inclusiveLowerBoundTS() hlc.Timestamp
+}
+
+type changeAggregatorLowerBoundOracle struct {
+	sf                         *spanFrontier
+	initialInclusiveLowerBound hlc.Timestamp
+}
+
+// inclusiveLowerBoundTs is used to generate a representative timestamp to name
+// cloudStorageSink files. This timestamp is either the statement time (in case this
+// changefeed job hasn't yet seen any resolved timestamps) or the successor timestamp to
+// the local span frontier. This convention is chosen to preserve CDC's ordering
+// guarantees. See comment on cloudStorageSink for more details.
+func (o *changeAggregatorLowerBoundOracle) inclusiveLowerBoundTS() hlc.Timestamp {
+	if frontier := o.sf.Frontier(); !frontier.IsEmpty() {
+		// We call `Next()` here on the frontier because this allows us
+		// to name files using a timestamp that is an inclusive lower bound
+		// on the timestamps of the updates contained within the file.
+		// Files being created at the point this method is called are guaranteed
+		// to contain row updates with timestamps strictly greater than the local
+		// span frontier timestamp.
+		return frontier.Next()
+	}
+	// This should only be returned in the case where the changefeed job hasn't yet
+	// seen a resolved timestamp.
+	return o.initialInclusiveLowerBound
+}
+
+var _ execinfra.Processor = &changeAggregator{}
+var _ execinfra.RowSource = &changeAggregator{}
 
 func newChangeAggregatorProcessor(
-	flowCtx *distsqlrun.FlowCtx,
+	flowCtx *execinfra.FlowCtx,
 	processorID int32,
-	spec distsqlpb.ChangeAggregatorSpec,
-	output distsqlrun.RowReceiver,
-) (distsqlrun.Processor, error) {
+	spec execinfrapb.ChangeAggregatorSpec,
+	output execinfra.RowReceiver,
+) (execinfra.Processor, error) {
 	ctx := flowCtx.EvalCtx.Ctx()
-	memMonitor := distsqlrun.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "changeagg-mem")
+	memMonitor := execinfra.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "changeagg-mem")
 	ca := &changeAggregator{
 		flowCtx: flowCtx,
 		spec:    spec,
@@ -86,14 +115,14 @@ func newChangeAggregatorProcessor(
 	}
 	if err := ca.Init(
 		ca,
-		&distsqlpb.PostProcessSpec{},
+		&execinfrapb.PostProcessSpec{},
 		nil, /* types */
 		flowCtx,
 		processorID,
 		output,
 		memMonitor,
-		distsqlrun.ProcStateOpts{
-			TrailingMetaCallback: func(context.Context) []distsqlpb.ProducerMetadata {
+		execinfra.ProcStateOpts{
+			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
 				ca.close()
 				return nil
 			},
@@ -121,10 +150,30 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	// early returns if errors are detected.
 	ctx = ca.StartInternal(ctx, changeAggregatorProcName)
 
+	var initialHighWater hlc.Timestamp
+	spans := make([]roachpb.Span, 0, len(ca.spec.Watches))
+	for _, watch := range ca.spec.Watches {
+		spans = append(spans, watch.Span)
+		if initialHighWater.IsEmpty() || watch.InitialResolved.Less(initialHighWater) {
+			initialHighWater = watch.InitialResolved
+		}
+	}
+
+	// This SpanFrontier only tracks the spans being watched on this node.
+	// There is a different SpanFrontier elsewhere for the entire changefeed.
+	// This object is used to filter out some previously emitted rows, and
+	// by the cloudStorageSink to name its output files in lexicographically
+	// monotonic fashion.
+	sf := makeSpanFrontier(spans...)
+	for _, watch := range ca.spec.Watches {
+		sf.Forward(watch.Span, watch.InitialResolved)
+	}
+	timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf, initialInclusiveLowerBound: ca.spec.Feed.StatementTime}
 	nodeID := ca.flowCtx.EvalCtx.NodeID
 	var err error
 	if ca.sink, err = getSink(
-		ca.spec.Feed.SinkURI, nodeID, ca.spec.Feed.Opts, ca.spec.Feed.Targets, ca.flowCtx.Settings,
+		ca.spec.Feed.SinkURI, nodeID, ca.spec.Feed.Opts, ca.spec.Feed.Targets,
+		ca.flowCtx.Cfg.Settings, timestampOracle, ca.flowCtx.Cfg.ExternalStorageFromURI,
 	); err != nil {
 		err = MarkRetryableError(err)
 		// Early abort in the case that there is an error creating the sink.
@@ -139,19 +188,10 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 		ca.changedRowBuf = &b.buf
 	}
 
-	initialHighWater := hlc.Timestamp{WallTime: -1}
-	var spans []roachpb.Span
-	for _, watch := range ca.spec.Watches {
-		spans = append(spans, watch.Span)
-		if initialHighWater.WallTime == -1 || watch.InitialResolved.Less(initialHighWater) {
-			initialHighWater = watch.InitialResolved
-		}
-	}
-
 	// The job registry has a set of metrics used to monitor the various jobs it
 	// runs. They're all stored as the `metric.Struct` interface because of
 	// dependency cycles.
-	metrics := ca.flowCtx.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
+	metrics := ca.flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
 	ca.sink = makeMetricsSink(metrics, ca.sink)
 	ca.sink = &errorWrapperSink{wrapped: ca.sink}
 
@@ -173,15 +213,15 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	ca.pollerMemMon = &pollerMemMon
 
 	buf := makeBuffer()
-	leaseMgr := ca.flowCtx.LeaseManager.(*sql.LeaseManager)
+	leaseMgr := ca.flowCtx.Cfg.LeaseManager.(*sql.LeaseManager)
 	ca.poller = makePoller(
-		ca.flowCtx.Settings, ca.flowCtx.ClientDB, ca.flowCtx.ClientDB.Clock(), ca.flowCtx.Gossip,
+		ca.flowCtx.Cfg.Settings, ca.flowCtx.Cfg.DB, ca.flowCtx.Cfg.DB.Clock(), ca.flowCtx.Cfg.Gossip,
 		spans, ca.spec.Feed, initialHighWater, buf, leaseMgr, metrics, ca.pollerMemMon,
 	)
 	rowsFn := kvsToRows(leaseMgr, ca.spec.Feed, buf.Get)
 
 	ca.tickFn = emitEntries(
-		ca.flowCtx.Settings, ca.spec.Feed, spans, ca.encoder, ca.sink, rowsFn, knobs, metrics)
+		ca.flowCtx.Cfg.Settings, ca.spec.Feed, sf, ca.encoder, ca.sink, rowsFn, knobs, metrics)
 
 	// Give errCh enough buffer both possible errors from supporting goroutines,
 	// but only the first one is ever used.
@@ -190,12 +230,7 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	ca.pollerDoneCh = make(chan struct{})
 	if err := ca.flowCtx.Stopper().RunAsyncTask(ctx, "changefeed-poller", func(ctx context.Context) {
 		defer close(ca.pollerDoneCh)
-		var err error
-		if PushEnabled.Get(&ca.flowCtx.Settings.SV) {
-			err = ca.poller.RunUsingRangefeeds(ctx)
-		} else {
-			err = ca.poller.Run(ctx)
-		}
+		err := ca.poller.RunUsingRangefeeds(ctx)
 
 		// Trying to call MoveToDraining here is racy (`MoveToDraining called in
 		// state stateTrailingMeta`), so return the error via a channel.
@@ -242,8 +277,8 @@ func (ca *changeAggregator) close() {
 }
 
 // Next is part of the RowSource interface.
-func (ca *changeAggregator) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
-	for ca.State == distsqlrun.StateRunning {
+func (ca *changeAggregator) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+	for ca.State == execinfra.StateRunning {
 		if !ca.changedRowBuf.IsEmpty() {
 			return ca.changedRowBuf.Pop(), nil
 		} else if !ca.resolvedSpanBuf.IsEmpty() {
@@ -308,15 +343,15 @@ const (
 )
 
 type changeFrontier struct {
-	distsqlrun.ProcessorBase
+	execinfra.ProcessorBase
 
-	flowCtx *distsqlrun.FlowCtx
-	spec    distsqlpb.ChangeFrontierSpec
+	flowCtx *execinfra.FlowCtx
+	spec    execinfrapb.ChangeFrontierSpec
 	memAcc  mon.BoundAccount
 	a       sqlbase.DatumAlloc
 
 	// input returns rows from one or more changeAggregator processors
-	input distsqlrun.RowSource
+	input execinfra.RowSource
 
 	// sf contains the current resolved timestamp high-water for the tracked
 	// span set.
@@ -355,18 +390,18 @@ type changeFrontier struct {
 	metricsID int
 }
 
-var _ distsqlrun.Processor = &changeFrontier{}
-var _ distsqlrun.RowSource = &changeFrontier{}
+var _ execinfra.Processor = &changeFrontier{}
+var _ execinfra.RowSource = &changeFrontier{}
 
 func newChangeFrontierProcessor(
-	flowCtx *distsqlrun.FlowCtx,
+	flowCtx *execinfra.FlowCtx,
 	processorID int32,
-	spec distsqlpb.ChangeFrontierSpec,
-	input distsqlrun.RowSource,
-	output distsqlrun.RowReceiver,
-) (distsqlrun.Processor, error) {
+	spec execinfrapb.ChangeFrontierSpec,
+	input execinfra.RowSource,
+	output execinfra.RowReceiver,
+) (execinfra.Processor, error) {
 	ctx := flowCtx.EvalCtx.Ctx()
-	memMonitor := distsqlrun.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "changefntr-mem")
+	memMonitor := execinfra.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "changefntr-mem")
 	cf := &changeFrontier{
 		flowCtx: flowCtx,
 		spec:    spec,
@@ -375,18 +410,18 @@ func newChangeFrontierProcessor(
 		sf:      makeSpanFrontier(spec.TrackedSpans...),
 	}
 	if err := cf.Init(
-		cf, &distsqlpb.PostProcessSpec{},
+		cf, &execinfrapb.PostProcessSpec{},
 		input.OutputTypes(),
 		flowCtx,
 		processorID,
 		output,
 		memMonitor,
-		distsqlrun.ProcStateOpts{
-			TrailingMetaCallback: func(context.Context) []distsqlpb.ProducerMetadata {
+		execinfra.ProcStateOpts{
+			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
 				cf.close()
 				return nil
 			},
-			InputsToDrain: []distsqlrun.RowSource{cf.input},
+			InputsToDrain: []execinfra.RowSource{cf.input},
 		},
 	); err != nil {
 		return nil, err
@@ -426,8 +461,12 @@ func (cf *changeFrontier) Start(ctx context.Context) context.Context {
 
 	nodeID := cf.flowCtx.EvalCtx.NodeID
 	var err error
+	// Pass a nil oracle because this sink is only used to emit resolved timestamps
+	// but the oracle is only used when emitting row updates.
+	var nilOracle timestampLowerBoundOracle
 	if cf.sink, err = getSink(
-		cf.spec.Feed.SinkURI, nodeID, cf.spec.Feed.Opts, cf.spec.Feed.Targets, cf.flowCtx.Settings,
+		cf.spec.Feed.SinkURI, nodeID, cf.spec.Feed.Opts, cf.spec.Feed.Targets,
+		cf.flowCtx.Cfg.Settings, nilOracle, cf.flowCtx.Cfg.ExternalStorageFromURI,
 	); err != nil {
 		err = MarkRetryableError(err)
 		cf.MoveToDraining(err)
@@ -441,13 +480,13 @@ func (cf *changeFrontier) Start(ctx context.Context) context.Context {
 	// The job registry has a set of metrics used to monitor the various jobs it
 	// runs. They're all stored as the `metric.Struct` interface because of
 	// dependency cycles.
-	cf.metrics = cf.flowCtx.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
+	cf.metrics = cf.flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
 	cf.sink = makeMetricsSink(cf.metrics, cf.sink)
 	cf.sink = &errorWrapperSink{wrapped: cf.sink}
 
 	cf.highWaterAtStart = cf.spec.Feed.StatementTime
 	if cf.spec.JobID != 0 {
-		job, err := cf.flowCtx.JobRegistry.LoadJob(ctx, cf.spec.JobID)
+		job, err := cf.flowCtx.Cfg.JobRegistry.LoadJob(ctx, cf.spec.JobID)
 		if err != nil {
 			cf.MoveToDraining(err)
 			return ctx
@@ -506,8 +545,8 @@ func (cf *changeFrontier) closeMetrics() {
 }
 
 // Next is part of the RowSource interface.
-func (cf *changeFrontier) Next() (sqlbase.EncDatumRow, *distsqlpb.ProducerMetadata) {
-	for cf.State == distsqlrun.StateRunning {
+func (cf *changeFrontier) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
+	for cf.State == execinfra.StateRunning {
 		if !cf.passthroughBuf.IsEmpty() {
 			return cf.passthroughBuf.Pop(), nil
 		} else if !cf.resolvedBuf.IsEmpty() {
@@ -549,11 +588,11 @@ func (cf *changeFrontier) noteResolvedSpan(d sqlbase.EncDatum) error {
 	}
 	raw, ok := d.Datum.(*tree.DBytes)
 	if !ok {
-		return pgerror.AssertionFailedf(`unexpected datum type %T: %s`, d.Datum, d.Datum)
+		return errors.AssertionFailedf(`unexpected datum type %T: %s`, d.Datum, d.Datum)
 	}
 	var resolved jobspb.ResolvedSpan
 	if err := protoutil.Unmarshal([]byte(*raw), &resolved); err != nil {
-		return pgerror.NewAssertionErrorWithWrappedErrf(err,
+		return errors.NewAssertionErrorWithWrappedErrf(err,
 			`unmarshalling resolved span: %x`, raw)
 	}
 
@@ -565,7 +604,7 @@ func (cf *changeFrontier) noteResolvedSpan(d sqlbase.EncDatum) error {
 	// job progress update closure, but it currently doesn't pass along the info
 	// we'd need to do it that way.
 	if !resolved.Timestamp.IsEmpty() && resolved.Timestamp.Less(cf.highWaterAtStart) {
-		log.ReportOrPanic(cf.Ctx, &cf.flowCtx.Settings.SV,
+		log.ReportOrPanic(cf.Ctx, &cf.flowCtx.Cfg.Settings.SV,
 			`got a span level timestamp %s for %s that is less than the initial high-water %s`,
 			log.Safe(resolved.Timestamp), resolved.Span, log.Safe(cf.highWaterAtStart))
 		return nil
@@ -599,8 +638,8 @@ func (cf *changeFrontier) noteResolvedSpan(d sqlbase.EncDatum) error {
 	// rangefeed is only checked at changefeed start/resume, so instead of
 	// switching on it here, just add them. Also add 1 second in case both these
 	// settings are set really low (as they are in unit tests).
-	pollInterval := changefeedPollInterval.Get(&cf.flowCtx.Settings.SV)
-	closedtsInterval := closedts.TargetDuration.Get(&cf.flowCtx.Settings.SV)
+	pollInterval := changefeedPollInterval.Get(&cf.flowCtx.Cfg.Settings.SV)
+	closedtsInterval := closedts.TargetDuration.Get(&cf.flowCtx.Cfg.Settings.SV)
 	slownessThreshold := time.Second + 10*(pollInterval+closedtsInterval)
 	frontier := cf.sf.Frontier()
 	now := timeutil.Now()

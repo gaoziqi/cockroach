@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 //
 //
@@ -272,11 +268,9 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Description: "COMMIT/ROLLBACK, or after a statement running as an implicit txn",
 			Next:        stateNoTxn{},
 			Action: func(args fsm.Args) error {
-				ts := args.Extended.(*txnState)
-				ts.finishSQLTxn()
-				ts.setAdvanceInfo(
-					advanceOne, noRewind, args.Payload.(eventTxnFinishPayload).toEvent())
-				return nil
+				return args.Extended.(*txnState).finishTxn(
+					args.Payload.(eventTxnFinishPayload),
+				)
 			},
 		},
 		// Handle the error on COMMIT cases: we move to NoTxn as per Postgres error
@@ -407,11 +401,9 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Description: "ROLLBACK",
 			Next:        stateNoTxn{},
 			Action: func(args fsm.Args) error {
-				ts := args.Extended.(*txnState)
-				ts.finishSQLTxn()
-				ts.setAdvanceInfo(
-					advanceOne, noRewind, args.Payload.(eventTxnFinishPayload).toEvent())
-				return nil
+				return args.Extended.(*txnState).finishTxn(
+					args.Payload.(eventTxnFinishPayload),
+				)
 			},
 		},
 		eventNonRetriableErr{IsCommit: fsm.Any}: {
@@ -460,11 +452,9 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Description: "ROLLBACK",
 			Next:        stateNoTxn{},
 			Action: func(args fsm.Args) error {
-				ts := args.Extended.(*txnState)
-				ts.finishSQLTxn()
-				ts.setAdvanceInfo(
-					advanceOne, noRewind, args.Payload.(eventTxnFinishPayload).toEvent())
-				return nil
+				return args.Extended.(*txnState).finishTxn(
+					args.Payload.(eventTxnFinishPayload),
+				)
 			},
 		},
 		// ROLLBACK TO SAVEPOINT
@@ -493,11 +483,9 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Description: "COMMIT",
 			Next:        stateNoTxn{},
 			Action: func(args fsm.Args) error {
-				ts := args.Extended.(*txnState)
-				ts.finishSQLTxn()
-				ts.setAdvanceInfo(
-					advanceOne, noRewind, args.Payload.(eventTxnFinishPayload).toEvent())
-				return nil
+				return args.Extended.(*txnState).finishTxn(
+					args.Payload.(eventTxnFinishPayload),
+				)
 			},
 		},
 		eventNonRetriableErr{IsCommit: fsm.Any}: {
@@ -549,6 +537,13 @@ func (ts *txnState) noTxnToOpen(
 		payload.tranCtx,
 	)
 	ts.setAdvanceInfo(advCode, noRewind, txnStart)
+	return nil
+}
+
+// finishTxn finishes the transaction. It also calls setAdvanceInfo().
+func (ts *txnState) finishTxn(payload eventTxnFinishPayload) error {
+	ts.finishSQLTxn()
+	ts.setAdvanceInfo(advanceOne, noRewind, payload.toEvent())
 	return nil
 }
 

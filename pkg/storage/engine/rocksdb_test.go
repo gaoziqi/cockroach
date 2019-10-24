@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
@@ -340,7 +336,7 @@ func makeKey(i int) MVCCKey {
 }
 
 func benchmarkIterOnBatch(ctx context.Context, b *testing.B, writes int) {
-	engine := createTestEngine()
+	engine := createTestRocksDBEngine()
 	defer engine.Close()
 
 	for i := 0; i < writes; i++ {
@@ -372,7 +368,7 @@ func benchmarkIterOnBatch(ctx context.Context, b *testing.B, writes int) {
 func benchmarkIterOnReadWriter(
 	ctx context.Context, b *testing.B, writes int, f func(Engine) ReadWriter, closeReadWriter bool,
 ) {
-	engine := createTestEngine()
+	engine := createTestRocksDBEngine()
 	defer engine.Close()
 
 	for i := 0; i < writes; i++ {
@@ -658,7 +654,7 @@ func TestConcurrentBatch(t *testing.T) {
 		RocksDBCache{},
 	)
 	if err != nil {
-		t.Fatalf("could not create new rocksdb db instance at %s: %v", dir, err)
+		t.Fatalf("could not create new rocksdb db instance at %s: %+v", dir, err)
 	}
 	defer db.Close()
 
@@ -719,6 +715,91 @@ func TestConcurrentBatch(t *testing.T) {
 	}
 }
 
+// TestRocksDBSstFileWriterTruncate ensures that sum of the chunks created by
+// calling Truncate on a RocksDBSstFileWriter is equivalent to an SST built
+// without ever calling Truncate.
+func TestRocksDBSstFileWriterTruncate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Truncate will be used on this writer.
+	sst1, err := MakeRocksDBSstFileWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sst1.Close()
+
+	// Truncate will not be used on this writer.
+	sst2, err := MakeRocksDBSstFileWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sst2.Close()
+
+	const keyLen = 10
+	const valLen = 950
+	ts := hlc.Timestamp{WallTime: 1}
+	key := MVCCKey{Key: roachpb.Key(make([]byte, keyLen)), Timestamp: ts}
+	value := make([]byte, valLen)
+
+	var resBuf1, resBuf2 []byte
+	const entries = 100000
+	const truncateChunk = entries / 10
+	for i := 0; i < entries; i++ {
+		key.Key = []byte(fmt.Sprintf("%09d", i))
+		copy(value, key.Key)
+
+		if err := sst1.Put(key, value); err != nil {
+			t.Fatal(err)
+		}
+		if err := sst2.Put(key, value); err != nil {
+			t.Fatal(err)
+		}
+
+		if i > 0 && i%truncateChunk == 0 {
+			sst1Chunk, err := sst1.Truncate()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("iteration %d, truncate chunk\tlen=%d", i, len(sst1Chunk))
+
+			// Even though we added keys, it is not guaranteed strictly by the
+			// contract of Truncate that a byte slice will be returned. This is
+			// because the keys may be in un-flushed blocks. This test had been tuned
+			// such that every other batch chunk is always large enough to require at
+			// least one block to be flushed.
+			empty := len(sst1Chunk) == 0
+			if i%(2*truncateChunk) == 0 {
+				if empty {
+					t.Fatalf("expected non-empty SST chunk during iteration %d", i)
+				}
+				resBuf1 = append(resBuf1, sst1Chunk...)
+			} else {
+				if !empty {
+					t.Fatalf("expected empty SST chunk during iteration %d", i)
+				}
+			}
+		}
+	}
+
+	sst1FinishBuf, err := sst1.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resBuf1 = append(resBuf1, sst1FinishBuf...)
+	t.Logf("truncated sst final chunk\t\tlen=%d", len(sst1FinishBuf))
+
+	resBuf2, err = sst2.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("non-truncated sst final chunk\tlen=%d", len(resBuf2))
+
+	if !bytes.Equal(resBuf1, resBuf2) {
+		t.Errorf("expected SST made up of truncate chunks (len=%d) to be equivalent to SST that "+
+			"was not (len=%d)", len(sst1FinishBuf), len(resBuf2))
+	}
+}
+
 func BenchmarkRocksDBSstFileWriter(b *testing.B) {
 	dir, err := ioutil.TempDir("", "BenchmarkRocksDBSstFileWriter")
 	if err != nil {
@@ -761,7 +842,7 @@ func BenchmarkRocksDBSstFileWriter(b *testing.B) {
 		kv.Key.Key = []byte(fmt.Sprintf("%09d", i))
 		copy(kv.Value, kv.Key.Key)
 		b.StartTimer()
-		if err := sst.Add(kv); err != nil {
+		if err := sst.Put(kv.Key, kv.Value); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -804,7 +885,7 @@ func BenchmarkRocksDBSstFileReader(b *testing.B) {
 		for i := 0; i < entries; i++ {
 			kv.Key.Key = []byte(fmt.Sprintf("%09d", i))
 			copy(kv.Value, kv.Key.Key)
-			if err := sst.Add(kv); err != nil {
+			if err := sst.Put(kv.Key, kv.Value); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -839,190 +920,6 @@ func BenchmarkRocksDBSstFileReader(b *testing.B) {
 	}
 }
 
-func TestRocksDBTimeBound(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	dir, dirCleanup := testutils.TempDir(t)
-	defer dirCleanup()
-
-	rocksdb, err := NewRocksDB(
-		RocksDBConfig{
-			Settings: cluster.MakeTestingClusterSettings(),
-			Dir:      dir,
-		},
-		RocksDBCache{},
-	)
-	if err != nil {
-		t.Fatalf("could not create new rocksdb db instance at %s: %v", dir, err)
-	}
-	defer rocksdb.Close()
-
-	var minTimestamp = hlc.Timestamp{WallTime: 1, Logical: 0}
-	var maxTimestamp = hlc.Timestamp{WallTime: 3, Logical: 0}
-	times := []hlc.Timestamp{
-		{WallTime: 2, Logical: 0},
-		minTimestamp,
-		maxTimestamp,
-		{WallTime: 2, Logical: 0},
-	}
-
-	for i, time := range times {
-		s := fmt.Sprintf("%02d", i)
-		key := MVCCKey{Key: roachpb.Key(s), Timestamp: time}
-		if err := rocksdb.Put(key, []byte(s)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := rocksdb.Flush(); err != nil {
-		t.Fatal(err)
-	}
-
-	ssts, err := rocksdb.GetUserProperties()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ssts.Sst) != 1 {
-		t.Fatalf("expected 1 sstable got %d", len(ssts.Sst))
-	}
-	sst := ssts.Sst[0]
-	if sst.TsMin == nil || *sst.TsMin != minTimestamp {
-		t.Fatalf("got min %v expected %v", sst.TsMin, minTimestamp)
-	}
-	if sst.TsMax == nil || *sst.TsMax != maxTimestamp {
-		t.Fatalf("got max %v expected %v", sst.TsMax, maxTimestamp)
-	}
-
-	batch := rocksdb.NewBatch()
-	defer batch.Close()
-
-	check := func(t *testing.T, tbi Iterator, keys, ssts int) {
-		defer tbi.Close()
-		tbi.Seek(NilKey)
-
-		var count int
-		for ; ; tbi.Next() {
-			ok, err := tbi.Valid()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !ok {
-				break
-			}
-			count++
-		}
-
-		// Make sure the iterator sees no writes.
-		if keys != count {
-			t.Fatalf("saw %d values in time bounded iterator, but expected %d", count, keys)
-		}
-		stats := tbi.Stats()
-		if a := stats.TimeBoundNumSSTs; a != ssts {
-			t.Fatalf("touched %d SSTs, expected %d", a, ssts)
-		}
-	}
-
-	testCases := []struct {
-		iter       Iterator
-		keys, ssts int
-	}{
-		// Completely to the right, not touching.
-		{
-			iter: batch.NewIterator(IterOptions{
-				MinTimestampHint: maxTimestamp.Next(),
-				MaxTimestampHint: maxTimestamp.Next().Next(),
-				UpperBound:       roachpb.KeyMax,
-				WithStats:        true,
-			}),
-			keys: 0,
-			ssts: 0,
-		},
-		// Completely to the left, not touching.
-		{
-			iter: batch.NewIterator(IterOptions{
-				MinTimestampHint: minTimestamp.Prev().Prev(),
-				MaxTimestampHint: minTimestamp.Prev(),
-				UpperBound:       roachpb.KeyMax,
-				WithStats:        true,
-			}),
-			keys: 0,
-			ssts: 0,
-		},
-		// Touching on the right.
-		{
-			iter: batch.NewIterator(IterOptions{
-				MinTimestampHint: maxTimestamp,
-				MaxTimestampHint: maxTimestamp,
-				UpperBound:       roachpb.KeyMax,
-				WithStats:        true,
-			}),
-			keys: len(times),
-			ssts: 1,
-		},
-		// Touching on the left.
-		{
-			iter: batch.NewIterator(IterOptions{
-				MinTimestampHint: minTimestamp,
-				MaxTimestampHint: minTimestamp,
-				UpperBound:       roachpb.KeyMax,
-				WithStats:        true,
-			}),
-			keys: len(times),
-			ssts: 1,
-		},
-		// Copy of last case, but confirm that we don't get SST stats if we don't
-		// ask for them.
-		{
-			iter: batch.NewIterator(IterOptions{
-				MinTimestampHint: minTimestamp,
-				MaxTimestampHint: minTimestamp,
-				UpperBound:       roachpb.KeyMax,
-				WithStats:        false,
-			}),
-			keys: len(times),
-			ssts: 0,
-		},
-		// Copy of last case, but confirm that upper bound is respected.
-		{
-			iter: batch.NewIterator(IterOptions{
-				MinTimestampHint: minTimestamp,
-				MaxTimestampHint: minTimestamp,
-				UpperBound:       []byte("02"),
-				WithStats:        false,
-			}),
-			keys: 2,
-			ssts: 0,
-		},
-	}
-
-	for _, test := range testCases {
-		t.Run("", func(t *testing.T) {
-			check(t, test.iter, test.keys, test.ssts)
-		})
-	}
-
-	// Make a regular iterator. Before #21721, this would accidentally pick up the
-	// time bounded iterator instead.
-	iter := batch.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
-	defer iter.Close()
-	iter.Seek(NilKey)
-
-	var count int
-	for ; ; iter.Next() {
-		ok, err := iter.Valid()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !ok {
-			break
-		}
-		count++
-	}
-
-	// Make sure the iterator sees the writes (i.e. it's not the time bounded iterator).
-	if expCount := len(times); expCount != count {
-		t.Fatalf("saw %d values in regular iterator, but expected %d", count, expCount)
-	}
-}
-
 func key(s string) MVCCKey {
 	return MakeMVCCMetadataKey([]byte(s))
 }
@@ -1044,7 +941,7 @@ func TestRocksDBDeleteRangeBug(t *testing.T) {
 		RocksDBCache{},
 	)
 	if err != nil {
-		t.Fatalf("could not create new rocksdb db instance at %s: %v", dir, err)
+		t.Fatalf("could not create new rocksdb db instance at %s: %+v", dir, err)
 	}
 	defer db.Close()
 
@@ -1258,12 +1155,17 @@ func TestRocksDBFileNotFoundError(t *testing.T) {
 		RocksDBCache{},
 	)
 	if err != nil {
-		t.Fatalf("could not create new rocksdb db instance at %s: %v", dir, err)
+		t.Fatalf("could not create new rocksdb db instance at %s: %+v", dir, err)
 	}
 	defer db.Close()
 
 	// Verify DeleteFile returns os.ErrNotExist if file does not exist.
 	if err := db.DeleteFile("/non/existent/file"); !os.IsNotExist(err) {
+		t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
+	}
+
+	// Verify DeleteDirAndFiles returns os.ErrNotExist if dir does not exist.
+	if err := db.DeleteDirAndFiles("/non/existent/file"); !os.IsNotExist(err) {
 		t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
 	}
 
@@ -1273,7 +1175,7 @@ func TestRocksDBFileNotFoundError(t *testing.T) {
 		t.Fatalf("unable to open file with filename %s, got err %v", fname, err)
 	} else {
 		// Write data to file so we can read it later.
-		if err := f.Append([]byte(data)); err != nil {
+		if _, err := f.Write([]byte(data)); err != nil {
 			t.Fatalf("error writing data: '%s' to file %s, got err %v", data, fname, err)
 		}
 		if err := f.Sync(); err != nil {
@@ -1340,13 +1242,7 @@ func TestRocksDBDeleteRangeCompaction(t *testing.T) {
 		defer sst.Close()
 
 		for i := 0; i < numEntries; i++ {
-			kv := MVCCKeyValue{
-				Key: MVCCKey{
-					Key: makeKey(string(p), i),
-				},
-				Value: randutil.RandBytes(rnd, valueSize),
-			}
-			if err := sst.Add(kv); err != nil {
+			if err := sst.Put(MVCCKey{Key: makeKey(string(p), i)}, randutil.RandBytes(rnd, valueSize)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -1468,12 +1364,7 @@ func BenchmarkRocksDBDeleteRangeIterate(b *testing.B) {
 						defer sst.Close()
 
 						for i := 0; i < entries; i++ {
-							kv := MVCCKeyValue{
-								Key: MVCCKey{
-									Key: makeKey(i),
-								},
-							}
-							if err := sst.Add(kv); err != nil {
+							if err := sst.Put(MVCCKey{Key: makeKey(i)}, nil); err != nil {
 								b.Fatal(err)
 							}
 						}
@@ -1527,35 +1418,31 @@ func BenchmarkRocksDBDeleteRangeIterate(b *testing.B) {
 func TestMakeBatchGroup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	// Assume every newly instantiated batch has size 12 (header only).
 	testCases := []struct {
 		maxSize   int
-		sizes     []int
 		groupSize []int
 		leader    []bool
 		groups    []int
 	}{
-		{1, []int{100, 100, 100}, []int{100, 100, 100}, []bool{true, true, true}, []int{1, 1, 1}},
-		{199, []int{100, 100, 100}, []int{100, 100, 100}, []bool{true, true, true}, []int{1, 1, 1}},
-		{200, []int{100, 100, 100}, []int{100, 200, 100}, []bool{true, false, true}, []int{2, 1}},
-		{299, []int{100, 100, 100}, []int{100, 200, 100}, []bool{true, false, true}, []int{2, 1}},
-		{300, []int{100, 100, 100}, []int{100, 200, 300}, []bool{true, false, false}, []int{3}},
+		{1, []int{12, 12, 12}, []bool{true, true, true}, []int{1, 1, 1}},
+		{23, []int{12, 12, 12}, []bool{true, true, true}, []int{1, 1, 1}},
+		{24, []int{12, 24, 12}, []bool{true, false, true}, []int{2, 1}},
+		{35, []int{12, 24, 12}, []bool{true, false, true}, []int{2, 1}},
+		{36, []int{12, 24, 36}, []bool{true, false, false}, []int{3}},
 		{
-			400,
-			[]int{100, 200, 300, 100, 500},
-			[]int{100, 300, 300, 400, 500},
-			[]bool{true, false, true, false, true},
-			[]int{2, 2, 1},
+			48,
+			[]int{12, 24, 36, 48, 12},
+			[]bool{true, false, false, false, true},
+			[]int{4, 1},
 		},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
 			var pending []*rocksDBBatch
 			var groupSize int
-			for i := range c.sizes {
-				// We use intimate knowledge of rocksDBBatch and RocksDBBatchBuilder to
-				// construct a batch of a specific size.
+			for i := range c.groupSize {
 				b := &rocksDBBatch{}
-				b.builder.repr = make([]byte, c.sizes[i])
 				var leader bool
 				pending, groupSize, leader = makeBatchGroup(pending, b, groupSize, c.maxSize)
 				if c.groupSize[i] != groupSize {
@@ -1592,10 +1479,10 @@ func TestSstFileWriterTimeBound(t *testing.T) {
 			t.Fatal(sst)
 		}
 		defer sst.Close()
-		if err := sst.Add(MVCCKeyValue{
-			Key:   MVCCKey{Key: []byte("key"), Timestamp: hlc.Timestamp{WallTime: walltime}},
-			Value: []byte("value"),
-		}); err != nil {
+		if err := sst.Put(
+			MVCCKey{Key: []byte("key"), Timestamp: hlc.Timestamp{WallTime: walltime}},
+			[]byte("value"),
+		); err != nil {
 			t.Fatal(err)
 		}
 		sstContents, err := sst.Finish()
@@ -1756,7 +1643,7 @@ func TestIngestDelayLimit(t *testing.T) {
 		{ramp, Stats{L0FileCount: 21}},
 		{ramp * 2, Stats{L0FileCount: 22}},
 		{max, Stats{L0FileCount: 55}},
-		{0, Stats{PendingCompactionBytesEstimate: 20 << 30}},
+		{0, Stats{PendingCompactionBytesEstimate: (2 << 30) - 1}},
 		{max, Stats{L0FileCount: 25, PendingCompactionBytesEstimate: 80 << 30}},
 		{max, Stats{L0FileCount: 35, PendingCompactionBytesEstimate: 20 << 30}},
 	} {

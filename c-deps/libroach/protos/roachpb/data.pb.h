@@ -1006,47 +1006,84 @@ class ChangeReplicasTrigger : public ::google::protobuf::MessageLite /* @@protoc
 
   // accessors -------------------------------------------------------
 
-  int updated_replicas_size() const;
-  void clear_updated_replicas();
-  static const int kUpdatedReplicasFieldNumber = 3;
-  ::cockroach::roachpb::ReplicaDescriptor* mutable_updated_replicas(int index);
+  int deprecated_updated_replicas_size() const;
+  void clear_deprecated_updated_replicas();
+  static const int kDeprecatedUpdatedReplicasFieldNumber = 3;
+  ::cockroach::roachpb::ReplicaDescriptor* mutable_deprecated_updated_replicas(int index);
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >*
-      mutable_updated_replicas();
-  const ::cockroach::roachpb::ReplicaDescriptor& updated_replicas(int index) const;
-  ::cockroach::roachpb::ReplicaDescriptor* add_updated_replicas();
+      mutable_deprecated_updated_replicas();
+  const ::cockroach::roachpb::ReplicaDescriptor& deprecated_updated_replicas(int index) const;
+  ::cockroach::roachpb::ReplicaDescriptor* add_deprecated_updated_replicas();
   const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >&
-      updated_replicas() const;
+      deprecated_updated_replicas() const;
 
-  bool has_replica() const;
-  void clear_replica();
-  static const int kReplicaFieldNumber = 2;
+  int internal_added_replicas_size() const;
+  void clear_internal_added_replicas();
+  static const int kInternalAddedReplicasFieldNumber = 6;
+  ::cockroach::roachpb::ReplicaDescriptor* mutable_internal_added_replicas(int index);
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >*
+      mutable_internal_added_replicas();
+  const ::cockroach::roachpb::ReplicaDescriptor& internal_added_replicas(int index) const;
+  ::cockroach::roachpb::ReplicaDescriptor* add_internal_added_replicas();
+  const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >&
+      internal_added_replicas() const;
+
+  int internal_removed_replicas_size() const;
+  void clear_internal_removed_replicas();
+  static const int kInternalRemovedReplicasFieldNumber = 7;
+  ::cockroach::roachpb::ReplicaDescriptor* mutable_internal_removed_replicas(int index);
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >*
+      mutable_internal_removed_replicas();
+  const ::cockroach::roachpb::ReplicaDescriptor& internal_removed_replicas(int index) const;
+  ::cockroach::roachpb::ReplicaDescriptor* add_internal_removed_replicas();
+  const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >&
+      internal_removed_replicas() const;
+
+  bool has_deprecated_replica() const;
+  void clear_deprecated_replica();
+  static const int kDeprecatedReplicaFieldNumber = 2;
   private:
-  const ::cockroach::roachpb::ReplicaDescriptor& _internal_replica() const;
+  const ::cockroach::roachpb::ReplicaDescriptor& _internal_deprecated_replica() const;
   public:
-  const ::cockroach::roachpb::ReplicaDescriptor& replica() const;
-  ::cockroach::roachpb::ReplicaDescriptor* release_replica();
-  ::cockroach::roachpb::ReplicaDescriptor* mutable_replica();
-  void set_allocated_replica(::cockroach::roachpb::ReplicaDescriptor* replica);
+  const ::cockroach::roachpb::ReplicaDescriptor& deprecated_replica() const;
+  ::cockroach::roachpb::ReplicaDescriptor* release_deprecated_replica();
+  ::cockroach::roachpb::ReplicaDescriptor* mutable_deprecated_replica();
+  void set_allocated_deprecated_replica(::cockroach::roachpb::ReplicaDescriptor* deprecated_replica);
 
-  // .cockroach.roachpb.ReplicaChangeType change_type = 1;
-  void clear_change_type();
-  static const int kChangeTypeFieldNumber = 1;
-  ::cockroach::roachpb::ReplicaChangeType change_type() const;
-  void set_change_type(::cockroach::roachpb::ReplicaChangeType value);
+  // .cockroach.roachpb.RangeDescriptor desc = 5;
+  bool has_desc() const;
+  void clear_desc();
+  static const int kDescFieldNumber = 5;
+  private:
+  const ::cockroach::roachpb::RangeDescriptor& _internal_desc() const;
+  public:
+  const ::cockroach::roachpb::RangeDescriptor& desc() const;
+  ::cockroach::roachpb::RangeDescriptor* release_desc();
+  ::cockroach::roachpb::RangeDescriptor* mutable_desc();
+  void set_allocated_desc(::cockroach::roachpb::RangeDescriptor* desc);
 
-  void clear_next_replica_id();
-  static const int kNextReplicaIdFieldNumber = 4;
-  ::google::protobuf::int32 next_replica_id() const;
-  void set_next_replica_id(::google::protobuf::int32 value);
+  // .cockroach.roachpb.ReplicaChangeType deprecated_change_type = 1;
+  void clear_deprecated_change_type();
+  static const int kDeprecatedChangeTypeFieldNumber = 1;
+  ::cockroach::roachpb::ReplicaChangeType deprecated_change_type() const;
+  void set_deprecated_change_type(::cockroach::roachpb::ReplicaChangeType value);
+
+  void clear_deprecated_next_replica_id();
+  static const int kDeprecatedNextReplicaIdFieldNumber = 4;
+  ::google::protobuf::int32 deprecated_next_replica_id() const;
+  void set_deprecated_next_replica_id(::google::protobuf::int32 value);
 
   // @@protoc_insertion_point(class_scope:cockroach.roachpb.ChangeReplicasTrigger)
  private:
 
   ::google::protobuf::internal::InternalMetadataWithArenaLite _internal_metadata_;
-  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor > updated_replicas_;
-  ::cockroach::roachpb::ReplicaDescriptor* replica_;
-  int change_type_;
-  ::google::protobuf::int32 next_replica_id_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor > deprecated_updated_replicas_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor > internal_added_replicas_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor > internal_removed_replicas_;
+  ::cockroach::roachpb::ReplicaDescriptor* deprecated_replica_;
+  ::cockroach::roachpb::RangeDescriptor* desc_;
+  int deprecated_change_type_;
+  ::google::protobuf::int32 deprecated_next_replica_id_;
   mutable ::google::protobuf::internal::CachedSize _cached_size_;
   friend struct ::protobuf_roachpb_2fdata_2eproto::TableStruct;
 };
@@ -1251,7 +1288,6 @@ class StickyBitTrigger : public ::google::protobuf::MessageLite /* @@protoc_inse
 
   // accessors -------------------------------------------------------
 
-  // .cockroach.util.hlc.Timestamp sticky_bit = 1;
   bool has_sticky_bit() const;
   void clear_sticky_bit();
   static const int kStickyBitFieldNumber = 1;
@@ -1720,16 +1756,16 @@ class Transaction : public ::google::protobuf::MessageLite /* @@protoc_insertion
   ::cockroach::util::hlc::Timestamp* mutable_max_timestamp();
   void set_allocated_max_timestamp(::cockroach::util::hlc::Timestamp* max_timestamp);
 
-  bool has_epoch_zero_timestamp() const;
-  void clear_epoch_zero_timestamp();
-  static const int kEpochZeroTimestampFieldNumber = 14;
+  bool has_deprecated_min_timestamp() const;
+  void clear_deprecated_min_timestamp();
+  static const int kDeprecatedMinTimestampFieldNumber = 14;
   private:
-  const ::cockroach::util::hlc::Timestamp& _internal_epoch_zero_timestamp() const;
+  const ::cockroach::util::hlc::Timestamp& _internal_deprecated_min_timestamp() const;
   public:
-  const ::cockroach::util::hlc::Timestamp& epoch_zero_timestamp() const;
-  ::cockroach::util::hlc::Timestamp* release_epoch_zero_timestamp();
-  ::cockroach::util::hlc::Timestamp* mutable_epoch_zero_timestamp();
-  void set_allocated_epoch_zero_timestamp(::cockroach::util::hlc::Timestamp* epoch_zero_timestamp);
+  const ::cockroach::util::hlc::Timestamp& deprecated_min_timestamp() const;
+  ::cockroach::util::hlc::Timestamp* release_deprecated_min_timestamp();
+  ::cockroach::util::hlc::Timestamp* mutable_deprecated_min_timestamp();
+  void set_allocated_deprecated_min_timestamp(::cockroach::util::hlc::Timestamp* deprecated_min_timestamp);
 
   bool has_refreshed_timestamp() const;
   void clear_refreshed_timestamp();
@@ -1748,23 +1784,17 @@ class Transaction : public ::google::protobuf::MessageLite /* @@protoc_insertion
   ::cockroach::roachpb::TransactionStatus status() const;
   void set_status(::cockroach::roachpb::TransactionStatus value);
 
-  // bool deprecated_writing = 9;
-  void clear_deprecated_writing();
-  static const int kDeprecatedWritingFieldNumber = 9;
-  bool deprecated_writing() const;
-  void set_deprecated_writing(bool value);
+  // bool orig_timestamp_was_observed = 16;
+  void clear_orig_timestamp_was_observed();
+  static const int kOrigTimestampWasObservedFieldNumber = 16;
+  bool orig_timestamp_was_observed() const;
+  void set_orig_timestamp_was_observed(bool value);
 
   // bool write_too_old = 12;
   void clear_write_too_old();
   static const int kWriteTooOldFieldNumber = 12;
   bool write_too_old() const;
   void set_write_too_old(bool value);
-
-  // bool orig_timestamp_was_observed = 16;
-  void clear_orig_timestamp_was_observed();
-  static const int kOrigTimestampWasObservedFieldNumber = 16;
-  bool orig_timestamp_was_observed() const;
-  void set_orig_timestamp_was_observed(bool value);
 
   // @@protoc_insertion_point(class_scope:cockroach.roachpb.Transaction)
  private:
@@ -1778,12 +1808,11 @@ class Transaction : public ::google::protobuf::MessageLite /* @@protoc_insertion
   ::cockroach::util::hlc::Timestamp* last_heartbeat_;
   ::cockroach::util::hlc::Timestamp* orig_timestamp_;
   ::cockroach::util::hlc::Timestamp* max_timestamp_;
-  ::cockroach::util::hlc::Timestamp* epoch_zero_timestamp_;
+  ::cockroach::util::hlc::Timestamp* deprecated_min_timestamp_;
   ::cockroach::util::hlc::Timestamp* refreshed_timestamp_;
   int status_;
-  bool deprecated_writing_;
-  bool write_too_old_;
   bool orig_timestamp_was_observed_;
+  bool write_too_old_;
   mutable ::google::protobuf::internal::CachedSize _cached_size_;
   friend struct ::protobuf_roachpb_2fdata_2eproto::TableStruct;
 };
@@ -1918,17 +1947,6 @@ class TransactionRecord : public ::google::protobuf::MessageLite /* @@protoc_ins
   ::cockroach::util::hlc::Timestamp* mutable_last_heartbeat();
   void set_allocated_last_heartbeat(::cockroach::util::hlc::Timestamp* last_heartbeat);
 
-  bool has_orig_timestamp() const;
-  void clear_orig_timestamp();
-  static const int kOrigTimestampFieldNumber = 6;
-  private:
-  const ::cockroach::util::hlc::Timestamp& _internal_orig_timestamp() const;
-  public:
-  const ::cockroach::util::hlc::Timestamp& orig_timestamp() const;
-  ::cockroach::util::hlc::Timestamp* release_orig_timestamp();
-  ::cockroach::util::hlc::Timestamp* mutable_orig_timestamp();
-  void set_allocated_orig_timestamp(::cockroach::util::hlc::Timestamp* orig_timestamp);
-
   // .cockroach.roachpb.TransactionStatus status = 4;
   void clear_status();
   static const int kStatusFieldNumber = 4;
@@ -1943,7 +1961,6 @@ class TransactionRecord : public ::google::protobuf::MessageLite /* @@protoc_ins
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::SequencedWrite > in_flight_writes_;
   ::cockroach::storage::engine::enginepb::TxnMeta* meta_;
   ::cockroach::util::hlc::Timestamp* last_heartbeat_;
-  ::cockroach::util::hlc::Timestamp* orig_timestamp_;
   int status_;
   mutable ::google::protobuf::internal::CachedSize _cached_size_;
   friend struct ::protobuf_roachpb_2fdata_2eproto::TableStruct;
@@ -3340,104 +3357,204 @@ inline void MergeTrigger::set_allocated_freeze_start(::cockroach::util::hlc::Tim
 
 // ChangeReplicasTrigger
 
-// .cockroach.roachpb.ReplicaChangeType change_type = 1;
-inline void ChangeReplicasTrigger::clear_change_type() {
-  change_type_ = 0;
+// .cockroach.roachpb.ReplicaChangeType deprecated_change_type = 1;
+inline void ChangeReplicasTrigger::clear_deprecated_change_type() {
+  deprecated_change_type_ = 0;
 }
-inline ::cockroach::roachpb::ReplicaChangeType ChangeReplicasTrigger::change_type() const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.change_type)
-  return static_cast< ::cockroach::roachpb::ReplicaChangeType >(change_type_);
+inline ::cockroach::roachpb::ReplicaChangeType ChangeReplicasTrigger::deprecated_change_type() const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.deprecated_change_type)
+  return static_cast< ::cockroach::roachpb::ReplicaChangeType >(deprecated_change_type_);
 }
-inline void ChangeReplicasTrigger::set_change_type(::cockroach::roachpb::ReplicaChangeType value) {
+inline void ChangeReplicasTrigger::set_deprecated_change_type(::cockroach::roachpb::ReplicaChangeType value) {
   
-  change_type_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.roachpb.ChangeReplicasTrigger.change_type)
+  deprecated_change_type_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.roachpb.ChangeReplicasTrigger.deprecated_change_type)
 }
 
-inline bool ChangeReplicasTrigger::has_replica() const {
-  return this != internal_default_instance() && replica_ != NULL;
+inline bool ChangeReplicasTrigger::has_deprecated_replica() const {
+  return this != internal_default_instance() && deprecated_replica_ != NULL;
 }
-inline const ::cockroach::roachpb::ReplicaDescriptor& ChangeReplicasTrigger::_internal_replica() const {
-  return *replica_;
+inline const ::cockroach::roachpb::ReplicaDescriptor& ChangeReplicasTrigger::_internal_deprecated_replica() const {
+  return *deprecated_replica_;
 }
-inline const ::cockroach::roachpb::ReplicaDescriptor& ChangeReplicasTrigger::replica() const {
-  const ::cockroach::roachpb::ReplicaDescriptor* p = replica_;
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.replica)
+inline const ::cockroach::roachpb::ReplicaDescriptor& ChangeReplicasTrigger::deprecated_replica() const {
+  const ::cockroach::roachpb::ReplicaDescriptor* p = deprecated_replica_;
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.deprecated_replica)
   return p != NULL ? *p : *reinterpret_cast<const ::cockroach::roachpb::ReplicaDescriptor*>(
       &::cockroach::roachpb::_ReplicaDescriptor_default_instance_);
 }
-inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::release_replica() {
-  // @@protoc_insertion_point(field_release:cockroach.roachpb.ChangeReplicasTrigger.replica)
+inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::release_deprecated_replica() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.ChangeReplicasTrigger.deprecated_replica)
   
-  ::cockroach::roachpb::ReplicaDescriptor* temp = replica_;
-  replica_ = NULL;
+  ::cockroach::roachpb::ReplicaDescriptor* temp = deprecated_replica_;
+  deprecated_replica_ = NULL;
   return temp;
 }
-inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::mutable_replica() {
+inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::mutable_deprecated_replica() {
   
-  if (replica_ == NULL) {
+  if (deprecated_replica_ == NULL) {
     auto* p = CreateMaybeMessage<::cockroach::roachpb::ReplicaDescriptor>(GetArenaNoVirtual());
-    replica_ = p;
+    deprecated_replica_ = p;
   }
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.ChangeReplicasTrigger.replica)
-  return replica_;
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.ChangeReplicasTrigger.deprecated_replica)
+  return deprecated_replica_;
 }
-inline void ChangeReplicasTrigger::set_allocated_replica(::cockroach::roachpb::ReplicaDescriptor* replica) {
+inline void ChangeReplicasTrigger::set_allocated_deprecated_replica(::cockroach::roachpb::ReplicaDescriptor* deprecated_replica) {
   ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
   if (message_arena == NULL) {
-    delete reinterpret_cast< ::google::protobuf::MessageLite*>(replica_);
+    delete reinterpret_cast< ::google::protobuf::MessageLite*>(deprecated_replica_);
   }
-  if (replica) {
+  if (deprecated_replica) {
     ::google::protobuf::Arena* submessage_arena = NULL;
     if (message_arena != submessage_arena) {
-      replica = ::google::protobuf::internal::GetOwnedMessage(
-          message_arena, replica, submessage_arena);
+      deprecated_replica = ::google::protobuf::internal::GetOwnedMessage(
+          message_arena, deprecated_replica, submessage_arena);
     }
     
   } else {
     
   }
-  replica_ = replica;
-  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.ChangeReplicasTrigger.replica)
+  deprecated_replica_ = deprecated_replica;
+  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.ChangeReplicasTrigger.deprecated_replica)
 }
 
-inline int ChangeReplicasTrigger::updated_replicas_size() const {
-  return updated_replicas_.size();
+inline int ChangeReplicasTrigger::deprecated_updated_replicas_size() const {
+  return deprecated_updated_replicas_.size();
 }
-inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::mutable_updated_replicas(int index) {
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.ChangeReplicasTrigger.updated_replicas)
-  return updated_replicas_.Mutable(index);
+inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::mutable_deprecated_updated_replicas(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.ChangeReplicasTrigger.deprecated_updated_replicas)
+  return deprecated_updated_replicas_.Mutable(index);
 }
 inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >*
-ChangeReplicasTrigger::mutable_updated_replicas() {
-  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.ChangeReplicasTrigger.updated_replicas)
-  return &updated_replicas_;
+ChangeReplicasTrigger::mutable_deprecated_updated_replicas() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.ChangeReplicasTrigger.deprecated_updated_replicas)
+  return &deprecated_updated_replicas_;
 }
-inline const ::cockroach::roachpb::ReplicaDescriptor& ChangeReplicasTrigger::updated_replicas(int index) const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.updated_replicas)
-  return updated_replicas_.Get(index);
+inline const ::cockroach::roachpb::ReplicaDescriptor& ChangeReplicasTrigger::deprecated_updated_replicas(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.deprecated_updated_replicas)
+  return deprecated_updated_replicas_.Get(index);
 }
-inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::add_updated_replicas() {
-  // @@protoc_insertion_point(field_add:cockroach.roachpb.ChangeReplicasTrigger.updated_replicas)
-  return updated_replicas_.Add();
+inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::add_deprecated_updated_replicas() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.ChangeReplicasTrigger.deprecated_updated_replicas)
+  return deprecated_updated_replicas_.Add();
 }
 inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >&
-ChangeReplicasTrigger::updated_replicas() const {
-  // @@protoc_insertion_point(field_list:cockroach.roachpb.ChangeReplicasTrigger.updated_replicas)
-  return updated_replicas_;
+ChangeReplicasTrigger::deprecated_updated_replicas() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.ChangeReplicasTrigger.deprecated_updated_replicas)
+  return deprecated_updated_replicas_;
 }
 
-inline void ChangeReplicasTrigger::clear_next_replica_id() {
-  next_replica_id_ = 0;
+inline void ChangeReplicasTrigger::clear_deprecated_next_replica_id() {
+  deprecated_next_replica_id_ = 0;
 }
-inline ::google::protobuf::int32 ChangeReplicasTrigger::next_replica_id() const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.next_replica_id)
-  return next_replica_id_;
+inline ::google::protobuf::int32 ChangeReplicasTrigger::deprecated_next_replica_id() const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.deprecated_next_replica_id)
+  return deprecated_next_replica_id_;
 }
-inline void ChangeReplicasTrigger::set_next_replica_id(::google::protobuf::int32 value) {
+inline void ChangeReplicasTrigger::set_deprecated_next_replica_id(::google::protobuf::int32 value) {
   
-  next_replica_id_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.roachpb.ChangeReplicasTrigger.next_replica_id)
+  deprecated_next_replica_id_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.roachpb.ChangeReplicasTrigger.deprecated_next_replica_id)
+}
+
+// .cockroach.roachpb.RangeDescriptor desc = 5;
+inline bool ChangeReplicasTrigger::has_desc() const {
+  return this != internal_default_instance() && desc_ != NULL;
+}
+inline const ::cockroach::roachpb::RangeDescriptor& ChangeReplicasTrigger::_internal_desc() const {
+  return *desc_;
+}
+inline const ::cockroach::roachpb::RangeDescriptor& ChangeReplicasTrigger::desc() const {
+  const ::cockroach::roachpb::RangeDescriptor* p = desc_;
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.desc)
+  return p != NULL ? *p : *reinterpret_cast<const ::cockroach::roachpb::RangeDescriptor*>(
+      &::cockroach::roachpb::_RangeDescriptor_default_instance_);
+}
+inline ::cockroach::roachpb::RangeDescriptor* ChangeReplicasTrigger::release_desc() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.ChangeReplicasTrigger.desc)
+  
+  ::cockroach::roachpb::RangeDescriptor* temp = desc_;
+  desc_ = NULL;
+  return temp;
+}
+inline ::cockroach::roachpb::RangeDescriptor* ChangeReplicasTrigger::mutable_desc() {
+  
+  if (desc_ == NULL) {
+    auto* p = CreateMaybeMessage<::cockroach::roachpb::RangeDescriptor>(GetArenaNoVirtual());
+    desc_ = p;
+  }
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.ChangeReplicasTrigger.desc)
+  return desc_;
+}
+inline void ChangeReplicasTrigger::set_allocated_desc(::cockroach::roachpb::RangeDescriptor* desc) {
+  ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
+  if (message_arena == NULL) {
+    delete reinterpret_cast< ::google::protobuf::MessageLite*>(desc_);
+  }
+  if (desc) {
+    ::google::protobuf::Arena* submessage_arena = NULL;
+    if (message_arena != submessage_arena) {
+      desc = ::google::protobuf::internal::GetOwnedMessage(
+          message_arena, desc, submessage_arena);
+    }
+    
+  } else {
+    
+  }
+  desc_ = desc;
+  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.ChangeReplicasTrigger.desc)
+}
+
+inline int ChangeReplicasTrigger::internal_added_replicas_size() const {
+  return internal_added_replicas_.size();
+}
+inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::mutable_internal_added_replicas(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.ChangeReplicasTrigger.internal_added_replicas)
+  return internal_added_replicas_.Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >*
+ChangeReplicasTrigger::mutable_internal_added_replicas() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.ChangeReplicasTrigger.internal_added_replicas)
+  return &internal_added_replicas_;
+}
+inline const ::cockroach::roachpb::ReplicaDescriptor& ChangeReplicasTrigger::internal_added_replicas(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.internal_added_replicas)
+  return internal_added_replicas_.Get(index);
+}
+inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::add_internal_added_replicas() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.ChangeReplicasTrigger.internal_added_replicas)
+  return internal_added_replicas_.Add();
+}
+inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >&
+ChangeReplicasTrigger::internal_added_replicas() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.ChangeReplicasTrigger.internal_added_replicas)
+  return internal_added_replicas_;
+}
+
+inline int ChangeReplicasTrigger::internal_removed_replicas_size() const {
+  return internal_removed_replicas_.size();
+}
+inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::mutable_internal_removed_replicas(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.ChangeReplicasTrigger.internal_removed_replicas)
+  return internal_removed_replicas_.Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >*
+ChangeReplicasTrigger::mutable_internal_removed_replicas() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.ChangeReplicasTrigger.internal_removed_replicas)
+  return &internal_removed_replicas_;
+}
+inline const ::cockroach::roachpb::ReplicaDescriptor& ChangeReplicasTrigger::internal_removed_replicas(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ChangeReplicasTrigger.internal_removed_replicas)
+  return internal_removed_replicas_.Get(index);
+}
+inline ::cockroach::roachpb::ReplicaDescriptor* ChangeReplicasTrigger::add_internal_removed_replicas() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.ChangeReplicasTrigger.internal_removed_replicas)
+  return internal_removed_replicas_.Add();
+}
+inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor >&
+ChangeReplicasTrigger::internal_removed_replicas() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.ChangeReplicasTrigger.internal_removed_replicas)
+  return internal_removed_replicas_;
 }
 
 // -------------------------------------------------------------------
@@ -3516,7 +3633,6 @@ inline void ModifiedSpanTrigger::set_allocated_node_liveness_span(::cockroach::r
 
 // StickyBitTrigger
 
-// .cockroach.util.hlc.Timestamp sticky_bit = 1;
 inline bool StickyBitTrigger::has_sticky_bit() const {
   return this != internal_default_instance() && sticky_bit_ != NULL;
 }
@@ -4114,51 +4230,18 @@ inline void Transaction::set_allocated_orig_timestamp(::cockroach::util::hlc::Ti
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.Transaction.orig_timestamp)
 }
 
-inline bool Transaction::has_max_timestamp() const {
-  return this != internal_default_instance() && max_timestamp_ != NULL;
+// bool orig_timestamp_was_observed = 16;
+inline void Transaction::clear_orig_timestamp_was_observed() {
+  orig_timestamp_was_observed_ = false;
 }
-inline const ::cockroach::util::hlc::Timestamp& Transaction::_internal_max_timestamp() const {
-  return *max_timestamp_;
+inline bool Transaction::orig_timestamp_was_observed() const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.orig_timestamp_was_observed)
+  return orig_timestamp_was_observed_;
 }
-inline const ::cockroach::util::hlc::Timestamp& Transaction::max_timestamp() const {
-  const ::cockroach::util::hlc::Timestamp* p = max_timestamp_;
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.max_timestamp)
-  return p != NULL ? *p : *reinterpret_cast<const ::cockroach::util::hlc::Timestamp*>(
-      &::cockroach::util::hlc::_Timestamp_default_instance_);
-}
-inline ::cockroach::util::hlc::Timestamp* Transaction::release_max_timestamp() {
-  // @@protoc_insertion_point(field_release:cockroach.roachpb.Transaction.max_timestamp)
+inline void Transaction::set_orig_timestamp_was_observed(bool value) {
   
-  ::cockroach::util::hlc::Timestamp* temp = max_timestamp_;
-  max_timestamp_ = NULL;
-  return temp;
-}
-inline ::cockroach::util::hlc::Timestamp* Transaction::mutable_max_timestamp() {
-  
-  if (max_timestamp_ == NULL) {
-    auto* p = CreateMaybeMessage<::cockroach::util::hlc::Timestamp>(GetArenaNoVirtual());
-    max_timestamp_ = p;
-  }
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.Transaction.max_timestamp)
-  return max_timestamp_;
-}
-inline void Transaction::set_allocated_max_timestamp(::cockroach::util::hlc::Timestamp* max_timestamp) {
-  ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
-  if (message_arena == NULL) {
-    delete reinterpret_cast< ::google::protobuf::MessageLite*>(max_timestamp_);
-  }
-  if (max_timestamp) {
-    ::google::protobuf::Arena* submessage_arena = NULL;
-    if (message_arena != submessage_arena) {
-      max_timestamp = ::google::protobuf::internal::GetOwnedMessage(
-          message_arena, max_timestamp, submessage_arena);
-    }
-    
-  } else {
-    
-  }
-  max_timestamp_ = max_timestamp;
-  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.Transaction.max_timestamp)
+  orig_timestamp_was_observed_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.roachpb.Transaction.orig_timestamp_was_observed)
 }
 
 inline bool Transaction::has_refreshed_timestamp() const {
@@ -4208,6 +4291,100 @@ inline void Transaction::set_allocated_refreshed_timestamp(::cockroach::util::hl
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.Transaction.refreshed_timestamp)
 }
 
+inline bool Transaction::has_deprecated_min_timestamp() const {
+  return this != internal_default_instance() && deprecated_min_timestamp_ != NULL;
+}
+inline const ::cockroach::util::hlc::Timestamp& Transaction::_internal_deprecated_min_timestamp() const {
+  return *deprecated_min_timestamp_;
+}
+inline const ::cockroach::util::hlc::Timestamp& Transaction::deprecated_min_timestamp() const {
+  const ::cockroach::util::hlc::Timestamp* p = deprecated_min_timestamp_;
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.deprecated_min_timestamp)
+  return p != NULL ? *p : *reinterpret_cast<const ::cockroach::util::hlc::Timestamp*>(
+      &::cockroach::util::hlc::_Timestamp_default_instance_);
+}
+inline ::cockroach::util::hlc::Timestamp* Transaction::release_deprecated_min_timestamp() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.Transaction.deprecated_min_timestamp)
+  
+  ::cockroach::util::hlc::Timestamp* temp = deprecated_min_timestamp_;
+  deprecated_min_timestamp_ = NULL;
+  return temp;
+}
+inline ::cockroach::util::hlc::Timestamp* Transaction::mutable_deprecated_min_timestamp() {
+  
+  if (deprecated_min_timestamp_ == NULL) {
+    auto* p = CreateMaybeMessage<::cockroach::util::hlc::Timestamp>(GetArenaNoVirtual());
+    deprecated_min_timestamp_ = p;
+  }
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.Transaction.deprecated_min_timestamp)
+  return deprecated_min_timestamp_;
+}
+inline void Transaction::set_allocated_deprecated_min_timestamp(::cockroach::util::hlc::Timestamp* deprecated_min_timestamp) {
+  ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
+  if (message_arena == NULL) {
+    delete reinterpret_cast< ::google::protobuf::MessageLite*>(deprecated_min_timestamp_);
+  }
+  if (deprecated_min_timestamp) {
+    ::google::protobuf::Arena* submessage_arena = NULL;
+    if (message_arena != submessage_arena) {
+      deprecated_min_timestamp = ::google::protobuf::internal::GetOwnedMessage(
+          message_arena, deprecated_min_timestamp, submessage_arena);
+    }
+    
+  } else {
+    
+  }
+  deprecated_min_timestamp_ = deprecated_min_timestamp;
+  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.Transaction.deprecated_min_timestamp)
+}
+
+inline bool Transaction::has_max_timestamp() const {
+  return this != internal_default_instance() && max_timestamp_ != NULL;
+}
+inline const ::cockroach::util::hlc::Timestamp& Transaction::_internal_max_timestamp() const {
+  return *max_timestamp_;
+}
+inline const ::cockroach::util::hlc::Timestamp& Transaction::max_timestamp() const {
+  const ::cockroach::util::hlc::Timestamp* p = max_timestamp_;
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.max_timestamp)
+  return p != NULL ? *p : *reinterpret_cast<const ::cockroach::util::hlc::Timestamp*>(
+      &::cockroach::util::hlc::_Timestamp_default_instance_);
+}
+inline ::cockroach::util::hlc::Timestamp* Transaction::release_max_timestamp() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.Transaction.max_timestamp)
+  
+  ::cockroach::util::hlc::Timestamp* temp = max_timestamp_;
+  max_timestamp_ = NULL;
+  return temp;
+}
+inline ::cockroach::util::hlc::Timestamp* Transaction::mutable_max_timestamp() {
+  
+  if (max_timestamp_ == NULL) {
+    auto* p = CreateMaybeMessage<::cockroach::util::hlc::Timestamp>(GetArenaNoVirtual());
+    max_timestamp_ = p;
+  }
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.Transaction.max_timestamp)
+  return max_timestamp_;
+}
+inline void Transaction::set_allocated_max_timestamp(::cockroach::util::hlc::Timestamp* max_timestamp) {
+  ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
+  if (message_arena == NULL) {
+    delete reinterpret_cast< ::google::protobuf::MessageLite*>(max_timestamp_);
+  }
+  if (max_timestamp) {
+    ::google::protobuf::Arena* submessage_arena = NULL;
+    if (message_arena != submessage_arena) {
+      max_timestamp = ::google::protobuf::internal::GetOwnedMessage(
+          message_arena, max_timestamp, submessage_arena);
+    }
+    
+  } else {
+    
+  }
+  max_timestamp_ = max_timestamp;
+  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.Transaction.max_timestamp)
+}
+
 inline int Transaction::observed_timestamps_size() const {
   return observed_timestamps_.size();
 }
@@ -4235,20 +4412,6 @@ inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Observe
 Transaction::observed_timestamps() const {
   // @@protoc_insertion_point(field_list:cockroach.roachpb.Transaction.observed_timestamps)
   return observed_timestamps_;
-}
-
-// bool deprecated_writing = 9;
-inline void Transaction::clear_deprecated_writing() {
-  deprecated_writing_ = false;
-}
-inline bool Transaction::deprecated_writing() const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.deprecated_writing)
-  return deprecated_writing_;
-}
-inline void Transaction::set_deprecated_writing(bool value) {
-  
-  deprecated_writing_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.roachpb.Transaction.deprecated_writing)
 }
 
 // bool write_too_old = 12;
@@ -4321,67 +4484,6 @@ inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::Sequenc
 Transaction::in_flight_writes() const {
   // @@protoc_insertion_point(field_list:cockroach.roachpb.Transaction.in_flight_writes)
   return in_flight_writes_;
-}
-
-inline bool Transaction::has_epoch_zero_timestamp() const {
-  return this != internal_default_instance() && epoch_zero_timestamp_ != NULL;
-}
-inline const ::cockroach::util::hlc::Timestamp& Transaction::_internal_epoch_zero_timestamp() const {
-  return *epoch_zero_timestamp_;
-}
-inline const ::cockroach::util::hlc::Timestamp& Transaction::epoch_zero_timestamp() const {
-  const ::cockroach::util::hlc::Timestamp* p = epoch_zero_timestamp_;
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.epoch_zero_timestamp)
-  return p != NULL ? *p : *reinterpret_cast<const ::cockroach::util::hlc::Timestamp*>(
-      &::cockroach::util::hlc::_Timestamp_default_instance_);
-}
-inline ::cockroach::util::hlc::Timestamp* Transaction::release_epoch_zero_timestamp() {
-  // @@protoc_insertion_point(field_release:cockroach.roachpb.Transaction.epoch_zero_timestamp)
-  
-  ::cockroach::util::hlc::Timestamp* temp = epoch_zero_timestamp_;
-  epoch_zero_timestamp_ = NULL;
-  return temp;
-}
-inline ::cockroach::util::hlc::Timestamp* Transaction::mutable_epoch_zero_timestamp() {
-  
-  if (epoch_zero_timestamp_ == NULL) {
-    auto* p = CreateMaybeMessage<::cockroach::util::hlc::Timestamp>(GetArenaNoVirtual());
-    epoch_zero_timestamp_ = p;
-  }
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.Transaction.epoch_zero_timestamp)
-  return epoch_zero_timestamp_;
-}
-inline void Transaction::set_allocated_epoch_zero_timestamp(::cockroach::util::hlc::Timestamp* epoch_zero_timestamp) {
-  ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
-  if (message_arena == NULL) {
-    delete reinterpret_cast< ::google::protobuf::MessageLite*>(epoch_zero_timestamp_);
-  }
-  if (epoch_zero_timestamp) {
-    ::google::protobuf::Arena* submessage_arena = NULL;
-    if (message_arena != submessage_arena) {
-      epoch_zero_timestamp = ::google::protobuf::internal::GetOwnedMessage(
-          message_arena, epoch_zero_timestamp, submessage_arena);
-    }
-    
-  } else {
-    
-  }
-  epoch_zero_timestamp_ = epoch_zero_timestamp;
-  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.Transaction.epoch_zero_timestamp)
-}
-
-// bool orig_timestamp_was_observed = 16;
-inline void Transaction::clear_orig_timestamp_was_observed() {
-  orig_timestamp_was_observed_ = false;
-}
-inline bool Transaction::orig_timestamp_was_observed() const {
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.Transaction.orig_timestamp_was_observed)
-  return orig_timestamp_was_observed_;
-}
-inline void Transaction::set_orig_timestamp_was_observed(bool value) {
-  
-  orig_timestamp_was_observed_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.roachpb.Transaction.orig_timestamp_was_observed)
 }
 
 // -------------------------------------------------------------------
@@ -4494,53 +4596,6 @@ inline void TransactionRecord::set_allocated_last_heartbeat(::cockroach::util::h
   }
   last_heartbeat_ = last_heartbeat;
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.TransactionRecord.last_heartbeat)
-}
-
-inline bool TransactionRecord::has_orig_timestamp() const {
-  return this != internal_default_instance() && orig_timestamp_ != NULL;
-}
-inline const ::cockroach::util::hlc::Timestamp& TransactionRecord::_internal_orig_timestamp() const {
-  return *orig_timestamp_;
-}
-inline const ::cockroach::util::hlc::Timestamp& TransactionRecord::orig_timestamp() const {
-  const ::cockroach::util::hlc::Timestamp* p = orig_timestamp_;
-  // @@protoc_insertion_point(field_get:cockroach.roachpb.TransactionRecord.orig_timestamp)
-  return p != NULL ? *p : *reinterpret_cast<const ::cockroach::util::hlc::Timestamp*>(
-      &::cockroach::util::hlc::_Timestamp_default_instance_);
-}
-inline ::cockroach::util::hlc::Timestamp* TransactionRecord::release_orig_timestamp() {
-  // @@protoc_insertion_point(field_release:cockroach.roachpb.TransactionRecord.orig_timestamp)
-  
-  ::cockroach::util::hlc::Timestamp* temp = orig_timestamp_;
-  orig_timestamp_ = NULL;
-  return temp;
-}
-inline ::cockroach::util::hlc::Timestamp* TransactionRecord::mutable_orig_timestamp() {
-  
-  if (orig_timestamp_ == NULL) {
-    auto* p = CreateMaybeMessage<::cockroach::util::hlc::Timestamp>(GetArenaNoVirtual());
-    orig_timestamp_ = p;
-  }
-  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.TransactionRecord.orig_timestamp)
-  return orig_timestamp_;
-}
-inline void TransactionRecord::set_allocated_orig_timestamp(::cockroach::util::hlc::Timestamp* orig_timestamp) {
-  ::google::protobuf::Arena* message_arena = GetArenaNoVirtual();
-  if (message_arena == NULL) {
-    delete reinterpret_cast< ::google::protobuf::MessageLite*>(orig_timestamp_);
-  }
-  if (orig_timestamp) {
-    ::google::protobuf::Arena* submessage_arena = NULL;
-    if (message_arena != submessage_arena) {
-      orig_timestamp = ::google::protobuf::internal::GetOwnedMessage(
-          message_arena, orig_timestamp, submessage_arena);
-    }
-    
-  } else {
-    
-  }
-  orig_timestamp_ = orig_timestamp;
-  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.TransactionRecord.orig_timestamp)
 }
 
 inline int TransactionRecord::intent_spans_size() const {

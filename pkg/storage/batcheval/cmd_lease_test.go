@@ -1,17 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -21,9 +16,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/stretchr/testify/require"
 )
 
 // TestLeaseTransferWithPipelinedWrite verifies that pipelined writes
@@ -65,7 +62,7 @@ func TestLeaseTransferWithPipelinedWrite(t *testing.T) {
 					defer func() {
 						if tx != nil {
 							if err := tx.Rollback(); err != nil {
-								log.Warningf(ctx, "error rolling back: %s", err)
+								log.Warningf(ctx, "error rolling back: %+v", err)
 							}
 						}
 					}()
@@ -104,8 +101,41 @@ func TestLeaseTransferWithPipelinedWrite(t *testing.T) {
 			t.Fatal("timed out")
 		case err := <-workerErrCh:
 			if err != nil {
-				t.Fatalf("worker failed: %s", err)
+				t.Fatalf("worker failed: %+v", err)
 			}
 		}
 	}
+}
+
+func TestLeaseCommandLearnerReplica(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	const voterStoreID, learnerStoreID roachpb.StoreID = 1, 2
+	replicas := []roachpb.ReplicaDescriptor{
+		{StoreID: voterStoreID, Type: roachpb.ReplicaTypeVoterFull()},
+		{StoreID: learnerStoreID, Type: roachpb.ReplicaTypeLearner()},
+	}
+	desc := roachpb.RangeDescriptor{}
+	desc.SetReplicas(roachpb.MakeReplicaDescriptors(replicas))
+	cArgs := CommandArgs{
+		EvalCtx: &mockEvalCtx{
+			storeID: learnerStoreID,
+			desc:    &desc,
+		},
+		Args: &roachpb.TransferLeaseRequest{},
+	}
+
+	// Learners are not allowed to become leaseholders for now, see the comments
+	// in TransferLease and RequestLease.
+	_, err := TransferLease(ctx, nil, cArgs, nil)
+	require.EqualError(t, err, `replica of type LEARNER cannot hold lease`)
+
+	cArgs.Args = &roachpb.RequestLeaseRequest{}
+	_, err = RequestLease(ctx, nil, cArgs, nil)
+
+	const exp = `cannot replace lease repl=(n0,s0):? seq=0 start=0.000000000,0 exp=<nil> ` +
+		`with repl=(n0,s0):? seq=0 start=0.000000000,0 exp=<nil>: ` +
+		`replica of type LEARNER cannot hold lease`
+	require.EqualError(t, err, exp)
 }

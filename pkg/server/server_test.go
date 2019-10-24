@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -33,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -77,7 +74,7 @@ func TestSelfBootstrap(t *testing.T) {
 func TestHealthCheck(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	cfg := config.DefaultZoneConfig()
+	cfg := zonepb.DefaultZoneConfig()
 	cfg.NumReplicas = proto.Int32(1)
 	s, err := serverutils.StartServerRaw(base.TestServerArgs{
 		Knobs: base.TestingKnobs{
@@ -319,7 +316,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	ts := s.(*TestServer)
 	tds := db.NonTransactionalSender()
 
-	if err := ts.node.storeCfg.DB.AdminSplit(ctx, "m", "m", true /* manual */); err != nil {
+	if err := ts.node.storeCfg.DB.AdminSplit(ctx, "m", "m", hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
 	writes := []roachpb.Key{roachpb.Key("a"), roachpb.Key("z")}
@@ -416,7 +413,7 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 			tds := db.NonTransactionalSender()
 
 			for _, sk := range tc.splitKeys {
-				if err := ts.node.storeCfg.DB.AdminSplit(ctx, sk, sk, true /* manual */); err != nil {
+				if err := ts.node.storeCfg.DB.AdminSplit(ctx, sk, sk, hlc.MaxTimestamp /* expirationTime */); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -546,9 +543,11 @@ func TestListenerFileCreation(t *testing.T) {
 	}
 
 	li := listenerInfo{
-		advertise: s.ServingAddr(),
-		http:      s.HTTPAddr(),
-		listen:    s.Addr(),
+		advertiseRPC: s.ServingRPCAddr(),
+		listenHTTP:   s.HTTPAddr(),
+		listenRPC:    s.RPCAddr(),
+		listenSQL:    s.SQLAddr(),
+		advertiseSQL: s.ServingSQLAddr(),
 	}
 	expectedFiles := li.Iter()
 

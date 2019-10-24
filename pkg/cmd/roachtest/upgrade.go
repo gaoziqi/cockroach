@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -23,7 +18,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	settings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -31,9 +25,9 @@ import (
 	"github.com/pkg/errors"
 )
 
-func registerUpgrade(r *registry) {
+func registerUpgrade(r *testRegistry) {
 	runUpgrade := func(ctx context.Context, t *test, c *cluster, oldVersion string) {
-		nodes := c.nodes
+		nodes := c.spec.NodeCount
 		goos := ifLocal(runtime.GOOS, "linux")
 
 		b, err := binfetcher.Download(ctx, binfetcher.Options{
@@ -97,6 +91,7 @@ func registerUpgrade(r *registry) {
 		}
 
 		decommissionAndStop := func(node int) error {
+			t.WorkerStatus("decomission")
 			port := fmt.Sprintf("{pgport:%d}", node)
 			// Note that the following command line needs to run against both v2.1
 			// and the current branch. Do not change it in a manner that is
@@ -104,6 +99,7 @@ func registerUpgrade(r *registry) {
 			if err := c.RunE(ctx, c.Node(node), "./cockroach quit --decommission --insecure --port="+port); err != nil {
 				return err
 			}
+			t.WorkerStatus("stop")
 			c.Stop(ctx, c.Node(node))
 			return nil
 		}
@@ -271,7 +267,7 @@ func registerUpgrade(r *registry) {
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(5),
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			pred, err := r.PredecessorVersion()
+			pred, err := PredecessorVersion(r.buildVersion)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -375,12 +371,14 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 	// upgrade mechanism (which is not inhibited by the
 	// cluster.preserve_downgrade_option cluster setting in this test.
 	var currentVersion string
-	clusterVersionUpgrade := func(newVersion string, manual bool) versionStep {
+	clusterVersionUpgrade := func(newVersion string) versionStep {
 		return versionStep{
 			clusterVersion: newVersion,
 			run: func() {
+				manual := newVersion != "" // old binary; needs hacks
+
 				func() {
-					if newVersion != "" {
+					if manual {
 						return
 					}
 					db1 := c.Conn(ctx, 1)
@@ -388,6 +386,7 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 					if err := db1.QueryRow(`SELECT crdb_internal.node_executable_version()`).Scan(&newVersion); err != nil {
 						t.Fatal(err)
 					}
+					t.l.Printf("%s: auto-resolved target version via node_executable_version()\n", newVersion)
 				}()
 				t.l.Printf("%s: cluster\n", newVersion)
 
@@ -424,7 +423,7 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 					t.l.Printf("%s: using workaround for upgrade\n", newVersion)
 				}
 
-				for i := 1; i < c.nodes; i++ {
+				for i := 1; i < c.spec.NodeCount; i++ {
 					err := retry.ForDuration(30*time.Second, func() error {
 						db := c.Conn(ctx, i)
 						defer db.Close()
@@ -464,20 +463,23 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 	steps := []versionStep{
 		// v1.1.0 is the first binary version that knows about cluster versions.
 		binaryVersionUpgrade("v1.1.9", nodes),
-		clusterVersionUpgrade("1.1", true /* manual */),
+		clusterVersionUpgrade("1.1"),
 
 		binaryVersionUpgrade("v2.0.7", nodes),
-		clusterVersionUpgrade("2.0", true /* manual */),
+		clusterVersionUpgrade("2.0"),
 
 		binaryVersionUpgrade("v2.1.2", nodes),
-		clusterVersionUpgrade("2.1", true /* manual */),
+		clusterVersionUpgrade("2.1"),
 
-		// TODO(bram): Update this to the full release version once it's out.
-		binaryVersionUpgrade("v19.1.0-rc.4", nodes),
-		clusterVersionUpgrade("19.1", false /* manual */),
+		// From now on, all version upgrade steps pass an empty version which
+		// means the test will look it up from node_executable_version().
 
+		binaryVersionUpgrade("v19.1.3", nodes),
+		clusterVersionUpgrade(""),
+
+		// HEAD gives us the main binary for this roachtest run.
 		binaryVersionUpgrade("HEAD", nodes),
-		clusterVersionUpgrade(settings.BinaryServerVersion.String(), false /* manual */),
+		clusterVersionUpgrade(""),
 	}
 
 	type feature struct {
@@ -514,9 +516,14 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 		},
 	}
 
-	testFeature := func(f feature, cv string) {
+	testFeature := func(f feature) {
 		db := c.Conn(ctx, 1)
 		defer db.Close()
+
+		var cv string
+		if err := db.QueryRowContext(ctx, `SHOW CLUSTER SETTING version`).Scan(&cv); err != nil {
+			t.Fatal(err)
+		}
 
 		minAllowedVersion, err := roachpb.ParseVersion(f.minAllowedVersion)
 		if err != nil {
@@ -571,10 +578,8 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 
 	for _, step := range steps {
 		step.run()
-		if step.clusterVersion != "" {
-			for _, feature := range features {
-				testFeature(feature, step.clusterVersion)
-			}
+		for _, feature := range features {
+			testFeature(feature)
 		}
 	}
 
@@ -589,10 +594,9 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 			t.Fatal(err)
 		}
 		if nodeVersion != currentVersion {
-			clusterVersionUpgrade(nodeVersion, false /* manual */).run()
-			for _, feature := range features {
-				testFeature(feature, nodeVersion)
-			}
+			t.Fatalf("not fully upgraded at end of test; have cluster setting at %s but node could run at %s",
+				currentVersion, nodeVersion,
+			)
 		}
 	}()
 }

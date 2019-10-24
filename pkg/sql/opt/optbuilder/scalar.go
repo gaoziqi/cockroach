@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
@@ -22,12 +18,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // buildScalar builds a set of memo groups that represent the given scalar
@@ -50,7 +49,7 @@ func (b *Builder) buildScalar(
 	// Note that GROUP BY columns cannot be reused inside an aggregate input
 	// expression (when inAgg=true) because the aggregate input expressions and
 	// grouping expressions are built as part of the same projection.
-	inGroupingContext := inScope.inGroupingContext() && !inScope.groupby.inAgg &&
+	inGroupingContext := inScope.inGroupingContext() && !inScope.inAgg &&
 		!inScope.groupby.buildingGroupingCols
 	if inGroupingContext {
 		// TODO(rytaft): This currently regenerates a string for each subexpression.
@@ -73,13 +72,38 @@ func (b *Builder) buildScalar(
 			// Non-grouping column was referenced. Note that a column that is part
 			// of a larger grouping expression would have been detected by the
 			// groupStrs checking code above.
-			panic(builderError{newGroupingError(&t.name)})
+			// Normally this would be a "column must appear in the GROUP BY clause"
+			// error. The only case where we allow this (for compatibility with
+			// Postgres) is when this column is part of a table and we are already
+			// grouping on the entire PK of that table.
+			g := inScope.groupby
+			if !b.allowImplicitGroupingColumn(t.id, g) {
+				panic(newGroupingError(&t.name))
+			}
+
+			// We add a new grouping column; these show up both in aggInScope and
+			// aggOutScope.
+			//
+			// Note that normalization rules will trim down the list of grouping
+			// columns based on FDs, so this is only for the purposes of building a
+			// valid operator.
+			aggInCol := b.addColumn(g.aggInScope, "" /* alias */, t)
+			b.finishBuildScalarRef(t, inScope, g.aggInScope, aggInCol, nil)
+			g.groupStrs[symbolicExprStr(t)] = aggInCol
+
+			g.aggOutScope.appendColumn(aggInCol)
+
+			return b.finishBuildScalarRef(t, g.aggOutScope, outScope, outCol, colRefs)
 		}
 
 		return b.finishBuildScalarRef(t, inScope, outScope, outCol, colRefs)
 
 	case *aggregateInfo:
-		return b.finishBuildScalarRef(t.col, inScope.groupby.aggOutScope, outScope, outCol, colRefs)
+		var aggOutScope *scope
+		if inScope.groupby != nil {
+			aggOutScope = inScope.groupby.aggOutScope
+		}
+		return b.finishBuildScalarRef(t.col, aggOutScope, outScope, outCol, colRefs)
 
 	case *windowInfo:
 		return b.finishBuildScalarRef(t.col, inScope, outScope, outCol, colRefs)
@@ -94,7 +118,7 @@ func (b *Builder) buildScalar(
 		arrayType := t.ResolvedType()
 		elementType := arrayType.ArrayContents()
 		if err := types.CheckArrayElementType(elementType); err != nil {
-			panic(builderError{err})
+			panic(err)
 		}
 		for i := range t.Exprs {
 			texpr := t.Exprs[i].(tree.TypedExpr)
@@ -125,7 +149,7 @@ func (b *Builder) buildScalar(
 		}
 
 		if err := types.CheckArrayElementType(typ); err != nil {
-			panic(builderError{err})
+			panic(err)
 		}
 
 		// Perform correctness checks on the outer cols, update colRefs and
@@ -273,7 +297,7 @@ func (b *Builder) buildScalar(
 
 	case *tree.IndexedVar:
 		if t.Idx < 0 || t.Idx >= len(inScope.cols) {
-			panic(pgerror.Newf(pgerror.CodeUndefinedColumnError,
+			panic(pgerror.Newf(pgcode.UndefinedColumn,
 				"invalid column ordinal: @%d", t.Idx+1))
 		}
 		out = b.factory.ConstructVariable(inScope.cols[t.Idx].id)
@@ -303,7 +327,7 @@ func (b *Builder) buildScalar(
 			// Replace placeholders with their value.
 			d, err := t.Eval(b.evalCtx)
 			if err != nil {
-				panic(builderError{err})
+				panic(err)
 			}
 			out = b.factory.ConstructConstVal(d, t.ResolvedType())
 		} else {
@@ -322,7 +346,7 @@ func (b *Builder) buildScalar(
 				// Non-grouping column was referenced. Note that a column that is part
 				// of a larger grouping expression would have been detected by the
 				// groupStrs checking code above.
-				panic(builderError{newGroupingError(&t.cols[0].name)})
+				panic(newGroupingError(&t.cols[0].name))
 			}
 			return b.finishBuildScalarRef(&t.cols[0], inScope, outScope, outCol, colRefs)
 		}
@@ -423,22 +447,22 @@ func (b *Builder) buildFunction(
 	f *tree.FuncExpr, inScope, outScope *scope, outCol *scopeColumn, colRefs *opt.ColSet,
 ) (out opt.ScalarExpr) {
 	if f.WindowDef != nil {
-		if inScope.groupby.inAgg {
-			panic(builderError{sqlbase.NewWindowInAggError()})
+		if inScope.inAgg {
+			panic(sqlbase.NewWindowInAggError())
 		}
 	}
 
 	def, err := f.Func.Resolve(b.semaCtx.SearchPath)
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
 
 	if isAggregate(def) {
-		panic(pgerror.AssertionFailedf("aggregate function should have been replaced"))
+		panic(errors.AssertionFailedf("aggregate function should have been replaced"))
 	}
 
 	if isWindow(def) {
-		panic(pgerror.AssertionFailedf("window function should have been replaced"))
+		panic(errors.AssertionFailedf("window function should have been replaced"))
 	}
 
 	args := make(memo.ScalarListExpr, len(f.Exprs))
@@ -512,15 +536,11 @@ func (b *Builder) checkSubqueryOuterCols(
 		return
 	}
 
-	if !b.IsCorrelated {
-		// Remember whether the query was correlated for the heuristic planner,
-		// to enhance error messages.
-		// TODO(knz): this can go away when the HP disappears.
-		b.IsCorrelated = true
-
-		// Register the use of correlation to telemetry.
-		// Note: we don't blindly increment the counter every time this
-		// method is called, to avoid double counting the same query.
+	// Register the use of correlation to telemetry.
+	// Note: we don't blindly increment the counter every time this
+	// method is called, to avoid double counting the same query.
+	if !b.isCorrelated {
+		b.isCorrelated = true
 		telemetry.Inc(sqltelemetry.CorrelatedSubqueryUseCounter)
 	}
 
@@ -538,13 +558,11 @@ func (b *Builder) checkSubqueryOuterCols(
 	}
 
 	// Check 1 (see function comment).
-	if b.semaCtx.Properties.IsSet(tree.RejectAggregates) && inScope.groupby.aggOutScope != nil {
-		aggCols := inScope.groupby.aggOutScope.getAggregateCols()
+	if b.semaCtx.Properties.IsSet(tree.RejectAggregates) && inScope.groupby != nil {
+		aggCols := inScope.groupby.aggregateResultCols()
 		for i := range aggCols {
-			if subqueryOuterCols.Contains(int(aggCols[i].id)) {
-				panic(builderError{
-					tree.NewInvalidFunctionUsageError(tree.AggregateClass, inScope.context),
-				})
+			if subqueryOuterCols.Contains(aggCols[i].id) {
+				panic(tree.NewInvalidFunctionUsageError(tree.AggregateClass, inScope.context))
 			}
 		}
 	}
@@ -556,9 +574,9 @@ func (b *Builder) checkSubqueryOuterCols(
 			!subqueryOuterCols.SubsetOf(inScope.groupby.aggOutScope.colSet()) {
 			subqueryOuterCols.DifferenceWith(inScope.groupby.aggOutScope.colSet())
 			colID, _ := subqueryOuterCols.Next(0)
-			col := inScope.getColumn(opt.ColumnID(colID))
+			col := inScope.getColumn(colID)
 			panic(pgerror.Newf(
-				pgerror.CodeGroupingError,
+				pgcode.Grouping,
 				"subquery uses ungrouped column \"%s\" from outer query",
 				tree.ErrString(&col.name)))
 		}
@@ -620,8 +638,10 @@ func (b *Builder) constructComparison(
 		return b.factory.ConstructJsonAllExists(left, right)
 	case tree.JSONSomeExists:
 		return b.factory.ConstructJsonSomeExists(left, right)
+	case tree.Overlaps:
+		return b.factory.ConstructOverlaps(left, right)
 	}
-	panic(pgerror.AssertionFailedf("unhandled comparison operator: %s", log.Safe(cmp)))
+	panic(errors.AssertionFailedf("unhandled comparison operator: %s", log.Safe(cmp)))
 }
 
 func (b *Builder) constructBinary(
@@ -663,7 +683,7 @@ func (b *Builder) constructBinary(
 	case tree.JSONFetchTextPath:
 		return b.factory.ConstructFetchTextPath(left, right)
 	}
-	panic(pgerror.AssertionFailedf("unhandled binary operator: %s", log.Safe(bin)))
+	panic(errors.AssertionFailedf("unhandled binary operator: %s", log.Safe(bin)))
 }
 
 func (b *Builder) constructUnary(
@@ -675,7 +695,7 @@ func (b *Builder) constructUnary(
 	case tree.UnaryComplement:
 		return b.factory.ConstructUnaryComplement(input)
 	}
-	panic(pgerror.AssertionFailedf("unhandled unary operator: %s", log.Safe(un)))
+	panic(errors.AssertionFailedf("unhandled unary operator: %s", log.Safe(un)))
 }
 
 // ScalarBuilder is a specialized variant of Builder that can be used to create
@@ -725,12 +745,12 @@ func NewScalar(
 func (sb *ScalarBuilder) Build(expr tree.TypedExpr) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			// This code allows us to propagate builder errors without adding
-			// lots of checks for `if err != nil` throughout the code. This is
-			// only possible because the code does not update shared state and does
-			// not manipulate locks.
-			if bldErr, ok := r.(builderError); ok {
-				err = bldErr
+			// This code allows us to propagate errors without adding lots of checks
+			// for `if err != nil` throughout the construction code. This is only
+			// possible because the code does not update shared state and does not
+			// manipulate locks.
+			if ok, e := errorutil.ShouldCatch(r); ok {
+				err = e
 			} else {
 				panic(r)
 			}

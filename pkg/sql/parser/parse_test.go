@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package parser_test
 
@@ -29,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
+	"github.com/cockroachdb/errors"
 )
 
 // TestParse verifies that we can parse the supplied SQL and regenerate the SQL
@@ -88,6 +85,7 @@ func TestParse(t *testing.T) {
 		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c (d)`},
 		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c.d (e)`},
 		{`CREATE INDEX ON a (b ASC, c DESC)`},
+		{`CREATE INDEX ON a (b NULLS FIRST, c ASC NULLS FIRST, d DESC NULLS LAST)`},
 		{`CREATE UNIQUE INDEX a ON b (c)`},
 		{`CREATE UNIQUE INDEX a ON b (c) STORING (d)`},
 		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d (e, f)`},
@@ -99,6 +97,7 @@ func TestParse(t *testing.T) {
 		{`CREATE INVERTED INDEX a ON b (c) INTERLEAVE IN PARENT d (e)`},
 
 		{`CREATE TABLE a ()`},
+		{`CREATE TEMPORARY TABLE a (b INT8)`},
 		{`EXPLAIN CREATE TABLE a ()`},
 		{`CREATE TABLE a (b INT8)`},
 		{`CREATE TABLE a (b INT8, c INT8)`},
@@ -256,6 +255,15 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE IF NOT EXISTS a AS SELECT * FROM b UNION SELECT * FROM c`},
 		{`CREATE TABLE a AS SELECT * FROM b UNION VALUES ('one', 1) ORDER BY c LIMIT 5`},
 		{`CREATE TABLE IF NOT EXISTS a AS SELECT * FROM b UNION VALUES ('one', 1) ORDER BY c LIMIT 5`},
+		{`CREATE TABLE a (z PRIMARY KEY) AS SELECT * FROM b`},
+		{`CREATE TABLE IF NOT EXISTS a (z PRIMARY KEY) AS SELECT * FROM b`},
+		{`CREATE TABLE a (x, y, z, PRIMARY KEY (x, y, z)) AS SELECT * FROM b`},
+		{`CREATE TABLE IF NOT EXISTS a (x, y, z, PRIMARY KEY (x, y, z)) AS SELECT * FROM b`},
+		{`CREATE TABLE a (x, FAMILY (x)) AS SELECT * FROM b`},
+		{`CREATE TABLE IF NOT EXISTS a (x, FAMILY (x)) AS SELECT * FROM b`},
+		{`CREATE TABLE a (x, y FAMILY f1) AS SELECT * FROM b`},
+		{`CREATE TABLE IF NOT EXISTS a (x, y FAMILY f1) AS SELECT * FROM b`},
+
 		{`CREATE TABLE a (b STRING COLLATE de)`},
 		{`CREATE TABLE a (b STRING(3) COLLATE de)`},
 		{`CREATE TABLE a (b STRING[] COLLATE de)`},
@@ -269,6 +277,7 @@ func TestParse(t *testing.T) {
 		{`CREATE VIEW a AS VALUES (1, 'one'), (2, 'two')`},
 		{`CREATE VIEW a (x, y) AS VALUES (1, 'one'), (2, 'two')`},
 		{`CREATE VIEW a AS TABLE b`},
+		{`CREATE TEMPORARY VIEW a AS SELECT b`},
 
 		{`CREATE SEQUENCE a`},
 		{`EXPLAIN CREATE SEQUENCE a`},
@@ -289,6 +298,7 @@ func TestParse(t *testing.T) {
 		{`CREATE SEQUENCE a INCREMENT 5 NO MAXVALUE MINVALUE 1 START 3`},
 		{`CREATE SEQUENCE a INCREMENT 5 NO CYCLE NO MAXVALUE MINVALUE 1 START 3 CACHE 1`},
 		{`CREATE SEQUENCE a VIRTUAL`},
+		{`CREATE TEMPORARY SEQUENCE a`},
 
 		{`CREATE STATISTICS a ON col1 FROM t`},
 		{`EXPLAIN CREATE STATISTICS a ON col1 FROM t`},
@@ -371,6 +381,10 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN RESUME JOBS SELECT a`},
 		{`PAUSE JOBS SELECT a`},
 		{`EXPLAIN PAUSE JOBS SELECT a`},
+		{`SHOW JOBS SELECT a`},
+		{`EXPLAIN SHOW JOBS SELECT a`},
+		{`SHOW JOBS WHEN COMPLETE SELECT a`},
+		{`EXPLAIN SHOW JOBS WHEN COMPLETE SELECT a`},
 
 		{`EXPLAIN SELECT 1`},
 		{`EXPLAIN EXPLAIN SELECT 1`},
@@ -409,7 +423,12 @@ func TestParse(t *testing.T) {
 		{`SHOW COLUMNS FROM a.b.c`},
 		{`SHOW INDEXES FROM a`},
 		{`EXPLAIN SHOW INDEXES FROM a`},
+		{`SHOW INDEXES FROM a WITH COMMENT`},
+		{`EXPLAIN SHOW INDEXES FROM a WITH COMMENT`},
 		{`SHOW INDEXES FROM a.b.c`},
+		{`SHOW INDEXES FROM a.b.c WITH COMMENT`},
+		{`SHOW INDEXES FROM DATABASE a`},
+		{`SHOW INDEXES FROM DATABASE a WITH COMMENT`},
 		{`SHOW CONSTRAINTS FROM a`},
 		{`SHOW CONSTRAINTS FROM a.b.c`},
 		{`EXPLAIN SHOW CONSTRAINTS FROM a.b.c`},
@@ -450,13 +469,18 @@ func TestParse(t *testing.T) {
 		{`SHOW STATISTICS FOR TABLE d.t`},
 		{`SHOW HISTOGRAM 123`},
 		{`EXPLAIN SHOW HISTOGRAM 123`},
-		{`SHOW EXPERIMENTAL_RANGES FROM TABLE d.t`},
-		{`EXPLAIN SHOW EXPERIMENTAL_RANGES FROM TABLE d.t`},
-		{`SHOW EXPERIMENTAL_RANGES FROM TABLE t`},
-		{`SHOW EXPERIMENTAL_RANGES FROM INDEX d.t@i`},
-		{`SHOW EXPERIMENTAL_RANGES FROM INDEX t@i`},
-		{`SHOW EXPERIMENTAL_RANGES FROM INDEX d.i`},
-		{`SHOW EXPERIMENTAL_RANGES FROM INDEX i`},
+		{`SHOW RANGE FROM TABLE t FOR ROW (1, 2)`},
+		{`SHOW RANGE FROM TABLE d.t FOR ROW (1, 2)`},
+		{`SHOW RANGE FROM INDEX d.t@i FOR ROW (1, 2)`},
+		{`SHOW RANGE FROM INDEX t@i FOR ROW (1, 2)`},
+		{`SHOW RANGE FROM INDEX i FOR ROW (1, 2)`},
+		{`SHOW RANGES FROM TABLE d.t`},
+		{`EXPLAIN SHOW RANGES FROM TABLE d.t`},
+		{`SHOW RANGES FROM TABLE t`},
+		{`SHOW RANGES FROM INDEX d.t@i`},
+		{`SHOW RANGES FROM INDEX t@i`},
+		{`SHOW RANGES FROM INDEX d.i`},
+		{`SHOW RANGES FROM INDEX i`},
 		{`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE d.t`},
 		{`SHOW ZONE CONFIGURATIONS`},
 		{`EXPLAIN SHOW ZONE CONFIGURATIONS`},
@@ -648,6 +672,7 @@ func TestParse(t *testing.T) {
 		{`SELECT a#>>'{x}'`},
 		{`SELECT (a->'x')->'y'`},
 		{`SELECT (a->'x')->>'y'`},
+		{`SELECT b && c`},
 
 		{`SELECT 1 FROM t`},
 		{`SELECT 1, 2 FROM t`},
@@ -707,6 +732,7 @@ func TestParse(t *testing.T) {
 		{`SELECT 'foo'::TIMESTAMP(6)`},
 		{`SELECT 'foo'::TIMESTAMPTZ(6)`},
 		{`SELECT 'foo'::TIME(6)`},
+		{`SELECT '0'::INTERVAL`},
 
 		{`SELECT '192.168.0.1'::INET`},
 		{`SELECT '192.168.0.1':::INET`},
@@ -838,9 +864,14 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t ORDER BY INDEX t@foo DESC`},
 		{`SELECT a FROM t ORDER BY INDEX t@primary`},
 		{`SELECT a FROM t ORDER BY INDEX t@like`},
+		{`SELECT a FROM t ORDER BY a NULLS FIRST`},
+		{`SELECT a FROM t ORDER BY a ASC NULLS FIRST`},
+		{`SELECT a FROM t ORDER BY a DESC NULLS LAST`},
 
 		{`SELECT 1 FROM t GROUP BY a`},
 		{`SELECT 1 FROM t GROUP BY a, b`},
+		{`SELECT sum(x ORDER BY y) FROM t`},
+		{`SELECT sum(x ORDER BY y, z) FROM t`},
 
 		{`SELECT a FROM t HAVING a = b`},
 
@@ -926,6 +957,10 @@ func TestParse(t *testing.T) {
 		{`SELECT avg(1) OVER (PARTITION BY b ORDER BY c GROUPS UNBOUNDED PRECEDING) FROM t`},
 		{`SELECT avg(1) OVER (w PARTITION BY b ORDER BY c GROUPS UNBOUNDED PRECEDING) FROM t`},
 
+		{`SELECT avg(1) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW) FROM t`},
+		{`SELECT avg(1) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE GROUP) FROM t`},
+		{`SELECT avg(1) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE TIES) FROM t`},
+
 		{`SELECT avg(1) FILTER (WHERE a > b)`},
 		{`SELECT avg(1) FILTER (WHERE a > b) OVER (ORDER BY c)`},
 
@@ -957,6 +992,9 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t1 AS OF SYSTEM TIME '2016-01-01'`},
 		{`SELECT a FROM t1, t2 AS OF SYSTEM TIME '2016-01-01'`},
 		{`SELECT a FROM t1 AS OF SYSTEM TIME -('a' || 'b')::INTERVAL`},
+
+		{`SELECT * FROM t LIMIT ALL`},
+		{`SELECT EXISTS ((((TABLE error FOR KEY SHARE)) LIMIT ALL FOR KEY SHARE)) AS is FROM ident`},
 
 		{`SELECT a FROM t LIMIT a`},
 		{`SELECT a FROM t OFFSET b`},
@@ -1010,6 +1048,13 @@ func TestParse(t *testing.T) {
 		{`SELECT (i.keys).*`},
 		{`SELECT (ARRAY['a', 'b', 'c']).name`},
 
+		{`SELECT 1 FOR UPDATE`},
+		{`SELECT 1 FOR NO KEY UPDATE`},
+		{`SELECT 1 FOR SHARE`},
+		{`SELECT 1 FOR KEY SHARE`},
+		{`SELECT 1 FOR UPDATE OF a`},
+		{`SELECT 1 FOR NO KEY UPDATE OF a, b`},
+
 		{`TABLE a`}, // Shorthand for: SELECT * FROM a; used e.g. in CREATE VIEW v AS TABLE t
 		{`EXPLAIN TABLE a`},
 		{`TABLE [123 AS a]`},
@@ -1024,6 +1069,9 @@ func TestParse(t *testing.T) {
 		{`UPDATE a.b SET b = 3`},
 		{`UPDATE a.b@c SET b = 3`},
 		{`UPDATE a SET b = 3, c = DEFAULT`},
+		{`UPDATE a SET b = 3, c = DEFAULT FROM b`},
+		{`UPDATE a SET b = 3, c = DEFAULT FROM a AS other`},
+		{`UPDATE a SET b = 3, c = DEFAULT FROM a AS other, b`},
 		{`UPDATE a SET b = 3 + 4`},
 		{`UPDATE a SET (b, c) = (3, DEFAULT)`},
 		{`UPDATE a SET (b, c) = (SELECT 3, 4)`},
@@ -1036,6 +1084,7 @@ func TestParse(t *testing.T) {
 		{`UPDATE a SET b = 3 WHERE a = b RETURNING a, a + b`},
 		{`UPDATE a SET b = 3 WHERE a = b RETURNING NOTHING`},
 		{`UPDATE a SET b = 3 WHERE a = b ORDER BY c LIMIT d RETURNING e`},
+		{`UPDATE a SET b = 3 FROM other WHERE a = b ORDER BY c LIMIT d RETURNING e`},
 
 		{`UPDATE t AS "0" SET k = ''`},                 // "0" lost its quotes
 		{`SELECT * FROM "0" JOIN "0" USING (id, "0")`}, // last "0" lost its quotes.
@@ -1110,6 +1159,13 @@ func TestParse(t *testing.T) {
 		{`ALTER INDEX d.i SPLIT AT VALUES (2)`},
 		{`ALTER INDEX "primary" SPLIT AT VALUES (2)`},
 		{`ALTER INDEX public.public."primary" SPLIT AT VALUES (2)`},
+		{`ALTER TABLE a SPLIT AT VALUES (1) WITH EXPIRATION '1 day'`},
+		{`ALTER TABLE a SPLIT AT VALUES (1) WITH EXPIRATION '1 day':::INTERVAL`},
+		{`ALTER TABLE a SPLIT AT VALUES (1) WITH EXPIRATION '7258118400000000.0'`},
+		{`ALTER TABLE a SPLIT AT VALUES (1) WITH EXPIRATION '2200-01-01 00:00:00.0'`},
+		{`ALTER TABLE a SPLIT AT VALUES (1) WITH EXPIRATION TIMESTAMP '2200-01-01 00:00:00.0'`},
+		{`ALTER TABLE a SPLIT AT VALUES (1) WITH EXPIRATION '2200-01-01 00:00:00.0':::TIMESTAMP`},
+		{`ALTER TABLE a SPLIT AT VALUES (1) WITH EXPIRATION TIMESTAMPTZ '2200-01-01 00:00:00.0'`},
 
 		{`ALTER TABLE a UNSPLIT AT VALUES (1)`},
 		{`EXPLAIN ALTER TABLE a UNSPLIT AT VALUES (1)`},
@@ -1211,10 +1267,12 @@ func TestParse(t *testing.T) {
 		{`COMMENT ON COLUMN a.b IS NULL`},
 		{`COMMENT ON COLUMN a.b.c IS 'a'`},
 		{`COMMENT ON COLUMN a.b.c.d IS 'a'`},
-		{`COMMENT ON TABLE foo IS 'a'`},
-		{`COMMENT ON TABLE foo IS NULL`},
 		{`COMMENT ON DATABASE foo IS 'a'`},
 		{`COMMENT ON DATABASE foo IS NULL`},
+		{`COMMENT ON INDEX foo IS 'a'`},
+		{`COMMENT ON INDEX foo IS NULL`},
+		{`COMMENT ON TABLE foo IS 'a'`},
+		{`COMMENT ON TABLE foo IS NULL`},
 
 		{`ALTER SEQUENCE a RENAME TO b`},
 		{`EXPLAIN ALTER SEQUENCE a RENAME TO b`},
@@ -1256,6 +1314,9 @@ func TestParse(t *testing.T) {
 		{`BACKUP DATABASE foo, baz TO 'bar'`},
 		{`BACKUP DATABASE foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`},
 
+		{`BACKUP DATABASE foo TO ($1, $2)`},
+		{`BACKUP DATABASE foo TO ($1, $2) INCREMENTAL FROM 'baz'`},
+
 		{`RESTORE TABLE foo FROM 'bar'`},
 		{`EXPLAIN RESTORE TABLE foo FROM 'bar'`},
 		{`RESTORE TABLE foo FROM $1`},
@@ -1268,16 +1329,23 @@ func TestParse(t *testing.T) {
 		{`RESTORE DATABASE foo, baz FROM 'bar'`},
 		{`RESTORE DATABASE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
 
+		{`RESTORE DATABASE foo FROM ($1, $2)`},
+		{`RESTORE DATABASE foo FROM ($1, $2), $3`},
+		{`RESTORE DATABASE foo FROM $1, ($2, $3)`},
+		{`RESTORE DATABASE foo FROM ($1, $2), ($3, $4)`},
+		{`RESTORE DATABASE foo FROM ($1, $2), ($3, $4) AS OF SYSTEM TIME '1'`},
+
 		{`BACKUP TABLE foo TO 'bar' WITH key1, key2 = 'value'`},
 		{`RESTORE TABLE foo FROM 'bar' WITH key1, key2 = 'value'`},
 
 		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 		{`EXPLAIN IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
-		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' MYSQLOUTFILE DATA ('path/to/some/file', $1)`},
+		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' DELIMITED DATA ('path/to/some/file', $1)`},
 		{`IMPORT TABLE foo (id INT8 PRIMARY KEY, email STRING, age INT8) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 		{`IMPORT TABLE foo (id INT8, email STRING, age INT8) CSV DATA ('path/to/some/file', $1) WITH comma = ',', "nullif" = 'n/a', temp = $2`},
 		{`IMPORT TABLE foo FROM PGDUMPCREATE 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`},
 		{`IMPORT INTO foo(id, email) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
+		{`IMPORT INTO foo CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 
 		{`IMPORT PGDUMP 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`},
 		{`EXPLAIN IMPORT PGDUMP 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`},
@@ -1301,20 +1369,22 @@ func TestParse(t *testing.T) {
 
 		// Regression for #15926
 		{`SELECT * FROM ((t1 NATURAL JOIN t2 WITH ORDINALITY AS o1)) WITH ORDINALITY AS o2`},
+
+		{`WITH cte AS (SELECT 1) SELECT * FROM cte`},
+		{`WITH cte (x) AS (INSERT INTO abc VALUES (1, 2)), cte2 (y) AS (SELECT x + 1 FROM cte) SELECT * FROM cte, cte2`},
+		{`WITH RECURSIVE cte (x) AS (SELECT 1), cte2 (y) AS (SELECT x + 1 FROM cte) SELECT 1`},
 	}
 	var p parser.Parser // Verify that the same parser can be reused.
 	for _, d := range testData {
-		t.Run(d.sql, func(t *testing.T) {
-			stmts, err := p.Parse(d.sql)
-			if err != nil {
-				t.Fatalf("%s: expected success, but found %s", d.sql, err)
-			}
-			s := stmts.String()
-			if d.sql != s {
-				t.Errorf("expected \n%q\n, but found \n%q", d.sql, s)
-			}
-			sqlutils.VerifyStatementPrettyRoundtrip(t, d.sql)
-		})
+		stmts, err := p.Parse(d.sql)
+		if err != nil {
+			t.Fatalf("%s: expected success, but found %s", d.sql, err)
+		}
+		s := stmts.String()
+		if d.sql != s {
+			t.Errorf("expected \n%q\n, but found \n%q", d.sql, s)
+		}
+		sqlutils.VerifyStatementPrettyRoundtrip(t, d.sql)
 	}
 }
 
@@ -1415,7 +1485,6 @@ func TestParse2(t *testing.T) {
 
 		{`SELECT b <<= c`, `SELECT inet_contained_by_or_equals(b, c)`},
 		{`SELECT b >>= c`, `SELECT inet_contains_or_equals(b, c)`},
-		{`SELECT b && c`, `SELECT inet_contains_or_contained_by(b, c)`},
 
 		{`SELECT NUMERIC 'foo'`, `SELECT DECIMAL 'foo'`},
 		{`SELECT REAL 'foo'`, `SELECT FLOAT4 'foo'`},
@@ -1556,6 +1625,11 @@ func TestParse2(t *testing.T) {
 
 		{`SELECT (ARRAY (1, 2))[1]`, `SELECT (ARRAY[1, 2])[1]`},
 
+		// Interval precision is syntactic sugar.
+		{`SELECT '0'::INTERVAL(6)`, `SELECT '0'::INTERVAL`},
+		// Interval constructor gets eagerly processed.
+		{`SELECT INTERVAL '0'`, `SELECT '00:00:00'`},
+
 		// Pretty printing the FAMILY INET function is not normal due to the grammar
 		// definition of FAMILY.
 		{`SELECT FAMILY(x)`, // lint: uppercase function OK
@@ -1613,6 +1687,8 @@ func TestParse2(t *testing.T) {
 			`SELECT overlay('w33333rce', 'resou', 3, 5)`},
 		// Special extract syntax
 		{`SELECT EXTRACT(second from now())`,
+			`SELECT extract('second', now())`},
+		{`SELECT EXTRACT('second' from now())`,
 			`SELECT extract('second', now())`},
 		// Special trim syntax
 		{`SELECT TRIM('xy' from 'xyxtrimyyx')`,
@@ -1716,8 +1792,15 @@ func TestParse2(t *testing.T) {
 			`DEALLOCATE ALL`},
 
 		{`CANCEL JOB a`, `CANCEL JOBS VALUES (a)`},
+		{`EXPLAIN CANCEL JOB a`, `EXPLAIN CANCEL JOBS VALUES (a)`},
 		{`RESUME JOB a`, `RESUME JOBS VALUES (a)`},
+		{`EXPLAIN RESUME JOB a`, `EXPLAIN RESUME JOBS VALUES (a)`},
 		{`PAUSE JOB a`, `PAUSE JOBS VALUES (a)`},
+		{`EXPLAIN PAUSE JOB a`, `EXPLAIN PAUSE JOBS VALUES (a)`},
+		{`SHOW JOB a`, `SHOW JOBS VALUES (a)`},
+		{`EXPLAIN SHOW JOB a`, `EXPLAIN SHOW JOBS VALUES (a)`},
+		{`SHOW JOB WHEN COMPLETE a`, `SHOW JOBS WHEN COMPLETE VALUES (a)`},
+		{`EXPLAIN SHOW JOB WHEN COMPLETE a`, `EXPLAIN SHOW JOBS WHEN COMPLETE VALUES (a)`},
 		{`CANCEL QUERY a`, `CANCEL QUERIES VALUES (a)`},
 		{`CANCEL QUERY IF EXISTS a`, `CANCEL QUERIES IF EXISTS VALUES (a)`},
 		{`CANCEL SESSION a`, `CANCEL SESSIONS VALUES (a)`},
@@ -1729,6 +1812,11 @@ func TestParse2(t *testing.T) {
 			`BACKUP DATABASE foo TO 'bar.12' INCREMENTAL FROM 'baz.34'`},
 		{`RESTORE DATABASE foo FROM bar`,
 			`RESTORE DATABASE foo FROM 'bar'`},
+		{`BACKUP DATABASE foo TO ($1)`, `BACKUP DATABASE foo TO $1`},
+
+		{`RESTORE DATABASE foo FROM ($1)`, `RESTORE DATABASE foo FROM $1`},
+		{`RESTORE DATABASE foo FROM ($1), ($2)`, `RESTORE DATABASE foo FROM $1, $2`},
+		{`RESTORE DATABASE foo FROM ($1), ($2, $3)`, `RESTORE DATABASE foo FROM $1, ($2, $3)`},
 
 		{`CREATE CHANGEFEED FOR TABLE foo INTO sink`,
 			`CREATE CHANGEFEED FOR TABLE foo INTO 'sink'`},
@@ -2024,7 +2112,11 @@ func TestParse2(t *testing.T) {
 		{`ALTER TABLE a DROP b`, `ALTER TABLE a DROP COLUMN b`},
 		{`ALTER TABLE a ALTER b DROP NOT NULL`, `ALTER TABLE a ALTER COLUMN b DROP NOT NULL`},
 		{`ALTER TABLE a ALTER b TYPE INT8`, `ALTER TABLE a ALTER COLUMN b SET DATA TYPE INT8`},
+
 		{`EXPLAIN ANALYZE SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
+		// Check the alternate spelling.
+		{`EXPLAIN ANALYSE (A, B, C) SELECT 1`, `EXPLAIN ANALYZE (A, B, C) SELECT 1`},
+		{`EXPLAIN ANALYSE SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
 
 		{`SET a = INDEX`, `SET a = "index"`},
 		{`SET a = NOTHING`, `SET a = "nothing"`},
@@ -2049,6 +2141,13 @@ func TestParse2(t *testing.T) {
 
 		{`CREATE TABLE a (b INT) PARTITION BY RANGE (b) (PARTITION p1 VALUES FROM (MINVALUE) TO (1), PARTITION p2 VALUES FROM (2, MAXVALUE) TO (4, 4), PARTITION p3 VALUES FROM (4, 4) TO (MAXVALUE))`,
 			`CREATE TABLE a (b INT8) PARTITION BY RANGE (b) (PARTITION p1 VALUES FROM (minvalue) TO (1), PARTITION p2 VALUES FROM (2, maxvalue) TO (4, 4), PARTITION p3 VALUES FROM (4, 4) TO (maxvalue))`},
+
+		// Check that JSONB operators have higher precedence than '='.
+		{`SELECT '{}'::JSONB ? 'a' = false`, `SELECT ('{}'::JSONB ? 'a') = false`},
+		{`SELECT '{}'::JSONB ?| 'a' = false`, `SELECT ('{}'::JSONB ?| 'a') = false`},
+		{`SELECT '{}'::JSONB ?& 'a' = false`, `SELECT ('{}'::JSONB ?& 'a') = false`},
+		{`SELECT '{}'::JSONB @> '{}'::JSONB = false`, `SELECT ('{}'::JSONB @> '{}'::JSONB) = false`},
+		{`SELECT '{}'::JSONB <@ '{}'::JSONB = false`, `SELECT ('{}'::JSONB <@ '{}'::JSONB) = false`},
 	}
 	for _, d := range testData {
 		t.Run(d.sql, func(t *testing.T) {
@@ -2130,138 +2229,163 @@ func TestParseError(t *testing.T) {
 		sql      string
 		expected string
 	}{
-		{`SELECT2 1`, `syntax error at or near "select2"
+		{`SELECT2 1`,
+			`at or near "select2": syntax error
+DETAIL: source SQL:
 SELECT2 1
-^
-`},
-		{`SELECT 1 FROM (t)`, `syntax error at or near ")"
+^`},
+		{`SELECT 1 FROM (t)`,
+			`at or near ")": syntax error
+DETAIL: source SQL:
 SELECT 1 FROM (t)
                 ^
 HINT: try \h <SOURCE>`},
-		{`SET TIME ZONE INTERVAL 'foobar'`, `syntax error: could not parse "foobar" as type interval: interval: missing unit at position 0: "foobar" at or near "EOF"
+		{`SET TIME ZONE INTERVAL 'foobar'`,
+			`at or near "EOF": syntax error: could not parse "foobar" as type interval: interval: missing unit at position 0: "foobar"
+DETAIL: source SQL:
 SET TIME ZONE INTERVAL 'foobar'
-                               ^
-`},
-		{`SELECT INTERVAL 'foo'`, `syntax error: could not parse "foo" as type interval: interval: missing unit at position 0: "foo" at or near "EOF"
+                               ^`},
+		{`SELECT INTERVAL 'foo'`,
+			`at or near "EOF": syntax error: could not parse "foo" as type interval: interval: missing unit at position 0: "foo"
+DETAIL: source SQL:
 SELECT INTERVAL 'foo'
-                     ^
-`},
-		{`SELECT 1 /* hello`, `lexical error: unterminated comment
+                     ^`},
+		{`SELECT 1 /* hello`,
+			`lexical error: unterminated comment
+DETAIL: source SQL:
 SELECT 1 /* hello
-         ^
-`},
-		{`SELECT '1`, `lexical error: unterminated string
+         ^`},
+		{`SELECT '1`,
+			`lexical error: unterminated string
+DETAIL: source SQL:
 SELECT '1
        ^
 HINT: try \h SELECT`},
 		{`SELECT * FROM t WHERE k=`,
-			`syntax error at or near "EOF"
+			`at or near "EOF": syntax error
+DETAIL: source SQL:
 SELECT * FROM t WHERE k=
                         ^
 HINT: try \h SELECT`,
 		},
 		{`CREATE TABLE test (
   CONSTRAINT foo INDEX (bar)
-)`, `syntax error at or near "index"
+)`,
+			`at or near "index": syntax error
+DETAIL: source SQL:
 CREATE TABLE test (
   CONSTRAINT foo INDEX (bar)
                  ^
 HINT: try \h CREATE TABLE`},
 		{`CREATE TABLE test (
   foo BIT(0)
-)`, `syntax error: length for type bit must be at least 1 at or near ")"
+)`,
+			`at or near ")": syntax error: length for type bit must be at least 1
+DETAIL: source SQL:
 CREATE TABLE test (
   foo BIT(0)
-           ^
-`},
+           ^`},
 		{`CREATE TABLE test (
   foo INT8 DEFAULT 1 DEFAULT 2
-)`, `syntax error: multiple default values specified for column "foo" at or near ")"
+)`,
+			`at or near ")": syntax error: multiple default values specified for column "foo"
+DETAIL: source SQL:
 CREATE TABLE test (
   foo INT8 DEFAULT 1 DEFAULT 2
 )
-^
-`},
+^`},
 		{`CREATE TABLE test (
   foo INT8 REFERENCES t1 REFERENCES t2
-)`, `syntax error: multiple foreign key constraints specified for column "foo" at or near ")"
+)`,
+			`at or near ")": syntax error: multiple foreign key constraints specified for column "foo"
+DETAIL: source SQL:
 CREATE TABLE test (
   foo INT8 REFERENCES t1 REFERENCES t2
 )
-^
-`},
+^`},
 		{`CREATE TABLE test (
   foo INT8 FAMILY a FAMILY b
-)`, `syntax error: multiple column families specified for column "foo" at or near ")"
+)`,
+			`at or near ")": syntax error: multiple column families specified for column "foo"
+DETAIL: source SQL:
 CREATE TABLE test (
   foo INT8 FAMILY a FAMILY b
 )
-^
-`},
-		{`SELECT family FROM test`, `syntax error at or near "from"
+^`},
+		{`SELECT family FROM test`,
+			`at or near "from": syntax error
+DETAIL: source SQL:
 SELECT family FROM test
               ^
 HINT: try \h SELECT`},
 		{`CREATE TABLE test (
   foo INT8 NOT NULL NULL
-)`, `syntax error: conflicting NULL/NOT NULL declarations for column "foo" at or near ")"
+)`,
+			`at or near ")": syntax error: conflicting NULL/NOT NULL declarations for column "foo"
+DETAIL: source SQL:
 CREATE TABLE test (
   foo INT8 NOT NULL NULL
 )
-^
-`},
+^`},
 		{`CREATE TABLE test (
   foo INT8 NULL NOT NULL
-)`, `syntax error: conflicting NULL/NOT NULL declarations for column "foo" at or near ")"
+)`,
+			`at or near ")": syntax error: conflicting NULL/NOT NULL declarations for column "foo"
+DETAIL: source SQL:
 CREATE TABLE test (
   foo INT8 NULL NOT NULL
 )
-^
-`},
+^`},
 		{`CREATE DATABASE a b`,
-			`syntax error at or near "b"
+			`at or near "b": syntax error
+DETAIL: source SQL:
 CREATE DATABASE a b
-                  ^
-`},
+                  ^`},
 		{`CREATE DATABASE a b c`,
-			`syntax error at or near "b"
+			`at or near "b": syntax error
+DETAIL: source SQL:
 CREATE DATABASE a b c
-                  ^
-`},
+                  ^`},
 		{`CREATE INDEX ON a (b) STORING ()`,
-			`syntax error at or near ")"
+			`at or near ")": syntax error
+DETAIL: source SQL:
 CREATE INDEX ON a (b) STORING ()
                                ^
 HINT: try \h CREATE INDEX`},
 		{`CREATE VIEW a`,
-			`syntax error at or near "EOF"
+			`at or near "EOF": syntax error
+DETAIL: source SQL:
 CREATE VIEW a
              ^
 HINT: try \h CREATE VIEW`},
 		{`CREATE VIEW a () AS select * FROM b`,
-			`syntax error at or near ")"
+			`at or near ")": syntax error
+DETAIL: source SQL:
 CREATE VIEW a () AS select * FROM b
                ^
 HINT: try \h CREATE VIEW`},
 		{`SELECT FROM t`,
-			`syntax error at or near "from"
+			`at or near "from": syntax error
+DETAIL: source SQL:
 SELECT FROM t
        ^
 HINT: try \h SELECT`},
 
 		{"SELECT 1e-\n-1",
 			`lexical error: invalid floating point literal
+DETAIL: source SQL:
 SELECT 1e-
        ^
 HINT: try \h SELECT`},
 		{"SELECT foo''",
-			`syntax error: type does not exist at or near ""
+			`at or near "": syntax error: type does not exist
+DETAIL: source SQL:
 SELECT foo''
-          ^
-`},
+          ^`},
 		{
 			`SELECT 0x FROM t`,
 			`lexical error: invalid hexadecimal numeric literal
+DETAIL: source SQL:
 SELECT 0x FROM t
        ^
 HINT: try \h SELECT`,
@@ -2269,6 +2393,7 @@ HINT: try \h SELECT`,
 		{
 			`SELECT x'fail' FROM t`,
 			`lexical error: invalid hexadecimal bytes literal
+DETAIL: source SQL:
 SELECT x'fail' FROM t
        ^
 HINT: try \h SELECT`,
@@ -2276,267 +2401,281 @@ HINT: try \h SELECT`,
 		{
 			`SELECT x'AAB' FROM t`,
 			`lexical error: invalid hexadecimal bytes literal
+DETAIL: source SQL:
 SELECT x'AAB' FROM t
        ^
 HINT: try \h SELECT`,
 		},
 		{
 			`SELECT POSITION('high', 'a')`,
-			`syntax error at or near ","
+			`at or near ",": syntax error
+DETAIL: source SQL:
 SELECT POSITION('high', 'a')
                       ^
 HINT: try \h SELECT`,
 		},
 		{
 			`SELECT a FROM foo@{FORCE_INDEX}`,
-			`syntax error at or near "}"
+			`at or near "}": syntax error
+DETAIL: source SQL:
 SELECT a FROM foo@{FORCE_INDEX}
                               ^
 HINT: try \h <SOURCE>`,
 		},
 		{
 			`SELECT a FROM foo@{FORCE_INDEX=}`,
-			`syntax error at or near "}"
+			`at or near "}": syntax error
+DETAIL: source SQL:
 SELECT a FROM foo@{FORCE_INDEX=}
                                ^
 HINT: try \h <SOURCE>`,
 		},
 		{
 			`SELECT a FROM foo@{FORCE_INDEX=bar,FORCE_INDEX=baz}`,
-			`syntax error: FORCE_INDEX specified multiple times at or near "baz"
+			`at or near "baz": syntax error: FORCE_INDEX specified multiple times
+DETAIL: source SQL:
 SELECT a FROM foo@{FORCE_INDEX=bar,FORCE_INDEX=baz}
-                                               ^
-`,
+                                               ^`,
 		},
 		{
 			`SELECT a FROM foo@{FORCE_INDEX=bar,NO_INDEX_JOIN}`,
-			`syntax error: FORCE_INDEX cannot be specified in conjunction with NO_INDEX_JOIN at or near "}"
+			`at or near "}": syntax error: FORCE_INDEX cannot be specified in conjunction with NO_INDEX_JOIN
+DETAIL: source SQL:
 SELECT a FROM foo@{FORCE_INDEX=bar,NO_INDEX_JOIN}
-                                                ^
-`,
+                                                ^`,
 		},
 		{
 			`SELECT a FROM foo@{NO_INDEX_JOIN,NO_INDEX_JOIN}`,
-			`syntax error: NO_INDEX_JOIN specified multiple times at or near "no_index_join"
+			`at or near "no_index_join": syntax error: NO_INDEX_JOIN specified multiple times
+DETAIL: source SQL:
 SELECT a FROM foo@{NO_INDEX_JOIN,NO_INDEX_JOIN}
-                                 ^
-`,
+                                 ^`,
 		},
 		{
 			`SELECT a FROM foo@{IGNORE_FOREIGN_KEYS,IGNORE_FOREIGN_KEYS}`,
-			`syntax error: IGNORE_FOREIGN_KEYS specified multiple times at or near "ignore_foreign_keys"
+			`at or near "ignore_foreign_keys": syntax error: IGNORE_FOREIGN_KEYS specified multiple times
+DETAIL: source SQL:
 SELECT a FROM foo@{IGNORE_FOREIGN_KEYS,IGNORE_FOREIGN_KEYS}
-                                       ^
-`,
+                                       ^`,
 		},
 		{
 			`SELECT a FROM foo@{ASC}`,
-			`syntax error: ASC/DESC must be specified in conjunction with an index at or near "}"
+			`at or near "}": syntax error: ASC/DESC must be specified in conjunction with an index
+DETAIL: source SQL:
 SELECT a FROM foo@{ASC}
-                      ^
-`,
+                      ^`,
 		},
 		{
 			`SELECT a FROM foo@{DESC}`,
-			`syntax error: ASC/DESC must be specified in conjunction with an index at or near "}"
+			`at or near "}": syntax error: ASC/DESC must be specified in conjunction with an index
+DETAIL: source SQL:
 SELECT a FROM foo@{DESC}
-                       ^
-`,
+                       ^`,
 		},
 		{
 			`INSERT INTO a@b VALUES (1, 2)`,
-			`syntax error at or near "@"
+			`at or near "@": syntax error
+DETAIL: source SQL:
 INSERT INTO a@b VALUES (1, 2)
              ^
 HINT: try \h INSERT`,
 		},
 		{
 			`ALTER TABLE t RENAME COLUMN x TO family`,
-			`syntax error at or near "family"
+			`at or near "family": syntax error
+DETAIL: source SQL:
 ALTER TABLE t RENAME COLUMN x TO family
                                  ^
 HINT: try \h ALTER TABLE`,
 		},
 		{
 			`SELECT CAST(1.2+2.3 AS notatype)`,
-			`syntax error: type does not exist at or near "notatype"
+			`at or near "notatype": syntax error: type does not exist
+DETAIL: source SQL:
 SELECT CAST(1.2+2.3 AS notatype)
-                       ^
-`,
+                       ^`,
 		},
 		{
 			`SELECT ANNOTATE_TYPE(1.2+2.3, notatype)`,
-			`syntax error: type does not exist at or near "notatype"
+			`at or near "notatype": syntax error: type does not exist
+DETAIL: source SQL:
 SELECT ANNOTATE_TYPE(1.2+2.3, notatype)
-                              ^
-`,
+                              ^`,
 		},
 		{
 			`CREATE USER foo WITH PASSWORD`,
-			`syntax error at or near "EOF"
+			`at or near "EOF": syntax error
+DETAIL: source SQL:
 CREATE USER foo WITH PASSWORD
                              ^
 HINT: try \h CREATE USER`,
 		},
 		{
 			`ALTER TABLE t RENAME TO t[TRUE]`,
-			`syntax error at or near "["
+			`at or near "[": syntax error
+DETAIL: source SQL:
 ALTER TABLE t RENAME TO t[TRUE]
-                         ^
-`,
+                         ^`,
 		},
 		{
 			`TABLE abc[TRUE]`,
-			`syntax error at or near "["
+			`at or near "[": syntax error
+DETAIL: source SQL:
 TABLE abc[TRUE]
-         ^
-`,
+         ^`,
 		},
 		{
 			`UPDATE kv SET k[0] = 9`,
-			`syntax error at or near "["
+			`at or near "[": syntax error
+DETAIL: source SQL:
 UPDATE kv SET k[0] = 9
                ^
 HINT: try \h UPDATE`,
 		},
 		{
 			`SELECT (0) FROM y[array[]]`,
-			`syntax error at or near "["
+			`at or near "[": syntax error
+DETAIL: source SQL:
 SELECT (0) FROM y[array[]]
-                 ^
-`,
+                 ^`,
 		},
 		{
 			`INSERT INTO kv (k[0]) VALUES ('hello')`,
-			`syntax error at or near "["
+			`at or near "[": syntax error
+DETAIL: source SQL:
 INSERT INTO kv (k[0]) VALUES ('hello')
                  ^
 HINT: try \h <SELECTCLAUSE>`,
 		},
 		{
 			`SELECT CASE 1 = 1 WHEN true THEN ARRAY[1, 2] ELSE ARRAY[2, 3] END[1]`,
-			`syntax error at or near "["
+			`at or near "[": syntax error
+DETAIL: source SQL:
 SELECT CASE 1 = 1 WHEN true THEN ARRAY[1, 2] ELSE ARRAY[2, 3] END[1]
-                                                                 ^
-`,
+                                                                 ^`,
 		},
 		{
 			`SELECT EXISTS(SELECT 1)[1]`,
-			`syntax error at or near "["
+			`at or near "[": syntax error
+DETAIL: source SQL:
 SELECT EXISTS(SELECT 1)[1]
-                       ^
-`,
+                       ^`,
 		},
 		{
 			`SELECT 1 + ANY ARRAY[1, 2, 3]`,
-			`syntax error: + ANY <array> is invalid because "+" is not a boolean operator at or near "EOF"
+			`at or near "EOF": syntax error: + ANY <array> is invalid because "+" is not a boolean operator
+DETAIL: source SQL:
 SELECT 1 + ANY ARRAY[1, 2, 3]
-                             ^
-`,
+                             ^`,
 		},
 		{
 			`SELECT 'f'::"blah"`,
-			`syntax error: type does not exist at or near "blah"
+			`at or near "blah": syntax error: type does not exist
+DETAIL: source SQL:
 SELECT 'f'::"blah"
-            ^
-`,
+            ^`,
 		},
 		// Ensure that the support for ON ROLE <namelist> doesn't leak
 		// where it should not be recognized.
 		{
 			`GRANT SELECT ON ROLE foo, bar TO blix`,
-			`syntax error at or near "foo"
+			`at or near "foo": syntax error
+DETAIL: source SQL:
 GRANT SELECT ON ROLE foo, bar TO blix
                      ^
 HINT: try \h GRANT`,
 		},
 		{
 			`REVOKE SELECT ON ROLE foo, bar FROM blix`,
-			`syntax error at or near "foo"
+			`at or near "foo": syntax error
+DETAIL: source SQL:
 REVOKE SELECT ON ROLE foo, bar FROM blix
                       ^
 HINT: try \h REVOKE`,
 		},
 		{
 			`BACKUP ROLE foo, bar TO 'baz'`,
-			`syntax error at or near "foo"
+			`at or near "foo": syntax error
+DETAIL: source SQL:
 BACKUP ROLE foo, bar TO 'baz'
             ^
 HINT: try \h BACKUP`,
 		},
 		{
 			`RESTORE ROLE foo, bar FROM 'baz'`,
-			`syntax error at or near "foo"
+			`at or near "foo": syntax error
+DETAIL: source SQL:
 RESTORE ROLE foo, bar FROM 'baz'
              ^
 HINT: try \h RESTORE`,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS UNBOUNDED FOLLOWING) FROM t`,
-			`syntax error: frame start cannot be UNBOUNDED FOLLOWING at or near "following"
+			`at or near "following": syntax error: frame start cannot be UNBOUNDED FOLLOWING
+DETAIL: source SQL:
 SELECT avg(1) OVER (ROWS UNBOUNDED FOLLOWING) FROM t
-                                   ^
-`,
+                                   ^`,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS 1 FOLLOWING) FROM t`,
-			`syntax error: frame starting from following row cannot end with current row at or near "following"
+			`at or near "following": syntax error: frame starting from following row cannot end with current row
+DETAIL: source SQL:
 SELECT avg(1) OVER (ROWS 1 FOLLOWING) FROM t
-                           ^
-`,
+                           ^`,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM t`,
-			`syntax error: frame start cannot be UNBOUNDED FOLLOWING at or near "following"
+			`at or near "following": syntax error: frame start cannot be UNBOUNDED FOLLOWING
+DETAIL: source SQL:
 SELECT avg(1) OVER (ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM t
-                                                                   ^
-`,
+                                                                   ^`,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED PRECEDING) FROM t`,
-			`syntax error: frame end cannot be UNBOUNDED PRECEDING at or near "preceding"
+			`at or near "preceding": syntax error: frame end cannot be UNBOUNDED PRECEDING
+DETAIL: source SQL:
 SELECT avg(1) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED PRECEDING) FROM t
-                                                                   ^
-`,
+                                                                   ^`,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t`,
-			`syntax error: frame starting from current row cannot have preceding rows at or near "preceding"
+			`at or near "preceding": syntax error: frame starting from current row cannot have preceding rows
+DETAIL: source SQL:
 SELECT avg(1) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t
-                                                   ^
-`,
+                                                   ^`,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t`,
-			`syntax error: frame starting from following row cannot have preceding rows at or near "preceding"
+			`at or near "preceding": syntax error: frame starting from following row cannot have preceding rows
+DETAIL: source SQL:
 SELECT avg(1) OVER (ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t
-                                                   ^
-`,
+                                                   ^`,
 		},
 		{
 			`SELECT avg(1) OVER (ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t`,
-			`syntax error: frame starting from following row cannot have preceding rows at or near "row"
+			`at or near "row": syntax error: frame starting from following row cannot have preceding rows
+DETAIL: source SQL:
 SELECT avg(1) OVER (ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t
-                                                         ^
-`,
+                                                         ^`,
 		},
 		{
 			`CREATE TABLE foo(a CHAR(0))`,
-			`syntax error: length for type CHAR must be at least 1 at or near ")"
+			`at or near ")": syntax error: length for type CHAR must be at least 1
+DETAIL: source SQL:
 CREATE TABLE foo(a CHAR(0))
-                         ^
-`,
+                         ^`,
 		},
 		{
 			`e'\xad'::string`,
 			`lexical error: invalid UTF-8 byte sequence
+DETAIL: source SQL:
 e'\xad'::string
-^
-`,
+^`,
 		},
 		{
 			`EXPLAIN EXECUTE a`,
-			`syntax error at or near "execute"
+			`at or near "execute": syntax error
+DETAIL: source SQL:
 EXPLAIN EXECUTE a
         ^
 HINT: try \h EXPLAIN`,
@@ -2544,13 +2683,15 @@ HINT: try \h EXPLAIN`,
 		{
 			`SELECT $0`,
 			`lexical error: placeholder index must be between 1 and 65536
+DETAIL: source SQL:
 SELECT $0
        ^
 HINT: try \h SELECT`,
 		},
 		{
 			`SELECT $-1`,
-			`syntax error at or near "$"
+			`at or near "$": syntax error
+DETAIL: source SQL:
 SELECT $-1
        ^
 HINT: try \h SELECT`,
@@ -2558,6 +2699,7 @@ HINT: try \h SELECT`,
 		{
 			`SELECT $123456789`,
 			`lexical error: placeholder index must be between 1 and 65536
+DETAIL: source SQL:
 SELECT $123456789
        ^
 HINT: try \h SELECT`,
@@ -2565,24 +2707,40 @@ HINT: try \h SELECT`,
 
 		{
 			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 2.0`,
-			`syntax error: THROTTLING fraction must be between 0 and 1 at or near "2.0"
+			`at or near "2.0": syntax error: THROTTLING fraction must be between 0 and 1
+DETAIL: source SQL:
 CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 2.0
-                                                           ^
-`,
+                                                           ^`,
 		},
 		{
 			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.1 THROTTLING 0.5`,
-			`syntax error: THROTTLING specified multiple times at or near "0.5"
+			`at or near "0.5": syntax error: THROTTLING specified multiple times
+DETAIL: source SQL:
 CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.1 THROTTLING 0.5
-                                                                          ^
-`,
+                                                                          ^`,
 		},
 		{
 			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '-1s' THROTTLING 0.1 AS OF SYSTEM TIME '-2s'`,
-			`syntax error: AS OF specified multiple times at or near "EOF"
+			`at or near "EOF": syntax error: AS OF specified multiple times
+DETAIL: source SQL:
 CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '-1s' THROTTLING 0.1 AS OF SYSTEM TIME '-2s'
-                                                                                                              ^
-`,
+                                                                                                              ^`,
+		},
+		{
+			`ALTER PARTITION p OF TABLE tbl@idx CONFIGURE ZONE USING num_replicas = 1`,
+			`at or near "idx": syntax error: index name should not be specified in ALTER PARTITION ... OF TABLE
+DETAIL: source SQL:
+ALTER PARTITION p OF TABLE tbl@idx CONFIGURE ZONE USING num_replicas = 1
+                               ^
+HINT: try ALTER PARTITION ... OF INDEX`,
+		},
+		{
+			`ALTER PARTITION p OF TABLE tbl@* CONFIGURE ZONE USING num_replicas = 1`,
+			`at or near "configure": syntax error: index wildcard unsupported in ALTER PARTITION ... OF TABLE
+DETAIL: source SQL:
+ALTER PARTITION p OF TABLE tbl@* CONFIGURE ZONE USING num_replicas = 1
+                                 ^
+HINT: try ALTER PARTITION <partition> OF INDEX <tablename>@*`,
 		},
 	}
 	for _, d := range testData {
@@ -2592,15 +2750,18 @@ CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '-1s' THROTTLI
 				t.Errorf("expected error, got nil for:\n%s", d.sql)
 				return
 			}
-			msg := err.Error()
-			if pgerr, ok := pgerror.GetPGCause(err); ok {
-				msg += strings.TrimPrefix(pgerr.Detail, "source SQL:") + "\n"
-				if pgerr.Hint != "" {
-					msg += "HINT: " + pgerr.Hint
-				}
+			pgerr := pgerror.Flatten(err)
+			msg := pgerr.Message
+			if pgerr.Detail != "" {
+				msg += "\nDETAIL: " + pgerr.Detail
+			}
+			if pgerr.Hint != "" {
+				msg += "\nHINT: " + pgerr.Hint
 			}
 			if msg != d.expected {
-				t.Errorf("%s: expected\n%s, but found\n%v", d.sql, d.expected, msg)
+				t.Errorf("%s:\nexpected:\n  %s\n\nbut found:\n  %s", d.sql,
+					strings.ReplaceAll(d.expected, "\n", "\n  "),
+					strings.ReplaceAll(msg, "\n", "\n  "))
 			}
 		})
 	}
@@ -2625,7 +2786,7 @@ func TestParsePanic(t *testing.T) {
 		"(F(F(F(F(F(F(F(F(F((" +
 		"F(0"
 	_, err := parser.Parse(s)
-	expected := `syntax error at or near "EOF"`
+	expected := `at or near "EOF": syntax error`
 	if !testutils.IsError(err, expected) {
 		t.Fatalf("expected %s, but found %v", expected, err)
 	}
@@ -2673,11 +2834,11 @@ func TestParsePrecedence(t *testing.T) {
 		return &tree.ComparisonExpr{Operator: tree.RegIMatch, Left: left, Right: right}
 	}
 
-	one := &tree.NumVal{Value: constant.MakeInt64(1), OrigString: "1"}
-	minusone := &tree.NumVal{Value: constant.MakeInt64(1), OrigString: "1", Negative: true}
-	two := &tree.NumVal{Value: constant.MakeInt64(2), OrigString: "2"}
-	minustwo := &tree.NumVal{Value: constant.MakeInt64(2), OrigString: "2", Negative: true}
-	three := &tree.NumVal{Value: constant.MakeInt64(3), OrigString: "3"}
+	one := tree.NewNumVal(constant.MakeInt64(1), "1", false /* negative */)
+	minusone := tree.NewNumVal(constant.MakeInt64(1), "1", true /* negative */)
+	two := tree.NewNumVal(constant.MakeInt64(2), "2", false /* negative */)
+	minustwo := tree.NewNumVal(constant.MakeInt64(2), "2", true /* negative */)
+	three := tree.NewNumVal(constant.MakeInt64(3), "3", false /* negative */)
 	a := tree.NewStrVal("a")
 	b := tree.NewStrVal("b")
 	c := tree.NewStrVal("c")
@@ -2828,7 +2989,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		expected string
 	}{
 		{`ALTER TABLE a ALTER CONSTRAINT foo`, 31632, `alter constraint`},
-		{`ALTER TABLE a ALTER b SET NOT NULL`, 28751, ``},
 
 		{`CREATE AGGREGATE a`, 0, `create aggregate`},
 		{`CREATE CAST a`, 0, `create cast`},
@@ -2841,7 +3001,7 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE FUNCTION a`, 17511, `create`},
 		{`CREATE OR REPLACE FUNCTION a`, 17511, `create`},
 		{`CREATE LANGUAGE a`, 17511, `create language a`},
-		{`CREATE MATERIALIZED VIEW a`, 24747, ``},
+		{`CREATE MATERIALIZED VIEW a`, 41649, ``},
 		{`CREATE OPERATOR a`, 0, `create operator`},
 		{`CREATE PUBLICATION a`, 0, `create publication`},
 		{`CREATE RULE a`, 0, `create rule`},
@@ -2880,10 +3040,7 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`SET LOCAL foo = bar`, 32562, ``},
 		{`SET foo FROM CURRENT`, 0, `set from current`},
 
-		{`CREATE TEMP TABLE a(b INT8)`, 5807, ``},
 		{`CREATE UNLOGGED TABLE a(b INT8)`, 0, `create unlogged`},
-		{`CREATE TEMP VIEW a AS SELECT b`, 5807, ``},
-		{`CREATE TEMP SEQUENCE a`, 5807, ``},
 
 		{`CREATE TABLE a(x INT[][])`, 32552, ``},
 		{`CREATE TABLE a(x INT[1][2])`, 32552, ``},
@@ -2930,16 +3087,14 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE INDEX a ON b(c + d)`, 9682, ``},
 		{`CREATE INDEX a ON b(c[d])`, 9682, ``},
 		{`CREATE INDEX a ON b(foo(c))`, 9682, ``},
+		{`CREATE INDEX a ON b(a NULLS LAST)`, 6224, ``},
+		{`CREATE INDEX a ON b(a ASC NULLS LAST)`, 6224, ``},
+		{`CREATE INDEX a ON b(a DESC NULLS FIRST)`, 6224, ``},
 
 		{`INSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``},
 		{`INSERT INTO foo VALUES (1,2) ON CONFLICT ON CONSTRAINT a DO NOTHING`, 28161, ``},
 
-		{`SELECT max(a ORDER BY b) FROM ab`, 23620, ``},
-
-		{`SELECT * FROM a FOR UPDATE`, 6583, ``},
 		{`SELECT * FROM ROWS FROM (a(b) AS (d))`, 0, `ROWS FROM with col_def_list`},
-
-		{`SELECT 123 AT TIME ZONE 'b'`, 32005, ``},
 
 		{`SELECT 'a'::INTERVAL SECOND`, 0, `interval with unit qualifier`},
 		{`SELECT 'a'::INTERVAL(123)`, 32564, ``},
@@ -2966,11 +3121,14 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`SELECT GROUPING (a,b,c)`, 0, `d_expr grouping`},
 		{`SELECT a(VARIADIC b)`, 0, `variadic`},
 		{`SELECT a(b, c, VARIADIC b)`, 0, `variadic`},
-		{`SELECT COLLATION FOR (a)`, 32563, ``},
 		{`SELECT CURRENT_TIME`, 26097, `current_time`},
 		{`SELECT CURRENT_TIME()`, 26097, `current_time`},
 		{`SELECT TREAT (a AS INT8)`, 0, `treat`},
 		{`SELECT a(b) WITHIN GROUP (ORDER BY c)`, 0, `within group`},
+
+		{`SELECT a FROM t ORDER BY a NULLS LAST`, 6224, ``},
+		{`SELECT a FROM t ORDER BY a ASC NULLS LAST`, 6224, ``},
+		{`SELECT a FROM t ORDER BY a DESC NULLS FIRST`, 6224, ``},
 
 		{`CREATE TABLE a(b BOX)`, 21286, `box`},
 		{`CREATE TABLE a(b CIDR)`, 18846, `cidr`},
@@ -2992,11 +3150,8 @@ func TestUnimplementedSyntax(t *testing.T) {
 
 		{`INSERT INTO a VALUES (1) ON CONFLICT (x) WHERE x > 3 DO NOTHING`, 32557, ``},
 
-		{`WITH RECURSIVE a AS (TABLE b) SELECT c`, 21085, ``},
-
 		{`UPDATE foo SET (a, a.b) = (1, 2)`, 27792, ``},
 		{`UPDATE foo SET a.b = 1`, 27792, ``},
-		{`UPDATE foo SET x = y FROM a, b`, 7841, ``},
 		{`UPDATE Foo SET x.y = z`, 27792, ``},
 
 		{`UPSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``},
@@ -3008,32 +3163,48 @@ func TestUnimplementedSyntax(t *testing.T) {
 				t.Errorf("%s: expected error, got nil", d.sql)
 				return
 			}
-			pgerr, ok := pgerror.GetPGCause(err)
-			if !ok {
-				t.Errorf("%s: unknown err type: %T", d.sql, err)
-				return
+			if errMsg := err.Error(); !strings.Contains(errMsg, "unimplemented: this syntax") {
+				t.Errorf("%s: expected unimplemented in message, got %q", d.sql, errMsg)
 			}
-			if !strings.HasPrefix(pgerr.Message, "syntax error: unimplemented") {
-				t.Errorf("%s: expected unimplemented at start of message, got %q", d.sql, pgerr.Message)
-			}
-			if pgerr.TelemetryKey == "" {
-				t.Errorf("%s: expected internal command set", d.sql)
+			tkeys := errors.GetTelemetryKeys(err)
+			if len(tkeys) == 0 {
+				t.Errorf("%s: expected telemetry key set", d.sql)
 			} else {
-				if !strings.HasPrefix(pgerr.TelemetryKey, "syntax.") {
-					t.Errorf("%s: expected 'syntax.' at start of internal command, got %q", d.sql, pgerr.TelemetryKey)
+				found := false
+				for _, tk := range tkeys {
+					if strings.Contains(tk, d.expected) {
+						found = true
+						break
+					}
 				}
-				if !strings.Contains(pgerr.TelemetryKey, d.expected) {
-					t.Errorf("%s: expected %q in internal command, got %q", d.sql, d.expected, pgerr.TelemetryKey)
+				if !found {
+					t.Errorf("%s: expected %q in telemetry keys, got %+v", d.sql, d.expected, tkeys)
 				}
 			}
 			if d.issue != 0 {
 				exp := fmt.Sprintf("syntax.#%d", d.issue)
-				if !strings.HasPrefix(pgerr.TelemetryKey, exp) {
-					t.Errorf("%s: expected %q at start of internal command, got %q", d.sql, exp, pgerr.TelemetryKey)
+				found := false
+				for _, tk := range tkeys {
+					if strings.HasPrefix(tk, exp) {
+						found = true
+						break
+					}
 				}
+				if !found {
+					t.Errorf("%s: expected %q in telemetry keys, got %+v", d.sql, exp, tkeys)
+				}
+
 				exp2 := fmt.Sprintf("issues/%d", d.issue)
-				if !strings.HasSuffix(pgerr.Hint, exp2) {
-					t.Errorf("%s: expected %q at end of hint, got %q", d.sql, exp2, pgerr.Hint)
+				found = false
+				hints := errors.GetAllHints(err)
+				for _, h := range hints {
+					if strings.HasSuffix(h, exp2) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("%s: expected %q at end of hint, got %+v", d.sql, exp2, hints)
 				}
 			}
 		})

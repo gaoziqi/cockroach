@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
-
 statement ok
 CREATE TABLE t (
   a INT PRIMARY KEY,
@@ -15,10 +13,10 @@ INSERT INTO t VALUES (1,1,1)
 statement ok
 CREATE INDEX foo ON t (b)
 
-statement error column b is of type int and thus is not indexable with an inverted index.*\nHINT.*35730
+statement error column b is of type int and thus is not indexable with an inverted index.*\nHINT.*\n.*35730
 CREATE INVERTED INDEX foo_inv ON t(b)
 
-statement error column b is of type int and thus is not indexable with an inverted index.*\nHINT.*35730
+statement error column b is of type int and thus is not indexable with an inverted index.*\nHINT.*\n.*35730
 CREATE INDEX foo_inv2 ON t USING GIN (b)
 
 statement error pq: inverted indexes can't be unique
@@ -30,7 +28,8 @@ CREATE TABLE c (
   foo JSON,
   bar JSON,
   INVERTED INDEX (foo),
-  INVERTED INDEX (bar)
+  INVERTED INDEX (bar),
+  FAMILY "primary" (id, foo, bar)
 )
 
 query TT
@@ -54,7 +53,7 @@ CREATE TABLE d (
   INVERTED INDEX (foo, bar)
 )
 
-statement error column foo is of type int and thus is not indexable with an inverted index.*\nHINT.*35730
+statement error column foo is of type int and thus is not indexable with an inverted index.*\nHINT.*\n.*35730
 CREATE TABLE d (
   id INT PRIMARY KEY,
   foo INT,
@@ -681,3 +680,17 @@ SELECT * from update_cascade_test ORDER BY update_cascade;
 2  {"a": "b", "c": "d"}
 3  ["b", "c"]
 5  ["a", "b"]
+
+# Test that inverted index validation correctly handles NULL values on creation (#38714)
+
+statement ok
+CREATE TABLE table_with_nulls (a JSON)
+
+statement ok
+INSERT INTO table_with_nulls VALUES (NULL)
+
+statement ok
+CREATE INVERTED INDEX ON table_with_nulls (a)
+
+statement ok
+DROP TABLE table_with_nulls

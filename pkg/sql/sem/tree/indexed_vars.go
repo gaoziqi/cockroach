@@ -1,23 +1,21 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // IndexedVarContainer provides the implementation of TypeCheck, Eval, and
@@ -65,7 +63,7 @@ func (v *IndexedVar) TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, e
 		// used a column reference in a place where it's not allowed by
 		// the docs, so just say that instead.
 		return nil, pgerror.Newf(
-			pgerror.CodeUndefinedColumnError, "column reference @%d not allowed in this context", v.Idx+1)
+			pgcode.UndefinedColumn, "column reference @%d not allowed in this context", v.Idx+1)
 	}
 	v.typ = ctx.IVarContainer.IndexedVarResolvedType(v.Idx)
 	return v, nil
@@ -74,7 +72,7 @@ func (v *IndexedVar) TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, e
 // Eval is part of the TypedExpr interface.
 func (v *IndexedVar) Eval(ctx *EvalContext) (Datum, error) {
 	if ctx.IVarContainer == nil || ctx.IVarContainer == unboundContainer {
-		return nil, pgerror.AssertionFailedf(
+		return nil, errors.AssertionFailedf(
 			"indexed var must be bound to a container before evaluation")
 	}
 	return ctx.IVarContainer.IndexedVarEval(v.Idx, ctx)
@@ -83,7 +81,7 @@ func (v *IndexedVar) Eval(ctx *EvalContext) (Datum, error) {
 // ResolvedType is part of the TypedExpr interface.
 func (v *IndexedVar) ResolvedType() *types.T {
 	if v.typ == nil {
-		panic(pgerror.AssertionFailedf("indexed var must be type checked first"))
+		panic(errors.AssertionFailedf("indexed var must be type checked first"))
 	}
 	return v.typ
 }
@@ -113,18 +111,6 @@ func NewTypedOrdinalReference(r int, typ *types.T) *IndexedVar {
 	return &IndexedVar{Idx: r, typeAnnotation: typeAnnotation{typ: typ}}
 }
 
-// NewIndexedVar is a helper routine to create a standalone Indexedvar
-// with the given index value. This needs to undergo BindIfUnbound()
-// below before it can be fully used. The difference with ordinal
-// references is that vars returned by this constructor are modified
-// in-place by BindIfUnbound.
-//
-// Do not use NewIndexedVar for AST nodes that can undergo binding two
-// or more times.
-func NewIndexedVar(r int) *IndexedVar {
-	return &IndexedVar{Idx: r, bindInPlace: true}
-}
-
 // IndexedVarHelper wraps an IndexedVarContainer (an interface) and creates
 // IndexedVars bound to that container.
 //
@@ -151,7 +137,7 @@ func (h *IndexedVarHelper) BindIfUnbound(ivar *IndexedVar) (*IndexedVar, error) 
 	// across containers.
 	if ivar.Idx < 0 || ivar.Idx >= len(h.vars) {
 		return ivar, pgerror.Newf(
-			pgerror.CodeUndefinedColumnError, "invalid column ordinal: @%d", ivar.Idx+1)
+			pgcode.UndefinedColumn, "invalid column ordinal: @%d", ivar.Idx+1)
 	}
 
 	if !ivar.Used {
@@ -181,7 +167,7 @@ func (h *IndexedVarHelper) AppendSlot() int {
 
 func (h *IndexedVarHelper) checkIndex(idx int) {
 	if idx < 0 || idx >= len(h.vars) {
-		panic(pgerror.AssertionFailedf(
+		panic(errors.AssertionFailedf(
 			"invalid var index %d (columns: %d)", log.Safe(idx), log.Safe(len(h.vars))))
 	}
 }
@@ -286,17 +272,17 @@ var unboundContainer = &unboundContainerType{}
 
 // IndexedVarEval is part of the IndexedVarContainer interface.
 func (*unboundContainerType) IndexedVarEval(idx int, _ *EvalContext) (Datum, error) {
-	return nil, pgerror.AssertionFailedf("unbound ordinal reference @%d", log.Safe(idx+1))
+	return nil, errors.AssertionFailedf("unbound ordinal reference @%d", log.Safe(idx+1))
 }
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
 func (*unboundContainerType) IndexedVarResolvedType(idx int) *types.T {
-	panic(pgerror.AssertionFailedf("unbound ordinal reference @%d", log.Safe(idx+1)))
+	panic(errors.AssertionFailedf("unbound ordinal reference @%d", log.Safe(idx+1)))
 }
 
 // IndexedVarNodeFormatter is part of the IndexedVarContainer interface.
 func (*unboundContainerType) IndexedVarNodeFormatter(idx int) NodeFormatter {
-	panic(pgerror.AssertionFailedf("unbound ordinal reference @%d", log.Safe(idx+1)))
+	panic(errors.AssertionFailedf("unbound ordinal reference @%d", log.Safe(idx+1)))
 }
 
 type typeContainer struct {
@@ -307,7 +293,7 @@ var _ IndexedVarContainer = &typeContainer{}
 
 // IndexedVarEval is part of the IndexedVarContainer interface.
 func (tc *typeContainer) IndexedVarEval(idx int, ctx *EvalContext) (Datum, error) {
-	return nil, pgerror.AssertionFailedf("no eval allowed in typeContainer")
+	return nil, errors.AssertionFailedf("no eval allowed in typeContainer")
 }
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.

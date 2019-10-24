@@ -33,6 +33,8 @@ add_library(roach
   file_registry.cc
   getter.cc
   godefs.cc
+  incremental_iterator.cc
+  row_counter.cc
   iterator.cc
   ldb.cc
   merge.cc
@@ -43,6 +45,7 @@ add_library(roach
   table_props.cc
   utils.cc
   protos/roachpb/data.pb.cc
+  protos/roachpb/errors.pb.cc
   protos/roachpb/internal.pb.cc
   protos/roachpb/metadata.pb.cc
   protos/storage/engine/enginepb/mvcc.pb.cc
@@ -53,6 +56,8 @@ add_library(roach
   protos/util/hlc/timestamp.pb.cc
   protos/util/log/log.pb.cc
   protos/util/unresolved_addr.pb.cc
+  protos/roachpb/api.pb.cc
+  protos/util/tracing/recorded_span.pb.cc
   rocksdbutils/env_encryption.cc
 )
 target_include_directories(roach
@@ -72,6 +77,7 @@ add_library(roachccl
   protosccl/ccl/storageccl/engineccl/enginepbccl/stats.pb.cc
 )
 target_include_directories(roachccl
+  PUBLIC ./ccl/include
   PRIVATE .. # CryptoPP headers are directly in the directory. Include .. to be able to include <cryptopp/....h>
   PRIVATE ../protobuf/src
   PRIVATE ../rocksdb/include
@@ -84,7 +90,7 @@ set_target_properties(roach roachccl PROPERTIES
   CXX_STANDARD 11
   CXX_STANDARD_REQUIRED YES
   CXX_EXTENSIONS NO
-  COMPILE_OPTIONS "-Werror;-Wall;-Wno-sign-compare"
+  COMPILE_OPTIONS "-Werror;-Wall;-Wno-sign-compare;-Wno-array-bounds"
 )
 
 enable_testing()
@@ -172,7 +178,7 @@ foreach(tsrc ${tests})
     CXX_STANDARD 11
     CXX_STANDARD_REQUIRED YES
     CXX_EXTENSIONS NO
-    COMPILE_OPTIONS "-Werror;-Wall;-Wno-sign-compare"
+    COMPILE_OPTIONS "-Werror;-Wall;-Wno-sign-compare;-Wno-array-bounds"
   )
 
   # Add the executable to the set of tests run by the "check" target.

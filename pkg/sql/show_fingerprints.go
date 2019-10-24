@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -19,11 +15,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 type showFingerprintsNode struct {
@@ -70,11 +66,6 @@ func (p *planner) ShowFingerprints(
 		tableDesc: tableDesc,
 		indexes:   tableDesc.AllNonDropIndexes(),
 	}, nil
-}
-
-var showFingerprintsColumns = sqlbase.ResultColumns{
-	{Name: "index_name", Typ: types.String},
-	{Name: "fingerprint", Typ: types.String},
 }
 
 // showFingerprintsRun contains the run-time state of
@@ -159,7 +150,7 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	}
 
 	if len(fingerprintCols) != 1 {
-		return false, pgerror.AssertionFailedf(
+		return false, errors.AssertionFailedf(
 			"unexpected number of columns returned: 1 vs %d",
 			len(fingerprintCols))
 	}

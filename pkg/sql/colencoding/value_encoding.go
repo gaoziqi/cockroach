@@ -1,25 +1,21 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package colencoding
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // DecodeTableValueToCol decodes a value encoded by EncodeTableValue, writing
@@ -62,7 +58,7 @@ func decodeUntaggedDatumToCol(vec coldata.Vec, idx uint16, t *types.T, buf []byt
 	case types.BytesFamily, types.StringFamily:
 		var data []byte
 		buf, data, err = encoding.DecodeUntaggedBytesValue(buf)
-		vec.Bytes()[idx] = data
+		vec.Bytes().Set(int(idx), data)
 	case types.DateFamily, types.OidFamily:
 		var i int64
 		buf, i, err = encoding.DecodeUntaggedIntValue(buf)
@@ -77,8 +73,6 @@ func decodeUntaggedDatumToCol(vec coldata.Vec, idx uint16, t *types.T, buf []byt
 		var i int64
 		buf, i, err = encoding.DecodeUntaggedIntValue(buf)
 		switch t.Width() {
-		case 8:
-			vec.Int8()[idx] = int8(i)
 		case 16:
 			vec.Int16()[idx] = int16(i)
 		case 32:
@@ -89,7 +83,7 @@ func decodeUntaggedDatumToCol(vec coldata.Vec, idx uint16, t *types.T, buf []byt
 			vec.Int64()[idx] = i
 		}
 	default:
-		return buf, pgerror.AssertionFailedf(
+		return buf, errors.AssertionFailedf(
 			"couldn't decode type: %s", log.Safe(t))
 	}
 	return buf, err

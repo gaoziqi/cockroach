@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -23,17 +19,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
 
 var _ sqlutil.InternalExecutor = &InternalExecutor{}
@@ -198,6 +194,7 @@ func (ie *internalExecutorImpl) initConnEx(
 	if err != nil {
 		return nil, nil, err
 	}
+	ex.executorType = executorTypeInternal
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -469,10 +466,10 @@ func (ie *internalExecutorImpl) execInternal(
 		// case we need to leave the error intact so that it can be retried at a
 		// higher level.
 		if retErr != nil && !errIsRetriable(retErr) {
-			retErr = pgerror.Wrapf(retErr, pgerror.CodeDataExceptionError, opName)
+			retErr = errors.Wrapf(retErr, opName)
 		}
 		if retRes.err != nil && !errIsRetriable(retRes.err) {
-			retRes.err = pgerror.Wrapf(retRes.err, pgerror.CodeDataExceptionError, opName)
+			retRes.err = errors.Wrapf(retRes.err, opName)
 		}
 	}()
 
@@ -507,7 +504,7 @@ func (ie *internalExecutorImpl) execInternal(
 				return
 			}
 		}
-		resCh <- result{err: pgerror.AssertionFailedf("missing result for pos: %d and no previous error", resPos)}
+		resCh <- result{err: errors.AssertionFailedf("missing result for pos: %d and no previous error", resPos)}
 	}
 	errCallback := func(err error) {
 		if resultsReceived {
@@ -598,6 +595,9 @@ func (icc *internalClientComm) CreateStatementResult(
 	pos CmdPos,
 	_ []pgwirebase.FormatCode,
 	_ sessiondata.DataConversionConfig,
+	_ int,
+	_ string,
+	_ bool,
 ) CommandResult {
 	return icc.createRes(pos, nil /* onClose */)
 }

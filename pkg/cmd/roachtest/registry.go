@@ -1,24 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
-func registerTests(r *registry) {
+func registerTests(r *testRegistry) {
 	// Helpful shell pipeline to generate the list below:
 	//
-	// grep -h -E 'func register[^(]+\(.*registry\) {' *.go | grep -E -o 'register[^(]+' | grep -E -v '^register(Tests|Benchmarks)$' | grep -v '^\w*Bench$' | sort -f | awk '{printf "\t%s(r)\n", $0}'
+	// grep -h -E 'func register[^(]+\(.*testRegistry\) {' pkg/cmd/roachtest/*.go | grep -E -o 'register[^(]+' | grep -E -v '^register(Tests|Benchmarks)$' | grep -v '^\w*Bench$' | sort -f | awk '{printf "\t%s(r)\n", $0}'
 
 	registerAcceptance(r)
 	registerAllocator(r)
@@ -26,16 +21,19 @@ func registerTests(r *registry) {
 	registerCancel(r)
 	registerCDC(r)
 	registerClearRange(r)
-	registerClock(r)
+	registerClockJumpTests(r)
+	registerClockMonotonicTests(r)
 	registerCopy(r)
 	registerDecommission(r)
 	registerDiskFull(r)
 	registerDiskStalledDetection(r)
+	registerDjango(r)
 	registerDrop(r)
 	registerElectionAfterRestart(r)
 	registerEncryption(r)
 	registerFlowable(r)
 	registerFollowerReads(r)
+	registerGopg(r)
 	registerGossip(r)
 	registerHibernate(r)
 	registerHotSpotSplits(r)
@@ -50,13 +48,17 @@ func registerTests(r *registry) {
 	registerKVGracefulDraining(r)
 	registerKVScalability(r)
 	registerKVSplits(r)
+	registerKVRangeLookups(r)
 	registerLargeRange(r)
 	registerLedger(r)
+	registerLibPQ(r)
 	registerNetwork(r)
+	registerPgjdbc(r)
 	registerPsycopg(r)
 	registerQueue(r)
 	registerRebalanceLoad(r)
 	registerReplicaGC(r)
+	registerRestart(r)
 	registerRestore(r)
 	registerRoachmart(r)
 	registerScaleData(r)
@@ -64,9 +66,11 @@ func registerTests(r *registry) {
 	registerSchemaChangeKV(r)
 	registerSchemaChangeIndexTPCC100(r)
 	registerSchemaChangeIndexTPCC1000(r)
+	registerMixedSchemaChangesTPCC1000(r)
 	registerSchemaChangeInvertedIndex(r)
 	registerScrubAllChecksTPCC(r)
 	registerScrubIndexOnlyTPCC(r)
+	registerSQLAlchemy(r)
 	registerSyncTest(r)
 	registerSysbench(r)
 	registerTPCC(r)
@@ -76,9 +80,10 @@ func registerTests(r *registry) {
 	registerVersion(r)
 	registerYCSB(r)
 	registerTPCHBench(r)
+	registerOverload(r)
 }
 
-func registerBenchmarks(r *registry) {
+func registerBenchmarks(r *testRegistry) {
 	// Helpful shell pipeline to generate the list below:
 	//
 	// grep -h -E 'func register[^(]+\(.*registry\) {' *.go | grep -E -o 'register[^(]+' | grep -v '^registerTests$' | grep '^\w*Bench$' | sort | awk '{printf "\t%s(r)\n", $0}'

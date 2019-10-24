@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -288,24 +284,25 @@ func (rs *replicaScanner) scanLoop(stopper *stop.Stopper) {
 				shouldStop = rs.waitAndProcess(ctx, stopper, start, nil)
 			}
 
-			shouldStop = shouldStop || nil != stopper.RunTask(
-				ctx, "storage.replicaScanner: scan loop",
-				func(ctx context.Context) {
-					// Increment iteration count.
-					rs.mu.Lock()
-					defer rs.mu.Unlock()
-					rs.mu.scanCount++
-					rs.mu.total += timeutil.Since(start)
-					if log.V(6) {
-						log.Infof(ctx, "reset replica scan iteration")
-					}
-
-					// Reset iteration and start time.
-					start = timeutil.Now()
-				})
+			// waitAndProcess returns true when the system is stopping. Note that this
+			// means we don't have to check the stopper as well.
 			if shouldStop {
 				return
 			}
+
+			// Increment iteration count.
+			func() {
+				rs.mu.Lock()
+				defer rs.mu.Unlock()
+				rs.mu.scanCount++
+				rs.mu.total += timeutil.Since(start)
+			}()
+			if log.V(6) {
+				log.Infof(ctx, "reset replica scan iteration")
+			}
+
+			// Reset iteration and start time.
+			start = timeutil.Now()
 		}
 	})
 }

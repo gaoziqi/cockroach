@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlutils
 
@@ -33,7 +29,7 @@ type SQLRunner struct {
 }
 
 // DBHandle is an interface that applies to *gosql.DB, *gosql.Conn, and
-// *gosql.Tx.
+// *gosql.Tx, as well as *RoundRobinDBHandle.
 type DBHandle interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (gosql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...interface{}) (*gosql.Rows, error)
@@ -48,6 +44,12 @@ var _ DBHandle = &gosql.Tx{}
 // The argument can be a *gosql.DB, *gosql.Conn, or *gosql.Tx object.
 func MakeSQLRunner(db DBHandle) *SQLRunner {
 	return &SQLRunner{DB: db}
+}
+
+// MakeRoundRobinSQLRunner returns a SQLRunner that uses a set of database
+// connections, in a round-robin fashion.
+func MakeRoundRobinSQLRunner(dbs ...DBHandle) *SQLRunner {
+	return MakeSQLRunner(MakeRoundRobinDBHandle(dbs...))
 }
 
 // Exec is a wrapper around gosql.Exec that kills the test on error.
@@ -203,4 +205,45 @@ func (sr *SQLRunner) CheckQueryResultsRetry(t testing.TB, query string, expected
 		}
 		return nil
 	})
+}
+
+// RoundRobinDBHandle aggregates multiple DBHandles into a single one; each time
+// a query is issued, a handle is selected in round-robin fashion.
+type RoundRobinDBHandle struct {
+	handles []DBHandle
+	current int
+}
+
+var _ DBHandle = &RoundRobinDBHandle{}
+
+// MakeRoundRobinDBHandle creates a RoundRobinDBHandle.
+func MakeRoundRobinDBHandle(handles ...DBHandle) *RoundRobinDBHandle {
+	return &RoundRobinDBHandle{handles: handles}
+}
+
+func (rr *RoundRobinDBHandle) next() DBHandle {
+	h := rr.handles[rr.current]
+	rr.current = (rr.current + 1) % len(rr.handles)
+	return h
+}
+
+// ExecContext is part of the DBHandle interface.
+func (rr *RoundRobinDBHandle) ExecContext(
+	ctx context.Context, query string, args ...interface{},
+) (gosql.Result, error) {
+	return rr.next().ExecContext(ctx, query, args...)
+}
+
+// QueryContext is part of the DBHandle interface.
+func (rr *RoundRobinDBHandle) QueryContext(
+	ctx context.Context, query string, args ...interface{},
+) (*gosql.Rows, error) {
+	return rr.next().QueryContext(ctx, query, args...)
+}
+
+// QueryRowContext is part of the DBHandle interface.
+func (rr *RoundRobinDBHandle) QueryRowContext(
+	ctx context.Context, query string, args ...interface{},
+) *gosql.Row {
+	return rr.next().QueryRowContext(ctx, query, args...)
 }

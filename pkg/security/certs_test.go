@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package security_test
 
@@ -32,6 +28,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/pkg/errors"
 )
+
+const testKeySize = 1024
 
 func TestGenerateCACert(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -77,7 +75,7 @@ func TestGenerateCACert(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		err := security.CreateCAPair(tc.certsDir, tc.caKey, 512,
+		err := security.CreateCAPair(tc.certsDir, tc.caKey, testKeySize,
 			time.Hour*48, tc.allowReuse, tc.overwrite)
 		if !testutils.IsError(err, tc.errStr) {
 			t.Errorf("#%d: expected error %s but got %+v", i, tc.errStr, err)
@@ -129,21 +127,21 @@ func TestGenerateNodeCerts(t *testing.T) {
 	// Try generating node certs without CA certs present.
 	if err := security.CreateNodePair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		512, time.Hour*48, false, []string{"localhost"},
+		testKeySize, time.Hour*48, false, []string{"localhost"},
 	); err == nil {
 		t.Fatalf("Expected error, but got none")
 	}
 
 	// Now try in the proper order.
 	if err := security.CreateCAPair(
-		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey), 512, time.Hour*96, false, false,
+		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey), testKeySize, time.Hour*96, false, false,
 	); err != nil {
 		t.Fatalf("Expected success, got %v", err)
 	}
 
 	if err := security.CreateNodePair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		512, time.Hour*48, false, []string{"localhost"},
+		testKeySize, time.Hour*48, false, []string{"localhost"},
 	); err != nil {
 		t.Fatalf("Expected success, got %v", err)
 	}
@@ -156,21 +154,21 @@ func TestGenerateNodeCerts(t *testing.T) {
 func generateBaseCerts(certsDir string) error {
 	if err := security.CreateCAPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		512, time.Hour*96, true, true,
+		testKeySize, time.Hour*96, true, true,
 	); err != nil {
 		return errors.Errorf("could not generate CA pair: %v", err)
 	}
 
 	if err := security.CreateNodePair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		512, time.Hour*48, true, []string{"127.0.0.1"},
+		testKeySize, time.Hour*48, true, []string{"127.0.0.1"},
 	); err != nil {
 		return errors.Errorf("could not generate Node pair: %v", err)
 	}
 
 	if err := security.CreateClientPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		512, time.Hour*48, true, security.RootUser, false,
+		testKeySize, time.Hour*48, true, security.RootUser, false,
 	); err != nil {
 		return errors.Errorf("could not generate Client pair: %v", err)
 	}
@@ -187,49 +185,49 @@ func generateBaseCerts(certsDir string) error {
 func generateSplitCACerts(certsDir string) error {
 	if err := security.CreateCAPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		512, time.Hour*96, true, true,
+		testKeySize, time.Hour*96, true, true,
 	); err != nil {
 		return errors.Errorf("could not generate CA pair: %v", err)
 	}
 
 	if err := security.CreateNodePair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedCAKey),
-		512, time.Hour*48, true, []string{"127.0.0.1"},
+		testKeySize, time.Hour*48, true, []string{"127.0.0.1"},
 	); err != nil {
 		return errors.Errorf("could not generate Node pair: %v", err)
 	}
 
 	if err := security.CreateClientCAPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedClientCAKey),
-		512, time.Hour*96, true, true,
+		testKeySize, time.Hour*96, true, true,
 	); err != nil {
 		return errors.Errorf("could not generate client CA pair: %v", err)
 	}
 
 	if err := security.CreateClientPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedClientCAKey),
-		512, time.Hour*48, true, security.NodeUser, false,
+		testKeySize, time.Hour*48, true, security.NodeUser, false,
 	); err != nil {
 		return errors.Errorf("could not generate Client pair: %v", err)
 	}
 
 	if err := security.CreateClientPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedClientCAKey),
-		512, time.Hour*48, true, security.RootUser, false,
+		testKeySize, time.Hour*48, true, security.RootUser, false,
 	); err != nil {
 		return errors.Errorf("could not generate Client pair: %v", err)
 	}
 
 	if err := security.CreateUICAPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedUICAKey),
-		512, time.Hour*96, true, true,
+		testKeySize, time.Hour*96, true, true,
 	); err != nil {
 		return errors.Errorf("could not generate UI CA pair: %v", err)
 	}
 
 	if err := security.CreateUIPair(
 		certsDir, filepath.Join(certsDir, security.EmbeddedUICAKey),
-		512, time.Hour*48, true, []string{"127.0.0.1"},
+		testKeySize, time.Hour*48, true, []string{"127.0.0.1"},
 	); err != nil {
 		return errors.Errorf("could not generate UI pair: %v", err)
 	}
@@ -437,7 +435,7 @@ func TestUseSplitCACerts(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		pgUrl := makeSecurePGUrl(s.ServingAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
+		pgUrl := makeSecurePGUrl(s.ServingSQLAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
 		goDB, err := gosql.Open("postgres", pgUrl)
 		if err != nil {
 			t.Fatal(err)
@@ -545,7 +543,7 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		pgUrl := makeSecurePGUrl(s.ServingAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
+		pgUrl := makeSecurePGUrl(s.ServingSQLAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
 		goDB, err := gosql.Open("postgres", pgUrl)
 		if err != nil {
 			t.Fatal(err)

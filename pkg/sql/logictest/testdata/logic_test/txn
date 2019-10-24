@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
-
 # Transaction involving schema changes.
 statement ok
 BEGIN TRANSACTION
@@ -93,7 +91,7 @@ a c
 statement ok
 BEGIN
 
-query error syntax error at or near ","
+query error at or near ",": syntax error
 SELECT count(*, 1) FROM kv
 
 statement error pgcode 25P02 current transaction is aborted, commands ignored until end of transaction block
@@ -558,7 +556,7 @@ statement ok
 BEGIN TRANSACTION; SAVEPOINT cockroach_restart; SELECT 1
 
 query error pgcode 40001 restart transaction: crdb_internal.force_retry\(\): TransactionRetryWithProtoRefreshError: forced by crdb_internal.force_retry\(\)
-SELECT crdb_internal.force_retry('1s':::INTERVAL)
+SELECT crdb_internal.force_retry('1h':::INTERVAL)
 
 query T
 SHOW TRANSACTION STATUS
@@ -578,31 +576,60 @@ COMMIT
 
 
 # Automatic retries for the first batch.
+# We use a sequence to avoid busy-looping the test.
 statement ok
-BEGIN TRANSACTION; SELECT crdb_internal.force_retry('100ms':::INTERVAL)
+CREATE SEQUENCE s;
+  BEGIN TRANSACTION;
+  SELECT IF(nextval('s')<3, crdb_internal.force_retry('1h':::INTERVAL), 0)
+
+# Demonstrate that the txn was indeed retried.
+query I
+SELECT currval('s')
+----
+3
 
 statement ok
-ROLLBACK
+ROLLBACK;
+  DROP SEQUENCE s
 
 # Automatic retries for the first batch even when that first batch comes after
 # the BEGIN.
 statement ok
-BEGIN TRANSACTION;
+CREATE SEQUENCE s;
+  BEGIN TRANSACTION;
 
 statement ok
-SELECT 1; SELECT crdb_internal.force_retry('100ms':::INTERVAL)
+SELECT 1;
+  SELECT IF(nextval('s')<3, crdb_internal.force_retry('1h':::INTERVAL), 0)
+
+# Demonstrate that the txn was indeed retried.
+query I
+SELECT currval('s')
+----
+3
 
 statement ok
-ROLLBACK
+ROLLBACK;
+  DROP SEQUENCE s
 
 # Automatic retries for the first batch even when that first batch comes after
 # the BEGIN and the BEGIN also has special statements that don't move the txn
 # state out of the "AutoRetry" state.
 statement ok
-BEGIN TRANSACTION; SAVEPOINT cockroach_restart; SET TRANSACTION PRIORITY HIGH; SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+CREATE SEQUENCE s;
+  BEGIN TRANSACTION;
+  SAVEPOINT cockroach_restart;
+  SET TRANSACTION PRIORITY HIGH;
+  SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
 
 statement ok
-SELECT crdb_internal.force_retry('100ms':::INTERVAL)
+SELECT IF(nextval('s')<3, crdb_internal.force_retry('1h':::INTERVAL), 0)
+
+# Demonstrate that the txn was indeed retried.
+query I
+SELECT currval('s')
+----
+3
 
 query T
 SHOW TRANSACTION ISOLATION LEVEL
@@ -615,25 +642,37 @@ SHOW TRANSACTION PRIORITY
 high
 
 statement ok
-ROLLBACK
+ROLLBACK;
+  DROP SEQUENCE s
 
 # Like above, but the SAVEPOINT is its own batch.
 statement ok
-BEGIN TRANSACTION
+CREATE SEQUENCE s;
+  BEGIN TRANSACTION
 
 statement ok
 SAVEPOINT cockroach_restart;
 
 statement ok
-SELECT crdb_internal.force_retry('100ms':::INTERVAL)
+SELECT IF(nextval('s')<3, crdb_internal.force_retry('1h':::INTERVAL), 0)
+
+# Demonstrate that the txn was indeed retried.
+query I
+SELECT currval('s')
+----
+3
 
 statement ok
-ROLLBACK
+ROLLBACK;
+  DROP SEQUENCE s
 
 
 # Automatic retries for the first batch after an explicit restart.
 statement ok
-BEGIN TRANSACTION; SAVEPOINT cockroach_restart; SELECT 1;
+CREATE SEQUENCE s;
+  BEGIN TRANSACTION;
+  SAVEPOINT cockroach_restart;
+  SELECT 1;
 
 query error pgcode 40001 restart transaction: crdb_internal.force_retry\(\): TransactionRetryWithProtoRefreshError: forced by crdb_internal.force_retry\(\)
 SELECT crdb_internal.force_retry('1h':::INTERVAL)
@@ -643,18 +682,27 @@ ROLLBACK TO SAVEPOINT COCKROACH_RESTART;
 
 # This is the automatic retry we care about.
 statement ok
-SELECT crdb_internal.force_retry('50ms':::INTERVAL)
+SELECT IF(nextval('s')<3, crdb_internal.force_retry('1h':::INTERVAL), 0)
+
+# Demonstrate that the txn was indeed retried.
+query I
+SELECT currval('s')
+----
+3
 
 statement ok
-ROLLBACK
+ROLLBACK;
+  DROP SEQUENCE s
 
 
 # Wrong savepoint name moves the txn state from RestartWait to Aborted.
 statement ok
-BEGIN TRANSACTION; SAVEPOINT cockroach_restart; SELECT 1;
+BEGIN TRANSACTION;
+  SAVEPOINT cockroach_restart;
+  SELECT 1
 
 query error pgcode 40001 restart transaction: crdb_internal.force_retry\(\): TransactionRetryWithProtoRefreshError: forced by crdb_internal.force_retry\(\)
-SELECT crdb_internal.force_retry('1s':::INTERVAL)
+SELECT crdb_internal.force_retry('1h':::INTERVAL)
 
 query T
 SHOW TRANSACTION STATUS
@@ -939,8 +987,7 @@ INSERT INTO kv VALUES('foo')
 statement error cannot execute UPDATE in a read-only transaction
 UPDATE kv SET v = 'foo'
 
-# The heuristic planner uses INSERT, the optimizer uses UPSERT; accept both.
-statement error SERT in a read-only transaction
+statement error cannot execute UPSERT in a read-only transaction
 UPSERT INTO kv VALUES('foo')
 
 statement error cannot execute DELETE in a read-only transaction
@@ -974,7 +1021,7 @@ statement ok
 BEGIN; SELECT 1
 
 query error pgcode 40001 restart transaction: crdb_internal.force_retry\(\): TransactionRetryWithProtoRefreshError: forced by crdb_internal.force_retry\(\)
-SELECT crdb_internal.force_retry('1s':::INTERVAL)
+SELECT crdb_internal.force_retry('1h':::INTERVAL)
 
 statement ok
 ROLLBACK

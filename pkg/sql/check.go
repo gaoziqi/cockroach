@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -22,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -43,7 +40,7 @@ func validateCheckExpr(
 	tblref := tree.TableRef{TableID: int64(tableDesc.ID), As: tree.AliasClause{Alias: "t"}}
 	sel := &tree.SelectClause{
 		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns, false /* forUpdateOrDelete */),
-		From:  &tree.From{Tables: []tree.TableExpr{&tblref}},
+		From:  tree.From{Tables: []tree.TableExpr{&tblref}},
 		Where: &tree.Where{Type: tree.AstWhere, Expr: &tree.NotExpr{Expr: expr}},
 	}
 	lim := &tree.Limit{Count: tree.NewDInt(1)}
@@ -56,7 +53,7 @@ func validateCheckExpr(
 		return err
 	}
 	if rows.Len() > 0 {
-		return pgerror.Newf(pgerror.CodeCheckViolationError,
+		return pgerror.Newf(pgcode.CheckViolation,
 			"validation of CHECK %q failed on row: %s",
 			expr.String(), labeledRowValues(tableDesc.Columns, rows))
 	}
@@ -76,23 +73,36 @@ func validateCheckExpr(
 //   NOT ((COALESCE(a_id, b_id) IS NULL) OR (a_id IS NOT NULL AND b_id IS NOT NULL))
 // LIMIT 1;
 func matchFullUnacceptableKeyQuery(
-	prefix int, srcTbl *sqlbase.TableDescriptor, srcIdx *sqlbase.IndexDescriptor, limitResults bool,
+	srcTbl *sqlbase.TableDescriptor, fk *sqlbase.ForeignKeyConstraint, limitResults bool,
 ) (sql string, colNames []string, _ error) {
-	srcCols := make([]string, prefix)
-	srcNotNullClause := make([]string, prefix)
-	for i := 0; i < prefix; i++ {
-		srcCols[i] = tree.NameString(srcIdx.ColumnNames[i])
-		srcNotNullClause[i] = fmt.Sprintf("%s IS NOT NULL", tree.NameString(srcIdx.ColumnNames[i]))
-	}
-
+	nCols := len(fk.OriginColumnIDs)
+	srcCols := make([]string, nCols)
+	srcNotNullClause := make([]string, nCols)
 	returnedCols := srcCols
-	// ExtraColumns will include primary index key values not already part of the index.
-	for _, id := range srcIdx.ExtraColumnIDs {
-		column, err := srcTbl.FindActiveColumnByID(id)
+	for i := 0; i < nCols; i++ {
+		col, err := srcTbl.FindColumnByID(fk.OriginColumnIDs[i])
 		if err != nil {
 			return "", nil, err
 		}
-		returnedCols = append(returnedCols, column.Name)
+		srcCols[i] = tree.NameString(col.Name)
+		srcNotNullClause[i] = fmt.Sprintf("%s IS NOT NULL", srcCols[i])
+	}
+
+	for _, id := range srcTbl.PrimaryIndex.ColumnIDs {
+		alreadyPresent := false
+		for _, otherID := range fk.OriginColumnIDs {
+			if id == otherID {
+				alreadyPresent = true
+				break
+			}
+		}
+		if !alreadyPresent {
+			col, err := srcTbl.FindActiveColumnByID(id)
+			if err != nil {
+				return "", nil, err
+			}
+			returnedCols = append(returnedCols, col.Name)
+		}
 	}
 
 	limit := ""
@@ -100,13 +110,12 @@ func matchFullUnacceptableKeyQuery(
 		limit = " LIMIT 1"
 	}
 	return fmt.Sprintf(
-		`SELECT %[1]s FROM [%[2]d AS tbl]@[%[3]d] WHERE NOT ((COALESCE(%[4]s) IS NULL) OR (%[5]s)) %[6]s`,
+		`SELECT %[1]s FROM [%[2]d AS tbl] WHERE NOT ((COALESCE(%[3]s) IS NULL) OR (%[4]s)) %[5]s`,
 		strings.Join(returnedCols, ","),         // 1
 		srcTbl.ID,                               // 2
-		srcIdx.ID,                               // 3
-		strings.Join(srcCols, ", "),             // 4
-		strings.Join(srcNotNullClause, " AND "), // 5
-		limit,                                   // 6
+		strings.Join(srcCols, ", "),             // 3
+		strings.Join(srcNotNullClause, " AND "), // 4
+		limit,                                   // 5
 	), returnedCols, nil
 }
 
@@ -128,44 +137,57 @@ func matchFullUnacceptableKeyQuery(
 // WHERE
 //   t.a IS NULL
 // LIMIT 1  -- if limitResults is set
-// AS OF SYSTEM TIME .. -- if asOf is not hlc.MaxTimestamp
 //
 // TODO(radu): change this to a query which executes as an anti-join when we
 // remove the heuristic planner.
 func nonMatchingRowQuery(
-	prefix int,
 	srcTbl *sqlbase.TableDescriptor,
-	srcIdx *sqlbase.IndexDescriptor,
-	targetID sqlbase.ID,
-	targetIdx *sqlbase.IndexDescriptor,
+	fk *sqlbase.ForeignKeyConstraint,
+	targetTbl *sqlbase.TableDescriptor,
 	limitResults bool,
-) (sql string, colNames []string, _ error) {
-	colNames = append([]string(nil), srcIdx.ColumnNames...)
-	// ExtraColumns will include primary index key values not already part of the index.
-	for _, id := range srcIdx.ExtraColumnIDs {
-		column, err := srcTbl.FindActiveColumnByID(id)
-		if err != nil {
-			return "", nil, err
-		}
-		colNames = append(colNames, column.Name)
+) (sql string, originColNames []string, _ error) {
+	originColNames, err := srcTbl.NamesForColumnIDs(fk.OriginColumnIDs)
+	if err != nil {
+		return "", nil, err
 	}
-
-	srcCols := make([]string, len(colNames))
-	qualifiedSrcCols := make([]string, len(colNames))
-	for i, n := range colNames {
+	// Get primary key columns not included in the FK
+	for _, pkColID := range srcTbl.PrimaryIndex.ColumnIDs {
+		found := false
+		for _, id := range fk.OriginColumnIDs {
+			if pkColID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			column, err := srcTbl.FindActiveColumnByID(pkColID)
+			if err != nil {
+				return "", nil, err
+			}
+			originColNames = append(originColNames, column.Name)
+		}
+	}
+	srcCols := make([]string, len(originColNames))
+	qualifiedSrcCols := make([]string, len(originColNames))
+	for i, n := range originColNames {
 		srcCols[i] = tree.NameString(n)
 		// s is the table alias used in the query.
 		qualifiedSrcCols[i] = fmt.Sprintf("s.%s", srcCols[i])
 	}
 
-	srcWhere := make([]string, prefix)
-	targetCols := make([]string, prefix)
-	on := make([]string, prefix)
+	referencedColNames, err := targetTbl.NamesForColumnIDs(fk.ReferencedColumnIDs)
+	if err != nil {
+		return "", nil, err
+	}
+	nCols := len(fk.OriginColumnIDs)
+	srcWhere := make([]string, nCols)
+	targetCols := make([]string, nCols)
+	on := make([]string, nCols)
 
-	for i := 0; i < prefix; i++ {
+	for i := 0; i < nCols; i++ {
 		// s and t are table aliases used in the query
-		srcWhere[i] = fmt.Sprintf("%s IS NOT NULL", tree.NameString(srcIdx.ColumnNames[i]))
-		targetCols[i] = fmt.Sprintf("t.%s", tree.NameString(targetIdx.ColumnNames[i]))
+		srcWhere[i] = fmt.Sprintf("%s IS NOT NULL", srcCols[i])
+		targetCols[i] = fmt.Sprintf("t.%s", tree.NameString(referencedColNames[i]))
 		on[i] = fmt.Sprintf("%s = %s", qualifiedSrcCols[i], targetCols[i])
 	}
 
@@ -175,61 +197,57 @@ func nonMatchingRowQuery(
 	}
 	return fmt.Sprintf(
 		`SELECT %[1]s FROM 
-		  (SELECT %[2]s FROM [%[3]d AS src]@{FORCE_INDEX=[%[4]d],IGNORE_FOREIGN_KEYS} WHERE %[5]s) AS s
+		  (SELECT %[2]s FROM [%[3]d AS src]@{IGNORE_FOREIGN_KEYS} WHERE %[4]s) AS s
 			LEFT OUTER JOIN
-			(SELECT * FROM [%[6]d AS target]@[%[7]d]) AS t
-			ON %[8]s
-		 WHERE %[9]s IS NULL %[10]s`,
+			(SELECT * FROM [%[5]d AS target]) AS t
+			ON %[6]s
+		 WHERE %[7]s IS NULL %[8]s`,
 		strings.Join(qualifiedSrcCols, ", "), // 1
 		strings.Join(srcCols, ", "),          // 2
 		srcTbl.ID,                            // 3
-		srcIdx.ID,                            // 4
-		strings.Join(srcWhere, " AND "),      // 5
-		targetID,                             // 6
-		targetIdx.ID,                         // 7
-		strings.Join(on, " AND "),            // 8
+		strings.Join(srcWhere, " AND "),      // 4
+		targetTbl.ID,                         // 5
+		strings.Join(on, " AND "),            // 6
 		// Sufficient to check the first column to see whether there was no matching row
-		targetCols[0], // 9
-		limit,         // 10
-	), colNames, nil
+		targetCols[0], // 7
+		limit,         // 8
+	), originColNames, nil
 }
 
 func validateForeignKey(
 	ctx context.Context,
 	srcTable *sqlbase.TableDescriptor,
-	srcIdx *sqlbase.IndexDescriptor,
+	fk *sqlbase.ForeignKeyConstraint,
 	ie tree.SessionBoundInternalExecutor,
 	txn *client.Txn,
 ) error {
-	targetTable, err := sqlbase.GetTableDescFromID(ctx, txn, srcIdx.ForeignKey.Table)
-	if err != nil {
-		return err
-	}
-	targetIdx, err := targetTable.FindIndexByID(srcIdx.ForeignKey.Index)
+	targetTable, err := sqlbase.GetTableDescFromID(ctx, txn, fk.ReferencedTableID)
 	if err != nil {
 		return err
 	}
 
-	prefix := len(srcIdx.ColumnNames)
-	if srcIdx.ForeignKey.SharedPrefixLen != 0 {
-		prefix = int(srcIdx.ForeignKey.SharedPrefixLen)
+	nCols := len(fk.OriginColumnIDs)
+
+	referencedColumnNames, err := targetTable.NamesForColumnIDs(fk.ReferencedColumnIDs)
+	if err != nil {
+		return err
 	}
 
 	// For MATCH FULL FKs, first check whether any disallowed keys containing both
 	// null and non-null values exist.
 	// (The matching options only matter for FKs with more than one column.)
-	if prefix > 1 && srcIdx.ForeignKey.Match == sqlbase.ForeignKeyReference_FULL {
+	if nCols > 1 && fk.Match == sqlbase.ForeignKeyReference_FULL {
 		query, colNames, err := matchFullUnacceptableKeyQuery(
-			prefix, srcTable, srcIdx,
-			true, /* limitResults */
+			srcTable, fk, true, /* limitResults */
 		)
 		if err != nil {
 			return err
 		}
 
 		log.Infof(ctx, "Validating MATCH FULL FK %q (%q [%v] -> %q [%v]) with query %q",
-			srcIdx.ForeignKey.Name,
-			srcTable.Name, srcIdx.ColumnNames, targetTable.Name, targetIdx.ColumnNames,
+			fk.Name,
+			srcTable.Name, colNames,
+			targetTable.Name, referencedColumnNames,
 			query,
 		)
 
@@ -238,14 +256,14 @@ func validateForeignKey(
 			return err
 		}
 		if values.Len() > 0 {
-			return pgerror.Newf(pgerror.CodeForeignKeyViolationError,
+			return pgerror.Newf(pgcode.ForeignKeyViolation,
 				"foreign key violation: MATCH FULL does not allow mixing of null and nonnull values %s for %s",
-				formatValues(colNames, values), srcIdx.ForeignKey.Name,
+				formatValues(colNames, values), fk.Name,
 			)
 		}
 	}
 	query, colNames, err := nonMatchingRowQuery(
-		prefix, srcTable, srcIdx, targetTable.ID, targetIdx,
+		srcTable, fk, targetTable,
 		true, /* limitResults */
 	)
 	if err != nil {
@@ -253,8 +271,8 @@ func validateForeignKey(
 	}
 
 	log.Infof(ctx, "Validating FK %q (%q [%v] -> %q [%v]) with query %q",
-		srcIdx.ForeignKey.Name,
-		srcTable.Name, srcIdx.ColumnNames, targetTable.Name, targetIdx.ColumnNames,
+		fk.Name,
+		srcTable.Name, colNames, targetTable.Name, referencedColumnNames,
 		query,
 	)
 
@@ -263,7 +281,7 @@ func validateForeignKey(
 		return err
 	}
 	if values.Len() > 0 {
-		return pgerror.Newf(pgerror.CodeForeignKeyViolationError,
+		return pgerror.Newf(pgcode.ForeignKeyViolation,
 			"foreign key violation: %q row %s has no match in %q",
 			srcTable.Name, formatValues(colNames, values), targetTable.Name)
 	}

@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -89,7 +84,7 @@ insert into test.commit values(3,1000), (1,1000), (2,1000);
 select age, message from [ show trace for session ];
 `)
 
-		for i := 1; i < origC.nodes; i++ {
+		for i := 1; i < origC.spec.NodeCount; i++ {
 			if dur := c.Measure(ctx, i, `SELECT 1`); dur > latency {
 				t.Fatalf("node %d unexpectedly affected by latency: select 1 took %.2fs", i, dur.Seconds())
 			}
@@ -102,7 +97,8 @@ select age, message from [ show trace for session ];
 }
 
 func runNetworkTPCC(ctx context.Context, t *test, origC *cluster, nodes int) {
-	serverNodes, workerNode := origC.Range(1, origC.nodes-1), origC.Node(origC.nodes)
+	n := origC.spec.NodeCount
+	serverNodes, workerNode := origC.Range(1, n-1), origC.Node(n)
 	origC.Put(ctx, cockroach, "./cockroach", origC.All())
 	origC.Put(ctx, workload, "./workload", origC.All())
 
@@ -140,8 +136,10 @@ func runNetworkTPCC(ctx context.Context, t *test, origC *cluster, nodes int) {
 		}
 
 		cmd := fmt.Sprintf(
-			"./workload run tpcc --warehouses=%d --wait=false --histograms=logs/stats.json --duration=%s {pgurl:2-%d}",
-			warehouses, duration, c.nodes-1)
+			"./workload run tpcc --warehouses=%d --wait=false"+
+				" --histograms="+perfArtifactsDir+"/stats.json"+
+				" --duration=%s {pgurl:2-%d}",
+			warehouses, duration, c.spec.NodeCount-1)
 		return c.RunL(ctx, tpccL, workerNode, cmd)
 	})
 
@@ -237,7 +235,7 @@ func runNetworkTPCC(ctx context.Context, t *test, origC *cluster, nodes int) {
 	m.Wait()
 }
 
-func registerNetwork(r *registry) {
+func registerNetwork(r *testRegistry) {
 	const numNodes = 4
 
 	r.Add(testSpec{

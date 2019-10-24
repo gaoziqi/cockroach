@@ -1,22 +1,29 @@
 required = [
  "github.com/client9/misspell/cmd/misspell",
+ "github.com/cockroachdb/errors",
  "github.com/cockroachdb/crlfmt",
  "github.com/cockroachdb/gostdlib/cmd/gofmt",
  "github.com/cockroachdb/gostdlib/x/tools/cmd/goimports",
  "github.com/cockroachdb/stress",
  "github.com/golang/dep/cmd/dep",
- "github.com/golang/lint/golint",
  "github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway",
  "github.com/kevinburke/go-bindata/go-bindata",
  "github.com/kisielk/errcheck",
  "github.com/mattn/goveralls",
  "github.com/mibk/dupl",
  "github.com/wadey/gocovmerge",
+ "golang.org/x/lint/golint",
  "golang.org/x/perf/cmd/benchstat",
  "golang.org/x/tools/cmd/goyacc",
  "golang.org/x/tools/cmd/stringer",
  "golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow",
  "honnef.co/go/tools/cmd/staticcheck",
+]
+
+noverify = [
+  # We generate Go code with cgo configuration flags into go-libedit in order
+   # to link against our own version of libedit.
+  "github.com/knz/go-libedit"
 ]
 
 ignored = [
@@ -31,7 +38,12 @@ ignored = [
 
 [[constraint]]
   name = "go.etcd.io/etcd"
-  branch = "master"
+  # The last time this was bumped forward, it was for a targeted fix of #40207,
+  # which temporarily prevented us from being compatible with etcd's HEAD. The
+  # PR fixing 40207 bumped it forward exactly one commit to minimize unrelated
+  # fallout. Feel free to move this back to `branch = "master"` at any time.
+  # branch = "master"
+  revision = "4a2b4c8f7e0a3754fdd5a3341a27c2431c2a5385"
 
 # Used for the API client; we want the latest.
 [[constraint]]
@@ -99,13 +111,15 @@ ignored = [
 # Pin to 2017.2.2 because of https://github.com/cockroachdb/cockroach/issues/33669.
 [[constraint]]
   name = "honnef.co/go/tools"
-  # This revision is not yet on master (as of 05-12-2019); when it is, we can
-  # switch to just using the master branch.
-  revision = "4187a5ff696fcfe80ef2204f78a3ae8262b2d54d"
+  revision = "1f0868a609b73436e79b066f93c7f1a28c5dbae2"
 
 # Test util - don't need to pin.
 [[constraint]]
   name = "github.com/leanovate/gopter"
+  branch = "master"
+
+[[constraint]]
+  name = "github.com/cockroachdb/pebble"
   branch = "master"
 
 # github.com/openzipkin-contrib/zipkin-go-opentracing requires a newer
@@ -118,6 +132,16 @@ ignored = [
 [[override]]
   name = "google.golang.org/genproto"
   branch = "master"
+
+[[constraint]]
+  name = "google.golang.org/grpc"
+  version = "=v1.21.2"
+
+# Pin until 48c3df3f8bccdfa2bed83f6e4936cdf9e4c68d15 is in a release.
+# Also investigate switching to v4 branch.
+[[constraint]]
+  name = "github.com/jackc/pgx"
+  revision = "23388fecf653ddfce2a4149acf71313b87d64e3d"
 
 [prune]
   go-tests = true

@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -180,8 +181,7 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 			key := keys[idx]
 			value.ClearChecksum()
 			value.InitChecksum(key)
-			kv := engine.MVCCKeyValue{Key: engine.MVCCKey{Key: key, Timestamp: ts}, Value: value.RawBytes}
-			if err := sst.Add(kv); err != nil {
+			if err := sst.Put(engine.MVCCKey{Key: key, Timestamp: ts}, value.RawBytes); err != nil {
 				t.Fatalf("%+v", err)
 			}
 		}
@@ -228,7 +228,7 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 	defer s.Stopper().Stop(ctx)
 	init(s.ClusterSettings())
 
-	storage, err := ExportStorageConfFromURI("nodelocal:///foo")
+	storage, err := cloud.ExternalStorageConfFromURI("nodelocal:///foo")
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -318,10 +318,10 @@ func runTestImport(t *testing.T, init func(*cluster.Settings)) {
 				t.Fatalf("failed to rewrite key: %s", reqMidKey2)
 			}
 
-			if err := kvDB.AdminSplit(ctx, reqMidKey1, reqMidKey1, true /* manual */); err != nil {
+			if err := kvDB.AdminSplit(ctx, reqMidKey1, reqMidKey1, hlc.MaxTimestamp /* expirationTime */); err != nil {
 				t.Fatal(err)
 			}
-			if err := kvDB.AdminSplit(ctx, reqMidKey2, reqMidKey2, true /* manual */); err != nil {
+			if err := kvDB.AdminSplit(ctx, reqMidKey2, reqMidKey2, hlc.MaxTimestamp /* expirationTime */); err != nil {
 				t.Fatal(err)
 			}
 

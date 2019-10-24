@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-metadata fakedist-opt
-
 # pg arrays must preserve control characters when converted to string,
 # but their direct representation as string does not escape the
 # control characters. In order for the test file to remain valid
@@ -417,12 +415,12 @@ statement ok
 DROP TABLE boundedtable
 
 # Creating multidimensional arrays should be disallowed.
-statement error unimplemented.*\nHINT.*32552
+statement error .*unimplemented.*\nHINT.*\n.*32552
 CREATE TABLE badtable (b INT[][])
 
 # Nested arrays should be disallowed
 
-query error unimplemented: arrays cannot have arrays as element type.*\nHINT.*32552
+query error unimplemented: arrays cannot have arrays as element type.*\nHINT.*\n.*32552
 SELECT ARRAY[ARRAY[1,2,3]]
 
 # The postgres-compat aliases should be disallowed.
@@ -862,10 +860,15 @@ DROP TABLE a
 
 # Element append
 
+# Postgres also requires that the string be explicitly casted, so we're no worse
+# for wear despite this being a little annoying.
 query T
-SELECT ARRAY['a','b','c'] || 'd'
+SELECT ARRAY['a','b','c'] || 'd'::text
 ----
 {a,b,c,d}
+
+query error unsupported binary operator
+SELECT ARRAY['a','b','c'] || 'd'
 
 query T
 SELECT ARRAY[1,2,3] || 4
@@ -1297,3 +1300,24 @@ GROUP BY
     tab_1.col_1
 ----
 {}
+
+# Regression test for #38293.
+statement ok
+CREATE TABLE defvals (
+    id SERIAL NOT NULL PRIMARY KEY,
+    arr1 STRING(100) ARRAY NOT NULL DEFAULT ARRAY[],
+    arr2 INT ARRAY NOT NULL DEFAULT ARRAY[]
+)
+
+statement ok
+INSERT INTO defvals(id) VALUES (1)
+
+statement ok
+CREATE TABLE defvals2 (
+    id SERIAL NOT NULL PRIMARY KEY,
+    arr1 STRING(100) ARRAY NOT NULL DEFAULT ARRAY[NULL],
+    arr2 INT ARRAY NOT NULL DEFAULT ARRAY[NULL]
+)
+
+statement ok
+INSERT INTO defvals2(id) VALUES (1)

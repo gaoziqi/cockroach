@@ -1,37 +1,45 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
+	"os/signal"
 	"os/user"
+	"path/filepath"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/spf13/cobra"
 )
 
+// runnerLogsDir is the dir under the artifacts root where the test runner log
+// and other runner-related logs (i.e. cluster creation logs) will be written.
+const runnerLogsDir = "_runner-logs"
+
 func main() {
 	rand.Seed(timeutil.Now().UnixNano())
 	username := os.Getenv("ROACHPROD_USER")
 	parallelism := 10
+	var cpuQuota int
 	// Path to a local dir where the test logs and artifacts collected from
 	// cluster will be placed.
 	var artifacts string
+	var httpPort int
+	var debugEnabled bool
+	var clusterID string
+	var count = 1
 
 	cobra.EnableCommandSorting = false
 
@@ -48,7 +56,10 @@ func main() {
 			}
 
 			if clusterName != "" && local {
-				return fmt.Errorf("cannot specify both an existing cluster (%s) and --local", clusterName)
+				return fmt.Errorf(
+					"cannot specify both an existing cluster (%s) and --local. However, if a local cluster "+
+						"already exists, --clusters=local will use it",
+					clusterName)
 			}
 			switch cmd.Name() {
 			case "run", "bench", "store-gen":
@@ -59,7 +70,10 @@ func main() {
 	}
 
 	rootCmd.PersistentFlags().StringVarP(
-		&clusterName, "cluster", "c", "", "name of an existing cluster to use for running tests")
+		&clusterName, "cluster", "c", "",
+		"Comma-separated list of names existing cluster to use for running tests. "+
+			"If fewer than --parallelism names are specified, then the parallelism "+
+			"is capped to the number of clusters specified.")
 	rootCmd.PersistentFlags().BoolVarP(
 		&local, "local", "l", local, "run tests locally")
 	rootCmd.PersistentFlags().StringVarP(
@@ -97,14 +111,17 @@ Examples:
    roachtest list tag:weekly
 `,
 		RunE: func(_ *cobra.Command, args []string) error {
-			r := newRegistry(setBuildVersion)
+			r, err := makeTestRegistry()
+			if err != nil {
+				return err
+			}
 			if !listBench {
-				registerTests(r)
+				registerTests(&r)
 			} else {
-				registerBenchmarks(r)
+				registerBenchmarks(&r)
 			}
 
-			names := r.ListAll(args)
+			names := r.List(context.Background(), args)
 			for _, name := range names {
 				fmt.Println(name)
 			}
@@ -115,8 +132,10 @@ Examples:
 		&listBench, "bench", false, "list benchmarks instead of tests")
 
 	var runCmd = &cobra.Command{
-		Use:   "run [tests]",
-		Short: "run automated tests on cockroach cluster",
+		// Don't display usage when tests fail.
+		SilenceUsage: true,
+		Use:          "run [tests]",
+		Short:        "run automated tests on cockroach cluster",
 		Long: `Run automated tests on existing or ephemeral cockroach clusters.
 
 roachtest run takes a list of regex patterns and runs all the matching tests.
@@ -124,13 +143,17 @@ If no pattern is given, all tests are run. See "help list" for more details on
 the test tags.
 `,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if count <= 0 {
-				return fmt.Errorf("--count (%d) must by greater than 0", count)
-			}
-			r := newRegistry(setBuildVersion)
-			registerTests(r)
-			os.Exit(r.Run(args, parallelism, artifacts, getUser(username)))
-			return nil
+			return runTests(registerTests, cliCfg{
+				args:         args,
+				count:        count,
+				cpuQuota:     cpuQuota,
+				debugEnabled: debugEnabled,
+				httpPort:     httpPort,
+				parallelism:  parallelism,
+				artifactsDir: artifacts,
+				user:         username,
+				clusterID:    clusterID,
+			})
 		},
 	}
 
@@ -142,17 +165,23 @@ the test tags.
 		&teamCity, "teamcity", false, "include teamcity-specific markers in output")
 
 	var benchCmd = &cobra.Command{
-		Use:   "bench [benchmarks]",
-		Short: "run automated benchmarks on cockroach cluster",
-		Long:  `Run automated benchmarks on existing or ephemeral cockroach clusters.`,
+		// Don't display usage when tests fail.
+		SilenceUsage: true,
+		Use:          "bench [benchmarks]",
+		Short:        "run automated benchmarks on cockroach cluster",
+		Long:         `Run automated benchmarks on existing or ephemeral cockroach clusters.`,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if count <= 0 {
-				return fmt.Errorf("--count (%d) must by greater than 0", count)
-			}
-			r := newRegistry(setBuildVersion)
-			registerBenchmarks(r)
-			os.Exit(r.Run(args, parallelism, artifacts, getUser(username)))
-			return nil
+			return runTests(registerBenchmarks, cliCfg{
+				args:         args,
+				count:        count,
+				cpuQuota:     cpuQuota,
+				debugEnabled: debugEnabled,
+				httpPort:     httpPort,
+				parallelism:  parallelism,
+				artifactsDir: artifacts,
+				user:         username,
+				clusterID:    clusterID,
+			})
 		},
 	}
 
@@ -177,6 +206,11 @@ the test tags.
 			"wipe existing cluster before starting test (for use with --cluster)")
 		cmd.Flags().StringVar(
 			&zonesF, "zones", "", "Zones for the cluster (use roachprod defaults if empty)")
+		cmd.Flags().IntVar(
+			&cpuQuota, "cpu-quota", 300,
+			"The number of cloud CPUs roachtest is allowed to use at any one time.")
+		cmd.Flags().IntVar(
+			&httpPort, "port", 8080, "the port on which to serve the HTTP interface")
 	}
 
 	rootCmd.AddCommand(listCmd)
@@ -189,7 +223,95 @@ the test tags.
 	}
 }
 
-// user takes the value passed on the command line and comes up with the
+type cliCfg struct {
+	args         []string
+	count        int
+	cpuQuota     int
+	debugEnabled bool
+	httpPort     int
+	parallelism  int
+	artifactsDir string
+	user         string
+	clusterID    string
+}
+
+func runTests(register func(*testRegistry), cfg cliCfg) error {
+	if cfg.count <= 0 {
+		return fmt.Errorf("--count (%d) must by greater than 0", cfg.count)
+	}
+	r, err := makeTestRegistry()
+	if err != nil {
+		return err
+	}
+	register(&r)
+	cr := newClusterRegistry()
+	runner := newTestRunner(cr, r.buildVersion)
+
+	filter := newFilter(cfg.args)
+	clusterType := roachprodCluster
+	if local {
+		clusterType = localCluster
+		if cfg.parallelism != 1 {
+			fmt.Printf("--local specified. Overriding --parallelism to 1.\n")
+			cfg.parallelism = 1
+		}
+	}
+	opt := clustersOpt{
+		typ:                       clusterType,
+		clusterName:               clusterName,
+		user:                      getUser(cfg.user),
+		cpuQuota:                  cfg.cpuQuota,
+		keepClustersOnTestFailure: cfg.debugEnabled,
+		clusterID:                 cfg.clusterID,
+	}
+	if err := runner.runHTTPServer(cfg.httpPort, os.Stdout); err != nil {
+		return err
+	}
+
+	tests := testsToRun(context.Background(), r, filter)
+	n := len(tests)
+	if n*cfg.count < cfg.parallelism {
+		// Don't spin up more workers than necessary. This has particular
+		// implications for the common case of running a single test once: if
+		// parallelism is set to 1, we'll use teeToStdout below to get logs to
+		// stdout/stderr.
+		cfg.parallelism = n * cfg.count
+	}
+	runnerDir := filepath.Join(cfg.artifactsDir, runnerLogsDir)
+	runnerLogPath := filepath.Join(
+		runnerDir, fmt.Sprintf("test_runner-%d.log", timeutil.Now().Unix()))
+	l, tee := testRunnerLogger(context.Background(), cfg.parallelism, runnerLogPath)
+	lopt := loggingOpt{
+		l:             l,
+		tee:           tee,
+		stdout:        os.Stdout,
+		stderr:        os.Stderr,
+		artifactsDir:  cfg.artifactsDir,
+		runnerLogPath: runnerLogPath,
+	}
+
+	// We're going to run all the workers (and thus all the tests) in a context
+	// that gets canceled when the Interrupt signal is received.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	CtrlC(ctx, l, cancel, cr)
+	err = runner.Run(ctx, tests, cfg.count, cfg.parallelism, opt, cfg.artifactsDir, lopt)
+
+	// Make sure we attempt to clean up. We run with a non-canceled ctx; the
+	// ctx above might be canceled in case a signal was received. If that's
+	// the case, we're running under a 5s timeout until the CtrlC() goroutine
+	// kills the process.
+	l.PrintfCtx(ctx, "runTests destroying all clusters")
+	cr.destroyAllClusters(context.Background(), l)
+
+	if teamCity {
+		// Collect the runner logs.
+		fmt.Printf("##teamcity[publishArtifacts '%s']\n", runnerDir)
+	}
+	return err
+}
+
+// getUser takes the value passed on the command line and comes up with the
 // username to use.
 func getUser(userFlag string) string {
 	if userFlag != "" {
@@ -200,4 +322,93 @@ func getUser(userFlag string) string {
 		panic(fmt.Sprintf("user.Current: %s", err))
 	}
 	return usr.Username
+}
+
+// CtrlC spawns a goroutine that sits around waiting for SIGINT. Once the first
+// signal is received, it calls cancel(), waits 5 seconds, and then calls
+// cr.destroyAllClusters(). The expectation is that the main goroutine will
+// respond to the cancelation and return, and so the process will be dead by the
+// time the 5s elapse.
+// If a 2nd signal is received, it calls os.Exit(2).
+func CtrlC(ctx context.Context, l *logger, cancel func(), cr *clusterRegistry) {
+	// Shut down test clusters when interrupted (for example CTRL-C).
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	go func() {
+		<-sig
+		shout(ctx, l, os.Stderr,
+			"Signaled received. Canceling workers and waiting up to 5s for them.")
+		// Signal runner.Run() to stop.
+		cancel()
+		<-time.After(5 * time.Second)
+		shout(ctx, l, os.Stderr, "5s elapsed. Will brutally destroy all clusters.")
+		// Make sure there are no leftover clusters.
+		destroyCh := make(chan struct{})
+		go func() {
+			// Destroy all clusters. Don't wait more than 5 min for that though.
+			destroyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			l.PrintfCtx(ctx, "CtrlC handler destroying all clusters")
+			cr.destroyAllClusters(destroyCtx, l)
+			cancel()
+			close(destroyCh)
+		}()
+		// If we get a second CTRL-C, exit immediately.
+		select {
+		case <-sig:
+			shout(ctx, l, os.Stderr, "Second SIGINT received. Quitting.")
+			os.Exit(2)
+		case <-destroyCh:
+			shout(ctx, l, os.Stderr, "Done destroying all clusters.")
+		}
+	}()
+}
+
+// testRunnerLogger returns a logger to be used by the test runner and a tee
+// option for the test logs.
+//
+// runnerLogPath is the path to the file that will contain the runner's log.
+func testRunnerLogger(
+	ctx context.Context, parallelism int, runnerLogPath string,
+) (*logger, teeOptType) {
+	teeOpt := noTee
+	if parallelism == 1 {
+		teeOpt = teeToStdout
+	}
+
+	var l *logger
+	if teeOpt == teeToStdout {
+		verboseCfg := loggerConfig{stdout: os.Stdout, stderr: os.Stderr}
+		var err error
+		l, err = verboseCfg.newLogger(runnerLogPath)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		verboseCfg := loggerConfig{}
+		var err error
+		l, err = verboseCfg.newLogger(runnerLogPath)
+		if err != nil {
+			panic(err)
+		}
+	}
+	shout(ctx, l, os.Stdout, "test runner logs in: %s", runnerLogPath)
+	return l, teeOpt
+}
+
+func testsToRun(ctx context.Context, r testRegistry, filter *testFilter) []testSpec {
+	tests := r.GetTests(ctx, filter)
+
+	var notSkipped []testSpec
+	for _, s := range tests {
+		if s.Skip == "" {
+			notSkipped = append(notSkipped, s)
+		} else {
+			if teamCity {
+				fmt.Fprintf(os.Stdout, "##teamcity[testIgnored name='%s' message='%s']\n",
+					s.Name, teamCityEscape(s.Skip))
+			}
+			fmt.Fprintf(os.Stdout, "--- SKIP: %s (%s)\n\t%s\n", s.Name, "0.00s", s.Skip)
+		}
+	}
+	return notSkipped
 }

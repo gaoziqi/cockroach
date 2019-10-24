@@ -1,21 +1,10 @@
 exec-ddl
 CREATE TABLE a (x INT PRIMARY KEY, y INT)
 ----
-TABLE a
- ├── x int not null
- ├── y int
- └── INDEX primary
-      └── x int not null
 
 exec-ddl
 CREATE TABLE b (x INT, z INT NOT NULL)
 ----
-TABLE b
- ├── x int
- ├── z int not null
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 exec-ddl
 ALTER TABLE a INJECT STATISTICS '[
@@ -70,7 +59,7 @@ norm
 SELECT * FROM a WHERE false
 ----
 values
- ├── columns: x:1(int) y:2(int)
+ ├── columns: x:1(int!null) y:2(int!null)
  ├── cardinality: [0 - 0]
  ├── stats: [rows=0]
  ├── key: ()
@@ -82,10 +71,12 @@ SELECT * FROM b WHERE x = 1 AND z = 2 AND rowid >= 5 AND rowid <= 8
 ----
 project
  ├── columns: x:1(int!null) z:2(int!null)
+ ├── cardinality: [0 - 4]
  ├── stats: [rows=8e-06]
  ├── fd: ()-->(1,2)
  └── select
       ├── columns: x:1(int!null) z:2(int!null) rowid:3(int!null)
+      ├── cardinality: [0 - 4]
       ├── stats: [rows=8e-06, distinct(1)=8e-06, null(1)=0, distinct(2)=8e-06, null(2)=0, distinct(3)=8e-06, null(3)=0]
       ├── key: (3)
       ├── fd: ()-->(1,2)
@@ -105,12 +96,12 @@ SELECT * FROM a WHERE x + y < 10
 ----
 select
  ├── columns: x:1(int!null) y:2(int)
- ├── stats: [rows=1333.33333, distinct(1)=1333.33333, null(1)=0]
+ ├── stats: [rows=1333.33333]
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── scan a
  │    ├── columns: x:1(int!null) y:2(int)
- │    ├── stats: [rows=4000, distinct(1)=4000, null(1)=0]
+ │    ├── stats: [rows=4000]
  │    ├── key: (1)
  │    └── fd: (1)-->(2)
  └── filters
@@ -122,12 +113,12 @@ SELECT * FROM a WHERE y = 5 AND x + y < 10
 ----
 select
  ├── columns: x:1(int!null) y:2(int!null)
- ├── stats: [rows=3.33333333, distinct(1)=3.33333333, null(1)=0, distinct(2)=1, null(2)=0]
+ ├── stats: [rows=3.33333333, distinct(2)=1, null(2)=0]
  ├── key: (1)
  ├── fd: ()-->(2)
  ├── scan a
  │    ├── columns: x:1(int!null) y:2(int)
- │    ├── stats: [rows=4000, distinct(1)=4000, null(1)=0, distinct(2)=400, null(2)=0]
+ │    ├── stats: [rows=4000, distinct(2)=400, null(2)=0]
  │    ├── key: (1)
  │    └── fd: (1)-->(2)
  └── filters
@@ -181,30 +172,20 @@ project
 exec-ddl
 CREATE TABLE idx (x INT PRIMARY KEY, y INT, z INT, INDEX yz (y DESC, z))
 ----
-TABLE idx
- ├── x int not null
- ├── y int
- ├── z int
- ├── INDEX primary
- │    └── x int not null
- └── INDEX yz
-      ├── y int desc
-      ├── z int
-      └── x int not null
 
 opt
 SELECT y FROM idx WHERE y < 5 AND z < 10
 ----
 project
  ├── columns: y:2(int!null)
- ├── stats: [rows=108.9]
+ ├── stats: [rows=111.111111]
  └── select
       ├── columns: y:2(int!null) z:3(int!null)
-      ├── stats: [rows=108.9, distinct(2)=69.2053852, null(2)=0, distinct(3)=69.2053852, null(3)=0]
+      ├── stats: [rows=111.111111, distinct(2)=33.3333333, null(2)=0, distinct(3)=33.3333333, null(3)=0]
       ├── scan idx@yz
       │    ├── columns: y:2(int!null) z:3(int)
       │    ├── constraint: /-2/3/1: (/4/NULL - /NULL)
-      │    └── stats: [rows=330, distinct(2)=98.265847, null(2)=0]
+      │    └── stats: [rows=333.333333, distinct(2)=33.3333333, null(2)=0, distinct(3)=100, null(3)=10]
       └── filters
            └── z < 10 [type=bool, outer=(3), constraints=(/3: (/NULL - /9]; tight)]
 
@@ -212,16 +193,6 @@ project
 exec-ddl
 CREATE TABLE tab0(pk INTEGER PRIMARY KEY, col0 INTEGER, col1 FLOAT, col2 TEXT, col3 INTEGER, col4 FLOAT, col5 TEXT)
 ----
-TABLE tab0
- ├── pk int not null
- ├── col0 int
- ├── col1 float
- ├── col2 string
- ├── col3 int
- ├── col4 float
- ├── col5 string
- └── INDEX primary
-      └── pk int not null
 
 # Note: it's not clear that this still tests the above issue, but I have left
 # it here anyway as an interesting test case. I've added another query below
@@ -234,7 +205,7 @@ SELECT pk FROM tab0 WHERE
   (col0 = 1 OR col0 IN (SELECT col3 FROM tab0))
 ----
 values
- ├── columns: pk:1(int)
+ ├── columns: pk:1(int!null)
  ├── cardinality: [0 - 0]
  ├── stats: [rows=0]
  ├── key: ()
@@ -263,11 +234,11 @@ SELECT count(*) FROM (SELECT * FROM tab0 WHERE col3 = 10) GROUP BY col0
 ----
 project
  ├── columns: count:8(int)
- ├── stats: [rows=1.99997344]
+ ├── stats: [rows=0.999973439]
  └── group-by
       ├── columns: col0:2(int) count_rows:8(int)
       ├── grouping columns: col0:2(int)
-      ├── stats: [rows=1.99997344, distinct(2)=0.999973439, null(2)=1.99997344]
+      ├── stats: [rows=0.999973439, distinct(2)=0.999973439, null(2)=0.999973439]
       ├── key: (2)
       ├── fd: (2)-->(8)
       ├── select
@@ -286,35 +257,14 @@ project
 exec-ddl
 CREATE TABLE customers (id INT PRIMARY KEY, name STRING, state STRING)
 ----
-TABLE customers
- ├── id int not null
- ├── name string
- ├── state string
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 CREATE TABLE order_history (order_id INT, item_id INT, customer_id INT, year INT)
 ----
-TABLE order_history
- ├── order_id int
- ├── item_id int
- ├── customer_id int
- ├── year int
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 exec-ddl
 CREATE TABLE district (d_id INT, d_w_id INT, d_name STRING, PRIMARY KEY(d_id, d_w_id))
 ----
-TABLE district
- ├── d_id int not null
- ├── d_w_id int not null
- ├── d_name string
- └── INDEX primary
-      ├── d_id int not null
-      └── d_w_id int not null
 
 exec-ddl
 ALTER TABLE district INJECT STATISTICS '[
@@ -349,7 +299,7 @@ SELECT * FROM district WHERE d_id = 1 AND d_name='bobs_burgers'
 ----
 select
  ├── columns: d_id:1(int!null) d_w_id:2(int!null) d_name:3(string!null)
- ├── stats: [rows=0.1, distinct(1)=0.1, null(1)=0, distinct(2)=0.0995511979, null(2)=0, distinct(3)=0.1, null(3)=0]
+ ├── stats: [rows=0.1, distinct(1)=0.1, null(1)=0, distinct(3)=0.1, null(3)=0]
  ├── key: (2)
  ├── fd: ()-->(1,3)
  ├── scan district
@@ -366,7 +316,7 @@ SELECT * FROM district WHERE d_id = 1 and d_name LIKE 'bob'
 ----
 select
  ├── columns: d_id:1(int!null) d_w_id:2(int!null) d_name:3(string!null)
- ├── stats: [rows=0.1, distinct(1)=0.1, null(1)=0, distinct(2)=0.0995511979, null(2)=0, distinct(3)=0.1, null(3)=0]
+ ├── stats: [rows=0.1, distinct(1)=0.1, null(1)=0, distinct(3)=0.1, null(3)=0]
  ├── key: (2)
  ├── fd: ()-->(1,3)
  ├── scan district
@@ -388,6 +338,7 @@ SELECT * FROM district WHERE d_id > 1 AND d_id < 10 AND d_w_id=10 AND d_name='bo
 ----
 select
  ├── columns: d_id:1(int!null) d_w_id:2(int!null) d_name:3(string!null)
+ ├── cardinality: [0 - 8]
  ├── stats: [rows=0.08, distinct(1)=0.08, null(1)=0, distinct(2)=0.08, null(2)=0, distinct(3)=0.08, null(3)=0]
  ├── key: (1)
  ├── fd: ()-->(2,3)
@@ -455,18 +406,18 @@ WHERE name='andy'
 ----
 select
  ├── columns: id:1(int!null) name:2(string!null) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int)
- ├── stats: [rows=2.31299908, distinct(1)=2.28907214, null(1)=0, distinct(2)=1, null(2)=0, distinct(6)=2.28907214, null(6)=0]
+ ├── stats: [rows=2.29713221, distinct(2)=1, null(2)=0]
  ├── fd: ()-->(2), (1)-->(3), (1)==(6), (6)==(1)
  ├── project
  │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int)
- │    ├── stats: [rows=1000, distinct(1)=100, null(1)=0, distinct(2)=432.339125, null(2)=0, distinct(6)=100, null(6)=0]
+ │    ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=0, distinct(6)=99, null(6)=0]
  │    ├── fd: (1)-->(2,3), (1)==(6), (6)==(1)
  │    └── select
  │         ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int) rowid:8(int!null)
- │         ├── stats: [rows=1000, distinct(1)=100, null(1)=0, distinct(2)=432.339125, null(2)=0, distinct(6)=100, null(6)=0, distinct(8)=632.138954, null(8)=0]
+ │         ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=0, distinct(6)=99, null(6)=0]
  │         ├── key: (8)
  │         ├── fd: (1)-->(2,3), (8)-->(4-7), (1)==(6), (6)==(1)
- │         ├── inner-join
+ │         ├── inner-join (hash)
  │         │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int) year:7(int) rowid:8(int!null)
  │         │    ├── stats: [rows=10000000, distinct(1)=10000, null(1)=0, distinct(2)=500, null(2)=0, distinct(6)=100, null(6)=100000, distinct(8)=1000, null(8)=0]
  │         │    ├── key: (1,8)
@@ -503,18 +454,18 @@ WHERE id = 1 AND name='andy'
 ----
 select
  ├── columns: id:1(int!null) name:2(string!null) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int)
- ├── stats: [rows=10, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0, distinct(6)=9.5617925, null(6)=0]
+ ├── stats: [rows=10, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0]
  ├── fd: ()-->(1-3,6), (1)==(6), (6)==(1)
  ├── project
  │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int)
- │    ├── stats: [rows=1000, distinct(1)=100, null(1)=0, distinct(2)=432.339125, null(2)=0, distinct(6)=100, null(6)=0]
+ │    ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=0, distinct(6)=99, null(6)=0]
  │    ├── fd: (1)-->(2,3), (1)==(6), (6)==(1)
  │    └── select
  │         ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int) rowid:8(int!null)
- │         ├── stats: [rows=1000, distinct(1)=100, null(1)=0, distinct(2)=432.339125, null(2)=0, distinct(6)=100, null(6)=0, distinct(8)=632.138954, null(8)=0]
+ │         ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=0, distinct(6)=99, null(6)=0]
  │         ├── key: (8)
  │         ├── fd: (1)-->(2,3), (8)-->(4-7), (1)==(6), (6)==(1)
- │         ├── inner-join
+ │         ├── inner-join (hash)
  │         │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int) year:7(int) rowid:8(int!null)
  │         │    ├── stats: [rows=10000000, distinct(1)=10000, null(1)=0, distinct(2)=500, null(2)=0, distinct(6)=100, null(6)=100000, distinct(8)=1000, null(8)=0]
  │         │    ├── key: (1,8)
@@ -541,7 +492,7 @@ SELECT * FROM order_history WHERE item_id = order_id AND item_id = customer_id A
 ----
 select
  ├── columns: order_id:1(int!null) item_id:2(int!null) customer_id:3(int!null) year:4(int)
- ├── stats: [rows=0.99, distinct(1)=0.99, null(1)=0, distinct(2)=0.99, null(2)=0, distinct(3)=0.99, null(3)=0]
+ ├── stats: [rows=0.9801, distinct(1)=0.9801, null(1)=0, distinct(2)=0.9801, null(2)=0, distinct(3)=0.9801, null(3)=0]
  ├── fd: ()-->(1-3), (1)==(2,3), (2)==(1,3), (3)==(1,2)
  ├── scan order_history
  │    ├── columns: order_id:1(int) item_id:2(int) customer_id:3(int) year:4(int)
@@ -572,7 +523,7 @@ SELECT * FROM order_history WHERE item_id = order_id AND customer_id < 5 AND cus
 ----
 select
  ├── columns: order_id:1(int!null) item_id:2(int!null) customer_id:3(int!null) year:4(int)
- ├── stats: [rows=0.99, distinct(1)=0.99, null(1)=0, distinct(2)=0.99, null(2)=0, distinct(3)=0.99, null(3)=0]
+ ├── stats: [rows=0.9801, distinct(1)=0.9801, null(1)=0, distinct(2)=0.9801, null(2)=0, distinct(3)=0.9801, null(3)=0]
  ├── fd: (1)==(2), (2)==(1)
  ├── scan order_history
  │    ├── columns: order_id:1(int) item_id:2(int) customer_id:3(int) year:4(int)
@@ -587,7 +538,7 @@ SELECT * FROM order_history WHERE item_id = order_id AND customer_id % 2 = 0
 ----
 select
  ├── columns: order_id:1(int!null) item_id:2(int!null) customer_id:3(int) year:4(int)
- ├── stats: [rows=3.33333333, distinct(1)=3.33333333, null(1)=0, distinct(2)=3.33333333, null(2)=0]
+ ├── stats: [rows=3.267, distinct(1)=3.267, null(1)=0, distinct(2)=3.267, null(2)=0]
  ├── fd: (1)==(2), (2)==(1)
  ├── scan order_history
  │    ├── columns: order_id:1(int) item_id:2(int) customer_id:3(int) year:4(int)
@@ -599,15 +550,6 @@ select
 exec-ddl
 CREATE TABLE c (x INT, z INT NOT NULL, UNIQUE INDEX x_idx (x))
 ----
-TABLE c
- ├── x int
- ├── z int not null
- ├── rowid int not null (hidden)
- ├── INDEX primary
- │    └── rowid int not null (hidden)
- └── INDEX x_idx
-      ├── x int
-      └── rowid int not null (hidden) (storing)
 
 # Test that the distinct and null counts for x are estimated correctly (since it's a weak
 # key).
@@ -616,12 +558,13 @@ SELECT * FROM c WHERE x >= 0 AND x < 100
 ----
 select
  ├── columns: x:1(int!null) z:2(int!null)
- ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=65.5215193, null(2)=0]
+ ├── cardinality: [0 - 100]
+ ├── stats: [rows=100, distinct(1)=100, null(1)=0]
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── scan c
  │    ├── columns: x:1(int) z:2(int!null)
- │    ├── stats: [rows=1000, distinct(1)=990, null(1)=10, distinct(2)=100, null(2)=0]
+ │    ├── stats: [rows=1000, distinct(1)=991, null(1)=10, distinct(2)=100, null(2)=0]
  │    ├── lax-key: (1,2)
  │    └── fd: (1)~~>(2)
  └── filters
@@ -630,13 +573,6 @@ select
 exec-ddl
 CREATE TABLE uvw (u INT, v INT, w INT)
 ----
-TABLE uvw
- ├── u int
- ├── v int
- ├── w int
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 # Test selectivity calculations by applying the two constraints in different
 # orders.
@@ -659,11 +595,11 @@ SELECT * FROM (SELECT * FROM uvw WHERE u=10) WHERE u=v
 ----
 select
  ├── columns: u:1(int!null) v:2(int!null) w:3(int)
- ├── stats: [rows=1.04536248, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0]
+ ├── stats: [rows=1.03537072, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0]
  ├── fd: ()-->(1,2), (1)==(2), (2)==(1)
  ├── select
  │    ├── columns: u:1(int!null) v:2(int) w:3(int)
- │    ├── stats: [rows=9.9, distinct(1)=1, null(1)=0, distinct(2)=9.47039924, null(2)=0.099]
+ │    ├── stats: [rows=10, distinct(1)=1, null(1)=0, distinct(2)=9.5617925, null(2)=0.1]
  │    ├── fd: ()-->(1)
  │    ├── scan uvw
  │    │    ├── columns: u:1(int) v:2(int) w:3(int)
@@ -678,11 +614,11 @@ SELECT * FROM (SELECT * FROM uvw WHERE u=v) WHERE u=10
 ----
 select
  ├── columns: u:1(int!null) v:2(int!null) w:3(int)
- ├── stats: [rows=1, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0]
+ ├── stats: [rows=1, distinct(1)=1, null(1)=0]
  ├── fd: ()-->(1,2), (1)==(2), (2)==(1)
  ├── select
  │    ├── columns: u:1(int!null) v:2(int!null) w:3(int)
- │    ├── stats: [rows=10, distinct(1)=10, null(1)=0, distinct(2)=10, null(2)=0]
+ │    ├── stats: [rows=9.801, distinct(1)=9.801, null(1)=0, distinct(2)=9.801, null(2)=0]
  │    ├── fd: (1)==(2), (2)==(1)
  │    ├── scan uvw
  │    │    ├── columns: u:1(int) v:2(int) w:3(int)
@@ -722,62 +658,8 @@ CREATE TABLE lineitem
     INDEX l_sk_pk (l_suppkey ASC, l_partkey ASC)
 );
 ----
-TABLE lineitem
- ├── l_orderkey int not null
- ├── l_partkey int not null
- ├── l_suppkey int not null
- ├── l_linenumber int not null
- ├── l_quantity float not null
- ├── l_extendedprice float not null
- ├── l_discount float not null
- ├── l_tax float not null
- ├── l_returnflag char not null
- ├── l_linestatus char not null
- ├── l_shipdate date not null
- ├── l_commitdate date not null
- ├── l_receiptdate date not null
- ├── l_shipinstruct char not null
- ├── l_shipmode char not null
- ├── l_comment varchar not null
- ├── INDEX primary
- │    ├── l_orderkey int not null
- │    └── l_linenumber int not null
- ├── INDEX l_ok
- │    ├── l_orderkey int not null
- │    └── l_linenumber int not null
- ├── INDEX l_pk
- │    ├── l_partkey int not null
- │    ├── l_orderkey int not null
- │    └── l_linenumber int not null
- ├── INDEX l_sk
- │    ├── l_suppkey int not null
- │    ├── l_orderkey int not null
- │    └── l_linenumber int not null
- ├── INDEX l_sd
- │    ├── l_shipdate date not null
- │    ├── l_orderkey int not null
- │    └── l_linenumber int not null
- ├── INDEX l_cd
- │    ├── l_commitdate date not null
- │    ├── l_orderkey int not null
- │    └── l_linenumber int not null
- ├── INDEX l_rd
- │    ├── l_receiptdate date not null
- │    ├── l_orderkey int not null
- │    └── l_linenumber int not null
- ├── INDEX l_pk_sk
- │    ├── l_partkey int not null
- │    ├── l_suppkey int not null
- │    ├── l_orderkey int not null
- │    └── l_linenumber int not null
- └── INDEX l_sk_pk
-      ├── l_suppkey int not null
-      ├── l_partkey int not null
-      ├── l_orderkey int not null
-      └── l_linenumber int not null
 
-# Regression test for #30226. The following two queries should have the same
-# estimate for number of rows.
+# We can determine that there are exactly 30 days for this range.
 opt
 SELECT *
 FROM lineitem
@@ -785,18 +667,21 @@ WHERE
     l_shipdate >= DATE '1995-09-01'
     AND l_shipdate < DATE '1995-10-01';
 ----
-index-join lineitem
+select
  ├── columns: l_orderkey:1(int!null) l_partkey:2(int!null) l_suppkey:3(int!null) l_linenumber:4(int!null) l_quantity:5(float!null) l_extendedprice:6(float!null) l_discount:7(float!null) l_tax:8(float!null) l_returnflag:9(char!null) l_linestatus:10(char!null) l_shipdate:11(date!null) l_commitdate:12(date!null) l_receiptdate:13(date!null) l_shipinstruct:14(char!null) l_shipmode:15(char!null) l_comment:16(varchar!null)
- ├── stats: [rows=111.111111, distinct(1)=69.2053852, null(1)=0, distinct(2)=69.2053852, null(2)=0, distinct(3)=69.2053852, null(3)=0, distinct(4)=69.2053852, null(4)=0, distinct(5)=69.2053852, null(5)=0, distinct(6)=69.2053852, null(6)=0, distinct(7)=69.2053852, null(7)=0, distinct(8)=69.2053852, null(8)=0, distinct(9)=69.2053852, null(9)=0, distinct(10)=69.2053852, null(10)=0, distinct(11)=69.2053852, null(11)=0, distinct(12)=69.2053852, null(12)=0, distinct(13)=69.2053852, null(13)=0, distinct(14)=69.2053852, null(14)=0, distinct(15)=69.2053852, null(15)=0, distinct(16)=69.2053852, null(16)=0]
+ ├── stats: [rows=300, distinct(11)=30, null(11)=0]
  ├── key: (1,4)
  ├── fd: (1,4)-->(2,3,5-16)
- └── scan lineitem@l_sd
-      ├── columns: l_orderkey:1(int!null) l_linenumber:4(int!null) l_shipdate:11(date!null)
-      ├── constraint: /11/1/4: [/'1995-09-01' - /'1995-09-30']
-      ├── stats: [rows=111.111111, distinct(1)=69.2053852, null(1)=0, distinct(4)=69.2053852, null(4)=0, distinct(11)=69.2053852, null(11)=0]
-      ├── key: (1,4)
-      └── fd: (1,4)-->(11)
+ ├── scan lineitem
+ │    ├── columns: l_orderkey:1(int!null) l_partkey:2(int!null) l_suppkey:3(int!null) l_linenumber:4(int!null) l_quantity:5(float!null) l_extendedprice:6(float!null) l_discount:7(float!null) l_tax:8(float!null) l_returnflag:9(char!null) l_linestatus:10(char!null) l_shipdate:11(date!null) l_commitdate:12(date!null) l_receiptdate:13(date!null) l_shipinstruct:14(char!null) l_shipmode:15(char!null) l_comment:16(varchar!null)
+ │    ├── stats: [rows=1000, distinct(1)=100, null(1)=0, distinct(2)=100, null(2)=0, distinct(3)=100, null(3)=0, distinct(4)=100, null(4)=0, distinct(5)=100, null(5)=0, distinct(6)=100, null(6)=0, distinct(7)=100, null(7)=0, distinct(8)=100, null(8)=0, distinct(9)=100, null(9)=0, distinct(10)=100, null(10)=0, distinct(11)=100, null(11)=0, distinct(12)=100, null(12)=0, distinct(13)=100, null(13)=0, distinct(14)=100, null(14)=0, distinct(15)=100, null(15)=0, distinct(16)=100, null(16)=0]
+ │    ├── key: (1,4)
+ │    └── fd: (1,4)-->(2,3,5-16)
+ └── filters
+      └── (l_shipdate >= '1995-09-01') AND (l_shipdate < '1995-10-01') [type=bool, outer=(11), constraints=(/11: [/'1995-09-01' - /'1995-09-30']; tight)]
 
+# We cannot determine the number of distinct values exactly since the upper
+# bound of the date range is compared to a timestamp rather than a date.
 opt
 SELECT *
 FROM lineitem
@@ -806,18 +691,18 @@ WHERE
 ----
 index-join lineitem
  ├── columns: l_orderkey:1(int!null) l_partkey:2(int!null) l_suppkey:3(int!null) l_linenumber:4(int!null) l_quantity:5(float!null) l_extendedprice:6(float!null) l_discount:7(float!null) l_tax:8(float!null) l_returnflag:9(char!null) l_linestatus:10(char!null) l_shipdate:11(date!null) l_commitdate:12(date!null) l_receiptdate:13(date!null) l_shipinstruct:14(char!null) l_shipmode:15(char!null) l_comment:16(varchar!null)
- ├── stats: [rows=111.111111, distinct(1)=69.2053852, null(1)=0, distinct(2)=69.2053852, null(2)=0, distinct(3)=69.2053852, null(3)=0, distinct(4)=69.2053852, null(4)=0, distinct(5)=69.2053852, null(5)=0, distinct(6)=69.2053852, null(6)=0, distinct(7)=69.2053852, null(7)=0, distinct(8)=69.2053852, null(8)=0, distinct(9)=69.2053852, null(9)=0, distinct(10)=69.2053852, null(10)=0, distinct(11)=69.2053852, null(11)=0, distinct(12)=69.2053852, null(12)=0, distinct(13)=69.2053852, null(13)=0, distinct(14)=69.2053852, null(14)=0, distinct(15)=69.2053852, null(15)=0, distinct(16)=69.2053852, null(16)=0]
+ ├── stats: [rows=111.111111, distinct(11)=33.3333333, null(11)=0]
  ├── key: (1,4)
  ├── fd: (1,4)-->(2,3,5-16)
  └── select
       ├── columns: l_orderkey:1(int!null) l_linenumber:4(int!null) l_shipdate:11(date!null)
-      ├── stats: [rows=111.111111, distinct(1)=73.4303342, null(1)=0, distinct(4)=73.4303342, null(4)=0, distinct(11)=73.4303342, null(11)=0]
+      ├── stats: [rows=111.111111]
       ├── key: (1,4)
       ├── fd: (1,4)-->(11)
       ├── scan lineitem@l_sd
       │    ├── columns: l_orderkey:1(int!null) l_linenumber:4(int!null) l_shipdate:11(date!null)
       │    ├── constraint: /11/1/4: [/'1995-09-01' - ]
-      │    ├── stats: [rows=333.333333, distinct(1)=98.265847, null(1)=0, distinct(4)=98.265847, null(4)=0, distinct(11)=98.265847, null(11)=0]
+      │    ├── stats: [rows=333.333333, distinct(1)=98.265847, null(1)=0, distinct(4)=98.265847, null(4)=0, distinct(11)=33.3333333, null(11)=0]
       │    ├── key: (1,4)
       │    └── fd: (1,4)-->(11)
       └── filters
@@ -837,7 +722,7 @@ inner-join (zigzag lineitem@l_sd lineitem@l_cd)
  ├── eq columns: [1 4] = [1 4]
  ├── left fixed columns: [11] = ['1995-09-01']
  ├── right fixed columns: [12] = ['1995-08-01']
- ├── stats: [rows=0.1, distinct(1)=0.099955012, null(1)=0, distinct(4)=0.099955012, null(4)=0, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.1, null(11,12)=0]
+ ├── stats: [rows=0.1, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.1, null(11,12)=0]
  ├── key: (1,4)
  ├── fd: ()-->(11,12)
  └── filters
@@ -853,7 +738,7 @@ WHERE
 ----
 select
  ├── columns: l_shipdate:11(date!null) l_commitdate:12(date!null) l_orderkey:1(int!null) l_linenumber:4(int!null)
- ├── stats: [rows=0.1, distinct(1)=0.099955012, null(1)=0, distinct(4)=0.099955012, null(4)=0, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.1, null(11,12)=0]
+ ├── stats: [rows=0.1, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.1, null(11,12)=0]
  ├── key: (1,4)
  ├── fd: ()-->(11,12)
  ├── scan lineitem
@@ -881,7 +766,7 @@ WHERE
 inner-join (lookup lineitem)
  ├── columns: l_shipdate:11(date!null) l_commitdate:12(date!null) l_orderkey:1(int!null) l_linenumber:4(int!null) l_quantity:5(float!null)
  ├── key columns: [1 4] = [1 4]
- ├── stats: [rows=0.1, distinct(1)=0.099955012, null(1)=0, distinct(4)=0.099955012, null(4)=0, distinct(5)=0.099955012, null(5)=0, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.00951671064, null(11,12)=0]
+ ├── stats: [rows=0.1, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.1, null(11,12)=0]
  ├── key: (1,4)
  ├── fd: ()-->(11,12), (1,4)-->(5)
  ├── inner-join (zigzag lineitem@l_sd lineitem@l_cd)
@@ -889,7 +774,7 @@ inner-join (lookup lineitem)
  │    ├── eq columns: [1 4] = [1 4]
  │    ├── left fixed columns: [11] = ['1995-09-01']
  │    ├── right fixed columns: [12] = ['1995-08-01']
- │    ├── stats: [rows=0.1, distinct(1)=0.099955012, null(1)=0, distinct(4)=0.099955012, null(4)=0, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.1, null(11,12)=0]
+ │    ├── stats: [rows=0.1, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0]
  │    ├── fd: ()-->(11,12)
  │    └── filters
  │         ├── l_shipdate = '1995-09-01' [type=bool, outer=(11), constraints=(/11: [/'1995-09-01' - /'1995-09-01']; tight), fd=()-->(11)]
@@ -905,7 +790,7 @@ WHERE
 ----
 select
  ├── columns: l_shipdate:11(date!null) l_commitdate:12(date!null) l_orderkey:1(int!null) l_linenumber:4(int!null) l_quantity:5(float!null)
- ├── stats: [rows=0.1, distinct(1)=0.099955012, null(1)=0, distinct(4)=0.099955012, null(4)=0, distinct(5)=0.099955012, null(5)=0, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.1, null(11,12)=0]
+ ├── stats: [rows=0.1, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.1, null(11,12)=0]
  ├── key: (1,4)
  ├── fd: ()-->(11,12), (1,4)-->(5)
  ├── scan lineitem
@@ -922,15 +807,6 @@ select
 exec-ddl
 CREATE TABLE tjson (a INT PRIMARY KEY, b JSON, c JSON, INVERTED INDEX b_idx (b))
 ----
-TABLE tjson
- ├── a int not null
- ├── b jsonb
- ├── c jsonb
- ├── INDEX primary
- │    └── a int not null
- └── INVERTED INDEX b_idx
-      ├── b jsonb
-      └── a int not null
 
 exec-ddl
 ALTER TABLE tjson INJECT STATISTICS '[
@@ -961,13 +837,13 @@ SELECT * FROM tjson WHERE b @> '{"a":"b"}'
 ----
 index-join tjson
  ├── columns: a:1(int!null) b:2(jsonb) c:3(jsonb)
- ├── stats: [rows=555.555556, distinct(1)=555.555556, null(1)=0]
+ ├── stats: [rows=555.555556]
  ├── key: (1)
  ├── fd: (1)-->(2,3)
  └── scan tjson@b_idx
       ├── columns: a:1(int!null)
       ├── constraint: /2/1: [/'{"a": "b"}' - /'{"a": "b"}']
-      ├── stats: [rows=555.555556, distinct(1)=555.555556, null(1)=0]
+      ├── stats: [rows=555.555556]
       └── key: (1)
 
 # Should generate a zigzag join on the inverted index. Row count should be
@@ -978,7 +854,7 @@ SELECT * FROM tjson WHERE b @> '{"a":"b", "c":"d"}'
 inner-join (lookup tjson)
  ├── columns: a:1(int!null) b:2(jsonb) c:3(jsonb)
  ├── key columns: [1] = [1]
- ├── stats: [rows=61.7283951, distinct(1)=61.7283951, null(1)=0]
+ ├── stats: [rows=61.7283951]
  ├── key: (1)
  ├── fd: (1)-->(2,3)
  ├── inner-join (zigzag tjson@b_idx tjson@b_idx)
@@ -998,7 +874,7 @@ SELECT * FROM tjson WHERE c @> '{"a":"b"}'
 ----
 select
  ├── columns: a:1(int!null) b:2(jsonb) c:3(jsonb)
- ├── stats: [rows=555.555556, distinct(1)=555.555556, null(1)=0]
+ ├── stats: [rows=555.555556]
  ├── key: (1)
  ├── fd: (1)-->(2,3)
  ├── scan tjson
@@ -1016,7 +892,7 @@ SELECT * FROM tjson WHERE c @> '{"a":"b", "c":"d"}'
 ----
 select
  ├── columns: a:1(int!null) b:2(jsonb) c:3(jsonb)
- ├── stats: [rows=61.7283951, distinct(1)=61.7283951, null(1)=0]
+ ├── stats: [rows=61.7283951]
  ├── key: (1)
  ├── fd: (1)-->(2,3)
  ├── scan tjson
@@ -1094,11 +970,13 @@ SELECT * FROM b WHERE x = 1 AND z = 2 AND rowid >= 5 AND rowid <= 8
 ----
 project
  ├── columns: x:1(int!null) z:2(int!null)
- ├── stats: [rows=6.4e-06]
+ ├── cardinality: [0 - 4]
+ ├── stats: [rows=6.40128026e-06]
  ├── fd: ()-->(1,2)
  └── select
       ├── columns: x:1(int!null) z:2(int!null) rowid:3(int!null)
-      ├── stats: [rows=6.4e-06, distinct(1)=6.4e-06, null(1)=0, distinct(2)=6.4e-06, null(2)=0, distinct(3)=6.4e-06, null(3)=0]
+      ├── cardinality: [0 - 4]
+      ├── stats: [rows=6.40128026e-06, distinct(1)=6.40128026e-06, null(1)=0, distinct(2)=6.40128026e-06, null(2)=0, distinct(3)=6.40128026e-06, null(3)=0]
       ├── key: (3)
       ├── fd: ()-->(1,2)
       ├── scan b
@@ -1117,12 +995,12 @@ SELECT * FROM a WHERE x + y < 10
 ----
 select
  ├── columns: x:1(int!null) y:2(int)
- ├── stats: [rows=1666.66667, distinct(1)=1666.66667, null(1)=0]
+ ├── stats: [rows=1666.66667]
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── scan a
  │    ├── columns: x:1(int!null) y:2(int)
- │    ├── stats: [rows=5000, distinct(1)=5000, null(1)=0]
+ │    ├── stats: [rows=5000]
  │    ├── key: (1)
  │    └── fd: (1)-->(2)
  └── filters
@@ -1134,12 +1012,12 @@ SELECT * FROM a WHERE y = 5 AND x + y < 10
 ----
 select
  ├── columns: x:1(int!null) y:2(int!null)
- ├── stats: [rows=3.33333333, distinct(1)=3.33333333, null(1)=0, distinct(2)=1, null(2)=0]
+ ├── stats: [rows=3.34168755, distinct(2)=1, null(2)=0]
  ├── key: (1)
  ├── fd: ()-->(2)
  ├── scan a
  │    ├── columns: x:1(int!null) y:2(int)
- │    ├── stats: [rows=5000, distinct(1)=5000, null(1)=0, distinct(2)=400, null(2)=1000]
+ │    ├── stats: [rows=5000, distinct(2)=400, null(2)=1000]
  │    ├── key: (1)
  │    └── fd: (1)-->(2)
  └── filters
@@ -1153,7 +1031,8 @@ SELECT * FROM c WHERE x >= 0 AND x < 100
 ----
 select
  ├── columns: x:1(int!null) z:2(int!null)
- ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=100, null(2)=0]
+ ├── cardinality: [0 - 100]
+ ├── stats: [rows=100, distinct(1)=100, null(1)=0]
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── scan c
@@ -1199,18 +1078,18 @@ WHERE name='andy'
 ----
 select
  ├── columns: id:1(int!null) name:2(string!null) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int)
- ├── stats: [rows=1.85039927, distinct(1)=1.85039927, null(1)=0, distinct(2)=1, null(2)=0, distinct(6)=1.85039927, null(6)=0]
+ ├── stats: [rows=1.84197978, distinct(2)=1, null(2)=0]
  ├── fd: ()-->(2), (1)-->(3), (1)==(6), (6)==(1)
  ├── project
  │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int)
- │    ├── stats: [rows=1000, distinct(1)=100, null(1)=0, distinct(2)=432.339125, null(2)=200, distinct(6)=100, null(6)=0]
+ │    ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=198, distinct(6)=99, null(6)=0]
  │    ├── fd: (1)-->(2,3), (1)==(6), (6)==(1)
  │    └── select
  │         ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int) rowid:8(int!null)
- │         ├── stats: [rows=1000, distinct(1)=100, null(1)=0, distinct(2)=432.339125, null(2)=200, distinct(6)=100, null(6)=0, distinct(8)=632.138954, null(8)=0]
+ │         ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=198, distinct(6)=99, null(6)=0]
  │         ├── key: (8)
  │         ├── fd: (1)-->(2,3), (8)-->(4-7), (1)==(6), (6)==(1)
- │         ├── inner-join
+ │         ├── inner-join (hash)
  │         │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int) year:7(int) rowid:8(int!null)
  │         │    ├── stats: [rows=10000000, distinct(1)=10000, null(1)=0, distinct(2)=500, null(2)=2000000, distinct(6)=100, null(6)=100000, distinct(8)=1000, null(8)=0]
  │         │    ├── key: (1,8)
@@ -1247,18 +1126,18 @@ WHERE id = 1 AND name='andy'
 ----
 select
  ├── columns: id:1(int!null) name:2(string!null) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int)
- ├── stats: [rows=8, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0, distinct(6)=8, null(6)=0]
+ ├── stats: [rows=8, distinct(1)=1, null(1)=0, distinct(2)=1, null(2)=0]
  ├── fd: ()-->(1-3,6), (1)==(6), (6)==(1)
  ├── project
  │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int)
- │    ├── stats: [rows=1000, distinct(1)=100, null(1)=0, distinct(2)=432.339125, null(2)=200, distinct(6)=100, null(6)=0]
+ │    ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=198, distinct(6)=99, null(6)=0]
  │    ├── fd: (1)-->(2,3), (1)==(6), (6)==(1)
  │    └── select
  │         ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int!null) year:7(int) rowid:8(int!null)
- │         ├── stats: [rows=1000, distinct(1)=100, null(1)=0, distinct(2)=432.339125, null(2)=200, distinct(6)=100, null(6)=0, distinct(8)=632.138954, null(8)=0]
+ │         ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=198, distinct(6)=99, null(6)=0]
  │         ├── key: (8)
  │         ├── fd: (1)-->(2,3), (8)-->(4-7), (1)==(6), (6)==(1)
- │         ├── inner-join
+ │         ├── inner-join (hash)
  │         │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int) year:7(int) rowid:8(int!null)
  │         │    ├── stats: [rows=10000000, distinct(1)=10000, null(1)=0, distinct(2)=500, null(2)=2000000, distinct(6)=100, null(6)=100000, distinct(8)=1000, null(8)=0]
  │         │    ├── key: (1,8)
@@ -1282,12 +1161,6 @@ select
 exec-ddl
 CREATE TABLE nulls (x INT, y INT);
 ----
-TABLE nulls
- ├── x int
- ├── y int
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 exec-ddl
 ALTER TABLE nulls INJECT STATISTICS '[
@@ -1301,6 +1174,47 @@ ALTER TABLE nulls INJECT STATISTICS '[
 ]'
 ----
 
+build
+SELECT * FROM nulls WHERE x = y
+----
+project
+ ├── columns: x:1(int!null) y:2(int!null)
+ ├── stats: [rows=9.9e-10]
+ ├── fd: (1)==(2), (2)==(1)
+ └── select
+      ├── columns: x:1(int!null) y:2(int!null) rowid:3(int!null)
+      ├── stats: [rows=9.9e-10, distinct(1)=1e-10, null(1)=0, distinct(2)=1e-10, null(2)=0]
+      ├── key: (3)
+      ├── fd: (3)-->(1,2), (1)==(2), (2)==(1)
+      ├── scan nulls
+      │    ├── columns: x:1(int) y:2(int) rowid:3(int!null)
+      │    ├── stats: [rows=1000, distinct(1)=1, null(1)=1000, distinct(2)=100, null(2)=10, distinct(3)=1000, null(3)=0]
+      │    ├── key: (3)
+      │    └── fd: (3)-->(1,2)
+      └── filters
+           └── x = y [type=bool, outer=(1,2), constraints=(/1: (/NULL - ]; /2: (/NULL - ]), fd=(1)==(2), (2)==(1)]
+
+build
+SELECT * FROM nulls WHERE x IS NULL
+----
+project
+ ├── columns: x:1(int) y:2(int)
+ ├── stats: [rows=1000]
+ ├── fd: ()-->(1)
+ └── select
+      ├── columns: x:1(int) y:2(int) rowid:3(int!null)
+      ├── stats: [rows=1000, distinct(1)=1, null(1)=1000]
+      ├── key: (3)
+      ├── fd: ()-->(1), (3)-->(2)
+      ├── scan nulls
+      │    ├── columns: x:1(int) y:2(int) rowid:3(int!null)
+      │    ├── stats: [rows=1000, distinct(1)=1, null(1)=1000, distinct(3)=1000, null(3)=0]
+      │    ├── key: (3)
+      │    └── fd: (3)-->(1,2)
+      └── filters
+           └── x IS NULL [type=bool, outer=(1), constraints=(/1: [/NULL - /NULL]; tight), fd=()-->(1)]
+
+
 # Regression test for #34440. Ensure the null count for x is less than or equal
 # to the row count.
 build colstat=1
@@ -1308,11 +1222,11 @@ SELECT * FROM nulls WHERE y = 3
 ----
 project
  ├── columns: x:1(int) y:2(int!null)
- ├── stats: [rows=9.9, distinct(1)=0.99995224, null(1)=9.9]
+ ├── stats: [rows=10, distinct(1)=0.999956829, null(1)=10]
  ├── fd: ()-->(2)
  └── select
       ├── columns: x:1(int) y:2(int!null) rowid:3(int!null)
-      ├── stats: [rows=9.9, distinct(1)=0.99995224, null(1)=9.9, distinct(2)=1, null(2)=0, distinct(3)=9.9, null(3)=0]
+      ├── stats: [rows=10, distinct(1)=0.999956829, null(1)=10, distinct(2)=1, null(2)=0]
       ├── key: (3)
       ├── fd: ()-->(2), (3)-->(1)
       ├── scan nulls
@@ -1353,7 +1267,7 @@ expr colstat=1 colstat=2
 ----
 select
  ├── columns: a:1(int) b:2(int!null) c:3(int)
- ├── stats: [rows=4.75, distinct(1)=4.75, null(1)=0, distinct(2)=1, null(2)=0]
+ ├── stats: [rows=5, distinct(1)=5, null(1)=0, distinct(2)=1, null(2)=0]
  ├── fd: ()-->(2)
  ├── fake-rel
  │    ├── columns: a:1(int) b:2(int) c:3(int)
@@ -1380,25 +1294,25 @@ HAVING
 project
  ├── columns: "?column?":5(int!null)
  ├── cardinality: [0 - 2]
- ├── stats: [rows=1]
+ ├── stats: [rows=2e-10]
  ├── fd: ()-->(5)
  ├── select
  │    ├── columns: column2:2(string) column3:3(varbit) min:4(bool!null)
  │    ├── cardinality: [0 - 2]
- │    ├── stats: [rows=1, distinct(4)=1, null(4)=0]
+ │    ├── stats: [rows=2e-10, distinct(4)=2e-10, null(4)=0]
  │    ├── key: (2,3)
  │    ├── fd: ()-->(4)
  │    ├── group-by
  │    │    ├── columns: column2:2(string) column3:3(varbit) min:4(bool)
  │    │    ├── grouping columns: column2:2(string) column3:3(varbit)
  │    │    ├── cardinality: [1 - 2]
- │    │    ├── stats: [rows=1, distinct(4)=0, null(4)=1, distinct(2,3)=0, null(2,3)=1]
+ │    │    ├── stats: [rows=2, distinct(4)=2, null(4)=2, distinct(2,3)=2, null(2,3)=2]
  │    │    ├── key: (2,3)
  │    │    ├── fd: (2,3)-->(4)
  │    │    ├── values
- │    │    │    ├── columns: column1:1(bool) column2:2(string) column3:3(varbit)
+ │    │    │    ├── columns: column1:1(bool!null) column2:2(string) column3:3(varbit)
  │    │    │    ├── cardinality: [2 - 2]
- │    │    │    ├── stats: [rows=2, distinct(2,3)=0, null(2,3)=2]
+ │    │    │    ├── stats: [rows=2, distinct(2,3)=2, null(2,3)=2]
  │    │    │    ├── (true, NULL, B'001000101101110') [type=tuple{bool, string, varbit}]
  │    │    │    └── (true, e'19\x1e', NULL) [type=tuple{bool, string, varbit}]
  │    │    └── aggregations
@@ -1408,3 +1322,235 @@ project
  │         └── variable: min [type=bool, outer=(4), constraints=(/4: [/true - /true]; tight), fd=()-->(4)]
  └── projections
       └── const: 1 [type=int]
+
+# Test that distinct count estimates are correct for date ranges.
+exec-ddl
+CREATE TABLE date_test (
+    k INT PRIMARY KEY,
+    d1 date NOT NULL,
+    d2 date NOT NULL,
+    d3 date NOT NULL,
+    INDEX d1_idx (d1 ASC),
+    INDEX d2_idx (d2 DESC)
+)
+----
+
+opt
+SELECT d1 FROM date_test WHERE d1 > DATE '1995-10-01' AND d1 < DATE '1995-11-01'
+----
+scan date_test@d1_idx
+ ├── columns: d1:2(date!null)
+ ├── constraint: /2/1: [/'1995-10-02' - /'1995-10-31']
+ └── stats: [rows=300, distinct(2)=30, null(2)=0]
+
+opt
+SELECT d1 FROM date_test WHERE d1 >= DATE '1995-10-01' AND d1 <= DATE '1995-11-01'
+----
+scan date_test@d1_idx
+ ├── columns: d1:2(date!null)
+ ├── constraint: /2/1: [/'1995-10-01' - /'1995-11-01']
+ └── stats: [rows=320, distinct(2)=32, null(2)=0]
+
+opt
+SELECT d2 FROM date_test WHERE d2 > DATE '1903-10-01' AND d2 <= DATE '1903-11-01'
+----
+scan date_test@d2_idx
+ ├── columns: d2:3(date!null)
+ ├── constraint: /-3/1: [/'1903-11-01' - /'1903-10-02']
+ └── stats: [rows=310, distinct(3)=31, null(3)=0]
+
+opt
+SELECT d2 FROM date_test WHERE d2 >= DATE '2003-10-01' AND d2 < DATE '2003-11-01'
+----
+scan date_test@d2_idx
+ ├── columns: d2:3(date!null)
+ ├── constraint: /-3/1: [/'2003-10-31' - /'2003-10-01']
+ └── stats: [rows=310, distinct(3)=31, null(3)=0]
+
+opt
+SELECT d3 FROM date_test WHERE d3 >= DATE '2003-10-01' AND d3 < DATE '2003-11-01'
+----
+select
+ ├── columns: d3:4(date!null)
+ ├── stats: [rows=310, distinct(4)=31, null(4)=0]
+ ├── scan date_test
+ │    ├── columns: d3:4(date!null)
+ │    └── stats: [rows=1000, distinct(4)=100, null(4)=0]
+ └── filters
+      └── (d3 >= '2003-10-01') AND (d3 < '2003-11-01') [type=bool, outer=(4), constraints=(/4: [/'2003-10-01' - /'2003-10-31']; tight)]
+
+opt
+SELECT d3 FROM date_test WHERE d3 >= DATE '1903-10-01' AND d3 < DATE '2003-10-01'
+----
+select
+ ├── columns: d3:4(date!null)
+ ├── stats: [rows=1000, distinct(4)=100, null(4)=0]
+ ├── scan date_test
+ │    ├── columns: d3:4(date!null)
+ │    └── stats: [rows=1000, distinct(4)=100, null(4)=0]
+ └── filters
+      └── (d3 >= '1903-10-01') AND (d3 < '2003-10-01') [type=bool, outer=(4), constraints=(/4: [/'1903-10-01' - /'2003-09-30']; tight)]
+
+# Regression test for #38344. Avoid floating point precision errors.
+exec-ddl
+CREATE TABLE t38344 (x BOOL)
+----
+
+exec-ddl
+ALTER TABLE t38344 INJECT STATISTICS '[
+  {
+    "columns": ["x"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 20000000000,
+    "distinct_count": 1,
+    "null_count": 20000000000
+  }
+]'
+----
+
+norm disable=InlineWith
+WITH t(x) AS (
+  SELECT (t1.x::int << 5533)::bool OR t2.x  AS x
+  FROM t38344 AS t1 LEFT JOIN t38344 AS t2 ON true
+)
+SELECT x FROM t WHERE x
+----
+with &1 (t)
+ ├── columns: x:6(bool!null)
+ ├── stats: [rows=1.98e+20, distinct(6)=1, null(6)=0]
+ ├── fd: ()-->(6)
+ ├── project
+ │    ├── columns: x:5(bool)
+ │    ├── stats: [rows=4e+20, distinct(5)=3, null(5)=4e+18]
+ │    ├── left-join (hash)
+ │    │    ├── columns: t1.x:1(bool) t2.x:3(bool)
+ │    │    ├── stats: [rows=4e+20]
+ │    │    ├── scan t1
+ │    │    │    ├── columns: t1.x:1(bool)
+ │    │    │    └── stats: [rows=2e+10]
+ │    │    ├── scan t2
+ │    │    │    ├── columns: t2.x:3(bool)
+ │    │    │    └── stats: [rows=2e+10]
+ │    │    └── filters (true)
+ │    └── projections
+ │         └── (t1.x::INT8 << 5533)::BOOL OR t2.x [type=bool, outer=(1,3)]
+ └── select
+      ├── columns: x:6(bool!null)
+      ├── stats: [rows=1.98e+20, distinct(6)=1, null(6)=0]
+      ├── fd: ()-->(6)
+      ├── with-scan &1 (t)
+      │    ├── columns: x:6(bool)
+      │    ├── mapping:
+      │    │    └──  x:5(bool) => x:6(bool)
+      │    └── stats: [rows=4e+20, distinct(6)=3, null(6)=4e+18]
+      └── filters
+           └── variable: x [type=bool, outer=(6), constraints=(/6: [/true - /true]; tight), fd=()-->(6)]
+
+# Regression test for #38375. Avoid floating point precision errors.
+exec-ddl
+CREATE TABLE t38375 (x INT, y INT)
+----
+
+exec-ddl
+ALTER TABLE t38375 INJECT STATISTICS '[
+  {
+    "columns": ["x"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 20000000000,
+    "distinct_count": 20000000000,
+    "null_count": 20000000000
+  },
+  {
+    "columns": ["y"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 20000000000,
+    "distinct_count": 10,
+    "null_count": 0
+  }
+]'
+----
+
+opt colstat=2
+SELECT * FROM t38375 WHERE x = 1
+----
+select
+ ├── columns: x:1(int!null) y:2(int)
+ ├── stats: [rows=2, distinct(1)=1, null(1)=0, distinct(2)=1.81269262, null(2)=0]
+ ├── fd: ()-->(1)
+ ├── scan t38375
+ │    ├── columns: x:1(int) y:2(int)
+ │    └── stats: [rows=2e+10, distinct(1)=2e+10, null(1)=2e+10, distinct(2)=10, null(2)=0]
+ └── filters
+      └── x = 1 [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
+
+# Support OR constraints.
+exec-ddl
+CREATE TABLE nation
+(
+    n_nationkey int PRIMARY KEY,
+    n_name char(25) NOT NULL,
+    n_regionkey int NOT NULL,
+    neighbor char(25) NOT NULL,
+    INDEX n_rk (n_regionkey ASC)
+)
+----
+
+exec-ddl
+ALTER TABLE nation INJECT STATISTICS '[
+  {
+    "columns": ["n_name"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000000,
+    "distinct_count": 2,
+    "null_count": 0
+  }
+]'
+----
+
+opt
+SELECT * FROM nation WHERE n_name = 'FRANCE' OR n_name = 'GERMANY'
+----
+select
+ ├── columns: n_nationkey:1(int!null) n_name:2(char!null) n_regionkey:3(int!null) neighbor:4(char!null)
+ ├── stats: [rows=333333.333, distinct(2)=2, null(2)=0]
+ ├── key: (1)
+ ├── fd: (1)-->(2-4)
+ ├── scan nation
+ │    ├── columns: n_nationkey:1(int!null) n_name:2(char!null) n_regionkey:3(int!null) neighbor:4(char!null)
+ │    ├── stats: [rows=1000000, distinct(1)=1000000, null(1)=0, distinct(2)=2, null(2)=0, distinct(3)=100000, null(3)=0, distinct(4)=100000, null(4)=0]
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-4)
+ └── filters
+      └── (n_name = 'FRANCE') OR (n_name = 'GERMANY') [type=bool, outer=(2), constraints=(/2: [/'FRANCE' - /'FRANCE'] [/'GERMANY' - /'GERMANY'])]
+
+opt
+SELECT * FROM nation WHERE (n_name = 'FRANCE' AND neighbor = 'GERMANY') OR (n_name = 'GERMANY' AND neighbor = 'FRANCE')
+----
+select
+ ├── columns: n_nationkey:1(int!null) n_name:2(char!null) n_regionkey:3(int!null) neighbor:4(char!null)
+ ├── stats: [rows=6.66666667, distinct(2)=2, null(2)=0, distinct(4)=2, null(4)=0]
+ ├── key: (1)
+ ├── fd: (1)-->(2-4)
+ ├── scan nation
+ │    ├── columns: n_nationkey:1(int!null) n_name:2(char!null) n_regionkey:3(int!null) neighbor:4(char!null)
+ │    ├── stats: [rows=1000000, distinct(1)=1000000, null(1)=0, distinct(2)=2, null(2)=0, distinct(3)=100000, null(3)=0, distinct(4)=100000, null(4)=0]
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-4)
+ └── filters
+      └── ((n_name = 'FRANCE') AND (neighbor = 'GERMANY')) OR ((n_name = 'GERMANY') AND (neighbor = 'FRANCE')) [type=bool, outer=(2,4), constraints=(/2: [/'FRANCE' - /'FRANCE'] [/'GERMANY' - /'GERMANY']; /4: [/'FRANCE' - /'FRANCE'] [/'GERMANY' - /'GERMANY'])]
+
+opt
+SELECT * FROM nation WHERE (n_name, neighbor) in (('FRANCE', 'GERMANY'), ('GERMANY', 'FRANCE'))
+----
+select
+ ├── columns: n_nationkey:1(int!null) n_name:2(char!null) n_regionkey:3(int!null) neighbor:4(char!null)
+ ├── stats: [rows=20, distinct(2)=2, null(2)=0, distinct(4)=2, null(4)=0]
+ ├── key: (1)
+ ├── fd: (1)-->(2-4)
+ ├── scan nation
+ │    ├── columns: n_nationkey:1(int!null) n_name:2(char!null) n_regionkey:3(int!null) neighbor:4(char!null)
+ │    ├── stats: [rows=1000000, distinct(1)=1000000, null(1)=0, distinct(2)=2, null(2)=0, distinct(3)=100000, null(3)=0, distinct(4)=100000, null(4)=0]
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-4)
+ └── filters
+      └── (n_name, neighbor) IN (('FRANCE', 'GERMANY'), ('GERMANY', 'FRANCE')) [type=bool, outer=(2,4), constraints=(/2/4: [/'FRANCE'/'GERMANY' - /'FRANCE'/'GERMANY'] [/'GERMANY'/'FRANCE' - /'GERMANY'/'FRANCE']; /4: [/'FRANCE' - /'FRANCE'] [/'GERMANY' - /'GERMANY']; tight)]

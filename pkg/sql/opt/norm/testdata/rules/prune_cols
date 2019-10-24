@@ -1,22 +1,10 @@
 exec-ddl
 CREATE TABLE a (k INT PRIMARY KEY, i INT, f FLOAT, s STRING)
 ----
-TABLE a
- ├── k int not null
- ├── i int
- ├── f float
- ├── s string
- └── INDEX primary
-      └── k int not null
 
 exec-ddl
 CREATE TABLE xy (x INT PRIMARY KEY, y INT)
 ----
-TABLE xy
- ├── x int not null
- ├── y int
- └── INDEX primary
-      └── x int not null
 
 exec-ddl
 CREATE TABLE abcde (
@@ -28,18 +16,6 @@ CREATE TABLE abcde (
     UNIQUE INDEX bc (b, c)
 )
 ----
-TABLE abcde
- ├── a int not null
- ├── b int
- ├── c int
- ├── d int
- ├── e int
- ├── INDEX primary
- │    └── a int not null
- └── INDEX bc
-      ├── b int
-      ├── c int
-      └── a int not null (storing)
 
 exec-ddl
 CREATE TABLE mutation (
@@ -52,21 +28,6 @@ CREATE TABLE mutation (
     INDEX "idx2:delete-only" (e)
 )
 ----
-TABLE mutation
- ├── a int not null
- ├── b int
- ├── c int
- ├── d int (mutation)
- ├── e int (mutation)
- ├── INDEX primary
- │    └── a int not null
- ├── INDEX idx1 (mutation)
- │    ├── b int
- │    ├── d int
- │    └── a int not null (storing)
- └── INDEX idx2 (mutation)
-      ├── e int
-      └── a int not null
 
 exec-ddl
 CREATE TABLE family (
@@ -81,20 +42,6 @@ CREATE TABLE family (
     INDEX (d)
 )
 ----
-TABLE family
- ├── a int not null
- ├── b int
- ├── c int
- ├── d int
- ├── e int
- ├── INDEX primary
- │    └── a int not null
- ├── INDEX secondary
- │    ├── d int
- │    └── a int not null
- ├── FAMILY family1 (a, b)
- ├── FAMILY family2 (c, d)
- └── FAMILY family3 (e)
 
 # --------------------------------------------------
 # PruneProjectCols
@@ -591,15 +538,16 @@ project
  ├── columns: k:1(int!null)
  ├── cardinality: [0 - 10]
  ├── key: (1)
- └── limit
+ └── offset
       ├── columns: k:1(int!null) i:2(int)
       ├── internal-ordering: +2
       ├── cardinality: [0 - 10]
       ├── key: (1)
       ├── fd: (1)-->(2)
-      ├── offset
+      ├── limit
       │    ├── columns: k:1(int!null) i:2(int)
       │    ├── internal-ordering: +2
+      │    ├── cardinality: [0 - 20]
       │    ├── key: (1)
       │    ├── fd: (1)-->(2)
       │    ├── ordering: +2
@@ -612,7 +560,7 @@ project
       │    │         ├── columns: k:1(int!null) i:2(int)
       │    │         ├── key: (1)
       │    │         └── fd: (1)-->(2)
-      │    └── const: 10 [type=int]
+      │    └── const: 20 [type=int]
       └── const: 10 [type=int]
 
 # We should scan k, i, s.
@@ -622,15 +570,16 @@ SELECT s FROM (SELECT k, i, f, s FROM a ORDER BY i, k LIMIT 10 OFFSET 10)
 project
  ├── columns: s:4(string)
  ├── cardinality: [0 - 10]
- └── limit
+ └── offset
       ├── columns: k:1(int!null) i:2(int) s:4(string)
       ├── internal-ordering: +2,+1
       ├── cardinality: [0 - 10]
       ├── key: (1)
       ├── fd: (1)-->(2,4)
-      ├── offset
+      ├── limit
       │    ├── columns: k:1(int!null) i:2(int) s:4(string)
       │    ├── internal-ordering: +2,+1
+      │    ├── cardinality: [0 - 20]
       │    ├── key: (1)
       │    ├── fd: (1)-->(2,4)
       │    ├── ordering: +2,+1
@@ -643,7 +592,7 @@ project
       │    │         ├── columns: k:1(int!null) i:2(int) s:4(string)
       │    │         ├── key: (1)
       │    │         └── fd: (1)-->(2,4)
-      │    └── const: 10 [type=int]
+      │    └── const: 20 [type=int]
       └── const: 10 [type=int]
 
 # We should scan k, i, s.
@@ -655,15 +604,16 @@ project
  ├── cardinality: [0 - 10]
  ├── key: (1)
  ├── fd: (1)-->(4)
- └── limit
+ └── offset
       ├── columns: k:1(int!null) i:2(int) s:4(string)
       ├── internal-ordering: +2,+1
       ├── cardinality: [0 - 10]
       ├── key: (1)
       ├── fd: (1)-->(2,4)
-      ├── offset
+      ├── limit
       │    ├── columns: k:1(int!null) i:2(int) s:4(string)
       │    ├── internal-ordering: +2,+1
+      │    ├── cardinality: [0 - 20]
       │    ├── key: (1)
       │    ├── fd: (1)-->(2,4)
       │    ├── ordering: +2,+1
@@ -676,7 +626,7 @@ project
       │    │         ├── columns: k:1(int!null) i:2(int) s:4(string)
       │    │         ├── key: (1)
       │    │         └── fd: (1)-->(2,4)
-      │    └── const: 10 [type=int]
+      │    └── const: 20 [type=int]
       └── const: 10 [type=int]
 
 # Project filter offset/limit columns, but can't push all the way down to scan.
@@ -686,12 +636,13 @@ SELECT f, f*2.0 AS r FROM (SELECT f, s FROM a GROUP BY f, s OFFSET 5 LIMIT 5) a
 project
  ├── columns: f:3(float) r:5(float)
  ├── cardinality: [0 - 5]
- ├── limit
+ ├── offset
  │    ├── columns: f:3(float) s:4(string)
  │    ├── cardinality: [0 - 5]
  │    ├── key: (3,4)
- │    ├── offset
+ │    ├── limit
  │    │    ├── columns: f:3(float) s:4(string)
+ │    │    ├── cardinality: [0 - 10]
  │    │    ├── key: (3,4)
  │    │    ├── distinct-on
  │    │    │    ├── columns: f:3(float) s:4(string)
@@ -699,7 +650,7 @@ project
  │    │    │    ├── key: (3,4)
  │    │    │    └── scan a
  │    │    │         └── columns: f:3(float) s:4(string)
- │    │    └── const: 5 [type=int]
+ │    │    └── const: 10 [type=int]
  │    └── const: 5 [type=int]
  └── projections
       └── f * 2.0 [type=float, outer=(3)]
@@ -788,7 +739,7 @@ SELECT a.k+1 AS r, xy.* FROM a FULL JOIN xy ON True
 project
  ├── columns: r:7(int) x:5(int) y:6(int)
  ├── fd: (5)-->(6)
- ├── full-join
+ ├── full-join (hash)
  │    ├── columns: k:1(int) x:5(int) y:6(int)
  │    ├── key: (1,5)
  │    ├── fd: (5)-->(6)
@@ -807,7 +758,7 @@ project
 opt expect=PruneJoinLeftCols
 SELECT xy.* FROM a, xy
 ----
-inner-join
+inner-join (hash)
  ├── columns: x:5(int!null) y:6(int)
  ├── fd: (5)-->(6)
  ├── scan a
@@ -825,7 +776,7 @@ project
  ├── columns: r:8(int) s:9(decimal) x:5(int!null) y:6(int)
  ├── side-effects
  ├── fd: (5)-->(6)
- ├── inner-join
+ ├── inner-join (hash)
  │    ├── columns: k:1(int!null) i:2(int) x:5(int!null) y:6(int) column7:7(int!null)
  │    ├── key: (1)
  │    ├── fd: (1)-->(2,7), (5)-->(6), (5)==(7), (7)==(5)
@@ -869,7 +820,7 @@ project
  ├── columns: k:1(int!null) x:7(int!null) y:8(int!null)
  ├── key: (1,7)
  ├── fd: (7)-->(8)
- └── inner-join
+ └── inner-join (hash)
       ├── columns: k:1(int!null) i:2(int!null) x:5(int!null) x:7(int!null) y:8(int!null)
       ├── key: (5,7)
       ├── fd: (1)-->(2), (1)==(5), (5)==(1), (7)-->(8)
@@ -966,9 +917,8 @@ project
       │    │    ├── fd: (1)-->(2)
       │    │    └── ordering: +1
       │    ├── scan xy
-      │    │    ├── columns: x:7(int!null) y:8(int)
+      │    │    ├── columns: x:7(int!null)
       │    │    ├── key: (7)
-      │    │    ├── fd: (7)-->(8)
       │    │    └── ordering: +7
       │    └── filters (true)
       ├── scan xy
@@ -987,10 +937,9 @@ WHERE
 ----
 project
  ├── columns: i:2(int)
- └── anti-join (merge)
+ └── anti-join (lookup xy)
       ├── columns: k:1(int!null) i:2(int)
-      ├── left ordering: +1
-      ├── right ordering: +5
+      ├── key columns: [1] = [5]
       ├── key: (1)
       ├── fd: (1)-->(2)
       ├── anti-join (merge)
@@ -999,22 +948,16 @@ project
       │    ├── right ordering: +7
       │    ├── key: (1)
       │    ├── fd: (1)-->(2)
-      │    ├── ordering: +1
       │    ├── scan a
       │    │    ├── columns: k:1(int!null) i:2(int)
       │    │    ├── key: (1)
       │    │    ├── fd: (1)-->(2)
       │    │    └── ordering: +1
       │    ├── scan xy
-      │    │    ├── columns: x:7(int!null) y:8(int)
+      │    │    ├── columns: x:7(int!null)
       │    │    ├── key: (7)
-      │    │    ├── fd: (7)-->(8)
       │    │    └── ordering: +7
       │    └── filters (true)
-      ├── scan xy
-      │    ├── columns: x:5(int!null)
-      │    ├── key: (5)
-      │    └── ordering: +5
       └── filters (true)
 
 # --------------------------------------------------
@@ -1107,7 +1050,7 @@ SELECT xy.*, a.k+1 AS r FROM xy FULL JOIN a ON True
 project
  ├── columns: x:1(int) y:2(int) r:7(int)
  ├── fd: (1)-->(2)
- ├── full-join
+ ├── full-join (hash)
  │    ├── columns: x:1(int) y:2(int) k:3(int)
  │    ├── key: (1,3)
  │    ├── fd: (1)-->(2)
@@ -1126,7 +1069,7 @@ project
 opt expect=PruneJoinRightCols
 SELECT xy.* FROM xy, a
 ----
-inner-join
+inner-join (hash)
  ├── columns: x:1(int!null) y:2(int)
  ├── fd: (1)-->(2)
  ├── scan xy
@@ -1144,7 +1087,7 @@ project
  ├── columns: x:1(int!null) y:2(int) r:8(int) s:9(decimal)
  ├── side-effects
  ├── fd: (1)-->(2)
- ├── inner-join
+ ├── inner-join (hash)
  │    ├── columns: x:1(int!null) y:2(int) k:3(int!null) i:4(int) column7:7(int!null)
  │    ├── key: (3)
  │    ├── fd: (1)-->(2), (3)-->(4,7), (1)==(7), (7)==(1)
@@ -1188,7 +1131,7 @@ project
  ├── columns: k:3(int!null) x:1(int!null) y:2(int!null)
  ├── key: (1,3)
  ├── fd: (1)-->(2)
- └── inner-join
+ └── inner-join (hash)
       ├── columns: x:1(int!null) y:2(int!null) k:3(int!null) x:7(int!null) y:8(int!null)
       ├── key: (1,7)
       ├── fd: (1)-->(2), (7)-->(8), (3)==(7), (7)==(3)
@@ -1226,7 +1169,7 @@ SELECT 1 r FROM a,xy
 project
  ├── columns: r:7(int!null)
  ├── fd: ()-->(7)
- ├── inner-join
+ ├── inner-join (hash)
  │    ├── scan a
  │    ├── scan xy
  │    └── filters (true)
@@ -1461,7 +1404,7 @@ opt expect=PruneValuesCols
 SELECT column1 FROM (VALUES (1, 2), (3, 4)) a
 ----
 values
- ├── columns: column1:1(int)
+ ├── columns: column1:1(int!null)
  ├── cardinality: [2 - 2]
  ├── (1,) [type=tuple{int}]
  └── (3,) [type=tuple{int}]
@@ -1471,7 +1414,7 @@ opt expect=PruneValuesCols
 SELECT column2 FROM (VALUES (1, 2, 3), (4, 5, 6)) a
 ----
 values
- ├── columns: column2:2(int)
+ ├── columns: column2:2(int!null)
  ├── cardinality: [2 - 2]
  ├── (2,) [type=tuple{int}]
  └── (5,) [type=tuple{int}]
@@ -1481,7 +1424,7 @@ opt expect=PruneValuesCols
 SELECT column3 FROM (VALUES ('foo', 'bar', 'baz'), ('apple', 'banana', 'cherry')) a
 ----
 values
- ├── columns: column3:3(string)
+ ├── columns: column3:3(string!null)
  ├── cardinality: [2 - 2]
  ├── ('baz',) [type=tuple{string}]
  └── ('cherry',) [type=tuple{string}]
@@ -1672,7 +1615,7 @@ window partition=()
  ├── columns: rank:5(int)
  ├── scan a
  └── windows
-      └── rank [type=undefined]
+      └── rank [type=int]
 
 norm expect=PruneWindowInputCols
 SELECT ntile(1) OVER () FROM a
@@ -1713,6 +1656,36 @@ project
       └── windows
            └── ntile [type=int, outer=(2)]
                 └── variable: t.public.a.i [type=int]
+
+# Ensure filter cols don't get pruned.
+norm
+SELECT
+    avg(i) FILTER (WHERE true) OVER (),
+    avg(i) FILTER (WHERE false) OVER ()
+FROM a
+----
+project
+ ├── columns: avg:5(decimal) avg:6(decimal)
+ └── window partition=()
+      ├── columns: i:2(int) avg:5(decimal) avg:6(decimal) avg_1_filter:7(bool!null) avg_2_filter:8(bool!null)
+      ├── fd: ()-->(7,8)
+      ├── project
+      │    ├── columns: avg_1_filter:7(bool!null) avg_2_filter:8(bool!null) i:2(int)
+      │    ├── fd: ()-->(7,8)
+      │    ├── scan a
+      │    │    └── columns: i:2(int)
+      │    └── projections
+      │         ├── true [type=bool]
+      │         └── false [type=bool]
+      └── windows
+           ├── agg-filter [type=decimal, outer=(2,7)]
+           │    ├── avg [type=decimal]
+           │    │    └── variable: i [type=int]
+           │    └── variable: avg_1_filter [type=bool]
+           └── agg-filter [type=decimal, outer=(2,8)]
+                ├── avg [type=decimal]
+                │    └── variable: i [type=int]
+                └── variable: avg_2_filter [type=bool]
 
 # --------------------------------------------------
 # PruneWindowOutputCols
@@ -1885,26 +1858,19 @@ delete mutation
       ├── key: (6)
       └── fd: (6)-->(7,9,10)
 
-# No pruning when RETURNING clause is present.
-# TODO(andyk): Need to prune output columns.
-opt expect-not=(PruneMutationFetchCols,PruneMutationInputCols)
+opt expect=(PruneMutationFetchCols,PruneMutationInputCols)
 DELETE FROM a RETURNING k, s
 ----
-project
+delete a
  ├── columns: k:1(int!null) s:4(string)
+ ├── fetch columns: k:5(int) s:8(string)
  ├── side-effects, mutations
  ├── key: (1)
  ├── fd: (1)-->(4)
- └── delete a
-      ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string)
-      ├── fetch columns: k:5(int) i:6(int) f:7(float) s:8(string)
-      ├── side-effects, mutations
-      ├── key: (1)
-      ├── fd: (1)-->(2-4)
-      └── scan a
-           ├── columns: k:5(int!null) i:6(int) f:7(float) s:8(string)
-           ├── key: (5)
-           └── fd: (5)-->(6-8)
+ └── scan a
+      ├── columns: k:5(int!null) s:8(string)
+      ├── key: (5)
+      └── fd: (5)-->(8)
 
 # Prune secondary family column not needed for the update.
 opt expect=(PruneMutationFetchCols,PruneMutationInputCols)
@@ -1947,29 +1913,28 @@ update "family"
            └── a + 1 [type=int, outer=(6)]
 
 # Do not prune columns that must be returned.
-# TODO(justin): in order to prune e here we need a PruneMutationReturnCols rule.
-opt expect-not=PruneMutationFetchCols
+opt expect=(PruneMutationFetchCols, PruneMutationReturnCols)
 UPDATE family SET c=c+1 RETURNING b
 ----
 project
  ├── columns: b:2(int)
  ├── side-effects, mutations
  └── update "family"
-      ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int) e:5(int)
-      ├── fetch columns: a:6(int) b:7(int) c:8(int) d:9(int) e:10(int)
+      ├── columns: a:1(int!null) b:2(int)
+      ├── fetch columns: a:6(int) b:7(int) c:8(int) d:9(int)
       ├── update-mapping:
       │    └──  column11:11 => c:3
       ├── side-effects, mutations
       ├── key: (1)
-      ├── fd: (1)-->(2-5)
+      ├── fd: (1)-->(2)
       └── project
-           ├── columns: column11:11(int) a:6(int!null) b:7(int) c:8(int) d:9(int) e:10(int)
+           ├── columns: column11:11(int) a:6(int!null) b:7(int) c:8(int) d:9(int)
            ├── key: (6)
-           ├── fd: (6)-->(7-10), (8)-->(11)
+           ├── fd: (6)-->(7-9), (8)-->(11)
            ├── scan "family"
-           │    ├── columns: a:6(int!null) b:7(int) c:8(int) d:9(int) e:10(int)
+           │    ├── columns: a:6(int!null) b:7(int) c:8(int) d:9(int)
            │    ├── key: (6)
-           │    └── fd: (6)-->(7-10)
+           │    └── fd: (6)-->(7-9)
            └── projections
                 └── c + 1 [type=int, outer=(8)]
 
@@ -1991,17 +1956,17 @@ upsert a
  ├── cardinality: [0 - 0]
  ├── side-effects, mutations
  └── project
-      ├── columns: upsert_i:15(int) column1:5(int) column2:6(string) column7:7(int) column8:8(float) k:9(int) i:10(int) f:11(float) s:12(string)
+      ├── columns: upsert_i:15(int) column1:5(int!null) column2:6(string!null) column7:7(int) column8:8(float) k:9(int) i:10(int) f:11(float) s:12(string)
       ├── cardinality: [1 - 1]
       ├── key: ()
       ├── fd: ()-->(5-12,15)
-      ├── left-join
-      │    ├── columns: column1:5(int) column2:6(string) column7:7(int) column8:8(float) k:9(int) i:10(int) f:11(float) s:12(string)
+      ├── left-join (hash)
+      │    ├── columns: column1:5(int!null) column2:6(string!null) column7:7(int) column8:8(float) k:9(int) i:10(int) f:11(float) s:12(string)
       │    ├── cardinality: [1 - 1]
       │    ├── key: ()
       │    ├── fd: ()-->(5-12)
       │    ├── values
-      │    │    ├── columns: column1:5(int) column2:6(string) column7:7(int) column8:8(float)
+      │    │    ├── columns: column1:5(int!null) column2:6(string!null) column7:7(int) column8:8(float)
       │    │    ├── cardinality: [1 - 1]
       │    │    ├── key: ()
       │    │    ├── fd: ()-->(5-8)
@@ -2042,17 +2007,17 @@ upsert a
  ├── key: ()
  ├── fd: ()-->(1-4)
  └── project
-      ├── columns: upsert_k:14(int) upsert_i:15(int) upsert_f:16(float) upsert_s:17(string) column1:5(int) column2:6(string) column7:7(int) column8:8(float) k:9(int) i:10(int) f:11(float) s:12(string)
+      ├── columns: upsert_k:14(int) upsert_i:15(int) upsert_f:16(float) upsert_s:17(string) column1:5(int!null) column2:6(string!null) column7:7(int) column8:8(float) k:9(int) i:10(int) f:11(float) s:12(string)
       ├── cardinality: [1 - 1]
       ├── key: ()
       ├── fd: ()-->(5-12,14-17)
-      ├── left-join
-      │    ├── columns: column1:5(int) column2:6(string) column7:7(int) column8:8(float) k:9(int) i:10(int) f:11(float) s:12(string)
+      ├── left-join (hash)
+      │    ├── columns: column1:5(int!null) column2:6(string!null) column7:7(int) column8:8(float) k:9(int) i:10(int) f:11(float) s:12(string)
       │    ├── cardinality: [1 - 1]
       │    ├── key: ()
       │    ├── fd: ()-->(5-12)
       │    ├── values
-      │    │    ├── columns: column1:5(int) column2:6(string) column7:7(int) column8:8(float)
+      │    │    ├── columns: column1:5(int!null) column2:6(string!null) column7:7(int) column8:8(float)
       │    │    ├── cardinality: [1 - 1]
       │    │    ├── key: ()
       │    │    ├── fd: ()-->(5-8)
@@ -2088,13 +2053,13 @@ upsert "family"
  │    └──  column2:7 => b:2
  ├── cardinality: [0 - 0]
  ├── side-effects, mutations
- └── left-join
-      ├── columns: column1:6(int) column2:7(int) column8:8(int) a:9(int) b:10(int)
+ └── left-join (hash)
+      ├── columns: column1:6(int!null) column2:7(int!null) column8:8(int) a:9(int) b:10(int)
       ├── cardinality: [1 - 1]
       ├── key: ()
       ├── fd: ()-->(6-10)
       ├── values
-      │    ├── columns: column1:6(int) column2:7(int) column8:8(int)
+      │    ├── columns: column1:6(int!null) column2:7(int!null) column8:8(int)
       │    ├── cardinality: [1 - 1]
       │    ├── key: ()
       │    ├── fd: ()-->(6-8)
@@ -2117,9 +2082,9 @@ project
  ├── key: ()
  ├── fd: ()-->(5)
  └── upsert "family"
-      ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int) e:5(int)
+      ├── columns: a:1(int!null) e:5(int)
       ├── canary column: 11
-      ├── fetch columns: a:11(int) b:12(int) c:13(int) d:14(int) e:15(int)
+      ├── fetch columns: a:11(int) c:13(int) d:14(int) e:15(int)
       ├── insert-mapping:
       │    ├──  column1:6 => a:1
       │    ├──  column2:7 => b:2
@@ -2130,44 +2095,38 @@ project
       │    └──  upsert_c:19 => c:3
       ├── return-mapping:
       │    ├──  upsert_a:17 => a:1
-      │    ├──  upsert_b:18 => b:2
-      │    ├──  upsert_c:19 => c:3
-      │    ├──  upsert_d:20 => d:4
       │    └──  upsert_e:21 => e:5
       ├── cardinality: [1 - 1]
       ├── side-effects, mutations
       ├── key: ()
-      ├── fd: ()-->(1-5)
+      ├── fd: ()-->(1,5)
       └── project
-           ├── columns: upsert_a:17(int) upsert_b:18(int) upsert_c:19(int) upsert_d:20(int) upsert_e:21(int) column1:6(int) column2:7(int) column3:8(int) column4:9(int) column5:10(int) a:11(int) b:12(int) c:13(int) d:14(int) e:15(int)
+           ├── columns: upsert_a:17(int) upsert_c:19(int) upsert_e:21(int) column1:6(int!null) column2:7(int!null) column3:8(int!null) column4:9(int!null) column5:10(int!null) a:11(int) c:13(int) d:14(int) e:15(int)
            ├── cardinality: [1 - 1]
            ├── key: ()
-           ├── fd: ()-->(6-15,17-21)
-           ├── left-join
-           │    ├── columns: column1:6(int) column2:7(int) column3:8(int) column4:9(int) column5:10(int) a:11(int) b:12(int) c:13(int) d:14(int) e:15(int)
+           ├── fd: ()-->(6-11,13-15,17,19,21)
+           ├── left-join (hash)
+           │    ├── columns: column1:6(int!null) column2:7(int!null) column3:8(int!null) column4:9(int!null) column5:10(int!null) a:11(int) c:13(int) d:14(int) e:15(int)
            │    ├── cardinality: [1 - 1]
            │    ├── key: ()
-           │    ├── fd: ()-->(6-15)
+           │    ├── fd: ()-->(6-11,13-15)
            │    ├── values
-           │    │    ├── columns: column1:6(int) column2:7(int) column3:8(int) column4:9(int) column5:10(int)
+           │    │    ├── columns: column1:6(int!null) column2:7(int!null) column3:8(int!null) column4:9(int!null) column5:10(int!null)
            │    │    ├── cardinality: [1 - 1]
            │    │    ├── key: ()
            │    │    ├── fd: ()-->(6-10)
            │    │    └── (1, 2, 3, 4, 5) [type=tuple{int, int, int, int, int}]
            │    ├── scan "family"
-           │    │    ├── columns: a:11(int!null) b:12(int) c:13(int) d:14(int) e:15(int)
+           │    │    ├── columns: a:11(int!null) c:13(int) d:14(int) e:15(int)
            │    │    ├── constraint: /11: [/1 - /1]
            │    │    ├── cardinality: [0 - 1]
            │    │    ├── key: ()
-           │    │    └── fd: ()-->(11-15)
+           │    │    └── fd: ()-->(11,13-15)
            │    └── filters (true)
            └── projections
                 ├── CASE WHEN a IS NULL THEN column1 ELSE a END [type=int, outer=(6,11)]
-                ├── CASE WHEN a IS NULL THEN column2 ELSE b END [type=int, outer=(7,11,12)]
                 ├── CASE WHEN a IS NULL THEN column3 ELSE 10 END [type=int, outer=(8,11)]
-                ├── CASE WHEN a IS NULL THEN column4 ELSE d END [type=int, outer=(9,11,14)]
                 └── CASE WHEN a IS NULL THEN column5 ELSE e END [type=int, outer=(10,11,15)]
-
 
 # Do not prune column in same secondary family as updated column. But prune
 # non-key column in primary family.
@@ -2189,17 +2148,17 @@ upsert "family"
  ├── cardinality: [0 - 0]
  ├── side-effects, mutations
  └── project
-      ├── columns: upsert_d:20(int) column1:6(int) column2:7(int) column3:8(int) column4:9(int) column10:10(int) a:11(int) c:13(int) d:14(int)
+      ├── columns: upsert_d:20(int) column1:6(int!null) column2:7(int!null) column3:8(int!null) column4:9(int!null) column10:10(int) a:11(int) c:13(int) d:14(int)
       ├── cardinality: [1 - 1]
       ├── key: ()
       ├── fd: ()-->(6-11,13,14,20)
-      ├── left-join
-      │    ├── columns: column1:6(int) column2:7(int) column3:8(int) column4:9(int) column10:10(int) a:11(int) c:13(int) d:14(int)
+      ├── left-join (hash)
+      │    ├── columns: column1:6(int!null) column2:7(int!null) column3:8(int!null) column4:9(int!null) column10:10(int) a:11(int) c:13(int) d:14(int)
       │    ├── cardinality: [1 - 1]
       │    ├── key: ()
       │    ├── fd: ()-->(6-11,13,14)
       │    ├── values
-      │    │    ├── columns: column1:6(int) column2:7(int) column3:8(int) column4:9(int) column10:10(int)
+      │    │    ├── columns: column1:6(int!null) column2:7(int!null) column3:8(int!null) column4:9(int!null) column10:10(int)
       │    │    ├── cardinality: [1 - 1]
       │    │    ├── key: ()
       │    │    ├── fd: ()-->(6-10)
@@ -2232,17 +2191,17 @@ upsert mutation
  ├── cardinality: [0 - 0]
  ├── side-effects, mutations
  └── project
-      ├── columns: upsert_b:17(int) column1:6(int) column2:7(int) column3:8(int) column9:9(int) a:10(int) b:11(int) c:12(int) d:13(int) e:14(int)
+      ├── columns: upsert_b:17(int) column1:6(int!null) column2:7(int!null) column3:8(int!null) column9:9(int) a:10(int) b:11(int) c:12(int) d:13(int) e:14(int)
       ├── cardinality: [1 - 1]
       ├── key: ()
       ├── fd: ()-->(6-14,17)
-      ├── left-join
-      │    ├── columns: column1:6(int) column2:7(int) column3:8(int) column9:9(int) a:10(int) b:11(int) c:12(int) d:13(int) e:14(int)
+      ├── left-join (hash)
+      │    ├── columns: column1:6(int!null) column2:7(int!null) column3:8(int!null) column9:9(int) a:10(int) b:11(int) c:12(int) d:13(int) e:14(int)
       │    ├── cardinality: [1 - 1]
       │    ├── key: ()
       │    ├── fd: ()-->(6-14)
       │    ├── values
-      │    │    ├── columns: column1:6(int) column2:7(int) column3:8(int) column9:9(int)
+      │    │    ├── columns: column1:6(int!null) column2:7(int!null) column3:8(int!null) column9:9(int)
       │    │    ├── cardinality: [1 - 1]
       │    │    ├── key: ()
       │    │    ├── fd: ()-->(6-9)
@@ -2256,3 +2215,714 @@ upsert mutation
       │    └── filters (true)
       └── projections
            └── CASE WHEN a IS NULL THEN column2 ELSE 10 END [type=int, outer=(7,10)]
+
+# ------------------------------------------------------------------------------
+# PruneMutationReturnCols
+# ------------------------------------------------------------------------------
+
+# Create a table with multiple column families the mutations can take advantage of.
+exec-ddl
+CREATE TABLE returning_test (
+    a INT,
+    b INT,
+    c STRING,
+    d INT,
+    e INT,
+    f INT,
+    g INT,
+    FAMILY (a),
+    FAMILY (b),
+    FAMILY (c),
+    FAMILY (d, e, f, g),
+    UNIQUE (a)
+)
+----
+
+# Fetch all the columns for the RETURN expression.
+opt
+UPDATE returning_test SET a = a + 1 RETURNING *
+----
+project
+ ├── columns: a:1(int) b:2(int) c:3(string) d:4(int) e:5(int) f:6(int) g:7(int)
+ ├── side-effects, mutations
+ └── update returning_test
+      ├── columns: a:1(int) b:2(int) c:3(string) d:4(int) e:5(int) f:6(int) g:7(int) rowid:8(int!null)
+      ├── fetch columns: a:9(int) b:10(int) c:11(string) d:12(int) e:13(int) f:14(int) g:15(int) rowid:16(int)
+      ├── update-mapping:
+      │    └──  column17:17 => a:1
+      ├── side-effects, mutations
+      ├── key: (8)
+      ├── fd: (8)-->(1-7)
+      └── project
+           ├── columns: column17:17(int) a:9(int) b:10(int) c:11(string) d:12(int) e:13(int) f:14(int) g:15(int) rowid:16(int!null)
+           ├── key: (16)
+           ├── fd: (16)-->(9-15), (9)~~>(10-16), (9)-->(17)
+           ├── scan returning_test
+           │    ├── columns: a:9(int) b:10(int) c:11(string) d:12(int) e:13(int) f:14(int) g:15(int) rowid:16(int!null)
+           │    ├── key: (16)
+           │    └── fd: (16)-->(9-15), (9)~~>(10-16)
+           └── projections
+                └── a + 1 [type=int, outer=(9)]
+
+
+# Fetch all the columns in the (d, e, f, g) family as d is being set.
+opt
+UPDATE returning_test SET d = a + d RETURNING a, d
+----
+project
+ ├── columns: a:1(int) d:4(int)
+ ├── side-effects, mutations
+ ├── lax-key: (1,4)
+ ├── fd: (1)~~>(4)
+ └── update returning_test
+      ├── columns: a:1(int) d:4(int) rowid:8(int!null)
+      ├── fetch columns: a:9(int) d:12(int) e:13(int) f:14(int) g:15(int) rowid:16(int)
+      ├── update-mapping:
+      │    └──  column17:17 => d:4
+      ├── side-effects, mutations
+      ├── key: (8)
+      ├── fd: (8)-->(1,4), (1)~~>(4,8)
+      └── project
+           ├── columns: column17:17(int) a:9(int) d:12(int) e:13(int) f:14(int) g:15(int) rowid:16(int!null)
+           ├── key: (16)
+           ├── fd: (16)-->(9,12-15), (9)~~>(12-16), (9,12)-->(17)
+           ├── scan returning_test
+           │    ├── columns: a:9(int) d:12(int) e:13(int) f:14(int) g:15(int) rowid:16(int!null)
+           │    ├── key: (16)
+           │    └── fd: (16)-->(9,12-15), (9)~~>(12-16)
+           └── projections
+                └── a + d [type=int, outer=(9,12)]
+
+# Fetch only whats being updated (not the (d, e, f, g) family).
+opt
+UPDATE returning_test SET a = a + d RETURNING a
+----
+project
+ ├── columns: a:1(int)
+ ├── side-effects, mutations
+ └── update returning_test
+      ├── columns: a:1(int) rowid:8(int!null)
+      ├── fetch columns: a:9(int) rowid:16(int)
+      ├── update-mapping:
+      │    └──  column17:17 => a:1
+      ├── side-effects, mutations
+      ├── key: (8)
+      ├── fd: (8)-->(1)
+      └── project
+           ├── columns: column17:17(int) a:9(int) rowid:16(int!null)
+           ├── key: (16)
+           ├── fd: (16)-->(9,17), (9)~~>(16,17)
+           ├── scan returning_test
+           │    ├── columns: a:9(int) d:12(int) rowid:16(int!null)
+           │    ├── key: (16)
+           │    └── fd: (16)-->(9,12), (9)~~>(12,16)
+           └── projections
+                └── a + d [type=int, outer=(9,12)]
+
+# We only fetch the minimal set of columns which is (a, b, c, rowid).
+opt
+UPDATE returning_test SET (b, a) = (a, a + b) RETURNING a, b, c
+----
+project
+ ├── columns: a:1(int) b:2(int) c:3(string)
+ ├── side-effects, mutations
+ ├── lax-key: (1-3)
+ ├── fd: (2)~~>(1,3)
+ └── update returning_test
+      ├── columns: a:1(int) b:2(int) c:3(string) rowid:8(int!null)
+      ├── fetch columns: a:9(int) b:10(int) c:11(string) rowid:16(int)
+      ├── update-mapping:
+      │    ├──  column17:17 => a:1
+      │    └──  a:9 => b:2
+      ├── side-effects, mutations
+      ├── key: (8)
+      ├── fd: (8)-->(1-3), (2)~~>(1,3,8)
+      └── project
+           ├── columns: column17:17(int) a:9(int) b:10(int) c:11(string) rowid:16(int!null)
+           ├── key: (16)
+           ├── fd: (16)-->(9-11), (9)~~>(10,11,16), (9,10)-->(17)
+           ├── scan returning_test
+           │    ├── columns: a:9(int) b:10(int) c:11(string) rowid:16(int!null)
+           │    ├── key: (16)
+           │    └── fd: (16)-->(9-11), (9)~~>(10,11,16)
+           └── projections
+                └── a + b [type=int, outer=(9,10)]
+
+
+# We apply the PruneMutationReturnCols rule multiple times, to get
+# the minimal set of columns which is (a, rowid). Notice how c and b
+# are pruned away.
+opt
+SELECT a FROM [SELECT a, b FROM [UPDATE returning_test SET a = a + 1 RETURNING a, b, c]]
+----
+project
+ ├── columns: a:1(int)
+ ├── side-effects, mutations
+ └── update returning_test
+      ├── columns: a:1(int) rowid:8(int!null)
+      ├── fetch columns: a:9(int) rowid:16(int)
+      ├── update-mapping:
+      │    └──  column17:17 => a:1
+      ├── side-effects, mutations
+      ├── key: (8)
+      ├── fd: (8)-->(1)
+      └── project
+           ├── columns: column17:17(int) a:9(int) rowid:16(int!null)
+           ├── key: (16)
+           ├── fd: (16)-->(9), (9)~~>(16), (9)-->(17)
+           ├── scan returning_test@secondary
+           │    ├── columns: a:9(int) rowid:16(int!null)
+           │    ├── key: (16)
+           │    └── fd: (16)-->(9), (9)~~>(16)
+           └── projections
+                └── a + 1 [type=int, outer=(9)]
+
+# We derive the prune cols for the mutation appropriately so we
+# can prune away columns even when the mutation is not under a
+# projection. Another rule will fire to add the appropriate
+# projection when this happens.
+opt
+SELECT a FROM [SELECT a, b FROM [UPDATE returning_test SET a = a + 1 RETURNING a, b, c] WHERE a > 1]
+----
+project
+ ├── columns: a:1(int!null)
+ ├── side-effects, mutations
+ └── select
+      ├── columns: a:1(int!null) rowid:8(int!null)
+      ├── side-effects, mutations
+      ├── key: (8)
+      ├── fd: (8)-->(1)
+      ├── update returning_test
+      │    ├── columns: a:1(int) rowid:8(int!null)
+      │    ├── fetch columns: a:9(int) rowid:16(int)
+      │    ├── update-mapping:
+      │    │    └──  column17:17 => a:1
+      │    ├── side-effects, mutations
+      │    ├── key: (8)
+      │    ├── fd: (8)-->(1)
+      │    └── project
+      │         ├── columns: column17:17(int) a:9(int) rowid:16(int!null)
+      │         ├── key: (16)
+      │         ├── fd: (16)-->(9), (9)~~>(16), (9)-->(17)
+      │         ├── scan returning_test@secondary
+      │         │    ├── columns: a:9(int) rowid:16(int!null)
+      │         │    ├── key: (16)
+      │         │    └── fd: (16)-->(9), (9)~~>(16)
+      │         └── projections
+      │              └── a + 1 [type=int, outer=(9)]
+      └── filters
+           └── a > 1 [type=bool, outer=(1), constraints=(/1: [/2 - ]; tight)]
+
+opt
+SELECT
+    *
+FROM
+    [SELECT a, b FROM returning_test] AS x
+    JOIN [SELECT a, b FROM [UPDATE returning_test SET a = a + 1 RETURNING a, b, c] WHERE a > 1]
+            AS y ON true
+----
+project
+ ├── columns: a:1(int) b:2(int) a:9(int!null) b:10(int)
+ ├── side-effects, mutations
+ ├── fd: (1)~~>(2)
+ └── inner-join (hash)
+      ├── columns: x.a:1(int) x.b:2(int) returning_test.a:9(int!null) returning_test.b:10(int) returning_test.rowid:16(int!null)
+      ├── side-effects, mutations
+      ├── lax-key: (1,2,16)
+      ├── fd: (1)~~>(2), (16)-->(9,10)
+      ├── scan x
+      │    ├── columns: x.a:1(int) x.b:2(int)
+      │    ├── lax-key: (1,2)
+      │    └── fd: (1)~~>(2)
+      ├── select
+      │    ├── columns: returning_test.a:9(int!null) returning_test.b:10(int) returning_test.rowid:16(int!null)
+      │    ├── side-effects, mutations
+      │    ├── key: (16)
+      │    ├── fd: (16)-->(9,10)
+      │    ├── update returning_test
+      │    │    ├── columns: returning_test.a:9(int) returning_test.b:10(int) returning_test.rowid:16(int!null)
+      │    │    ├── fetch columns: returning_test.a:17(int) returning_test.b:18(int) returning_test.rowid:24(int)
+      │    │    ├── update-mapping:
+      │    │    │    └──  column25:25 => returning_test.a:9
+      │    │    ├── side-effects, mutations
+      │    │    ├── key: (16)
+      │    │    ├── fd: (16)-->(9,10)
+      │    │    └── project
+      │    │         ├── columns: column25:25(int) returning_test.a:17(int) returning_test.b:18(int) returning_test.rowid:24(int!null)
+      │    │         ├── key: (24)
+      │    │         ├── fd: (24)-->(17,18), (17)~~>(18,24), (17)-->(25)
+      │    │         ├── scan returning_test
+      │    │         │    ├── columns: returning_test.a:17(int) returning_test.b:18(int) returning_test.rowid:24(int!null)
+      │    │         │    ├── key: (24)
+      │    │         │    └── fd: (24)-->(17,18), (17)~~>(18,24)
+      │    │         └── projections
+      │    │              └── returning_test.a + 1 [type=int, outer=(17)]
+      │    └── filters
+      │         └── returning_test.a > 1 [type=bool, outer=(9), constraints=(/9: [/2 - ]; tight)]
+      └── filters (true)
+
+# Check if the rule works as desired for other mutations.
+opt
+INSERT INTO returning_test VALUES (1, 2, 'c') ON CONFLICT (a) DO UPDATE SET a = excluded.a + returning_test.a RETURNING a, b, c
+----
+project
+ ├── columns: a:1(int) b:2(int) c:3(string)
+ ├── cardinality: [1 - 1]
+ ├── side-effects, mutations
+ ├── key: ()
+ ├── fd: ()-->(1-3)
+ └── upsert returning_test
+      ├── columns: a:1(int) b:2(int) c:3(string) rowid:8(int!null)
+      ├── canary column: 21
+      ├── fetch columns: a:14(int) b:15(int) c:16(string) rowid:21(int)
+      ├── insert-mapping:
+      │    ├──  column1:9 => a:1
+      │    ├──  column2:10 => b:2
+      │    ├──  column3:11 => c:3
+      │    ├──  column12:12 => d:4
+      │    ├──  column12:12 => e:5
+      │    ├──  column12:12 => f:6
+      │    ├──  column12:12 => g:7
+      │    └──  column13:13 => rowid:8
+      ├── update-mapping:
+      │    └──  upsert_a:23 => a:1
+      ├── return-mapping:
+      │    ├──  upsert_a:23 => a:1
+      │    ├──  upsert_b:24 => b:2
+      │    ├──  upsert_c:25 => c:3
+      │    └──  upsert_rowid:30 => rowid:8
+      ├── cardinality: [1 - 1]
+      ├── side-effects, mutations
+      ├── key: ()
+      ├── fd: ()-->(1-3,8)
+      └── project
+           ├── columns: upsert_a:23(int) upsert_b:24(int) upsert_c:25(string) upsert_rowid:30(int) column1:9(int!null) column2:10(int!null) column3:11(string!null) column12:12(int) column13:13(int) a:14(int) b:15(int) c:16(string) rowid:21(int)
+           ├── cardinality: [1 - 1]
+           ├── side-effects
+           ├── key: ()
+           ├── fd: ()-->(9-16,21,23-25,30)
+           ├── left-join (hash)
+           │    ├── columns: column1:9(int!null) column2:10(int!null) column3:11(string!null) column12:12(int) column13:13(int) a:14(int) b:15(int) c:16(string) rowid:21(int)
+           │    ├── cardinality: [1 - 1]
+           │    ├── side-effects
+           │    ├── key: ()
+           │    ├── fd: ()-->(9-16,21)
+           │    ├── values
+           │    │    ├── columns: column1:9(int!null) column2:10(int!null) column3:11(string!null) column12:12(int) column13:13(int)
+           │    │    ├── cardinality: [1 - 1]
+           │    │    ├── side-effects
+           │    │    ├── key: ()
+           │    │    ├── fd: ()-->(9-13)
+           │    │    └── (1, 2, 'c', CAST(NULL AS INT8), unique_rowid()) [type=tuple{int, int, string, int, int}]
+           │    ├── index-join returning_test
+           │    │    ├── columns: a:14(int!null) b:15(int) c:16(string) rowid:21(int!null)
+           │    │    ├── cardinality: [0 - 1]
+           │    │    ├── key: ()
+           │    │    ├── fd: ()-->(14-16,21)
+           │    │    └── scan returning_test@secondary
+           │    │         ├── columns: a:14(int!null) rowid:21(int!null)
+           │    │         ├── constraint: /14: [/1 - /1]
+           │    │         ├── cardinality: [0 - 1]
+           │    │         ├── key: ()
+           │    │         └── fd: ()-->(14,21)
+           │    └── filters (true)
+           └── projections
+                ├── CASE WHEN rowid IS NULL THEN column1 ELSE column1 + a END [type=int, outer=(9,14,21)]
+                ├── CASE WHEN rowid IS NULL THEN column2 ELSE b END [type=int, outer=(10,15,21)]
+                ├── CASE WHEN rowid IS NULL THEN column3 ELSE c END [type=string, outer=(11,16,21)]
+                └── CASE WHEN rowid IS NULL THEN column13 ELSE rowid END [type=int, outer=(13,21)]
+
+opt
+DELETE FROM returning_test WHERE a < b + d RETURNING a, b, d
+----
+project
+ ├── columns: a:1(int!null) b:2(int) d:4(int)
+ ├── side-effects, mutations
+ ├── key: (1)
+ ├── fd: (1)-->(2,4)
+ └── delete returning_test
+      ├── columns: a:1(int!null) b:2(int) d:4(int) rowid:8(int!null)
+      ├── fetch columns: a:9(int) b:10(int) d:12(int) rowid:16(int)
+      ├── side-effects, mutations
+      ├── key: (8)
+      ├── fd: (8)-->(1,2,4), (1)-->(2,4,8)
+      └── select
+           ├── columns: a:9(int!null) b:10(int) d:12(int) rowid:16(int!null)
+           ├── key: (16)
+           ├── fd: (16)-->(9,10,12), (9)-->(10,12,16)
+           ├── scan returning_test
+           │    ├── columns: a:9(int) b:10(int) d:12(int) rowid:16(int!null)
+           │    ├── key: (16)
+           │    └── fd: (16)-->(9,10,12), (9)~~>(10,12,16)
+           └── filters
+                └── a < (b + d) [type=bool, outer=(9,10,12), constraints=(/9: (/NULL - ])]
+
+opt
+UPSERT INTO returning_test (a, b, c) VALUES (1, 2, 'c') RETURNING a, b, c, d
+----
+project
+ ├── columns: a:1(int!null) b:2(int!null) c:3(string!null) d:4(int)
+ ├── cardinality: [1 - ]
+ ├── side-effects, mutations
+ ├── fd: ()-->(1-3)
+ └── upsert returning_test
+      ├── columns: a:1(int!null) b:2(int!null) c:3(string!null) d:4(int) rowid:8(int!null)
+      ├── canary column: 21
+      ├── fetch columns: a:14(int) b:15(int) c:16(string) d:17(int) rowid:21(int)
+      ├── insert-mapping:
+      │    ├──  column1:9 => a:1
+      │    ├──  column2:10 => b:2
+      │    ├──  column3:11 => c:3
+      │    ├──  column12:12 => d:4
+      │    ├──  column12:12 => e:5
+      │    ├──  column12:12 => f:6
+      │    ├──  column12:12 => g:7
+      │    └──  column13:13 => rowid:8
+      ├── update-mapping:
+      │    ├──  column1:9 => a:1
+      │    ├──  column2:10 => b:2
+      │    └──  column3:11 => c:3
+      ├── return-mapping:
+      │    ├──  column1:9 => a:1
+      │    ├──  column2:10 => b:2
+      │    ├──  column3:11 => c:3
+      │    ├──  upsert_d:22 => d:4
+      │    └──  upsert_rowid:26 => rowid:8
+      ├── cardinality: [1 - ]
+      ├── side-effects, mutations
+      ├── fd: ()-->(1-3)
+      └── project
+           ├── columns: upsert_d:22(int) upsert_rowid:26(int) column1:9(int!null) column2:10(int!null) column3:11(string!null) column12:12(int) column13:13(int) a:14(int) b:15(int) c:16(string) d:17(int) rowid:21(int)
+           ├── cardinality: [1 - ]
+           ├── side-effects
+           ├── key: (21)
+           ├── fd: ()-->(9-13), (21)-->(14-17), (14)~~>(15-17,21), (17,21)-->(22), (21)-->(26)
+           ├── left-join (lookup returning_test)
+           │    ├── columns: column1:9(int!null) column2:10(int!null) column3:11(string!null) column12:12(int) column13:13(int) a:14(int) b:15(int) c:16(string) d:17(int) rowid:21(int)
+           │    ├── key columns: [13] = [21]
+           │    ├── cardinality: [1 - ]
+           │    ├── side-effects
+           │    ├── key: (21)
+           │    ├── fd: ()-->(9-13), (21)-->(14-17), (14)~~>(15-17,21)
+           │    ├── values
+           │    │    ├── columns: column1:9(int!null) column2:10(int!null) column3:11(string!null) column12:12(int) column13:13(int)
+           │    │    ├── cardinality: [1 - 1]
+           │    │    ├── side-effects
+           │    │    ├── key: ()
+           │    │    ├── fd: ()-->(9-13)
+           │    │    └── (1, 2, 'c', CAST(NULL AS INT8), unique_rowid()) [type=tuple{int, int, string, int, int}]
+           │    └── filters (true)
+           └── projections
+                ├── CASE WHEN rowid IS NULL THEN column12 ELSE d END [type=int, outer=(12,17,21)]
+                └── CASE WHEN rowid IS NULL THEN column13 ELSE rowid END [type=int, outer=(13,21)]
+
+# Make sure the passthrough columns of an UPDATE ... FROM query are pruned.
+opt
+UPDATE abcde
+SET
+  b=family.b, c = family.c
+FROM
+  family
+WHERE
+  abcde.a=family.a
+RETURNING
+  abcde.a, family.b, family.c
+----
+update abcde
+ ├── columns: a:1(int!null) b:12(int) c:13(int)
+ ├── fetch columns: abcde.a:6(int) abcde.b:7(int) abcde.c:8(int) abcde.d:9(int) abcde.e:10(int)
+ ├── update-mapping:
+ │    ├──  "family".b:12 => abcde.b:2
+ │    └──  "family".c:13 => abcde.c:3
+ ├── side-effects, mutations
+ ├── key: (1)
+ ├── fd: (1)-->(12,13)
+ └── inner-join (merge)
+      ├── columns: abcde.a:6(int!null) abcde.b:7(int) abcde.c:8(int) abcde.d:9(int) abcde.e:10(int) "family".a:11(int!null) "family".b:12(int) "family".c:13(int)
+      ├── left ordering: +6
+      ├── right ordering: +11
+      ├── key: (11)
+      ├── fd: (6)-->(7-10), (7,8)~~>(6,9,10), (11)-->(12,13), (6)==(11), (11)==(6)
+      ├── scan abcde
+      │    ├── columns: abcde.a:6(int!null) abcde.b:7(int) abcde.c:8(int) abcde.d:9(int) abcde.e:10(int)
+      │    ├── key: (6)
+      │    ├── fd: (6)-->(7-10), (7,8)~~>(6,9,10)
+      │    └── ordering: +6
+      ├── scan "family"
+      │    ├── columns: "family".a:11(int!null) "family".b:12(int) "family".c:13(int)
+      │    ├── key: (11)
+      │    ├── fd: (11)-->(12,13)
+      │    └── ordering: +11
+      └── filters (true)
+
+# --------------------------------------------------
+# PruneSemiAntiJoinRightCols
+# --------------------------------------------------
+
+# We should only see the `a` column scanned for family.
+opt expect=PruneSemiAntiJoinRightCols
+SELECT a, b, c FROM abcde WHERE EXISTS (SELECT * FROM family WHERE abcde.a=family.a)
+----
+semi-join (hash)
+ ├── columns: a:1(int!null) b:2(int) c:3(int)
+ ├── key: (1)
+ ├── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── scan abcde@bc
+ │    ├── columns: abcde.a:1(int!null) abcde.b:2(int) abcde.c:3(int)
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── scan "family"@secondary
+ │    ├── columns: "family".a:6(int!null)
+ │    └── key: (6)
+ └── filters
+      └── abcde.a = "family".a [type=bool, outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
+
+# We should see the `a`, `b` and `c` columns scanned for family.
+opt expect=PruneSemiAntiJoinRightCols
+SELECT a, b, c FROM abcde WHERE EXISTS (SELECT * FROM family WHERE abcde.a=family.a AND abcde.b > family.b + family.c)
+----
+semi-join (hash)
+ ├── columns: a:1(int!null) b:2(int) c:3(int)
+ ├── key: (1)
+ ├── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── scan abcde@bc
+ │    ├── columns: abcde.a:1(int!null) abcde.b:2(int) abcde.c:3(int)
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── scan "family"
+ │    ├── columns: "family".a:6(int!null) "family".b:7(int) "family".c:8(int)
+ │    ├── key: (6)
+ │    └── fd: (6)-->(7,8)
+ └── filters
+      ├── abcde.a = "family".a [type=bool, outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
+      └── abcde.b > ("family".b + "family".c) [type=bool, outer=(2,7,8), constraints=(/2: (/NULL - ])]
+
+opt expect=PruneSemiAntiJoinRightCols
+SELECT a, b, c FROM abcde WHERE NOT EXISTS (SELECT * FROM family WHERE abcde.a=family.a)
+----
+anti-join (hash)
+ ├── columns: a:1(int!null) b:2(int) c:3(int)
+ ├── key: (1)
+ ├── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── scan abcde@bc
+ │    ├── columns: abcde.a:1(int!null) abcde.b:2(int) abcde.c:3(int)
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── scan "family"@secondary
+ │    ├── columns: "family".a:6(int!null)
+ │    └── key: (6)
+ └── filters
+      └── abcde.a = "family".a [type=bool, outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
+
+# Test using multi-level nesting so we don't decorrelate the semi-join.
+opt expect=PruneSemiAntiJoinRightCols
+SELECT
+    a, b, c
+FROM
+    abcde
+WHERE
+    EXISTS(
+        SELECT
+            *
+        FROM
+            "family"
+        WHERE
+            abcde.a = "family".a AND EXISTS(SELECT * FROM a WHERE abcde.a = a.k)
+    )
+----
+semi-join-apply
+ ├── columns: a:1(int!null) b:2(int) c:3(int)
+ ├── key: (1)
+ ├── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── scan abcde@bc
+ │    ├── columns: abcde.a:1(int!null) abcde.b:2(int) abcde.c:3(int)
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── semi-join (hash)
+ │    ├── columns: "family".a:6(int!null)
+ │    ├── outer: (1)
+ │    ├── key: (6)
+ │    ├── scan "family"@secondary
+ │    │    ├── columns: "family".a:6(int!null)
+ │    │    └── key: (6)
+ │    ├── scan a
+ │    │    ├── columns: k:11(int!null)
+ │    │    └── key: (11)
+ │    └── filters
+ │         └── abcde.a = k [type=bool, outer=(1,11), constraints=(/1: (/NULL - ]; /11: (/NULL - ]), fd=(1)==(11), (11)==(1)]
+ └── filters
+      └── abcde.a = "family".a [type=bool, outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
+
+# Test using multi-level nesting so we don't decorrelate the anti-join.
+opt expect=PruneSemiAntiJoinRightCols
+SELECT
+    a, b, c
+FROM
+    abcde
+WHERE
+    NOT EXISTS(
+        SELECT
+            *
+        FROM
+            "family"
+        WHERE
+            abcde.a = "family".a AND EXISTS(SELECT * FROM a WHERE abcde.a = a.k)
+    )
+----
+anti-join-apply
+ ├── columns: a:1(int!null) b:2(int) c:3(int)
+ ├── key: (1)
+ ├── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── scan abcde@bc
+ │    ├── columns: abcde.a:1(int!null) abcde.b:2(int) abcde.c:3(int)
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2,3), (2,3)~~>(1)
+ ├── semi-join (hash)
+ │    ├── columns: "family".a:6(int!null)
+ │    ├── outer: (1)
+ │    ├── key: (6)
+ │    ├── scan "family"@secondary
+ │    │    ├── columns: "family".a:6(int!null)
+ │    │    └── key: (6)
+ │    ├── scan a
+ │    │    ├── columns: k:11(int!null)
+ │    │    └── key: (11)
+ │    └── filters
+ │         └── abcde.a = k [type=bool, outer=(1,11), constraints=(/1: (/NULL - ]; /11: (/NULL - ]), fd=(1)==(11), (11)==(1)]
+ └── filters
+      └── abcde.a = "family".a [type=bool, outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
+
+opt disable=InlineWith expect=PruneWithScanCols
+WITH foo AS (SELECT * FROM a)
+  SELECT i FROM foo
+----
+with &1 (foo)
+ ├── columns: i:6(int)
+ ├── scan a
+ │    ├── columns: a.k:1(int!null) a.i:2(int) a.f:3(float) a.s:4(string)
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-4)
+ └── with-scan &1 (foo)
+      ├── columns: i:6(int)
+      └── mapping:
+           └──  a.i:2(int) => i:6(int)
+
+opt disable=InlineWith format=show-all expect=PruneWithCols
+WITH foo AS (SELECT * FROM a)
+  SELECT i FROM (SELECT i, 1 AS y FROM foo) ORDER BY y
+----
+with &1 (foo)
+ ├── columns: i:6(int)
+ ├── stats: [rows=1000]
+ ├── cost: 1080.04
+ ├── prune: (6)
+ ├── scan t.public.a
+ │    ├── columns: t.public.a.k:1(int!null) t.public.a.i:2(int) t.public.a.f:3(float) t.public.a.s:4(string)
+ │    ├── stats: [rows=1000]
+ │    ├── cost: 1080.02
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4)
+ │    ├── prune: (1-4)
+ │    └── interesting orderings: (+1)
+ └── with-scan &1 (foo)
+      ├── columns: i:6(int)
+      ├── mapping:
+      │    └──  t.public.a.i:2(int) => i:6(int)
+      ├── stats: [rows=1000]
+      ├── cost: 0.01
+      ├── prune: (6)
+      └── cte-uses: map[1:1]
+
+# --------------------------------------------------
+# PruneUnionAllCols
+# --------------------------------------------------
+
+opt expect=PruneUnionAllCols
+SELECT a FROM (
+  SELECT a, b FROM abcde
+  UNION ALL
+  SELECT * FROM xy
+)
+----
+union-all
+ ├── columns: a:8(int!null)
+ ├── left columns: abcde.a:1(int)
+ ├── right columns: x:6(int)
+ ├── scan abcde@bc
+ │    ├── columns: abcde.a:1(int!null)
+ │    └── key: (1)
+ └── scan xy
+      ├── columns: x:6(int!null)
+      └── key: (6)
+
+opt expect=PruneUnionAllCols
+SELECT count(*) FROM (
+  SELECT a, b FROM abcde
+  UNION ALL
+  SELECT * FROM xy
+)
+----
+scalar-group-by
+ ├── columns: count:10(int)
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(10)
+ ├── union-all
+ │    ├── scan abcde@bc
+ │    └── scan xy
+ └── aggregations
+      └── count-rows [type=int]
+
+opt expect=PruneUnionAllCols
+SELECT 1 FROM a INNER JOIN (SELECT a, b FROM abcde UNION ALL SELECT * from xy) AS b ON a.i=b.b
+----
+project
+ ├── columns: "?column?":14(int!null)
+ ├── fd: ()-->(14)
+ ├── inner-join (hash)
+ │    ├── columns: i:2(int!null) b:13(int!null)
+ │    ├── fd: (2)==(13), (13)==(2)
+ │    ├── union-all
+ │    │    ├── columns: b:13(int)
+ │    │    ├── left columns: abcde.b:6(int)
+ │    │    ├── right columns: y:11(int)
+ │    │    ├── scan abcde@bc
+ │    │    │    └── columns: abcde.b:6(int)
+ │    │    └── scan xy
+ │    │         └── columns: y:11(int)
+ │    ├── scan a
+ │    │    └── columns: i:2(int)
+ │    └── filters
+ │         └── i = b [type=bool, outer=(2,13), constraints=(/2: (/NULL - ]; /13: (/NULL - ]), fd=(2)==(13), (13)==(2)]
+ └── projections
+      └── const: 1 [type=int]
+
+# Test that even when one side of the UnionAll input has a greater
+# number of prunable columns than the other (neither the top-level
+# Project nor the UnionAll need any input columns, but the right-hand
+# Scan has a filter and cannot prune column x), a Project is added to
+# ensure that both inputs to the UnionAll have the same number of
+# columns.
+opt expect=PruneUnionAllCols
+SELECT 1 FROM (
+  SELECT a, b FROM abcde
+  UNION ALL
+  SELECT * from xy WHERE x=1
+)
+----
+project
+ ├── columns: "?column?":10(int!null)
+ ├── fd: ()-->(10)
+ ├── union-all
+ │    ├── scan abcde@bc
+ │    └── project
+ │         ├── cardinality: [0 - 1]
+ │         ├── key: ()
+ │         └── scan xy
+ │              ├── columns: x:6(int!null)
+ │              ├── constraint: /6: [/1 - /1]
+ │              ├── cardinality: [0 - 1]
+ │              ├── key: ()
+ │              └── fd: ()-->(6)
+ └── projections
+      └── const: 1 [type=int]

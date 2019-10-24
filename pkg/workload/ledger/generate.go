@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ledger
 
@@ -22,7 +17,7 @@ import (
 	"math/rand"
 	"strconv"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
+	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
@@ -37,17 +32,17 @@ const (
 	cashMoneyType    = "C"
 )
 
-var ledgerCustomerColTypes = []types.T{
-	types.Int64,
-	types.Bytes,
-	types.Bytes,
-	types.Bytes,
-	types.Bool,
-	types.Bool,
-	types.Bytes,
-	types.Int64,
-	types.Int64,
-	types.Int64,
+var ledgerCustomerColTypes = []coltypes.T{
+	coltypes.Int64,
+	coltypes.Bytes,
+	coltypes.Bytes,
+	coltypes.Bytes,
+	coltypes.Bool,
+	coltypes.Bool,
+	coltypes.Bytes,
+	coltypes.Int64,
+	coltypes.Int64,
+	coltypes.Int64,
 }
 
 func (w *ledger) ledgerCustomerInitialRow(rowIdx int) []interface{} {
@@ -75,16 +70,16 @@ func (w *ledger) ledgerCustomerSplitRow(splitIdx int) []interface{} {
 	}
 }
 
-var ledgerTransactionColTypes = []types.T{
-	types.Bytes,
-	types.Bytes,
-	types.Bytes,
-	types.Int64,
-	types.Bytes,
-	types.Bytes,
-	types.Bytes,
-	types.Bytes,
-	types.Bytes,
+var ledgerTransactionColTypes = []coltypes.T{
+	coltypes.Bytes,
+	coltypes.Bytes,
+	coltypes.Bytes,
+	coltypes.Int64,
+	coltypes.Bytes,
+	coltypes.Bytes,
+	coltypes.Bytes,
+	coltypes.Bytes,
+	coltypes.Bytes,
 }
 
 func (w *ledger) ledgerTransactionInitialRow(rowIdx int) []interface{} {

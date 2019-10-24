@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -53,7 +49,7 @@ func runClusterInit(ctx context.Context, t *test, c *cluster) {
 					`--listen-addr=:{pgport:1} --http-port=$[{pgport:1}+1] `+
 					`> {log-dir}/cockroach.stdout 2> {log-dir}/cockroach.stderr`)
 		})
-		for i := 2; i <= c.nodes; i++ {
+		for i := 2; i <= c.spec.NodeCount; i++ {
 			i := i
 			g.Go(func() error {
 				return c.RunE(ctx, c.Node(i),
@@ -82,7 +78,7 @@ func runClusterInit(ctx context.Context, t *test, c *cluster) {
 
 		func() {
 			var g errgroup.Group
-			for i := 1; i <= c.nodes; i++ {
+			for i := 1; i <= c.spec.NodeCount; i++ {
 				i := i
 				g.Go(func() error {
 					return c.RunE(ctx, c.Node(i),
@@ -103,7 +99,7 @@ func runClusterInit(ctx context.Context, t *test, c *cluster) {
 
 			// Wait for the servers to bind their ports.
 			if err := retry.ForDuration(10*time.Second, func() error {
-				for i := 1; i <= c.nodes; i++ {
+				for i := 1; i <= c.spec.NodeCount; i++ {
 					resp, err := http.Get(urlMap[i] + "/health")
 					if err != nil {
 						return err
@@ -116,7 +112,7 @@ func runClusterInit(ctx context.Context, t *test, c *cluster) {
 			}
 
 			var dbs []*gosql.DB
-			for i := 1; i <= c.nodes; i++ {
+			for i := 1; i <= c.spec.NodeCount; i++ {
 				db := c.Conn(ctx, i)
 				defer db.Close()
 				dbs = append(dbs, db)

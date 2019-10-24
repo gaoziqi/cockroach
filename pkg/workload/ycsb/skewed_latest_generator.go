@@ -1,17 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ycsb
 
@@ -50,12 +45,12 @@ func NewSkewedLatestGenerator(
 	return &z, nil
 }
 
-// IncrementIMax increments iMax.
-func (z *SkewedLatestGenerator) IncrementIMax() error {
+// IncrementIMax increments iMax by count.
+func (z *SkewedLatestGenerator) IncrementIMax(count uint64) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	z.mu.iMax++
-	return z.mu.zipfGen.IncrementIMax()
+	z.mu.iMax += count
+	return z.mu.zipfGen.IncrementIMax(count)
 }
 
 // Uint64 returns a random Uint64 between iMin and iMax, where keys near iMax

@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package gce
 
@@ -50,7 +45,7 @@ var projectsWithGC = []string{defaultProject, "andrei-jepsen"}
 
 // init will inject the GCE provider into vm.Providers, but only if the gcloud tool is available on the local path.
 func init() {
-	var p vm.Provider
+	var p vm.Provider = &Provider{}
 	if _, err := exec.LookPath("gcloud"); err != nil {
 		p = flagstub.New(p, "please install the gcloud CLI utilities "+
 			"(https://cloud.google.com/sdk/downloads)")
@@ -103,7 +98,7 @@ type jsonVM struct {
 }
 
 // Convert the JSON VM data into our common VM type
-func (jsonVM *jsonVM) toVM(project string) *vm.VM {
+func (jsonVM *jsonVM) toVM(project string, opts *providerOpts) (ret *vm.VM) {
 	var vmErrors []error
 	var err error
 
@@ -144,20 +139,25 @@ func (jsonVM *jsonVM) toVM(project string) *vm.VM {
 
 	machineType := lastComponent(jsonVM.MachineType)
 	zone := lastComponent(jsonVM.Zone)
-
-	return &vm.VM{
-		Name:       jsonVM.Name,
-		CreatedAt:  jsonVM.CreationTimestamp,
-		Errors:     vmErrors,
-		DNS:        fmt.Sprintf("%s.%s.%s", jsonVM.Name, zone, project),
-		Lifetime:   lifetime,
-		PrivateIP:  privateIP,
-		Provider:   ProviderName,
-		ProviderID: jsonVM.Name,
-		PublicIP:   publicIP,
+	remoteUser := config.SharedUser
+	if !opts.useSharedUser {
 		// N.B. gcloud uses the local username to log into instances rather
-		// than the username on the authenticated Google account.
-		RemoteUser:  config.OSUser.Username,
+		// than the username on the authenticated Google account but we set
+		// up the shared user at cluster creation time. Allow use of the
+		// local username if requested.
+		remoteUser = config.OSUser.Username
+	}
+	return &vm.VM{
+		Name:        jsonVM.Name,
+		CreatedAt:   jsonVM.CreationTimestamp,
+		Errors:      vmErrors,
+		DNS:         fmt.Sprintf("%s.%s.%s", jsonVM.Name, zone, project),
+		Lifetime:    lifetime,
+		PrivateIP:   privateIP,
+		Provider:    ProviderName,
+		ProviderID:  jsonVM.Name,
+		PublicIP:    publicIP,
+		RemoteUser:  remoteUser,
 		VPC:         vpc,
 		MachineType: machineType,
 		Zone:        zone,
@@ -179,6 +179,11 @@ type providerOpts struct {
 	ServiceAccount string
 	MachineType    string
 	Zones          []string
+	Image          string
+
+	// useSharedUser indicates that the shared user rather than the personal
+	// user should be used to ssh into the remote machines.
+	useSharedUser bool
 }
 
 // projectsVal is the implementation for the --gce-projects flag. It populates
@@ -251,6 +256,8 @@ func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 		"Machine type (see https://cloud.google.com/compute/docs/machine-types)")
 	flags.StringSliceVar(&o.Zones, ProviderName+"-zones",
 		[]string{"us-east1-b", "us-west1-b", "europe-west2-b"}, "Zones for cluster")
+	flags.StringVar(&o.Image, ProviderName+"-image", "ubuntu-1604-xenial-v20190122a",
+		"Image to use to create the vm, ubuntu-1904-disco-v20191008 is a more modern image")
 }
 
 func (o *providerOpts) ConfigureClusterFlags(flags *pflag.FlagSet, opt vm.MultipleProjectsOption) {
@@ -273,6 +280,11 @@ func (o *providerOpts) ConfigureClusterFlags(flags *pflag.FlagSet, opt vm.Multip
 		},
 		ProviderName+"-project", /* name */
 		usage)
+
+	flags.BoolVar(&o.useSharedUser,
+		ProviderName+"-use-shared-user", true,
+		fmt.Sprintf("use the shared user %q for ssh rather than your user %q",
+			config.SharedUser, config.OSUser.Username))
 }
 
 // Provider is the GCE implementation of the vm.Provider interface.
@@ -337,7 +349,7 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 		"--subnet", "default",
 		"--maintenance-policy", "MIGRATE",
 		"--scopes", "default,storage-rw",
-		"--image", "ubuntu-1604-xenial-v20190122a",
+		"--image", p.opts.Image,
 		"--image-project", "ubuntu-os-cloud",
 		"--boot-disk-size", "10",
 		"--boot-disk-type", "pd-ssd",
@@ -508,7 +520,7 @@ func (p *Provider) List() (vm.List, error) {
 
 		// Now, convert the json payload into our common VM type
 		for _, jsonVM := range jsonVMS {
-			vms = append(vms, *jsonVM.toVM(prj))
+			vms = append(vms, *jsonVM.toVM(prj, &p.opts))
 		}
 	}
 

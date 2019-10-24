@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -101,12 +97,13 @@ func (u urlParser) Set(v string) error {
 	}
 
 	cliCtx := u.cliCtx
+	fl := flagSetForCmd(u.cmd)
 
 	// If user name / password information is available, forward it to
 	// --user. We store the password for later re-collection by
 	// makeClientConnURL().
 	if parsedURL.User != nil {
-		f := u.cmd.Flags().Lookup(cliflags.User.Name)
+		f := fl.Lookup(cliflags.User.Name)
 		if f == nil {
 			// A client which does not support --user will also not use
 			// makeClientConnURL(), so we can ignore/forget about the
@@ -145,7 +142,7 @@ func (u urlParser) Set(v string) error {
 	// If a database path is available, forward it to --database.
 	if parsedURL.Path != "" {
 		dbPath := strings.TrimLeft(parsedURL.Path, "/")
-		f := u.cmd.Flags().Lookup(cliflags.Database.Name)
+		f := fl.Lookup(cliflags.Database.Name)
 		if f == nil {
 			// A client which does not support --database does not need this
 			// bit of information, so we can ignore/forget about it. We do
@@ -172,8 +169,6 @@ func (u urlParser) Set(v string) error {
 		}
 
 		cliCtx.extraConnURLOptions = options
-
-		fl := u.cmd.Flags()
 
 		switch sslMode := options.Get("sslmode"); sslMode {
 		case "disable":

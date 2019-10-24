@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // Package workload provides an abstraction for generators of sql query loads
 // (and requisite initial data) as well as tools for working with these
@@ -18,31 +14,22 @@
 package workload
 
 import (
-	"bytes"
 	"context"
 	gosql "database/sql"
 	"fmt"
 	"math"
 	"math/bits"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
-	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/time/rate"
 )
 
 // Generator represents one or more sql query loads and associated initial data.
@@ -103,6 +90,11 @@ type Hooks struct {
 	// PreLoad is called after workload tables are created and before workload
 	// data is loaded. It is not called when storing or loading a fixture.
 	// Implementations should be idempotent.
+	//
+	// TODO(dan): Deprecate the PreLoad hook, it doesn't play well with fixtures.
+	// It's only used in practice for zone configs, so it should be reasonably
+	// straightforward to make zone configs first class citizens of
+	// workload.Table.
 	PreLoad func(*gosql.DB) error
 	// PostLoad is called after workload tables are created workload data is
 	// loaded. It called after restoring a fixture. This, for example, is where
@@ -115,6 +107,9 @@ type Hooks struct {
 	// These are expected to pass after the initial data load as well as after
 	// running queryload.
 	CheckConsistency func(context.Context, *gosql.DB) error
+	// Partition is used to run a partitioning step on the data created by the workload.
+	// TODO (rohany): migrate existing partitioning steps (such as tpcc's) into here.
+	Partition func(*gosql.DB) error
 }
 
 // Meta is used to register a Generator at init time and holds meta information
@@ -167,9 +162,6 @@ type Table struct {
 type BatchedTuples struct {
 	// NumBatches is the number of batches of tuples.
 	NumBatches int
-	// NumTotal is the total number of tuples in all batches. Not all generators
-	// will know this, it's set to 0 when unknown.
-	NumTotal int
 	// FillBatch is a function to deterministically compute a columnar-batch of
 	// tuples given its index.
 	//
@@ -183,23 +175,27 @@ type BatchedTuples struct {
 
 // Tuples is like TypedTuples except that it tries to guess the type of each
 // datum. However, if the function ever returns nil for one of the datums, you
-// need to use TypedTuples instead and specify the types.
+// need to use TypedTuples instead and specify the coltypes.
 func Tuples(count int, fn func(int) []interface{}) BatchedTuples {
 	return TypedTuples(count, nil /* colTypes */, fn)
 }
+
+const (
+	// timestampOutputFormat is used to output all timestamps.
+	timestampOutputFormat = "2006-01-02 15:04:05.999999-07:00"
+)
 
 // TypedTuples returns a BatchedTuples where each batch has size 1. It's
 // intended to be easier to use than directly specifying a BatchedTuples, but
 // the tradeoff is some bit of performance. If colTypes is nil, an attempt is
 // made to infer them.
-func TypedTuples(count int, colTypes []types.T, fn func(int) []interface{}) BatchedTuples {
+func TypedTuples(count int, colTypes []coltypes.T, fn func(int) []interface{}) BatchedTuples {
 	// The FillBatch we create has to be concurrency safe, so we can't let it do
 	// the one-time initialization of colTypes without this protection.
 	var colTypesOnce sync.Once
 
 	t := BatchedTuples{
 		NumBatches: count,
-		NumTotal:   count,
 	}
 	if fn != nil {
 		t.FillBatch = func(batchIdx int, cb coldata.Batch, _ *bufalloc.ByteAllocator) {
@@ -207,7 +203,7 @@ func TypedTuples(count int, colTypes []types.T, fn func(int) []interface{}) Batc
 
 			colTypesOnce.Do(func() {
 				if colTypes == nil {
-					colTypes = make([]types.T, len(row))
+					colTypes = make([]coltypes.T, len(row))
 					for i, datum := range row {
 						if datum == nil {
 							panic(fmt.Sprintf(
@@ -215,9 +211,9 @@ func TypedTuples(count int, colTypes []types.T, fn func(int) []interface{}) Batc
 						} else {
 							switch datum.(type) {
 							case time.Time:
-								colTypes[i] = types.Bytes
+								colTypes[i] = coltypes.Bytes
 							default:
-								colTypes[i] = types.FromGoType(datum)
+								colTypes[i] = coltypes.FromGoType(datum)
 							}
 						}
 					}
@@ -236,11 +232,11 @@ func TypedTuples(count int, colTypes []types.T, fn func(int) []interface{}) Batc
 				case float64:
 					col.Float64()[0] = d
 				case string:
-					col.Bytes()[0] = []byte(d)
+					col.Bytes().Set(0, []byte(d))
 				case []byte:
-					col.Bytes()[0] = d
+					col.Bytes().Set(0, d)
 				case time.Time:
-					col.Bytes()[0] = []byte(d.Round(time.Microsecond).UTC().Format(tree.TimestampOutputFormat))
+					col.Bytes().Set(0, []byte(d.Round(time.Microsecond).UTC().Format(timestampOutputFormat)))
 				default:
 					panic(fmt.Sprintf(`unhandled datum type %T`, d))
 				}
@@ -269,27 +265,27 @@ func ColBatchToRows(cb coldata.Batch) [][]interface{} {
 	for colIdx, col := range cb.ColVecs() {
 		nulls := col.Nulls()
 		switch col.Type() {
-		case types.Bool:
+		case coltypes.Bool:
 			for rowIdx, datum := range col.Bool() {
 				if !nulls.NullAt64(uint64(rowIdx)) {
 					datums[rowIdx*numCols+colIdx] = datum
 				}
 			}
-		case types.Int64:
+		case coltypes.Int64:
 			for rowIdx, datum := range col.Int64() {
 				if !nulls.NullAt64(uint64(rowIdx)) {
 					datums[rowIdx*numCols+colIdx] = datum
 				}
 			}
-		case types.Float64:
+		case coltypes.Float64:
 			for rowIdx, datum := range col.Float64() {
 				if !nulls.NullAt64(uint64(rowIdx)) {
 					datums[rowIdx*numCols+colIdx] = datum
 				}
 			}
-		case types.Bytes:
+		case coltypes.Bytes:
 			// HACK: workload's Table schemas are SQL schemas, but the initial data is
-			// returned as a coldata.Batch, which has a more limited set of types.
+			// returned as a coldata.Batch, which has a more limited set of coltypes.
 			// (Or, in the case of simple workloads that return a []interface{}, it's
 			// roundtripped through coldata.Batch by the `Tuples` helper.)
 			//
@@ -301,9 +297,10 @@ func ColBatchToRows(cb coldata.Batch) [][]interface{} {
 			// data/splits are okay with the fidelity loss. So, to avoid the
 			// complexity and the undesirable pkg/sql/parser dep, we simply treat them
 			// all as bytes and let the caller deal with the ambiguity.
-			for rowIdx, datum := range col.Bytes() {
+			colBytes := col.Bytes()
+			for rowIdx := 0; rowIdx < colBytes.Len(); rowIdx++ {
 				if !nulls.NullAt64(uint64(rowIdx)) {
-					datums[rowIdx*numCols+colIdx] = datum
+					datums[rowIdx*numCols+colIdx] = colBytes.Get(rowIdx)
 				}
 			}
 		default:
@@ -315,6 +312,27 @@ func ColBatchToRows(cb coldata.Batch) [][]interface{} {
 		rows[rowIdx] = datums[rowIdx*numCols : (rowIdx+1)*numCols]
 	}
 	return rows
+}
+
+// InitialDataLoader loads the initial data for all tables in a workload. It
+// returns a measure of how many bytes were loaded.
+//
+// TODO(dan): It would be lovely if the number of bytes loaded was comparable
+// between implementations but this is sadly not the case right now.
+type InitialDataLoader interface {
+	InitialDataLoad(context.Context, *gosql.DB, Generator) (int64, error)
+}
+
+// ImportDataLoader is a hook for binaries that include CCL code to inject an
+// IMPORT-based InitialDataLoader implementation.
+var ImportDataLoader InitialDataLoader = requiresCCLBinaryDataLoader(`IMPORT`)
+
+type requiresCCLBinaryDataLoader string
+
+func (l requiresCCLBinaryDataLoader) InitialDataLoad(
+	context.Context, *gosql.DB, Generator,
+) (int64, error) {
+	return 0, errors.Errorf(`loading initial data with %s requires a CCL binary`, l)
 }
 
 // QueryLoad represents some SQL query workload performable on a database
@@ -426,314 +444,5 @@ func ApproxDatumSize(x interface{}) int64 {
 		return 12
 	default:
 		panic(fmt.Sprintf("unsupported type %T: %v", x, x))
-	}
-}
-
-// Setup creates the given tables and fills them with initial data via batched
-// INSERTs. batchSize will only be used when positive (but INSERTs are batched
-// either way). The function is idempotent and can be called multiple times if
-// the Generator does not have any initial rows.
-//
-// The size of the loaded data is returned in bytes, suitable for use with
-// SetBytes of benchmarks. The exact definition of this is deferred to the
-// ApproxDatumSize implementation.
-func Setup(
-	ctx context.Context, db *gosql.DB, gen Generator, batchSize, concurrency int,
-) (int64, error) {
-	if batchSize <= 0 {
-		batchSize = 1000
-	}
-	if concurrency < 1 {
-		concurrency = 1
-	}
-
-	tables := gen.Tables()
-	var hooks Hooks
-	if h, ok := gen.(Hookser); ok {
-		hooks = h.Hooks()
-	}
-
-	for _, table := range tables {
-		createStmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" %s`, table.Name, table.Schema)
-		if _, err := db.ExecContext(ctx, createStmt); err != nil {
-			return 0, errors.Wrapf(err, "could not create table: %s", table.Name)
-		}
-	}
-
-	if hooks.PreLoad != nil {
-		if err := hooks.PreLoad(db); err != nil {
-			return 0, errors.Wrapf(err, "Could not preload")
-		}
-	}
-
-	var size int64
-	for _, table := range tables {
-		if table.InitialRows.NumBatches == 0 {
-			continue
-		} else if table.InitialRows.FillBatch == nil {
-			return 0, errors.Errorf(
-				`initial data is not supported for workload %s`, gen.Meta().Name)
-		}
-		batchesPerWorker := table.InitialRows.NumBatches / concurrency
-		g, gCtx := errgroup.WithContext(ctx)
-		for i := 0; i < concurrency; i++ {
-			startIdx := i * batchesPerWorker
-			endIdx := startIdx + batchesPerWorker
-			if i == concurrency-1 {
-				// Account for any rounding error in batchesPerWorker.
-				endIdx = table.InitialRows.NumBatches
-			}
-			g.Go(func() error {
-				var insertStmtBuf bytes.Buffer
-				var params []interface{}
-				var numRows int
-				flush := func() error {
-					if len(params) > 0 {
-						insertStmt := insertStmtBuf.String()
-						if _, err := db.ExecContext(gCtx, insertStmt, params...); err != nil {
-							return errors.Wrapf(err, "failed insert into %s", table.Name)
-						}
-					}
-					insertStmtBuf.Reset()
-					fmt.Fprintf(&insertStmtBuf, `INSERT INTO "%s" VALUES `, table.Name)
-					params = params[:0]
-					numRows = 0
-					return nil
-				}
-				_ = flush()
-
-				for batchIdx := startIdx; batchIdx < endIdx; batchIdx++ {
-					for _, row := range table.InitialRows.BatchRows(batchIdx) {
-						if len(params) != 0 {
-							insertStmtBuf.WriteString(`,`)
-						}
-						insertStmtBuf.WriteString(`(`)
-						for i, datum := range row {
-							atomic.AddInt64(&size, ApproxDatumSize(datum))
-							if i != 0 {
-								insertStmtBuf.WriteString(`,`)
-							}
-							fmt.Fprintf(&insertStmtBuf, `$%d`, len(params)+i+1)
-						}
-						params = append(params, row...)
-						insertStmtBuf.WriteString(`)`)
-						if numRows++; numRows >= batchSize {
-							if err := flush(); err != nil {
-								return err
-							}
-						}
-					}
-				}
-				return flush()
-			})
-		}
-		if err := g.Wait(); err != nil {
-			return 0, err
-		}
-	}
-
-	if hooks.PostLoad != nil {
-		if err := hooks.PostLoad(db); err != nil {
-			return 0, errors.Wrapf(err, "Could not postload")
-		}
-	}
-
-	return size, nil
-}
-
-func maybeDisableMergeQueue(db *gosql.DB) error {
-	var ok bool
-	if err := db.QueryRow(
-		`SELECT count(*) > 0 FROM [ SHOW ALL CLUSTER SETTINGS ] AS _ (v) WHERE v = 'kv.range_merge.queue_enabled'`,
-	).Scan(&ok); err != nil || !ok {
-		return err
-	}
-	_, err := db.Exec("SET CLUSTER SETTING kv.range_merge.queue_enabled = false")
-	return err
-}
-
-// Split creates the range splits defined by the given table.
-func Split(ctx context.Context, db *gosql.DB, table Table, concurrency int) error {
-	// Prevent the merge queue from immediately discarding our splits.
-	if err := maybeDisableMergeQueue(db); err != nil {
-		return err
-	}
-
-	if table.Splits.NumBatches <= 0 {
-		return nil
-	}
-	splitPoints := make([][]interface{}, 0, table.Splits.NumBatches)
-	for splitIdx := 0; splitIdx < table.Splits.NumBatches; splitIdx++ {
-		splitPoints = append(splitPoints, table.Splits.BatchRows(splitIdx)...)
-	}
-	sort.Sort(sliceSliceInterface(splitPoints))
-
-	type pair struct {
-		lo, hi int
-	}
-	splitCh := make(chan pair, len(splitPoints)/2+1)
-	splitCh <- pair{0, len(splitPoints)}
-	doneCh := make(chan struct{})
-
-	log.Infof(ctx, `starting %d splits`, len(splitPoints))
-	g := ctxgroup.WithContext(ctx)
-	// Rate limit splitting to prevent replica imbalance.
-	r := rate.NewLimiter(128, 1)
-	for i := 0; i < concurrency; i++ {
-		g.GoCtx(func(ctx context.Context) error {
-			var buf bytes.Buffer
-			for {
-				select {
-				case p, ok := <-splitCh:
-					if !ok {
-						return nil
-					}
-					if err := r.Wait(ctx); err != nil {
-						return err
-					}
-					m := (p.lo + p.hi) / 2
-					split := strings.Join(StringTuple(splitPoints[m]), `,`)
-
-					buf.Reset()
-					fmt.Fprintf(&buf, `ALTER TABLE %s SPLIT AT VALUES (%s)`, table.Name, split)
-					// If you're investigating an error coming out of this Exec, see the
-					// HACK comment in ColBatchToRows for some context that may (or may
-					// not) help you.
-					if _, err := db.Exec(buf.String()); err != nil {
-						return errors.Wrap(err, buf.String())
-					}
-
-					buf.Reset()
-					fmt.Fprintf(&buf, `ALTER TABLE %s SCATTER FROM (%s) TO (%s)`,
-						table.Name, split, split)
-					if _, err := db.Exec(buf.String()); err != nil {
-						// SCATTER can collide with normal replicate queue
-						// operations and fail spuriously, so only print the
-						// error.
-						log.Warningf(ctx, `%s: %s`, buf.String(), err)
-					}
-
-					select {
-					case doneCh <- struct{}{}:
-					case <-ctx.Done():
-						return ctx.Err()
-					}
-
-					if p.lo < m {
-						splitCh <- pair{p.lo, m}
-					}
-					if m+1 < p.hi {
-						splitCh <- pair{m + 1, p.hi}
-					}
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-
-			}
-		})
-	}
-	g.GoCtx(func(ctx context.Context) error {
-		finished := 0
-		for finished < len(splitPoints) {
-			select {
-			case <-doneCh:
-				finished++
-				if finished%1000 == 0 {
-					log.Infof(ctx, "finished %d of %d splits", finished, len(splitPoints))
-				}
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		close(splitCh)
-		return nil
-	})
-	return g.Wait()
-}
-
-// StringTuple returns the given datums as strings suitable for use in directly
-// in SQL.
-//
-// TODO(dan): Remove this once SCATTER supports placeholders.
-func StringTuple(datums []interface{}) []string {
-	s := make([]string, len(datums))
-	for i, datum := range datums {
-		if datum == nil {
-			s[i] = `NULL`
-			continue
-		}
-		switch x := datum.(type) {
-		case int:
-			s[i] = strconv.Itoa(x)
-		case int64:
-			s[i] = strconv.FormatInt(x, 10)
-		case uint64:
-			s[i] = strconv.FormatUint(x, 10)
-		case string:
-			s[i] = lex.EscapeSQLString(x)
-		case float64:
-			s[i] = fmt.Sprintf(`%f`, x)
-		case []byte:
-			// See the HACK comment in ColBatchToRows.
-			s[i] = lex.EscapeSQLString(string(x))
-		default:
-			panic(fmt.Sprintf("unsupported type %T: %v", x, x))
-		}
-	}
-	return s
-}
-
-type sliceSliceInterface [][]interface{}
-
-func (s sliceSliceInterface) Len() int      { return len(s) }
-func (s sliceSliceInterface) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s sliceSliceInterface) Less(i, j int) bool {
-	for offset := 0; ; offset++ {
-		iLen, jLen := len(s[i]), len(s[j])
-		if iLen <= offset || jLen <= offset {
-			return iLen < jLen
-		}
-		var cmp int
-		switch x := s[i][offset].(type) {
-		case int:
-			if y := s[j][offset].(int); x < y {
-				return true
-			} else if x > y {
-				return false
-			}
-			continue
-		case int64:
-			if y := s[j][offset].(int64); x < y {
-				return true
-			} else if x > y {
-				return false
-			}
-			continue
-		case float64:
-			if y := s[j][offset].(float64); x < y {
-				return true
-			} else if x > y {
-				return false
-			}
-			continue
-		case uint64:
-			if y := s[j][offset].(uint64); x < y {
-				return true
-			} else if x > y {
-				return false
-			}
-			continue
-		case string:
-			cmp = strings.Compare(x, s[j][offset].(string))
-		case []byte:
-			cmp = bytes.Compare(x, s[j][offset].([]byte))
-		default:
-			panic(fmt.Sprintf("unsupported type %T: %v", x, x))
-		}
-		if cmp < 0 {
-			return true
-		} else if cmp > 0 {
-			return false
-		}
 	}
 }

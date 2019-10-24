@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "mvcc.h"
 #include "comparator.h"
@@ -217,12 +213,11 @@ MVCCStatsResult MVCCComputeStats(DBIterator* iter, DBKey start, DBKey end, int64
 
 bool MVCCIsValidSplitKey(DBSlice key) { return IsValidSplitKey(ToSlice(key)); }
 
-DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey end, DBKey min_split,
+DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey min_split,
                           int64_t target_size, DBString* split_key) {
   auto iter_rep = iter->rep.get();
   const std::string start_key = EncodeKey(start);
   iter_rep->Seek(start_key);
-  const std::string end_key = EncodeKey(end);
   const rocksdb::Slice min_split_key = ToSlice(min_split.key);
 
   int64_t size_so_far = 0;
@@ -230,7 +225,7 @@ DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey end, DBKey min_sp
   int64_t best_split_diff = std::numeric_limits<int64_t>::max();
   std::string prev_key;
 
-  for (; iter_rep->Valid() && kComparator.Compare(iter_rep->key(), end_key) < 0; iter_rep->Next()) {
+  for (; iter_rep->Valid(); iter_rep->Next()) {
     const rocksdb::Slice key = iter_rep->key();
     rocksdb::Slice decoded_key;
     int64_t wall_time = 0;

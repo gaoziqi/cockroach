@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -20,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
 	"github.com/cockroachdb/cockroach/pkg/storage/tscache"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -85,7 +82,7 @@ func (r *Replica) updateTimestampCache(
 			//
 			// It inserts the timestamp of the final batch in the transaction.
 			// This timestamp must necessarily be equal to or greater than the
-			// transaction's OrigTimestamp, which is consulted in
+			// transaction's MinTimestamp, which is consulted in
 			// CanCreateTxnRecord.
 			if br.Txn.Status.IsFinalized() {
 				key := keys.TransactionKey(start, txnID)
@@ -101,7 +98,7 @@ func (r *Replica) updateTimestampCache(
 			//
 			// Insert the timestamp of the batch, which we asserted during
 			// command evaluation was equal to or greater than the transaction's
-			// OrigTimestamp.
+			// MinTimestamp.
 			recovered := br.Responses[i].GetInner().(*roachpb.RecoverTxnResponse).RecoveredTxn
 			if recovered.Status.IsFinalized() {
 				key := keys.TransactionKey(start, recovered.ID)
@@ -137,21 +134,19 @@ func (r *Replica) updateTimestampCache(
 			key := keys.TransactionKey(start, pushee.ID)
 			addToTSCache(key, nil, pushee.Timestamp, t.PusherTxn.ID, readCache)
 		case *roachpb.ConditionalPutRequest:
-			if pErr != nil {
-				// ConditionalPut still updates on ConditionFailedErrors.
-				if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); !ok {
-					continue
-				}
+			// ConditionalPut only updates on ConditionFailedErrors. On other
+			// errors, no information is returned. On successful writes, the
+			// intent already protects against writes underneath the read.
+			if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); ok {
+				addToTSCache(start, end, ts, txnID, true /* readCache */)
 			}
-			addToTSCache(start, end, ts, txnID, true /* readCache */)
 		case *roachpb.InitPutRequest:
-			if pErr != nil {
-				// InitPut still updates on ConditionFailedErrors.
-				if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); !ok {
-					continue
-				}
+			// InitPut only updates on ConditionFailedErrors. On other errors,
+			// no information is returned. On successful writes, the intent
+			// already protects against writes underneath the read.
+			if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); ok {
+				addToTSCache(start, end, ts, txnID, true /* readCache */)
 			}
-			addToTSCache(start, end, ts, txnID, true /* readCache */)
 		case *roachpb.ScanRequest:
 			resp := br.Responses[i].GetInner().(*roachpb.ScanResponse)
 			if resp.ResumeSpan != nil {
@@ -227,6 +222,14 @@ func checkedTSCacheUpdate(
 	}
 }
 
+// txnsPushedDueToClosedTimestamp is a telemetry counter for the number of
+// batch requests which have been pushed due to the closed timestamp.
+var batchesPushedDueToClosedTimestamp telemetry.Counter
+
+func init() {
+	batchesPushedDueToClosedTimestamp = telemetry.GetCounter("kv.closed_timestamp.txns_pushed")
+}
+
 // applyTimestampCache moves the batch timestamp forward depending on
 // the presence of overlapping entries in the timestamp cache. If the
 // batch is transactional, the txn timestamp and the txn.WriteTooOld
@@ -246,14 +249,14 @@ func checkedTSCacheUpdate(
 // the read timestamp cache. That is, if the read timestamp cache returns a
 // value below minReadTS, minReadTS (without an associated txn id) will be used
 // instead to adjust the batch's timestamp.
-//
-// The timestamp cache also has a role in preventing replays of BeginTransaction
-// reordered after an EndTransaction. If that's detected, an error will be
-// returned.
 func (r *Replica) applyTimestampCache(
 	ctx context.Context, ba *roachpb.BatchRequest, minReadTS hlc.Timestamp,
-) (bool, *roachpb.Error) {
+) bool {
+	// bumpedDueToMinReadTS is set to true if the highest timestamp bump encountered
+	// below is due to the minReadTS.
+	var bumpedDueToMinReadTS bool
 	var bumped bool
+
 	for _, union := range ba.Requests {
 		args := union.GetInner()
 		if roachpb.ConsultsTimestampCache(args) {
@@ -261,61 +264,61 @@ func (r *Replica) applyTimestampCache(
 
 			// Forward the timestamp if there's been a more recent read (by someone else).
 			rTS, rTxnID := r.store.tsCache.GetMaxRead(header.Key, header.EndKey)
+			var forwardedToMinReadTS bool
 			if rTS.Forward(minReadTS) {
+				forwardedToMinReadTS = true
 				rTxnID = uuid.Nil
 			}
+			nextRTS := rTS.Next()
+			var bumpedCurReq bool
 			if ba.Txn != nil {
 				if ba.Txn.ID != rTxnID {
-					nextTS := rTS.Next()
-					if ba.Txn.Timestamp.Less(nextTS) {
+					if ba.Txn.Timestamp.Less(nextRTS) {
 						txn := ba.Txn.Clone()
-						bumped = txn.Timestamp.Forward(nextTS) || bumped
+						bumpedCurReq = txn.Timestamp.Forward(nextRTS)
 						ba.Txn = txn
 					}
 				}
 			} else {
-				bumped = ba.Timestamp.Forward(rTS.Next()) || bumped
+				bumpedCurReq = ba.Timestamp.Forward(nextRTS)
 			}
+			// Preserve bumpedDueToMinReadTS if we did not just bump or set it
+			// appropriately if we did.
+			bumpedDueToMinReadTS = (!bumpedCurReq && bumpedDueToMinReadTS) || (bumpedCurReq && forwardedToMinReadTS)
+			bumped, bumpedCurReq = bumped || bumpedCurReq, false
 
 			// On more recent writes, forward the timestamp and set the
 			// write too old boolean for transactions. Note that currently
 			// only EndTransaction and DeleteRange requests update the
 			// write timestamp cache.
 			wTS, wTxnID := r.store.tsCache.GetMaxWrite(header.Key, header.EndKey)
+			nextWTS := wTS.Next()
 			if ba.Txn != nil {
 				if ba.Txn.ID != wTxnID {
-					if !wTS.Less(ba.Txn.Timestamp) {
+					if ba.Txn.Timestamp.Less(nextWTS) {
 						txn := ba.Txn.Clone()
-						bumped = txn.Timestamp.Forward(wTS.Next()) || bumped
+						bumpedCurReq = txn.Timestamp.Forward(nextWTS)
 						txn.WriteTooOld = true
 						ba.Txn = txn
 					}
 				}
 			} else {
-				bumped = ba.Timestamp.Forward(wTS.Next()) || bumped
+				bumpedCurReq = ba.Timestamp.Forward(nextWTS)
 			}
+			// Clear bumpedDueToMinReadTS if we just bumped due to the write tscache.
+			bumpedDueToMinReadTS = !bumpedCurReq && bumpedDueToMinReadTS
+			bumped = bumped || bumpedCurReq
 		}
 	}
-	return bumped, nil
+	if bumpedDueToMinReadTS {
+		telemetry.Inc(batchesPushedDueToClosedTimestamp)
+	}
+	return bumped
 }
 
-// CanCreateTxnRecord determines whether a transaction record can be created
-// for the provided transaction information. Callers should provide an upper
-// bound on the transaction's minimum timestamp across all epochs (typically
-// the original timestamp of its first epoch). If this is not exact then the
-// method may return false positives (i.e. it determines that the record could
-// be created when it actually couldn't) but will never return false negatives
-// (i.e. it will never determine that the record could not be created when it
-// actually could).
-//
-// Because of this, callers who intend to write the transaction record should
-// always provide an exact minimum timestamp. They can't provide their
-// provisional commit timestamp because it may have moved forward over the
-// course of a single epoch and they can't provide their (current epoch's)
-// OrigTimestamp because it may have moved forward over a series of prior
-// epochs. Either of these timestamps might be above the timestamp that a
-// successful aborter might have used when aborting the transaction. Instead,
-// they should provide their epoch-zero original timestamp.
+// CanCreateTxnRecord determines whether a transaction record can be created for
+// the provided transaction information. Callers must provide the transaction's
+// minimum timestamp across all epochs, along with its ID and its key.
 //
 // If the method return true, it also returns the minimum provisional commit
 // timestamp that the record can be created with. If the method returns false,
@@ -436,7 +439,7 @@ func (r *Replica) applyTimestampCache(
 // system.
 //
 func (r *Replica) CanCreateTxnRecord(
-	txnID uuid.UUID, txnKey []byte, txnMinTSUpperBound hlc.Timestamp,
+	txnID uuid.UUID, txnKey []byte, txnMinTS hlc.Timestamp,
 ) (ok bool, minCommitTS hlc.Timestamp, reason roachpb.TransactionAbortedReason) {
 	// Consult the timestamp cache with the transaction's key. The timestamp
 	// cache is used in two ways for transactions without transaction records.
@@ -466,7 +469,7 @@ func (r *Replica) CanCreateTxnRecord(
 	wTS, wTxnID := r.store.tsCache.GetMaxWrite(key, nil /* end */)
 	// Compare against the minimum timestamp that the transaction could have
 	// written intents at.
-	if !wTS.Less(txnMinTSUpperBound) {
+	if !wTS.Less(txnMinTS) {
 		switch wTxnID {
 		case txnID:
 			// If we find our own transaction ID then an EndTransaction request

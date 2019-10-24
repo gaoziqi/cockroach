@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package row
 
@@ -24,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -34,12 +29,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
-// debugRowFetch can be used to turn on some low-level debugging logs. We use
+// DebugRowFetch can be used to turn on some low-level debugging logs. We use
 // this to avoid using log.V in the hot path.
-const debugRowFetch = false
+const DebugRowFetch = false
 
 type kvBatchFetcher interface {
 	// nextBatch returns the next batch of rows. Returns false in the first
@@ -48,7 +43,7 @@ type kvBatchFetcher interface {
 	// version - both must be handled by calling code.
 	nextBatch(ctx context.Context) (ok bool, kvs []roachpb.KeyValue,
 		batchResponse []byte, origSpan roachpb.Span, err error)
-	getRangesInfo() []roachpb.RangeInfo
+	GetRangesInfo() []roachpb.RangeInfo
 }
 
 type tableInfo struct {
@@ -209,7 +204,7 @@ type Fetcher struct {
 
 	// -- Fields updated during a scan --
 
-	kvFetcher      kvFetcher
+	kvFetcher      *KVFetcher
 	indexKey       []byte // the index key of the current row
 	prettyValueBuf *bytes.Buffer
 
@@ -253,7 +248,7 @@ func (rf *Fetcher) Init(
 	tables ...FetcherTableArgs,
 ) error {
 	if len(tables) == 0 {
-		return pgerror.AssertionFailedf("no tables to fetch from")
+		return errors.AssertionFailedf("no tables to fetch from")
 	}
 
 	rf.reverse = reverse
@@ -359,8 +354,20 @@ func (rf *Fetcher) Init(
 			} else {
 				table.indexColIdx[i] = -1
 				if table.neededCols.Contains(int(id)) {
-					return pgerror.AssertionFailedf("needed column %d not in colIdxMap", id)
+					return errors.AssertionFailedf("needed column %d not in colIdxMap", id)
 				}
+			}
+		}
+
+		// In order to track #40410 more effectively, check that the contents of
+		// table.neededValueColsByIdx are valid.
+		for idx, ok := table.neededValueColsByIdx.Next(0); ok; idx, ok = table.neededValueColsByIdx.Next(idx + 1) {
+			if idx >= len(table.row) || idx < 0 {
+				return errors.AssertionFailedf(
+					"neededValueColsByIdx contains an invalid index. column %d requested, but table has %d columns",
+					idx,
+					len(table.row),
+				)
 			}
 		}
 
@@ -448,7 +455,7 @@ func (rf *Fetcher) StartScan(
 	traceKV bool,
 ) error {
 	if len(spans) == 0 {
-		return pgerror.AssertionFailedf("no spans")
+		return errors.AssertionFailedf("no spans")
 	}
 
 	rf.traceKV = traceKV
@@ -481,7 +488,7 @@ func (rf *Fetcher) StartInconsistentScan(
 	traceKV bool,
 ) error {
 	if len(spans) == 0 {
-		return pgerror.AssertionFailedf("no spans")
+		return errors.AssertionFailedf("no spans")
 	}
 
 	txnTimestamp := initialTimestamp
@@ -571,7 +578,7 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 	var ok bool
 
 	for {
-		ok, rf.kv, _, err = rf.kvFetcher.nextKV(ctx)
+		ok, rf.kv, _, err = rf.kvFetcher.NextKV(ctx)
 		if err != nil {
 			return false, err
 		}
@@ -898,7 +905,7 @@ func (rf *Fetcher) processKV(
 			}
 		}
 
-		if debugRowFetch {
+		if DebugRowFetch {
 			if hasExtraCols(table) {
 				log.Infof(ctx, "Scan %s -> %s", kv.Key, rf.prettyEncDatums(table.extraTypes, table.extraVals))
 			} else {
@@ -968,7 +975,7 @@ func (rf *Fetcher) processValueSingle(
 				prettyValue = value.String()
 			}
 			table.row[idx] = sqlbase.DatumToEncDatum(typ, value)
-			if debugRowFetch {
+			if DebugRowFetch {
 				log.Infof(ctx, "Scan %s -> %v", kv.Key, value)
 			}
 			return prettyKey, prettyValue, nil
@@ -977,7 +984,7 @@ func (rf *Fetcher) processValueSingle(
 
 	// No need to unmarshal the column value. Either the column was part of
 	// the index key or it isn't needed.
-	if debugRowFetch {
+	if DebugRowFetch {
 		log.Infof(ctx, "Scan %s -> [%d] (skipped)", kv.Key, colID)
 	}
 	return prettyKey, prettyValue, nil
@@ -1016,7 +1023,7 @@ func (rf *Fetcher) processValueBytes(
 				return "", "", err
 			}
 			valueBytes = valueBytes[len:]
-			if debugRowFetch {
+			if DebugRowFetch {
 				log.Infof(ctx, "Scan %s -> [%d] (skipped)", kv.Key, colID)
 			}
 			continue
@@ -1042,7 +1049,7 @@ func (rf *Fetcher) processValueBytes(
 		}
 		table.row[idx] = encValue
 		rf.valueColsFound++
-		if debugRowFetch {
+		if DebugRowFetch {
 			log.Infof(ctx, "Scan %d -> %v", idx, encValue)
 		}
 	}
@@ -1233,7 +1240,7 @@ func (rf *Fetcher) checkPrimaryIndexDatumEncodings(ctx context.Context) error {
 		familyID := table.desc.Families[i].ID
 		familySortedColumnIDs, ok := rh.sortedColumnFamily(familyID)
 		if !ok {
-			return pgerror.AssertionFailedf("invalid family sorted column id map for family %d", familyID)
+			return errors.AssertionFailedf("invalid family sorted column id map for family %d", familyID)
 		}
 
 		for _, colID := range familySortedColumnIDs {
@@ -1244,25 +1251,25 @@ func (rf *Fetcher) checkPrimaryIndexDatumEncodings(ctx context.Context) error {
 			}
 
 			if skip, err := rh.skipColumnInPK(colID, familyID, rowVal.Datum); err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err, "unable to determine skip")
+				return errors.NewAssertionErrorWithWrappedErrf(err, "unable to determine skip")
 			} else if skip {
 				continue
 			}
 
 			col := colIDToColumn[colID]
 			if col == nil {
-				return pgerror.AssertionFailedf("column mapping not found for column %d", colID)
+				return errors.AssertionFailedf("column mapping not found for column %d", colID)
 			}
 
 			if lastColID > col.ID {
-				return pgerror.AssertionFailedf("cannot write column id %d after %d", col.ID, lastColID)
+				return errors.AssertionFailedf("cannot write column id %d after %d", col.ID, lastColID)
 			}
 			colIDDiff := col.ID - lastColID
 			lastColID = col.ID
 
 			if result, err := sqlbase.EncodeTableValue([]byte(nil), colIDDiff, rowVal.Datum,
 				scratch); err != nil {
-				return pgerror.NewAssertionErrorWithWrappedErrf(err, "could not re-encode column %s, value was %#v",
+				return errors.NewAssertionErrorWithWrappedErrf(err, "could not re-encode column %s, value was %#v",
 					col.Name, rowVal.Datum)
 			} else if !rowVal.BytesEqual(result) {
 				return scrub.WrapError(scrub.IndexValueDecodingError, errors.Errorf(
@@ -1369,7 +1376,7 @@ func (rf *Fetcher) finalizeRow() error {
 						indexColValues = append(indexColValues, "?")
 					}
 				}
-				err := pgerror.AssertionFailedf(
+				err := errors.AssertionFailedf(
 					"Non-nullable column \"%s:%s\" with no value! Index scanned was %q with the index key columns (%s) and the values (%s)",
 					table.desc.Name, table.cols[i].Name, table.index.Name,
 					strings.Join(table.index.ColumnNames, ","), strings.Join(indexColValues, ","))
@@ -1416,17 +1423,22 @@ func (rf *Fetcher) PartialKey(nCols int) (roachpb.Key, error) {
 // GetRangesInfo returns information about the ranges where the rows came from.
 // The RangeInfo's are deduped and not ordered.
 func (rf *Fetcher) GetRangesInfo() []roachpb.RangeInfo {
-	f := rf.kvFetcher.kvBatchFetcher
+	f := rf.kvFetcher
 	if f == nil {
 		// Not yet initialized.
 		return nil
 	}
-	return f.getRangesInfo()
+	return f.GetRangesInfo()
 }
 
-// GetBytesRead returns total number of bytes read by the underlying kvFetcher.
+// GetBytesRead returns total number of bytes read by the underlying KVFetcher.
 func (rf *Fetcher) GetBytesRead() int64 {
-	return rf.kvFetcher.bytesRead
+	f := rf.kvFetcher
+	if f == nil {
+		// Not yet initialized.
+		return 0
+	}
+	return f.bytesRead
 }
 
 // Only unique secondary indexes have extra columns to decode (namely the

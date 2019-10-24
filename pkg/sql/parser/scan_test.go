@@ -1,27 +1,23 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package parser
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -66,7 +62,7 @@ func TestScanner(t *testing.T) {
 		{`^`, []int{'^'}},
 		{`$`, []int{'$'}},
 		{`&`, []int{'&'}},
-		{`&&`, []int{INET_CONTAINS_OR_CONTAINED_BY}},
+		{`&&`, []int{AND_AND}},
 		{`|`, []int{'|'}},
 		{`||`, []int{CONCAT}},
 		{`#`, []int{'#'}},
@@ -333,7 +329,7 @@ func TestScanError(t *testing.T) {
 		if lval.id != ERROR {
 			t.Errorf("%s: expected ERROR, but found %d", d.sql, lval.id)
 		}
-		if !testutils.IsError(pgerror.New("00000", lval.str), d.err) {
+		if !testutils.IsError(errors.New(lval.str), d.err) {
 			t.Errorf("%s: expected %s, but found %v", d.sql, d.err, lval.str)
 		}
 	}

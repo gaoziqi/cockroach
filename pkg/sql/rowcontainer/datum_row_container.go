@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rowcontainer
 
@@ -171,6 +167,10 @@ func (c *RowContainer) UnsafeReset(ctx context.Context) error {
 
 // Close releases the memory associated with the RowContainer.
 func (c *RowContainer) Close(ctx context.Context) {
+	if c == nil {
+		// Allow Close on an uninitialized container.
+		return
+	}
 	c.chunks = nil
 	c.varSizedColumns = nil
 	c.memAcc.Close(ctx)
@@ -246,6 +246,11 @@ func (c *RowContainer) AddRow(ctx context.Context, row tree.Datums) (tree.Datums
 // Len reports the number of rows currently held in this RowContainer.
 func (c *RowContainer) Len() int {
 	return c.numRows
+}
+
+// NumCols reports the number of columns for each row in the container.
+func (c *RowContainer) NumCols() int {
+	return c.numCols
 }
 
 // At accesses a row at a specific index.

@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package install
 
@@ -25,18 +20,21 @@ import (
 
 var parameterRe = regexp.MustCompile(`{[^}]*}`)
 var pgURLRe = regexp.MustCompile(`{pgurl(:[-,0-9]+)?}`)
+var pgHostRe = regexp.MustCompile(`{pghost(:[-,0-9]+)?}`)
 var pgPortRe = regexp.MustCompile(`{pgport(:[-,0-9]+)?}`)
 var uiPortRe = regexp.MustCompile(`{uiport(:[-,0-9]+)?}`)
 var storeDirRe = regexp.MustCompile(`{store-dir}`)
 var logDirRe = regexp.MustCompile(`{log-dir}`)
+var certsDirRe = regexp.MustCompile(`{certs-dir}`)
 
 // expander expands a string which contains templated parameters for cluster
-// attributes like pgurl, pgport, uiport, store-dir, and log-dir with the
-// corresponding values.
+// attributes like pgurl, pghost, pgport, uiport, store-dir, and log-dir with
+// the corresponding values.
 type expander struct {
 	node int
 
 	pgURLs  map[int]string
+	pgHosts map[int]string
 	pgPorts map[int]string
 	uiPorts map[int]string
 }
@@ -53,10 +51,12 @@ func (e *expander) expand(c *SyncedCluster, arg string) (string, error) {
 		}
 		expanders := []expanderFunc{
 			e.maybeExpandPgURL,
+			e.maybeExpandPgHost,
 			e.maybeExpandPgPort,
 			e.maybeExpandUIPort,
 			e.maybeExpandStoreDir,
 			e.maybeExpandLogDir,
+			e.maybeExpandCertsDir,
 		}
 		for _, f := range expanders {
 			v, expanded, fErr := f(c, s)
@@ -120,6 +120,21 @@ func (e *expander) maybeExpandPgURL(c *SyncedCluster, s string) (string, bool, e
 	return s, err == nil, err
 }
 
+// maybeExpandPgHost is an expanderFunc for {pghost:<nodeSpec>}
+func (e *expander) maybeExpandPgHost(c *SyncedCluster, s string) (string, bool, error) {
+	m := pgHostRe.FindStringSubmatch(s)
+	if m == nil {
+		return s, false, nil
+	}
+
+	if e.pgHosts == nil {
+		e.pgHosts = c.pghosts(allNodes(len(c.VMs)))
+	}
+
+	s, err := e.maybeExpandMap(c, e.pgHosts, m[1])
+	return s, err == nil, err
+}
+
 // maybeExpandPgURL is an expanderFunc for {pgport:<nodeSpec>}
 func (e *expander) maybeExpandPgPort(c *SyncedCluster, s string) (string, bool, error) {
 	m := pgPortRe.FindStringSubmatch(s)
@@ -170,4 +185,12 @@ func (e *expander) maybeExpandLogDir(c *SyncedCluster, s string) (string, bool, 
 		return s, false, nil
 	}
 	return c.Impl.LogDir(c, e.node), true, nil
+}
+
+// maybeExpandCertsDir is an expanderFunc for "{certs-dir}"
+func (e *expander) maybeExpandCertsDir(c *SyncedCluster, s string) (string, bool, error) {
+	if !certsDirRe.MatchString(s) {
+		return s, false, nil
+	}
+	return c.Impl.CertsDir(c, e.node), true, nil
 }

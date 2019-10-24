@@ -1,20 +1,17 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -32,9 +29,6 @@ type joinPredicate struct {
 
 	// left/rightEqualityIndices give the position of equality columns
 	// on the left and right input row arrays, respectively.
-	// Left/right columns that have an equality constraint in the ON
-	// condition also have their indices appended when tryAddEqualityFilter
-	// is invoked (see planner.addJoinFilter).
 	// Only columns with the same left and right value types can be equality
 	// columns.
 	leftEqualityIndices  []int
@@ -73,69 +67,6 @@ type joinPredicate struct {
 	// will link to it by reference after checkRenderStar / analyzeExpr.
 	// Enforce this using NoCopy.
 	_ util.NoCopy
-}
-
-// tryAddEqualityFilter attempts to turn the given filter expression into
-// an equality predicate. It returns true iff the transformation succeeds.
-func (p *joinPredicate) tryAddEqualityFilter(
-	filter tree.Expr, left, right *sqlbase.DataSourceInfo,
-) bool {
-	c, ok := filter.(*tree.ComparisonExpr)
-	if !ok || c.Operator != tree.EQ {
-		return false
-	}
-	lhs, ok := c.Left.(*tree.IndexedVar)
-	if !ok {
-		return false
-	}
-	rhs, ok := c.Right.(*tree.IndexedVar)
-	if !ok {
-		return false
-	}
-
-	sourceBoundary := len(left.SourceColumns)
-	if (lhs.Idx >= sourceBoundary && rhs.Idx >= sourceBoundary) ||
-		(lhs.Idx < sourceBoundary && rhs.Idx < sourceBoundary) {
-		// Both variables are on the same side of the join (e.g. `a JOIN b ON a.x = a.y`).
-		return false
-	}
-
-	if lhs.Idx > rhs.Idx {
-		lhs, rhs = rhs, lhs
-	}
-
-	if !lhs.ResolvedType().Equivalent(rhs.ResolvedType()) {
-		// Issue #22519: we can't have two equality columns of mismatched types
-		// because the hash-joiner assumes the encodings are the same.
-		return false
-	}
-
-	// At this point we have an equality, so we can add it to the list
-	// of equality columns.
-
-	// To do this we must be a bit careful: the expression contains
-	// IndexedVars, and the column indices at this point will refer to
-	// the full column set of the joinPredicate, including the
-	// merged columns.
-	p.addEquality(left, lhs.Idx, right, rhs.Idx-len(left.SourceColumns))
-	return true
-}
-
-func (p *joinPredicate) addEquality(
-	left *sqlbase.DataSourceInfo, leftColIdx int, right *sqlbase.DataSourceInfo, rightColIdx int,
-) {
-	// Also, we will want to avoid redundant equality checks.
-	for i := range p.leftEqualityIndices {
-		if p.leftEqualityIndices[i] == leftColIdx && p.rightEqualityIndices[i] == rightColIdx {
-			// The filter is already there.
-			return
-		}
-	}
-
-	p.leftEqualityIndices = append(p.leftEqualityIndices, leftColIdx)
-	p.rightEqualityIndices = append(p.rightEqualityIndices, rightColIdx)
-	p.leftColNames = append(p.leftColNames, tree.Name(left.SourceColumns[leftColIdx].Name))
-	p.rightColNames = append(p.rightColNames, tree.Name(right.SourceColumns[rightColIdx].Name))
 }
 
 // makePredicate constructs a joinPredicate object for joins. The join condition
@@ -220,7 +151,7 @@ func makePredicate(
 			// First, check if the comparison would even be valid.
 			_, found := tree.FindEqualComparisonFunction(uc.leftType, uc.rightType)
 			if !found {
-				return nil, pgerror.Newf(pgerror.CodeDatatypeMismatchError,
+				return nil, pgerror.Newf(pgcode.DatatypeMismatch,
 					"JOIN/USING types %s for left and %s for right cannot be matched for column %s",
 					uc.leftType, uc.rightType, uc.name,
 				)
@@ -283,32 +214,6 @@ func (p *joinPredicate) eval(ctx *tree.EvalContext, leftRow, rightRow tree.Datum
 	return true, nil
 }
 
-// getNeededColumns figures out the columns needed for the two
-// sources.  This takes into account both the equality columns and the
-// predicate expression.
-func (p *joinPredicate) getNeededColumns(neededJoined []bool) ([]bool, []bool) {
-	// Reset the helper and rebind the variable to detect which columns
-	// are effectively needed.
-	p.onCond = p.iVarHelper.Rebind(p.onCond, true, false)
-
-	// The columns that are part of the expression are always needed.
-	neededJoined = append([]bool(nil), neededJoined...)
-	for i := range neededJoined {
-		if p.iVarHelper.IndexedVarUsed(i) {
-			neededJoined[i] = true
-		}
-	}
-	leftNeeded := neededJoined[:p.numLeftCols]
-	rightNeeded := neededJoined[p.numLeftCols:]
-
-	// The equality columns are always needed.
-	for i := range p.leftEqualityIndices {
-		leftNeeded[p.leftEqualityIndices[i]] = true
-		rightNeeded[p.rightEqualityIndices[i]] = true
-	}
-	return leftNeeded, rightNeeded
-}
-
 // prepareRow prepares the output row by combining values from the
 // input data sources.
 func (p *joinPredicate) prepareRow(result, leftRow, rightRow tree.Datums) {
@@ -340,7 +245,7 @@ func makeUsingColumns(
 	for _, syntaxColName := range usingColNames {
 		colName := string(syntaxColName)
 		if _, ok := seenNames[colName]; ok {
-			return nil, pgerror.Newf(pgerror.CodeDuplicateColumnError,
+			return nil, pgerror.Newf(pgcode.DuplicateColumn,
 				"column %q appears more than once in USING clause", colName)
 		}
 		seenNames[colName] = struct{}{}
@@ -382,10 +287,24 @@ func pickUsingColumn(
 		}
 	}
 	if idx == invalidColIdx {
-		return idx, nil, pgerror.Newf(pgerror.CodeUndefinedColumnError,
+		return idx, nil, pgerror.Newf(pgcode.UndefinedColumn,
 			"column \"%s\" specified in USING clause does not exist in %s table", colName, context)
 	}
 	return idx, cols[idx].Typ, nil
 }
 
 const invalidColIdx = -1
+
+// mergeConj combines two predicates.
+func mergeConj(left, right tree.TypedExpr) tree.TypedExpr {
+	if isFilterTrue(left) {
+		if right == tree.DBoolTrue {
+			return nil
+		}
+		return right
+	}
+	if isFilterTrue(right) {
+		return left
+	}
+	return tree.NewTypedAndExpr(left, right)
+}

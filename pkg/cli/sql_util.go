@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -38,8 +34,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 type sqlConnI interface {
@@ -77,6 +73,20 @@ type initialSQLConnectionError struct {
 
 // Error implements the error interface.
 func (i *initialSQLConnectionError) Error() string { return i.err.Error() }
+
+// Cause implements causer.
+func (i *initialSQLConnectionError) Cause() error { return i.err }
+
+// Format implements fmt.Formatter.
+func (i *initialSQLConnectionError) Format(s fmt.State, verb rune) { errors.FormatError(i, s, verb) }
+
+// FormatError implements errors.Formatter.
+func (i *initialSQLConnectionError) FormatError(p errors.Printer) error {
+	if p.Detail() {
+		p.Print("error while establishing the SQL session")
+	}
+	return i.err
+}
 
 // wrapConnError detects TCP EOF errors during the initial SQL handshake.
 // These are translated to a message "perhaps this is not a CockroachDB node"
@@ -470,25 +480,44 @@ func makeSQLConn(url string) *sqlConn {
 	}
 }
 
-// getPasswordAndMakeSQLClient prompts for a password if running in secure mode
-// and no certificates have been supplied.
-// Attempting to use security.RootUser without valid certificates will return an error.
-func getPasswordAndMakeSQLClient(appName string) (*sqlConn, error) {
-	return makeSQLClient(appName)
-}
-
 var sqlConnTimeout = envutil.EnvOrDefaultString("COCKROACH_CONNECT_TIMEOUT", "5")
+
+// defaultSQLDb describes how a missing database part in the SQL
+// connection string is processed when creating a client connection.
+type defaultSQLDb int
+
+const (
+	// useSystemDb means that a missing database will be overridden with
+	// "system".
+	useSystemDb defaultSQLDb = iota
+	// useDefaultDb means that a missing database will be left as-is so
+	// that the server can default to "defaultdb".
+	useDefaultDb
+)
 
 // makeSQLClient connects to the database using the connection
 // settings set by the command-line flags.
+// If a password is needed, it also prompts for the password.
+//
+// If forceSystemDB is set, it also connects it to the `system`
+// database. The --database flag or database part in the URL is then
+// ignored.
 //
 // The appName given as argument is added to the URL even if --url is
 // specified, but only if the URL didn't already specify
 // application_name. It is prefixed with '$ ' to mark it as internal.
-func makeSQLClient(appName string) (*sqlConn, error) {
+func makeSQLClient(appName string, defaultMode defaultSQLDb) (*sqlConn, error) {
 	baseURL, err := cliCtx.makeClientConnURL()
 	if err != nil {
 		return nil, err
+	}
+
+	if defaultMode == useSystemDb && baseURL.Path == "" {
+		// Override the target database. This is because the current
+		// database can influence the output of CLI commands, and in the
+		// case where the database is missing it will default server-wise to
+		// `defaultdb` which may not exist.
+		baseURL.Path = "system"
 	}
 
 	// If there is no user in the URL already, fill in the default user.
@@ -585,50 +614,6 @@ func runQuery(conn *sqlConn, fn queryFunc, showMoreChars bool) ([]string, [][]st
 
 	defer func() { _ = rows.Close() }()
 	return sqlRowsToStrings(rows, showMoreChars)
-}
-
-// runQueryRaw takes a 'query' with optional 'parameters'.
-// It returns the result rows as strings with minimal changes (no escaping, etc).
-func runQueryRaw(conn *sqlConn, fn queryFunc) (cols []string, results [][]string, err error) {
-	rows, err := fn(conn)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	defer func() {
-		rowsErr := rows.Close()
-		if err != nil {
-			err = errors.Wrapf(rowsErr, "error after row-wise error: %v", err)
-		}
-	}()
-	cols = rows.Columns()
-	vals := make([]driver.Value, len(cols))
-	for {
-		err := rows.Next(vals)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return cols, results, err
-		}
-		rowStrings := make([]string, len(cols))
-		for i, v := range vals {
-			switch t := v.(type) {
-			case nil:
-				rowStrings[i] = "NULL"
-			case string:
-				rowStrings[i] = t
-			case []byte:
-				rowStrings[i] = string(t)
-			case time.Time:
-				rowStrings[i] = t.Format(tree.TimestampOutputFormat)
-			default:
-				rowStrings[i] = fmt.Sprintf("%v", t)
-			}
-		}
-		results = append(results, rowStrings)
-	}
-	return cols, results, nil
 }
 
 // handleCopyError ensures the user is properly informed when they issue

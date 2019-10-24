@@ -1,22 +1,19 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
 import (
 	"container/heap"
 	"context"
+	"fmt"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -24,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -37,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 // testQueueImpl implements queueImpl with a closure for shouldQueue.
@@ -132,28 +131,28 @@ func TestQueuePriorityQueue(t *testing.T) {
 	pq.sl = make([]*replicaItem, count)
 	for i := 0; i < count; {
 		pq.sl[i] = &replicaItem{
-			value:    roachpb.RangeID(i),
+			rangeID:  roachpb.RangeID(i),
 			priority: float64(i),
 			index:    i,
 		}
-		expRanges[3-i] = pq.sl[i].value
+		expRanges[3-i] = pq.sl[i].rangeID
 		i++
 	}
 	heap.Init(&pq)
 
 	// Insert a new item and then modify its priority.
 	priorityItem := &replicaItem{
-		value:    -1,
+		rangeID:  -1,
 		priority: 1.0,
 	}
 	heap.Push(&pq, priorityItem)
 	pq.update(priorityItem, 4.0)
-	expRanges[0] = priorityItem.value
+	expRanges[0] = priorityItem.rangeID
 
 	// Take the items out; they should arrive in decreasing priority order.
 	for i := 0; pq.Len() > 0; i++ {
 		item := heap.Pop(&pq).(*replicaItem)
-		if item.value != expRanges[i] {
+		if item.rangeID != expRanges[i] {
 			t.Errorf("%d: unexpected range with priority %f", i, item.priority)
 		}
 	}
@@ -514,7 +513,7 @@ func TestNeedsSystemConfig(t *testing.T) {
 		tc.store.cfg.AmbientCtx, &base.Config{Insecure: true}, tc.store.cfg.Clock, stopper,
 		&cluster.MakeTestingClusterSettings().Version)
 	emptyGossip := gossip.NewTest(
-		tc.gossip.NodeID.Get(), rpcContext, rpc.NewServer(rpcContext), stopper, tc.store.Registry(), config.DefaultZoneConfigRef())
+		tc.gossip.NodeID.Get(), rpcContext, rpc.NewServer(rpcContext), stopper, tc.store.Registry(), zonepb.DefaultZoneConfigRef())
 	bqNeedsSysCfg := makeTestBaseQueue("test", testQueue, tc.store, emptyGossip, queueConfig{
 		needsSystemConfig:    true,
 		acceptsUnsplitRanges: true,
@@ -629,11 +628,11 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 		return nil
 	})
 	neverSplitsDesc := neverSplits.Desc()
-	if sysCfg.NeedsSplit(neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
+	if sysCfg.NeedsSplit(ctx, neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
 		t.Fatal("System config says range needs to be split")
 	}
 	willSplitDesc := willSplit.Desc()
-	if sysCfg.NeedsSplit(willSplitDesc.StartKey, willSplitDesc.EndKey) {
+	if sysCfg.NeedsSplit(ctx, willSplitDesc.StartKey, willSplitDesc.EndKey) {
 		t.Fatal("System config says range needs to be split")
 	}
 
@@ -659,18 +658,19 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	// Now add a user object, it will trigger a split.
 	// The range willSplit starts at the beginning of the user data range,
 	// which means keys.MaxReservedDescID+1.
-	zoneConfig := config.DefaultZoneConfig()
+	zoneConfig := zonepb.DefaultZoneConfig()
 	zoneConfig.RangeMaxBytes = proto.Int64(1 << 20)
 	config.TestingSetZoneConfig(keys.MaxReservedDescID+2, zoneConfig)
 
 	// Check our config.
 	neverSplitsDesc = neverSplits.Desc()
-	if sysCfg.NeedsSplit(neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
+	if sysCfg.NeedsSplit(ctx, neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
 		t.Fatal("System config says range needs to be split")
 	}
 	willSplitDesc = willSplit.Desc()
-	if !sysCfg.NeedsSplit(willSplitDesc.StartKey, willSplitDesc.EndKey) {
-		t.Fatal("System config says range does not need to be split")
+	if !sysCfg.NeedsSplit(ctx, willSplitDesc.StartKey, willSplitDesc.EndKey) {
+		t.Fatalf("System config says range %s does not need to be split",
+			willSplitDesc.RSpan())
 	}
 
 	bq.maybeAdd(ctx, neverSplits, hlc.Timestamp{})
@@ -1101,6 +1101,51 @@ func TestBaseQueueProcessConcurrently(t *testing.T) {
 
 	pQueue.processBlocker <- struct{}{}
 	assertProcessedAndProcessing(3, 0)
+}
+
+// TestBaseQueueReplicaChange ensures that if a replica is added to the queue
+// with a non-zero replica ID then it is only processed if the retrieved replica
+// from the getReplica() function has the same replica ID.
+func TestBaseQueueChangeReplicaID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// The testContext exists only to construct the baseQueue.
+	tc := testContext{}
+	stopper := stop.NewStopper()
+	ctx := context.Background()
+	defer stopper.Stop(ctx)
+	tc.Start(t, stopper)
+	testQueue := &testQueueImpl{
+		shouldQueueFn: func(now hlc.Timestamp, r *Replica) (shouldQueue bool, priority float64) {
+			return true, 1.0
+		},
+	}
+	bq := makeTestBaseQueue("test", testQueue, tc.store, tc.gossip, queueConfig{
+		maxSize:              defaultQueueMaxSize,
+		acceptsUnsplitRanges: true,
+	})
+	r := &fakeReplica{rangeID: 1, replicaID: 1}
+	bq.mu.Lock()
+	bq.getReplica = func(rangeID roachpb.RangeID) (replicaInQueue, error) {
+		if rangeID != 1 {
+			panic(fmt.Errorf("expected range id 1, got %d", rangeID))
+		}
+		return r, nil
+	}
+	bq.mu.Unlock()
+	require.Equal(t, 0, testQueue.getProcessed())
+	bq.maybeAdd(ctx, r, tc.store.Clock().Now())
+	bq.DrainQueue(tc.store.Stopper())
+	require.Equal(t, 1, testQueue.getProcessed())
+	bq.maybeAdd(ctx, r, tc.store.Clock().Now())
+	r.replicaID = 2
+	bq.DrainQueue(tc.store.Stopper())
+	require.Equal(t, 1, testQueue.getProcessed())
+	require.Equal(t, 0, bq.Length())
+	require.Equal(t, 0, bq.PurgatoryLength())
+	bq.mu.Lock()
+	defer bq.mu.Unlock()
+	_, exists := bq.mu.replicas[1]
+	require.False(t, exists, bq.mu.replicas)
 }
 
 func TestBaseQueueRequeue(t *testing.T) {

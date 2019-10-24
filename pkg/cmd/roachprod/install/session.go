@@ -1,32 +1,24 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package install
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
 
@@ -52,16 +44,24 @@ type remoteSession struct {
 }
 
 func newRemoteSession(user, host string, logdir string) (*remoteSession, error) {
-	logfile := filepath.Join(
-		logdir,
-		fmt.Sprintf("ssh_%s_%s", host, timeutil.Now().Format(time.RFC3339)),
-	)
+	// TODO(tbg): this is disabled at the time of writing. It was difficult
+	// to assign the logfiles to the roachtest and as a bonus our CI harness
+	// never actually managed to collect the files since they had wrong
+	// permissions; instead they clogged up the roachprod dir.
+	// logfile := filepath.Join(
+	//	logdir,
+	// 	fmt.Sprintf("ssh_%s_%s", host, timeutil.Now().Format(time.RFC3339)),
+	// )
+	const logfile = ""
 	args := []string{
 		user + "@" + host,
-		"-vvv", "-E", logfile,
+
+		// TODO(tbg): see above.
+		//"-vvv", "-E", logfile,
 		// NB: -q suppresses -E, at least on OSX. Difficult decisions will have
 		// to be made if omitting -q leads to annoyance on stdout/stderr.
-		// "-q",
+
+		"-q",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "StrictHostKeyChecking=no",
 		// Send keep alives every minute to prevent connections without activity
@@ -78,7 +78,7 @@ func newRemoteSession(user, host string, logdir string) (*remoteSession, error) 
 }
 
 func (s *remoteSession) errWithDebug(err error) error {
-	if err != nil {
+	if err != nil && s.logfile != "" {
 		err = errors.Wrapf(err, "ssh verbose log retained in %s", s.logfile)
 		s.logfile = "" // prevent removal on close
 	}

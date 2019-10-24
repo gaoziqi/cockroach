@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package opt_test
 
@@ -24,14 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 func TestMetadata(t *testing.T) {
 	var md opt.Metadata
 	schID := md.AddSchema(&testcat.Schema{})
 	colID := md.AddColumn("col", types.Int)
-	tabID := md.AddTable(&testcat.Table{})
+	tabID := md.AddTable(&testcat.Table{}, &tree.TableName{})
 
 	// Call Init and add objects from catalog, verifying that IDs have been reset.
 	testCat := testcat.New()
@@ -45,11 +40,11 @@ func TestMetadata(t *testing.T) {
 	if md.AddColumn("col2", types.Int) != colID {
 		t.Fatalf("unexpected column id")
 	}
-	if md.AddTable(tab) != tabID {
+	if md.AddTable(tab, &tree.TableName{}) != tabID {
 		t.Fatalf("unexpected table id")
 	}
 
-	md.AddDataSourceDependency(tab.Name(), tab, privilege.CREATE)
+	md.AddDependency(opt.DepByName(&tab.TabName), tab, privilege.CREATE)
 	depsUpToDate, err := md.CheckDependencies(context.TODO(), testCat)
 	if err == nil || depsUpToDate {
 		t.Fatalf("expected table privilege to be revoked")
@@ -145,7 +140,7 @@ func TestMetadataTables(t *testing.T) {
 	y := &testcat.Column{Name: "y"}
 	a.Columns = append(a.Columns, x, y)
 
-	tabID := md.AddTable(a)
+	tabID := md.AddTable(a, &tree.TableName{})
 	if tabID == 0 {
 		t.Fatalf("unexpected table id: %d", tabID)
 	}
@@ -170,7 +165,7 @@ func TestMetadataTables(t *testing.T) {
 	b.TabName = tree.MakeUnqualifiedTableName(tree.Name("b"))
 	b.Columns = append(b.Columns, &testcat.Column{Name: "x"})
 
-	otherTabID := md.AddTable(b)
+	otherTabID := md.AddTable(b, &tree.TableName{})
 	if otherTabID == tabID {
 		t.Fatalf("unexpected table id: %d", tabID)
 	}
@@ -197,19 +192,20 @@ func TestIndexColumns(t *testing.T) {
 	}
 
 	var md opt.Metadata
-	a := md.AddTable(cat.Table(tree.NewUnqualifiedTableName("a")))
+	tn := tree.NewUnqualifiedTableName("a")
+	a := md.AddTable(cat.Table(tn), tn)
 
-	k := int(a.ColumnID(0))
-	i := int(a.ColumnID(1))
-	s := int(a.ColumnID(2))
-	f := int(a.ColumnID(3))
+	k := a.ColumnID(0)
+	i := a.ColumnID(1)
+	s := a.ColumnID(2)
+	f := a.ColumnID(3)
 
 	testCases := []struct {
 		index        int
 		expectedCols opt.ColSet
 	}{
-		{1, util.MakeFastIntSet(k, i)},
-		{2, util.MakeFastIntSet(s, f, k)},
+		{1, opt.MakeColSet(k, i)},
+		{2, opt.MakeColSet(s, f, k)},
 	}
 
 	for _, tc := range testCases {

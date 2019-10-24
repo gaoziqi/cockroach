@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -25,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 )
 
-func registerScaleData(r *registry) {
+func registerScaleData(r *testRegistry) {
 	// apps is a suite of Sqlapp applications designed to be used to check the
 	// consistency of a database under load. Each Sqlapp application launches a
 	// set of workers who perform database operations while another worker
@@ -58,9 +53,9 @@ func registerScaleData(r *registry) {
 }
 
 func runSqlapp(ctx context.Context, t *test, c *cluster, app, flags string, dur time.Duration) {
-	roachNodeCount := c.nodes - 1
+	roachNodeCount := c.spec.NodeCount - 1
 	roachNodes := c.Range(1, roachNodeCount)
-	appNode := c.Node(c.nodes)
+	appNode := c.Node(c.spec.NodeCount)
 
 	if local && runtime.GOOS != "linux" {
 		t.Fatalf("must run on linux os, found %s", runtime.GOOS)

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -20,8 +16,11 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 )
@@ -46,36 +45,12 @@ type explainPlanNode struct {
 	// subqueryPlans contains the subquery plans for the explained query.
 	subqueryPlans []subquery
 
-	// expanded indicates whether to invoke expandPlan() on the sub-node.
-	expanded bool
+	// postqueryPlans contains the postquery plans for the explained query.
+	postqueryPlans []postquery
 
-	// optimized indicates whether to invoke setNeededColumns() on the sub-node.
-	optimized bool
-
-	// optimizeSubqueries indicates whether to invoke optimizeSubquery and
-	// setUnlimited on the subqueries.
-	optimizeSubqueries bool
+	stmtType tree.StatementType
 
 	run explainPlanRun
-}
-
-// newExplainPlanNode instantiates a planNode that runs an EXPLAIN query.
-func (p *planner) makeExplainPlanNode(
-	ctx context.Context, opts *tree.ExplainOptions, origStmt tree.Statement,
-) (planNode, error) {
-	// Build the plan for the query being explained.  We want to capture
-	// all the analyzed sub-queries in the explain node, so we are going
-	// to override the planner's subquery plan slice.
-	defer func(s []subquery) { p.curPlan.subqueryPlans = s }(p.curPlan.subqueryPlans)
-	p.curPlan.subqueryPlans = nil
-
-	plan, err := p.newPlan(ctx, origStmt, nil)
-	if err != nil {
-		return nil, err
-	}
-	return p.makeExplainPlanNodeWithPlan(
-		ctx, opts, true /* optimizeSubqueries */, plan, p.curPlan.subqueryPlans,
-	)
 }
 
 // makeExplainPlanNodeWithPlan instantiates a planNode that EXPLAINs an
@@ -83,9 +58,10 @@ func (p *planner) makeExplainPlanNode(
 func (p *planner) makeExplainPlanNodeWithPlan(
 	ctx context.Context,
 	opts *tree.ExplainOptions,
-	optimizeSubqueries bool,
 	plan planNode,
 	subqueryPlans []subquery,
+	postqueryPlans []postquery,
+	stmtType tree.StatementType,
 ) (planNode, error) {
 	flags := explainFlags{
 		symbolicVars: opts.Flags.Contains(tree.ExplainFlagSymVars),
@@ -130,12 +106,11 @@ func (p *planner) makeExplainPlanNodeWithPlan(
 	}
 
 	node := &explainPlanNode{
-		explainer:          e,
-		expanded:           !opts.Flags.Contains(tree.ExplainFlagNoExpand),
-		optimized:          !opts.Flags.Contains(tree.ExplainFlagNoOptimize),
-		optimizeSubqueries: optimizeSubqueries,
-		plan:               plan,
-		subqueryPlans:      subqueryPlans,
+		explainer:      e,
+		plan:           plan,
+		subqueryPlans:  subqueryPlans,
+		postqueryPlans: postqueryPlans,
+		stmtType:       stmtType,
 		run: explainPlanRun{
 			results: p.newContainerValuesNode(columns, 0),
 		},
@@ -150,23 +125,8 @@ type explainPlanRun struct {
 }
 
 func (e *explainPlanNode) startExec(params runParams) error {
-	if e.optimizeSubqueries {
-		// The sub-plan's subqueries have been captured local to the EXPLAIN
-		// node so that they would not be automatically started for
-		// execution by planTop.start(). But this also means they were not
-		// yet processed by makePlan()/optimizePlan(). Do it here.
-		for i := range e.subqueryPlans {
-			if err := params.p.optimizeSubquery(params.ctx, &e.subqueryPlans[i]); err != nil {
-				return err
-			}
-
-			// Trigger limit propagation. This would be done otherwise when
-			// starting the plan. However we do not want to start the plan.
-			params.p.setUnlimited(e.subqueryPlans[i].plan)
-		}
-	}
-
-	return params.p.populateExplain(params.ctx, &e.explainer, e.run.results, e.plan, e.subqueryPlans)
+	return params.p.populateExplain(params, &e.explainer, e.run.results, e.plan, e.subqueryPlans, e.postqueryPlans,
+		e.stmtType)
 }
 
 func (e *explainPlanNode) Next(params runParams) (bool, error) { return e.run.results.Next(params) }
@@ -176,6 +136,9 @@ func (e *explainPlanNode) Close(ctx context.Context) {
 	e.plan.Close(ctx)
 	for i := range e.subqueryPlans {
 		e.subqueryPlans[i].plan.Close(ctx)
+	}
+	for i := range e.postqueryPlans {
+		e.postqueryPlans[i].plan.Close(ctx)
 	}
 	e.run.results.Close(ctx)
 }
@@ -234,9 +197,56 @@ var emptyString = tree.NewDString("")
 // The subquery plans, if any are known to the planner, are printed
 // at the bottom.
 func (p *planner) populateExplain(
-	ctx context.Context, e *explainer, v *valuesNode, plan planNode, subqueryPlans []subquery,
+	params runParams,
+	e *explainer,
+	v *valuesNode,
+	plan planNode,
+	subqueryPlans []subquery,
+	postqueryPlans []postquery,
+	stmtType tree.StatementType,
 ) error {
-	e.populateEntries(ctx, plan, subqueryPlans, explainSubqueryFmtFlags)
+	ctx := params.ctx
+	e.populateEntries(ctx, plan, subqueryPlans, postqueryPlans, explainSubqueryFmtFlags)
+
+	var isDistSQL, isVec bool
+	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
+	isDistSQL, _ = willDistributePlan(distSQLPlanner, plan, params)
+	outerSubqueries := params.p.curPlan.subqueryPlans
+	planCtx := makeExplainVecPlanningCtx(distSQLPlanner, params, stmtType, subqueryPlans, isDistSQL)
+	defer func() {
+		planCtx.planner.curPlan.subqueryPlans = outerSubqueries
+	}()
+	physicalPlan, err := makePhysicalPlan(planCtx, distSQLPlanner, plan)
+	if err == nil {
+		// There might be an issue making the physical plan, but that should not
+		// cause an error or panic, so swallow the error. See #40677 for example.
+		distSQLPlanner.FinalizePlan(planCtx, &physicalPlan)
+		flows := physicalPlan.GenerateFlowSpecs(params.extendedEvalCtx.NodeID)
+		flowCtx := makeFlowCtx(planCtx, physicalPlan, params)
+
+		ctxSessionData := flowCtx.EvalCtx.SessionData
+		vectorizedThresholdMet := physicalPlan.MaxEstimatedRowCount >= ctxSessionData.VectorizeRowCountThreshold
+		isVec = true
+		if ctxSessionData.VectorizeMode == sessiondata.VectorizeOff {
+			isVec = false
+		} else if !vectorizedThresholdMet && ctxSessionData.VectorizeMode == sessiondata.VectorizeAuto {
+			isVec = false
+		} else {
+			thisNodeID := distSQLPlanner.nodeDesc.NodeID
+			for nodeID, flow := range flows {
+				fuseOpt := flowinfra.FuseNormally
+				if nodeID == thisNodeID && !isDistSQL {
+					fuseOpt = flowinfra.FuseAggressively
+				}
+				_, err := colflow.SupportsVectorized(params.ctx, flowCtx, flow.Processors, fuseOpt)
+				isVec = isVec && (err == nil)
+			}
+		}
+	}
+
+	if err := appendExecutionDetails(ctx, v, e.showMetadata, isDistSQL, isVec); err != nil {
+		return err
+	}
 
 	tp := treeprinter.New()
 	// n keeps track of the current node on each level.
@@ -275,7 +285,7 @@ func (p *planner) populateExplain(
 				// Columns metadata.
 				row[5] = tree.NewDString(formatColumns(cols, e.showTypes))
 				// Ordering metadata.
-				row[6] = tree.NewDString(planPhysicalProps(entry.plan).AsString(cols))
+				row[6] = tree.NewDString(formatOrdering(planReqOrdering(entry.plan), cols))
 			}
 		}
 		if _, err := v.rows.AddRow(ctx, row); err != nil {
@@ -286,27 +296,80 @@ func (p *planner) populateExplain(
 	return nil
 }
 
+func appendExecutionDetails(
+	ctx context.Context, v *valuesNode, showMetadata, isDistSQL, isVec bool,
+) error {
+	var distSQLRow, vecRow tree.Datums
+	distSQLFieldName := tree.NewDString("distributed")
+	distSQLValue := tree.NewDString(fmt.Sprintf("%t", isDistSQL))
+	vecFieldName := tree.NewDString("vectorized")
+	vecValue := tree.NewDString(fmt.Sprintf("%t", isVec))
+	if !showMetadata {
+		distSQLRow = tree.Datums{
+			emptyString,      // Tree
+			distSQLFieldName, // Field
+			distSQLValue,     // Description
+		}
+		vecRow = tree.Datums{
+			emptyString,  // Tree
+			vecFieldName, // Field
+			vecValue,     // Description
+		}
+	} else {
+		distSQLRow = tree.Datums{
+			emptyString,      // Tree
+			tree.NewDInt(0),  // Level
+			emptyString,      // Type
+			distSQLFieldName, // Field
+			distSQLValue,     // Description
+			emptyString,      // Columns
+			emptyString,      // Ordering
+		}
+		vecRow = tree.Datums{
+			emptyString,     // Tree
+			tree.NewDInt(0), // Level
+			emptyString,     // Type
+			vecFieldName,    // Field
+			vecValue,        // Description
+			emptyString,     // Columns
+			emptyString,     // Ordering
+		}
+	}
+	if _, err := v.rows.AddRow(ctx, distSQLRow); err != nil {
+		return err
+	}
+	if _, err := v.rows.AddRow(ctx, vecRow); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (e *explainer) populateEntries(
-	ctx context.Context, plan planNode, subqueryPlans []subquery, subqueryFmtFlags tree.FmtFlags,
+	ctx context.Context,
+	plan planNode,
+	subqueryPlans []subquery,
+	postqueryPlans []postquery,
+	subqueryFmtFlags tree.FmtFlags,
 ) {
 	e.entries = nil
 	observer := e.observer()
-	_ = populateEntriesForObserver(ctx, plan, subqueryPlans, observer, false /* returnError */, subqueryFmtFlags)
+	_ = populateEntriesForObserver(ctx, plan, subqueryPlans, postqueryPlans, observer, false /* returnError */, subqueryFmtFlags)
 }
 
 func populateEntriesForObserver(
 	ctx context.Context,
 	plan planNode,
 	subqueryPlans []subquery,
+	postqueryPlans []postquery,
 	observer planObserver,
 	returnError bool,
 	subqueryFmtFlags tree.FmtFlags,
 ) error {
-	// If there are any subqueries in the plan, we enclose both the main
-	// plan and the sub-queries as children of a virtual "root"
-	// node. This is not introduced in the common case where there are
-	// no subqueries.
-	if len(subqueryPlans) > 0 {
+	// If there are any sub- or postqueries in the plan, we enclose both the main
+	// plan and the sub- and postqueries as children of a virtual "root" node.
+	// This is not introduced in the common case where there are no sub- and
+	// postqueries.
+	if len(subqueryPlans) > 0 || len(postqueryPlans) > 0 {
 		if _, err := observer.enterNode(ctx, "root", plan); err != nil && returnError {
 			return err
 		}
@@ -330,7 +393,7 @@ func populateEntriesForObserver(
 			"original sql",
 			tree.AsStringWithFlags(subqueryPlans[i].subquery, subqueryFmtFlags),
 		)
-		observer.attr("subquery", "exec mode", distsqlrun.SubqueryExecModeNames[subqueryPlans[i].execMode])
+		observer.attr("subquery", "exec mode", rowexec.SubqueryExecModeNames[subqueryPlans[i].execMode])
 		if subqueryPlans[i].plan != nil {
 			if err := walkPlan(ctx, subqueryPlans[i].plan, observer); err != nil && returnError {
 				return err
@@ -343,7 +406,22 @@ func populateEntriesForObserver(
 		}
 	}
 
-	if len(subqueryPlans) > 0 {
+	// Explain the postqueries.
+	for i := range postqueryPlans {
+		if _, err := observer.enterNode(ctx, "postquery", plan); err != nil && returnError {
+			return err
+		}
+		if postqueryPlans[i].plan != nil {
+			if err := walkPlan(ctx, postqueryPlans[i].plan, observer); err != nil && returnError {
+				return err
+			}
+		}
+		if err := observer.leaveNode("postquery", postqueryPlans[i].plan); err != nil && returnError {
+			return err
+		}
+	}
+
+	if len(subqueryPlans) > 0 || len(postqueryPlans) > 0 {
 		if err := observer.leaveNode("root", plan); err != nil && returnError {
 			return err
 		}
@@ -353,7 +431,9 @@ func populateEntriesForObserver(
 }
 
 // planToString uses explain() to build a string representation of the planNode.
-func planToString(ctx context.Context, plan planNode, subqueryPlans []subquery) string {
+func planToString(
+	ctx context.Context, plan planNode, subqueryPlans []subquery, postqueryPlans []postquery,
+) string {
 	e := explainer{
 		explainFlags: explainFlags{
 			showMetadata: true,
@@ -361,7 +441,7 @@ func planToString(ctx context.Context, plan planNode, subqueryPlans []subquery) 
 		},
 		fmtFlags: tree.FmtExpr(tree.FmtSymbolicSubqueries, true, true, true),
 	}
-	e.populateEntries(ctx, plan, subqueryPlans, explainSubqueryFmtFlags)
+	e.populateEntries(ctx, plan, subqueryPlans, postqueryPlans, explainSubqueryFmtFlags)
 	var buf bytes.Buffer
 	for _, e := range e.entries {
 		field := e.field
@@ -375,7 +455,7 @@ func planToString(ctx context.Context, plan planNode, subqueryPlans []subquery) 
 			fmt.Fprintf(
 				&buf, "%d %s%s %s %s %s\n", e.level, e.node, field, e.fieldVal,
 				formatColumns(cols, true),
-				planPhysicalProps(plan).AsString(cols),
+				formatOrdering(planReqOrdering(plan), cols),
 			)
 		}
 	}

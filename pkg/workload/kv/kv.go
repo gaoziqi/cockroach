@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -61,7 +56,6 @@ type kv struct {
 	zipfian                              bool
 	splits                               int
 	secondaryIndex                       bool
-	useOpt                               bool
 	targetCompressionRatio               float64
 }
 
@@ -115,7 +109,6 @@ var kvMeta = workload.Meta{
 			`Number of splits to perform before starting normal operations.`)
 		g.flags.BoolVar(&g.secondaryIndex, `secondary-index`, false,
 			`Add a secondary index to the schema`)
-		g.flags.BoolVar(&g.useOpt, `use-opt`, true, `Use cost-based optimizer`)
 		g.flags.Float64Var(&g.targetCompressionRatio, `target-compression-ratio`, 1.0,
 			`Target compression ratio for data blocks. Must be >= 1.0`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
@@ -210,13 +203,6 @@ func (w *kv) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, er
 	mcp, err := workload.NewMultiConnPool(cfg, urls...)
 	if err != nil {
 		return workload.QueryLoad{}, err
-	}
-
-	if !w.useOpt {
-		_, err := mcp.Get().Exec("SET optimizer=off")
-		if err != nil {
-			return workload.QueryLoad{}, err
-		}
 	}
 
 	// Read statement

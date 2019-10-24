@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package builtins
 
@@ -20,6 +16,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	gojson "encoding/json"
 	"fmt"
 	"hash"
 	"hash/crc32"
@@ -41,12 +38,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -55,21 +54,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/knz/strtime"
-	"github.com/pkg/errors"
 )
 
 var (
-	errEmptyInputString = pgerror.New(pgerror.CodeInvalidParameterValueError, "the input string must not be empty")
-	errAbsOfMinInt64    = pgerror.New(pgerror.CodeNumericValueOutOfRangeError, "abs of min integer value (-9223372036854775808) not defined")
-	errSqrtOfNegNumber  = pgerror.New(pgerror.CodeInvalidArgumentForPowerFunctionError, "cannot take square root of a negative number")
-	errLogOfNegNumber   = pgerror.New(pgerror.CodeInvalidArgumentForLogarithmError, "cannot take logarithm of a negative number")
-	errLogOfZero        = pgerror.New(pgerror.CodeInvalidArgumentForLogarithmError, "cannot take logarithm of zero")
-	errZeroIP           = pgerror.New(pgerror.CodeInvalidParameterValueError, "zero length IP")
-	errChrValueTooSmall = pgerror.New(pgerror.CodeInvalidParameterValueError, "input value must be >= 0")
-	errChrValueTooLarge = pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+	errEmptyInputString = pgerror.New(pgcode.InvalidParameterValue, "the input string must not be empty")
+	errAbsOfMinInt64    = pgerror.New(pgcode.NumericValueOutOfRange, "abs of min integer value (-9223372036854775808) not defined")
+	errSqrtOfNegNumber  = pgerror.New(pgcode.InvalidArgumentForPowerFunction, "cannot take square root of a negative number")
+	errLogOfNegNumber   = pgerror.New(pgcode.InvalidArgumentForLogarithm, "cannot take logarithm of a negative number")
+	errLogOfZero        = pgerror.New(pgcode.InvalidArgumentForLogarithm, "cannot take logarithm of zero")
+	errZeroIP           = pgerror.New(pgcode.InvalidParameterValue, "zero length IP")
+	errChrValueTooSmall = pgerror.New(pgcode.InvalidParameterValue, "input value must be >= 0")
+	errChrValueTooLarge = pgerror.Newf(pgcode.InvalidParameterValue,
 		"input value must be <= %d (maximum Unicode code point)", utf8.MaxRune)
-	errStringTooLarge = pgerror.Newf(pgerror.CodeProgramLimitExceededError,
+	errStringTooLarge = pgerror.Newf(pgcode.ProgramLimitExceeded,
 		fmt.Sprintf("requested length too large, exceeds %s", humanizeutil.IBytes(maxAllocatedStringSize)))
 )
 
@@ -145,12 +144,12 @@ func makeBuiltin(props tree.FunctionProperties, overloads ...tree.Overload) buil
 }
 
 func newDecodeError(enc string) error {
-	return pgerror.Newf(pgerror.CodeCharacterNotInRepertoireError,
+	return pgerror.Newf(pgcode.CharacterNotInRepertoire,
 		"invalid byte sequence for encoding %q", enc)
 }
 
 func newEncodeError(c rune, enc string) error {
-	return pgerror.Newf(pgerror.CodeUntranslatableCharacterError,
+	return pgerror.Newf(pgcode.UntranslatableCharacter,
 		"character %q has no representation in encoding %q", c, enc)
 }
 
@@ -227,7 +226,7 @@ var builtins = map[string]builtinDefinition{
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				if len(args) == 0 {
-					return nil, pgerror.Newf(pgerror.CodeUndefinedFunctionError, errInsufficientArgsFmtString, "concat_ws")
+					return nil, pgerror.Newf(pgcode.UndefinedFunction, errInsufficientArgsFmtString, "concat_ws")
 				}
 				if args[0] == tree.DNull {
 					return tree.DNull, nil
@@ -282,7 +281,7 @@ var builtins = map[string]builtinDefinition{
 					}
 					return tree.NewDString(buf.String()), nil
 				}
-				return nil, pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+				return nil, pgerror.Newf(pgcode.InvalidParameterValue,
 					"invalid source encoding name %q", enc)
 			},
 			Info: "Decode the bytes in `str` into a string using encoding `enc`. " +
@@ -313,7 +312,7 @@ var builtins = map[string]builtinDefinition{
 					}
 					return tree.NewDBytes(tree.DBytes(res)), nil
 				}
-				return nil, pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+				return nil, pgerror.Newf(pgcode.InvalidParameterValue,
 					"invalid destination encoding name %q", enc)
 			},
 			Info: "Encode the string `str` as a byte array using encoding `enc`. " +
@@ -499,7 +498,7 @@ var builtins = map[string]builtinDefinition{
 
 				if !(dIPAddr.Family == ipaddr.IPv4family && mask >= 0 && mask <= 32) && !(dIPAddr.Family == ipaddr.IPv6family && mask >= 0 && mask <= 128) {
 					return nil, pgerror.Newf(
-						pgerror.CodeInvalidParameterValueError, "invalid mask length: %d", mask)
+						pgcode.InvalidParameterValue, "invalid mask length: %d", mask)
 				}
 				return &tree.DIPAddr{IPAddr: ipaddr.IPAddr{Family: dIPAddr.Family, Addr: dIPAddr.Addr, Mask: byte(mask)}}, nil
 			},
@@ -558,23 +557,6 @@ var builtins = map[string]builtinDefinition{
 		},
 	),
 
-	"inet_contains_or_contained_by": makeBuiltin(defProps(),
-		tree.Overload{
-			Types: tree.ArgTypes{
-				{"val", types.INet},
-				{"val", types.INet},
-			},
-			ReturnType: tree.FixedReturnType(types.Bool),
-			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				ipAddr := tree.MustBeDIPAddr(args[0]).IPAddr
-				other := tree.MustBeDIPAddr(args[1]).IPAddr
-				return tree.MakeDBool(tree.DBool(ipAddr.ContainsOrContainedBy(&other))), nil
-			},
-			Info: "Test for subnet inclusion, using only the network parts of the addresses. " +
-				"The host part of the addresses is ignored.",
-		},
-	),
-
 	"inet_contains_or_equals": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ArgTypes{
@@ -622,7 +604,7 @@ var builtins = map[string]builtinDefinition{
 				// ip will be nil.
 				if ip == nil {
 					return nil, pgerror.Newf(
-						pgerror.CodeInvalidParameterValueError, "invalid IP format: %s", ipdstr.String())
+						pgcode.InvalidParameterValue, "invalid IP format: %s", ipdstr.String())
 				}
 				return tree.NewDBytes(tree.DBytes(ip)), nil
 			},
@@ -646,7 +628,7 @@ var builtins = map[string]builtinDefinition{
 
 				if field <= 0 {
 					return nil, pgerror.Newf(
-						pgerror.CodeInvalidParameterValueError, "field position %d must be greater than zero", field)
+						pgcode.InvalidParameterValue, "field position %d must be greater than zero", field)
 				}
 
 				splits := strings.Split(text, sep)
@@ -697,7 +679,7 @@ var builtins = map[string]builtinDefinition{
 				data, format := *args[0].(*tree.DBytes), string(tree.MustBeDString(args[1]))
 				be, ok := sessiondata.BytesEncodeFormatFromString(format)
 				if !ok {
-					return nil, pgerror.New(pgerror.CodeInvalidParameterValueError,
+					return nil, pgerror.New(pgcode.InvalidParameterValue,
 						"only 'hex', 'escape', and 'base64' formats are supported for encode()")
 				}
 				return tree.NewDString(lex.EncodeByteArrayToRawBytes(
@@ -715,7 +697,7 @@ var builtins = map[string]builtinDefinition{
 				data, format := string(tree.MustBeDString(args[0])), string(tree.MustBeDString(args[1]))
 				be, ok := sessiondata.BytesEncodeFormatFromString(format)
 				if !ok {
-					return nil, pgerror.New(pgerror.CodeInvalidParameterValueError,
+					return nil, pgerror.New(pgcode.InvalidParameterValue,
 						"only 'hex', 'escape', and 'base64' formats are supported for decode()")
 				}
 				res, err := lex.DecodeRawBytesToByteArray(data, be)
@@ -1796,7 +1778,8 @@ may increase either contention or retry errors, or both.`,
 				return extractStringFromTimestamp(ctx, fromTS.Time, timeSpan)
 			},
 			Info: "Extracts `element` from `input`.\n\n" +
-				"Compatible elements: year, quarter, month, week, dayofweek, dayofyear,\n" +
+				"Compatible elements: millennium, century, decade, year, isoyear,\n" +
+				"quarter, month, week, dayofweek, isodow, dayofyear, julian,\n" +
 				"hour, minute, second, millisecond, microsecond, epoch",
 		},
 		tree.Overload{
@@ -1812,7 +1795,8 @@ may increase either contention or retry errors, or both.`,
 				return extractStringFromTimestamp(ctx, fromTSTZ.Time, timeSpan)
 			},
 			Info: "Extracts `element` from `input`.\n\n" +
-				"Compatible elements: year, quarter, month, week, dayofweek, dayofyear,\n" +
+				"Compatible elements: millennium, century, decade, year, isoyear,\n" +
+				"quarter, month, week, dayofweek, isodow, dayofyear, julian,\n" +
 				"hour, minute, second, millisecond, microsecond, epoch",
 		},
 		tree.Overload{
@@ -1824,7 +1808,8 @@ may increase either contention or retry errors, or both.`,
 				return extractStringFromTimestamp(ctx, fromTSTZ.Time, timeSpan)
 			},
 			Info: "Extracts `element` from `input`.\n\n" +
-				"Compatible elements: year, quarter, month, week, dayofweek, dayofyear,\n" +
+				"Compatible elements: millennium, century, decade, year, isoyear,\n" +
+				"quarter, month, week, dayofweek, isodow, dayofyear, julian,\n" +
 				"hour, minute, second, millisecond, microsecond, epoch",
 		},
 		tree.Overload{
@@ -1868,7 +1853,7 @@ may increase either contention or retry errors, or both.`,
 
 				default:
 					return nil, pgerror.Newf(
-						pgerror.CodeInvalidParameterValueError, "unsupported timespan: %s", timeSpan)
+						pgcode.InvalidParameterValue, "unsupported timespan: %s", timeSpan)
 				}
 			},
 			Info: "Extracts `element` from `input`.\n" +
@@ -1927,8 +1912,8 @@ may increase either contention or retry errors, or both.`,
 			},
 			Info: "Truncates `input` to precision `element`.  Sets all fields that are less\n" +
 				"significant than `element` to zero (or one, for day and month)\n\n" +
-				"Compatible elements: year, quarter, month, week, hour, minute, second,\n" +
-				"millisecond, microsecond.",
+				"Compatible elements: millennium, century, decade, year, quarter, month,\n" +
+				"week, day, hour, minute, second, millisecond, microsecond.",
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{{"element", types.String}, {"input", types.Date}},
@@ -1944,8 +1929,8 @@ may increase either contention or retry errors, or both.`,
 			},
 			Info: "Truncates `input` to precision `element`.  Sets all fields that are less\n" +
 				"significant than `element` to zero (or one, for day and month)\n\n" +
-				"Compatible elements: year, quarter, month, week, hour, minute, second,\n" +
-				"millisecond, microsecond.",
+				"Compatible elements: millennium, century, decade, year, quarter, month,\n" +
+				"week, day, hour, minute, second, millisecond, microsecond.",
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{{"element", types.String}, {"input", types.Time}},
@@ -1973,8 +1958,8 @@ may increase either contention or retry errors, or both.`,
 			},
 			Info: "Truncates `input` to precision `element`.  Sets all fields that are less\n" +
 				"significant than `element` to zero (or one, for day and month)\n\n" +
-				"Compatible elements: year, quarter, month, week, hour, minute, second,\n" +
-				"millisecond, microsecond.",
+				"Compatible elements: millennium, century, decade, year, quarter, month,\n" +
+				"week, day, hour, minute, second, millisecond, microsecond.",
 		},
 	),
 
@@ -2246,6 +2231,35 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
+	"row_to_json": makeBuiltin(defProps(),
+		tree.Overload{
+			Types:      tree.ArgTypes{{"row", types.AnyTuple}},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				tuple := args[0].(*tree.DTuple)
+				builder := json.NewObjectBuilder(len(tuple.D))
+				typ := tuple.ResolvedType()
+				labels := typ.TupleLabels()
+				for i, d := range tuple.D {
+					var label string
+					if labels != nil {
+						label = labels[i]
+					}
+					if label == "" {
+						label = fmt.Sprintf("f%d", i+1)
+					}
+					val, err := tree.AsJSON(d)
+					if err != nil {
+						return nil, err
+					}
+					builder.Add(label, val)
+				}
+				return tree.NewDJSON(builder.Build()), nil
+			},
+			Info: "Returns the row as a JSON object.",
+		},
+	),
+
 	"sin": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
 			return tree.NewDFloat(tree.DFloat(math.Sin(x))), nil
@@ -2311,6 +2325,46 @@ may increase either contention or retry errors, or both.`,
 		}, "Calculates the tangent of `val`."),
 	),
 
+	// https://www.postgresql.org/docs/9.6/functions-datetime.html
+	"timezone": makeBuiltin(defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"timestamp", types.Timestamp},
+				{"timezone", types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.TimestampTZ),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				ts := tree.MustBeDTimestamp(args[0])
+				tzStr := string(tree.MustBeDString(args[1]))
+				loc, err := timeutil.TimeZoneStringToLocation(tzStr)
+				if err != nil {
+					return nil, err
+				}
+				_, before := ts.Time.Zone()
+				_, after := ts.Time.In(loc).Zone()
+				return tree.MakeDTimestampTZ(ts.Time.Add(time.Duration(before-after)*time.Second), time.Microsecond), nil
+			},
+			Info: "Treat given time stamp without time zone as located in the specified time zone",
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"timestamptz", types.TimestampTZ},
+				{"timezone", types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.Timestamp),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				ts := tree.MustBeDTimestampTZ(args[0])
+				tzStr := string(tree.MustBeDString(args[1]))
+				loc, err := timeutil.TimeZoneStringToLocation(tzStr)
+				if err != nil {
+					return nil, err
+				}
+				return ts.EvalAtTimeZone(ctx, loc), nil
+			},
+			Info: "Convert given time stamp with time zone to the new time zone, with no time zone designation",
+		},
+	),
+
 	"trunc": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
 			return tree.NewDFloat(tree.DFloat(math.Trunc(x))), nil
@@ -2320,6 +2374,60 @@ may increase either contention or retry errors, or both.`,
 			x.Modf(&dd.Decimal, nil)
 			return dd, nil
 		}, "Truncates the decimal values of `val`."),
+	),
+
+	"width_bucket": makeBuiltin(defProps(),
+		tree.Overload{
+			Types: tree.ArgTypes{{"operand", types.Decimal}, {"b1", types.Decimal},
+				{"b2", types.Decimal}, {"count", types.Int}},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				operand, _ := args[0].(*tree.DDecimal).Float64()
+				b1, _ := args[1].(*tree.DDecimal).Float64()
+				b2, _ := args[2].(*tree.DDecimal).Float64()
+				count := int(tree.MustBeDInt(args[3]))
+				return tree.NewDInt(tree.DInt(widthBucket(operand, b1, b2, count))), nil
+			},
+			Info: "return the bucket number to which operand would be assigned in a histogram having count " +
+				"equal-width buckets spanning the range b1 to b2.",
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{{"operand", types.Int}, {"b1", types.Int},
+				{"b2", types.Int}, {"count", types.Int}},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				operand := float64(tree.MustBeDInt(args[0]))
+				b1 := float64(tree.MustBeDInt(args[1]))
+				b2 := float64(tree.MustBeDInt(args[2]))
+				count := int(tree.MustBeDInt(args[3]))
+				return tree.NewDInt(tree.DInt(widthBucket(operand, b1, b2, count))), nil
+			},
+			Info: "return the bucket number to which operand would be assigned in a histogram having count " +
+				"equal-width buckets spanning the range b1 to b2.",
+		},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"operand", types.Any}, {"thresholds", types.AnyArray}},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				operand := args[0]
+				thresholds := tree.MustBeDArray(args[1])
+
+				if !operand.ResolvedType().Equivalent(thresholds.ParamTyp) {
+					return tree.NewDInt(0), errors.New("Operand and thresholds must be of the same type")
+				}
+
+				for i, v := range thresholds.Array {
+					if operand.Compare(ctx, v) < 0 {
+						return tree.NewDInt(tree.DInt(i)), nil
+					}
+				}
+
+				return tree.NewDInt(tree.DInt(thresholds.Len())), nil
+			},
+			Info: "return the bucket number to which operand would be assigned given an array listing the " +
+				"lower bounds of the buckets; returns 0 for an input less than the first lower bound; the " +
+				"thresholds array must be sorted, smallest first, or unexpected results will be obtained",
+		},
 	),
 
 	// Array functions.
@@ -2757,6 +2865,29 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
+	// https://www.postgresql.org/docs/10/functions-info.html#FUNCTIONS-INFO-CATALOG-TABLE
+	"pg_collation_for": makeBuiltin(
+		tree.FunctionProperties{Category: categoryString},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"str", types.Any}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				var collation string
+				switch t := args[0].(type) {
+				case *tree.DString:
+					collation = "default"
+				case *tree.DCollatedString:
+					collation = t.Locale
+				default:
+					return tree.DNull, pgerror.Newf(pgcode.DatatypeMismatch,
+						"collations are not supported by type: %s", t.ResolvedType())
+				}
+				return tree.NewDString(fmt.Sprintf(`"%s"`, collation)), nil
+			},
+			Info: "Returns the collation of the argument",
+		},
+	),
+
 	"crdb_internal.locality_value": makeBuiltin(
 		tree.FunctionProperties{Category: categorySystemInfo},
 		tree.Overload{
@@ -2807,6 +2938,99 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
+	"crdb_internal.cluster_name": makeBuiltin(
+		tree.FunctionProperties{Category: categorySystemInfo},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				return tree.NewDString(ctx.ClusterName), nil
+			},
+			Info: "Returns the cluster name.",
+		},
+	),
+
+	"crdb_internal.encode_key": makeBuiltin(
+		tree.FunctionProperties{Category: categorySystemInfo},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"table_id", types.Int},
+				{"index_id", types.Int},
+				{"row_tuple", types.AnyTuple},
+			},
+			ReturnType: tree.FixedReturnType(types.Bytes),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				tableID := int(tree.MustBeDInt(args[0]))
+				indexID := int(tree.MustBeDInt(args[1]))
+				rowDatums, ok := tree.AsDTuple(args[2])
+				if !ok {
+					return nil, errors.AssertionFailedf("expected DTuple, found %s", args[2])
+				}
+
+				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, sqlbase.ID(tableID))
+				if err != nil {
+					return nil, err
+				}
+
+				if len(rowDatums.D) != len(tableDesc.Columns) {
+					return nil, pgerror.Newf(pgcode.Syntax, "number of values provided must equal number of columns in table")
+				}
+
+				// Check that all the input datums have types that line up with the columns.
+				var datums tree.Datums
+				for i, d := range rowDatums.D {
+					// We try to perform a cast here rather than a typecheck because the individual datums
+					// already have a fixed type, and not information is known at typechecking time for those
+					// datums to line up with the column types of the input table. Instead we try to cast the
+					// parsed datums into the types of the table's columns.
+					var newDatum tree.Datum
+					if d.ResolvedType() == types.Unknown {
+						if !tableDesc.Columns[i].Nullable {
+							return nil, pgerror.Newf(pgcode.NotNullViolation, "NULL provided as a value for a non-nullable column")
+						}
+						newDatum = tree.DNull
+					} else {
+						expectedTyp := tableDesc.Columns[i].DatumType()
+						newDatum, err = tree.PerformCast(ctx, d, expectedTyp)
+						if err != nil {
+							return nil, errors.WithHint(err, "try to explicitly cast each value to the corresponding column type")
+						}
+					}
+					datums = append(datums, newDatum)
+				}
+
+				indexDesc := tableDesc.AllNonDropIndexes()[indexID-1]
+
+				// Create a column id to row index map. In this case, each column ID just maps to the i'th ordinal.
+				colMap := make(map[sqlbase.ColumnID]int)
+				for i := range tableDesc.Columns {
+					colMap[tableDesc.Columns[i].ID] = i
+				}
+
+				if indexDesc.ID == tableDesc.PrimaryIndex.ID {
+					keyPrefix := tableDesc.IndexSpan(indexDesc.ID).Key
+					res, _, err := sqlbase.EncodeIndexKey(tableDesc, indexDesc, colMap, datums, keyPrefix)
+					if err != nil {
+						return nil, err
+					}
+					return tree.NewDBytes(tree.DBytes(res)), err
+				}
+				// We have a secondary index.
+				res, err := sqlbase.EncodeSecondaryIndex(tableDesc, indexDesc, colMap, datums)
+				if err != nil {
+					return nil, err
+				}
+				// If EncodeSecondaryIndex returns more than one element then we have an inverted index,
+				// which this command does not support right now.
+				if len(res) > 1 {
+					return nil, unimplemented.NewWithIssue(41232, "inverted indexes not supported right now")
+				}
+				return tree.NewDBytes(tree.DBytes(res[0].Key)), err
+			},
+			Info: "Generate the key for a row on a particular table and index.",
+		},
+	),
+
 	"crdb_internal.force_error": makeBuiltin(
 		tree.FunctionProperties{
 			Category: categorySystemInfo,
@@ -2837,7 +3061,7 @@ may increase either contention or retry errors, or both.`,
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				msg := string(*args[0].(*tree.DString))
-				return nil, pgerror.AssertionFailedf("%s", msg)
+				return nil, errors.AssertionFailedf("%s", msg)
 			},
 			Info: "This function is used only by CockroachDB's developers for testing purposes.",
 		},
@@ -2896,9 +3120,6 @@ may increase either contention or retry errors, or both.`,
 			Types:      tree.ArgTypes{{"val", types.Interval}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				if err := checkPrivilegedUser(ctx); err != nil {
-					return nil, err
-				}
 				minDuration := args[0].(*tree.DInterval).Duration
 				elapsed := duration.MakeDuration(int64(ctx.StmtTimestamp.Sub(ctx.TxnTimestamp)), 0, 0)
 				if elapsed.Compare(minDuration) < 0 {
@@ -2928,7 +3149,7 @@ may increase either contention or retry errors, or both.`,
 					},
 				})
 				if err := ctx.Txn.Run(ctx.Context, b); err != nil {
-					return nil, pgerror.Newf(pgerror.CodeInvalidParameterValueError, "message: %s", err)
+					return nil, pgerror.Newf(pgcode.InvalidParameterValue, "message: %s", err)
 				}
 				resp := b.RawResponse().Responses[0].GetInner().(*roachpb.LeaseInfoResponse)
 
@@ -2976,6 +3197,42 @@ may increase either contention or retry errors, or both.`,
 		},
 	),
 
+	// Return statistics about a range.
+	"crdb_internal.range_stats": makeBuiltin(
+		tree.FunctionProperties{
+			Category: categorySystemInfo,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"key", types.Bytes},
+			},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				key := []byte(tree.MustBeDBytes(args[0]))
+				b := &client.Batch{}
+				b.AddRawRequest(&roachpb.RangeStatsRequest{
+					RequestHeader: roachpb.RequestHeader{
+						Key: key,
+					},
+				})
+				if err := ctx.Txn.Run(ctx.Context, b); err != nil {
+					return nil, pgerror.Newf(pgcode.InvalidParameterValue, "message: %s", err)
+				}
+				resp := b.RawResponse().Responses[0].GetInner().(*roachpb.RangeStatsResponse).MVCCStats
+				jsonStr, err := gojson.Marshal(&resp)
+				if err != nil {
+					return nil, err
+				}
+				jsonDatum, err := tree.ParseDJSON(string(jsonStr))
+				if err != nil {
+					return nil, err
+				}
+				return jsonDatum, nil
+			},
+			Info: "This function is used to retrieve range statistics information as a JSON object.",
+		},
+	),
+
 	"crdb_internal.set_vmodule": makeBuiltin(
 		tree.FunctionProperties{
 			Category: categorySystemInfo,
@@ -3001,13 +3258,18 @@ may increase either contention or retry errors, or both.`,
 	// Returns the number of distinct inverted index entries that would be generated for a JSON value.
 	"crdb_internal.json_num_index_entries": makeBuiltin(
 		tree.FunctionProperties{
-			Category: categorySystemInfo,
+			Category:     categorySystemInfo,
+			NullableArgs: true,
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{{"val", types.Jsonb}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				n, err := json.NumInvertedIndexEntries(tree.MustBeDJSON(args[0]).JSON)
+				arg := args[0]
+				if arg == tree.DNull {
+					return tree.NewDInt(tree.DInt(1)), nil
+				}
+				n, err := json.NumInvertedIndexEntries(tree.MustBeDJSON(arg).JSON)
 				if err != nil {
 					return nil, err
 				}
@@ -3091,7 +3353,7 @@ var substringImpls = makeBuiltin(tree.FunctionProperties{Category: categoryStrin
 	tree.Overload{
 		Types: tree.ArgTypes{
 			{"input", types.String},
-			{"substr_pos", types.Int},
+			{"start_pos", types.Int},
 		},
 		ReturnType: tree.FixedReturnType(types.String),
 		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
@@ -3107,15 +3369,16 @@ var substringImpls = makeBuiltin(tree.FunctionProperties{Category: categoryStrin
 
 			return tree.NewDString(string(runes[start:])), nil
 		},
-		Info: "Returns a substring of `input` starting at `substr_pos` (count starts at 1).",
+		Info: "Returns a substring of `input` starting at `start_pos` (count starts at 1).",
 	},
 	tree.Overload{
 		Types: tree.ArgTypes{
 			{"input", types.String},
 			{"start_pos", types.Int},
-			{"end_pos", types.Int},
+			{"length", types.Int},
 		},
-		ReturnType: tree.FixedReturnType(types.String),
+		SpecializedVecBuiltin: tree.SubstringStringIntInt,
+		ReturnType:            tree.FixedReturnType(types.String),
 		Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 			runes := []rune(string(tree.MustBeDString(args[0])))
 			// SQL strings are 1-indexed.
@@ -3124,7 +3387,7 @@ var substringImpls = makeBuiltin(tree.FunctionProperties{Category: categoryStrin
 
 			if length < 0 {
 				return nil, pgerror.Newf(
-					pgerror.CodeInvalidParameterValueError, "negative substring length %d not allowed", length)
+					pgcode.InvalidParameterValue, "negative substring length %d not allowed", length)
 			}
 
 			end := start + length
@@ -3145,7 +3408,8 @@ var substringImpls = makeBuiltin(tree.FunctionProperties{Category: categoryStrin
 
 			return tree.NewDString(string(runes[start:end])), nil
 		},
-		Info: "Returns a substring of `input` between `start_pos` and `end_pos` (count starts at 1).",
+		Info: "Returns a substring of `input` starting at `start_pos` (count starts at 1) and " +
+			"including up to `length` characters.",
 	},
 	tree.Overload{
 		Types: tree.ArgTypes{
@@ -3283,11 +3547,11 @@ var (
 )
 
 var (
-	errJSONObjectNotEvenNumberOfElements = pgerror.New(pgerror.CodeInvalidParameterValueError,
+	errJSONObjectNotEvenNumberOfElements = pgerror.New(pgcode.InvalidParameterValue,
 		"array must have even number of elements")
-	errJSONObjectNullValueForKey = pgerror.New(pgerror.CodeInvalidParameterValueError,
+	errJSONObjectNullValueForKey = pgerror.New(pgcode.InvalidParameterValue,
 		"null value not allowed for object key")
-	errJSONObjectMismatchedArrayDim = pgerror.New(pgerror.CodeInvalidParameterValueError,
+	errJSONObjectMismatchedArrayDim = pgerror.New(pgcode.InvalidParameterValue,
 		"mismatched array dimensions")
 )
 
@@ -3336,7 +3600,7 @@ func checkHasNulls(ary tree.DArray) error {
 	if ary.HasNulls {
 		for i := range ary.Array {
 			if ary.Array[i] == tree.DNull {
-				return pgerror.Newf(pgerror.CodeNullValueNotAllowedError, "path element at position %d is null", i+1)
+				return pgerror.Newf(pgcode.NullValueNotAllowed, "path element at position %d is null", i+1)
 			}
 		}
 	}
@@ -3460,7 +3724,7 @@ var jsonTypeOfImpl = tree.Overload{
 		case json.ObjectJSONType:
 			return jsonObjectDString, nil
 		}
-		return nil, pgerror.AssertionFailedf("unexpected JSON type %d", t)
+		return nil, errors.AssertionFailedf("unexpected JSON type %d", t)
 	},
 	Info: "Returns the type of the outermost JSON value as a text string.",
 }
@@ -3482,14 +3746,14 @@ var jsonBuildObjectImpl = tree.Overload{
 	ReturnType: tree.FixedReturnType(types.Jsonb),
 	Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 		if len(args)%2 != 0 {
-			return nil, pgerror.New(pgerror.CodeInvalidParameterValueError,
+			return nil, pgerror.New(pgcode.InvalidParameterValue,
 				"argument list must have even number of elements")
 		}
 
 		builder := json.NewObjectBuilder(len(args) / 2)
 		for i := 0; i < len(args); i += 2 {
 			if args[i] == tree.DNull {
-				return nil, pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+				return nil, pgerror.Newf(pgcode.InvalidParameterValue,
 					"argument %d cannot be null", i+1)
 			}
 
@@ -3520,7 +3784,7 @@ var toJSONImpl = tree.Overload{
 	Info: "Returns the value as JSON or JSONB.",
 }
 
-var prettyPrintNotSupportedError = pgerror.Newf(pgerror.CodeFeatureNotSupportedError, "pretty printing is not supported")
+var prettyPrintNotSupportedError = pgerror.Newf(pgcode.FeatureNotSupported, "pretty printing is not supported")
 
 var arrayToJSONImpls = makeBuiltin(jsonProps(),
 	tree.Overload{
@@ -3642,10 +3906,10 @@ var jsonArrayLengthImpl = tree.Overload{
 		case json.ArrayJSONType:
 			return tree.NewDInt(tree.DInt(j.Len())), nil
 		case json.ObjectJSONType:
-			return nil, pgerror.New(pgerror.CodeInvalidParameterValueError,
+			return nil, pgerror.New(pgcode.InvalidParameterValue,
 				"cannot get array length of a non-array")
 		default:
-			return nil, pgerror.New(pgerror.CodeInvalidParameterValueError,
+			return nil, pgerror.New(pgcode.InvalidParameterValue,
 				"cannot get array length of a scalar")
 		}
 	},
@@ -3814,7 +4078,7 @@ func feedHash(h hash.Hash, args tree.Datums) (bool, error) {
 		}
 		_, err := h.Write([]byte(buf))
 		if err != nil {
-			return false, pgerror.NewAssertionErrorWithWrappedErrf(err,
+			return false, errors.NewAssertionErrorWithWrappedErrf(err,
 				`"It never returns an error." -- https://golang.org/pkg/hash: %T`, h)
 		}
 	}
@@ -4067,7 +4331,7 @@ func regexpEvalFlags(pattern, sqlFlags string) (string, error) {
 			flags &^= syntax.OneLine
 		default:
 			return "", pgerror.Newf(
-				pgerror.CodeInvalidRegularExpressionError, "invalid regexp flag: %q", sqlFlag)
+				pgcode.InvalidRegularExpression, "invalid regexp flag: %q", sqlFlag)
 		}
 	}
 
@@ -4093,7 +4357,7 @@ func regexpEvalFlags(pattern, sqlFlags string) (string, error) {
 func overlay(s, to string, pos, size int) (tree.Datum, error) {
 	if pos < 1 {
 		return nil, pgerror.Newf(
-			pgerror.CodeInvalidParameterValueError, "non-positive substring length not allowed: %d", pos)
+			pgcode.InvalidParameterValue, "non-positive substring length not allowed: %d", pos)
 	}
 	pos--
 
@@ -4222,24 +4486,67 @@ func extractStringFromTime(fromTime *tree.DTime, timeSpan string) (tree.Datum, e
 	case "second", "seconds":
 		return tree.NewDInt(tree.DInt(t.Second())), nil
 	case "millisecond", "milliseconds":
-		return tree.NewDInt(tree.DInt(t.Microsecond() / microsPerMilli)), nil
+		return tree.NewDInt(tree.DInt((t.Second() * 1000) + (t.Microsecond() / microsPerMilli))), nil
 	case "microsecond", "microseconds":
-		return tree.NewDInt(tree.DInt(t.Microsecond())), nil
+		return tree.NewDInt(tree.DInt((t.Second() * 1000 * 1000) + t.Microsecond())), nil
 	case "epoch":
 		seconds := time.Duration(t) * time.Microsecond / time.Second
 		return tree.NewDInt(tree.DInt(int64(seconds))), nil
 	default:
 		return nil, pgerror.Newf(
-			pgerror.CodeInvalidParameterValueError, "unsupported timespan: %s", timeSpan)
+			pgcode.InvalidParameterValue, "unsupported timespan: %s", timeSpan)
 	}
+}
+
+// dateToJulianDay is based on the date2j function in PostgreSQL 10.5.
+func dateToJulianDay(year int, month int, day int) int {
+	if month > 2 {
+		month++
+		year += 4800
+	} else {
+		month += 13
+		year += 4799
+	}
+
+	century := year / 100
+	jd := year*365 - 32167
+	jd += year/4 - century + century/4
+	jd += 7834*month/256 + day
+
+	return jd
 }
 
 func extractStringFromTimestamp(
 	_ *tree.EvalContext, fromTime time.Time, timeSpan string,
 ) (tree.Datum, error) {
 	switch timeSpan {
+	case "millennia", "millennium", "millenniums":
+		year := fromTime.Year()
+		if year > 0 {
+			return tree.NewDInt(tree.DInt((year + 999) / 1000)), nil
+		}
+		return tree.NewDInt(tree.DInt(-((999 - (year - 1)) / 1000))), nil
+
+	case "centuries", "century":
+		year := fromTime.Year()
+		if year > 0 {
+			return tree.NewDInt(tree.DInt((year + 99) / 100)), nil
+		}
+		return tree.NewDInt(tree.DInt(-((99 - (year - 1)) / 100))), nil
+
+	case "decade", "decades":
+		year := fromTime.Year()
+		if year >= 0 {
+			return tree.NewDInt(tree.DInt(year / 10)), nil
+		}
+		return tree.NewDInt(tree.DInt(-((8 - (year - 1)) / 10))), nil
+
 	case "year", "years":
 		return tree.NewDInt(tree.DInt(fromTime.Year())), nil
+
+	case "isoyear":
+		year, _ := fromTime.ISOWeek()
+		return tree.NewDInt(tree.DInt(year)), nil
 
 	case "quarter":
 		return tree.NewDInt(tree.DInt((fromTime.Month()-1)/3 + 1)), nil
@@ -4257,8 +4564,19 @@ func extractStringFromTimestamp(
 	case "dayofweek", "dow":
 		return tree.NewDInt(tree.DInt(fromTime.Weekday())), nil
 
+	case "isodow":
+		day := fromTime.Weekday()
+		if day == 0 {
+			return tree.NewDInt(tree.DInt(7)), nil
+		}
+		return tree.NewDInt(tree.DInt(day)), nil
+
 	case "dayofyear", "doy":
 		return tree.NewDInt(tree.DInt(fromTime.YearDay())), nil
+
+	case "julian":
+		julianDay := dateToJulianDay(fromTime.Year(), int(fromTime.Month()), fromTime.Day())
+		return tree.NewDInt(tree.DInt(julianDay)), nil
 
 	case "hour", "hours":
 		return tree.NewDInt(tree.DInt(fromTime.Hour())), nil
@@ -4271,16 +4589,16 @@ func extractStringFromTimestamp(
 
 	case "millisecond", "milliseconds":
 		// This a PG extension not supported in MySQL.
-		return tree.NewDInt(tree.DInt(fromTime.Nanosecond() / int(time.Millisecond))), nil
+		return tree.NewDInt(tree.DInt((fromTime.Second() * 1000) + (fromTime.Nanosecond() / int(time.Millisecond)))), nil
 
 	case "microsecond", "microseconds":
-		return tree.NewDInt(tree.DInt(fromTime.Nanosecond() / int(time.Microsecond))), nil
+		return tree.NewDInt(tree.DInt((fromTime.Second() * 1000 * 1000) + (fromTime.Nanosecond() / int(time.Microsecond)))), nil
 
 	case "epoch":
 		return tree.NewDInt(tree.DInt(fromTime.Unix())), nil
 
 	default:
-		return nil, pgerror.Newf(pgerror.CodeInvalidParameterValueError, "unsupported timespan: %s", timeSpan)
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "unsupported timespan: %s", timeSpan)
 	}
 }
 
@@ -4307,7 +4625,7 @@ func truncateTime(fromTime *tree.DTime, timeSpan string) (*tree.DTime, error) {
 		micro = (micro / microsPerMilli) * microsPerMilli
 	case "microsecond", "microseconds":
 	default:
-		return nil, pgerror.Newf(pgerror.CodeInvalidParameterValueError, "unsupported timespan: %s", timeSpan)
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "unsupported timespan: %s", timeSpan)
 	}
 
 	return tree.MakeDTime(timeofday.New(hour, min, sec, micro)), nil
@@ -4399,7 +4717,7 @@ func encodeEscape(input []byte) string {
 	return result.String()
 }
 
-var errInvalidSyntaxForDecode = pgerror.New(pgerror.CodeInvalidParameterValueError, "invalid syntax for decode(..., 'escape')")
+var errInvalidSyntaxForDecode = pgerror.New(pgcode.InvalidParameterValue, "invalid syntax for decode(..., 'escape')")
 
 func isOctalDigit(c byte) bool {
 	return '0' <= c && c <= '7'
@@ -4455,6 +4773,30 @@ func truncateTimestamp(
 	nsecTrunc := 0
 
 	switch timeSpan {
+	case "millennia", "millennium", "millenniums":
+		if year > 0 {
+			year = ((year+999)/1000)*1000 - 999
+		} else {
+			year = -((999-(year-1))/1000)*1000 + 1
+		}
+		month, day, hour, min, sec, nsec = monthTrunc, dayTrunc, hourTrunc, minTrunc, secTrunc, nsecTrunc
+
+	case "centuries", "century":
+		if year > 0 {
+			year = ((year+99)/100)*100 - 99
+		} else {
+			year = -((99-(year-1))/100)*100 + 1
+		}
+		month, day, hour, min, sec, nsec = monthTrunc, dayTrunc, hourTrunc, minTrunc, secTrunc, nsecTrunc
+
+	case "decade", "decades":
+		if year >= 0 {
+			year = (year / 10) * 10
+		} else {
+			year = -((8 - (year - 1)) / 10) * 10
+		}
+		month, day, hour, min, sec, nsec = monthTrunc, dayTrunc, hourTrunc, minTrunc, secTrunc, nsecTrunc
+
 	case "year", "years":
 		month, day, hour, min, sec, nsec = monthTrunc, dayTrunc, hourTrunc, minTrunc, secTrunc, nsecTrunc
 
@@ -4493,7 +4835,7 @@ func truncateTimestamp(
 		nsec = microseconds
 
 	default:
-		return nil, pgerror.Newf(pgerror.CodeInvalidParameterValueError, "unsupported timespan: %s", timeSpan)
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "unsupported timespan: %s", timeSpan)
 	}
 
 	toTime := time.Date(year, month, day, hour, min, sec, nsec, loc)
@@ -4504,7 +4846,7 @@ func truncateTimestamp(
 func asJSONBuildObjectKey(d tree.Datum) (string, error) {
 	switch t := d.(type) {
 	case *tree.DJSON, *tree.DArray, *tree.DTuple:
-		return "", pgerror.New(pgerror.CodeInvalidParameterValueError,
+		return "", pgerror.New(pgcode.InvalidParameterValue,
 			"key value must be scalar, not array, tuple, or json")
 	case *tree.DString:
 		return string(*t), nil
@@ -4515,7 +4857,7 @@ func asJSONBuildObjectKey(d tree.Datum) (string, error) {
 		*tree.DTime, *tree.DBitArray:
 		return tree.AsStringWithFlags(d, tree.FmtBareStrings), nil
 	default:
-		return "", pgerror.AssertionFailedf("unexpected type %T for key value", d)
+		return "", errors.AssertionFailedf("unexpected type %T for key value", d)
 	}
 }
 
@@ -4524,7 +4866,7 @@ func asJSONObjectKey(d tree.Datum) (string, error) {
 	case *tree.DString:
 		return string(*t), nil
 	default:
-		return "", pgerror.AssertionFailedf("unexpected type %T for asJSONObjectKey", d)
+		return "", errors.AssertionFailedf("unexpected type %T for asJSONObjectKey", d)
 	}
 }
 
@@ -4601,6 +4943,25 @@ func rpad(s string, length int, fill string) (string, error) {
 	return buf.String(), nil
 }
 
+// widthBucket returns the bucket number to which operand would be assigned in a histogram having count
+// equal-width buckets spanning the range b1 to b2
+func widthBucket(operand float64, b1 float64, b2 float64, count int) int {
+	bucket := 0
+	if (b1 < b2 && operand > b2) || (b1 > b2 && operand < b2) {
+		return count + 1
+	}
+
+	if (b1 < b2 && operand < b1) || (b1 > b2 && operand > b1) {
+		return 0
+	}
+
+	width := (b2 - b1) / float64(count)
+	difference := operand - b1
+	bucket = int(math.Floor(difference/width) + 1)
+
+	return bucket
+}
+
 // CleanEncodingName sanitizes the string meant to represent a
 // recognized encoding. This ignores any non-alphanumeric character.
 //
@@ -4620,7 +4981,7 @@ func CleanEncodingName(s string) string {
 }
 
 var errInsufficientPriv = pgerror.New(
-	pgerror.CodeInsufficientPrivilegeError, "insufficient privilege",
+	pgcode.InsufficientPrivilege, "insufficient privilege",
 )
 
 func checkPrivilegedUser(ctx *tree.EvalContext) error {
@@ -4638,7 +4999,7 @@ var EvalFollowerReadOffset func(clusterID uuid.UUID, _ *cluster.Settings) (time.
 
 func recentTimestamp(ctx *tree.EvalContext) (time.Time, error) {
 	if EvalFollowerReadOffset == nil {
-		return time.Time{}, pgerror.New(pgerror.CodeFeatureNotSupportedError,
+		return time.Time{}, pgerror.New(pgcode.FeatureNotSupported,
 			tree.FollowerReadTimestampFunctionName+
 				" is only available in ccl distribution")
 	}

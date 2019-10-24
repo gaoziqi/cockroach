@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -21,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -603,16 +600,18 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		mtc.transport.Listen(partitionStore.Ident.StoreID, &unreliableRaftHandler{
 			rangeID:            rangeID,
 			RaftMessageHandler: partitionStore,
-			dropReq: func(req *storage.RaftMessageRequest) bool {
-				// Make sure that even going forward no MsgApp for what we just truncated can
-				// make it through. The Raft transport is asynchronous so this is necessary
-				// to make the test pass reliably.
-				// NB: the Index on the message is the log index that _precedes_ any of the
-				// entries in the MsgApp, so filter where msg.Index < index, not <= index.
-				return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
+			unreliableRaftHandlerFuncs: unreliableRaftHandlerFuncs{
+				dropReq: func(req *storage.RaftMessageRequest) bool {
+					// Make sure that even going forward no MsgApp for what we just truncated can
+					// make it through. The Raft transport is asynchronous so this is necessary
+					// to make the test pass reliably.
+					// NB: the Index on the message is the log index that _precedes_ any of the
+					// entries in the MsgApp, so filter where msg.Index < index, not <= index.
+					return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
+				},
+				dropHB:   func(*storage.RaftHeartbeat) bool { return false },
+				dropResp: func(*storage.RaftMessageResponse) bool { return false },
 			},
-			dropHB:   func(*storage.RaftHeartbeat) bool { return false },
-			dropResp: func(*storage.RaftMessageResponse) bool { return false },
 		})
 
 		// Check the error.
@@ -699,7 +698,7 @@ func TestReplicaRangefeedNudgeSlowClosedTimestamp(t *testing.T) {
 	rangeFeedChs := make([]chan *roachpb.RangeFeedEvent, len(repls))
 	rangeFeedErrC := make(chan error, len(repls))
 	for i := range repls {
-		ds := tc.Server(i).DistSender()
+		ds := tc.Server(i).DistSenderI().(*kv.DistSender)
 		rangeFeedCh := make(chan *roachpb.RangeFeedEvent)
 		rangeFeedChs[i] = rangeFeedCh
 		go func() {

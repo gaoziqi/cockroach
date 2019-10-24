@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -52,6 +48,10 @@ const (
 	plannerStartExecStmt    // Execution starts.
 	plannerEndExecStmt      // Execution ends.
 
+	// Transaction phases.
+	transactionStart // Transaction starts.
+	transactionEnd   // Transaction ends.
+
 	// sessionNumPhases must be listed last so that it can be used to
 	// define arrays sufficiently large to hold all the other values.
 	sessionNumPhases
@@ -79,6 +79,7 @@ type EngineMetrics struct {
 	SQLExecLatency        *metric.Histogram
 	DistSQLServiceLatency *metric.Histogram
 	SQLServiceLatency     *metric.Histogram
+	SQLTxnLatency         *metric.Histogram
 
 	// TxnAbortCount counts transactions that were aborted, either due
 	// to non-retriable errors, or retriable errors when the client-side
@@ -102,6 +103,7 @@ func (ex *connExecutor) maybeSavePlan(
 		p.stmt,
 		p.curPlan.flags.IsSet(planFlagDistributed),
 		p.curPlan.flags.IsSet(planFlagOptUsed),
+		p.curPlan.flags.IsSet(planFlagImplicitTxn),
 		p.curPlan.execErr) {
 		// If statement plan sample is requested, collect a sample.
 		return planToTree(ctx, &p.curPlan)
@@ -118,9 +120,15 @@ func (ex *connExecutor) maybeSavePlan(
 // - result is the result set computed by the query/statement.
 // - err is the error encountered, if any.
 func (ex *connExecutor) recordStatementSummary(
-	ctx context.Context, planner *planner, automaticRetryCount int, rowsAffected int, err error,
+	ctx context.Context,
+	planner *planner,
+	automaticRetryCount int,
+	rowsAffected int,
+	err error,
+	bytesRead int64,
+	rowsRead int64,
 ) {
-	phaseTimes := planner.statsCollector.PhaseTimes()
+	phaseTimes := &ex.statsCollector.phaseTimes
 
 	// Compute the run latency. This is always recorded in the
 	// server metrics.
@@ -159,17 +167,11 @@ func (ex *connExecutor) recordStatementSummary(
 		m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 	}
 
-	// Close the plan if this was not done earlier.
-	// This also ensures that curPlan.savedPlanForStats is
-	// collected (see maybeSavePlan).
-	planner.curPlan.execErr = err
-	planner.curPlan.close(ctx)
-
-	planner.statsCollector.RecordStatement(
+	ex.statsCollector.recordStatement(
 		stmt, planner.curPlan.savedPlanForStats,
-		flags.IsSet(planFlagDistributed), flags.IsSet(planFlagOptUsed),
+		flags.IsSet(planFlagDistributed), flags.IsSet(planFlagOptUsed), flags.IsSet(planFlagImplicitTxn),
 		automaticRetryCount, rowsAffected, err,
-		parseLat, planLat, runLat, svcLat, execOverhead,
+		parseLat, planLat, runLat, svcLat, execOverhead, bytesRead, rowsRead,
 	)
 
 	if log.V(2) {
@@ -198,8 +200,6 @@ func (ex *connExecutor) updateOptCounters(planFlags planFlags) {
 	m := &ex.metrics.EngineMetrics
 	if planFlags.IsSet(planFlagOptUsed) {
 		m.SQLOptCount.Inc(1)
-	} else if planFlags.IsSet(planFlagOptFallback) {
-		m.SQLOptFallbackCount.Inc(1)
 	}
 
 	if planFlags.IsSet(planFlagOptCacheHit) {

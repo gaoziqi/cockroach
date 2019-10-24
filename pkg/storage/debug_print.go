@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -103,7 +98,7 @@ func tryIntent(kv engine.MVCCKeyValue) (string, error) {
 
 func decodeWriteBatch(writeBatch *storagepb.WriteBatch) (string, error) {
 	if writeBatch == nil {
-		return "<nil>", nil
+		return "<nil>\n", nil
 	}
 
 	r, err := engine.NewRocksDBBatchReader(writeBatch.Data)
@@ -170,46 +165,59 @@ func tryRaftLogEntry(kv engine.MVCCKeyValue) (string, error) {
 	if err := maybeUnmarshalInline(kv.Value, &ent); err != nil {
 		return "", err
 	}
-	if ent.Type == raftpb.EntryNormal {
-		if len(ent.Data) > 0 {
-			_, cmdData := DecodeRaftCommand(ent.Data)
-			var cmd storagepb.RaftCommand
-			if err := protoutil.Unmarshal(cmdData, &cmd); err != nil {
+
+	var cmd storagepb.RaftCommand
+	switch ent.Type {
+	case raftpb.EntryNormal:
+		if len(ent.Data) == 0 {
+			return fmt.Sprintf("%s: EMPTY\n", &ent), nil
+		}
+		_, cmdData := DecodeRaftCommand(ent.Data)
+		if err := protoutil.Unmarshal(cmdData, &cmd); err != nil {
+			return "", err
+		}
+	case raftpb.EntryConfChange, raftpb.EntryConfChangeV2:
+		var c raftpb.ConfChangeI
+		if ent.Type == raftpb.EntryConfChange {
+			var cc raftpb.ConfChange
+			if err := protoutil.Unmarshal(ent.Data, &cc); err != nil {
 				return "", err
 			}
-			ent.Data = nil
-			var leaseStr string
-			if l := cmd.DeprecatedProposerLease; l != nil {
-				// Use the full lease, if available.
-				leaseStr = l.String()
-			} else {
-				leaseStr = fmt.Sprintf("lease #%d", cmd.ProposerLeaseSequence)
+			c = cc
+		} else {
+			var cc raftpb.ConfChangeV2
+			if err := protoutil.Unmarshal(ent.Data, &cc); err != nil {
+				return "", err
 			}
-			writeBatch, err := decodeWriteBatch(cmd.WriteBatch)
-			if err != nil {
-				writeBatch = "failed to decode: " + err.Error() + "\nafter:\n" + writeBatch
-			}
-			return fmt.Sprintf("%s by %s\n%s\nwrite batch:\n%s",
-				&ent, leaseStr, &cmd, writeBatch), nil
+			c = cc
 		}
-		return fmt.Sprintf("%s: EMPTY\n", &ent), nil
-	} else if ent.Type == raftpb.EntryConfChange {
-		var cc raftpb.ConfChange
-		if err := protoutil.Unmarshal(ent.Data, &cc); err != nil {
-			return "", err
-		}
+
 		var ctx ConfChangeContext
-		if err := protoutil.Unmarshal(cc.Context, &ctx); err != nil {
+		if err := protoutil.Unmarshal(c.AsV2().Context, &ctx); err != nil {
 			return "", err
 		}
-		var cmd storagepb.ReplicatedEvalResult
 		if err := protoutil.Unmarshal(ctx.Payload, &cmd); err != nil {
 			return "", err
 		}
-		ent.Data = nil
-		return fmt.Sprintf("%s\n%s\n", &ent, &cmd), nil
+	default:
+		return "", fmt.Errorf("unknown log entry type: %s", &ent)
 	}
-	return "", fmt.Errorf("unknown log entry type: %s", &ent)
+	ent.Data = nil
+
+	var leaseStr string
+	if l := cmd.DeprecatedProposerLease; l != nil {
+		leaseStr = l.String() // use full lease, if available
+	} else {
+		leaseStr = fmt.Sprintf("lease #%d", cmd.ProposerLeaseSequence)
+	}
+
+	wbStr, err := decodeWriteBatch(cmd.WriteBatch)
+	if err != nil {
+		wbStr = "failed to decode: " + err.Error() + "\nafter:\n" + wbStr
+	}
+	cmd.WriteBatch = nil
+
+	return fmt.Sprintf("%s by %s\n%s\nwrite batch:\n%s", &ent, leaseStr, &cmd, wbStr), nil
 }
 
 func tryTxn(kv engine.MVCCKeyValue) (string, error) {

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -22,14 +18,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
+	"github.com/cockroachdb/logtags"
 	"github.com/pkg/errors"
 )
 
@@ -104,11 +100,11 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		}
 	}
 
-	sketchSpecs := make([]distsqlpb.SketchSpec, len(reqStats))
+	sketchSpecs := make([]execinfrapb.SketchSpec, len(reqStats))
 	sampledColumnIDs := make([]sqlbase.ColumnID, scan.valNeededForCol.Len())
 	for i, s := range reqStats {
-		spec := distsqlpb.SketchSpec{
-			SketchType:          distsqlpb.SketchType_HLL_PLUS_PLUS_V1,
+		spec := execinfrapb.SketchSpec{
+			SketchType:          execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
 			GenerateHistogram:   s.histogram,
 			HistogramMaxBuckets: uint32(s.histogramMaxBuckets),
 			Columns:             make([]uint32, len(s.columns)),
@@ -128,7 +124,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	}
 
 	// Set up the samplers.
-	sampler := &distsqlpb.SamplerSpec{Sketches: sketchSpecs}
+	sampler := &execinfrapb.SamplerSpec{Sketches: sketchSpecs}
 	for _, s := range reqStats {
 		sampler.MaxFractionIdle = details.MaxFractionIdle
 		if s.histogram {
@@ -152,10 +148,10 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	outTypes = append(outTypes, *types.Bytes)
 
 	p.AddNoGroupingStage(
-		distsqlpb.ProcessorCoreUnion{Sampler: sampler},
-		distsqlpb.PostProcessSpec{},
+		execinfrapb.ProcessorCoreUnion{Sampler: sampler},
+		execinfrapb.PostProcessSpec{},
 		outTypes,
-		distsqlpb.Ordering{},
+		execinfrapb.Ordering{},
 	)
 
 	// Estimate the expected number of rows based on existing stats in the cache.
@@ -181,7 +177,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	}
 
 	// Set up the final SampleAggregator stage.
-	agg := &distsqlpb.SampleAggregatorSpec{
+	agg := &execinfrapb.SampleAggregatorSpec{
 		Sketches:         sketchSpecs,
 		SampleSize:       sampler.SampleSize,
 		SampledColumnIDs: sampledColumnIDs,
@@ -196,8 +192,8 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	}
 	p.AddSingleGroupStage(
 		node,
-		distsqlpb.ProcessorCoreUnion{SampleAggregator: agg},
-		distsqlpb.PostProcessSpec{},
+		execinfrapb.ProcessorCoreUnion{SampleAggregator: agg},
+		execinfrapb.PostProcessSpec{},
 		[]types.T{},
 	)
 
@@ -208,13 +204,12 @@ func (dsp *DistSQLPlanner) createPlanForCreateStats(
 	planCtx *PlanningCtx, job *jobs.Job,
 ) (PhysicalPlan, error) {
 	details := job.Details().(jobspb.CreateStatsDetails)
-	reqStats := make([]requestedStat, len(details.ColumnLists))
+	reqStats := make([]requestedStat, len(details.ColumnStats))
+	histogramCollectionEnabled := stats.HistogramClusterMode.Get(&dsp.st.SV)
 	for i := 0; i < len(reqStats); i++ {
-		// Currently we do not use histograms, so don't bother creating one.
-		// When this changes, we can only use it for single-column stats.
-		histogram := false
+		histogram := details.ColumnStats[i].HasHistogram && histogramCollectionEnabled
 		reqStats[i] = requestedStat{
-			columns:             details.ColumnLists[i].IDs,
+			columns:             details.ColumnStats[i].ColumnIDs,
 			histogram:           histogram,
 			histogramMaxBuckets: histogramBuckets,
 			name:                details.Name,
@@ -256,6 +251,6 @@ func (dsp *DistSQLPlanner) planAndRunCreateStats(
 	)
 	defer recv.Release()
 
-	dsp.Run(planCtx, txn, &physPlan, recv, evalCtx, nil /* finishedSetupFn */)
+	dsp.Run(planCtx, txn, &physPlan, recv, evalCtx, nil /* finishedSetupFn */)()
 	return resultRows.Err()
 }

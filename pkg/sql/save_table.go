@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -20,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
 
 // saveTableNode is used for internal testing. It is a node that passes through
@@ -32,6 +29,11 @@ type saveTableNode struct {
 
 	target tree.TableName
 
+	// Column names from the saved table. These could be different than the names
+	// of the columns in the source plan. Note that saveTableNode passes through
+	// the source plan's column names.
+	colNames []string
+
 	run struct {
 		// vals accumulates a ValuesClause with the rows.
 		vals tree.ValuesClause
@@ -41,8 +43,10 @@ type saveTableNode struct {
 // saveTableInsertBatch is the number of rows per issued INSERT statement.
 const saveTableInsertBatch = 100
 
-func (p *planner) makeSaveTable(source planNode, target *tree.TableName) planNode {
-	return &saveTableNode{source: source, target: *target}
+func (p *planner) makeSaveTable(
+	source planNode, target *tree.TableName, colNames []string,
+) planNode {
+	return &saveTableNode{source: source, target: *target, colNames: colNames}
 }
 
 func (n *saveTableNode) startExec(params runParams) error {
@@ -51,10 +55,16 @@ func (n *saveTableNode) startExec(params runParams) error {
 	}
 
 	cols := planColumns(n.source)
-	for _, c := range cols {
+	if len(n.colNames) != len(cols) {
+		return errors.AssertionFailedf(
+			"number of column names (%d) does not match number of columns (%d)",
+			len(n.colNames), len(cols),
+		)
+	}
+	for i := 0; i < len(cols); i++ {
 		def := &tree.ColumnTableDef{
-			Name: tree.Name(c.Name),
-			Type: c.Typ,
+			Name: tree.Name(n.colNames[i]),
+			Type: cols[i].Typ,
 		}
 		def.Nullable.Nullability = tree.SilentNull
 		create.Defs = append(create.Defs, def)

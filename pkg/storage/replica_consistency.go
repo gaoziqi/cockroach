@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -29,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -46,7 +42,19 @@ import (
 	"github.com/pkg/errors"
 )
 
-var testingFatalOnStatsMismatch = envutil.EnvOrDefaultBool("COCKROACH_FATAL_ON_STATS_MISMATCH", false)
+// fatalOnStatsMismatch, if true, turns stats mismatches into fatal errors. A
+// stats mismatch is the event in which
+// - the consistency checker finds that all replicas are consistent
+//   (i.e. byte-by-byte identical)
+// - the (identical) stats tracked in them do not correspond to a recomputation
+//   via the data, i.e. the stats were incorrect
+// - ContainsEstimates==false, i.e. the stats claimed they were correct.
+//
+// Before issuing the fatal error, the cluster bootstrap version is verified.
+// We know that old versions of CockroachDB sometimes violated this invariant,
+// but we want to exclude these violations, focusing only on cases in which we
+// know old CRDB versions (<19.1 at time of writing) were not involved.
+var fatalOnStatsMismatch = envutil.EnvOrDefaultBool("COCKROACH_ENFORCE_CONSISTENT_STATS", false)
 
 const (
 	// collectChecksumTimeout controls how long we'll wait to collect a checksum
@@ -120,10 +128,12 @@ func (r *Replica) CheckConsistency(
 		inconsistencyCount++
 		var buf bytes.Buffer
 		_, _ = fmt.Fprintf(&buf, "replica %s is inconsistent: expected checksum %x, got %x\n"+
-			"persisted stats: exp %+v, got %+v\n",
+			"persisted stats: exp %+v, got %+v\n"+
+			"stats delta: exp %+v, got %+v\n",
 			result.Replica,
 			expResponse.Checksum, result.Response.Checksum,
 			expResponse.Persisted, result.Response.Persisted,
+			expResponse.Delta, result.Response.Delta,
 		)
 		if expResponse.Snapshot != nil && result.Response.Snapshot != nil {
 			diff := diffRange(expResponse.Snapshot, result.Response.Snapshot)
@@ -176,18 +186,30 @@ func (r *Replica) CheckConsistency(
 		// is through this mechanism that existing ranges are updated. Hence, the
 		// logging below is relatively timid.
 
-		// If there's no delta (or some nodes in the cluster may not know
-		// RecomputeStats, in which case sending it to them could crash them),
-		// there's nothing else to do.
-		if delta == (enginepb.MVCCStats{}) || !r.ClusterSettings().Version.IsActive(cluster.VersionRecomputeStats) {
+		// If there's no delta, there's nothing else to do.
+		if delta == (enginepb.MVCCStats{}) {
 			return resp, nil
 		}
 
-		if !delta.ContainsEstimates && testingFatalOnStatsMismatch {
+		if !delta.ContainsEstimates && fatalOnStatsMismatch {
 			// ContainsEstimates is true if the replica's persisted MVCCStats had ContainsEstimates set.
 			// If this was *not* the case, the replica believed it had accurate stats. But we just found
 			// out that this isn't true.
-			log.Fatalf(ctx, "found a delta of %+v", log.Safe(delta))
+
+			var v roachpb.Version
+			if err := r.store.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+				return txn.GetProto(ctx, keys.BootstrapVersionKey, &v)
+			}); err != nil {
+				log.Infof(ctx, "while retrieving cluster bootstrap version: %s", err)
+				// Intentionally continue with the assumption that it's the current version.
+				v = r.store.cfg.Settings.Version.Version().Version
+			}
+			// For clusters that ever ran <19.1, we're not so sure that the stats are
+			// consistent. Verify this only for clusters that started out on 19.1 or
+			// higher.
+			if !v.Less(roachpb.Version{Major: 19, Minor: 1}) {
+				log.Fatalf(ctx, "found a delta of %+v", log.Safe(delta))
+			}
 		}
 
 		// We've found that there's something to correct; send an RecomputeStatsRequest. Note that this
@@ -260,7 +282,7 @@ type ConsistencyCheckResult struct {
 func (r *Replica) collectChecksumFromReplica(
 	ctx context.Context, replica roachpb.ReplicaDescriptor, id uuid.UUID, checksum []byte,
 ) (CollectChecksumResponse, error) {
-	conn, err := r.store.cfg.NodeDialer.Dial(ctx, replica.NodeID)
+	conn, err := r.store.cfg.NodeDialer.Dial(ctx, replica.NodeID, rpc.DefaultClass)
 	if err != nil {
 		return CollectChecksumResponse{},
 			errors.Wrapf(err, "could not dial node ID %d", replica.NodeID)
@@ -304,7 +326,7 @@ func (r *Replica) RunConsistencyCheck(
 
 		// Move the local replica to the front (which makes it the "master"
 		// we're comparing against).
-		orderedReplicas = append(orderedReplicas, desc.Replicas().Unwrap()...)
+		orderedReplicas = append(orderedReplicas, desc.Replicas().All()...)
 
 		sort.Slice(orderedReplicas, func(i, j int) bool {
 			return orderedReplicas[i] == localReplica
@@ -551,6 +573,7 @@ func (r *Replica) sha512(
 				return nil, err
 			}
 			kv.Value = v.RawBytes
+			snapshot.KV = append(snapshot.KV, kv)
 		}
 		if _, err := hasher.Write(b); err != nil {
 			return nil, err

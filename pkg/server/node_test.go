@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -27,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -176,7 +173,10 @@ func createAndStartTestNode(
 	// because otherwise some of the initial ranges cannot be accessed (since
 	// they need an epoch-based lease).
 	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, nil /* alive */)
-	if err := node.start(ctx, addr, bootstrappedEngines, newEngines,
+	if err := node.start(ctx,
+		addr,
+		addr, // Note: this is not really a SQL address but these tests do not use SQL so all is fine.
+		bootstrappedEngines, newEngines, "",
 		roachpb.Attributes{}, locality, cv, []roachpb.LocalityAddress{},
 		nil, /*nodeDescriptorCallback */
 	); err != nil {
@@ -209,7 +209,7 @@ func TestBootstrapCluster(t *testing.T) {
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 	defer e.Close()
 	if _, err := bootstrapCluster(
-		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
+		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestBootstrapCluster(t *testing.T) {
 	}
 
 	// Add the initial keys for sql.
-	kvs, tableSplits := GetBootstrapSchema(config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef()).GetInitialValues()
+	kvs, tableSplits := GetBootstrapSchema(zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef()).GetInitialValues()
 	for _, kv := range kvs {
 		expectedKeys = append(expectedKeys, kv.Key)
 	}
@@ -264,7 +264,7 @@ func TestBootstrapNewStore(t *testing.T) {
 	ctx := context.Background()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 	if _, err := bootstrapCluster(
-		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
+		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestNodeJoin(t *testing.T) {
 	engineStopper.AddCloser(e)
 
 	if _, err := bootstrapCluster(
-		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
+		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +390,7 @@ func TestCorruptedClusterID(t *testing.T) {
 	defer e.Close()
 
 	if _, err := bootstrapCluster(
-		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
+		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,9 @@ func TestCorruptedClusterID(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := node.start(
-		ctx, serverAddr, bootstrappedEngines, newEngines,
+		ctx, serverAddr,
+		serverAddr, // Note: this is not really a SQL address but the tests in this package do not use SQL so all is fine.
+		bootstrappedEngines, newEngines, "",
 		roachpb.Attributes{}, roachpb.Locality{}, cv,
 		[]roachpb.LocalityAddress{},
 		nil, /* nodeDescriptorCallback */
@@ -692,7 +694,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	// ========================================
 
 	// Split the range.
-	if err := ts.db.AdminSplit(context.TODO(), splitKey, splitKey, true /* manual */); err != nil {
+	if err := ts.db.AdminSplit(context.TODO(), splitKey, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -732,7 +734,7 @@ func TestStartNodeWithLocality(t *testing.T) {
 		e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 		defer e.Close()
 		if _, err := bootstrapCluster(
-			ctx, []engine.Engine{e}, cluster.TestingClusterVersion, config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef(),
+			ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 		); err != nil {
 			t.Fatal(err)
 		}

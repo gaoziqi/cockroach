@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
@@ -20,10 +16,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // buildUpdate builds a memo group for an UpdateOp expression. First, an input
@@ -67,7 +65,7 @@ import (
 // become a physical property required of the Update operator).
 func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope) {
 	if upd.OrderBy != nil && upd.Limit == nil {
-		panic(pgerror.Newf(pgerror.CodeSyntaxError,
+		panic(pgerror.Newf(pgcode.Syntax,
 			"UPDATE statement requires LIMIT when ORDER BY is used"))
 	}
 
@@ -76,9 +74,9 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 		panic(pgerror.DangerousStatementf("UPDATE without WHERE clause"))
 	}
 
+	var ctes []cteSource
 	if upd.With != nil {
-		inScope = b.buildCTE(upd.With.CTEList, inScope)
-		defer b.checkCTEUsage(inScope)
+		inScope, ctes = b.buildCTEs(upd.With, inScope)
 	}
 
 	// UPDATE xx AS yy - we want to know about xx (tn) because
@@ -93,10 +91,10 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 	}
 
 	// Check Select permission as well, since existing values must be read.
-	b.checkPrivilege(tn, tab, privilege.SELECT)
+	b.checkPrivilege(opt.DepByName(tn), tab, privilege.SELECT)
 
 	var mb mutationBuilder
-	mb.init(b, opt.UpdateOp, tab, *alias)
+	mb.init(b, "update", tab, *alias)
 
 	// Build the input expression that selects the rows that will be updated:
 	//
@@ -105,7 +103,7 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 	//   ORDER BY <order-by> LIMIT <limit>
 	//
 	// All columns from the update table will be projected.
-	mb.buildInputForUpdateOrDelete(inScope, upd.Where, upd.Limit, upd.OrderBy)
+	mb.buildInputForUpdate(inScope, upd.Table, upd.From, upd.Where, upd.Limit, upd.OrderBy)
 
 	// Derive the columns that will be updated from the SET expressions.
 	mb.addTargetColsForUpdate(upd.Exprs)
@@ -124,6 +122,8 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 		mb.buildUpdate(nil /* returning */)
 	}
 
+	mb.outScope.expr = b.wrapWithCTEs(mb.outScope.expr, ctes)
+
 	return mb.outScope
 }
 
@@ -133,7 +133,7 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 // exactly as many columns as are expected by the named SET columns.
 func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 	if len(mb.targetColList) != 0 {
-		panic(pgerror.AssertionFailedf("addTargetColsForUpdate cannot be called more than once"))
+		panic(errors.AssertionFailedf("addTargetColsForUpdate cannot be called more than once"))
 	}
 
 	for _, expr := range exprs {
@@ -165,7 +165,7 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 					"source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression; not supported: %T", expr.Expr))
 			}
 			if len(expr.Names) != n {
-				panic(pgerror.Newf(pgerror.CodeSyntaxError,
+				panic(pgerror.Newf(pgcode.Syntax,
 					"number of columns (%d) does not match number of values (%d)",
 					len(expr.Names), n))
 			}
@@ -324,8 +324,14 @@ func (mb *mutationBuilder) addComputedColsForUpdate() {
 func (mb *mutationBuilder) buildUpdate(returning tree.ReturningExprs) {
 	mb.addCheckConstraintCols()
 
-	private := mb.makeMutationPrivate(returning != nil)
-	mb.outScope.expr = mb.b.factory.ConstructUpdate(mb.outScope.expr, private)
+	mb.buildFKChecksForUpdate()
 
+	private := mb.makeMutationPrivate(returning != nil)
+	for _, col := range mb.extraAccessibleCols {
+		if col.id != 0 {
+			private.PassthroughCols = append(private.PassthroughCols, col.id)
+		}
+	}
+	mb.outScope.expr = mb.b.factory.ConstructUpdate(mb.outScope.expr, mb.checks, private)
 	mb.buildReturning(returning)
 }

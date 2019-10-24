@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -18,7 +14,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -29,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
+// Test the behavior of a binary that doesn't link in CCL when it comes to
+// dealing with partitions. Some things are expected to work, others aren't.
 func TestRemovePartitioningOSS(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -76,15 +74,16 @@ func TestRemovePartitioningOSS(t *testing.T) {
 	FAMILY fam_1_v (v)
 ) PARTITION BY RANGE (k) (
 	PARTITION p1 VALUES FROM (1) TO (2)
-)`
+)
+-- Warning: Partitioned table with no zone configurations.`
 	if a := sqlDB.QueryStr(t, "SHOW CREATE t.kv")[0][1]; exp != a {
 		t.Fatalf("expected:\n%s\n\ngot:\n%s\n\n", exp, a)
 	}
 
 	// Hack in partition zone configs. This also requires a CCL binary to do
 	// properly.
-	zoneConfig := config.ZoneConfig{
-		Subzones: []config.Subzone{
+	zoneConfig := zonepb.ZoneConfig{
+		Subzones: []zonepb.Subzone{
 			{
 				IndexID:       uint32(tableDesc.PrimaryIndex.ID),
 				PartitionName: "p1",
@@ -102,22 +101,26 @@ func TestRemovePartitioningOSS(t *testing.T) {
 		t.Fatal(err)
 	}
 	sqlDB.Exec(t, `INSERT INTO system.zones VALUES ($1, $2)`, tableDesc.ID, zoneConfigBytes)
-	for _, p := range []string{"p1", "p2"} {
-		if exists := sqlutils.ZoneConfigExists(t, sqlDB, "t.kv."+p); !exists {
+	for _, p := range []string{
+		"PARTITION p1 OF INDEX t.public.kv@primary",
+		"PARTITION p2 OF INDEX t.public.kv@foo",
+	} {
+		if exists := sqlutils.ZoneConfigExists(t, sqlDB, p); !exists {
 			t.Fatalf("zone config for %s does not exist", p)
 		}
 	}
 
-	// TODO(benesch): introduce a "STRIP CCL" command to make it possible to
-	// remove CCL features from a table using an OSS binary.
-	reqCCLErr := "requires a CCL binary"
-	sqlDB.ExpectErr(t, reqCCLErr, `ALTER TABLE t.kv PARTITION BY NOTHING`)
-	sqlDB.ExpectErr(t, reqCCLErr, `ALTER INDEX t.kv@foo PARTITION BY NOTHING`)
-	sqlDB.ExpectErr(t, reqCCLErr, `ALTER PARTITION p1 OF TABLE t.kv CONFIGURE ZONE USING DEFAULT`)
-	sqlDB.ExpectErr(t, reqCCLErr, `ALTER PARTITION p2 OF TABLE t.kv CONFIGURE ZONE USING DEFAULT`)
+	// Some things don't work.
+	sqlDB.ExpectErr(t,
+		"OSS binaries do not include enterprise features",
+		`ALTER PARTITION p1 OF TABLE t.kv CONFIGURE ZONE USING DEFAULT`)
+	sqlDB.ExpectErr(t,
+		"OSS binaries do not include enterprise features",
+		`ALTER PARTITION p2 OF INDEX t.kv@foo CONFIGURE ZONE USING DEFAULT`)
 
-	// Odd exception: removing partitioning is, in fact, possible when there are
-	// no zone configs for the table's indices or partitions.
+	// But removing partitioning works.
+	sqlDB.Exec(t, `ALTER TABLE t.kv PARTITION BY NOTHING`)
+	sqlDB.Exec(t, `ALTER INDEX t.kv@foo PARTITION BY NOTHING`)
 	sqlDB.Exec(t, `DELETE FROM system.zones WHERE id = $1`, tableDesc.ID)
 	sqlDB.Exec(t, `ALTER TABLE t.kv PARTITION BY NOTHING`)
 	sqlDB.Exec(t, `ALTER INDEX t.kv@foo PARTITION BY NOTHING`)

@@ -1,17 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -37,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -49,18 +45,27 @@ var maxRate = runFlags.Float64(
 	"max-rate", 0, "Maximum frequency of operations (reads/writes). If 0, no limit.")
 var maxOps = runFlags.Uint64("max-ops", 0, "Maximum number of operations to run")
 var duration = runFlags.Duration("duration", 0, "The duration to run. If 0, run forever.")
-var doInit = runFlags.Bool("init", false, "Automatically run init")
+var doInit = runFlags.Bool("init", false, "Automatically run init. DEPRECATED: Use workload init instead.")
 var ramp = runFlags.Duration("ramp", 0*time.Second, "The duration over which to ramp up load.")
 
 var initFlags = pflag.NewFlagSet(`init`, pflag.ContinueOnError)
 var drop = initFlags.Bool("drop", false, "Drop the existing database, if it exists")
 
 var sharedFlags = pflag.NewFlagSet(`shared`, pflag.ContinueOnError)
-var pprofport = initFlags.Int("pprofport", 33333, "Port for pprof endpoint.")
+var pprofport = sharedFlags.Int("pprofport", 33333, "Port for pprof endpoint.")
+var dataLoader = sharedFlags.String("data-loader", `INSERT`,
+	"How to load initial table data. Options are INSERT and IMPORT")
+
+var displayEvery = runFlags.Duration("display-every", time.Second, "How much time between every one-line activity reports.")
+
+var displayFormat = runFlags.String("display-format", "simple", "Output display format (simple, incremental-json)")
 
 var histograms = runFlags.String(
 	"histograms", "",
 	"File to write per-op incremental and cumulative histogram data.")
+var histogramsMaxLatency = runFlags.Duration(
+	"histograms-max-latency", 100*time.Second,
+	"Expected maximum latency of running a query")
 
 func init() {
 	AddSubCmd(func(userFacing bool) *cobra.Command {
@@ -220,10 +225,7 @@ func workerRun(
 		// Limit how quickly the load generator sends requests based on --max-rate.
 		if limiter != nil {
 			if err := limiter.Wait(ctx); err != nil {
-				if err == ctx.Err() {
-					return
-				}
-				panic(err)
+				return
 			}
 		}
 
@@ -266,12 +268,22 @@ func runInitImpl(
 		return err
 	}
 
-	const batchSize = -1
-	// TODO(dan): Don't hardcode this. Similar to dbOverride, this should be
-	// hooked up to a flag directly once once more of run.go moves inside
-	// workload.
-	const concurrency = 16
-	_, err := workload.Setup(ctx, initDB, gen, batchSize, concurrency)
+	var l workload.InitialDataLoader
+	switch strings.ToLower(*dataLoader) {
+	case `insert`, `inserts`:
+		l = workloadsql.InsertsDataLoader{
+			// TODO(dan): Don't hardcode this. Similar to dbOverride, this should be
+			// hooked up to a flag directly once once more of run.go moves inside
+			// workload.
+			Concurrency: 16,
+		}
+	case `import`, `imports`:
+		l = workload.ImportDataLoader
+	default:
+		return errors.Errorf(`unknown data loader: %s`, *dataLoader)
+	}
+
+	_, err := workloadsql.Setup(ctx, initDB, gen, l)
 	return err
 }
 
@@ -295,12 +307,24 @@ func startPProfEndPoint(ctx context.Context) {
 func runRun(gen workload.Generator, urls []string, dbName string) error {
 	ctx := context.Background()
 
+	var formatter outputFormat
+	switch *displayFormat {
+	case "simple":
+		formatter = &textFormatter{}
+	case "incremental-json":
+		formatter = &jsonFormatter{w: os.Stdout}
+	default:
+		return errors.Errorf("unknown display format: %s", *displayFormat)
+	}
+
 	startPProfEndPoint(ctx)
 	initDB, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return err
 	}
 	if *doInit || *drop {
+		log.Info(ctx, `DEPRECATION: `+
+			`the --init flag on "workload run" will no longer be supported after 19.2`)
 		for {
 			err = runInitImpl(ctx, gen, initDB, dbName)
 			if err == nil {
@@ -324,7 +348,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	if !ok {
 		return errors.Errorf(`no operations defined for %s`, gen.Meta().Name)
 	}
-	reg := histogram.NewRegistry()
+	reg := histogram.NewRegistry(*histogramsMaxLatency)
 	var ops workload.QueryLoad
 	for {
 		ops, err = o.Ops(urls, reg)
@@ -335,13 +359,6 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			return err
 		}
 		log.Infof(ctx, "retrying after error while creating load: %v", err)
-	}
-
-	const splitConcurrency = 384 // TODO(dan): Don't hardcode this.
-	for _, table := range gen.Tables() {
-		if err := workload.Split(ctx, initDB, table, splitConcurrency); err != nil {
-			return err
-		}
 	}
 
 	start := timeutil.Now()
@@ -390,8 +407,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		}
 	}()
 
-	var numErr int
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(*displayEvery)
 	defer ticker.Stop()
 	done := make(chan os.Signal, 3)
 	signal.Notify(done, exitSignals...)
@@ -418,11 +434,11 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		jsonEnc = json.NewEncoder(jsonF)
 	}
 
-	everySecond := log.Every(time.Second)
-	for i := 0; ; {
+	everySecond := log.Every(*displayEvery)
+	for {
 		select {
 		case err := <-errCh:
-			numErr++
+			formatter.outputError(err)
 			if *tolerateErrors {
 				if everySecond.ShouldLog() {
 					log.Error(ctx, err)
@@ -434,21 +450,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		case <-ticker.C:
 			startElapsed := timeutil.Since(start)
 			reg.Tick(func(t histogram.Tick) {
-				if i%20 == 0 {
-					fmt.Println("_elapsed___errors__ops/sec(inst)___ops/sec(cum)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)")
-				}
-				i++
-				fmt.Printf("%8s %8d %14.1f %14.1f %8.1f %8.1f %8.1f %8.1f %s\n",
-					time.Duration(startElapsed.Seconds()+0.5)*time.Second,
-					numErr,
-					float64(t.Hist.TotalCount())/t.Elapsed.Seconds(),
-					float64(t.Cumulative.TotalCount())/startElapsed.Seconds(),
-					time.Duration(t.Hist.ValueAtQuantile(50)).Seconds()*1000,
-					time.Duration(t.Hist.ValueAtQuantile(95)).Seconds()*1000,
-					time.Duration(t.Hist.ValueAtQuantile(99)).Seconds()*1000,
-					time.Duration(t.Hist.ValueAtQuantile(100)).Seconds()*1000,
-					t.Name,
-				)
+				formatter.outputTick(startElapsed, t)
 				if jsonEnc != nil && rampDone == nil {
 					_ = jsonEnc.Encode(t.Snapshot())
 				}
@@ -459,7 +461,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		case <-rampDone:
 			rampDone = nil
 			start = timeutil.Now()
-			i = 0
+			formatter.rampDone()
 			reg.Tick(func(t histogram.Tick) {
 				t.Cumulative.Reset()
 				t.Hist.Reset()
@@ -470,32 +472,11 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			if ops.Close != nil {
 				ops.Close(ctx)
 			}
-			const totalHeader = "\n_elapsed___errors_____ops(total)___ops/sec(cum)__avg(ms)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)"
-			fmt.Println(totalHeader + `__total`)
-			startElapsed := timeutil.Since(start)
-			printTotalHist := func(t histogram.Tick) {
-				if t.Cumulative == nil {
-					return
-				}
-				if t.Cumulative.TotalCount() == 0 {
-					return
-				}
-				fmt.Printf("%7.1fs %8d %14d %14.1f %8.1f %8.1f %8.1f %8.1f %8.1f  %s\n",
-					startElapsed.Seconds(), numErr,
-					t.Cumulative.TotalCount(),
-					float64(t.Cumulative.TotalCount())/startElapsed.Seconds(),
-					time.Duration(t.Cumulative.Mean()).Seconds()*1000,
-					time.Duration(t.Cumulative.ValueAtQuantile(50)).Seconds()*1000,
-					time.Duration(t.Cumulative.ValueAtQuantile(95)).Seconds()*1000,
-					time.Duration(t.Cumulative.ValueAtQuantile(99)).Seconds()*1000,
-					time.Duration(t.Cumulative.ValueAtQuantile(100)).Seconds()*1000,
-					t.Name,
-				)
-			}
 
+			startElapsed := timeutil.Since(start)
 			resultTick := histogram.Tick{Name: ops.ResultHist}
 			reg.Tick(func(t histogram.Tick) {
-				printTotalHist(t)
+				formatter.outputTotal(startElapsed, t)
 				if jsonEnc != nil {
 					// Note that we're outputting the delta from the last tick. The
 					// cumulative histogram can be computed by merging all of the
@@ -511,9 +492,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 					}
 				}
 			})
-
-			fmt.Println(totalHeader + `__result`)
-			printTotalHist(resultTick)
+			formatter.outputResult(startElapsed, resultTick)
 
 			if h, ok := gen.(workload.Hookser); ok {
 				if h.Hooks().PostRun != nil {

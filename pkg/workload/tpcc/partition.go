@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
@@ -267,7 +262,7 @@ func configureZone(db *gosql.DB, cfg zoneConfig, table, partition string, partId
 		opts = fmt.Sprintf(`constraints = '[+%s]'`, kv)
 	case partitionedLeases:
 		// Place one replica in the zone and give that replica lease preference.
-		opts = fmt.Sprintf(`constraints = '{"+%s":1}', lease_preferences = '[[+%s]]'`, kv, kv)
+		opts = fmt.Sprintf(`num_replicas = COPY FROM PARENT, constraints = '{"+%s":1}', lease_preferences = '[[+%s]]'`, kv, kv)
 	default:
 		panic("unexpected")
 	}
@@ -398,8 +393,8 @@ func replicateItem(db *gosql.DB, cfg zoneConfig) error {
 
 		configure := fmt.Sprintf(`
 			ALTER INDEX item@%s
-			CONFIGURE ZONE USING lease_preferences = '[[+zone=%s]]'`,
-			idxName, zone)
+			CONFIGURE ZONE USING num_replicas = COPY FROM PARENT, constraints = '{"+zone=%s":1}', lease_preferences = '[[+zone=%s]]'`,
+			idxName, zone, zone)
 		if _, err := db.Exec(configure); err != nil {
 			return errors.Wrapf(err, "Couldn't exec %q", configure)
 		}

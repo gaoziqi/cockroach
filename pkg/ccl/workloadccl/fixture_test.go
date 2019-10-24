@@ -6,7 +6,7 @@
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
-package workloadccl
+package workloadccl_test
 
 import (
 	"context"
@@ -21,6 +21,7 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/workloadccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -115,16 +116,16 @@ func TestFixture(t *testing.T) {
 		t.Fatalf(`%+v`, err)
 	}
 
-	config := FixtureConfig{
+	config := workloadccl.FixtureConfig{
 		GCSBucket: gcsBucket,
 		GCSPrefix: fmt.Sprintf(`TestFixture-%d`, timeutil.Now().UnixNano()),
 	}
 
-	if _, err := GetFixture(ctx, gcs, config, gen); !testutils.IsError(err, `fixture not found`) {
+	if _, err := workloadccl.GetFixture(ctx, gcs, config, gen); !testutils.IsError(err, `fixture not found`) {
 		t.Fatalf(`expected "fixture not found" error but got: %+v`, err)
 	}
 
-	fixtures, err := ListFixtures(ctx, gcs, config)
+	fixtures, err := workloadccl.ListFixtures(ctx, gcs, config)
 	if err != nil {
 		t.Fatalf(`%+v`, err)
 	}
@@ -133,17 +134,17 @@ func TestFixture(t *testing.T) {
 	}
 
 	const filesPerNode = 1
-	fixture, err := MakeFixture(ctx, db, gcs, config, gen, filesPerNode)
+	fixture, err := workloadccl.MakeFixture(ctx, db, gcs, config, gen, filesPerNode)
 	if err != nil {
 		t.Fatalf(`%+v`, err)
 	}
 
-	_, err = MakeFixture(ctx, db, gcs, config, gen, filesPerNode)
+	_, err = workloadccl.MakeFixture(ctx, db, gcs, config, gen, filesPerNode)
 	if !testutils.IsError(err, `already exists`) {
 		t.Fatalf(`expected 'already exists' error got: %+v`, err)
 	}
 
-	fixtures, err = ListFixtures(ctx, gcs, config)
+	fixtures, err = workloadccl.ListFixtures(ctx, gcs, config)
 	if err != nil {
 		t.Fatalf(`%+v`, err)
 	}
@@ -152,7 +153,7 @@ func TestFixture(t *testing.T) {
 	}
 
 	sqlDB.Exec(t, `CREATE DATABASE test`)
-	if _, err := RestoreFixture(ctx, db, fixture, `test`); err != nil {
+	if _, err := workloadccl.RestoreFixture(ctx, db, fixture, `test`, false); err != nil {
 		t.Fatalf(`%+v`, err)
 	}
 	sqlDB.CheckQueryResults(t,
@@ -183,41 +184,21 @@ func TestImportFixture(t *testing.T) {
 	}
 
 	const filesPerNode = 1
-	const noSkipPostLoad = false
-	sqlDB.Exec(t, `CREATE DATABASE distsort`)
-	_, err := ImportFixture(
-		ctx, db, gen, `distsort`, false /* directIngestion */, filesPerNode, true, /* injectStats */
-		noSkipPostLoad, ``, /* csvServer */
+
+	sqlDB.Exec(t, `CREATE DATABASE ingest`)
+	_, err := workloadccl.ImportFixture(
+		ctx, db, gen, `ingest`, filesPerNode, false, /* injectStats */
+		``, /* csvServer */
 	)
 	require.NoError(t, err)
 	sqlDB.CheckQueryResults(t,
-		`SELECT count(*) FROM distsort.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
-
-	sqlDB.CheckQueryResults(t,
-		`SELECT statistics_name, column_names, row_count, distinct_count, null_count
-           FROM [SHOW STATISTICS FOR TABLE distsort.fx]`,
-		[][]string{
-			{"__auto__", "{key}", "100", "100", "0"},
-			{"__auto__", "{value}", "100", "1", "5"},
-		})
-
-	sqlDB.Exec(t, `CREATE DATABASE direct`)
-	_, err = ImportFixture(
-		ctx, db, gen, `direct`, true /* directIngestion */, filesPerNode, false, /* injectStats */
-		noSkipPostLoad, ``, /* csvServer */
-	)
-	require.NoError(t, err)
-	sqlDB.CheckQueryResults(t,
-		`SELECT count(*) FROM direct.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
-
-	fingerprints := sqlDB.QueryStr(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE distsort.fx`)
-	sqlDB.CheckQueryResults(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE direct.fx`, fingerprints)
+		`SELECT count(*) FROM ingest.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
 
 	// Since we did not inject stats, the IMPORT should have triggered
 	// automatic stats collection.
 	sqlDB.CheckQueryResultsRetry(t,
 		`SELECT statistics_name, column_names, row_count, distinct_count, null_count
-           FROM [SHOW STATISTICS FOR TABLE direct.fx]`,
+           FROM [SHOW STATISTICS FOR TABLE ingest.fx]`,
 		[][]string{
 			{"__auto__", "{key}", "10", "10", "0"},
 			{"__auto__", "{value}", "10", "1", "0"},
@@ -241,10 +222,10 @@ func TestImportFixtureCSVServer(t *testing.T) {
 	}
 
 	const filesPerNode = 1
-	const noDirectIngest, noInjectStats, noSkipPostLoad = false, false, true
+	const noInjectStats = false
 	sqlDB.Exec(t, `CREATE DATABASE d`)
-	_, err := ImportFixture(
-		ctx, db, gen, `d`, noDirectIngest, filesPerNode, noInjectStats, noSkipPostLoad, ts.URL,
+	_, err := workloadccl.ImportFixture(
+		ctx, db, gen, `d`, filesPerNode, noInjectStats, ts.URL,
 	)
 	require.NoError(t, err)
 	sqlDB.CheckQueryResults(t,

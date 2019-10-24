@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -27,11 +23,12 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -42,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -162,6 +160,25 @@ func (s *adminServer) AllMetricMetadata(
 
 	resp := &serverpb.MetricMetadataResponse{
 		Metadata: s.server.recorder.GetMetricsMetadata(),
+	}
+
+	return resp, nil
+}
+
+// ChartCatalog returns a catalog of Admin UI charts useful for debugging.
+func (s *adminServer) ChartCatalog(
+	ctx context.Context, req *serverpb.ChartCatalogRequest,
+) (*serverpb.ChartCatalogResponse, error) {
+	metricsMetadata := s.server.recorder.GetMetricsMetadata()
+
+	chartCatalog, err := catalog.GenerateCatalog(metricsMetadata)
+
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &serverpb.ChartCatalogResponse{
+		Catalog: chartCatalog,
 	}
 
 	return resp, nil
@@ -667,7 +684,7 @@ func (s *adminServer) statsForSpan(
 		if err := kv.Value.GetProto(&rng); err != nil {
 			return nil, s.serverError(err)
 		}
-		for _, repl := range rng.Replicas().Unwrap() {
+		for _, repl := range rng.Replicas().All() {
 			nodeIDs[repl.NodeID] = struct{}{}
 		}
 	}
@@ -1423,7 +1440,7 @@ func (s *adminServer) DecommissionStatus(
 					if err := row.ValueProto(&rangeDesc); err != nil {
 						return errors.Wrapf(err, "%s: unable to unmarshal range descriptor", row.Key)
 					}
-					for _, r := range rangeDesc.Replicas().Unwrap() {
+					for _, r := range rangeDesc.Replicas().All() {
 						if _, ok := replicaCounts[r.NodeID]; ok {
 							replicaCounts[r.NodeID]++
 						}
@@ -1535,7 +1552,7 @@ func (s *adminServer) DataDistribution(
 		if droppedAtTime == nil {
 			// TODO(vilterp): figure out a way to get zone configs for tables that are dropped
 			zoneConfigQuery := fmt.Sprintf(
-				`SELECT zone_id, cli_specifier FROM [SHOW ZONE CONFIGURATION FOR TABLE %s.%s]`,
+				`SELECT zone_id FROM [SHOW ZONE CONFIGURATION FOR TABLE %s.%s]`,
 				(*tree.Name)(dbName), (*tree.Name)(tableName),
 			)
 			rows, _ /* cols */, err := s.server.internalExecutor.QueryWithUser(
@@ -1592,7 +1609,7 @@ func (s *adminServer) DataDistribution(
 				return err
 			}
 
-			for _, replicaDesc := range rangeDesc.Replicas().Unwrap() {
+			for _, replicaDesc := range rangeDesc.Replicas().All() {
 				tableInfo, ok := tableInfosByTableID[tableID]
 				if !ok {
 					// This is a database, skip.
@@ -1609,9 +1626,9 @@ func (s *adminServer) DataDistribution(
 	// Get zone configs.
 	// TODO(vilterp): this can be done in parallel with getting table/db names and replica counts.
 	zoneConfigsQuery := `
-		SELECT zone_name, config_sql, config_protobuf
+		SELECT target, raw_config_sql, raw_config_protobuf
 		FROM crdb_internal.zones
-		WHERE zone_name IS NOT NULL
+		WHERE target IS NOT NULL
 	`
 	rows2, _ /* cols */, err := s.server.internalExecutor.QueryWithUser(
 		ctx, "admin-replica-matrix", nil /* txn */, userName, zoneConfigsQuery,
@@ -1621,16 +1638,16 @@ func (s *adminServer) DataDistribution(
 	}
 
 	for _, row := range rows2 {
-		zoneName := string(tree.MustBeDString(row[0]))
+		target := string(tree.MustBeDString(row[0]))
 		zcSQL := tree.MustBeDString(row[1])
 		zcBytes := tree.MustBeDBytes(row[2])
-		var zcProto config.ZoneConfig
+		var zcProto zonepb.ZoneConfig
 		if err := protoutil.Unmarshal([]byte(zcBytes), &zcProto); err != nil {
 			return nil, s.serverError(err)
 		}
 
-		resp.ZoneConfigs[zoneName] = serverpb.DataDistributionResponse_ZoneConfig{
-			ZoneName:  zoneName,
+		resp.ZoneConfigs[target] = serverpb.DataDistributionResponse_ZoneConfig{
+			Target:    target,
 			Config:    zcProto,
 			ConfigSQL: string(zcSQL),
 		}
@@ -2016,29 +2033,29 @@ func (rs resultScanner) Scan(row tree.Datums, colName string, dst interface{}) e
 // if it exists.
 func (s *adminServer) queryZone(
 	ctx context.Context, userName string, id sqlbase.ID,
-) (config.ZoneConfig, bool, error) {
+) (zonepb.ZoneConfig, bool, error) {
 	const query = `SELECT config FROM system.zones WHERE id = $1`
 	rows, _ /* cols */, err := s.server.internalExecutor.QueryWithUser(
 		ctx, "admin-query-zone", nil /* txn */, userName, query, id,
 	)
 	if err != nil {
-		return *config.NewZoneConfig(), false, err
+		return *zonepb.NewZoneConfig(), false, err
 	}
 
 	if len(rows) == 0 {
-		return *config.NewZoneConfig(), false, nil
+		return *zonepb.NewZoneConfig(), false, nil
 	}
 
 	var zoneBytes []byte
 	scanner := resultScanner{}
 	err = scanner.ScanIndex(rows[0], 0, &zoneBytes)
 	if err != nil {
-		return *config.NewZoneConfig(), false, err
+		return *zonepb.NewZoneConfig(), false, err
 	}
 
-	var zone config.ZoneConfig
+	var zone zonepb.ZoneConfig
 	if err := protoutil.Unmarshal(zoneBytes, &zone); err != nil {
-		return *config.NewZoneConfig(), false, err
+		return *zonepb.NewZoneConfig(), false, err
 	}
 	return zone, true, nil
 }
@@ -2048,14 +2065,14 @@ func (s *adminServer) queryZone(
 // ZoneConfig specified for the object IDs in the path.
 func (s *adminServer) queryZonePath(
 	ctx context.Context, userName string, path []sqlbase.ID,
-) (sqlbase.ID, config.ZoneConfig, bool, error) {
+) (sqlbase.ID, zonepb.ZoneConfig, bool, error) {
 	for i := len(path) - 1; i >= 0; i-- {
 		zone, zoneExists, err := s.queryZone(ctx, userName, path[i])
 		if err != nil || zoneExists {
 			return path[i], zone, true, err
 		}
 	}
-	return 0, *config.NewZoneConfig(), false, nil
+	return 0, *zonepb.NewZoneConfig(), false, nil
 }
 
 // queryNamespaceID queries for the ID of the namespace with the given name and
@@ -2110,7 +2127,8 @@ func (s *adminServer) dialNode(
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.server.rpcContext.GRPCDialNode(addr.String(), nodeID).Connect(ctx)
+	conn, err := s.server.rpcContext.GRPCDialNode(
+		addr.String(), nodeID, rpc.DefaultClass).Connect(ctx)
 	if err != nil {
 		return nil, err
 	}

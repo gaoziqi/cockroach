@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -71,45 +67,42 @@ func TestQueryCounts(t *testing.T) {
 
 	var testcases = []queryCounter{
 		// The counts are deltas for each query.
-		{query: "SET OPTIMIZER = 'off'", miscCount: 1, miscExecutedCount: 1, fallbackCount: 1},
-		{query: "SET DISTSQL = 'off'", miscCount: 1, miscExecutedCount: 1},
+		{query: "SET DISTSQL = 'off'", miscCount: 1, miscExecutedCount: 1, optCount: 1},
 		{query: "BEGIN; END", txnBeginCount: 1, txnCommitCount: 1},
-		{query: "SELECT 1", selectCount: 1, selectExecutedCount: 1, txnCommitCount: 1},
-		{query: "CREATE DATABASE mt", ddlCount: 1},
-		{query: "CREATE TABLE mt.n (num INTEGER PRIMARY KEY)", ddlCount: 1},
-		{query: "INSERT INTO mt.n VALUES (3)", insertCount: 1},
+		{query: "SELECT 1", selectCount: 1, selectExecutedCount: 1, txnCommitCount: 1, optCount: 1},
+		{query: "CREATE DATABASE mt", ddlCount: 1, optCount: 1},
+		{query: "CREATE TABLE mt.n (num INTEGER PRIMARY KEY)", ddlCount: 1, optCount: 1},
+		{query: "INSERT INTO mt.n VALUES (3)", insertCount: 1, optCount: 1},
 		// Test failure (uniqueness violation).
-		{query: "INSERT INTO mt.n VALUES (3)", failureCount: 1, insertCount: 1, expectError: true},
+		{query: "INSERT INTO mt.n VALUES (3)", failureCount: 1, insertCount: 1, optCount: 1, expectError: true},
 		// Test failure (planning error).
 		{
 			query:        "INSERT INTO nonexistent VALUES (3)",
 			failureCount: 1, insertCount: 1, expectError: true,
 		},
-		{query: "UPDATE mt.n SET num = num + 1", updateCount: 1},
-		{query: "DELETE FROM mt.n", deleteCount: 1},
-		{query: "ALTER TABLE mt.n ADD COLUMN num2 INTEGER", ddlCount: 1},
-		{query: "EXPLAIN SELECT * FROM mt.n", miscCount: 1, miscExecutedCount: 1},
+		{query: "UPDATE mt.n SET num = num + 1", updateCount: 1, optCount: 1},
+		{query: "DELETE FROM mt.n", deleteCount: 1, optCount: 1},
+		{query: "ALTER TABLE mt.n ADD COLUMN num2 INTEGER", ddlCount: 1, optCount: 1},
+		{query: "EXPLAIN SELECT * FROM mt.n", miscCount: 1, miscExecutedCount: 1, optCount: 1},
 		{
 			query:         "BEGIN; UPDATE mt.n SET num = num + 1; END",
-			txnBeginCount: 1, updateCount: 1, txnCommitCount: 1,
+			txnBeginCount: 1, updateCount: 1, txnCommitCount: 1, optCount: 1,
 		},
 		{
 			query:       "SELECT * FROM mt.n; SELECT * FROM mt.n; SELECT * FROM mt.n",
-			selectCount: 3, selectExecutedCount: 3,
+			selectCount: 3, selectExecutedCount: 3, optCount: 3,
 		},
-		{query: "SET DISTSQL = 'on'", miscCount: 1, miscExecutedCount: 1},
+		{query: "SET DISTSQL = 'on'", miscCount: 1, miscExecutedCount: 1, optCount: 1},
 		{
 			query:       "SELECT * FROM mt.n",
-			selectCount: 1, selectExecutedCount: 1, distSQLSelectCount: 1,
+			selectCount: 1, selectExecutedCount: 1, distSQLSelectCount: 1, optCount: 1,
 		},
-		{query: "SET DISTSQL = 'off'", miscCount: 1, miscExecutedCount: 1},
-		{query: "DROP TABLE mt.n", ddlCount: 1},
-		{query: "SET database = system", miscCount: 1, miscExecutedCount: 1},
-		{query: "SET OPTIMIZER = 'on'", miscCount: 1, miscExecutedCount: 1},
+		{query: "SET DISTSQL = 'off'", miscCount: 1, miscExecutedCount: 1, optCount: 1},
+		{query: "DROP TABLE mt.n", ddlCount: 1, optCount: 1},
+		{query: "SET database = system", miscCount: 1, miscExecutedCount: 1, optCount: 1},
 		{query: "SELECT 3", selectCount: 1, selectExecutedCount: 1, optCount: 1},
 		{query: "CREATE TABLE mt.n (num INTEGER PRIMARY KEY)", ddlCount: 1, optCount: 1},
 		{query: "UPDATE mt.n SET num = num + 1", updateCount: 1, optCount: 1},
-		{query: "SET OPTIMIZER = 'off'", miscCount: 1, miscExecutedCount: 1, fallbackCount: 1},
 	}
 
 	accum := initializeQueryCounter(s)

@@ -1,23 +1,18 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadimpl"
 	"golang.org/x/exp/rand"
 )
 
@@ -25,28 +20,34 @@ var cLastTokens = [...]string{
 	"BAR", "OUGHT", "ABLE", "PRI", "PRES",
 	"ESE", "ANTI", "CALLY", "ATION", "EING"}
 
-// cLoad is the value of C at load time. See 2.1.6.1.
-// It's used for the non-uniform random generator.
-var cLoad int
-
-// cCustomerID is the value of C for the customer id generator. 2.1.6.
-var cCustomerID int
-
-// cCustomerID is the value of C for the item id generator. 2.1.6.
-var cItemID int
-
-func init() {
-	rand.Seed(uint64(timeutil.Now().UnixNano()))
-	cLoad = rand.Intn(256)
-	cItemID = rand.Intn(1024)
-	cCustomerID = rand.Intn(8192)
+func (w *tpcc) initNonUniformRandomConstants() {
+	rng := rand.New(rand.NewSource(w.seed))
+	w.cLoad = rng.Intn(256)
+	w.cItemID = rng.Intn(1024)
+	w.cCustomerID = rng.Intn(8192)
 }
+
+const precomputedLength = 10000
+const aCharsAlphabet = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890`
+const lettersAlphabet = `ABCDEFGHIJKLMNOPQRSTUVWXYZ`
+const numbersAlphabet = `1234567890`
+
+type tpccRand struct {
+	*rand.Rand
+
+	aChars, letters, numbers workloadimpl.PrecomputedRand
+}
+
+type aCharsOffset int
+type lettersOffset int
+type numbersOffset int
 
 func randStringFromAlphabet(
 	rng *rand.Rand,
 	a *bufalloc.ByteAllocator,
 	minLen, maxLen int,
-	randStringFn func(rand.Source, []byte),
+	pr workloadimpl.PrecomputedRand,
+	prOffset *int,
 ) []byte {
 	size := maxLen
 	if maxLen-minLen != 0 {
@@ -58,64 +59,73 @@ func randStringFromAlphabet(
 
 	var b []byte
 	*a, b = a.Alloc(size, 0 /* extraCap */)
-	// TODO(dan): According to the benchmark, it's faster to pass a
-	// *rand.PCGSource here than it is to pass a *rand.Rand. I tried doing the
-	// plumbing and didn't see a difference in BenchmarkInitTPCC, but I'm not
-	// convinced that I didn't mess something up.
-	//
-	// name                      old time/op    new time/op    delta
-	// RandStringFast/letters-8    86.2ns ± 2%    74.9ns ± 0%  -13.17%  (p=0.008 n=5+5)
-	// RandStringFast/numbers-8    86.8ns ± 7%    74.2ns ± 1%  -14.50%  (p=0.008 n=5+5)
-	// RandStringFast/aChars-8      101ns ± 2%      86ns ± 1%  -15.15%  (p=0.008 n=5+5)
-	//
-	// name                      old speed      new speed      delta
-	// RandStringFast/letters-8   302MB/s ± 2%   347MB/s ± 0%  +15.08%  (p=0.008 n=5+5)
-	// RandStringFast/numbers-8   300MB/s ± 7%   350MB/s ± 1%  +16.81%  (p=0.008 n=5+5)
-	// RandStringFast/aChars-8    256MB/s ± 2%   303MB/s ± 1%  +18.42%  (p=0.008 n=5+5)
-	randStringFn(rng, b)
+	*prOffset = pr.FillBytes(*prOffset, b)
 	return b
 }
 
-// randAString generates a random alphanumeric string of length between min and
-// max inclusive. See 4.3.2.2.
-func randAString(rng *rand.Rand, a *bufalloc.ByteAllocator, min, max int) []byte {
-	return randStringFromAlphabet(rng, a, min, max, randStringAChars)
+// randAStringInitialDataOnly generates a random alphanumeric string of length
+// between min and max inclusive. It uses a set of pregenerated random data,
+// which the spec allows only for initial data. See 4.3.2.2.
+//
+// For speed, this is done using precomputed random data, which is explicitly
+// allowed by the spec for initial data only. See 4.3.2.1.
+func randAStringInitialDataOnly(
+	rng *tpccRand, ao *aCharsOffset, a *bufalloc.ByteAllocator, min, max int,
+) []byte {
+	return randStringFromAlphabet(rng.Rand, a, min, max, rng.aChars, (*int)(ao))
 }
 
-// randOriginalString generates a random a-string[26..50] with 10% chance of
-// containing the string "ORIGINAL" somewhere in the middle of the string.
-// See 4.3.3.1.
-func randOriginalString(rng *rand.Rand, a *bufalloc.ByteAllocator) []byte {
-	if rng.Intn(9) == 0 {
-		l := int(randInt(rng, 26, 50))
-		off := int(randInt(rng, 0, l-8))
+// randNStringInitialDataOnly generates a random numeric string of length
+// between min and max inclusive. See 4.3.2.2.
+//
+// For speed, this is done using precomputed random data, which is explicitly
+// allowed by the spec for initial data only. See 4.3.2.1.
+func randNStringInitialDataOnly(
+	rng *tpccRand, no *numbersOffset, a *bufalloc.ByteAllocator, min, max int,
+) []byte {
+	return randStringFromAlphabet(rng.Rand, a, min, max, rng.numbers, (*int)(no))
+}
+
+// randStateInitialDataOnly produces a random US state. (spec just says 2
+// letters)
+//
+// For speed, this is done using precomputed random data, which is explicitly
+// allowed by the spec for initial data only. See 4.3.2.1.
+func randStateInitialDataOnly(rng *tpccRand, lo *lettersOffset, a *bufalloc.ByteAllocator) []byte {
+	return randStringFromAlphabet(rng.Rand, a, 2, 2, rng.letters, (*int)(lo))
+}
+
+// randOriginalStringInitialDataOnly generates a random a-string[26..50] with
+// 10% chance of containing the string "ORIGINAL" somewhere in the middle of the
+// string. See 4.3.3.1.
+//
+// For speed, this is done using precomputed random data, which is explicitly
+// allowed by the spec for initial data only. See 4.3.2.1.
+func randOriginalStringInitialDataOnly(
+	rng *tpccRand, ao *aCharsOffset, a *bufalloc.ByteAllocator,
+) []byte {
+	if rng.Rand.Intn(9) == 0 {
+		l := int(randInt(rng.Rand, 26, 50))
+		off := int(randInt(rng.Rand, 0, l-8))
 		var buf []byte
 		*a, buf = a.Alloc(l, 0 /* extraCap */)
-		copy(buf[:off], randAString(rng, a, off, off))
+		copy(buf[:off], randAStringInitialDataOnly(rng, ao, a, off, off))
 		copy(buf[off:off+8], originalString)
-		copy(buf[off+8:], randAString(rng, a, l-off-8, l-off-8))
+		copy(buf[off+8:], randAStringInitialDataOnly(rng, ao, a, l-off-8, l-off-8))
 		return buf
 	}
-	return randAString(rng, a, 26, 50)
-}
-
-// randNString generates a random numeric string of length between min and max
-// inclusive. See 4.3.2.2.
-func randNString(rng *rand.Rand, a *bufalloc.ByteAllocator, min, max int) []byte {
-	return randStringFromAlphabet(rng, a, min, max, randStringNumbers)
-}
-
-// randState produces a random US state. (spec just says 2 letters)
-func randState(rng *rand.Rand, a *bufalloc.ByteAllocator) []byte {
-	return randStringFromAlphabet(rng, a, 2, 2, randStringLetters)
+	return randAStringInitialDataOnly(rng, ao, a, 26, 50)
 }
 
 // randZip produces a random "zip code" - a 4-digit number plus the constant
 // "11111". See 4.3.2.7.
-func randZip(rng *rand.Rand, a *bufalloc.ByteAllocator) []byte {
+//
+// For speed, this is done using precomputed random data, which is explicitly
+// allowed by the spec for initial data only. See 4.3.2.1.
+func randZipInitialDataOnly(rng *tpccRand, no *numbersOffset, a *bufalloc.ByteAllocator) []byte {
 	var buf []byte
 	*a, buf = a.Alloc(9, 0 /* extraCap */)
-	copy(buf[:4], randNString(rng, a, 4, 4))
+	copy(buf[:4], randNStringInitialDataOnly(rng, no, a, 4, 4))
 	copy(buf[4:], `11111`)
 	return buf
 }
@@ -151,73 +161,16 @@ func randCLastSyllables(n int, a *bufalloc.ByteAllocator) []byte {
 }
 
 // See 4.3.2.3.
-func randCLast(rng *rand.Rand, a *bufalloc.ByteAllocator) []byte {
-	return randCLastSyllables(((rng.Intn(256)|rng.Intn(1000))+cLoad)%1000, a)
+func (w *tpcc) randCLast(rng *rand.Rand, a *bufalloc.ByteAllocator) []byte {
+	return randCLastSyllables(((rng.Intn(256)|rng.Intn(1000))+w.cLoad)%1000, a)
 }
 
 // Return a non-uniform random customer ID. See 2.1.6.
-func randCustomerID(rng *rand.Rand) int {
-	return ((rng.Intn(1024) | (rng.Intn(3000) + 1) + cCustomerID) % 3000) + 1
+func (w *tpcc) randCustomerID(rng *rand.Rand) int {
+	return ((rng.Intn(1024) | (rng.Intn(3000) + 1) + w.cCustomerID) % 3000) + 1
 }
 
 // Return a non-uniform random item ID. See 2.1.6.
-func randItemID(rng *rand.Rand) int {
-	return ((rng.Intn(8190) | (rng.Intn(100000) + 1) + cItemID) % 100000) + 1
-}
-
-// NOTE: The following are intentionally duplicated. They're a very hot path in
-// restoring a TPCC fixture and hardcoding alphabet, len(alphabet), and
-// charsPerRand seems to trigger some compiler optimizations that don't happen
-// if those things are params. Don't modify these without consulting
-// BenchmarkRandStringFast and BenchmarkInitTPCC.
-
-func randStringLetters(rng rand.Source, buf []byte) {
-	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	const lettersLen = uint64(len(letters))
-	const lettersCharsPerRand = uint64(13) // floor(log(math.MaxUint64)/log(lettersLen))
-
-	var r, charsLeft uint64
-	for i := 0; i < len(buf); i++ {
-		if charsLeft == 0 {
-			r = rng.Uint64()
-			charsLeft = lettersCharsPerRand
-		}
-		buf[i] = letters[r%lettersLen]
-		r = r / lettersLen
-		charsLeft--
-	}
-}
-
-func randStringNumbers(rng rand.Source, buf []byte) {
-	const numbers = "1234567890"
-	const numbersLen = uint64(len(numbers))
-	const numbersCharsPerRand = uint64(19) // floor(log(math.MaxUint64)/log(numbersLen))
-
-	var r, charsLeft uint64
-	for i := 0; i < len(buf); i++ {
-		if charsLeft == 0 {
-			r = rng.Uint64()
-			charsLeft = numbersCharsPerRand
-		}
-		buf[i] = numbers[r%numbersLen]
-		r = r / numbersLen
-		charsLeft--
-	}
-}
-
-func randStringAChars(rng rand.Source, buf []byte) {
-	const aChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
-	const aCharsLen = uint64(len(aChars))
-	const aCharsCharsPerRand = uint64(10) // floor(log(math.MaxUint64)/log(aCharsLen))
-
-	var r, charsLeft uint64
-	for i := 0; i < len(buf); i++ {
-		if charsLeft == 0 {
-			r = rng.Uint64()
-			charsLeft = aCharsCharsPerRand
-		}
-		buf[i] = aChars[r%aCharsLen]
-		r = r / aCharsLen
-		charsLeft--
-	}
+func (w *tpcc) randItemID(rng *rand.Rand) int {
+	return ((rng.Intn(8190) | (rng.Intn(100000) + 1) + w.cItemID) % 100000) + 1
 }

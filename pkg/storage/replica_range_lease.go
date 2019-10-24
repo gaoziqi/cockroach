@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This file contains replica methods related to range leases.
 //
@@ -57,9 +53,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/logtags"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
@@ -555,7 +551,7 @@ func (r *Replica) leaseStatus(
 			// use the lease nor do we want to attempt to acquire it.
 			if err != nil {
 				if leaseStatusLogLimiter.ShouldLog() {
-					log.Warningf(context.TODO(), "can't determine lease status due to node liveness error: %s", err)
+					log.Warningf(context.TODO(), "can't determine lease status due to node liveness error: %+v", err)
 				}
 			}
 			status.State = storagepb.LeaseState_ERROR
@@ -677,6 +673,18 @@ func (r *Replica) AdminTransferLease(ctx context.Context, target roachpb.StoreID
 		var ok bool
 		if nextLeaseHolder, ok = desc.GetReplicaDescriptor(target); !ok {
 			return nil, nil, errors.Errorf("unable to find store %d in range %+v", target, desc)
+		}
+
+		// For now, don't allow replicas of type LEARNER to be leaseholders, see
+		// comments in RequestLease and TransferLease for why.
+		//
+		// TODO(dan): We shouldn't need this, the checks in RequestLease and
+		// TransferLease are the canonical ones and should be sufficient. Sadly, the
+		// `r.mu.minLeaseProposedTS = status.Timestamp` line below will likely play
+		// badly with that. This would be an issue even without learners, but
+		// omitting this check would make it worse. Fixme.
+		if t := nextLeaseHolder.GetType(); t != roachpb.VOTER_FULL {
+			return nil, nil, errors.Errorf(`cannot transfer lease to replica of type %s`, t)
 		}
 
 		if nextLease, ok := r.mu.pendingLeaseRequest.RequestPending(); ok &&

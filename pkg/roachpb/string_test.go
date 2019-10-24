@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package roachpb_test
 
@@ -33,12 +29,13 @@ func TestTransactionString(t *testing.T) {
 	}
 	txn := roachpb.Transaction{
 		TxnMeta: enginepb.TxnMeta{
-			Key:       roachpb.Key("foo"),
-			ID:        txnID,
-			Epoch:     2,
-			Timestamp: hlc.Timestamp{WallTime: 20, Logical: 21},
-			Priority:  957356782,
-			Sequence:  15,
+			Key:          roachpb.Key("foo"),
+			ID:           txnID,
+			Epoch:        2,
+			Timestamp:    hlc.Timestamp{WallTime: 20, Logical: 21},
+			MinTimestamp: hlc.Timestamp{WallTime: 10, Logical: 11},
+			Priority:     957356782,
+			Sequence:     15,
 		},
 		Name:          "name",
 		Status:        roachpb.COMMITTED,
@@ -47,7 +44,7 @@ func TestTransactionString(t *testing.T) {
 		MaxTimestamp:  hlc.Timestamp{WallTime: 40, Logical: 41},
 	}
 	expStr := `"name" id=d7aa0f5e key="foo" rw=true pri=44.58039917 stat=COMMITTED ` +
-		`epo=2 ts=0.000000020,21 orig=0.000000030,31 max=0.000000040,41 wto=false seq=15`
+		`epo=2 ts=0.000000020,21 orig=0.000000030,31 min=0.000000010,11 max=0.000000040,41 wto=false seq=15`
 
 	if str := txn.String(); str != expStr {
 		t.Errorf("expected txn %s; got %s", expStr, str)

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package spanlatch
 
@@ -32,8 +28,8 @@ import (
 )
 
 // A Manager maintains an interval tree of key and key range latches. Latch
-// acquitions affecting keys or key ranges must wait on already-acquired latches
-// which overlap their key ranges to be released.
+// acquisitions affecting keys or key ranges must wait on already-acquired
+// latches which overlap their key ranges to be released.
 //
 // Latch acquisition attempts invoke Manager.Acquire and provide details about
 // the spans that they plan to touch and the timestamps they plan to touch them
@@ -416,7 +412,7 @@ func (m *Manager) waitForSignal(ctx context.Context, t *timeutil.Timer, wait, he
 				defer m.slowReqs.Dec(1)
 			}
 		case <-ctx.Done():
-			log.VEventf(ctx, 2, "%s while acquiring latches", ctx.Err())
+			log.VEventf(ctx, 2, "%s while acquiring latch %s, held by %s", ctx.Err(), wait, held)
 			return ctx.Err()
 		case <-m.stopper.ShouldQuiesce():
 			// While shutting down, requests may acquire

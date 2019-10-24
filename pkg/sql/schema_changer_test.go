@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -27,16 +23,17 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -536,10 +533,7 @@ func runSchemaChangeWithOperations(
 		t.Fatal(err)
 	}
 	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
-		// TODO(dt,lucy-zhang): #35160. Fix scrub's plan assertions.
-		if !strings.Contains(err.Error(), "could not find MergeJoinerSpec in plan") {
-			t.Fatal(err)
-		}
+		t.Fatal(err)
 	}
 
 	// Delete the rows inserted.
@@ -600,7 +594,7 @@ func TestRaceWithBackfill(t *testing.T) {
 			AsyncExecNotification: asyncSchemaChangerDisabled,
 			BackfillChunkSize:     chunkSize,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				notifyBackfill()
 				return nil
@@ -634,11 +628,11 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 
 	// Split the table into multiple ranges.
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
-	// SplitTable moves the right range, so we split things back to front
-	// in order to move less data.
-	for i := numNodes - 1; i > 0; i-- {
-		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	var sps []sql.SplitPoint
+	for i := 1; i <= numNodes-1; i++ {
+		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
+	sql.SplitTable(t, tc, tableDesc, sps)
 
 	ctx := context.TODO()
 
@@ -768,7 +762,7 @@ func TestDropWhileBackfill(t *testing.T) {
 			AsyncExecNotification: asyncSchemaChangerDisabled,
 			BackfillChunkSize:     chunkSize,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				if partialBackfillDone.Load().(bool) {
 					notifyBackfill()
@@ -810,11 +804,11 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 
 	// Split the table into multiple ranges.
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
-	// SplitTable moves the right range, so we split things back to front
-	// in order to move less data.
-	for i := numNodes - 1; i > 0; i-- {
-		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	var sps []sql.SplitPoint
+	for i := 1; i <= numNodes-1; i++ {
+		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
+	sql.SplitTable(t, tc, tableDesc, sps)
 
 	ctx := context.TODO()
 
@@ -922,11 +916,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// Split the table into multiple ranges.
-	// SplitTable moves the right range, so we split things back to front
-	// in order to move less data.
-	for i := numNodes - 1; i > 0; i-- {
-		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	var sps []sql.SplitPoint
+	for i := 1; i <= numNodes-1; i++ {
+		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
+	sql.SplitTable(t, tc, tableDesc, sps)
 
 	ctx := context.TODO()
 
@@ -993,7 +987,7 @@ func TestAbortSchemaChangeBackfill(t *testing.T) {
 			AsyncExecQuickly:  true,
 			BackfillChunkSize: maxValue,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				switch atomic.LoadInt64(&backfillCount) {
 				case 0:
@@ -1348,7 +1342,7 @@ func TestSchemaChangeRetry(t *testing.T) {
 			AsyncExecNotification:   asyncSchemaChangerDisabled,
 			WriteCheckpointInterval: time.Nanosecond,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{RunBeforeBackfillChunk: checkSpan},
+		DistSQL: &execinfra.TestingKnobs{RunBeforeBackfillChunk: checkSpan},
 		// Disable backfill migrations, we still need the jobs table migration.
 		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
 			DisableBackfillMigrations: true,
@@ -1408,7 +1402,7 @@ func TestSchemaChangeRetryOnVersionChange(t *testing.T) {
 			WriteCheckpointInterval: time.Nanosecond,
 			BackfillChunkSize:       maxValue / 10,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				currChunk++
 				// Fail somewhere in the middle.
@@ -1515,7 +1509,7 @@ func TestSchemaChangePurgeFailure(t *testing.T) {
 			AsyncExecQuickly:  true,
 			BackfillChunkSize: chunkSize,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				// Return a deadline exceeded error during the third attempt
 				// which attempts to clean up the schema change.
@@ -1656,7 +1650,7 @@ func TestSchemaChangeFailureAfterCheckpointing(t *testing.T) {
 			// failure happens after a checkpoint has been written.
 			WriteCheckpointInterval: time.Nanosecond,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				attempts++
 				// Return a deadline exceeded error during the third attempt
@@ -2186,7 +2180,7 @@ func TestSchemaUniqueColumnDropFailure(t *testing.T) {
 			// failure happens after a checkpoint has been written.
 			WriteCheckpointInterval: time.Nanosecond,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				attempts++
 				// Return a deadline exceeded error while dropping
@@ -2258,7 +2252,7 @@ func TestCRUDWhileColumnBackfill(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				if backfillNotification != nil {
 					// Close channel to notify that the schema change has
@@ -2532,11 +2526,11 @@ func TestBackfillCompletesOnChunkBoundary(t *testing.T) {
 
 	// Split the table into multiple ranges.
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
-	// SplitTable moves the right range, so we split things back to front
-	// in order to move less data.
-	for i := numNodes - 1; i > 0; i-- {
-		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	var sps []sql.SplitPoint
+	for i := 1; i <= numNodes-1; i++ {
+		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
+	sql.SplitTable(t, tc, tableDesc, sps)
 
 	// Run some schema changes.
 	testCases := []struct {
@@ -2592,29 +2586,59 @@ INSERT INTO t.kv VALUES ('a', 'b');
 		expectedErr string
 	}{
 		// DROP TABLE followed by CREATE TABLE case.
-		{`drop-create`, `DROP TABLE t.kv`, `CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR)`,
-			`relation "kv" already exists`},
+		{
+			name:        `drop-create`,
+			firstStmt:   `DROP TABLE t.kv`,
+			secondStmt:  `CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR)`,
+			expectedErr: `relation "kv" already exists`,
+		},
 		// schema change followed by another statement works.
-		{`createindex-insert`, `CREATE INDEX foo ON t.kv (v)`, `INSERT INTO t.kv VALUES ('c', 'd')`,
-			``},
+		{
+			name:        `createindex-insert`,
+			firstStmt:   `CREATE INDEX foo ON t.kv (v)`,
+			secondStmt:  `INSERT INTO t.kv VALUES ('c', 'd')`,
+			expectedErr: ``,
+		},
 		// CREATE TABLE followed by INSERT works.
-		{`createtable-insert`, `CREATE TABLE t.origin (k CHAR PRIMARY KEY, v CHAR);`,
-			`INSERT INTO t.origin VALUES ('c', 'd')`, ``},
+		{
+			name:        `createtable-insert`,
+			firstStmt:   `CREATE TABLE t.origin (k CHAR PRIMARY KEY, v CHAR);`,
+			secondStmt:  `INSERT INTO t.origin VALUES ('c', 'd')`,
+			expectedErr: ``},
 		// Support multiple schema changes for ORMs: #15269
 		// Support insert into another table after schema changes: #15297
-		{`multiple-schema-change`,
-			`CREATE TABLE t.orm1 (k CHAR PRIMARY KEY, v CHAR); CREATE TABLE t.orm2 (k CHAR PRIMARY KEY, v CHAR);`,
-			`CREATE INDEX foo ON t.orm1 (v); CREATE INDEX foo ON t.orm2 (v); INSERT INTO t.origin VALUES ('e', 'f')`,
-			``},
+		{
+			name:        `multiple-schema-change`,
+			firstStmt:   `CREATE TABLE t.orm1 (k CHAR PRIMARY KEY, v CHAR); CREATE TABLE t.orm2 (k CHAR PRIMARY KEY, v CHAR);`,
+			secondStmt:  `CREATE INDEX foo ON t.orm1 (v); CREATE INDEX foo ON t.orm2 (v); INSERT INTO t.origin VALUES ('e', 'f')`,
+			expectedErr: ``,
+		},
 		// schema change at the end of a transaction that has written.
-		{`insert-create`, `INSERT INTO t.kv VALUES ('e', 'f')`, `CREATE INDEX foo ON t.kv (v)`,
-			`schema change statement cannot follow a statement that has written in the same transaction`},
+		{
+			name:        `insert-create`,
+			firstStmt:   `INSERT INTO t.kv VALUES ('e', 'f')`,
+			secondStmt:  `CREATE INDEX foo2 ON t.kv (v)`,
+			expectedErr: `schema change statement cannot follow a statement that has written in the same transaction`,
+		},
 		// schema change at the end of a read only transaction.
-		{`select-create`, `SELECT * FROM t.kv`, `CREATE INDEX bar ON t.kv (v)`, ``},
-		{`index-on-add-col`, `ALTER TABLE t.kv ADD i INT`,
-			`CREATE INDEX foobar ON t.kv (i)`, ``},
-		{`check-on-add-col`, `ALTER TABLE t.kv ADD j INT`,
-			`ALTER TABLE t.kv ADD CONSTRAINT ck_j CHECK (j >= 0)`, ``},
+		{
+			name:        `select-create`,
+			firstStmt:   `SELECT * FROM t.kv`,
+			secondStmt:  `CREATE INDEX bar ON t.kv (v)`,
+			expectedErr: ``,
+		},
+		{
+			name:        `index-on-add-col`,
+			firstStmt:   `ALTER TABLE t.kv ADD i INT`,
+			secondStmt:  `CREATE INDEX foobar ON t.kv (i)`,
+			expectedErr: ``,
+		},
+		{
+			name:        `check-on-add-col`,
+			firstStmt:   `ALTER TABLE t.kv ADD j INT`,
+			secondStmt:  `ALTER TABLE t.kv ADD CONSTRAINT ck_j CHECK (j >= 0)`,
+			expectedErr: ``,
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -2807,11 +2831,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// Split the table into multiple ranges.
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
-	// SplitTable moves the right range, so we split things back to front
-	// in order to move less data.
-	for i := numNodes - 1; i > 0; i-- {
-		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	var sps []sql.SplitPoint
+	for i := 1; i <= numNodes-1; i++ {
+		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / numNodes * i}})
 	}
+	sql.SplitTable(t, tc, tableDesc, sps)
 
 	testCases := []struct {
 		sql    string
@@ -2984,7 +3008,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
 
 	// Add a zone config.
-	cfg := config.DefaultZoneConfig()
+	cfg := zonepb.DefaultZoneConfig()
 	buf, err := protoutil.Marshal(&cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -3094,7 +3118,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
 
 	// Add a zone config.
-	var cfg config.ZoneConfig
+	var cfg zonepb.ZoneConfig
 	cfg, err := addImmediateGCZoneConfig(sqlDB, tableDesc.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -3128,7 +3152,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 	// Ensure that the FK property still holds.
 	if _, err := sqlDB.Exec(
 		`INSERT INTO t.test VALUES ($1 , $2, $3)`, maxValue+2, maxValue+2, 3.15,
-	); !testutils.IsError(err, "foreign key violation") {
+	); !testutils.IsError(err, "foreign key violation|violates foreign key") {
 		t.Fatalf("err = %v", err)
 	}
 
@@ -3205,7 +3229,7 @@ func TestTruncateWhileColumnBackfill(t *testing.T) {
 			},
 			AsyncExecQuickly: true,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				switch atomic.LoadInt64(&backfillCount) {
 				case 3:
@@ -3364,7 +3388,7 @@ func TestIndexBackfillAfterGC(t *testing.T) {
 			RequestHeader: roachpb.RequestHeaderFromSpan(sp),
 			Threshold:     tc.Server(0).Clock().Now(),
 		}
-		_, err := client.SendWrapped(ctx, tc.Server(0).DistSender(), &gcr)
+		_, err := client.SendWrapped(ctx, tc.Server(0).DistSenderI().(*kv.DistSender), &gcr)
 		if err != nil {
 			panic(err)
 		}
@@ -3373,7 +3397,7 @@ func TestIndexBackfillAfterGC(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				if fn := runGC; fn != nil {
 					runGC = nil
@@ -3411,7 +3435,7 @@ func TestAddComputedColumn(t *testing.T) {
 	done := false
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				if db == nil || done {
 					return nil
@@ -3592,7 +3616,7 @@ func TestCancelSchemaChange(t *testing.T) {
 			AsyncExecQuickly:  true,
 			BackfillChunkSize: 10,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				if !doCancel {
 					return nil
@@ -3632,12 +3656,12 @@ func TestCancelSchemaChange(t *testing.T) {
 
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
 	// Split the table into multiple ranges.
-	// SplitTable moves the right range, so we split things back to front
-	// in order to move less data.
+	var sps []sql.SplitPoint
 	const numSplits = numNodes * 2
-	for i := numSplits - 1; i > 0; i-- {
-		sql.SplitTable(t, tc, tableDesc, i%numNodes, maxValue/numSplits*i)
+	for i := 1; i <= numSplits-1; i++ {
+		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i % numNodes, Vals: []interface{}{maxValue / numSplits * i}})
 	}
+	sql.SplitTable(t, tc, tableDesc, sps)
 
 	ctx := context.TODO()
 	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
@@ -3809,12 +3833,9 @@ func TestSchemaChangeRetryError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// TODO(vivek): fix #17698. The transaction should get retried
-	// without returning this error to the user.
-	if err := tx.Commit(); !testutils.IsError(err,
-		`restart transaction: TransactionRetryWithProtoRefreshError: TransactionRetryError: retry txn \(RETRY_SERIALIZABLE\)`,
-	) {
-		t.Fatalf("err = %+v", err)
+	// The transaction should get pushed and commit without an error.
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -4039,7 +4060,7 @@ func TestIndexBackfillValidation(t *testing.T) {
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: maxValue / 5,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunAfterBackfillChunk: func() {
 				count := atomic.AddInt64(&backfillCount, 1)
 				if count == 2 {
@@ -4109,7 +4130,7 @@ func TestInvertedIndexBackfillValidation(t *testing.T) {
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: maxValue / 5,
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunAfterBackfillChunk: func() {
 				count := atomic.AddInt64(&backfillCount, 1)
 				if count == 2 {
@@ -4284,6 +4305,92 @@ func TestCreateStatsAfterSchemaChange(t *testing.T) {
 			{"__auto__", "{w}", "0", "0", "0"},
 			{"__auto__", "{x}", "0", "0", "0"},
 		})
+}
+
+func TestTableValidityWhileAddingFK(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := tests.CreateTestServerParams()
+
+	publishWriteNotification := make(chan struct{})
+	continuePublishWriteNotification := make(chan struct{})
+
+	backfillNotification := make(chan struct{})
+	continueBackfillNotification := make(chan struct{})
+
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforePublishWriteAndDelete: func() {
+				if publishWriteNotification != nil {
+					// Notify before the delete and write only state is published.
+					close(publishWriteNotification)
+					publishWriteNotification = nil
+					<-continuePublishWriteNotification
+				}
+			},
+			RunBeforeBackfill: func() error {
+				if backfillNotification != nil {
+					// Notify before the backfill begins.
+					close(backfillNotification)
+					backfillNotification = nil
+					<-continueBackfillNotification
+				}
+				return nil
+			},
+		},
+		// Disable backfill migrations, we still need the jobs table migration.
+		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
+			DisableBackfillMigrations: true,
+		},
+	}
+
+	server, sqlDB, _ := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.child (a INT PRIMARY KEY, b INT, INDEX (b));
+CREATE TABLE t.parent (a INT PRIMARY KEY);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	n1 := publishWriteNotification
+	n2 := backfillNotification
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		if _, err := sqlDB.Exec(`ALTER TABLE t.child ADD FOREIGN KEY (b) REFERENCES t.child (a), ADD FOREIGN KEY (a) REFERENCES t.parent (a)`); err != nil {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+
+	<-n1
+	if _, err := sqlDB.Query(`SHOW CONSTRAINTS FROM t.child`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Query(`SHOW CONSTRAINTS FROM t.parent`); err != nil {
+		t.Fatal(err)
+	}
+	close(continuePublishWriteNotification)
+
+	<-n2
+	if _, err := sqlDB.Query(`SHOW CONSTRAINTS FROM t.child`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Query(`SHOW CONSTRAINTS FROM t.parent`); err != nil {
+		t.Fatal(err)
+	}
+	close(continueBackfillNotification)
+
+	wg.Wait()
+
+	if err := sqlutils.RunScrub(sqlDB, "t", "child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlutils.RunScrub(sqlDB, "t", "parent"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestWritesWithChecksBeforeDefaultColumnBackfill tests that when a check on a
@@ -4507,7 +4614,7 @@ func TestSchemaChangeJobRunningStatus(t *testing.T) {
 				return runBeforeIndexValidation()
 			},
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				return runBeforeBackfillChunk()
 			},
@@ -4627,7 +4734,7 @@ func TestIntentRaceWithIndexBackfill(t *testing.T) {
 				return nil
 			},
 		},
-		DistSQL: &distsqlrun.TestingKnobs{
+		DistSQL: &execinfra.TestingKnobs{
 			RunAfterBackfillChunk: func() {
 				select {
 				case <-backfillProgressing:
@@ -4665,9 +4772,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatal(err)
 	}
 
-	for i := numNodes - 1; i > 0; i-- {
-		sql.SplitTable(t, tc, tableDesc, i, maxValue/2)
+	var sps []sql.SplitPoint
+	for i := 1; i < numNodes-1; i++ {
+		sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue / 2}})
 	}
+	sql.SplitTable(t, tc, tableDesc, sps)
 
 	bg := ctxgroup.WithContext(ctx)
 	bg.Go(func() error {
@@ -4742,11 +4851,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 func TestSchemaChangeJobRunningStatusValidation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
-	var runBeforeChecksValidation func() error
+	var runBeforeConstraintValidation func() error
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			RunBeforeChecksValidation: func() error {
-				return runBeforeChecksValidation()
+			RunBeforeConstraintValidation: func() error {
+				return runBeforeConstraintValidation()
 			},
 		},
 		// Disable backfill migrations, we still need the jobs table migration.
@@ -4767,7 +4876,7 @@ INSERT INTO t.test (k, v) VALUES (1, 99), (2, 100);
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	runBeforeChecksValidation = func() error {
+	runBeforeConstraintValidation = func() error {
 		return jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusValidation, jobs.Record{
 			Username:    security.RootUser,
 			Description: "ALTER TABLE t.public.test ADD COLUMN a INT8 AS (v - 1) STORED, ADD CHECK ((a < v) AND (a IS NOT NULL))",
@@ -4780,6 +4889,62 @@ INSERT INTO t.test (k, v) VALUES (1, 99), (2, 100);
 	if _, err := sqlDB.Exec(
 		`ALTER TABLE t.test ADD COLUMN a INT AS (v - 1) STORED, ADD CHECK (a < v AND a IS NOT NULL)`,
 	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFKReferencesAddedOnlyOnceOnRetry verifies that if ALTER TABLE ADD FOREIGN
+// KEY is retried, both the FK reference and backreference (on another table)
+// are only added once. This is addressed by #38377.
+func TestFKReferencesAddedOnlyOnceOnRetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := tests.CreateTestServerParams()
+	var runBeforeConstraintValidation func() error
+	errorReturned := false
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforeConstraintValidation: func() error {
+				return runBeforeConstraintValidation()
+			},
+		},
+		// Disable backfill migrations, we still need the jobs table migration.
+		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
+			DisableBackfillMigrations: true,
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
+CREATE TABLE t.test2 (k INT, INDEX (k));
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// After FK forward references and backreferences are installed, and before
+	// the validation query is run, return an error so that the schema change
+	// has to be retried. The error is only returned on the first try.
+	runBeforeConstraintValidation = func() error {
+		if !errorReturned {
+			errorReturned = true
+			return context.DeadlineExceeded
+
+		}
+		return nil
+	}
+	if _, err := sqlDB.Exec(`
+ALTER TABLE t.test2 ADD FOREIGN KEY (k) REFERENCES t.test;
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Table descriptor validation failures, resulting from, e.g., broken or
+	// duplicated backreferences, are returned by SHOW CONSTRAINTS.
+	if _, err := sqlDB.Query(`SHOW CONSTRAINTS FROM t.test`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Query(`SHOW CONSTRAINTS FROM t.test2`); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -12,7 +12,9 @@ maybe_ccache
 tc_end_block "Prepare environment"
 
 tc_start_block "Compile CockroachDB"
-run build/builder.sh make build
+# Buffer noisy output and only print it on failure.
+run build/builder.sh make build &> artifacts/roachtests-compile.log || (cat artifacts/roachtests-compile.log && false)
+rm artifacts/roachtests-compile.log
 tc_end_block "Compile CockroachDB"
 
 tc_start_block "Compile roachprod/workload/roachtest"
@@ -24,8 +26,9 @@ tc_start_block "Run local roachtests"
 run build/builder.sh env \
   COCKROACH_DEV_LICENSE="$COCKROACH_DEV_LICENSE" \
 	stdbuf -oL -eL \
-	./bin/roachtest run '(acceptance|kv/splits|cdc/bank)' \
+	./bin/roachtest run acceptance kv/splits cdc/bank \
   --local \
+  --parallelism=1 \
   --cockroach "cockroach" \
   --roachprod "bin/roachprod" \
   --workload "bin/workload" \

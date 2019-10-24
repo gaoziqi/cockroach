@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -21,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -86,6 +83,7 @@ func initCLIDefaults() {
 
 	sqlCtx.setStmts = nil
 	sqlCtx.execStmts = nil
+	sqlCtx.repeatDelay = 0
 	sqlCtx.safeUpdates = false
 	sqlCtx.showTimes = false
 	sqlCtx.debugMode = false
@@ -102,14 +100,15 @@ func initCLIDefaults() {
 	debugCtx.inputFile = ""
 	debugCtx.printSystemConfig = false
 	debugCtx.maxResults = 1000
-	debugCtx.ballastSize = base.SizeSpec{}
-
-	zoneCtx.zoneConfig = ""
-	zoneCtx.zoneDisableReplication = false
+	debugCtx.ballastSize = base.SizeSpec{InBytes: 1000000000}
 
 	serverCfg.ReadyFn = nil
 	serverCfg.DelayedBootstrapFn = nil
 	serverCfg.SocketFile = ""
+	serverCfg.JoinList = nil
+	serverCfg.DefaultZoneConfig = zonepb.DefaultZoneConfig()
+	serverCfg.DefaultSystemZoneConfig = zonepb.DefaultSystemZoneConfig()
+
 	startCtx.serverInsecure = baseCfg.Insecure
 	startCtx.serverSSLCertsDir = base.DefaultCertsDirectory
 	startCtx.serverListenAddr = ""
@@ -144,6 +143,15 @@ func initCLIDefaults() {
 	networkBenchCtx.server = true
 	networkBenchCtx.port = 8081
 	networkBenchCtx.addresses = []string{"localhost:8081"}
+
+	demoCtx.nodes = 1
+	demoCtx.useEmptyDatabase = false
+	demoCtx.simulateLatency = false
+	demoCtx.runWorkload = false
+	demoCtx.localities = nil
+	demoCtx.geoPartitionedReplicas = false
+	demoCtx.disableTelemetry = false
+	demoCtx.disableLicenseAcquisition = false
 
 	initPreFlagsDefaults()
 
@@ -214,6 +222,11 @@ var sqlCtx = struct {
 	// execStmts is a list of statements to execute.
 	execStmts statementsValue
 
+	// repeatDelay indicates that the execStmts should be "watched"
+	// at the specified time interval. Zero disables
+	// the watch.
+	repeatDelay time.Duration
+
 	// safeUpdates indicates whether to set sql_safe_updates in the CLI
 	// shell.
 	safeUpdates bool
@@ -231,7 +244,7 @@ var sqlCtx = struct {
 	debugMode bool
 }{cliContext: &cliCtx}
 
-// dumpCtx captures the command-line parameters of the `sql` command.
+// dumpCtx captures the command-line parameters of the `dump` command.
 // Defaults set by InitCLIDefaults() above.
 var dumpCtx struct {
 	// dumpMode determines which part of the database should be dumped.
@@ -254,13 +267,6 @@ var debugCtx struct {
 	maxResults        int64
 }
 
-// zoneCtx captures the command-line parameters of the `zone` command.
-// Defaults set by InitCLIDefaults() above.
-var zoneCtx struct {
-	zoneConfig             string
-	zoneDisableReplication bool
-}
-
 // startCtx captures the command-line arguments for the `start` command.
 // Defaults set by InitCLIDefaults() above.
 var startCtx struct {
@@ -271,6 +277,7 @@ var startCtx struct {
 
 	// temporary directory to use to spill computation results to disk.
 	tempDir string
+
 	// directory to use for remotely-initiated operations that can
 	// specify node-local I/O paths, like BACKUP/RESTORE/IMPORT.
 	externalIODir string
@@ -288,8 +295,7 @@ var startCtx struct {
 	pidFile string
 
 	// logging settings specific to file logging.
-	logDir     log.DirName
-	logDirFlag *pflag.Flag
+	logDir log.DirName
 }
 
 // quitCtx captures the command-line parameters of the `quit` command.
@@ -334,4 +340,17 @@ var sqlfmtCtx struct {
 	noSimplify bool
 	align      bool
 	execStmts  statementsValue
+}
+
+// demoCtx captures the command-line parameters of the `demo` command.
+// Defaults set by InitCLIDefaults() above.
+var demoCtx struct {
+	nodes                     int
+	disableTelemetry          bool
+	disableLicenseAcquisition bool
+	useEmptyDatabase          bool
+	runWorkload               bool
+	localities                demoLocalityList
+	geoPartitionedReplicas    bool
+	simulateLatency           bool
 }

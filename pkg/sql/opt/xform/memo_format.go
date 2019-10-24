@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package xform
 
@@ -22,8 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
+	"github.com/cockroachdb/errors"
 )
 
 // FmtFlags controls how the memo output is formatted.
@@ -104,7 +100,7 @@ func (mf *memoFormatter) format() string {
 func (mf *memoFormatter) group(expr opt.Expr) int {
 	res, ok := mf.groupIdx[firstExpr(expr)]
 	if !ok {
-		panic(pgerror.AssertionFailedf("unknown group for %s", expr))
+		panic(errors.AssertionFailedf("unknown group for %s", expr))
 	}
 	return res
 }
@@ -272,7 +268,7 @@ func (mf *memoFormatter) formatPrivate(e opt.Expr, physProps *physical.Required)
 
 	// Start by using private expression formatting.
 	m := mf.o.mem
-	nf := memo.MakeExprFmtCtxBuffer(mf.buf, memo.ExprFmtHideAll, m)
+	nf := memo.MakeExprFmtCtxBuffer(mf.buf, memo.ExprFmtHideAll, m, nil /* catalog */)
 	memo.FormatPrivate(&nf, private, physProps)
 
 	// Now append additional information that's useful in the memo case.
@@ -302,8 +298,8 @@ func (mf *memoFormatter) formatPrivate(e opt.Expr, physProps *physical.Required)
 		}
 
 	case *memo.ProjectExpr:
-		t.Passthrough.ForEach(func(i int) {
-			fmt.Fprintf(mf.buf, " %s", m.Metadata().ColumnMeta(opt.ColumnID(i)).Alias)
+		t.Passthrough.ForEach(func(i opt.ColumnID) {
+			fmt.Fprintf(mf.buf, " %s", m.Metadata().ColumnMeta(i).Alias)
 		})
 	}
 }

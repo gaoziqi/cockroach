@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package norm
 
@@ -19,9 +15,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // HasHoistableSubquery returns true if the given scalar expression contains a
@@ -332,16 +328,12 @@ func (c *CustomFuncs) ConstructNonApplyJoin(
 		return c.f.ConstructInnerJoin(left, right, on, private)
 	case opt.LeftJoinOp, opt.LeftJoinApplyOp:
 		return c.f.ConstructLeftJoin(left, right, on, private)
-	case opt.RightJoinOp, opt.RightJoinApplyOp:
-		return c.f.ConstructRightJoin(left, right, on, private)
-	case opt.FullJoinOp, opt.FullJoinApplyOp:
-		return c.f.ConstructFullJoin(left, right, on, private)
 	case opt.SemiJoinOp, opt.SemiJoinApplyOp:
 		return c.f.ConstructSemiJoin(left, right, on, private)
 	case opt.AntiJoinOp, opt.AntiJoinApplyOp:
 		return c.f.ConstructAntiJoin(left, right, on, private)
 	}
-	panic(pgerror.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
+	panic(errors.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
 }
 
 // ConstructApplyJoin constructs the apply join operator that corresponds
@@ -354,16 +346,12 @@ func (c *CustomFuncs) ConstructApplyJoin(
 		return c.f.ConstructInnerJoinApply(left, right, on, private)
 	case opt.LeftJoinOp, opt.LeftJoinApplyOp:
 		return c.f.ConstructLeftJoinApply(left, right, on, private)
-	case opt.RightJoinOp, opt.RightJoinApplyOp:
-		return c.f.ConstructRightJoinApply(left, right, on, private)
-	case opt.FullJoinOp, opt.FullJoinApplyOp:
-		return c.f.ConstructFullJoinApply(left, right, on, private)
 	case opt.SemiJoinOp, opt.SemiJoinApplyOp:
 		return c.f.ConstructSemiJoinApply(left, right, on, private)
 	case opt.AntiJoinOp, opt.AntiJoinApplyOp:
 		return c.f.ConstructAntiJoinApply(left, right, on, private)
 	}
-	panic(pgerror.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
+	panic(errors.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
 }
 
 // EnsureKey finds the shortest strong key for the input expression. If no
@@ -386,7 +374,7 @@ func (c *CustomFuncs) EnsureKey(in memo.RelExpr) memo.RelExpr {
 func (c *CustomFuncs) KeyCols(in memo.RelExpr) opt.ColSet {
 	keyCols, ok := c.CandidateKey(in)
 	if !ok {
-		panic(pgerror.AssertionFailedf("expected expression to have key"))
+		panic(errors.AssertionFailedf("expected expression to have key"))
 	}
 	return keyCols
 }
@@ -396,7 +384,7 @@ func (c *CustomFuncs) KeyCols(in memo.RelExpr) opt.ColSet {
 func (c *CustomFuncs) NonKeyCols(in memo.RelExpr) opt.ColSet {
 	keyCols, ok := c.CandidateKey(in)
 	if !ok {
-		panic(pgerror.AssertionFailedf("expected expression to have key"))
+		panic(errors.AssertionFailedf("expected expression to have key"))
 	}
 	return c.OutputCols(in).Difference(keyCols)
 }
@@ -454,7 +442,7 @@ func (c *CustomFuncs) EnsureCanaryCol(in memo.RelExpr, aggs memo.AggregationsExp
 			// passthrough aggregate like ConstAgg.
 			id, ok := in.Relational().NotNullCols.Next(0)
 			if ok && !aggs.OutputCols().Contains(id) {
-				return opt.ColumnID(id)
+				return id
 			}
 
 			// Synthesize a new column ID.
@@ -469,7 +457,7 @@ func (c *CustomFuncs) EnsureCanaryCol(in memo.RelExpr, aggs memo.AggregationsExp
 //
 // See the TryDecorrelateScalarGroupBy rule comment for more details.
 func (c *CustomFuncs) EnsureCanary(in memo.RelExpr, canaryCol opt.ColumnID) memo.RelExpr {
-	if canaryCol == 0 || c.OutputCols(in).Contains(int(canaryCol)) {
+	if canaryCol == 0 || c.OutputCols(in).Contains(canaryCol) {
 		return in
 	}
 	result := c.ProjectExtraCol(in, c.f.ConstructTrue(), canaryCol)
@@ -481,7 +469,7 @@ func (c *CustomFuncs) EnsureCanary(in memo.RelExpr, canaryCol opt.ColumnID) memo
 func (c *CustomFuncs) CanaryColSet(canaryCol opt.ColumnID) opt.ColSet {
 	var colSet opt.ColSet
 	if canaryCol != 0 {
-		colSet.Add(int(canaryCol))
+		colSet.Add(canaryCol)
 	}
 	return colSet
 }
@@ -540,7 +528,7 @@ func (c *CustomFuncs) TranslateNonIgnoreAggs(
 ) memo.RelExpr {
 	var aggCanaryVar opt.ScalarExpr
 	passthrough := c.OutputCols(newIn).Copy()
-	passthrough.Remove(int(canaryCol))
+	passthrough.Remove(canaryCol)
 
 	var projections memo.ProjectionsExpr
 	for i := range newAggs {
@@ -550,9 +538,9 @@ func (c *CustomFuncs) TranslateNonIgnoreAggs(
 				if canaryCol == 0 {
 					id, ok := oldIn.Relational().NotNullCols.Next(0)
 					if !ok {
-						panic(pgerror.AssertionFailedf("expected input expression to have not-null column"))
+						panic(errors.AssertionFailedf("expected input expression to have not-null column"))
 					}
-					canaryCol = opt.ColumnID(id)
+					canaryCol = id
 				}
 				aggCanaryVar = c.f.ConstructVariable(canaryCol)
 			}
@@ -565,7 +553,7 @@ func (c *CustomFuncs) TranslateNonIgnoreAggs(
 				// we translate that into Count.
 				// TestAllAggsIgnoreNullsOrNullOnEmpty verifies that this assumption is
 				// true.
-				panic(pgerror.AssertionFailedf("can't decorrelate with aggregate %s", log.Safe(agg.Op())))
+				panic(errors.AssertionFailedf("can't decorrelate with aggregate %s", log.Safe(agg.Op())))
 			}
 
 			if projections == nil {
@@ -575,7 +563,7 @@ func (c *CustomFuncs) TranslateNonIgnoreAggs(
 				Element:    c.constructCanaryChecker(aggCanaryVar, newAggs[i].Col),
 				ColPrivate: memo.ColPrivate{Col: oldAggs[i].Col},
 			})
-			passthrough.Remove(int(newAggs[i].Col))
+			passthrough.Remove(newAggs[i].Col)
 		}
 	}
 
@@ -612,9 +600,9 @@ func (c *CustomFuncs) EnsureAggsCanIgnoreNulls(
 			// Translate CountRows() to Count(notNullCol).
 			id, ok := in.Relational().NotNullCols.Next(0)
 			if !ok {
-				panic(pgerror.AssertionFailedf("expected input expression to have not-null column"))
+				panic(errors.AssertionFailedf("expected input expression to have not-null column"))
 			}
-			notNullColID := opt.ColumnID(id)
+			notNullColID := id
 			newAgg = c.f.ConstructCount(c.f.ConstructVariable(notNullColID))
 
 		default:
@@ -709,12 +697,8 @@ func (c *CustomFuncs) ConstructNoColsRow() memo.RelExpr {
 // referenceSingleColumn returns a Variable operator that refers to the one and
 // only column that is projected by the input expression.
 func (c *CustomFuncs) referenceSingleColumn(in memo.RelExpr) opt.ScalarExpr {
-	cols := in.Relational().OutputCols
-	if cols.Len() != 1 {
-		panic(pgerror.AssertionFailedf("expression does not have exactly one column"))
-	}
-	colID, _ := cols.Next(0)
-	return c.f.ConstructVariable(opt.ColumnID(colID))
+	colID := in.Relational().OutputCols.SingleColumn()
+	return c.f.ConstructVariable(colID)
 }
 
 // subqueryHoister searches scalar expression trees looking for correlated
@@ -813,9 +797,15 @@ func (r *subqueryHoister) hoistAll(scalar opt.ScalarExpr) opt.ScalarExpr {
 		}
 
 		// Replace the Subquery operator with a Variable operator referring to
-		// the first (and only) column in the hoisted query.
-		colID, _ := subqueryProps.OutputCols.Next(0)
-		return r.f.ConstructVariable(opt.ColumnID(colID))
+		// the output column of the hoisted query.
+		var colID opt.ColumnID
+		switch t := scalar.(type) {
+		case *memo.ArrayFlattenExpr:
+			colID = t.RequestedCol
+		default:
+			colID = subqueryProps.OutputCols.SingleColumn()
+		}
+		return r.f.ConstructVariable(colID)
 	}
 
 	return r.f.Replace(scalar, func(nd opt.Expr) opt.Expr {

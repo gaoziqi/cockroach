@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgwire
 
@@ -32,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -84,6 +81,7 @@ func TestConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	serverAddr := ln.Addr()
+	log.Infof(context.TODO(), "started listener on %s", serverAddr)
 
 	var g errgroup.Group
 	ctx := context.TODO()
@@ -177,7 +175,7 @@ func TestConn(t *testing.T) {
 	expectSync(ctx, t, &rd)
 
 	// Test that parse error turns into SendError.
-	expectSendError(ctx, t, pgerror.CodeSyntaxError, &rd, conn)
+	expectSendError(ctx, t, pgcode.Syntax, &rd, conn)
 
 	clientWG.Done()
 
@@ -549,12 +547,8 @@ func expectSendError(
 		t.Fatalf("%s: expected command SendError, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
 	}
 
-	pg, ok := se.Err.(*pgerror.Error)
-	if !ok {
-		t.Fatalf("expected pgerror, got %T (%s)", se.Err, se.Err)
-	}
-	if pg.Code != pgErrCode {
-		t.Fatalf("expected code %s, got: %s", pgErrCode, pg.Code)
+	if code := pgerror.GetPGCode(se.Err); code != pgErrCode {
+		t.Fatalf("expected code %s, got: %s", pgErrCode, code)
 	}
 
 	if err := finishQuery(execPortal, c); err != nil {
@@ -666,7 +660,7 @@ func TestConnClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.ServingAddr(), "testConnClose" /* prefix */, url.User(security.RootUser),
+		t, s.ServingSQLAddr(), "testConnClose" /* prefix */, url.User(security.RootUser),
 	)
 	defer cleanupFunc()
 	noBufferDB, err := gosql.Open("postgres", pgURL.String())
@@ -803,6 +797,7 @@ func TestReadTimeoutConnExits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	log.Infof(context.TODO(), "started listener on %s", ln.Addr())
 	defer func() {
 		if err := ln.Close(); err != nil {
 			t.Fatal(err)
@@ -874,7 +869,7 @@ func TestConnResultsBufferSize(t *testing.T) {
 		require.Equal(t, `16384`, size)
 	}
 
-	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
+	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 	q := pgURL.Query()
 
@@ -957,7 +952,7 @@ func TestConnCloseCancelsAuth(t *testing.T) {
 
 	// We're going to open a client connection and do the minimum so that the
 	// server gets to the authentication phase, where it will block.
-	conn, err := net.Dial("tcp", s.ServingAddr())
+	conn, err := net.Dial("tcp", s.ServingSQLAddr())
 	if err != nil {
 		t.Fatal(err)
 	}

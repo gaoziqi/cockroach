@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -44,17 +40,6 @@ func declareKeysGC(
 	// but can avoid declaring these keys below.
 	if gcr.Threshold != (hlc.Timestamp{}) {
 		spans.Add(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeLastGCKey(header.RangeID)})
-	}
-	if gcr.TxnSpanGCThreshold != (hlc.Timestamp{}) {
-		spans.Add(spanset.SpanReadWrite, roachpb.Span{
-			// TODO(bdarnell): since this must be checked by all
-			// reads, this should be factored out into a separate
-			// waiter which blocks only those reads far enough in the
-			// past to be affected by the in-flight GCRequest (i.e.
-			// normally none). This means this key would be special
-			// cased and would not acquire latches.
-			Key: keys.RangeTxnSpanGCThresholdKey(header.RangeID),
-		})
 	}
 	spans.Add(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(desc.StartKey)})
 }
@@ -98,13 +83,6 @@ func GC(
 		newThreshold.Forward(args.Threshold)
 	}
 
-	var newTxnSpanGCThreshold hlc.Timestamp
-	if args.TxnSpanGCThreshold != (hlc.Timestamp{}) {
-		oldTxnSpanGCThreshold := cArgs.EvalCtx.GetTxnSpanGCThreshold()
-		newTxnSpanGCThreshold = oldTxnSpanGCThreshold
-		newTxnSpanGCThreshold.Forward(args.TxnSpanGCThreshold)
-	}
-
 	var pd result.Result
 	stateLoader := MakeStateLoader(cArgs.EvalCtx)
 
@@ -116,13 +94,6 @@ func GC(
 	if newThreshold != (hlc.Timestamp{}) {
 		replState.GCThreshold = &newThreshold
 		if err := stateLoader.SetGCThreshold(ctx, batch, cArgs.Stats, &newThreshold); err != nil {
-			return result.Result{}, err
-		}
-	}
-
-	if newTxnSpanGCThreshold != (hlc.Timestamp{}) {
-		replState.TxnSpanGCThreshold = &newTxnSpanGCThreshold
-		if err := stateLoader.SetTxnSpanGCThreshold(ctx, batch, cArgs.Stats, &newTxnSpanGCThreshold); err != nil {
 			return result.Result{}, err
 		}
 	}

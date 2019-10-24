@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -171,7 +167,7 @@ type txnPipeliner struct {
 	st *cluster.Settings
 	// Optional; used to condense intent spans, if provided. If not provided,
 	// a transaction's write footprint may grow without bound.
-	ri       *RangeIterator
+	riGen    RangeIteratorGen
 	wrapped  lockedSender
 	disabled bool
 
@@ -457,7 +453,7 @@ func (tp *txnPipeliner) updateWriteTracking(
 ) {
 	// After adding new writes to the write footprint, check whether we need to
 	// condense the set to stay below memory limits.
-	defer tp.footprint.maybeCondense(ctx, tp.ri, trackedWritesMaxSize.Get(&tp.st.SV))
+	defer tp.footprint.maybeCondense(ctx, tp.riGen, trackedWritesMaxSize.Get(&tp.st.SV))
 
 	// If the request failed, add all intent writes directly to the write
 	// footprint. This reduces the likelihood of dangling intents blocking
@@ -469,11 +465,24 @@ func (tp *txnPipeliner) updateWriteTracking(
 		return
 	}
 
-	// If the transaction is no longer pending, clear the in-flight writes set
-	// and immediately return.
-	// TODO(nvanbenschoten): Do we have to handle missing Txn's anymore?
-	if br.Txn != nil && br.Txn.Status != roachpb.PENDING {
-		tp.ifWrites.clear(false /* reuse */)
+	// Similarly, if the transaction is now finalized, we don't need to
+	// accurately update the write tracking.
+	if br.Txn.Status.IsFinalized() {
+		switch br.Txn.Status {
+		case roachpb.ABORTED:
+			// If the transaction is now ABORTED, add all intent writes from
+			// the batch directly to the write footprint. We don't know which
+			// of these succeeded.
+			ba.IntentSpanIterate(nil, tp.footprint.insert)
+		case roachpb.COMMITTED:
+			// If the transaction is now COMMITTED, it must not have any more
+			// in-flight writes, so clear them. Technically we should move all
+			// of these to the write footprint, but since the transaction is
+			// already committed, there's no reason to.
+			tp.ifWrites.clear(false /* reuse */)
+		default:
+			panic("unexpected")
+		}
 		return
 	}
 
@@ -833,7 +842,9 @@ func (s *condensableSpanSet) mergeAndSort() (distinct bool) {
 // exceeded, the method is more aggressive in its attempt to reduce the memory
 // footprint of the span set. Not only will it merge overlapping spans, but
 // spans within the same range boundaries are also condensed.
-func (s *condensableSpanSet) maybeCondense(ctx context.Context, ri *RangeIterator, maxBytes int64) {
+func (s *condensableSpanSet) maybeCondense(
+	ctx context.Context, riGen RangeIteratorGen, maxBytes int64,
+) {
 	if s.bytes < maxBytes {
 		return
 	}
@@ -847,11 +858,11 @@ func (s *condensableSpanSet) maybeCondense(ctx context.Context, ri *RangeIterato
 		return
 	}
 
-	if ri == nil {
-		// If we were not given a RangeIterator, we cannot condense the spans.
+	if riGen == nil {
+		// If we were not given a RangeIteratorGen, we cannot condense the spans.
 		return
 	}
-	defer ri.Reset()
+	ri := riGen()
 
 	// Divide spans by range boundaries and condense. Iterate over spans
 	// using a range iterator and add each to a bucket keyed by range

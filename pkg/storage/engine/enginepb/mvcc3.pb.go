@@ -95,22 +95,36 @@ type TxnMeta struct {
 	//       transaction commits.
 	//
 	Timestamp hlc.Timestamp `protobuf:"bytes,5,opt,name=timestamp,proto3" json:"timestamp"`
-	Priority  TxnPriority   `protobuf:"varint,6,opt,name=priority,proto3,casttype=TxnPriority" json:"priority,omitempty"`
+	// The timestamp that the transaction was assigned by its gateway when it
+	// began its first epoch. This is the earliest timestamp that the transaction
+	// could have written any of its intents at.
+	//
+	// The timestamp is currently used in two places:
+	// 1. by the transaction itself and by concurrent transactions when
+	//    determining whether this transaction's record can be initially
+	//    written. The timestamp is compared against the transaction's
+	//    corresponding write timestamp cache entry to ensure that a
+	//    finalized transaction can never commit, either after a replay
+	//    or a transaction abort. See CanCreateTxnRecord.
+	// 2. by intent resolution to efficiently scan for intents while
+	//    using a time-bound iterator - i.e. there can be intents to
+	//    resolve up to the timestamp that the txn started with.
+	MinTimestamp hlc.Timestamp `protobuf:"bytes,9,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp"`
+	// The transaction's priority, ratcheted on transaction pushes.
+	Priority TxnPriority `protobuf:"varint,6,opt,name=priority,proto3,casttype=TxnPriority" json:"priority,omitempty"`
 	// A zero-indexed sequence number which is increased on each request
 	// sent as part of the transaction. When set in the header of a batch of
 	// requests, the value will correspond to the sequence number of the
 	// last request. Used to provide idempotency and to protect against
 	// out-of-order application (by means of a transaction retry).
-	Sequence             TxnSeq   `protobuf:"varint,7,opt,name=sequence,proto3,casttype=TxnSeq" json:"sequence,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Sequence TxnSeq `protobuf:"varint,7,opt,name=sequence,proto3,casttype=TxnSeq" json:"sequence,omitempty"`
 }
 
 func (m *TxnMeta) Reset()         { *m = TxnMeta{} }
 func (m *TxnMeta) String() string { return proto.CompactTextString(m) }
 func (*TxnMeta) ProtoMessage()    {}
 func (*TxnMeta) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{0}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{0}
 }
 func (m *TxnMeta) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -142,29 +156,27 @@ type MVCCStatsDelta struct {
 	// TODO(nvanbenschoten): now that we've split MVCCPersistentStats
 	// from this MVCCStatsDelta type, we can turn contains_estimates
 	// into a three-valued type ('UNCHANGED', 'NO', and 'YES').
-	ContainsEstimates    bool     `protobuf:"varint,14,opt,name=contains_estimates,json=containsEstimates,proto3" json:"contains_estimates,omitempty"`
-	LastUpdateNanos      int64    `protobuf:"fixed64,1,opt,name=last_update_nanos,json=lastUpdateNanos,proto3" json:"last_update_nanos,omitempty"`
-	IntentAge            int64    `protobuf:"fixed64,2,opt,name=intent_age,json=intentAge,proto3" json:"intent_age,omitempty"`
-	GCBytesAge           int64    `protobuf:"fixed64,3,opt,name=gc_bytes_age,json=gcBytesAge,proto3" json:"gc_bytes_age,omitempty"`
-	LiveBytes            int64    `protobuf:"zigzag64,4,opt,name=live_bytes,json=liveBytes,proto3" json:"live_bytes,omitempty"`
-	LiveCount            int64    `protobuf:"zigzag64,5,opt,name=live_count,json=liveCount,proto3" json:"live_count,omitempty"`
-	KeyBytes             int64    `protobuf:"zigzag64,6,opt,name=key_bytes,json=keyBytes,proto3" json:"key_bytes,omitempty"`
-	KeyCount             int64    `protobuf:"zigzag64,7,opt,name=key_count,json=keyCount,proto3" json:"key_count,omitempty"`
-	ValBytes             int64    `protobuf:"zigzag64,8,opt,name=val_bytes,json=valBytes,proto3" json:"val_bytes,omitempty"`
-	ValCount             int64    `protobuf:"zigzag64,9,opt,name=val_count,json=valCount,proto3" json:"val_count,omitempty"`
-	IntentBytes          int64    `protobuf:"zigzag64,10,opt,name=intent_bytes,json=intentBytes,proto3" json:"intent_bytes,omitempty"`
-	IntentCount          int64    `protobuf:"zigzag64,11,opt,name=intent_count,json=intentCount,proto3" json:"intent_count,omitempty"`
-	SysBytes             int64    `protobuf:"zigzag64,12,opt,name=sys_bytes,json=sysBytes,proto3" json:"sys_bytes,omitempty"`
-	SysCount             int64    `protobuf:"zigzag64,13,opt,name=sys_count,json=sysCount,proto3" json:"sys_count,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ContainsEstimates bool  `protobuf:"varint,14,opt,name=contains_estimates,json=containsEstimates,proto3" json:"contains_estimates,omitempty"`
+	LastUpdateNanos   int64 `protobuf:"fixed64,1,opt,name=last_update_nanos,json=lastUpdateNanos,proto3" json:"last_update_nanos,omitempty"`
+	IntentAge         int64 `protobuf:"fixed64,2,opt,name=intent_age,json=intentAge,proto3" json:"intent_age,omitempty"`
+	GCBytesAge        int64 `protobuf:"fixed64,3,opt,name=gc_bytes_age,json=gcBytesAge,proto3" json:"gc_bytes_age,omitempty"`
+	LiveBytes         int64 `protobuf:"zigzag64,4,opt,name=live_bytes,json=liveBytes,proto3" json:"live_bytes,omitempty"`
+	LiveCount         int64 `protobuf:"zigzag64,5,opt,name=live_count,json=liveCount,proto3" json:"live_count,omitempty"`
+	KeyBytes          int64 `protobuf:"zigzag64,6,opt,name=key_bytes,json=keyBytes,proto3" json:"key_bytes,omitempty"`
+	KeyCount          int64 `protobuf:"zigzag64,7,opt,name=key_count,json=keyCount,proto3" json:"key_count,omitempty"`
+	ValBytes          int64 `protobuf:"zigzag64,8,opt,name=val_bytes,json=valBytes,proto3" json:"val_bytes,omitempty"`
+	ValCount          int64 `protobuf:"zigzag64,9,opt,name=val_count,json=valCount,proto3" json:"val_count,omitempty"`
+	IntentBytes       int64 `protobuf:"zigzag64,10,opt,name=intent_bytes,json=intentBytes,proto3" json:"intent_bytes,omitempty"`
+	IntentCount       int64 `protobuf:"zigzag64,11,opt,name=intent_count,json=intentCount,proto3" json:"intent_count,omitempty"`
+	SysBytes          int64 `protobuf:"zigzag64,12,opt,name=sys_bytes,json=sysBytes,proto3" json:"sys_bytes,omitempty"`
+	SysCount          int64 `protobuf:"zigzag64,13,opt,name=sys_count,json=sysCount,proto3" json:"sys_count,omitempty"`
 }
 
 func (m *MVCCStatsDelta) Reset()         { *m = MVCCStatsDelta{} }
 func (m *MVCCStatsDelta) String() string { return proto.CompactTextString(m) }
 func (*MVCCStatsDelta) ProtoMessage()    {}
 func (*MVCCStatsDelta) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{1}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{1}
 }
 func (m *MVCCStatsDelta) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -194,29 +206,27 @@ var xxx_messageInfo_MVCCStatsDelta proto.InternalMessageInfo
 // values but inefficient to store negative values. This makes the encodings
 // incompatible.
 type MVCCPersistentStats struct {
-	ContainsEstimates    bool     `protobuf:"varint,14,opt,name=contains_estimates,json=containsEstimates,proto3" json:"contains_estimates,omitempty"`
-	LastUpdateNanos      int64    `protobuf:"fixed64,1,opt,name=last_update_nanos,json=lastUpdateNanos,proto3" json:"last_update_nanos,omitempty"`
-	IntentAge            int64    `protobuf:"fixed64,2,opt,name=intent_age,json=intentAge,proto3" json:"intent_age,omitempty"`
-	GCBytesAge           int64    `protobuf:"fixed64,3,opt,name=gc_bytes_age,json=gcBytesAge,proto3" json:"gc_bytes_age,omitempty"`
-	LiveBytes            int64    `protobuf:"varint,4,opt,name=live_bytes,json=liveBytes,proto3" json:"live_bytes,omitempty"`
-	LiveCount            int64    `protobuf:"varint,5,opt,name=live_count,json=liveCount,proto3" json:"live_count,omitempty"`
-	KeyBytes             int64    `protobuf:"varint,6,opt,name=key_bytes,json=keyBytes,proto3" json:"key_bytes,omitempty"`
-	KeyCount             int64    `protobuf:"varint,7,opt,name=key_count,json=keyCount,proto3" json:"key_count,omitempty"`
-	ValBytes             int64    `protobuf:"varint,8,opt,name=val_bytes,json=valBytes,proto3" json:"val_bytes,omitempty"`
-	ValCount             int64    `protobuf:"varint,9,opt,name=val_count,json=valCount,proto3" json:"val_count,omitempty"`
-	IntentBytes          int64    `protobuf:"varint,10,opt,name=intent_bytes,json=intentBytes,proto3" json:"intent_bytes,omitempty"`
-	IntentCount          int64    `protobuf:"varint,11,opt,name=intent_count,json=intentCount,proto3" json:"intent_count,omitempty"`
-	SysBytes             int64    `protobuf:"varint,12,opt,name=sys_bytes,json=sysBytes,proto3" json:"sys_bytes,omitempty"`
-	SysCount             int64    `protobuf:"varint,13,opt,name=sys_count,json=sysCount,proto3" json:"sys_count,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	ContainsEstimates bool  `protobuf:"varint,14,opt,name=contains_estimates,json=containsEstimates,proto3" json:"contains_estimates,omitempty"`
+	LastUpdateNanos   int64 `protobuf:"fixed64,1,opt,name=last_update_nanos,json=lastUpdateNanos,proto3" json:"last_update_nanos,omitempty"`
+	IntentAge         int64 `protobuf:"fixed64,2,opt,name=intent_age,json=intentAge,proto3" json:"intent_age,omitempty"`
+	GCBytesAge        int64 `protobuf:"fixed64,3,opt,name=gc_bytes_age,json=gcBytesAge,proto3" json:"gc_bytes_age,omitempty"`
+	LiveBytes         int64 `protobuf:"varint,4,opt,name=live_bytes,json=liveBytes,proto3" json:"live_bytes,omitempty"`
+	LiveCount         int64 `protobuf:"varint,5,opt,name=live_count,json=liveCount,proto3" json:"live_count,omitempty"`
+	KeyBytes          int64 `protobuf:"varint,6,opt,name=key_bytes,json=keyBytes,proto3" json:"key_bytes,omitempty"`
+	KeyCount          int64 `protobuf:"varint,7,opt,name=key_count,json=keyCount,proto3" json:"key_count,omitempty"`
+	ValBytes          int64 `protobuf:"varint,8,opt,name=val_bytes,json=valBytes,proto3" json:"val_bytes,omitempty"`
+	ValCount          int64 `protobuf:"varint,9,opt,name=val_count,json=valCount,proto3" json:"val_count,omitempty"`
+	IntentBytes       int64 `protobuf:"varint,10,opt,name=intent_bytes,json=intentBytes,proto3" json:"intent_bytes,omitempty"`
+	IntentCount       int64 `protobuf:"varint,11,opt,name=intent_count,json=intentCount,proto3" json:"intent_count,omitempty"`
+	SysBytes          int64 `protobuf:"varint,12,opt,name=sys_bytes,json=sysBytes,proto3" json:"sys_bytes,omitempty"`
+	SysCount          int64 `protobuf:"varint,13,opt,name=sys_count,json=sysCount,proto3" json:"sys_count,omitempty"`
 }
 
 func (m *MVCCPersistentStats) Reset()         { *m = MVCCPersistentStats{} }
 func (m *MVCCPersistentStats) String() string { return proto.CompactTextString(m) }
 func (*MVCCPersistentStats) ProtoMessage()    {}
 func (*MVCCPersistentStats) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{2}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{2}
 }
 func (m *MVCCPersistentStats) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -254,16 +264,14 @@ type RangeAppliedState struct {
 	LeaseAppliedIndex uint64 `protobuf:"varint,2,opt,name=lease_applied_index,json=leaseAppliedIndex,proto3" json:"lease_applied_index,omitempty"`
 	// range_stats is the set of mvcc stats that accounts for the current value
 	// of the Raft state machine.
-	RangeStats           MVCCPersistentStats `protobuf:"bytes,3,opt,name=range_stats,json=rangeStats,proto3" json:"range_stats"`
-	XXX_NoUnkeyedLiteral struct{}            `json:"-"`
-	XXX_sizecache        int32               `json:"-"`
+	RangeStats MVCCPersistentStats `protobuf:"bytes,3,opt,name=range_stats,json=rangeStats,proto3" json:"range_stats"`
 }
 
 func (m *RangeAppliedState) Reset()         { *m = RangeAppliedState{} }
 func (m *RangeAppliedState) String() string { return proto.CompactTextString(m) }
 func (*RangeAppliedState) ProtoMessage()    {}
 func (*RangeAppliedState) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{3}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{3}
 }
 func (m *RangeAppliedState) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -291,18 +299,16 @@ var xxx_messageInfo_RangeAppliedState proto.InternalMessageInfo
 // MVCCWriteValueOp corresponds to a value being written outside of a
 // transaction.
 type MVCCWriteValueOp struct {
-	Key                  []byte        `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Timestamp            hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
-	Value                []byte        `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
-	XXX_sizecache        int32         `json:"-"`
+	Key       []byte        `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Timestamp hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
+	Value     []byte        `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
 }
 
 func (m *MVCCWriteValueOp) Reset()         { *m = MVCCWriteValueOp{} }
 func (m *MVCCWriteValueOp) String() string { return proto.CompactTextString(m) }
 func (*MVCCWriteValueOp) ProtoMessage()    {}
 func (*MVCCWriteValueOp) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{4}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{4}
 }
 func (m *MVCCWriteValueOp) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -330,18 +336,17 @@ var xxx_messageInfo_MVCCWriteValueOp proto.InternalMessageInfo
 // MVCCUpdateIntentOp corresponds to an intent being written for a given
 // transaction.
 type MVCCWriteIntentOp struct {
-	TxnID                github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
-	TxnKey               []byte                                              `protobuf:"bytes,2,opt,name=txn_key,json=txnKey,proto3" json:"txn_key,omitempty"`
-	Timestamp            hlc.Timestamp                                       `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp"`
-	XXX_NoUnkeyedLiteral struct{}                                            `json:"-"`
-	XXX_sizecache        int32                                               `json:"-"`
+	TxnID           github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
+	TxnKey          []byte                                              `protobuf:"bytes,2,opt,name=txn_key,json=txnKey,proto3" json:"txn_key,omitempty"`
+	TxnMinTimestamp hlc.Timestamp                                       `protobuf:"bytes,4,opt,name=txn_min_timestamp,json=txnMinTimestamp,proto3" json:"txn_min_timestamp"`
+	Timestamp       hlc.Timestamp                                       `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp"`
 }
 
 func (m *MVCCWriteIntentOp) Reset()         { *m = MVCCWriteIntentOp{} }
 func (m *MVCCWriteIntentOp) String() string { return proto.CompactTextString(m) }
 func (*MVCCWriteIntentOp) ProtoMessage()    {}
 func (*MVCCWriteIntentOp) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{5}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{5}
 }
 func (m *MVCCWriteIntentOp) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -369,17 +374,15 @@ var xxx_messageInfo_MVCCWriteIntentOp proto.InternalMessageInfo
 // MVCCUpdateIntentOp corresponds to an intent being updates at a larger
 // timestamp for a given transaction.
 type MVCCUpdateIntentOp struct {
-	TxnID                github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
-	Timestamp            hlc.Timestamp                                       `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
-	XXX_NoUnkeyedLiteral struct{}                                            `json:"-"`
-	XXX_sizecache        int32                                               `json:"-"`
+	TxnID     github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
+	Timestamp hlc.Timestamp                                       `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
 }
 
 func (m *MVCCUpdateIntentOp) Reset()         { *m = MVCCUpdateIntentOp{} }
 func (m *MVCCUpdateIntentOp) String() string { return proto.CompactTextString(m) }
 func (*MVCCUpdateIntentOp) ProtoMessage()    {}
 func (*MVCCUpdateIntentOp) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{6}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{6}
 }
 func (m *MVCCUpdateIntentOp) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -407,19 +410,17 @@ var xxx_messageInfo_MVCCUpdateIntentOp proto.InternalMessageInfo
 // MVCCCommitIntentOp corresponds to an intent being committed for a given
 // transaction.
 type MVCCCommitIntentOp struct {
-	TxnID                github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
-	Key                  []byte                                              `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
-	Timestamp            hlc.Timestamp                                       `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp"`
-	Value                []byte                                              `protobuf:"bytes,4,opt,name=value,proto3" json:"value,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}                                            `json:"-"`
-	XXX_sizecache        int32                                               `json:"-"`
+	TxnID     github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
+	Key       []byte                                              `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	Timestamp hlc.Timestamp                                       `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp"`
+	Value     []byte                                              `protobuf:"bytes,4,opt,name=value,proto3" json:"value,omitempty"`
 }
 
 func (m *MVCCCommitIntentOp) Reset()         { *m = MVCCCommitIntentOp{} }
 func (m *MVCCCommitIntentOp) String() string { return proto.CompactTextString(m) }
 func (*MVCCCommitIntentOp) ProtoMessage()    {}
 func (*MVCCCommitIntentOp) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{7}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{7}
 }
 func (m *MVCCCommitIntentOp) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -452,16 +453,14 @@ var xxx_messageInfo_MVCCCommitIntentOp proto.InternalMessageInfo
 // instance, a committed transaction will abort any intents it decided not to
 // write in its final epoch.
 type MVCCAbortIntentOp struct {
-	TxnID                github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
-	XXX_NoUnkeyedLiteral struct{}                                            `json:"-"`
-	XXX_sizecache        int32                                               `json:"-"`
+	TxnID github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
 }
 
 func (m *MVCCAbortIntentOp) Reset()         { *m = MVCCAbortIntentOp{} }
 func (m *MVCCAbortIntentOp) String() string { return proto.CompactTextString(m) }
 func (*MVCCAbortIntentOp) ProtoMessage()    {}
 func (*MVCCAbortIntentOp) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{8}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{8}
 }
 func (m *MVCCAbortIntentOp) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -490,16 +489,14 @@ var xxx_messageInfo_MVCCAbortIntentOp proto.InternalMessageInfo
 // operation indicates that none of the transaction's intents will ever be
 // committed.
 type MVCCAbortTxnOp struct {
-	TxnID                github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
-	XXX_NoUnkeyedLiteral struct{}                                            `json:"-"`
-	XXX_sizecache        int32                                               `json:"-"`
+	TxnID github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=txn_id,json=txnId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"txn_id"`
 }
 
 func (m *MVCCAbortTxnOp) Reset()         { *m = MVCCAbortTxnOp{} }
 func (m *MVCCAbortTxnOp) String() string { return proto.CompactTextString(m) }
 func (*MVCCAbortTxnOp) ProtoMessage()    {}
 func (*MVCCAbortTxnOp) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{9}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{9}
 }
 func (m *MVCCAbortTxnOp) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -526,21 +523,19 @@ var xxx_messageInfo_MVCCAbortTxnOp proto.InternalMessageInfo
 
 // MVCCLogicalOp is a union of all logical MVCC operation types.
 type MVCCLogicalOp struct {
-	WriteValue           *MVCCWriteValueOp   `protobuf:"bytes,1,opt,name=write_value,json=writeValue,proto3" json:"write_value,omitempty"`
-	WriteIntent          *MVCCWriteIntentOp  `protobuf:"bytes,2,opt,name=write_intent,json=writeIntent,proto3" json:"write_intent,omitempty"`
-	UpdateIntent         *MVCCUpdateIntentOp `protobuf:"bytes,3,opt,name=update_intent,json=updateIntent,proto3" json:"update_intent,omitempty"`
-	CommitIntent         *MVCCCommitIntentOp `protobuf:"bytes,4,opt,name=commit_intent,json=commitIntent,proto3" json:"commit_intent,omitempty"`
-	AbortIntent          *MVCCAbortIntentOp  `protobuf:"bytes,5,opt,name=abort_intent,json=abortIntent,proto3" json:"abort_intent,omitempty"`
-	AbortTxn             *MVCCAbortTxnOp     `protobuf:"bytes,6,opt,name=abort_txn,json=abortTxn,proto3" json:"abort_txn,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}            `json:"-"`
-	XXX_sizecache        int32               `json:"-"`
+	WriteValue   *MVCCWriteValueOp   `protobuf:"bytes,1,opt,name=write_value,json=writeValue,proto3" json:"write_value,omitempty"`
+	WriteIntent  *MVCCWriteIntentOp  `protobuf:"bytes,2,opt,name=write_intent,json=writeIntent,proto3" json:"write_intent,omitempty"`
+	UpdateIntent *MVCCUpdateIntentOp `protobuf:"bytes,3,opt,name=update_intent,json=updateIntent,proto3" json:"update_intent,omitempty"`
+	CommitIntent *MVCCCommitIntentOp `protobuf:"bytes,4,opt,name=commit_intent,json=commitIntent,proto3" json:"commit_intent,omitempty"`
+	AbortIntent  *MVCCAbortIntentOp  `protobuf:"bytes,5,opt,name=abort_intent,json=abortIntent,proto3" json:"abort_intent,omitempty"`
+	AbortTxn     *MVCCAbortTxnOp     `protobuf:"bytes,6,opt,name=abort_txn,json=abortTxn,proto3" json:"abort_txn,omitempty"`
 }
 
 func (m *MVCCLogicalOp) Reset()         { *m = MVCCLogicalOp{} }
 func (m *MVCCLogicalOp) String() string { return proto.CompactTextString(m) }
 func (*MVCCLogicalOp) ProtoMessage()    {}
 func (*MVCCLogicalOp) Descriptor() ([]byte, []int) {
-	return fileDescriptor_mvcc3_40a164001ad58245, []int{10}
+	return fileDescriptor_mvcc3_103868dd91da76fd, []int{10}
 }
 func (m *MVCCLogicalOp) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -607,6 +602,9 @@ func (this *TxnMeta) Equal(that interface{}) bool {
 		return false
 	}
 	if !this.Timestamp.Equal(&that1.Timestamp) {
+		return false
+	}
+	if !this.MinTimestamp.Equal(&that1.MinTimestamp) {
 		return false
 	}
 	if this.Priority != that1.Priority {
@@ -825,6 +823,14 @@ func (m *TxnMeta) MarshalTo(dAtA []byte) (int, error) {
 		i++
 		i = encodeVarintMvcc3(dAtA, i, uint64(m.Sequence))
 	}
+	dAtA[i] = 0x4a
+	i++
+	i = encodeVarintMvcc3(dAtA, i, uint64(m.MinTimestamp.Size()))
+	n3, err := m.MinTimestamp.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n3
 	return i, nil
 }
 
@@ -1048,11 +1054,11 @@ func (m *RangeAppliedState) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x1a
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.RangeStats.Size()))
-	n3, err := m.RangeStats.MarshalTo(dAtA[i:])
+	n4, err := m.RangeStats.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n3
+	i += n4
 	return i, nil
 }
 
@@ -1080,11 +1086,11 @@ func (m *MVCCWriteValueOp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x12
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.Timestamp.Size()))
-	n4, err := m.Timestamp.MarshalTo(dAtA[i:])
+	n5, err := m.Timestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n4
+	i += n5
 	if len(m.Value) > 0 {
 		dAtA[i] = 0x1a
 		i++
@@ -1112,11 +1118,11 @@ func (m *MVCCWriteIntentOp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.TxnID.Size()))
-	n5, err := m.TxnID.MarshalTo(dAtA[i:])
+	n6, err := m.TxnID.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n5
+	i += n6
 	if len(m.TxnKey) > 0 {
 		dAtA[i] = 0x12
 		i++
@@ -1126,11 +1132,19 @@ func (m *MVCCWriteIntentOp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x1a
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.Timestamp.Size()))
-	n6, err := m.Timestamp.MarshalTo(dAtA[i:])
+	n7, err := m.Timestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n6
+	i += n7
+	dAtA[i] = 0x22
+	i++
+	i = encodeVarintMvcc3(dAtA, i, uint64(m.TxnMinTimestamp.Size()))
+	n8, err := m.TxnMinTimestamp.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n8
 	return i, nil
 }
 
@@ -1152,19 +1166,19 @@ func (m *MVCCUpdateIntentOp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.TxnID.Size()))
-	n7, err := m.TxnID.MarshalTo(dAtA[i:])
+	n9, err := m.TxnID.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n7
+	i += n9
 	dAtA[i] = 0x12
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.Timestamp.Size()))
-	n8, err := m.Timestamp.MarshalTo(dAtA[i:])
+	n10, err := m.Timestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n8
+	i += n10
 	return i, nil
 }
 
@@ -1186,11 +1200,11 @@ func (m *MVCCCommitIntentOp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.TxnID.Size()))
-	n9, err := m.TxnID.MarshalTo(dAtA[i:])
+	n11, err := m.TxnID.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n9
+	i += n11
 	if len(m.Key) > 0 {
 		dAtA[i] = 0x12
 		i++
@@ -1200,11 +1214,11 @@ func (m *MVCCCommitIntentOp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x1a
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.Timestamp.Size()))
-	n10, err := m.Timestamp.MarshalTo(dAtA[i:])
+	n12, err := m.Timestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n10
+	i += n12
 	if len(m.Value) > 0 {
 		dAtA[i] = 0x22
 		i++
@@ -1232,11 +1246,11 @@ func (m *MVCCAbortIntentOp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.TxnID.Size()))
-	n11, err := m.TxnID.MarshalTo(dAtA[i:])
+	n13, err := m.TxnID.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n11
+	i += n13
 	return i, nil
 }
 
@@ -1258,11 +1272,11 @@ func (m *MVCCAbortTxnOp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintMvcc3(dAtA, i, uint64(m.TxnID.Size()))
-	n12, err := m.TxnID.MarshalTo(dAtA[i:])
+	n14, err := m.TxnID.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n12
+	i += n14
 	return i, nil
 }
 
@@ -1285,61 +1299,61 @@ func (m *MVCCLogicalOp) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0xa
 		i++
 		i = encodeVarintMvcc3(dAtA, i, uint64(m.WriteValue.Size()))
-		n13, err := m.WriteValue.MarshalTo(dAtA[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n13
-	}
-	if m.WriteIntent != nil {
-		dAtA[i] = 0x12
-		i++
-		i = encodeVarintMvcc3(dAtA, i, uint64(m.WriteIntent.Size()))
-		n14, err := m.WriteIntent.MarshalTo(dAtA[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n14
-	}
-	if m.UpdateIntent != nil {
-		dAtA[i] = 0x1a
-		i++
-		i = encodeVarintMvcc3(dAtA, i, uint64(m.UpdateIntent.Size()))
-		n15, err := m.UpdateIntent.MarshalTo(dAtA[i:])
+		n15, err := m.WriteValue.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n15
 	}
-	if m.CommitIntent != nil {
-		dAtA[i] = 0x22
+	if m.WriteIntent != nil {
+		dAtA[i] = 0x12
 		i++
-		i = encodeVarintMvcc3(dAtA, i, uint64(m.CommitIntent.Size()))
-		n16, err := m.CommitIntent.MarshalTo(dAtA[i:])
+		i = encodeVarintMvcc3(dAtA, i, uint64(m.WriteIntent.Size()))
+		n16, err := m.WriteIntent.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n16
 	}
-	if m.AbortIntent != nil {
-		dAtA[i] = 0x2a
+	if m.UpdateIntent != nil {
+		dAtA[i] = 0x1a
 		i++
-		i = encodeVarintMvcc3(dAtA, i, uint64(m.AbortIntent.Size()))
-		n17, err := m.AbortIntent.MarshalTo(dAtA[i:])
+		i = encodeVarintMvcc3(dAtA, i, uint64(m.UpdateIntent.Size()))
+		n17, err := m.UpdateIntent.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n17
 	}
-	if m.AbortTxn != nil {
-		dAtA[i] = 0x32
+	if m.CommitIntent != nil {
+		dAtA[i] = 0x22
 		i++
-		i = encodeVarintMvcc3(dAtA, i, uint64(m.AbortTxn.Size()))
-		n18, err := m.AbortTxn.MarshalTo(dAtA[i:])
+		i = encodeVarintMvcc3(dAtA, i, uint64(m.CommitIntent.Size()))
+		n18, err := m.CommitIntent.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n18
+	}
+	if m.AbortIntent != nil {
+		dAtA[i] = 0x2a
+		i++
+		i = encodeVarintMvcc3(dAtA, i, uint64(m.AbortIntent.Size()))
+		n19, err := m.AbortIntent.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n19
+	}
+	if m.AbortTxn != nil {
+		dAtA[i] = 0x32
+		i++
+		i = encodeVarintMvcc3(dAtA, i, uint64(m.AbortTxn.Size()))
+		n20, err := m.AbortTxn.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n20
 	}
 	return i, nil
 }
@@ -1376,6 +1390,8 @@ func NewPopulatedTxnMeta(r randyMvcc3, easy bool) *TxnMeta {
 	if r.Intn(2) == 0 {
 		this.Sequence *= -1
 	}
+	v4 := hlc.NewPopulatedTimestamp(r, easy)
+	this.MinTimestamp = *v4
 	if !easy && r.Intn(10) != 0 {
 	}
 	return this
@@ -1445,8 +1461,8 @@ func NewPopulatedRangeAppliedState(r randyMvcc3, easy bool) *RangeAppliedState {
 	this := &RangeAppliedState{}
 	this.RaftAppliedIndex = uint64(uint64(r.Uint32()))
 	this.LeaseAppliedIndex = uint64(uint64(r.Uint32()))
-	v4 := NewPopulatedMVCCPersistentStats(r, easy)
-	this.RangeStats = *v4
+	v5 := NewPopulatedMVCCPersistentStats(r, easy)
+	this.RangeStats = *v5
 	if !easy && r.Intn(10) != 0 {
 	}
 	return this
@@ -1471,9 +1487,9 @@ func randUTF8RuneMvcc3(r randyMvcc3) rune {
 	return rune(ru + 61)
 }
 func randStringMvcc3(r randyMvcc3) string {
-	v5 := r.Intn(100)
-	tmps := make([]rune, v5)
-	for i := 0; i < v5; i++ {
+	v6 := r.Intn(100)
+	tmps := make([]rune, v6)
+	for i := 0; i < v6; i++ {
 		tmps[i] = randUTF8RuneMvcc3(r)
 	}
 	return string(tmps)
@@ -1495,11 +1511,11 @@ func randFieldMvcc3(dAtA []byte, r randyMvcc3, fieldNumber int, wire int) []byte
 	switch wire {
 	case 0:
 		dAtA = encodeVarintPopulateMvcc3(dAtA, uint64(key))
-		v6 := r.Int63()
+		v7 := r.Int63()
 		if r.Intn(2) == 0 {
-			v6 *= -1
+			v7 *= -1
 		}
-		dAtA = encodeVarintPopulateMvcc3(dAtA, uint64(v6))
+		dAtA = encodeVarintPopulateMvcc3(dAtA, uint64(v7))
 	case 1:
 		dAtA = encodeVarintPopulateMvcc3(dAtA, uint64(key))
 		dAtA = append(dAtA, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
@@ -1547,6 +1563,8 @@ func (m *TxnMeta) Size() (n int) {
 	if m.Sequence != 0 {
 		n += 1 + sovMvcc3(uint64(m.Sequence))
 	}
+	l = m.MinTimestamp.Size()
+	n += 1 + l + sovMvcc3(uint64(l))
 	return n
 }
 
@@ -1701,6 +1719,8 @@ func (m *MVCCWriteIntentOp) Size() (n int) {
 		n += 1 + l + sovMvcc3(uint64(l))
 	}
 	l = m.Timestamp.Size()
+	n += 1 + l + sovMvcc3(uint64(l))
+	l = m.TxnMinTimestamp.Size()
 	n += 1 + l + sovMvcc3(uint64(l))
 	return n
 }
@@ -2025,6 +2045,36 @@ func (m *TxnMeta) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 9:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MinTimestamp", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMvcc3
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthMvcc3
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.MinTimestamp.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipMvcc3(dAtA[iNdEx:])
@@ -3026,6 +3076,36 @@ func (m *MVCCWriteIntentOp) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TxnMinTimestamp", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMvcc3
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthMvcc3
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.TxnMinTimestamp.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipMvcc3(dAtA[iNdEx:])
@@ -3843,76 +3923,78 @@ var (
 )
 
 func init() {
-	proto.RegisterFile("storage/engine/enginepb/mvcc3.proto", fileDescriptor_mvcc3_40a164001ad58245)
+	proto.RegisterFile("storage/engine/enginepb/mvcc3.proto", fileDescriptor_mvcc3_103868dd91da76fd)
 }
 
-var fileDescriptor_mvcc3_40a164001ad58245 = []byte{
-	// 1059 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcc, 0x57, 0x4f, 0x6f, 0x1b, 0x45,
-	0x14, 0xcf, 0xfe, 0x71, 0xb2, 0x1e, 0x3b, 0xa9, 0x3d, 0xad, 0x84, 0x55, 0x54, 0x6f, 0x6a, 0x24,
-	0x14, 0xf1, 0x67, 0x0d, 0x09, 0x70, 0xc8, 0xcd, 0x7f, 0x2a, 0xe4, 0x42, 0x9b, 0xb2, 0x75, 0x5a,
-	0x09, 0x84, 0x56, 0xe3, 0xf5, 0xb0, 0x5e, 0x79, 0x3d, 0xbb, 0xdd, 0x1d, 0xbb, 0xeb, 0x03, 0xdf,
-	0x81, 0x8f, 0x90, 0x0b, 0xdf, 0x80, 0x03, 0x47, 0x8e, 0x39, 0x70, 0xe0, 0x88, 0x2a, 0x64, 0x81,
-	0xb9, 0xf0, 0x01, 0x38, 0x45, 0x42, 0x42, 0x33, 0xb3, 0xbb, 0xb6, 0x2b, 0x70, 0x9a, 0x44, 0x44,
-	0x9c, 0x32, 0xf3, 0x7e, 0xef, 0xfd, 0xde, 0xcc, 0xfb, 0xbd, 0x7d, 0x13, 0x83, 0x37, 0x22, 0xea,
-	0x87, 0xc8, 0xc1, 0x75, 0x4c, 0x1c, 0x97, 0xa4, 0x7f, 0x82, 0x5e, 0x7d, 0x34, 0xb1, 0xed, 0x03,
-	0x23, 0x08, 0x7d, 0xea, 0xc3, 0xbb, 0xb6, 0x6f, 0x0f, 0x43, 0x1f, 0xd9, 0x03, 0x23, 0x71, 0x37,
-	0x84, 0x9f, 0x91, 0xba, 0xdf, 0xae, 0x8c, 0xa9, 0xeb, 0xd5, 0x07, 0x9e, 0x5d, 0xa7, 0xee, 0x08,
-	0x47, 0x14, 0x8d, 0x02, 0x11, 0x7c, 0xfb, 0x96, 0xe3, 0x3b, 0x3e, 0x5f, 0xd6, 0xd9, 0x4a, 0x58,
-	0x6b, 0x3f, 0xc8, 0x60, 0xab, 0x1b, 0x93, 0x07, 0x98, 0x22, 0xf8, 0x19, 0x90, 0xdd, 0x7e, 0x45,
-	0xda, 0x95, 0xf6, 0x8a, 0xcd, 0xc6, 0xe9, 0x4c, 0xdf, 0x78, 0x31, 0xd3, 0x0f, 0x1c, 0x97, 0x0e,
-	0xc6, 0x3d, 0xc3, 0xf6, 0x47, 0xf5, 0x2c, 0x7b, 0xbf, 0xb7, 0x58, 0xd7, 0x83, 0xa1, 0x53, 0xe7,
-	0x49, 0xc7, 0x63, 0xb7, 0x6f, 0x1c, 0x1f, 0x77, 0xda, 0xf3, 0x99, 0x2e, 0x77, 0xda, 0xa6, 0xec,
-	0xf6, 0x61, 0x09, 0x28, 0x43, 0x3c, 0xad, 0x28, 0x8c, 0xd3, 0x64, 0x4b, 0x58, 0x03, 0x39, 0x1c,
-	0xf8, 0xf6, 0xa0, 0xa2, 0xee, 0x4a, 0x7b, 0xb9, 0x66, 0xf1, 0x6c, 0xa6, 0x6b, 0xdd, 0x98, 0xdc,
-	0x63, 0x36, 0x53, 0x40, 0xb0, 0x01, 0xf2, 0xd9, 0xe9, 0x2b, 0xb9, 0x5d, 0x69, 0xaf, 0xb0, 0x7f,
-	0xc7, 0x58, 0xdc, 0x9d, 0x65, 0x33, 0x06, 0x9e, 0x6d, 0x74, 0x53, 0xa7, 0xa6, 0xca, 0x8e, 0x6b,
-	0x2e, 0xa2, 0xe0, 0xdb, 0x40, 0x0b, 0x42, 0xd7, 0x0f, 0x5d, 0x3a, 0xad, 0x6c, 0xf2, 0x4c, 0x37,
-	0xce, 0x66, 0x7a, 0xa1, 0x1b, 0x93, 0x47, 0x89, 0xd9, 0xcc, 0x1c, 0xe0, 0x9b, 0x40, 0x8b, 0xf0,
-	0xb3, 0x31, 0x26, 0x36, 0xae, 0x6c, 0x71, 0x67, 0x70, 0x36, 0xd3, 0x37, 0xbb, 0x31, 0x79, 0x8c,
-	0x9f, 0x99, 0x19, 0x76, 0xa8, 0x7d, 0x7f, 0xa2, 0x4b, 0x7f, 0x9c, 0xe8, 0xd2, 0x7d, 0x55, 0x93,
-	0x4b, 0xca, 0x7d, 0x55, 0xd3, 0x4a, 0xf9, 0xda, 0x9f, 0x0a, 0xd8, 0x79, 0xf0, 0xa4, 0xd5, 0x7a,
-	0x4c, 0x11, 0x8d, 0xda, 0xd8, 0xa3, 0x08, 0xbe, 0x05, 0xca, 0x1e, 0x8a, 0xa8, 0x35, 0x0e, 0xfa,
-	0x88, 0x62, 0x8b, 0x20, 0xe2, 0x47, 0xbc, 0xb0, 0x25, 0xf3, 0x06, 0x03, 0x8e, 0xb9, 0xfd, 0x21,
-	0x33, 0xc3, 0x3b, 0x00, 0xb8, 0x84, 0x62, 0x42, 0x2d, 0xe4, 0xe0, 0x8a, 0xcc, 0x9d, 0xf2, 0xc2,
-	0xd2, 0x70, 0x30, 0x7c, 0x0f, 0x14, 0x1d, 0xdb, 0xea, 0x4d, 0x29, 0x8e, 0xb8, 0x03, 0x2b, 0x65,
-	0xa9, 0xb9, 0x33, 0x9f, 0xe9, 0xe0, 0xe3, 0x56, 0x93, 0x99, 0x1b, 0x0e, 0x36, 0x81, 0x63, 0xa7,
-	0x6b, 0x46, 0xe8, 0xb9, 0x13, 0x2c, 0x62, 0x78, 0x99, 0xa1, 0x99, 0x67, 0x16, 0xee, 0x91, 0xc1,
-	0xb6, 0x3f, 0x26, 0x94, 0x57, 0x37, 0x81, 0x5b, 0xcc, 0x00, 0x5f, 0x07, 0xf9, 0x21, 0x9e, 0x26,
-	0xc1, 0x9b, 0x1c, 0xd5, 0x86, 0x78, 0x2a, 0x62, 0x13, 0x50, 0x84, 0x6e, 0x65, 0x60, 0x16, 0x39,
-	0x41, 0x5e, 0x12, 0xa9, 0x09, 0x70, 0x82, 0xbc, 0x2c, 0x92, 0x81, 0x22, 0x32, 0x9f, 0x81, 0x22,
-	0xf2, 0x2e, 0x28, 0x26, 0x25, 0x10, 0xc1, 0x80, 0xe3, 0x05, 0x61, 0x13, 0xf1, 0x0b, 0x17, 0x41,
-	0x51, 0x58, 0x76, 0xc9, 0xf2, 0x47, 0xd3, 0x28, 0xa1, 0x28, 0x8a, 0x14, 0xd1, 0x34, 0xca, 0xf2,
-	0x33, 0x50, 0x04, 0x6f, 0x67, 0xa0, 0x88, 0x7c, 0x17, 0x40, 0xdb, 0x27, 0x14, 0xb9, 0x24, 0xb2,
-	0x70, 0x44, 0xdd, 0x11, 0x62, 0x14, 0x3b, 0xbb, 0xd2, 0x9e, 0x66, 0x96, 0x53, 0xe4, 0x5e, 0x0a,
-	0x1c, 0xaa, 0xac, 0x05, 0x6a, 0x7f, 0x29, 0xe0, 0x26, 0x93, 0xfd, 0x11, 0x0e, 0x23, 0x37, 0x62,
-	0xc7, 0xe0, 0x0d, 0xf0, 0x7f, 0xd3, 0x5e, 0x59, 0xaf, 0xbd, 0xb2, 0x56, 0x7b, 0x65, 0x9d, 0xf6,
-	0xca, 0x3a, 0xed, 0x95, 0x75, 0xda, 0x2b, 0xe7, 0x68, 0xaf, 0x9c, 0xaf, 0xbd, 0x72, 0x8e, 0xf6,
-	0xca, 0x3a, 0xed, 0x95, 0xcb, 0x6b, 0x9f, 0x8d, 0x80, 0xda, 0x0b, 0x09, 0x94, 0x4d, 0x44, 0x1c,
-	0xdc, 0x08, 0x02, 0xcf, 0xc5, 0x7d, 0xa6, 0x3e, 0x86, 0xef, 0x00, 0x18, 0xa2, 0xaf, 0xa8, 0x85,
-	0x84, 0xd1, 0x72, 0x49, 0x1f, 0xc7, 0x5c, 0x7e, 0xd5, 0x2c, 0x31, 0x24, 0xf1, 0xee, 0x30, 0x3b,
-	0x34, 0xc0, 0x4d, 0x0f, 0xa3, 0x08, 0xbf, 0xe4, 0x2e, 0x73, 0xf7, 0x32, 0x87, 0x56, 0xfc, 0xbf,
-	0x04, 0x85, 0x90, 0xa5, 0xb4, 0x22, 0xd6, 0x6a, 0xbc, 0x1f, 0x0a, 0xfb, 0x1f, 0x19, 0xe7, 0x3e,
-	0x0b, 0xc6, 0x3f, 0x34, 0x6a, 0x32, 0x33, 0x01, 0x27, 0xe4, 0x96, 0xa5, 0xcb, 0x7d, 0x0d, 0x4a,
-	0x2c, 0xe4, 0x69, 0xe8, 0x52, 0xfc, 0x04, 0x79, 0x63, 0x7c, 0x14, 0xa4, 0xb3, 0x5c, 0x5a, 0xcc,
-	0xf2, 0x95, 0x39, 0x2d, 0x5f, 0x6a, 0x4e, 0xdf, 0x02, 0xb9, 0x09, 0xe3, 0x4f, 0x9e, 0x08, 0xb1,
-	0xa9, 0xfd, 0x28, 0x81, 0x72, 0x96, 0xbf, 0xc3, 0x75, 0x3e, 0x0a, 0xe0, 0x17, 0x60, 0x93, 0xc6,
-	0xc4, 0xca, 0xde, 0xa8, 0xf6, 0xd5, 0xde, 0xa8, 0x5c, 0x37, 0x26, 0x9d, 0xb6, 0x99, 0xa3, 0x31,
-	0xe9, 0xf4, 0xe1, 0x6b, 0x60, 0x8b, 0x91, 0xb3, 0x1b, 0xca, 0xfc, 0x28, 0x2c, 0xd7, 0x27, 0x2f,
-	0x5f, 0x52, 0xb9, 0xcc, 0x25, 0x6b, 0xdf, 0x49, 0x00, 0xb2, 0xeb, 0x88, 0x4f, 0xff, 0x7a, 0xee,
-	0x73, 0x75, 0x6d, 0x6a, 0xbf, 0x24, 0xc7, 0x6e, 0xf9, 0xa3, 0x91, 0x4b, 0xaf, 0xe7, 0xd8, 0x49,
-	0x93, 0xc9, 0xff, 0xd2, 0x64, 0xca, 0xd5, 0x9a, 0x4c, 0x5d, 0x6e, 0xb2, 0x40, 0xf4, 0x58, 0xa3,
-	0xe7, 0x87, 0xd7, 0x73, 0xb9, 0xda, 0x48, 0xfc, 0xa3, 0xc0, 0x33, 0x76, 0x63, 0xf2, 0x5f, 0xa7,
-	0xfb, 0x56, 0x05, 0xdb, 0x2c, 0xdf, 0xa7, 0xbe, 0xe3, 0xda, 0xc8, 0x3b, 0x0a, 0x60, 0x17, 0x14,
-	0x9e, 0xb3, 0x4f, 0xca, 0x12, 0xe5, 0x90, 0x78, 0x35, 0x0f, 0x5e, 0x71, 0x7e, 0x2c, 0x0f, 0x03,
-	0x13, 0x3c, 0xcf, 0x76, 0xf0, 0x29, 0x28, 0x0a, 0x56, 0x31, 0x91, 0x93, 0x6e, 0xfb, 0xe0, 0x22,
-	0xb4, 0x69, 0xfd, 0x4d, 0x71, 0x3e, 0xb1, 0x85, 0x9f, 0x83, 0xed, 0xe4, 0x15, 0x4d, 0x98, 0x85,
-	0xfc, 0x1f, 0xbe, 0x22, 0xf3, 0xea, 0xe7, 0x66, 0x16, 0xc7, 0x4b, 0x7b, 0xc6, 0x6d, 0xf3, 0xbe,
-	0x4e, 0xb9, 0xd5, 0x0b, 0x71, 0xaf, 0x7e, 0x13, 0x66, 0xd1, 0x5e, 0xda, 0xb3, 0x82, 0x20, 0xa6,
-	0x71, 0x4a, 0x9d, 0xbb, 0x50, 0x41, 0x56, 0x1a, 0xd2, 0x2c, 0xa0, 0xc5, 0x16, 0x3e, 0x04, 0x79,
-	0x41, 0x4c, 0x63, 0xc2, 0x1f, 0xe8, 0xc2, 0xfe, 0xfb, 0x17, 0x61, 0xe5, 0x4d, 0x67, 0x6a, 0x28,
-	0x59, 0x1f, 0xaa, 0xa7, 0x27, 0xba, 0xd4, 0xac, 0x9c, 0xfe, 0x56, 0xdd, 0x38, 0x9d, 0x57, 0xa5,
-	0x9f, 0xe6, 0x55, 0xe9, 0xe7, 0x79, 0x55, 0xfa, 0x75, 0x5e, 0x95, 0xbe, 0xf9, 0xbd, 0xba, 0xd1,
-	0xdb, 0xe4, 0x3f, 0x12, 0x0e, 0xfe, 0x0e, 0x00, 0x00, 0xff, 0xff, 0x08, 0x39, 0xde, 0x88, 0x9e,
-	0x0c, 0x00, 0x00,
+var fileDescriptor_mvcc3_103868dd91da76fd = []byte{
+	// 1101 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcc, 0x57, 0x4f, 0x6f, 0xe3, 0x44,
+	0x14, 0xaf, 0x63, 0xa7, 0x75, 0x26, 0x69, 0x9b, 0xcc, 0xae, 0x44, 0xb4, 0x68, 0x93, 0x6e, 0x90,
+	0x50, 0xc5, 0x1f, 0x07, 0x5a, 0xe0, 0xd0, 0x5b, 0xd2, 0xae, 0x20, 0x0b, 0xdd, 0x2e, 0xde, 0x74,
+	0x57, 0x02, 0x21, 0x6b, 0xe2, 0x0c, 0xee, 0xa8, 0xf6, 0xd8, 0x6b, 0x4f, 0xba, 0xce, 0x81, 0x2f,
+	0xc0, 0x89, 0x2f, 0x80, 0xd4, 0x0b, 0xdf, 0x80, 0x03, 0x1f, 0xa1, 0xc7, 0x3d, 0xae, 0x56, 0x28,
+	0x82, 0xf4, 0xc2, 0x07, 0xe0, 0x54, 0x09, 0x09, 0xcd, 0x8c, 0xed, 0x24, 0x2b, 0x48, 0xff, 0x89,
+	0x8a, 0x53, 0x67, 0xde, 0xef, 0xbd, 0xdf, 0x7b, 0x33, 0xbf, 0xe7, 0x79, 0x0d, 0x78, 0x2b, 0x62,
+	0x7e, 0x88, 0x1c, 0xdc, 0xc4, 0xd4, 0x21, 0x34, 0xfd, 0x13, 0xf4, 0x9a, 0xde, 0x91, 0x6d, 0x6f,
+	0x1a, 0x41, 0xe8, 0x33, 0x1f, 0xde, 0xb3, 0x7d, 0xfb, 0x30, 0xf4, 0x91, 0x7d, 0x60, 0x24, 0xee,
+	0x86, 0xf4, 0x33, 0x52, 0xf7, 0x3b, 0xd5, 0x01, 0x23, 0x6e, 0xf3, 0xc0, 0xb5, 0x9b, 0x8c, 0x78,
+	0x38, 0x62, 0xc8, 0x0b, 0x64, 0xf0, 0x9d, 0xdb, 0x8e, 0xef, 0xf8, 0x62, 0xd9, 0xe4, 0x2b, 0x69,
+	0x6d, 0x7c, 0xaf, 0x82, 0xa5, 0x6e, 0x4c, 0x77, 0x31, 0x43, 0xf0, 0x4b, 0x90, 0x23, 0xfd, 0xaa,
+	0xb2, 0xa6, 0xac, 0x97, 0xda, 0xad, 0x93, 0x51, 0x7d, 0xe1, 0xd5, 0xa8, 0xbe, 0xe9, 0x10, 0x76,
+	0x30, 0xe8, 0x19, 0xb6, 0xef, 0x35, 0xb3, 0xec, 0xfd, 0xde, 0x64, 0xdd, 0x0c, 0x0e, 0x9d, 0xa6,
+	0x48, 0x3a, 0x18, 0x90, 0xbe, 0xb1, 0xbf, 0xdf, 0xd9, 0x19, 0x8f, 0xea, 0xb9, 0xce, 0x8e, 0x99,
+	0x23, 0x7d, 0x58, 0x06, 0xea, 0x21, 0x1e, 0x56, 0x55, 0xce, 0x69, 0xf2, 0x25, 0x6c, 0x80, 0x3c,
+	0x0e, 0x7c, 0xfb, 0xa0, 0xaa, 0xad, 0x29, 0xeb, 0xf9, 0x76, 0xe9, 0x6c, 0x54, 0xd7, 0xbb, 0x31,
+	0xbd, 0xcf, 0x6d, 0xa6, 0x84, 0x60, 0x0b, 0x14, 0xb2, 0xea, 0xab, 0xf9, 0x35, 0x65, 0xbd, 0xb8,
+	0x71, 0xd7, 0x98, 0x9c, 0x9d, 0x67, 0x33, 0x0e, 0x5c, 0xdb, 0xe8, 0xa6, 0x4e, 0x6d, 0x8d, 0x97,
+	0x6b, 0x4e, 0xa2, 0xe0, 0xbb, 0x40, 0x0f, 0x42, 0xe2, 0x87, 0x84, 0x0d, 0xab, 0x8b, 0x22, 0xd3,
+	0xea, 0xd9, 0xa8, 0x5e, 0xec, 0xc6, 0xf4, 0x51, 0x62, 0x36, 0x33, 0x07, 0xf8, 0x36, 0xd0, 0x23,
+	0xfc, 0x6c, 0x80, 0xa9, 0x8d, 0xab, 0x4b, 0xc2, 0x19, 0x9c, 0x8d, 0xea, 0x8b, 0xdd, 0x98, 0x3e,
+	0xc6, 0xcf, 0xcc, 0x0c, 0x83, 0x9f, 0x81, 0x65, 0x8f, 0x50, 0x6b, 0x52, 0x5b, 0xe1, 0xe2, 0xb5,
+	0x95, 0x3c, 0x42, 0x33, 0xdb, 0x96, 0xfe, 0xcb, 0x71, 0x5d, 0xf9, 0xe3, 0xb8, 0xae, 0x3c, 0xd0,
+	0xf4, 0x5c, 0x59, 0x7d, 0xa0, 0xe9, 0x7a, 0xb9, 0xd0, 0xf8, 0x53, 0x05, 0x2b, 0xbb, 0x4f, 0xb6,
+	0xb7, 0x1f, 0x33, 0xc4, 0xa2, 0x1d, 0xec, 0x32, 0x04, 0xdf, 0x01, 0x15, 0x17, 0x45, 0xcc, 0x1a,
+	0x04, 0x7d, 0xc4, 0xb0, 0x45, 0x11, 0xf5, 0x23, 0x21, 0x51, 0xd9, 0x5c, 0xe5, 0xc0, 0xbe, 0xb0,
+	0x3f, 0xe4, 0x66, 0x78, 0x17, 0x00, 0x42, 0x19, 0xa6, 0xcc, 0x42, 0x0e, 0xae, 0xe6, 0x84, 0x53,
+	0x41, 0x5a, 0x5a, 0x0e, 0x86, 0x1f, 0x80, 0x92, 0x63, 0x5b, 0xbd, 0x21, 0xc3, 0x91, 0x70, 0xe0,
+	0xa2, 0x94, 0xdb, 0x2b, 0xe3, 0x51, 0x1d, 0x7c, 0xba, 0xdd, 0xe6, 0xe6, 0x96, 0x83, 0x4d, 0xe0,
+	0xd8, 0xe9, 0x9a, 0x13, 0xba, 0xe4, 0x08, 0xcb, 0x18, 0x21, 0x18, 0x34, 0x0b, 0xdc, 0x22, 0x3c,
+	0x32, 0xd8, 0xf6, 0x07, 0x94, 0x09, 0x9d, 0x12, 0x78, 0x9b, 0x1b, 0xe0, 0x9b, 0xa0, 0x70, 0x88,
+	0x87, 0x49, 0xf0, 0xa2, 0x40, 0xf5, 0x43, 0x3c, 0x94, 0xb1, 0x09, 0x28, 0x43, 0x97, 0x32, 0x30,
+	0x8b, 0x3c, 0x42, 0x6e, 0x12, 0xa9, 0x4b, 0xf0, 0x08, 0xb9, 0x59, 0x24, 0x07, 0x65, 0x64, 0x21,
+	0x03, 0x65, 0xe4, 0x3d, 0x50, 0x4a, 0xae, 0x40, 0x06, 0x03, 0x81, 0x17, 0xa5, 0x4d, 0xc6, 0x4f,
+	0x5c, 0x24, 0x45, 0x71, 0xda, 0x25, 0xcb, 0x1f, 0x0d, 0xa3, 0x84, 0xa2, 0x24, 0x53, 0x44, 0xc3,
+	0x28, 0xcb, 0xcf, 0x41, 0x19, 0xbc, 0x9c, 0x81, 0x32, 0xf2, 0x7d, 0x00, 0x6d, 0x9f, 0x32, 0x44,
+	0x68, 0x64, 0xe1, 0x88, 0x11, 0x0f, 0x71, 0x8a, 0x95, 0x35, 0x65, 0x5d, 0x37, 0x2b, 0x29, 0x72,
+	0x3f, 0x05, 0xb6, 0x34, 0xde, 0x02, 0x8d, 0xbf, 0x54, 0x70, 0x8b, 0xcb, 0xfe, 0x08, 0x87, 0x11,
+	0x89, 0x78, 0x19, 0xa2, 0x01, 0xfe, 0x6f, 0xda, 0xab, 0xf3, 0xb5, 0x57, 0xe7, 0x6a, 0xaf, 0xce,
+	0xd3, 0x5e, 0x9d, 0xa7, 0xbd, 0x3a, 0x4f, 0x7b, 0xf5, 0x1c, 0xed, 0xd5, 0xf3, 0xb5, 0x57, 0xcf,
+	0xd1, 0x5e, 0x9d, 0xa7, 0xbd, 0x7a, 0x75, 0xed, 0xb3, 0x27, 0xa0, 0xf1, 0x4a, 0x01, 0x15, 0x13,
+	0x51, 0x07, 0xb7, 0x82, 0xc0, 0x25, 0xb8, 0xcf, 0xd5, 0xc7, 0xf0, 0x3d, 0x00, 0x43, 0xf4, 0x2d,
+	0xb3, 0x90, 0x34, 0x5a, 0x84, 0xf6, 0x71, 0x2c, 0xe4, 0xd7, 0xcc, 0x32, 0x47, 0x12, 0xef, 0x0e,
+	0xb7, 0x43, 0x03, 0xdc, 0x72, 0x31, 0x8a, 0xf0, 0x6b, 0xee, 0x39, 0xe1, 0x5e, 0x11, 0xd0, 0x8c,
+	0xff, 0x37, 0xa0, 0x18, 0xf2, 0x94, 0x56, 0xc4, 0x5b, 0x4d, 0xf4, 0x43, 0x71, 0xe3, 0x13, 0xe3,
+	0xdc, 0x01, 0x63, 0xfc, 0x43, 0xa3, 0x26, 0x2f, 0x1c, 0x10, 0x84, 0xc2, 0x32, 0x75, 0xb8, 0xef,
+	0x40, 0x99, 0x87, 0x3c, 0x0d, 0x09, 0xc3, 0x4f, 0x90, 0x3b, 0xc0, 0x7b, 0x41, 0x3a, 0x15, 0x94,
+	0xc9, 0x54, 0x98, 0x79, 0xf1, 0x73, 0x57, 0x7a, 0xf1, 0x6f, 0x83, 0xfc, 0x11, 0xe7, 0x4f, 0x86,
+	0x8d, 0xdc, 0x34, 0x7e, 0xcc, 0x81, 0x4a, 0x96, 0xbf, 0x23, 0x74, 0xde, 0x0b, 0xe0, 0xd7, 0x60,
+	0x91, 0xc5, 0xd4, 0xca, 0xa6, 0xdd, 0xce, 0xf5, 0xa6, 0x5d, 0xbe, 0x1b, 0xd3, 0xce, 0x8e, 0x99,
+	0x67, 0x31, 0xed, 0xf4, 0xe1, 0x1b, 0x60, 0x89, 0x93, 0xf3, 0x13, 0xe6, 0x44, 0x29, 0x3c, 0xd7,
+	0xe7, 0xaf, 0x1f, 0x52, 0xbd, 0xd2, 0x21, 0xf7, 0x40, 0x85, 0x73, 0xcf, 0x4e, 0x21, 0xed, 0xe2,
+	0x54, 0xab, 0x2c, 0xa6, 0xbb, 0x53, 0x83, 0xa8, 0xf1, 0xb3, 0x02, 0x20, 0xbf, 0x1f, 0xf9, 0x96,
+	0xdc, 0xcc, 0x05, 0x5d, 0x5f, 0xec, 0xc6, 0xaf, 0x49, 0xd9, 0xdb, 0xbe, 0xe7, 0x11, 0x76, 0x33,
+	0x65, 0x27, 0x5d, 0x9b, 0xfb, 0x97, 0xae, 0x55, 0xaf, 0xd7, 0xb5, 0xda, 0x74, 0xd7, 0x06, 0xb2,
+	0x69, 0x5b, 0x3d, 0x3f, 0xbc, 0x99, 0xc3, 0x35, 0x3c, 0xf9, 0x9f, 0x87, 0xc8, 0xd8, 0x8d, 0xe9,
+	0x7f, 0x9d, 0xee, 0x27, 0x0d, 0x2c, 0xf3, 0x7c, 0x5f, 0xf8, 0x0e, 0xb1, 0x91, 0xbb, 0x17, 0xc0,
+	0x2e, 0x28, 0x3e, 0xe7, 0xdf, 0xa8, 0x25, 0xaf, 0x43, 0x11, 0xb7, 0xb9, 0x79, 0xc1, 0x07, 0x69,
+	0xfa, 0x75, 0x31, 0xc1, 0xf3, 0x6c, 0x07, 0x9f, 0x82, 0x92, 0x64, 0x95, 0x4f, 0x7c, 0xd2, 0x6d,
+	0x1f, 0x5d, 0x86, 0x36, 0xbd, 0x7f, 0x53, 0xd6, 0x27, 0xb7, 0xf0, 0x2b, 0xb0, 0x9c, 0x8c, 0xe5,
+	0x84, 0x59, 0xca, 0xff, 0xf1, 0x05, 0x99, 0x67, 0x3f, 0x37, 0xb3, 0x34, 0x98, 0xda, 0x73, 0x6e,
+	0x5b, 0xf4, 0x75, 0xca, 0xad, 0x5d, 0x8a, 0x7b, 0xf6, 0x9b, 0x30, 0x4b, 0xf6, 0xd4, 0x9e, 0x5f,
+	0x08, 0xe2, 0x1a, 0xa7, 0xd4, 0xf9, 0x4b, 0x5d, 0xc8, 0x4c, 0x43, 0x9a, 0x45, 0x34, 0xd9, 0xc2,
+	0x87, 0xa0, 0x20, 0x89, 0x59, 0x4c, 0xc5, 0xc4, 0x2f, 0x6e, 0x7c, 0x78, 0x19, 0x56, 0xd1, 0x74,
+	0xa6, 0x8e, 0x92, 0xf5, 0x96, 0x76, 0x72, 0x5c, 0x57, 0xda, 0x6b, 0x27, 0xbf, 0xd7, 0x16, 0x4e,
+	0xc6, 0x35, 0xe5, 0xc5, 0xb8, 0xa6, 0xbc, 0x1c, 0xd7, 0x94, 0xdf, 0xc6, 0x35, 0xe5, 0x87, 0xd3,
+	0xda, 0xc2, 0x8b, 0xd3, 0xda, 0xc2, 0xcb, 0xd3, 0xda, 0x42, 0x6f, 0x51, 0xfc, 0x8e, 0xd9, 0xfc,
+	0x3b, 0x00, 0x00, 0xff, 0xff, 0x74, 0x64, 0x63, 0xef, 0x41, 0x0d, 0x00, 0x00,
 }

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -30,12 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 type stmtKey struct {
@@ -43,14 +39,16 @@ type stmtKey struct {
 	failed      bool
 	distSQLUsed bool
 	optUsed     bool
+	implicitTxn bool
 }
 
 // appStats holds per-application statistics.
 type appStats struct {
-	st *cluster.Settings
-
 	syncutil.Mutex
+
+	st    *cluster.Settings
 	stmts map[stmtKey]*stmtStats
+	txns  transactionStats
 }
 
 // stmtStats holds per-statement statistics.
@@ -60,10 +58,24 @@ type stmtStats struct {
 	data roachpb.StatementStatistics
 }
 
+// transactionStats holds per-application transaction statistics.
+type transactionStats struct {
+	mu struct {
+		syncutil.Mutex
+		roachpb.TxnStats
+	}
+}
+
 // stmtStatsEnable determines whether to collect per-statement
 // statistics.
 var stmtStatsEnable = settings.RegisterBoolSetting(
 	"sql.metrics.statement_details.enabled", "collect per-statement query statistics", true,
+)
+
+// txnStatsEnable determines whether to collect per-application transaction
+// statistics.
+var txnStatsEnable = settings.RegisterBoolSetting(
+	"sql.metrics.transaction_details.enabled", "collect per-application transaction statistics", true,
 )
 
 // sqlStatsCollectionLatencyThreshold specifies the minimum amount of time
@@ -118,12 +130,14 @@ func (a *appStats) recordStatement(
 	samplePlanDescription *roachpb.ExplainTreePlanNode,
 	distSQLUsed bool,
 	optUsed bool,
+	implicitTxn bool,
 	automaticRetryCount int,
 	numRows int,
 	err error,
 	parseLat, planLat, runLat, svcLat, ovhLat float64,
+	bytesRead, rowsRead int64,
 ) {
-	if a == nil || !stmtStatsEnable.Get(&a.st.SV) {
+	if !stmtStatsEnable.Get(&a.st.SV) {
 		return
 	}
 
@@ -132,7 +146,7 @@ func (a *appStats) recordStatement(
 	}
 
 	// Get the statistics object.
-	s := a.getStatsForStmt(stmt, distSQLUsed, optUsed, err, true /* createIfNonexistent */)
+	s := a.getStatsForStmt(stmt, distSQLUsed, optUsed, implicitTxn, err, true /* createIfNonexistent */)
 
 	// Collect the per-statement statistics.
 	s.Lock()
@@ -156,16 +170,23 @@ func (a *appStats) recordStatement(
 	s.data.RunLat.Record(s.data.Count, runLat)
 	s.data.ServiceLat.Record(s.data.Count, svcLat)
 	s.data.OverheadLat.Record(s.data.Count, ovhLat)
+	s.data.BytesRead = bytesRead
+	s.data.RowsRead = rowsRead
 	s.Unlock()
 }
 
 // getStatsForStmt retrieves the per-stmt stat object.
 func (a *appStats) getStatsForStmt(
-	stmt *Statement, distSQLUsed bool, optimizerUsed bool, err error, createIfNonexistent bool,
+	stmt *Statement,
+	distSQLUsed bool,
+	optimizerUsed bool,
+	implicitTxn bool,
+	err error,
+	createIfNonexistent bool,
 ) *stmtStats {
 	// Extend the statement key with various characteristics, so
 	// that we use separate buckets for the different situations.
-	key := stmtKey{failed: err != nil, distSQLUsed: distSQLUsed, optUsed: optimizerUsed}
+	key := stmtKey{failed: err != nil, distSQLUsed: distSQLUsed, optUsed: optimizerUsed, implicitTxn: implicitTxn}
 	if stmt.AnonymizedStr != "" {
 		// Use the cached anonymized string.
 		key.stmt = stmt.AnonymizedStr
@@ -193,12 +214,48 @@ func anonymizeStmt(ast tree.Statement) string {
 	return tree.AsStringWithFlags(ast, tree.FmtHideConstants)
 }
 
-// sqlStats carries per-application statistics for all applications on
-// each node.
+func (s *transactionStats) getStats() (
+	txnCount int64,
+	txnTimeAvg float64,
+	txnTimeVar float64,
+	committedCount int64,
+	implicitCount int64,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	txnCount = s.mu.TxnCount
+	txnTimeAvg = s.mu.TxnTimeSec.Mean
+	txnTimeVar = s.mu.TxnTimeSec.GetVariance(txnCount)
+	committedCount = s.mu.CommittedCount
+	implicitCount = s.mu.ImplicitCount
+	return txnCount, txnTimeAvg, txnTimeVar, committedCount, implicitCount
+}
+
+func (s *transactionStats) recordTransaction(txnTimeSec float64, ev txnEvent, implicit bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.TxnCount++
+	s.mu.TxnTimeSec.Record(s.mu.TxnCount, txnTimeSec)
+	if ev == txnCommit {
+		s.mu.CommittedCount++
+	}
+	if implicit {
+		s.mu.ImplicitCount++
+	}
+}
+
+func (a *appStats) recordTransaction(txnTimeSec float64, ev txnEvent, implicit bool) {
+	if !txnStatsEnable.Get(&a.st.SV) {
+		return
+	}
+	a.txns.recordTransaction(txnTimeSec, ev, implicit)
+}
+
+// sqlStats carries per-application statistics for all applications.
 type sqlStats struct {
-	st *cluster.Settings
 	syncutil.Mutex
 
+	st *cluster.Settings
 	// lastReset is the time at which the app containers were reset.
 	lastReset time.Time
 	// apps is the container for all the per-application statistics objects.
@@ -211,7 +268,10 @@ func (s *sqlStats) getStatsForApplication(appName string) *appStats {
 	if a, ok := s.apps[appName]; ok {
 		return a
 	}
-	a := &appStats{st: s.st, stmts: make(map[stmtKey]*stmtStats)}
+	a := &appStats{
+		st:    s.st,
+		stmts: make(map[stmtKey]*stmtStats),
+	}
 	s.apps[appName] = a
 	return a
 }
@@ -247,8 +307,8 @@ func (s *sqlStats) resetStats(ctx context.Context) {
 			dumpStmtStats(ctx, appName, a.stmts)
 		}
 
-		// Clear the map, to release the memory; make the new map somewhat
-		// already large for the likely future workload.
+		// Clear the map, to release the memory; make the new map somewhat already
+		// large for the likely future workload.
 		a.stmts = make(map[stmtKey]*stmtStats, len(a.stmts)/2)
 		a.Unlock()
 	}
@@ -351,11 +411,12 @@ func (s *sqlStats) getStmtStats(
 			}
 			if ok {
 				k := roachpb.StatementStatisticsKey{
-					Query:   maybeScrubbed,
-					DistSQL: q.distSQLUsed,
-					Opt:     q.optUsed,
-					Failed:  q.failed,
-					App:     maybeHashedAppName,
+					Query:       maybeScrubbed,
+					DistSQL:     q.distSQLUsed,
+					Opt:         q.optUsed,
+					ImplicitTxn: q.implicitTxn,
+					Failed:      q.failed,
+					App:         maybeHashedAppName,
 				}
 				stats.Lock()
 				data := stats.data
@@ -412,7 +473,7 @@ func HashForReporting(secret, appName string) string {
 	}
 	hash := hmac.New(sha256.New, []byte(secret))
 	if _, err := hash.Write([]byte(appName)); err != nil {
-		panic(pgerror.NewAssertionErrorWithWrappedErrf(err,
+		panic(errors.NewAssertionErrorWithWrappedErrf(err,
 			`"It never returns an error." -- https://golang.org/pkg/hash`))
 	}
 	return hex.EncodeToString(hash.Sum(nil)[:4])

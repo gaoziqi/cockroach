@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package contextutil
 
@@ -21,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestRunWithTimeout(t *testing.T) {
@@ -56,8 +53,9 @@ func TestRunWithTimeout(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		return errors.Wrap(ctx.Err(), "custom error")
 	})
-	if err.Error() != expectedMsg {
-		t.Fatalf("expected %s, actual %s", expectedMsg, err.Error())
+	expExtended := expectedMsg + ": custom error: context deadline exceeded"
+	if err.Error() != expExtended {
+		t.Fatalf("expected %s, actual %s", expExtended, err.Error())
 	}
 	netError, ok = err.(net.Error)
 	if !ok {
@@ -94,4 +92,23 @@ func TestRunWithTimeoutWithoutDeadlineExceeded(t *testing.T) {
 		t.Fatalf("RunWithTimeout should return an error caused by the underlying " +
 			"returned error")
 	}
+}
+
+func TestCancelWithReason(t *testing.T) {
+	ctx := context.Background()
+
+	var cancel CancelWithReasonFunc
+	ctx, cancel = WithCancelReason(ctx)
+
+	e := errors.New("hodor")
+	go func() {
+		cancel(e)
+	}()
+
+	<-ctx.Done()
+
+	expected := "context canceled"
+	found := ctx.Err().Error()
+	assert.Equal(t, expected, found)
+	assert.Equal(t, e, GetCancelReason(ctx))
 }

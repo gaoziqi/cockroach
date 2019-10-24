@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -22,6 +18,7 @@ import (
 	"math/rand"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,36 +26,37 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
 	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
-	"go.etcd.io/etcd/raft"
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
@@ -934,10 +932,10 @@ func TestStoreRangeMergeStats(t *testing.T) {
 
 	// Stats should agree with recomputation.
 	if err := verifyRecomputedStats(snap, lhsDesc, msA, mtc.manualClock.UnixNano()); err != nil {
-		t.Fatalf("failed to verify range A's stats before split: %v", err)
+		t.Fatalf("failed to verify range A's stats before split: %+v", err)
 	}
 	if err := verifyRecomputedStats(snap, rhsDesc, msB, mtc.manualClock.UnixNano()); err != nil {
-		t.Fatalf("failed to verify range B's stats before split: %v", err)
+		t.Fatalf("failed to verify range B's stats before split: %+v", err)
 	}
 
 	mtc.manualClock.Increment(100)
@@ -961,7 +959,7 @@ func TestStoreRangeMergeStats(t *testing.T) {
 	nowNanos := mtc.manualClock.UnixNano()
 	msMerged.AgeTo(nowNanos)
 	if err := verifyRecomputedStats(snap, replMerged.Desc(), msMerged, nowNanos); err != nil {
-		t.Errorf("failed to verify range's stats after merge: %v", err)
+		t.Errorf("failed to verify range's stats after merge: %+v", err)
 	}
 }
 
@@ -1076,8 +1074,7 @@ func TestStoreRangeMergeInFlightTxns(t *testing.T) {
 		var cancel func()
 		ctx, cancel = context.WithTimeout(ctx, testutils.DefaultSucceedsSoonDuration)
 		defer cancel()
-		defer func(old time.Duration) { txnwait.TxnLivenessThreshold = old }(txnwait.TxnLivenessThreshold)
-		txnwait.TxnLivenessThreshold = 2 * testutils.DefaultSucceedsSoonDuration
+		defer txnwait.TestingOverrideTxnLivenessThreshold(2 * testutils.DefaultSucceedsSoonDuration)
 
 		// Create a transaction that won't complete until after the merge.
 		txn1 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
@@ -1630,6 +1627,9 @@ func TestStoreRangeMergeConcurrentRequests(t *testing.T) {
 // replica tombstone, if S4 received a slow Raft message for the now-GC'd
 // replica, it would incorrectly construct an uninitialized replica and panic.
 //
+// This test also ensures that the nodes which processes the Merge writes a
+// tombstone which prevents the range from being resurrected by a raft message.
+//
 // This test's approach to simulating this sequence of events is based on
 // TestReplicaGCRace.
 func TestStoreReplicaGCAfterMerge(t *testing.T) {
@@ -1640,6 +1640,7 @@ func TestStoreReplicaGCAfterMerge(t *testing.T) {
 	storeCfg.TestingKnobs.DisableReplicateQueue = true
 	storeCfg.TestingKnobs.DisableReplicaGCQueue = true
 	storeCfg.TestingKnobs.DisableMergeQueue = true
+	storeCfg.TestingKnobs.DisableEagerReplicaRemoval = true
 	mtc := &multiTestContext{storeConfig: &storeCfg}
 	mtc.Start(t, 2)
 	defer mtc.Stop()
@@ -1683,7 +1684,7 @@ func TestStoreReplicaGCAfterMerge(t *testing.T) {
 		t.Fatalf("expected %s to have a replica on %s", rhsDesc, store1)
 	}
 
-	transport0 := storage.NewRaftTransport(
+	transport := storage.NewRaftTransport(
 		log.AmbientContext{Tracer: mtc.storeConfig.Settings.Tracer},
 		cluster.MakeTestingClusterSettings(),
 		nodedialer.New(mtc.rpcContext, gossip.AddressResolver(mtc.gossips[0])),
@@ -1691,23 +1692,27 @@ func TestStoreReplicaGCAfterMerge(t *testing.T) {
 		mtc.transportStopper,
 	)
 	errChan := errorChannelTestHandler(make(chan *roachpb.Error, 1))
-	transport0.Listen(store0.StoreID(), errChan)
+	transport.Listen(store0.StoreID(), errChan)
+	transport.Listen(store1.StoreID(), errChan)
 
-	sendHeartbeat := func(toReplDesc roachpb.ReplicaDescriptor) {
+	sendHeartbeat := func(
+		rangeID roachpb.RangeID,
+		fromReplDesc, toReplDesc roachpb.ReplicaDescriptor,
+	) {
 		// Try several times, as the message may be dropped (see #18355).
 		for i := 0; i < 5; i++ {
-			if sent := transport0.SendAsync(&storage.RaftMessageRequest{
-				FromReplica: rhsReplDesc0,
+			if sent := transport.SendAsync(&storage.RaftMessageRequest{
+				FromReplica: fromReplDesc,
 				ToReplica:   toReplDesc,
 				Heartbeats: []storage.RaftHeartbeat{
 					{
-						RangeID:       rhsDesc.RangeID,
-						FromReplicaID: rhsReplDesc0.ReplicaID,
+						RangeID:       rangeID,
+						FromReplicaID: fromReplDesc.ReplicaID,
 						ToReplicaID:   toReplDesc.ReplicaID,
 						Commit:        42,
 					},
 				},
-			}); !sent {
+			}, rpc.DefaultClass); !sent {
 				t.Fatal("failed to send heartbeat")
 			}
 			select {
@@ -1724,130 +1729,97 @@ func TestStoreReplicaGCAfterMerge(t *testing.T) {
 		t.Fatal("did not get expected RaftGroupDeleted error")
 	}
 
-	// Send a heartbeat to the now-GC'd replica on store1. If the replica
+	// Send a heartbeat to the now-GC'd replica on the stores. If the replica
 	// tombstone was not written correctly when the replica was GC'd, this will
 	// cause a panic.
-	sendHeartbeat(rhsReplDesc1)
+	sendHeartbeat(rhsDesc.RangeID, rhsReplDesc0, rhsReplDesc1)
+	sendHeartbeat(rhsDesc.RangeID, rhsReplDesc1, rhsReplDesc0)
 
-	// Send a heartbeat to a fictional replica on store1 with a large replica ID.
+	// Send a heartbeat to a fictional replicas on with a large replica ID.
 	// This tests an implementation detail: the replica tombstone that gets
-	// written in this case will use the maximum possible replica ID, so store1
-	// should ignore heartbeats for replicas of the range with _any_ replica ID.
-	sendHeartbeat(roachpb.ReplicaDescriptor{
+	// written in this case will use the maximum possible replica ID, so the
+	// stores should ignore heartbeats for replicas of the range with _any_
+	// replica ID.
+	sendHeartbeat(rhsDesc.RangeID, rhsReplDesc0, roachpb.ReplicaDescriptor{
 		NodeID:    store1.Ident.NodeID,
 		StoreID:   store1.Ident.StoreID,
 		ReplicaID: 123456,
 	})
 
-	// Be extra paranoid and verify the exact value of the replica tombstone.
-	var rhsTombstone1 roachpb.RaftTombstone
-	rhsTombstoneKey := keys.RaftTombstoneKey(rhsDesc.RangeID)
-	ok, err = engine.MVCCGetProto(ctx, store1.Engine(), rhsTombstoneKey, hlc.Timestamp{},
-		&rhsTombstone1, engine.MVCCGetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	} else if !ok {
-		t.Fatalf("missing raft tombstone at key %s", rhsTombstoneKey)
-	}
-	if e, a := roachpb.ReplicaID(math.MaxInt32), rhsTombstone1.NextReplicaID; e != a {
-		t.Fatalf("expected next replica ID to be %d, but got %d", e, a)
-	}
-}
-
-// TestStoreRangeMergeResplitAddReplicaRace verifies that an add replica request
-// that occurs concurrently with a merge is aborted.
-//
-// To see why aborting the add replica request is necessary, consider two
-// adjacent and collocated ranges, Q and R. Say the replicate queue decides to
-// rebalance Q onto store S4. It will initiate a ChangeReplicas command that
-// will send S4 a preemptive snapshot, then launch a replica-change transaction
-// to update R's range descriptor with the new replica. Now say the merge queue
-// decides to merge Q and R after the preemptive snapshot of Q has been sent to
-// S4 but before the replica-change transaction has started. The merge can
-// succeed because the ranges are still collocated. (The new replica of Q is
-// only considered added once the replica-change transaction commits.) If the
-// replica-change transaction were to commit, the new replica of Q on S4 would
-// have a snapshot of Q that predated the merge. In order to catch up, it would
-// need to apply the merge trigger, but the merge trigger will explode because
-// S4 does not have a replica of R.
-//
-// To avoid this scenario, ChangeReplicas commands will abort if they discover
-// the range descriptor has changed between when the snapshot is sent and when
-// the replica-change transaction starts.
-func TestStoreRangeMergeAddReplicaRace(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	ctx := context.Background()
-	storeCfg := storage.TestStoreConfig(nil)
-	storeCfg.TestingKnobs.DisableSplitQueue = true
-	storeCfg.TestingKnobs.DisableMergeQueue = true
-	storeCfg.TestingKnobs.DisableReplicateQueue = true
-
-	mtc := &multiTestContext{
-		storeConfig: &storeCfg,
-		// This test was written before the multiTestContext started creating many
-		// system ranges at startup, and hasn't been update to take that into
-		// account.
-		startWithSingleRange: true,
-	}
-
-	mtc.Start(t, 2)
-	defer mtc.Stop()
-	store0, store1 := mtc.Store(0), mtc.Store(1)
-
-	lhsDesc, rhsDesc, err := createSplitRanges(ctx, store0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Arrange to block all snapshots until we're ready.
-	snapshotSentCh := make(chan struct{})
-	allowSnapshotCh := make(chan struct{})
-	mtc.transport.Listen(store1.StoreID(), RaftMessageHandlerInterceptor{
-		RaftMessageHandler: store1,
-		handleSnapshotFilter: func(header *storage.SnapshotRequest_Header) {
-			snapshotSentCh <- struct{}{}
-			<-allowSnapshotCh
-		},
+	sendHeartbeat(rhsDesc.RangeID, rhsReplDesc1, roachpb.ReplicaDescriptor{
+		NodeID:    store0.Ident.NodeID,
+		StoreID:   store0.Ident.StoreID,
+		ReplicaID: 123456,
 	})
 
-	// Launch the add replicas request. This will get stuck sending a preemptive
-	// snapshot thanks to the handler we installed above.
-	errCh := make(chan error)
-	go func() {
-		errCh <- mtc.replicateRangeNonFatal(rhsDesc.RangeID, 1)
-	}()
-
-	// Wait for the add replicas request to send a snapshot, then merge the ranges
-	// together.
-	<-snapshotSentCh
-	mergeArgs := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
-	if _, pErr := client.SendWrapped(ctx, store0.TestSender(), mergeArgs); pErr != nil {
-		t.Fatal(pErr)
+	// Be extra paranoid and verify the exact value of the replica tombstone.
+	checkTombstone := func(eng engine.Engine) {
+		var rhsTombstone roachpb.RaftTombstone
+		rhsTombstoneKey := keys.RaftTombstoneKey(rhsDesc.RangeID)
+		ok, err = engine.MVCCGetProto(ctx, eng, rhsTombstoneKey, hlc.Timestamp{},
+			&rhsTombstone, engine.MVCCGetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		} else if !ok {
+			t.Fatalf("missing raft tombstone at key %s", rhsTombstoneKey)
+		}
+		if e, a := roachpb.ReplicaID(math.MaxInt32), rhsTombstone.NextReplicaID; e != a {
+			t.Fatalf("expected next replica ID to be %d, but got %d", e, a)
+		}
 	}
+	checkTombstone(store0.Engine())
+	checkTombstone(store1.Engine())
+}
 
-	// Allow snapshots, which will allow the add replicas to complete.
-	close(allowSnapshotCh)
-	expErr := `change replicas of r2 failed: descriptor changed: .* \(range subsumed\)`
-	if err := <-errCh; !testutils.IsError(err, expErr) {
-		t.Fatalf("expected error %q, got %v", expErr, err)
+// TestStoreRangeMergeAddReplicaRace verifies that when an add replica request
+// occurs concurrently with a merge, one of them is aborted with a "descriptor
+// changed" CPut error.
+func TestStoreRangeMergeAddReplicaRace(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	scratchStartKey := tc.ScratchRange(t)
+	origDesc := tc.LookupRangeOrFatal(t, scratchStartKey)
+	splitKey := scratchStartKey.Next()
+	beforeDesc, _ := tc.SplitRangeOrFatal(t, splitKey)
+
+	mergeErrCh, addErrCh := make(chan error, 1), make(chan error, 1)
+	go func() {
+		mergeErrCh <- tc.Server(0).DB().AdminMerge(ctx, scratchStartKey)
+	}()
+	go func() {
+		_, err := tc.Server(0).DB().AdminChangeReplicas(
+			ctx, scratchStartKey, beforeDesc, roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA, tc.Target(1)))
+		addErrCh <- err
+	}()
+	mergeErr := <-mergeErrCh
+	addErr := <-addErrCh
+	afterDesc := tc.LookupRangeOrFatal(t, scratchStartKey)
+
+	const acceptableMergeErr = `unexpected value: raw_bytes|ranges not collocated` +
+		`|cannot merge range with non-voter replicas`
+	if mergeErr == nil && testutils.IsError(addErr, `descriptor changed: \[expected\]`) {
+		// Merge won the race, no add happened.
+		require.Len(t, afterDesc.Replicas().Voters(), 1)
+		require.Equal(t, origDesc.EndKey, afterDesc.EndKey)
+	} else if addErr == nil && testutils.IsError(mergeErr, acceptableMergeErr) {
+		// Add won the race, no merge happened.
+		require.Len(t, afterDesc.Replicas().Voters(), 2)
+		require.Equal(t, beforeDesc.EndKey, afterDesc.EndKey)
+	} else {
+		t.Fatalf(`expected exactly one of merge or add to succeed got: [merge] %v [add] %v`,
+			mergeErr, addErr)
 	}
 }
 
 // TestStoreRangeMergeResplitAddReplicaRace tests a diabolical edge case in the
-// merge/add replica race.
-//
-// Consider the same situation as described in the comment on
-// TestStoreRangeMergeAddReplicaRace, except that Q and R merge together and
-// then split at exactly the same key, all before the replica-change transaction
-// starts. Q's range descriptor will have the same start key, end key, and next
-// replica ID that it did when the preemptive snapshot started. That is, it will
-// look unchanged! To protect against this, range descriptors contain a
-// generation counter, which is incremented on every split or merge. The
-// presence of this counter means that ChangeReplicas commands can detect and
-// abort if any merges have occurred since the preemptive snapshot, even if the
-// sequence of splits or merges left the keyspan of the range unchanged. This
-// diabolical edge case is tested here.
+// merge/add replica race. If two replicas merge and then split at the previous
+// boundary, the descriptor will look unchanged and our usual CPut protection
+// would fail. For this reason, we introduced RangeDescriptor.Generation.
 //
 // Note that splits will not increment the generation counter until the cluster
 // version includes VersionRangeMerges. That's ok, because a sequence of splits
@@ -1856,44 +1828,28 @@ func TestStoreRangeMergeAddReplicaRace(t *testing.T) {
 // always increment the generation counter.
 func TestStoreRangeMergeResplitAddReplicaRace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
 	ctx := context.Background()
-	storeCfg := storage.TestStoreConfig(nil)
-	storeCfg.TestingKnobs.DisableSplitQueue = true
-	storeCfg.TestingKnobs.DisableMergeQueue = true
-	storeCfg.TestingKnobs.DisableReplicateQueue = true
-
-	mtc := &multiTestContext{storeConfig: &storeCfg}
-	mtc.Start(t, 2)
-	defer mtc.Stop()
-	store0, store1 := mtc.Store(0), mtc.Store(1)
-
-	lhsDesc, rhsDesc, err := createSplitRanges(ctx, store0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mtc.transport.Listen(store1.StoreID(), RaftMessageHandlerInterceptor{
-		RaftMessageHandler: store1,
-		handleSnapshotFilter: func(header *storage.SnapshotRequest_Header) {
-			mergeArgs := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
-			if _, pErr := client.SendWrapped(ctx, store0.TestSender(), mergeArgs); pErr != nil {
-				// The filter is invoked by a different goroutine, so can't use t.Fatal.
-				t.Error(pErr)
-				return
-			}
-			splitArgs := adminSplitArgs(rhsDesc.StartKey.AsRawKey())
-			if _, pErr := client.SendWrapped(ctx, store0.TestSender(), splitArgs); pErr != nil {
-				// The filter is invoked by a different goroutine, so can't use t.Fatal.
-				t.Error(pErr)
-				return
-			}
-		},
+	tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
 	})
+	defer tc.Stopper().Stop(ctx)
 
-	err = mtc.replicateRangeNonFatal(lhsDesc.RangeID, 1)
-	if exp := "change replicas of r.* failed: descriptor changed"; !testutils.IsError(err, exp) {
-		t.Fatalf("expected error %q, got %v", exp, err)
+	scratchStartKey := tc.ScratchRange(t)
+	splitKey := scratchStartKey.Next()
+	origDesc, _ := tc.SplitRangeOrFatal(t, splitKey)
+	require.NoError(t, tc.Server(0).DB().AdminMerge(ctx, scratchStartKey))
+	resplitDesc, _ := tc.SplitRangeOrFatal(t, splitKey)
+
+	assert.Equal(t, origDesc.RangeID, resplitDesc.RangeID)
+	assert.Equal(t, origDesc.StartKey, resplitDesc.StartKey)
+	assert.Equal(t, origDesc.EndKey, resplitDesc.EndKey)
+	assert.Equal(t, origDesc.Replicas().All(), resplitDesc.Replicas().All())
+	assert.NotEqual(t, origDesc.Generation, resplitDesc.Generation)
+
+	_, err := tc.Server(0).DB().AdminChangeReplicas(
+		ctx, scratchStartKey, origDesc, roachpb.MakeReplicationChanges(roachpb.ADD_REPLICA, tc.Target(1)))
+	if !testutils.IsError(err, `descriptor changed`) {
+		t.Fatalf(`expected "descriptor changed" error got: %+v`, err)
 	}
 }
 
@@ -2087,8 +2043,20 @@ func TestStoreRangeMergeSlowAbandonedFollower(t *testing.T) {
 	lhsRepl2.RaftUnlock()
 
 	// Ensure that the unblocked merge eventually applies and subsumes the RHS.
+	// In general this will happen due to receiving a ReplicaTooOldError but
+	// it may require the replica GC queue. In rare cases the LHS will never
+	// hear about the merge and may need to be GC'd on its own.
 	testutils.SucceedsSoon(t, func() error {
-		if _, err := store2.GetReplica(rhsDesc.RangeID); err == nil {
+		// Make the the LHS gets destroyed.
+		if lhsRepl, err := store2.GetReplica(lhsDesc.RangeID); err == nil {
+			if err := store2.ManualReplicaGC(lhsRepl); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if rhsRepl, err := store2.GetReplica(rhsDesc.RangeID); err == nil {
+			if err := store2.ManualReplicaGC(rhsRepl); err != nil {
+				t.Fatal(err)
+			}
 			return errors.New("rhs not yet destroyed")
 		}
 		return nil
@@ -2104,6 +2072,7 @@ func TestStoreRangeMergeAbandonedFollowers(t *testing.T) {
 	storeCfg.TestingKnobs.DisableReplicaGCQueue = true
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	storeCfg.TestingKnobs.DisableMergeQueue = true
+	storeCfg.TestingKnobs.DisableEagerReplicaRemoval = true
 	mtc := &multiTestContext{storeConfig: &storeCfg}
 	mtc.Start(t, 3)
 	defer mtc.Stop()
@@ -2322,120 +2291,10 @@ func TestStoreRangeMergeDeadFollowerDuringTxn(t *testing.T) {
 
 	args := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
 	_, pErr := client.SendWrapped(ctx, store0.TestSender(), args)
-	expErr := "merge of range into .* failed: waiting for all right-hand replicas to catch up"
+	expErr := "merge failed: waiting for all right-hand replicas to catch up"
 	if !testutils.IsPError(pErr, expErr) {
 		t.Fatalf("expected %q error, but got %v", expErr, pErr)
 	}
-}
-
-func TestStoreRangeMergeReadoptedBothFollowers(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	ctx := context.Background()
-	storeCfg := storage.TestStoreConfig(nil)
-	storeCfg.TestingKnobs.DisableReplicateQueue = true
-	storeCfg.TestingKnobs.DisableReplicaGCQueue = true
-	storeCfg.TestingKnobs.DisableMergeQueue = true
-	mtc := &multiTestContext{storeConfig: &storeCfg}
-	mtc.Start(t, 3)
-	defer mtc.Stop()
-	store0, store2 := mtc.Store(0), mtc.Store(2)
-	distSender := mtc.distSenders[0]
-
-	// Create two ranges on all nodes.
-	rngID := store0.LookupReplica(roachpb.RKey("a")).Desc().RangeID
-	mtc.replicateRange(rngID, 1, 2)
-	lhsDesc, rhsDesc, err := createSplitRanges(ctx, store0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait for all stores to have fully processed the split.
-	for _, key := range []roachpb.Key{roachpb.Key("a"), roachpb.Key("b")} {
-		if _, pErr := client.SendWrapped(ctx, distSender, incrementArgs(key, 1)); pErr != nil {
-			t.Fatal(pErr)
-		}
-		mtc.waitForValues(key, []int64{1, 1, 1})
-	}
-
-	lhsRepl0, err := store0.GetReplica(lhsDesc.RangeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lhsRepl2, err := store2.GetReplica(lhsDesc.RangeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rhsRepl2, err := store2.GetReplica(rhsDesc.RangeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Abandon the two ranges on store2, but do not GC them.
-	mtc.unreplicateRange(lhsDesc.RangeID, 2)
-	mtc.unreplicateRange(rhsDesc.RangeID, 2)
-
-	// Merge the two ranges together.
-	args := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
-	_, pErr := client.SendWrapped(ctx, store0.TestSender(), args)
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
-
-	addLHSRepl2 := func() error {
-		for r := retry.StartWithCtx(ctx, retry.Options{}); r.Next(); {
-			_, err := lhsRepl0.ChangeReplicas(ctx, roachpb.ADD_REPLICA, roachpb.ReplicationTarget{
-				NodeID:  store2.Ident.NodeID,
-				StoreID: store2.Ident.StoreID,
-			}, lhsRepl0.Desc(), storagepb.ReasonUnknown, t.Name())
-			if !testutils.IsError(err, "store busy applying snapshots") {
-				return err
-			}
-		}
-		t.Fatal("unreachable")
-		return nil
-	}
-
-	// Attempt to re-add the merged range to store2. The operation should fail
-	// because store2's LHS and RHS replicas intersect the merged range.
-	err = addLHSRepl2()
-	if exp := "cannot apply snapshot: snapshot intersects existing range"; !testutils.IsError(err, exp) {
-		t.Fatalf("expected %q error, but got %v", exp, err)
-	}
-
-	// GC the replica of the LHS on store2.
-	if err := store2.ManualReplicaGC(lhsRepl2); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store2.GetReplica(lhsDesc.RangeID); err == nil {
-		t.Fatal("lhs replica not destroyed on store2")
-	}
-
-	// Attempt to re-add the merged range to store2. The operation should fail
-	// again because store2's RHS still intersects the merged range.
-	err = addLHSRepl2()
-	if exp := "cannot apply snapshot: snapshot intersects existing range"; !testutils.IsError(err, exp) {
-		t.Fatalf("expected %q error, but got %v", exp, err)
-	}
-
-	// GC the replica of the RHS on store2.
-	if err := store2.ManualReplicaGC(rhsRepl2); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store2.GetReplica(rhsDesc.RangeID); err == nil {
-		t.Fatal("rhs replica not destroyed on store2")
-	}
-
-	// Attempt to re-add the merged range to store2 one last time. This time the
-	// operation should succeed because there are no remaining intersecting
-	// replicas.
-	if err := addLHSRepl2(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Give store2 the lease to force all commands to be applied, including the
-	// ChangeReplicas.
-	mtc.transferLease(ctx, lhsDesc.RangeID, 0, 2)
 }
 
 func TestStoreRangeReadoptedLHSFollower(t *testing.T) {
@@ -2491,13 +2350,15 @@ func TestStoreRangeReadoptedLHSFollower(t *testing.T) {
 		// immediately because there are no overlapping replicas that would interfere
 		// with the widening of the existing LHS replica.
 		if _, err := mtc.dbs[0].AdminChangeReplicas(
-			ctx, lhsDesc.StartKey.AsRawKey(), roachpb.ADD_REPLICA,
-			[]roachpb.ReplicationTarget{{
-				NodeID:  mtc.idents[2].NodeID,
-				StoreID: mtc.idents[2].StoreID,
-			}},
+			ctx, lhsDesc.StartKey.AsRawKey(),
 			*lhsDesc,
-		); !testutils.IsError(err, "cannot apply snapshot: snapshot intersects existing range") {
+			roachpb.MakeReplicationChanges(
+				roachpb.ADD_REPLICA,
+				roachpb.ReplicationTarget{
+					NodeID:  mtc.idents[2].NodeID,
+					StoreID: mtc.idents[2].StoreID,
+				}),
+		); !testutils.IsError(err, "descriptor changed") {
 			t.Fatal(err)
 		}
 
@@ -2979,81 +2840,108 @@ func TestStoreRangeMergeSlowWatcher(t *testing.T) {
 	}
 }
 
-// unreliableRaftHandler drops all Raft messages that are addressed to the
-// specified rangeID, but lets all other messages through.
-type unreliableRaftHandler struct {
-	rangeID roachpb.RangeID
-	storage.RaftMessageHandler
-	// If non-nil, can return false to avoid dropping a msg to rangeID
-	dropReq  func(*storage.RaftMessageRequest) bool
-	dropHB   func(*storage.RaftHeartbeat) bool
-	dropResp func(*storage.RaftMessageResponse) bool
-}
-
-func (h *unreliableRaftHandler) HandleRaftRequest(
-	ctx context.Context,
-	req *storage.RaftMessageRequest,
-	respStream storage.RaftMessageResponseStream,
-) *roachpb.Error {
-	if len(req.Heartbeats)+len(req.HeartbeatResps) > 0 {
-		reqCpy := *req
-		req = &reqCpy
-		req.Heartbeats = h.filterHeartbeats(req.Heartbeats)
-		req.HeartbeatResps = h.filterHeartbeats(req.HeartbeatResps)
-		if len(req.Heartbeats)+len(req.HeartbeatResps) == 0 {
-			// Entirely filtered.
-			return nil
-		}
-	} else if req.RangeID == h.rangeID {
-		if h.dropReq == nil || h.dropReq(req) {
-			log.Infof(
-				ctx,
-				"dropping Raft message %s",
-				raft.DescribeMessage(req.Message, func([]byte) string {
-					return "<omitted>"
-				}),
-			)
-
-			return nil
-		}
-	}
-	return h.RaftMessageHandler.HandleRaftRequest(ctx, req, respStream)
-}
-
-func (h *unreliableRaftHandler) filterHeartbeats(
-	hbs []storage.RaftHeartbeat,
-) []storage.RaftHeartbeat {
-	if len(hbs) == 0 {
-		return hbs
-	}
-	var cpy []storage.RaftHeartbeat
-	for i := range hbs {
-		hb := &hbs[i]
-		if hb.RangeID != h.rangeID || (h.dropHB != nil && !h.dropHB(hb)) {
-			cpy = append(cpy, *hb)
-		}
-	}
-	return cpy
-}
-
-func (h *unreliableRaftHandler) HandleRaftResponse(
-	ctx context.Context, resp *storage.RaftMessageResponse,
-) error {
-	if resp.RangeID == h.rangeID {
-		if h.dropResp == nil || h.dropResp(resp) {
-			return nil
-		}
-	}
-	return h.RaftMessageHandler.HandleRaftResponse(ctx, resp)
-}
-
 func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	// We will be testing the SSTs written on store2's engine.
+	var eng engine.Engine
 	ctx := context.Background()
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableReplicateQueue = true
 	storeCfg.TestingKnobs.DisableReplicaGCQueue = true
+	storeCfg.TestingKnobs.BeforeSnapshotSSTIngestion = func(
+		inSnap storage.IncomingSnapshot,
+		snapType storage.SnapshotRequest_Type,
+		sstNames []string,
+	) error {
+		// Only verify snapshots of type RAFT and on the range under exercise
+		// (range 2). Note that the keys of range 2 aren't verified in this
+		// functions. Unreplicated range-id local keys are not verified because
+		// there are too many keys and the other replicated keys are verified later
+		// on in the test. This function verifies that the subsumed replicas have
+		// been handled properly.
+		if snapType != storage.SnapshotRequest_RAFT || inSnap.State.Desc.RangeID != roachpb.RangeID(2) {
+			return nil
+		}
+		// The seven SSTs we are expecting to ingest are in the following order:
+		// 1. Replicated range-id local keys of the range in the snapshot.
+		// 2. Range-local keys of the range in the snapshot.
+		// 3. User keys of the range in the snapshot.
+		// 4. Unreplicated range-id local keys of the range in the snapshot.
+		// 5. SST to clear range-id local keys of the subsumed replica with
+		//    RangeID 3.
+		// 6. SST to clear range-id local keys of the subsumed replica with
+		//    RangeID 4.
+		// 7. SST to clear the user keys of the subsumed replicas.
+		//
+		// NOTE: There are no range-local keys in [d, /Max) in the store we're
+		// sending a snapshot to, so we aren't expecting an SST to clear those
+		// keys.
+		if len(sstNames) != 7 {
+			return errors.Errorf("expected to ingest 7 SSTs, got %d SSTs", len(sstNames))
+		}
+
+		// Only verify the SSTs of the subsumed replicas (the last three SSTs) by
+		// constructing the expected SST and ensuring that they are byte-by-byte
+		// equal. This verification ensures that the SSTs have the same tombstones
+		// and range deletion tombstones.
+		var expectedSSTs [][]byte
+		sstNames = sstNames[4:]
+
+		// Range-id local range of subsumed replicas.
+		for _, rangeID := range []roachpb.RangeID{roachpb.RangeID(3), roachpb.RangeID(4)} {
+			sst, err := engine.MakeRocksDBSstFileWriter()
+			if err != nil {
+				return err
+			}
+			defer sst.Close()
+			r := rditer.MakeRangeIDLocalKeyRange(rangeID, false)
+			if err := sst.ClearRange(r.Start, r.End); err != nil {
+				return err
+			}
+			tombstoneKey := keys.RaftTombstoneKey(rangeID)
+			tombstoneValue := &roachpb.RaftTombstone{NextReplicaID: math.MaxInt32}
+			if err := engine.MVCCBlindPutProto(context.TODO(), &sst, nil, tombstoneKey, hlc.Timestamp{}, tombstoneValue, nil); err != nil {
+				return err
+			}
+			expectedSST, err := sst.Finish()
+			if err != nil {
+				return err
+			}
+			expectedSSTs = append(expectedSSTs, expectedSST)
+		}
+
+		// User key range of subsumed replicas.
+		sst, err := engine.MakeRocksDBSstFileWriter()
+		if err != nil {
+			return err
+		}
+		defer sst.Close()
+		desc := roachpb.RangeDescriptor{
+			StartKey: roachpb.RKey("d"),
+			EndKey:   roachpb.RKeyMax,
+		}
+		r := rditer.MakeUserKeyRange(&desc)
+		if err := engine.ClearRangeWithHeuristic(eng, &sst, r.Start, r.End); err != nil {
+			return err
+		}
+		expectedSST, err := sst.Finish()
+		if err != nil {
+			return err
+		}
+		expectedSSTs = append(expectedSSTs, expectedSST)
+
+		for i := range sstNames {
+			actualSST, err := eng.ReadFile(sstNames[i])
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(actualSST, expectedSSTs[i]) {
+				return errors.Errorf("contents of %s were unexpected", sstNames[i])
+			}
+		}
+		return nil
+	}
 	mtc := &multiTestContext{
 		storeConfig: &storeCfg,
 		// This test was written before the multiTestContext started creating many
@@ -3064,6 +2952,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 	mtc.Start(t, 3)
 	defer mtc.Stop()
 	store0, store2 := mtc.Store(0), mtc.Store(2)
+	eng = store2.Engine()
 	distSender := mtc.distSenders[0]
 
 	// Create three fully-caught-up, adjacent ranges on all three stores.
@@ -3072,6 +2961,18 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		if _, pErr := client.SendWrapped(ctx, distSender, adminSplitArgs(key)); pErr != nil {
 			t.Fatal(pErr)
 		}
+		if _, pErr := client.SendWrapped(ctx, distSender, incrementArgs(key, 1)); pErr != nil {
+			t.Fatal(pErr)
+		}
+		mtc.waitForValues(key, []int64{1, 1, 1})
+	}
+
+	// Put some keys in [d, /Max) so the subsumed replica of [c, /Max) with range
+	// ID 4 has tombstones. We will clear uncontained key range of subsumed
+	// replicas, so when we are receiving a snapshot for [a, d), we expect to
+	// clear the keys in [d, /Max).
+	for i := 0; i < 10; i++ {
+		key := roachpb.Key("d" + strconv.Itoa(i))
 		if _, pErr := client.SendWrapped(ctx, distSender, incrementArgs(key, 1)); pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -3126,20 +3027,22 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 	mtc.transport.Listen(store2.Ident.StoreID, &unreliableRaftHandler{
 		rangeID:            aRepl0.RangeID,
 		RaftMessageHandler: store2,
-		dropReq: func(req *storage.RaftMessageRequest) bool {
-			// Make sure that even going forward no MsgApp for what we just
-			// truncated can make it through. The Raft transport is asynchronous
-			// so this is necessary to make the test pass reliably - otherwise
-			// the follower on store2 may catch up without needing a snapshot,
-			// tripping up the test.
-			//
-			// NB: the Index on the message is the log index that _precedes_ any of the
-			// entries in the MsgApp, so filter where msg.Index < index, not <= index.
-			return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
+		unreliableRaftHandlerFuncs: unreliableRaftHandlerFuncs{
+			dropReq: func(req *storage.RaftMessageRequest) bool {
+				// Make sure that even going forward no MsgApp for what we just
+				// truncated can make it through. The Raft transport is asynchronous
+				// so this is necessary to make the test pass reliably - otherwise
+				// the follower on store2 may catch up without needing a snapshot,
+				// tripping up the test.
+				//
+				// NB: the Index on the message is the log index that _precedes_ any of the
+				// entries in the MsgApp, so filter where msg.Index < index, not <= index.
+				return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
+			},
+			// Don't drop heartbeats or responses.
+			dropHB:   func(*storage.RaftHeartbeat) bool { return false },
+			dropResp: func(*storage.RaftMessageResponse) bool { return false },
 		},
-		// Don't drop heartbeats or responses.
-		dropHB:   func(*storage.RaftHeartbeat) bool { return false },
-		dropResp: func(*storage.RaftMessageResponse) bool { return false },
 	})
 
 	// Wait for all replicas to catch up to the same point. Because we truncated
@@ -3281,19 +3184,20 @@ func TestMergeQueue(t *testing.T) {
 	clock := hlc.NewClock(manualClock.UnixNano, time.Nanosecond)
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableSplitQueue = true
+	storeCfg.TestingKnobs.DisableReplicateQueue = true
 	storeCfg.TestingKnobs.DisableScanner = true
+	rangeMinBytes := int64(1 << 10) // 1KB
+	storeCfg.DefaultZoneConfig.RangeMinBytes = &rangeMinBytes
 	sv := &storeCfg.Settings.SV
 	storagebase.MergeQueueEnabled.Override(sv, true)
 	storage.MergeQueueInterval.Override(sv, 0) // process greedily
-	manualSplitTTL := time.Millisecond * 200
-	storage.ManualSplitTTL.Override(sv, manualSplitTTL)
 	var mtc multiTestContext
 	// This test was written before the multiTestContext started creating many
 	// system ranges at startup, and hasn't been update to take that into account.
 	mtc.startWithSingleRange = true
 
 	mtc.storeConfig = &storeCfg
-	// Inject clock for manipulation in tests
+	// Inject clock for manipulation in tests.
 	mtc.clock = clock
 	mtc.Start(t, 2)
 	defer mtc.Stop()
@@ -3301,10 +3205,10 @@ func TestMergeQueue(t *testing.T) {
 	store := mtc.Store(0)
 	store.SetMergeQueueActive(true)
 
-	split := func(t *testing.T, key roachpb.Key, manual bool) {
+	split := func(t *testing.T, key roachpb.Key, expirationTime hlc.Timestamp) {
 		t.Helper()
 		args := adminSplitArgs(key)
-		args.Manual = manual
+		args.ExpirationTime = expirationTime
 		if _, pErr := client.SendWrapped(ctx, store.DB().NonTransactionalSender(), args); pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -3323,14 +3227,14 @@ func TestMergeQueue(t *testing.T) {
 	rhsStartKey := roachpb.RKey("b")
 	rhsEndKey := roachpb.RKey("c")
 	for _, k := range []roachpb.RKey{lhsStartKey, rhsStartKey, rhsEndKey} {
-		split(t, k.AsRawKey(), false /* manual */)
+		split(t, k.AsRawKey(), hlc.Timestamp{} /* expirationTime */)
 	}
 	lhs := func() *storage.Replica { return store.LookupReplica(lhsStartKey) }
 	rhs := func() *storage.Replica { return store.LookupReplica(rhsStartKey) }
 
 	// setThresholds simulates a zone config update that updates the ranges'
 	// minimum and maximum sizes.
-	setZones := func(zone config.ZoneConfig) {
+	setZones := func(zone zonepb.ZoneConfig) {
 		lhs().SetZoneConfig(&zone)
 		rhs().SetZoneConfig(&zone)
 	}
@@ -3348,7 +3252,7 @@ func TestMergeQueue(t *testing.T) {
 		}
 		setZones(*storeCfg.DefaultZoneConfig)
 		store.MustForceMergeScanAndProcess() // drain any merges that might already be queued
-		split(t, roachpb.Key("b"), false /* manual */)
+		split(t, roachpb.Key("b"), hlc.Timestamp{} /* expirationTime */)
 	}
 
 	verifyMerged := func(t *testing.T) {
@@ -3386,7 +3290,7 @@ func TestMergeQueue(t *testing.T) {
 
 	t.Run("lhs-undersize", func(t *testing.T) {
 		reset(t)
-		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*config.ZoneConfig)
+		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*zonepb.ZoneConfig)
 		*zone.RangeMinBytes *= 2
 		lhs().SetZoneConfig(zone)
 		store.MustForceMergeScanAndProcess()
@@ -3398,7 +3302,7 @@ func TestMergeQueue(t *testing.T) {
 
 		// The ranges are individually beneath the minimum size threshold, but
 		// together they'll exceed the maximum size threshold.
-		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*config.ZoneConfig)
+		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*zonepb.ZoneConfig)
 		zone.RangeMinBytes = proto.Int64(lhs().GetMVCCStats().Total() + 1)
 		zone.RangeMaxBytes = proto.Int64(lhs().GetMVCCStats().Total()*2 - 1)
 		setZones(*zone)
@@ -3415,9 +3319,12 @@ func TestMergeQueue(t *testing.T) {
 	t.Run("non-collocated", func(t *testing.T) {
 		reset(t)
 		verifyUnmerged(t)
-		mtc.replicateRange(rhs().RangeID, 1)
-		mtc.transferLease(ctx, rhs().RangeID, 0, 1)
-		mtc.unreplicateRange(rhs().RangeID, 0)
+		rhsRangeID := rhs().RangeID
+		mtc.replicateRange(rhsRangeID, 1)
+		mtc.transferLease(ctx, rhsRangeID, 0, 1)
+		mtc.unreplicateRange(rhsRangeID, 0)
+		require.NoError(t, mtc.waitForUnreplicated(rhsRangeID, 0))
+
 		clearRange(t, lhsStartKey, rhsEndKey)
 		store.MustForceMergeScanAndProcess()
 		verifyMerged(t)
@@ -3426,13 +3333,13 @@ func TestMergeQueue(t *testing.T) {
 	// TODO(jeffreyxiao): Add subtest to consider load when making merging
 	// decisions.
 
-	t.Run("sticky bit", func(t *testing.T) {
+	t.Run("sticky-bit", func(t *testing.T) {
 		reset(t)
 		store.MustForceMergeScanAndProcess()
 		verifyUnmerged(t)
 
 		// Perform manual merge and verify that no merge occurred.
-		split(t, rhsStartKey.AsRawKey(), true /* manual */)
+		split(t, rhsStartKey.AsRawKey(), hlc.MaxTimestamp /* expirationTime */)
 		clearRange(t, lhsStartKey, rhsEndKey)
 		store.MustForceMergeScanAndProcess()
 		verifyUnmerged(t)
@@ -3450,13 +3357,14 @@ func TestMergeQueue(t *testing.T) {
 		verifyMerged(t)
 	})
 
-	t.Run("sticky bit ttl", func(t *testing.T) {
+	t.Run("sticky-bit-expiration", func(t *testing.T) {
+		manualSplitTTL := time.Millisecond * 200
 		reset(t)
 		store.MustForceMergeScanAndProcess()
 		verifyUnmerged(t)
 
 		// Perform manual merge and verify that no merge occurred.
-		split(t, rhsStartKey.AsRawKey(), true /* manual */)
+		split(t, rhsStartKey.AsRawKey(), clock.Now().Add(manualSplitTTL.Nanoseconds(), 0) /* expirationTime */)
 		clearRange(t, lhsStartKey, rhsEndKey)
 		store.MustForceMergeScanAndProcess()
 		verifyUnmerged(t)

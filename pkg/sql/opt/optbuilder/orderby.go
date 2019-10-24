@@ -1,22 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -93,7 +90,7 @@ func (b *Builder) findIndexByName(table cat.Table, name tree.UnrestrictedName) (
 		}
 	}
 
-	return nil, pgerror.Newf(pgerror.CodeUndefinedObjectError,
+	return nil, pgerror.Newf(pgcode.UndefinedObject,
 		`index %q not found`, name)
 }
 
@@ -116,11 +113,16 @@ func (b *Builder) addExtraColumn(
 func (b *Builder) analyzeOrderByIndex(
 	order *tree.Order, inScope, projectionsScope, orderByScope *scope,
 ) {
-	tab, _ := b.resolveTable(&order.Table, privilege.SELECT)
+	tab, tn := b.resolveTable(&order.Table, privilege.SELECT)
 	index, err := b.findIndexByName(tab, order.Index)
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
+
+	// We fully qualify the table name in case another table expression was
+	// aliased to the same name as an existing table.
+	tn.ExplicitCatalog = true
+	tn.ExplicitSchema = true
 
 	// Append each key column from the index (including the implicit primary key
 	// columns) to the ordering scope.
@@ -128,7 +130,7 @@ func (b *Builder) analyzeOrderByIndex(
 		// Columns which are indexable are always orderable.
 		col := index.Column(i)
 		if err != nil {
-			panic(builderError{err})
+			panic(err)
 		}
 
 		desc := col.Descending
@@ -138,7 +140,7 @@ func (b *Builder) analyzeOrderByIndex(
 			desc = !desc
 		}
 
-		colItem := tree.NewColumnItem(tab.Name(), col.ColName())
+		colItem := tree.NewColumnItem(&tn, col.ColName())
 		expr := inScope.resolveType(colItem, types.Any)
 		outCol := b.addColumn(orderByScope, "" /* alias */, expr)
 		outCol.descending = desc

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -24,7 +20,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -38,16 +34,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/pebble"
 	"github.com/elastic/gosigar"
 	"github.com/pkg/errors"
 )
 
 // Context defaults.
 const (
-	// DefaultCacheSize is the default size of the RocksDB cache. We default the
-	// cache size and SQL memory pool size to 128 MiB. Larger values might
-	// provide significantly better performance, but we're not sure what type of
-	// system we're running on (development or production or some shared
+	// DefaultCacheSize is the default size of the RocksDB and Pebble caches. We
+	// default the cache size and SQL memory pool size to 128 MiB. Larger values
+	// might provide significantly better performance, but we're not sure what
+	// type of system we're running on (development or production or some shared
 	// environment). Production users should almost certainly override these
 	// settings and we'll warn in the logs about doing so.
 	DefaultCacheSize         = 128 << 20 // 128 MB
@@ -135,6 +132,10 @@ type Config struct {
 	// Stores is specified to enable durable key-value storage.
 	Stores base.StoreSpecList
 
+	// StorageEngine specifies the engine type (eg. rocksdb, pebble) to use to
+	// instantiate stores.
+	StorageEngine base.EngineType
+
 	// TempStorageConfig is used to configure temp storage, which stores
 	// ephemeral data when processing large queries.
 	TempStorageConfig base.TempStorageConfig
@@ -145,8 +146,7 @@ type Config struct {
 	Attrs string
 
 	// JoinList is a list of node addresses that act as bootstrap hosts for
-	// connecting to the gossip network. Each item in the list can actually be
-	// multiple comma-separated addresses, kept for backward-compatibility.
+	// connecting to the gossip network.
 	JoinList base.JoinListType
 
 	// RetryOptions controls the retry behavior of the server.
@@ -179,8 +179,9 @@ type Config struct {
 	GoroutineDumpDirName string
 
 	// HeapProfileDirName is the directory name for heap profiles using
-	// heapprofiler.
+	// heapprofiler. If empty, no heap profiles will be collected.
 	HeapProfileDirName string
+
 	// Parsed values.
 
 	// NodeAttributes is the parsed representation of Attrs.
@@ -237,11 +238,11 @@ type Config struct {
 	// DefaultZoneConfig is used to set the default zone config inside the server.
 	// It can be overridden during tests by setting the DefaultZoneConfigOverride
 	// server testing knob.
-	DefaultZoneConfig config.ZoneConfig
+	DefaultZoneConfig zonepb.ZoneConfig
 	// DefaultSystemZoneConfig is used to set the default system zone config
 	// inside the server. It can be overridden during tests by setting the
 	// DefaultSystemZoneConfigOverride server testing knob.
-	DefaultSystemZoneConfig config.ZoneConfig
+	DefaultSystemZoneConfig zonepb.ZoneConfig
 
 	// Locality is a description of the topography of the server.
 	Locality roachpb.Locality
@@ -341,8 +342,8 @@ func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
 
 	cfg := Config{
 		Config:                         new(base.Config),
-		DefaultZoneConfig:              config.DefaultZoneConfig(),
-		DefaultSystemZoneConfig:        config.DefaultSystemZoneConfig(),
+		DefaultZoneConfig:              zonepb.DefaultZoneConfig(),
+		DefaultSystemZoneConfig:        zonepb.DefaultSystemZoneConfig(),
 		MaxOffset:                      MaxOffsetType(base.DefaultMaxClockOffset),
 		Settings:                       st,
 		CacheSize:                      DefaultCacheSize,
@@ -431,9 +432,16 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 	var details []string
 
-	details = append(details, fmt.Sprintf("RocksDB cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
-	cache := engine.NewRocksDBCache(cfg.CacheSize)
-	defer cache.Release()
+	var cache engine.RocksDBCache
+	var pebbleCache *pebble.Cache
+	if cfg.StorageEngine == base.EngineTypePebble {
+		details = append(details, fmt.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
+		pebbleCache = pebble.NewCache(cfg.CacheSize)
+	} else {
+		details = append(details, fmt.Sprintf("RocksDB cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
+		cache = engine.NewRocksDBCache(cfg.CacheSize)
+		defer cache.Release()
+	}
 
 	var physicalStores int
 	for _, spec := range cfg.Stores.Specs {
@@ -483,19 +491,42 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 			details = append(details, fmt.Sprintf("store %d: RocksDB, max size %s, max open file limit %d",
 				i, humanizeutil.IBytes(sizeInBytes), openFileLimitPerStore))
-			rocksDBConfig := engine.RocksDBConfig{
-				Attrs:                   spec.Attributes,
-				Dir:                     spec.Path,
-				MaxSizeBytes:            sizeInBytes,
-				MaxOpenFiles:            openFileLimitPerStore,
-				WarnLargeBatchThreshold: 500 * time.Millisecond,
-				Settings:                cfg.Settings,
-				UseFileRegistry:         spec.UseFileRegistry,
-				RocksDBOptions:          spec.RocksDBOptions,
-				ExtraOptions:            spec.ExtraOptions,
-			}
 
-			eng, err := engine.NewRocksDB(rocksDBConfig, cache)
+			var eng engine.Engine
+			var err error
+			if cfg.StorageEngine == base.EngineTypePebble {
+				// TODO(itsbilal): Tune these options, and allow them to be overridden
+				// in the spec (similar to the existing spec.RocksDBOptions and others).
+				pebbleOpts := &pebble.Options{
+					Cache:                       pebbleCache,
+					MaxOpenFiles:                int(openFileLimitPerStore),
+					MemTableSize:                64 << 20,
+					MemTableStopWritesThreshold: 4,
+					MinFlushRate:                4 << 20,
+					L0CompactionThreshold:       2,
+					L0StopWritesThreshold:       400,
+					LBaseMaxBytes:               64 << 20, // 64 MB
+					Levels: []pebble.LevelOptions{{
+						BlockSize: 32 << 10,
+					}},
+				}
+				eng, err = engine.NewPebble(spec.Path, pebbleOpts)
+				eng.(*engine.Pebble).SetAttrs(spec.Attributes)
+			} else {
+				rocksDBConfig := engine.RocksDBConfig{
+					Attrs:                   spec.Attributes,
+					Dir:                     spec.Path,
+					MaxSizeBytes:            sizeInBytes,
+					MaxOpenFiles:            openFileLimitPerStore,
+					WarnLargeBatchThreshold: 500 * time.Millisecond,
+					Settings:                cfg.Settings,
+					UseFileRegistry:         spec.UseFileRegistry,
+					RocksDBOptions:          spec.RocksDBOptions,
+					ExtraOptions:            spec.ExtraOptions,
+				}
+
+				eng, err = engine.NewRocksDB(rocksDBConfig, cache)
+			}
 			if err != nil {
 				return Engines{}, err
 			}
@@ -579,18 +610,12 @@ func (cfg *Config) readEnvironmentVariables() {
 // parseGossipBootstrapResolvers parses list of gossip bootstrap resolvers.
 func (cfg *Config) parseGossipBootstrapResolvers() ([]resolver.Resolver, error) {
 	var bootstrapResolvers []resolver.Resolver
-	for _, commaSeparatedAddresses := range cfg.JoinList {
-		addresses := strings.Split(commaSeparatedAddresses, ",")
-		for _, address := range addresses {
-			if len(address) == 0 {
-				continue
-			}
-			resolver, err := resolver.NewResolver(address)
-			if err != nil {
-				return nil, err
-			}
-			bootstrapResolvers = append(bootstrapResolvers, resolver)
+	for _, address := range cfg.JoinList {
+		resolver, err := resolver.NewResolver(address)
+		if err != nil {
+			return nil, err
 		}
+		bootstrapResolvers = append(bootstrapResolvers, resolver)
 	}
 
 	return bootstrapResolvers, nil

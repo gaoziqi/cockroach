@@ -1,23 +1,20 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
 import (
 	"fmt"
+	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -25,35 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
-
-func init() {
-	// We use a hook to avoid a dependency on the sqlbase package. We
-	// should probably move keys/protos elsewhere.
-	config.SplitAtIDHook = SplitAtIDHook
-}
-
-// SplitAtIDHook determines whether a specific descriptor ID
-// should be considered for a split at all. If it is a database
-// or a view table descriptor, it should not be considered.
-func SplitAtIDHook(id uint32, cfg *config.SystemConfig) bool {
-	descVal := cfg.GetDesc(MakeDescMetadataKey(ID(id)))
-	if descVal == nil {
-		return false
-	}
-	var desc Descriptor
-	if err := descVal.GetProto(&desc); err != nil {
-		return false
-	}
-	if dbDesc := desc.GetDatabase(); dbDesc != nil {
-		return false
-	}
-	if tableDesc := desc.GetTable(); tableDesc != nil {
-		if viewStr := tableDesc.GetViewQuery(); viewStr != "" {
-			return false
-		}
-	}
-	return true
-}
 
 // sql CREATE commands and full schema for each system table.
 // These strings are *not* used at runtime, but are checked by the
@@ -224,7 +192,7 @@ CREATE TABLE system.role_members (
 CREATE TABLE system.comments (
    type      INT NOT NULL,    -- type of object, to distinguish between db, table, column and others
    object_id INT NOT NULL,    -- object ID, this will be usually db/table desc ID
-   sub_id    INT NOT NULL,    -- sub ID for columns inside table, 0 for pure table
+   sub_id    INT NOT NULL,    -- sub ID for column or indexes inside table, 0 for pure table
    comment   STRING NOT NULL, -- the comment
    PRIMARY KEY (type, object_id, sub_id)
 );`
@@ -262,12 +230,16 @@ var SystemAllowedPrivileges = map[ID]privilege.List{
 	// users will be able to modify system tables' schemas at will. CREATE and
 	// DROP privileges are allowed on the above system tables for backwards
 	// compatibility reasons only!
-	keys.JobsTableID:            privilege.ReadWriteData,
-	keys.WebSessionsTableID:     privilege.ReadWriteData,
-	keys.TableStatisticsTableID: privilege.ReadWriteData,
-	keys.LocationsTableID:       privilege.ReadWriteData,
-	keys.RoleMembersTableID:     privilege.ReadWriteData,
-	keys.CommentsTableID:        privilege.ReadWriteData,
+	keys.JobsTableID:                          privilege.ReadWriteData,
+	keys.WebSessionsTableID:                   privilege.ReadWriteData,
+	keys.TableStatisticsTableID:               privilege.ReadWriteData,
+	keys.LocationsTableID:                     privilege.ReadWriteData,
+	keys.RoleMembersTableID:                   privilege.ReadWriteData,
+	keys.CommentsTableID:                      privilege.ReadWriteData,
+	keys.ReplicationConstraintStatsTableID:    privilege.ReadWriteData,
+	keys.ReplicationCriticalLocalitiesTableID: privilege.ReadWriteData,
+	keys.ReplicationStatsTableID:              privilege.ReadWriteData,
+	keys.ReportsMetaTableID:                   privilege.ReadWriteData,
 }
 
 // Helpers used to make some of the TableDescriptor literals below more concise.
@@ -335,12 +307,15 @@ var (
 		Version:    1,
 		Columns: []ColumnDescriptor{
 			{Name: "id", ID: 1, Type: *types.Int},
-			{Name: "descriptor", ID: 2, Type: *types.Bytes, Nullable: true},
+			{Name: "descriptor", ID: keys.DescriptorTableDescriptorColID, Type: *types.Bytes, Nullable: true},
 		},
 		NextColumnID: 3,
 		Families: []ColumnFamilyDescriptor{
+			// The id of the first col fam is hardcoded in keys.MakeDescMetadataKey().
 			{Name: "primary", ID: 0, ColumnNames: []string{"id"}, ColumnIDs: singleID1},
-			{Name: "fam_2_descriptor", ID: 2, ColumnNames: []string{"descriptor"}, ColumnIDs: []ColumnID{2}, DefaultColumnID: 2},
+			{Name: "fam_2_descriptor", ID: keys.DescriptorTableDescriptorColFamID,
+				ColumnNames: []string{"descriptor"},
+				ColumnIDs:   []ColumnID{keys.DescriptorTableDescriptorColID}, DefaultColumnID: keys.DescriptorTableDescriptorColID},
 		},
 		PrimaryIndex:   pk("id"),
 		NextFamilyID:   3,
@@ -389,7 +364,8 @@ var (
 		NextColumnID: 3,
 		Families: []ColumnFamilyDescriptor{
 			{Name: "primary", ID: 0, ColumnNames: []string{"id"}, ColumnIDs: singleID1},
-			{Name: "fam_2_config", ID: 2, ColumnNames: []string{"config"}, ColumnIDs: []ColumnID{2}, DefaultColumnID: 2},
+			{Name: "fam_2_config", ID: keys.ZonesTableConfigColFamID, ColumnNames: []string{"config"},
+				ColumnIDs: []ColumnID{keys.ZonesTableConfigColumnID}, DefaultColumnID: keys.ZonesTableConfigColumnID},
 		},
 		PrimaryIndex: IndexDescriptor{
 			Name:             "primary",
@@ -864,16 +840,200 @@ var (
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
+
+	ReportsMetaTable = TableDescriptor{
+		Name:     "reports_meta",
+		ID:       keys.ReportsMetaTableID,
+		ParentID: keys.SystemDatabaseID,
+		Version:  1,
+		Columns: []ColumnDescriptor{
+			{Name: "id", ID: 1, Type: *types.Int},
+			{Name: "generated", ID: 2, Type: *types.Timestamp},
+		},
+		NextColumnID: 3,
+		Families: []ColumnFamilyDescriptor{
+			{
+				Name:        "primary",
+				ID:          0,
+				ColumnNames: []string{"id", "generated"},
+				ColumnIDs:   []ColumnID{1, 2},
+			},
+		},
+		NextFamilyID: 1,
+		PrimaryIndex: IndexDescriptor{
+			Name:        "primary",
+			ID:          1,
+			Unique:      true,
+			ColumnNames: []string{"id"},
+			ColumnDirections: []IndexDescriptor_Direction{
+				IndexDescriptor_ASC,
+			},
+			ColumnIDs: []ColumnID{1},
+		},
+		NextIndexID:    2,
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ReportsMetaTableID]),
+		FormatVersion:  InterleavedFormatVersion,
+		NextMutationID: 1,
+	}
+
+	ReplicationConstraintStatsTableTTL = time.Minute * 10
+	// TODO(andrei): In 20.1 we should add a foreign key reference to the
+	// reports_meta table. Until then, it would cost us having to create an index
+	// on report_id.
+	ReplicationConstraintStatsTable = TableDescriptor{
+		Name:     "replication_constraint_stats",
+		ID:       keys.ReplicationConstraintStatsTableID,
+		ParentID: keys.SystemDatabaseID,
+		Version:  1,
+		Columns: []ColumnDescriptor{
+			{Name: "zone_id", ID: 1, Type: *types.Int},
+			{Name: "subzone_id", ID: 2, Type: *types.Int},
+			{Name: "type", ID: 3, Type: *types.String},
+			{Name: "config", ID: 4, Type: *types.String},
+			{Name: "report_id", ID: 5, Type: *types.Int},
+			{Name: "violation_start", ID: 6, Type: *types.Timestamp, Nullable: true},
+			{Name: "violating_ranges", ID: 7, Type: *types.Int},
+		},
+		NextColumnID: 8,
+		Families: []ColumnFamilyDescriptor{
+			{
+				Name: "primary",
+				ID:   0,
+				ColumnNames: []string{
+					"zone_id",
+					"subzone_id",
+					"type",
+					"config",
+					"report_id",
+					"violation_start",
+					"violating_ranges",
+				},
+				ColumnIDs: []ColumnID{1, 2, 3, 4, 5, 6, 7},
+			},
+		},
+		NextFamilyID: 1,
+		PrimaryIndex: IndexDescriptor{
+			Name:        "primary",
+			ID:          1,
+			Unique:      true,
+			ColumnNames: []string{"zone_id", "subzone_id", "type", "config"},
+			ColumnDirections: []IndexDescriptor_Direction{
+				IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC,
+			},
+			ColumnIDs: []ColumnID{1, 2, 3, 4},
+		},
+		NextIndexID:    2,
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ReplicationConstraintStatsTableID]),
+		FormatVersion:  InterleavedFormatVersion,
+		NextMutationID: 1,
+	}
+
+	// TODO(andrei): In 20.1 we should add a foreign key reference to the
+	// reports_meta table. Until then, it would cost us having to create an index
+	// on report_id.
+	ReplicationCriticalLocalitiesTable = TableDescriptor{
+		Name:     "replication_critical_localities",
+		ID:       keys.ReplicationCriticalLocalitiesTableID,
+		ParentID: keys.SystemDatabaseID,
+		Version:  1,
+		Columns: []ColumnDescriptor{
+			{Name: "zone_id", ID: 1, Type: *types.Int},
+			{Name: "subzone_id", ID: 2, Type: *types.Int},
+			{Name: "locality", ID: 3, Type: *types.String},
+			{Name: "report_id", ID: 4, Type: *types.Int},
+			{Name: "at_risk_ranges", ID: 5, Type: *types.Int},
+		},
+		NextColumnID: 6,
+		Families: []ColumnFamilyDescriptor{
+			{
+				Name: "primary",
+				ID:   0,
+				ColumnNames: []string{
+					"zone_id",
+					"subzone_id",
+					"locality",
+					"report_id",
+					"at_risk_ranges",
+				},
+				ColumnIDs: []ColumnID{1, 2, 3, 4, 5},
+			},
+		},
+		NextFamilyID: 1,
+		PrimaryIndex: IndexDescriptor{
+			Name:        "primary",
+			ID:          1,
+			Unique:      true,
+			ColumnNames: []string{"zone_id", "subzone_id", "locality"},
+			ColumnDirections: []IndexDescriptor_Direction{
+				IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC,
+			},
+			ColumnIDs: []ColumnID{1, 2, 3},
+		},
+		NextIndexID:    2,
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ReplicationCriticalLocalitiesTableID]),
+		FormatVersion:  InterleavedFormatVersion,
+		NextMutationID: 1,
+	}
+
+	ReplicationStatsTableTTL = time.Minute * 10
+	// TODO(andrei): In 20.1 we should add a foreign key reference to the
+	// reports_meta table. Until then, it would cost us having to create an index
+	// on report_id.
+	ReplicationStatsTable = TableDescriptor{
+		Name:     "replication_stats",
+		ID:       keys.ReplicationStatsTableID,
+		ParentID: keys.SystemDatabaseID,
+		Version:  1,
+		Columns: []ColumnDescriptor{
+			{Name: "zone_id", ID: 1, Type: *types.Int},
+			{Name: "subzone_id", ID: 2, Type: *types.Int},
+			{Name: "report_id", ID: 3, Type: *types.Int},
+			{Name: "total_ranges", ID: 4, Type: *types.Int},
+			{Name: "unavailable_ranges", ID: 5, Type: *types.Int},
+			{Name: "under_replicated_ranges", ID: 6, Type: *types.Int},
+			{Name: "over_replicated_ranges", ID: 7, Type: *types.Int},
+		},
+		NextColumnID: 8,
+		Families: []ColumnFamilyDescriptor{
+			{
+				Name: "primary",
+				ID:   0,
+				ColumnNames: []string{
+					"zone_id",
+					"subzone_id",
+					"report_id",
+					"total_ranges",
+					"unavailable_ranges",
+					"under_replicated_ranges",
+					"over_replicated_ranges",
+				},
+				ColumnIDs: []ColumnID{1, 2, 3, 4, 5, 6, 7},
+			},
+		},
+		NextFamilyID: 2,
+		PrimaryIndex: IndexDescriptor{
+			Name:             "primary",
+			ID:               1,
+			Unique:           true,
+			ColumnNames:      []string{"zone_id", "subzone_id"},
+			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
+			ColumnIDs:        []ColumnID{1, 2},
+		},
+		NextIndexID:    2,
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ReplicationStatsTableID]),
+		FormatVersion:  InterleavedFormatVersion,
+		NextMutationID: 1,
+	}
 )
 
 // Create a kv pair for the zone config for the given key and config value.
-func createZoneConfigKV(keyID int, zoneConfig *config.ZoneConfig) roachpb.KeyValue {
+func createZoneConfigKV(keyID int, zoneConfig *zonepb.ZoneConfig) roachpb.KeyValue {
 	value := roachpb.Value{}
 	if err := value.SetProto(zoneConfig); err != nil {
 		panic(fmt.Sprintf("could not marshal ZoneConfig for ID: %d: %s", keyID, err))
 	}
 	return roachpb.KeyValue{
-		Key:   config.MakeZoneKey(uint32(keyID)),
+		Key:   keys.ZoneKey(uint32(keyID)),
 		Value: value,
 	}
 }
@@ -891,6 +1051,7 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	target.AddDescriptor(keys.SystemDatabaseID, &DescriptorTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &UsersTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &ZonesTable)
+	target.AddDescriptor(keys.SystemDatabaseID, &SettingsTable)
 
 	// Add all the other system tables.
 	target.AddDescriptor(keys.SystemDatabaseID, &LeaseTable)
@@ -898,7 +1059,6 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	target.AddDescriptor(keys.SystemDatabaseID, &RangeEventTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &UITable)
 	target.AddDescriptor(keys.SystemDatabaseID, &JobsTable)
-	target.AddDescriptor(keys.SystemDatabaseID, &SettingsTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &WebSessionsTable)
 
 	// Tables introduced in 2.0, added here for 2.1.
@@ -909,14 +1069,18 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	// The CommentsTable has been introduced in 2.2. It was added here since it
 	// was introduced, but it's also created as a migration for older clusters.
 	target.AddDescriptor(keys.SystemDatabaseID, &CommentsTable)
+	target.AddDescriptor(keys.SystemDatabaseID, &ReportsMetaTable)
+	target.AddDescriptor(keys.SystemDatabaseID, &ReplicationConstraintStatsTable)
+	target.AddDescriptor(keys.SystemDatabaseID, &ReplicationStatsTable)
+	target.AddDescriptor(keys.SystemDatabaseID, &ReplicationCriticalLocalitiesTable)
 }
 
 // addSystemDatabaseToSchema populates the supplied MetadataSchema with the
 // System database, its tables and zone configurations.
 func addSystemDatabaseToSchema(
 	target *MetadataSchema,
-	defaultZoneConfig *config.ZoneConfig,
-	defaultSystemZoneConfig *config.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig,
+	defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) {
 	addSystemDescriptorsToSchema(target)
 
@@ -929,9 +1093,9 @@ func addSystemDatabaseToSchema(
 	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.RootNamespaceID, defaultZoneConfig))
 
 	systemZoneConf := defaultSystemZoneConfig
-	metaRangeZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*config.ZoneConfig)
-	jobsZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*config.ZoneConfig)
-	livenessZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*config.ZoneConfig)
+	metaRangeZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*zonepb.ZoneConfig)
+	jobsZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*zonepb.ZoneConfig)
+	livenessZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*zonepb.ZoneConfig)
 
 	// .meta zone config entry with a shorter GC time.
 	metaRangeZoneConf.GC.TTLSeconds = 60 * 60 // 1h
@@ -941,11 +1105,23 @@ func addSystemDatabaseToSchema(
 	jobsZoneConf.GC.TTLSeconds = 10 * 60 // 10m
 	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.JobsTableID, jobsZoneConf))
 
+	// Some reporting tables have shorter GC times.
+	replicationConstraintStatsZoneConf := &zonepb.ZoneConfig{
+		GC: &zonepb.GCPolicy{TTLSeconds: int32(ReplicationConstraintStatsTableTTL.Seconds())},
+	}
+	replicationStatsZoneConf := &zonepb.ZoneConfig{
+		GC: &zonepb.GCPolicy{TTLSeconds: int32(ReplicationStatsTableTTL.Seconds())},
+	}
+
 	// Liveness zone config entry with a shorter GC time.
 	livenessZoneConf.GC.TTLSeconds = 10 * 60 // 10m
 	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.LivenessRangesID, livenessZoneConf))
 	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.SystemRangesID, systemZoneConf))
 	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.SystemDatabaseID, systemZoneConf))
+	target.otherKV = append(target.otherKV,
+		createZoneConfigKV(keys.ReplicationConstraintStatsTableID, replicationConstraintStatsZoneConf))
+	target.otherKV = append(target.otherKV,
+		createZoneConfigKV(keys.ReplicationStatsTableID, replicationStatsZoneConf))
 }
 
 // IsSystemConfigID returns whether this ID is for a system config object.

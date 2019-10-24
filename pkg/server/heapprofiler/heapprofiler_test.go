@@ -1,99 +1,65 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package heapprofiler
 
 import (
 	"context"
-	"strconv"
-	"strings"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/stretchr/testify/assert"
 )
 
-type rssVal struct {
-	secs time.Duration // secs is the time at which this rss value was emitted
-	rss  int64
-}
+func TestHeapProfiler(t *testing.T) {
+	ctx := context.Background()
+	type test struct {
+		secs      int // The measurement's timestamp.
+		heapBytes uint64
 
-func testHelper(
-	t *testing.T,
-	hp *HeapProfiler,
-	st *cluster.Settings,
-	rssValues []rssVal,
-	expectedScores []int64,
-	expectedPrefixes []string,
-) {
-	baseTime := time.Time{}
-	numProfiles := 0
-	mockHeapProfile := func(
-		ctx context.Context, dir string, prefix string, suffix string,
-	) {
-		assert.Equal(t, prefix, expectedPrefixes[numProfiles])
-		score, err := strconv.ParseInt(strings.Split(suffix, "_")[0], 10, 64)
-		assert.Nil(t, err)
-		assert.Equal(t, expectedScores[numProfiles], score)
-		numProfiles++
+		expProfile bool
+	}
+	tests := []test{
+		{0, 30, true},    // we always take the first profile
+		{10, 40, true},   // new high-water mark
+		{20, 30, false},  // below high-water mark; no profile
+		{4000, 10, true}, // new hour; should trigger regardless of the usage
 	}
 	var currentTime time.Time
-	var timeLocker syncutil.RWMutex
 	now := func() time.Time {
-		timeLocker.RLock()
-		defer timeLocker.RUnlock()
 		return currentTime
 	}
-	hp.takeHeapProfile = mockHeapProfile
-	hp.currentTime = now
-	// set a large negative time so that first profile is triggered correctly
-	// since we start time from 0 in test.
-	// Not needed in main code as time will never be 0.
-	hp.lastProfileTime = time.Time{}.Add(-1000 * time.Second)
 
-	ctx := context.TODO()
-	for _, r := range rssValues {
-		currentTime = baseTime.Add(time.Second * r.secs)
-		hp.MaybeTakeProfile(ctx, st, r.rss)
+	var tookProfile bool
+	hp, err := NewHeapProfiler("dummy_dir", cluster.MakeTestingClusterSettings())
+	if err != nil {
+		t.Fatal(err)
 	}
-	assert.Equal(t, numProfiles, len(expectedScores))
-}
+	hp.knobs = testingKnobs{
+		now:               now,
+		dontWriteProfiles: true,
+		maybeTakeProfileHook: func(willTakeProfile bool) {
+			tookProfile = willTakeProfile
+		},
+	}
 
-func TestPercentSystemMemoryHeuristic(t *testing.T) {
-	rssValues := []rssVal{
-		{0, 30}, {20, 40}, // random small values
-		{30, 88},            // should trigger
-		{80, 89},            // should not trigger as less than 60s before last profile
-		{130, 10}, {140, 4}, // random small values
-		{150, 90}, // should trigger
-		{260, 92}, // should not trigger as continues above threshold
-		{290, 30}, // random small value
-		{380, 99}, // should trigger
-		{390, 30}, // random small value
-		{430, 91}, // should not trigger as less than 60s before last profile
-		{500, 95}, // should trigger
+	for i, r := range tests {
+		currentTime = (time.Time{}).Add(time.Second * time.Duration(r.secs))
+
+		// Initialize enough of ms for the purposes of the HeapProfiler.
+		var ms runtime.MemStats
+		ms.HeapAlloc = r.heapBytes
+
+		hp.MaybeTakeProfile(ctx, ms)
+		assert.Equal(t, r.expProfile, tookProfile, i)
 	}
-	expectedScores := []int64{88, 90, 99, 95}
-	prefix := "memprof.fraction_system_memory."
-	expectedPrefixes := []string{prefix, prefix, prefix, prefix}
-	hp := &HeapProfiler{
-		stats:      &stats{systemMemory: 100},
-		heuristics: []heuristic{fractionSystemMemoryHeuristic},
-	}
-	st := &cluster.Settings{}
-	systemMemoryThresholdFraction.Override(&st.SV, .85)
-	testHelper(t, hp, st, rssValues, expectedScores, expectedPrefixes)
 }

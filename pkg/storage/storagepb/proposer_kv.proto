@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 syntax = "proto3";
 package cockroach.storage.storagepb;
@@ -129,22 +125,18 @@ message ReplicatedEvalResult {
   storage.storagepb.ReplicaState state = 2;
   Split split = 3;
   Merge merge = 4;
-  reserved 5;
   ComputeChecksum compute_checksum = 21;
   bool is_lease_request = 6;
-  reserved 7;
   // Duplicates BatchRequest.Timestamp for proposer-evaluated KV. Used
   // to verify the validity of the command (for lease coverage and GC
   // threshold).
   util.hlc.Timestamp timestamp = 8 [(gogoproto.nullable) = false];
-  bool is_consistency_related = 9;
   // The stats delta corresponding to the data in this WriteBatch. On
   // a split, contains only the contributions to the left-hand side.
   storage.engine.enginepb.MVCCStats deprecated_delta = 10; // See #18828
   storage.engine.enginepb.MVCCStatsDelta delta = 18 [(gogoproto.nullable) = false];
   ChangeReplicas change_replicas = 12;
   int64 raft_log_delta = 13;
-  reserved 14, 15;
 
   // AddSSTable is a side effect that must execute before the Raft application
   // is committed. It must be idempotent to account for an ill-timed crash after
@@ -162,7 +154,6 @@ message ReplicatedEvalResult {
     bytes data = 1;
     uint32 crc32 = 2 [(gogoproto.customname) = "CRC32"];
   }
-  reserved 16;
   AddSSTable add_sstable = 17 [(gogoproto.customname) = "AddSSTable"];
 
   // suggested_compactions are sent to the engine's compactor to
@@ -175,7 +166,7 @@ message ReplicatedEvalResult {
   // but before we tried to apply it.
   util.hlc.Timestamp prev_lease_proposal = 20;
 
-  reserved 10001 to 10013;
+  reserved 5, 7, 9, 14, 15, 16, 10001 to 10013;
 }
 
 // WriteBatch is the serialized representation of a RocksDB write
@@ -280,5 +271,20 @@ message RaftCommand {
   // to the physical operations being made in the write_batch.
   LogicalOpLog logical_op_log = 15;
 
+  // trace_data, if not empty, contains details of proposer's trace as returned by
+  // Tracer.Inject(opentracing.TextMap). Used to create span for command
+  // application on all the replicas that "follow from" the proposer.
+  map<string, string> trace_data = 16;
+
   reserved 1, 10001 to 10014;
+}
+
+// RaftCommandFooter contains a subset of the fields in RaftCommand. It is used
+// to optimize a pattern where most of the fields in RaftCommand are marshaled
+// outside of a heavily contended critical section, except for the fields in the
+// footer, which are assigned and marhsaled inside of the critical section and
+// appended to the marshaled byte buffer. This minimizes the memory allocation
+// and marshaling work performed under lock.
+message RaftCommandFooter {
+  uint64 max_lease_index = 4;
 }

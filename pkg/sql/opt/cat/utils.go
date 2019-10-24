@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cat
 
@@ -19,6 +15,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
@@ -55,46 +52,47 @@ func ExpandDataSourceGlob(
 // ResolveTableIndex resolves a TableIndexName.
 func ResolveTableIndex(
 	ctx context.Context, catalog Catalog, flags Flags, name *tree.TableIndexName,
-) (Index, error) {
+) (Index, DataSourceName, error) {
 	if name.Table.TableName != "" {
-		ds, _, err := catalog.ResolveDataSource(ctx, flags, &name.Table)
+		ds, tn, err := catalog.ResolveDataSource(ctx, flags, &name.Table)
 		if err != nil {
-			return nil, err
+			return nil, DataSourceName{}, err
 		}
 		table, ok := ds.(Table)
 		if !ok {
-			return nil, pgerror.Newf(
-				pgerror.CodeWrongObjectTypeError, "%q is not a table", name.Table.TableName,
+			return nil, DataSourceName{}, pgerror.Newf(
+				pgcode.WrongObjectType, "%q is not a table", name.Table.TableName,
 			)
 		}
 		if name.Index == "" {
 			// Return primary index.
-			return table.Index(0), nil
+			return table.Index(0), tn, nil
 		}
 		for i := 0; i < table.IndexCount(); i++ {
 			if idx := table.Index(i); idx.Name() == tree.Name(name.Index) {
-				return idx, nil
+				return idx, tn, nil
 			}
 		}
-		return nil, pgerror.Newf(
-			pgerror.CodeUndefinedObjectError, "index %q does not exist", name.Index,
+		return nil, DataSourceName{}, pgerror.Newf(
+			pgcode.UndefinedObject, "index %q does not exist", name.Index,
 		)
 	}
 
 	// We have to search for a table that has an index with the given name.
 	schema, _, err := catalog.ResolveSchema(ctx, flags, &name.Table.TableNamePrefix)
 	if err != nil {
-		return nil, err
+		return nil, DataSourceName{}, err
 	}
 	dsNames, err := schema.GetDataSourceNames(ctx)
 	if err != nil {
-		return nil, err
+		return nil, DataSourceName{}, err
 	}
 	var found Index
+	var foundTabName DataSourceName
 	for i := range dsNames {
-		ds, _, err := catalog.ResolveDataSource(ctx, flags, &dsNames[i])
+		ds, tn, err := catalog.ResolveDataSource(ctx, flags, &dsNames[i])
 		if err != nil {
-			return nil, err
+			return nil, DataSourceName{}, err
 		}
 		table, ok := ds.(Table)
 		if !ok {
@@ -104,21 +102,22 @@ func ResolveTableIndex(
 		for i := 0; i < table.IndexCount(); i++ {
 			if idx := table.Index(i); idx.Name() == tree.Name(name.Index) {
 				if found != nil {
-					return nil, pgerror.Newf(pgerror.CodeAmbiguousParameterError,
+					return nil, DataSourceName{}, pgerror.Newf(pgcode.AmbiguousParameter,
 						"index name %q is ambiguous (found in %s and %s)",
-						name.Index, table.Name().String(), found.Table().Name().String())
+						name.Index, tn.String(), foundTabName.String())
 				}
 				found = idx
+				foundTabName = tn
 				break
 			}
 		}
 	}
 	if found == nil {
-		return nil, pgerror.Newf(
-			pgerror.CodeUndefinedObjectError, "index %q does not exist", name.Index,
+		return nil, DataSourceName{}, pgerror.Newf(
+			pgcode.UndefinedObject, "index %q does not exist", name.Index,
 		)
 	}
-	return found, nil
+	return found, foundTabName, nil
 }
 
 // FindTableColumnByName returns the ordinal of the non-mutation column having
@@ -135,7 +134,10 @@ func FindTableColumnByName(tab Table, name tree.Name) int {
 // FormatTable nicely formats a catalog table using a treeprinter for debugging
 // and testing.
 func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
-	child := tp.Childf("TABLE %s", tab.Name().TableName)
+	child := tp.Childf("TABLE %s", tab.Name())
+	if tab.IsVirtualTable() {
+		child.Child("virtual table")
+	}
 
 	var buf bytes.Buffer
 	for i := 0; i < tab.DeletableColumnCount(); i++ {
@@ -144,19 +146,7 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 		child.Child(buf.String())
 	}
 
-	for i := 0; i < tab.DeletableIndexCount(); i++ {
-		formatCatalogIndex(tab, i, child)
-	}
-
-	for i := 0; i < tab.OutboundForeignKeyCount(); i++ {
-		formatCatalogFKRef(cat, tab, tab.OutboundForeignKey(i), child)
-	}
-
-	for i := 0; i < tab.CheckCount(); i++ {
-		child.Childf("CHECK (%s)", tab.Check(i))
-	}
-
-	// Don't print the primary family, since it's implied.
+	// If we only have one primary family (the default), don't print it.
 	if tab.FamilyCount() > 1 || tab.Family(0).Name() != "primary" {
 		for i := 0; i < tab.FamilyCount(); i++ {
 			buf.Reset()
@@ -164,6 +154,24 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 			child.Child(buf.String())
 		}
 	}
+
+	for i := 0; i < tab.CheckCount(); i++ {
+		child.Childf("CHECK (%s)", tab.Check(i).Constraint)
+	}
+
+	for i := 0; i < tab.DeletableIndexCount(); i++ {
+		formatCatalogIndex(tab, i, child)
+	}
+
+	for i := 0; i < tab.OutboundForeignKeyCount(); i++ {
+		formatCatalogFKRef(cat, false /* inbound */, tab.OutboundForeignKey(i), child)
+	}
+
+	for i := 0; i < tab.InboundForeignKeyCount(); i++ {
+		formatCatalogFKRef(cat, true /* inbound */, tab.InboundForeignKey(i), child)
+	}
+
+	// TODO(radu): show stats.
 }
 
 // formatCatalogIndex nicely formats a catalog index using a treeprinter for
@@ -202,6 +210,16 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 
 		child.Child(buf.String())
 	}
+
+	FormatZone(idx.Zone(), child)
+
+	partPrefixes := idx.PartitionByListPrefixes()
+	if len(partPrefixes) != 0 {
+		c := child.Child("partition by list prefixes")
+		for i := range partPrefixes {
+			c.Child(partPrefixes[i].String())
+		}
+	}
 }
 
 // formatColPrefix returns a string representation of a list of columns. The
@@ -223,20 +241,39 @@ func formatCols(tab Table, numCols int, colOrdinal func(tab Table, i int) int) s
 
 // formatCatalogFKRef nicely formats a catalog foreign key reference using a
 // treeprinter for debugging and testing.
-func formatCatalogFKRef(cat Catalog, tab Table, fkRef ForeignKeyConstraint, tp treeprinter.Node) {
-	ds, err := cat.ResolveDataSourceByID(context.TODO(), fkRef.ReferencedTableID())
+func formatCatalogFKRef(
+	catalog Catalog, inbound bool, fkRef ForeignKeyConstraint, tp treeprinter.Node,
+) {
+	originDS, _, err := catalog.ResolveDataSourceByID(context.TODO(), Flags{}, fkRef.OriginTableID())
 	if err != nil {
 		panic(err)
 	}
+	refDS, _, err := catalog.ResolveDataSourceByID(context.TODO(), Flags{}, fkRef.ReferencedTableID())
+	if err != nil {
+		panic(err)
+	}
+	title := "CONSTRAINT"
+	if inbound {
+		title = "REFERENCED BY " + title
+	}
+	var extra bytes.Buffer
+	if fkRef.MatchMethod() != tree.MatchSimple {
+		fmt.Fprintf(&extra, " %s", fkRef.MatchMethod())
+	}
 
-	fkTable := ds.(Table)
+	if action := fkRef.DeleteReferenceAction(); action != tree.NoAction {
+		fmt.Fprintf(&extra, " ON DELETE %s", action.String())
+	}
 
 	tp.Childf(
-		"CONSTRAINT %s FOREIGN KEY %s REFERENCES %v %s",
+		"%s %s FOREIGN KEY %v %s REFERENCES %v %s%s",
+		title,
 		fkRef.Name(),
-		formatCols(tab, fkRef.ColumnCount(), fkRef.OriginColumnOrdinal),
-		ds.Name(),
-		formatCols(fkTable, fkRef.ColumnCount(), fkRef.ReferencedColumnOrdinal),
+		originDS.Name(),
+		formatCols(originDS.(Table), fkRef.ColumnCount(), fkRef.OriginColumnOrdinal),
+		refDS.Name(),
+		formatCols(refDS.(Table), fkRef.ColumnCount(), fkRef.ReferencedColumnOrdinal),
+		extra.String(),
 	)
 }
 
@@ -245,11 +282,17 @@ func formatColumn(col Column, isMutationCol bool, buf *bytes.Buffer) {
 	if !col.IsNullable() {
 		fmt.Fprintf(buf, " not null")
 	}
+	if col.IsComputed() {
+		fmt.Fprintf(buf, " as (%s) stored", col.ComputedExprStr())
+	}
+	if col.HasDefault() {
+		fmt.Fprintf(buf, " default (%s)", col.DefaultExprStr())
+	}
 	if col.IsHidden() {
-		fmt.Fprintf(buf, " (hidden)")
+		fmt.Fprintf(buf, " [hidden]")
 	}
 	if isMutationCol {
-		fmt.Fprintf(buf, " (mutation)")
+		fmt.Fprintf(buf, " [mutation]")
 	}
 }
 

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -19,7 +15,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -85,7 +81,7 @@ type metadataDescriptor struct {
 // MakeMetadataSchema constructs a new MetadataSchema value which constructs
 // the "system" database.
 func MakeMetadataSchema(
-	defaultZoneConfig *config.ZoneConfig, defaultSystemZoneConfig *config.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) MetadataSchema {
 	ms := MetadataSchema{}
 	addSystemDatabaseToSchema(&ms, defaultZoneConfig, defaultSystemZoneConfig)
@@ -145,7 +141,7 @@ func (ms MetadataSchema) GetInitialValues() ([]roachpb.KeyValue, []roachpb.RKey)
 		value := roachpb.Value{}
 		value.SetInt(int64(desc.GetID()))
 		ret = append(ret, roachpb.KeyValue{
-			Key:   MakeNameMetadataKey(parentID, desc.GetName()),
+			Key:   NewTableKey(parentID, desc.GetName()).Key(),
 			Value: value,
 		})
 

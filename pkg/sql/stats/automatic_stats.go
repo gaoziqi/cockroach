@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stats
 
@@ -23,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -31,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // AutoStatsClusterSettingName is the name of the automatic stats collection
@@ -56,7 +53,7 @@ var AutomaticStatisticsMaxIdleTime = settings.RegisterValidatedFloatSetting(
 	0.9,
 	func(val float64) error {
 		if val < 0 || val >= 1 {
-			return pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+			return pgerror.Newf(pgcode.InvalidParameterValue,
 				"sql.stats.automatic_collection.max_fraction_idle must be >= 0 and < 1 but found: %v", val)
 		}
 		return nil
@@ -311,7 +308,11 @@ func (r *Refresher) ensureAllTables(
 
 	// Use a historical read so as to disable txn contention resolution.
 	getAllTablesQuery := fmt.Sprintf(
-		`SELECT table_id FROM crdb_internal.tables AS OF SYSTEM TIME '-%s' WHERE schema_name = 'public'`,
+		`
+SELECT table_id FROM crdb_internal.tables AS OF SYSTEM TIME '-%s'
+WHERE schema_name = 'public'
+AND drop_time IS NULL
+`,
 		initialTableCollectionDelay)
 
 	rows, err := r.ex.Query(
@@ -422,8 +423,7 @@ func (r *Refresher) maybeRefreshStats(
 	}
 
 	if err := r.refreshStats(ctx, tableID, asOf); err != nil {
-		pgerr, ok := errors.Cause(err).(*pgerror.Error)
-		if ok && pgerr.Code == pgerror.CodeLockNotAvailableError {
+		if errors.Is(err, ConcurrentCreateStatsError) {
 			// Another stats job was already running. Attempt to reschedule this
 			// refresh.
 			if mustRefresh {
@@ -548,3 +548,15 @@ func (r autoStatsRand) randInt(n int64) int64 {
 	defer r.Unlock()
 	return r.Int63n(n)
 }
+
+type concurrentCreateStatisticsError struct{}
+
+var _ error = concurrentCreateStatisticsError{}
+
+func (concurrentCreateStatisticsError) Error() string {
+	return "another CREATE STATISTICS job is already running"
+}
+
+// ConcurrentCreateStatsError is reported when two CREATE STATISTICS jobs
+// are issued concurrently. This is a sentinel error.
+var ConcurrentCreateStatsError error = concurrentCreateStatisticsError{}

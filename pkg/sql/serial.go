@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -19,12 +15,14 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // uniqueRowIDExpr is used as default expression when
@@ -84,7 +82,7 @@ func (p *planner) processSerialInColumnDef(
 
 	default:
 		return nil, nil, nil, nil,
-			pgerror.AssertionFailedf("unknown serial normalization mode: %s", serialNormalizationMode)
+			errors.AssertionFailedf("unknown serial normalization mode: %s", serialNormalizationMode)
 	}
 
 	// Clear the IsSerial bit now that it's been remapped.
@@ -134,7 +132,7 @@ func (p *planner) processSerialInColumnDef(
 
 	defaultExpr := &tree.FuncExpr{
 		Func:  tree.WrapFunction("nextval"),
-		Exprs: tree.Exprs{tree.NewStrVal(seqName.Table())},
+		Exprs: tree.Exprs{tree.NewStrVal(seqName.String())},
 	}
 
 	seqType := ""
@@ -188,7 +186,7 @@ func assertValidSerialColumnDef(d *tree.ColumnTableDef, tableName *ObjectName) e
 	if d.HasDefaultExpr() {
 		// SERIAL implies a new default expression, we can't have one to
 		// start with. This is the error produced by pg in such case.
-		return pgerror.Newf(pgerror.CodeSyntaxError,
+		return pgerror.Newf(pgcode.Syntax,
 			"multiple default values specified for column %q of table %q",
 			tree.ErrString(&d.Name), tree.ErrString(tableName))
 	}
@@ -196,14 +194,14 @@ func assertValidSerialColumnDef(d *tree.ColumnTableDef, tableName *ObjectName) e
 	if d.Nullable.Nullability == tree.Null {
 		// SERIAL implies a non-NULL column, we can't accept a nullability
 		// spec. This is the error produced by pg in such case.
-		return pgerror.Newf(pgerror.CodeSyntaxError,
+		return pgerror.Newf(pgcode.Syntax,
 			"conflicting NULL/NOT NULL declarations for column %q of table %q",
 			tree.ErrString(&d.Name), tree.ErrString(tableName))
 	}
 
 	if d.Computed.Expr != nil {
 		// SERIAL cannot be a computed column.
-		return pgerror.Newf(pgerror.CodeSyntaxError,
+		return pgerror.Newf(pgcode.Syntax,
 			"SERIAL column %q of table %q cannot be computed",
 			tree.ErrString(&d.Name), tree.ErrString(tableName))
 	}

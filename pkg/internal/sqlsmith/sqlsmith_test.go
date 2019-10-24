@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlsmith
 
@@ -19,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -34,11 +31,9 @@ var (
 	flagNum         = flag.Int("num", 100, "number of statements to generate")
 	flagNoMutations = flag.Bool("no-mutations", false, "disables mutations during testing")
 	flagNoWiths     = flag.Bool("no-withs", false, "disables WITHs during testing")
+	flagVec         = flag.Bool("vec", false, "attempt to generate vectorized-friendly queries")
+	flagCheckVec    = flag.Bool("check-vec", false, "fail if a generated statement cannot be vectorized")
 )
-
-func init() {
-	flag.Parse()
-}
 
 // TestGenerateParse verifies that statements produced by Generate can be
 // parsed. This is useful because since we make AST nodes directly we can
@@ -53,28 +48,6 @@ func TestGenerateParse(t *testing.T) {
 	rnd, _ := randutil.NewPseudoRand()
 
 	db := sqlutils.MakeSQLRunner(sqlDB)
-	db.Exec(t, `
-		CREATE TABLE t (
-			_bool bool,
-			_bytes bytes,
-			_date date,
-			_decimal decimal,
-			_float4 float4,
-			_float8 float8,
-			_inet inet,
-			_int4 int4,
-			_int8 int8,
-			_interval interval,
-			_jsonb jsonb,
-			_string string,
-			_time time,
-			_timestamp timestamp,
-			_timestamptz timestamptz,
-			_uuid uuid
-		);
-		INSERT INTO t DEFAULT VALUES;
-	`)
-
 	var opts []SmitherOption
 	if *flagNoMutations {
 		opts = append(opts, DisableMutations())
@@ -82,11 +55,18 @@ func TestGenerateParse(t *testing.T) {
 	if *flagNoWiths {
 		opts = append(opts, DisableWith())
 	}
+	if *flagVec {
+		opts = append(opts, Vectorizable())
+		db.Exec(t, VecSeedTable)
+	} else {
+		db.Exec(t, SeedTable)
+	}
 
-	smither, err := NewSmither(nil, rnd, opts...)
+	smither, err := NewSmither(sqlDB, rnd, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	seen := map[string]bool{}
 	for i := 0; i < *flagNum; i++ {
 		stmt := smither.Generate()
@@ -99,7 +79,36 @@ func TestGenerateParse(t *testing.T) {
 		}
 		stmt = prettyCfg.Pretty(parsed.AST)
 		fmt.Print("STMT: ", i, "\n", stmt, ";\n\n")
+		if *flagCheckVec {
+			if _, err := sqlDB.Exec(fmt.Sprintf("EXPLAIN (vec) %s", stmt)); err != nil {
+				es := err.Error()
+				ok := false
+				// It is hard to make queries that can always
+				// be vectorized. Hard code a list of error
+				// messages we are ok with.
+				for _, s := range []string{
+					// If the optimizer removes stuff due
+					// to something like a `WHERE false`,
+					// vec will fail with an error message
+					// like this. This is hard to fix
+					// because things like `WHERE true AND
+					// false` similarly remove rows but are
+					// harder to detect.
+					"num_rows:0",
+					"unsorted distinct",
+				} {
+					if strings.Contains(es, s) {
+						ok = true
+						break
+					}
+				}
+				if !ok {
+					t.Fatal(err)
+				}
+			}
+		}
 		if *flagExec {
+			db.Exec(t, `SET statement_timeout = '9s'`)
 			if _, err := sqlDB.Exec(stmt); err != nil {
 				es := err.Error()
 				if !seen[es] {

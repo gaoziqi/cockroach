@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -79,11 +75,12 @@ func TestDistBackfill(t *testing.T) {
 	)
 	// Split the table into multiple ranges.
 	descNumToStr := sqlbase.GetTableDescriptor(cdb, "test", "numtostr")
-	// SplitTable moves the right range, so we split things back to front
-	// in order to move less data.
+	var sps []SplitPoint
+	//for i := 1; i <= numNodes-1; i++ {
 	for i := numNodes - 1; i > 0; i-- {
-		SplitTable(t, tc, descNumToStr, i, n*n/numNodes*i)
+		sps = append(sps, SplitPoint{i, []interface{}{n * n / numNodes * i}})
 	}
+	SplitTable(t, tc, descNumToStr, sps)
 
 	db := tc.ServerConn(0)
 	db.SetMaxOpenConns(1)

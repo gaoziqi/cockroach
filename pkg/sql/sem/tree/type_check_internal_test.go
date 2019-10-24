@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -27,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func BenchmarkTypeCheck(b *testing.B) {
@@ -49,6 +46,7 @@ func BenchmarkTypeCheck(b *testing.B) {
 }
 
 func TestTypeCheckNormalize(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		expr     string
 		expected string
@@ -111,12 +109,12 @@ func exprs(fns ...copyableExpr) []copyableExpr {
 }
 func intConst(s string) copyableExpr {
 	return func() tree.Expr {
-		return &tree.NumVal{Value: constant.MakeFromLiteral(s, token.INT, 0), OrigString: s}
+		return tree.NewNumVal(constant.MakeFromLiteral(s, token.INT, 0), s, false /* negative */)
 	}
 }
 func decConst(s string) copyableExpr {
 	return func() tree.Expr {
-		return &tree.NumVal{Value: constant.MakeFromLiteral(s, token.FLOAT, 0), OrigString: s}
+		return tree.NewNumVal(constant.MakeFromLiteral(s, token.FLOAT, 0), s, false /* negative */)
 	}
 }
 func dint(i tree.DInt) copyableExpr {
@@ -208,6 +206,7 @@ func attemptTypeCheckSameTypedExprs(t *testing.T, idx int, test sameTypedExprsTe
 }
 
 func TestTypeCheckSameTypedExprs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for i, d := range []sameTypedExprsTestCase{
 		// Constants.
 		{nil, nil, exprs(intConst("1")), types.Int, nil},
@@ -269,6 +268,7 @@ func TestTypeCheckSameTypedExprs(t *testing.T) {
 }
 
 func TestTypeCheckSameTypedTupleExprs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for i, d := range []sameTypedExprsTestCase{
 		// // Constants.
 		{nil, nil, exprs(tuple(intConst("1"))), ttuple(types.Int), nil},
@@ -292,6 +292,7 @@ func TestTypeCheckSameTypedTupleExprs(t *testing.T) {
 		// Verify dealing with Null.
 		{nil, nil, exprs(tuple(intConst("1"), dnull), tuple(dnull, decConst("1"))), ttuple(types.Int, types.Decimal), nil},
 		{nil, nil, exprs(tuple(dint(1), dnull), tuple(dnull, ddecimal(1))), ttuple(types.Int, types.Decimal), nil},
+		{nil, nil, exprs(tuple(dint(1), dnull), dnull, tuple(dint(1), dnull), dnull), ttuple(types.Int, types.Unknown), nil},
 		// Verify desired type when possible.
 		{nil, ttuple(types.Int, types.Decimal), exprs(tuple(intConst("1"), intConst("1")), tuple(intConst("1"), intConst("1"))), ttuple(types.Int, types.Decimal), nil},
 		// Verify desired type when possible with unresolved constants.
@@ -302,6 +303,7 @@ func TestTypeCheckSameTypedTupleExprs(t *testing.T) {
 }
 
 func TestTypeCheckSameTypedExprsError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	decimalIntMismatchErr := `expected .* to be of type (decimal|int), found type (decimal|int)`
 	tupleFloatIntMismatchErr := `tuples .* are not the same type: ` + decimalIntMismatchErr
 	tupleIntMismatchErr := `expected .* to be of type (tuple|int), found type (tuple|int)`
@@ -352,6 +354,7 @@ func annot(p *tree.Placeholder, typ *types.T) tree.Expr {
 }
 
 func TestProcessPlaceholderAnnotations(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	intType := types.Int
 	boolType := types.Bool
 
@@ -529,6 +532,7 @@ func TestProcessPlaceholderAnnotations(t *testing.T) {
 }
 
 func TestProcessPlaceholderAnnotationsError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	intType := types.Int
 	floatType := types.Float
 

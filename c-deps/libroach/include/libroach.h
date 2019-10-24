@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #pragma once
 
@@ -276,6 +272,7 @@ DBStatus DBMergeOne(DBSlice existing, DBSlice update, DBString* new_value);
 // merged with existing. This method is provided for invocation from Go code.
 DBStatus DBPartialMergeOne(DBSlice existing, DBSlice update, DBString* new_value);
 
+
 // NB: The function (cStatsToGoStats) that converts these to the go
 // representation is unfortunately duplicated in engine and engineccl. If this
 // struct is changed, both places need to be updated.
@@ -298,8 +295,19 @@ typedef struct {
 
 MVCCStatsResult MVCCComputeStats(DBIterator* iter, DBKey start, DBKey end, int64_t now_nanos);
 
+// DBCheckForKeyCollisions runs both iterators in lockstep and errors out at the
+// first key collision, where a collision refers to any two MVCC keys with the
+// same user key, and with a different timestamp or value.
+//
+// An exception is made when the latest version of the colliding key is a
+// tombstone from an MVCC delete in the existing data. If the timestamp of the
+// SST key is greater than or equal to the timestamp of the tombstone, then it
+// is not considered a collision and we continue iteration from the next key in
+// the existing data.
+DBIterState DBCheckForKeyCollisions(DBIterator* existingIter, DBIterator* sstIter, MVCCStatsResult* skippedKVStats, DBString* write_intent);
+
 bool MVCCIsValidSplitKey(DBSlice key);
-DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey end, DBKey min_split,
+DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey min_split,
                           int64_t target_size, DBString* split_key);
 
 // DBTxn contains the fields from a roachpb.Transaction that are
@@ -465,6 +473,19 @@ DBStatus DBSstFileWriterAdd(DBSstFileWriter* fw, DBKey key, DBSlice val);
 // Adds a deletion tombstone to the sstable being built. See DBSstFileWriterAdd for more.
 DBStatus DBSstFileWriterDelete(DBSstFileWriter* fw, DBKey key);
 
+// Adds a range deletion tombstone to the sstable being built. This function
+// can be called at any time with respect to DBSstFileWriter{Put,Merge,Delete}
+// (I.E. does not have to be greater than any previously added entry). Range
+// deletion tombstones do not take precedence over other Puts in the same SST.
+// `Open` must have been called. `Close` cannot have been called.
+DBStatus DBSstFileWriterDeleteRange(DBSstFileWriter* fw, DBKey start, DBKey end);
+
+// Truncates the writer and stores the constructed file's contents in *data.
+// May be called multiple times. The returned data won't necessarily reflect
+// the latest writes, only the keys whose underlying RocksDB blocks have been
+// flushed. Close cannot have been called.
+DBStatus DBSstFileWriterTruncate(DBSstFileWriter *fw, DBString* data);
+
 // Finalizes the writer and stores the constructed file's contents in *data. At
 // least one kv entry must have been added. May only be called once.
 DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data);
@@ -514,6 +535,11 @@ DBStatus DBLockFile(DBSlice filename, DBFileLock* lock);
 // DBUnlockFile unlocks the file asscoiated with the specified lock and GCs any allocated memory for
 // the lock.
 DBStatus DBUnlockFile(DBFileLock lock);
+
+// DBExportToSst exports changes over the keyrange and time interval between the
+// start and end DBKeys to an SSTable using an IncrementalIterator.
+DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIterOptions iter_opts,
+                       DBEngine* engine, DBString* data, DBString* write_intent, DBString* summary);
 
 #ifdef __cplusplus
 }  // extern "C"

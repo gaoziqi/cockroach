@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -22,9 +18,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestParseColumnType(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		str          string
 		expectedType *types.T
@@ -48,7 +46,11 @@ func TestParseColumnType(t *testing.T) {
 		{"JSONB", types.Jsonb},
 		{"TIME", types.Time},
 		{"TIMESTAMP", types.Timestamp},
+		{"TIMESTAMP(0)", types.MakeTimestamp(0)},
+		{"TIMESTAMP(6)", types.MakeTimestamp(6)},
 		{"TIMESTAMPTZ", types.TimestampTZ},
+		{"TIMESTAMPTZ(0)", types.MakeTimestampTZ(0)},
+		{"TIMESTAMPTZ(6)", types.MakeTimestampTZ(6)},
 		{"INTERVAL", types.Interval},
 		{"STRING", types.String},
 		{"CHAR", types.MakeChar(1)},
@@ -90,6 +92,7 @@ func TestParseColumnType(t *testing.T) {
 }
 
 func TestParseColumnTypeAliases(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		str          string
 		expectedStr  string

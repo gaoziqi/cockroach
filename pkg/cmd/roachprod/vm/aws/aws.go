@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package aws
 
@@ -74,6 +69,7 @@ type providerOpts struct {
 
 	MachineType        string
 	SSDMachineType     string
+	CPUOptions         string
 	RemoteUserName     string
 	EBSVolumeType      string
 	EBSVolumeSize      int
@@ -129,6 +125,9 @@ func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&o.SSDMachineType, ProviderName+"-machine-type-ssd", defaultSSDMachineType,
 		"Machine type for --local-ssd (see https://aws.amazon.com/ec2/instance-types/)")
 
+	flags.StringVar(&o.CPUOptions, ProviderName+"-cpu-options", "",
+		"Options to specify number of cores and threads per core (see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-optimize-cpu.html#instance-specify-cpu-options)")
+
 	// AWS images generally use "ubuntu" or "ec2-user"
 	flags.StringVar(&o.RemoteUserName, ProviderName+"-user",
 		"ubuntu", "Name of the remote user to SSH as")
@@ -142,7 +141,7 @@ func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 			"-ebs-volume-type=io1")
 
 	flags.StringSliceVar(&o.CreateZones, ProviderName+"-zones", defaultCreateZones,
-		"aws availability zones to use for cluster creation, at most one zone per region will be used")
+		"aws availability zones to use for cluster creation, the cluster will be spread out evenly by region (if geo) and then by AZ within a region")
 }
 
 func (o *providerOpts) ConfigureClusterFlags(flags *pflag.FlagSet, _ vm.MultipleProjectsOption) {
@@ -222,28 +221,43 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 		return errors.Errorf("Please specify a valid region.")
 	}
 
-	// Only use one region if we're not creating a distributed cluster
+	var zones []string // contains an az corresponding to each entry in names
 	if !opts.GeoDistributed {
-		regions = []string{regions[0]}
-	}
-
-	// Choose a random availability zone for each region.
-	zones := make([]string, len(regions))
-	for i, region := range regions {
-		regionZones, err := p.regionZones(region, p.opts.CreateZones)
+		// Only use one zone in the region if we're not creating a geo cluster.
+		regionZones, err := p.regionZones(regions[0], p.opts.CreateZones)
 		if err != nil {
 			return err
 		}
-		zones[i] = regionZones[rand.Int31n(int32(len(regionZones)))]
+		// Select a random AZ from the first region.
+		zone := regionZones[rand.Intn(len(regionZones))]
+		for range names {
+			zones = append(zones, zone)
+		}
+	} else {
+		// Distribute the nodes amongst availability zones if geo distributed.
+		zonesPerRegion := len(names) / len(regions)
+		leftover := len(names) % len(regions)
+		for i, region := range regions {
+			regionZones, err := p.regionZones(region, p.opts.CreateZones)
+			if err != nil {
+				return err
+			}
+			totalZonesPerRegion := zonesPerRegion
+			if leftover > i {
+				totalZonesPerRegion++
+			}
+			for j := 0; j < totalZonesPerRegion; j++ {
+				zoneIndex := j % len(regionZones)
+				zones = append(zones, regionZones[zoneIndex])
+			}
+		}
 	}
-	nodeZones := vm.ZonePlacement(len(zones), len(names))
-
 	var g errgroup.Group
 	const rateLimit = 2 // per second
 	limiter := rate.NewLimiter(rateLimit, 2 /* buckets */)
 	for i := range names {
 		capName := names[i]
-		placement := zones[nodeZones[i]]
+		placement := zones[i]
 		res := limiter.Reserve()
 		g.Go(func() error {
 			time.Sleep(res.Delay())
@@ -587,6 +601,8 @@ func (p *Provider) runInstance(name string, zone string, opts vm.CreateOpts) err
 		machineType = p.opts.MachineType
 	}
 
+	cpuOptions := p.opts.CPUOptions
+
 	// We avoid the need to make a second call to set the tags by jamming
 	// all of our metadata into the TagSpec.
 	tagSpecs := fmt.Sprintf(
@@ -634,6 +650,9 @@ func (p *Provider) runInstance(name string, zone string, opts vm.CreateOpts) err
 		"--subnet-id", az.subnetID,
 		"--tag-specifications", tagSpecs,
 		"--user-data", "file://" + filename,
+	}
+	if cpuOptions != "" {
+		args = append(args, "--cpu-options", cpuOptions)
 	}
 
 	// The local NVMe devices are automatically mapped.  Otherwise, we need to map an EBS data volume.

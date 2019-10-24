@@ -5,13 +5,6 @@ CREATE TABLE abc (
     c FLOAT AS (a::float) STORED
 )
 ----
-TABLE abc
- ├── a int not null
- ├── b string
- ├── c float
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 exec-ddl
 ALTER TABLE abc INJECT STATISTICS '[
@@ -37,12 +30,6 @@ CREATE TABLE xyz (
     z FLOAT8
 )
 ----
-TABLE xyz
- ├── x string not null
- ├── y int not null
- ├── z float
- └── INDEX primary
-      └── x string not null
 
 # Statistics should be derived from input columns and transferred to RETURNING
 # columns.
@@ -60,7 +47,7 @@ WHERE y=10
 select
  ├── columns: x:1(string!null) y:2(int!null) z:3(float)
  ├── side-effects, mutations
- ├── stats: [rows=1, distinct(1)=0.999742533, null(1)=0, distinct(2)=1, null(2)=0]
+ ├── stats: [rows=1, distinct(2)=1, null(2)=0]
  ├── fd: ()-->(2)
  ├── upsert xyz
  │    ├── columns: x:1(string!null) y:2(int!null) z:3(float)
@@ -86,7 +73,7 @@ select
  │         │    ├── columns: column12:12(int!null) a:4(int!null) b:5(string!null) column8:8(float) x:9(string) y:10(int) z:11(float)
  │         │    ├── stats: [rows=200, distinct(5,9)=181.351171, null(5,9)=0, distinct(4,9,12)=200, null(4,9,12)=0]
  │         │    ├── fd: ()-->(5,8,12), (9)-->(10,11)
- │         │    ├── left-join
+ │         │    ├── left-join (hash)
  │         │    │    ├── columns: a:4(int!null) b:5(string!null) column8:8(float) x:9(string) y:10(int) z:11(float)
  │         │    │    ├── stats: [rows=200, distinct(9)=1, null(9)=0, distinct(4,9)=200, null(4,9)=0, distinct(5,9)=181.351171, null(5,9)=0]
  │         │    │    ├── fd: ()-->(5,8), (9)-->(10,11)
@@ -100,7 +87,7 @@ select
  │         │    │    │    │    ├── fd: ()-->(5)
  │         │    │    │    │    └── select
  │         │    │    │    │         ├── columns: a:4(int!null) b:5(string!null) c:6(float) rowid:7(int!null)
- │         │    │    │    │         ├── stats: [rows=200, distinct(4)=200, null(4)=0, distinct(5)=1, null(5)=0, distinct(7)=200, null(7)=0]
+ │         │    │    │    │         ├── stats: [rows=200, distinct(4)=200, null(4)=0, distinct(5)=1, null(5)=0]
  │         │    │    │    │         ├── key: (7)
  │         │    │    │    │         ├── fd: ()-->(5), (7)-->(4,6)
  │         │    │    │    │         ├── scan abc

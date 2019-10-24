@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -21,10 +17,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 // setVarNode represents a SET SESSION statement.
@@ -42,7 +40,7 @@ func (p *planner) SetVar(ctx context.Context, n *tree.SetVar) (planNode, error) 
 	if n.Name == "" {
 		// A client has sent the reserved internal syntax SET ROW ...,
 		// or the user entered `SET "" = foo`. Reject it.
-		return nil, pgerror.Newf(pgerror.CodeSyntaxError,
+		return nil, pgerror.Newf(pgcode.Syntax,
 			"invalid variable name: %q", n.Name)
 	}
 
@@ -162,9 +160,11 @@ func datumAsString(evalCtx *tree.EvalContext, name string, value tree.TypedExpr)
 	}
 	s, ok := tree.AsDString(val)
 	if !ok {
-		return "", pgerror.Newf(pgerror.CodeInvalidParameterValueError,
-			"parameter %q requires a string value", name).SetDetailf(
-			"%s is a %s", value, val.ResolvedType())
+		err = pgerror.Newf(pgcode.InvalidParameterValue,
+			"parameter %q requires a string value", name)
+		err = errors.WithDetailf(err,
+			"%s is a %s", value, errors.Safe(val.ResolvedType()))
+		return "", err
 	}
 	return string(s), nil
 }
@@ -183,9 +183,11 @@ func datumAsInt(evalCtx *tree.EvalContext, name string, value tree.TypedExpr) (i
 	}
 	iv, ok := tree.AsDInt(val)
 	if !ok {
-		return 0, pgerror.Newf(pgerror.CodeInvalidParameterValueError,
-			"parameter %q requires an integer value", name).SetDetailf(
-			"%s is a %s", value, val.ResolvedType())
+		err = pgerror.Newf(pgcode.InvalidParameterValue,
+			"parameter %q requires an integer value", name)
+		err = errors.WithDetailf(err,
+			"%s is a %s", value, errors.Safe(val.ResolvedType()))
+		return 0, err
 	}
 	return int64(iv), nil
 }
@@ -329,25 +331,26 @@ func intervalToDuration(interval *tree.DInterval) (time.Duration, error) {
 }
 
 func newSingleArgVarError(varName string) error {
-	return pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+	return pgerror.Newf(pgcode.InvalidParameterValue,
 		"SET %s takes only one argument", varName)
 }
 
 func wrapSetVarError(varName, actualValue string, fmt string, args ...interface{}) error {
-	return pgerror.Newf(pgerror.CodeInvalidParameterValueError,
-		"invalid value for parameter %q: %q", varName, actualValue).SetDetailf(fmt, args...)
+	err := pgerror.Newf(pgcode.InvalidParameterValue,
+		"invalid value for parameter %q: %q", varName, actualValue)
+	return errors.WithDetailf(err, fmt, args...)
 }
 
-func newVarValueError(varName, actualVal string, allowedVals ...string) *pgerror.Error {
-	err := pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+func newVarValueError(varName, actualVal string, allowedVals ...string) (err error) {
+	err = pgerror.Newf(pgcode.InvalidParameterValue,
 		"invalid value for parameter %q: %q", varName, actualVal)
 	if len(allowedVals) > 0 {
-		err = err.SetHintf("Available values: %s", strings.Join(allowedVals, ","))
+		err = errors.WithHintf(err, "Available values: %s", strings.Join(allowedVals, ","))
 	}
 	return err
 }
 
 func newCannotChangeParameterError(varName string) error {
-	return pgerror.Newf(pgerror.CodeCantChangeRuntimeParamError,
+	return pgerror.Newf(pgcode.CantChangeRuntimeParam,
 		"parameter %q cannot be changed", varName)
 }

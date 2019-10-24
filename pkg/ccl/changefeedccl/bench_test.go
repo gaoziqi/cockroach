@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -41,6 +42,15 @@ import (
 func BenchmarkChangefeedTicks(b *testing.B) {
 	defer leaktest.AfterTest(b)()
 	defer log.Scope(b).Close(b)
+
+	// In PR #38211, we removed the polling based data watcher in changefeeds in
+	// favor of RangeFeed. This benchmark worked by writing a bunch of data at
+	// certain timestamps and manipulating clocks at runtime so the polling
+	// grabbed a little of it at a time. There's fundamentally no way for this to
+	// work with RangeFeed without a rewrite, but it's not being used for anything
+	// right now, so the rewrite isn't worth it. We should fix this if we need to
+	// start doing changefeed perf work at some point.
+	b.Skip(`broken in #38211`)
 
 	ctx := context.Background()
 	s, sqlDBRaw, _ := serverutils.StartServer(b, base.TestServerArgs{UseDatabase: "d"})
@@ -196,7 +206,7 @@ func createBenchmarkChangefeed(
 		nil /* curCount */, nil /* maxHist */, math.MaxInt64, settings,
 	)
 	poller := makePoller(
-		settings, s.DB(), feedClock, s.Gossip(), spans, details, initialHighWater, buf,
+		settings, s.DB(), feedClock, s.GossipI().(*gossip.Gossip), spans, details, initialHighWater, buf,
 		leaseMgr, metrics, &mm,
 	)
 
@@ -208,11 +218,12 @@ func createBenchmarkChangefeed(
 		m:        th,
 	}
 	rowsFn := kvsToRows(s.LeaseManager().(*sql.LeaseManager), details, buf.Get)
+	sf := makeSpanFrontier(spans...)
 	tickFn := emitEntries(
-		s.ClusterSettings(), details, spans, encoder, sink, rowsFn, TestingKnobs{}, metrics)
+		s.ClusterSettings(), details, sf, encoder, sink, rowsFn, TestingKnobs{}, metrics)
 
 	ctx, cancel := context.WithCancel(ctx)
-	go func() { _ = poller.Run(ctx) }()
+	go func() { _ = poller.RunUsingRangefeeds(ctx) }()
 	go func() { _ = thUpdater.PollTableDescs(ctx) }()
 
 	errCh := make(chan error, 1)
@@ -267,6 +278,7 @@ func loadWorkloadBatches(sqlDB *gosql.DB, table workload.Table) ([]time.Time, in
 	var now time.Time
 	var timestamps []time.Time
 	var benchBytes int64
+	var numRows int
 
 	var insertStmtBuf bytes.Buffer
 	var params []interface{}
@@ -279,6 +291,7 @@ func loadWorkloadBatches(sqlDB *gosql.DB, table workload.Table) ([]time.Time, in
 		insertStmtBuf.Reset()
 		insertStmtBuf.WriteString(`INSERT INTO "` + table.Name + `" VALUES `)
 		for _, row := range table.InitialRows.BatchRows(batchIdx) {
+			numRows++
 			if len(params) != 0 {
 				insertStmtBuf.WriteString(`,`)
 			}
@@ -303,17 +316,14 @@ func loadWorkloadBatches(sqlDB *gosql.DB, table workload.Table) ([]time.Time, in
 		timestamps = append(timestamps, now)
 	}
 
-	if table.InitialRows.NumTotal != 0 {
-		var totalRows int
-		if err := sqlDB.QueryRow(
-			`SELECT count(*) FROM "` + table.Name + `"`,
-		).Scan(&totalRows); err != nil {
-			return nil, 0, err
-		}
-		if table.InitialRows.NumTotal != totalRows {
-			return nil, 0, errors.Errorf(`sanity check failed: expected %d rows got %d`,
-				table.InitialRows.NumTotal, totalRows)
-		}
+	var totalRows int
+	if err := sqlDB.QueryRow(
+		`SELECT count(*) FROM "` + table.Name + `"`,
+	).Scan(&totalRows); err != nil {
+		return nil, 0, err
+	}
+	if numRows != totalRows {
+		return nil, 0, errors.Errorf(`sanity check failed: expected %d rows got %d`, numRows, totalRows)
 	}
 
 	return timestamps, benchBytes, nil

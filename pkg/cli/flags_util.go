@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -28,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/keysutil"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
 	"github.com/pkg/errors"
@@ -41,7 +38,7 @@ var _ pflag.Value = &localityList{}
 // Type implements the pflag.Value interface.
 func (l *localityList) Type() string { return "localityList" }
 
-// String implements the pflag.Value interface.=
+// String implements the pflag.Value interface.
 func (l *localityList) String() string {
 	string := ""
 	for _, loc := range []roachpb.LocalityAddress(*l) {
@@ -51,7 +48,7 @@ func (l *localityList) String() string {
 	return string
 }
 
-// String implements the pflag.Value interface.
+// Set implements the pflag.Value interface.
 func (l *localityList) Set(value string) error {
 	*l = []roachpb.LocalityAddress{}
 
@@ -79,6 +76,35 @@ func (l *localityList) Set(value string) error {
 		*l = append(*l, locAddress)
 	}
 
+	return nil
+}
+
+// type used to implement parsing a list of localities for the cockroach demo command.
+type demoLocalityList []roachpb.Locality
+
+// Type implements the pflag.Value interface.
+func (l *demoLocalityList) Type() string { return "demoLocalityList" }
+
+// String implements the pflag.Value interface.
+func (l *demoLocalityList) String() string {
+	s := ""
+	for _, loc := range []roachpb.Locality(*l) {
+		s += loc.String()
+	}
+	return s
+}
+
+// Set implements the pflag.Value interface.
+func (l *demoLocalityList) Set(value string) error {
+	*l = []roachpb.Locality{}
+	locs := strings.Split(value, ":")
+	for _, value := range locs {
+		parsedLoc := &roachpb.Locality{}
+		if err := parsedLoc.Set(value); err != nil {
+			return err
+		}
+		*l = append(*l, *parsedLoc)
+	}
 	return nil
 }
 
@@ -189,7 +215,8 @@ func (k *mvccKey) Set(value string) error {
 		}
 		*k = mvccKey(engine.MakeMVCCMetadataKey(roachpb.Key(unquoted)))
 	case human:
-		key, err := keys.UglyPrint(keyStr)
+		scanner := keysutil.MakePrettyScanner(nil /* tableParser */)
+		key, err := scanner.Scan(keyStr)
 		if err != nil {
 			return err
 		}

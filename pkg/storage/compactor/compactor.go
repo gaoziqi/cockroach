@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package compactor
 
@@ -26,11 +22,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/logtags"
 	"github.com/pkg/errors"
 )
 
@@ -132,7 +128,7 @@ func (c *Compactor) Start(ctx context.Context, stopper *stop.Stopper) {
 					// A new suggestion was made. Examine the compaction queue,
 					// which returns the number of bytes queued.
 					if bytesQueued, err := c.examineQueue(ctx); err != nil {
-						log.Warningf(ctx, "failed check whether compaction suggestions exist: %s", err)
+						log.Warningf(ctx, "failed check whether compaction suggestions exist: %+v", err)
 					} else if bytesQueued > 0 {
 						log.VEventf(ctx, 3, "compactor starting in %s as there are suggested compactions pending", c.minInterval())
 					} else {
@@ -149,7 +145,7 @@ func (c *Compactor) Start(ctx context.Context, stopper *stop.Stopper) {
 					timer.Read = true
 					ok, err := c.processSuggestions(ctx)
 					if err != nil {
-						log.Warningf(ctx, "failed processing suggested compactions: %s", err)
+						log.Warningf(ctx, "failed processing suggested compactions: %+v", err)
 					}
 					if ok {
 						// The queue was processed, so either it's empty or contains suggestions
@@ -266,7 +262,7 @@ func (c *Compactor) processSuggestions(ctx context.Context) (bool, error) {
 		if done := c.aggregateCompaction(ctx, ssti, &aggr, sc); done {
 			processedBytes, err := c.processCompaction(ctx, aggr, capacity)
 			if err != nil {
-				log.Errorf(ctx, "failed processing suggested compactions %+v: %s", aggr, err)
+				log.Errorf(ctx, "failed processing suggested compactions %+v: %+v", aggr, err)
 			} else if err := updateBytesQueued(processedBytes); err != nil {
 				log.Errorf(ctx, "failed updating bytes queued metric %+v", err)
 			}
@@ -344,7 +340,7 @@ func (c *Compactor) fetchSuggestions(
 		return nil, 0, err
 	}
 	if err := delBatch.Commit(true); err != nil {
-		log.Warningf(ctx, "unable to delete suggested compaction records: %s", err)
+		log.Warningf(ctx, "unable to delete suggested compaction records: %+v", err)
 	}
 	return suggestions, totalBytes, nil
 }
@@ -412,7 +408,7 @@ func (c *Compactor) processCompaction(
 	}
 
 	if err := delBatch.Commit(true); err != nil {
-		log.Warningf(ctx, "unable to delete suggested compaction records: %s", err)
+		log.Warningf(ctx, "unable to delete suggested compaction records: %+v", err)
 	}
 	delBatch.Close()
 
@@ -511,7 +507,7 @@ func (c *Compactor) Suggest(ctx context.Context, sc storagepb.SuggestedCompactio
 	// Store the new compaction.
 	//lint:ignore SA1019 historical usage of deprecated engine.PutProto is OK
 	if _, _, err = engine.PutProto(c.eng, engine.MVCCKey{Key: key}, &sc.Compaction); err != nil {
-		log.Warningf(ctx, "unable to record suggested compaction: %s", err)
+		log.Warningf(ctx, "unable to record suggested compaction: %+v", err)
 	}
 
 	// Poke the compactor goroutine to reconsider compaction in light of

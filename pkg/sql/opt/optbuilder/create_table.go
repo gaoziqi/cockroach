@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
@@ -29,6 +25,7 @@ import (
 // buildCreateTable constructs a CreateTable operator based on the CREATE TABLE
 // statement.
 func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outScope *scope) {
+	b.DisableMemoReuse = true
 	sch, resName := b.resolveSchemaForCreate(&ct.Table)
 	// TODO(radu): we are modifying the AST in-place here. We should be storing
 	// the resolved name separately.
@@ -42,29 +39,46 @@ func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outSco
 	var input memo.RelExpr
 	var inputCols physical.Presentation
 	if ct.As() {
+		// The execution code might need to stringify the query to run it
+		// asynchronously. For that we need the data sources to be fully qualified.
+		// TODO(radu): this interaction is pretty hacky, investigate moving the
+		// generation of the string to the optimizer.
+		b.qualifyDataSourceNamesInAST = true
+		defer func() {
+			b.qualifyDataSourceNamesInAST = false
+		}()
+
 		// Build the input query.
 		outScope := b.buildSelect(ct.AsSource, nil /* desiredTypes */, inScope)
 
-		numColNames := len(ct.AsColumnNames)
+		numColNames := 0
+		for i := 0; i < len(ct.Defs); i++ {
+			if _, ok := ct.Defs[i].(*tree.ColumnTableDef); ok {
+				numColNames++
+			}
+		}
 		numColumns := len(outScope.cols)
 		if numColNames != 0 && numColNames != numColumns {
-			panic(builderError{sqlbase.NewSyntaxError(fmt.Sprintf(
+			panic(sqlbase.NewSyntaxError(fmt.Sprintf(
 				"CREATE TABLE specifies %d column name%s, but data source has %d column%s",
 				numColNames, util.Pluralize(int64(numColNames)),
-				numColumns, util.Pluralize(int64(numColumns))))})
+				numColumns, util.Pluralize(int64(numColumns)))))
 		}
 
-		// Synthesize rowid column, and append to end of column list.
-		props, overloads := builtins.GetBuiltinProperties("unique_rowid")
-		private := &memo.FunctionPrivate{
-			Name:       "unique_rowid",
-			Typ:        types.Int,
-			Properties: props,
-			Overload:   &overloads[0],
+		input = outScope.expr
+		if !ct.AsHasUserSpecifiedPrimaryKey() {
+			// Synthesize rowid column, and append to end of column list.
+			props, overloads := builtins.GetBuiltinProperties("unique_rowid")
+			private := &memo.FunctionPrivate{
+				Name:       "unique_rowid",
+				Typ:        types.Int,
+				Properties: props,
+				Overload:   &overloads[0],
+			}
+			fn := b.factory.ConstructFunction(memo.EmptyScalarListExpr, private)
+			scopeCol := b.synthesizeColumn(outScope, "rowid", types.Int, nil /* expr */, fn)
+			input = b.factory.CustomFuncs().ProjectExtraCol(outScope.expr, fn, scopeCol.id)
 		}
-		fn := b.factory.ConstructFunction(memo.EmptyScalarListExpr, private)
-		scopeCol := b.synthesizeColumn(outScope, "rowid", types.Int, nil /* expr */, fn)
-		input = b.factory.CustomFuncs().ProjectExtraCol(outScope.expr, fn, scopeCol.id)
 		inputCols = outScope.makePhysicalProps().Presentation
 	} else {
 		// Create dummy empty input.

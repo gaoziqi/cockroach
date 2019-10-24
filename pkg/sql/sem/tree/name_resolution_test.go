@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -25,9 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestClassifyTablePattern(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		in, out  string
 		expanded string
@@ -36,10 +34,10 @@ func TestClassifyTablePattern(t *testing.T) {
 		{`a`, `a`, `""."".a`, ``},
 		{`a.b`, `a.b`, `"".a.b`, ``},
 		{`a.b.c`, `a.b.c`, `a.b.c`, ``},
-		{`a.b.c.d`, ``, ``, `syntax error at or near "\."`},
+		{`a.b.c.d`, ``, ``, `at or near "\.": syntax error`},
 		{`a.""`, ``, ``, `invalid table name: a\.""`},
 		{`a.b.""`, ``, ``, `invalid table name: a\.b\.""`},
-		{`a.b.c.""`, ``, ``, `syntax error at or near "\."`},
+		{`a.b.c.""`, ``, ``, `at or near "\.": syntax error`},
 		{`a."".c`, ``, ``, `invalid table name: a\.""\.c`},
 		// CockroachDB extension: empty catalog name.
 		{`"".b.c`, `"".b.c`, `"".b.c`, ``},
@@ -53,10 +51,10 @@ func TestClassifyTablePattern(t *testing.T) {
 		{`*`, `*`, `""."".*`, ``},
 		{`a.*`, `a.*`, `"".a.*`, ``},
 		{`a.b.*`, `a.b.*`, `a.b.*`, ``},
-		{`a.b.c.*`, ``, ``, `syntax error at or near "\."`},
-		{`a.b.*.c`, ``, ``, `syntax error at or near "\."`},
-		{`a.*.b`, ``, ``, `syntax error at or near "\."`},
-		{`*.b`, ``, ``, `syntax error at or near "\."`},
+		{`a.b.c.*`, ``, ``, `at or near "\.": syntax error`},
+		{`a.b.*.c`, ``, ``, `at or near "\.": syntax error`},
+		{`a.*.b`, ``, ``, `at or near "\.": syntax error`},
+		{`*.b`, ``, ``, `at or near "\.": syntax error`},
 		{`"".*`, ``, ``, `invalid table name: "".\*`},
 		{`a."".*`, ``, ``, `invalid table name: a\.""\.\*`},
 		{`a.b."".*`, ``, ``, `invalid table name: a.b.""`},
@@ -68,7 +66,7 @@ func TestClassifyTablePattern(t *testing.T) {
 		{`"user".x.*`, `"user".x.*`, `"user".x.*`, ``},
 		{`x.user.*`, `x."user".*`, `x."user".*`, ``},
 
-		{`foo@bar`, ``, ``, `syntax error at or near "@"`},
+		{`foo@bar`, ``, ``, `at or near "@": syntax error`},
 	}
 
 	for _, tc := range testCases {
@@ -112,6 +110,7 @@ func TestClassifyTablePattern(t *testing.T) {
 }
 
 func TestClassifyColumnName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		in, out string
 		err     string
@@ -120,12 +119,12 @@ func TestClassifyColumnName(t *testing.T) {
 		{`a.b`, `a.b`, ``},
 		{`a.b.c`, `a.b.c`, ``},
 		{`a.b.c.d`, `a.b.c.d`, ``},
-		{`a.b.c.d.e`, ``, `syntax error at or near "\."`},
+		{`a.b.c.d.e`, ``, `at or near "\.": syntax error`},
 		{`""`, ``, `invalid column name: ""`},
 		{`a.""`, ``, `invalid column name: a\.""`},
 		{`a.b.""`, ``, `invalid column name: a\.b\.""`},
 		{`a.b.c.""`, ``, `invalid column name: a\.b\.c\.""`},
-		{`a.b.c.d.""`, ``, `syntax error at or near "\."`},
+		{`a.b.c.d.""`, ``, `at or near "\.": syntax error`},
 		{`"".a`, ``, `invalid column name: ""\.a`},
 		{`"".a.b`, ``, `invalid column name: ""\.a\.b`},
 		// CockroachDB extension: empty catalog name.
@@ -144,14 +143,14 @@ func TestClassifyColumnName(t *testing.T) {
 		{`a.*`, `a.*`, ``},
 		{`a.b.*`, `a.b.*`, ``},
 		{`a.b.c.*`, `a.b.c.*`, ``},
-		{`a.b.c.d.*`, ``, `syntax error at or near "\."`},
-		{`a.b.*.c`, ``, `syntax error at or near "\."`},
-		{`a.*.b`, ``, `syntax error at or near "\."`},
-		{`*.b`, ``, `syntax error at or near "\."`},
+		{`a.b.c.d.*`, ``, `at or near "\.": syntax error`},
+		{`a.b.*.c`, ``, `at or near "\.": syntax error`},
+		{`a.*.b`, ``, `at or near "\.": syntax error`},
+		{`*.b`, ``, `at or near "\.": syntax error`},
 		{`"".*`, ``, `invalid column name: "".\*`},
 		{`a."".*`, ``, `invalid column name: a\.""\.\*`},
 		{`a.b."".*`, ``, `invalid column name: a\.b\.""\.\*`},
-		{`a.b.c."".*`, ``, `syntax error at or near "\."`},
+		{`a.b.c."".*`, ``, `at or near "\.": syntax error`},
 
 		{`"".a.*`, ``, `invalid column name: ""\.a.*`},
 		// CockroachDB extension: empty catalog name.
@@ -164,7 +163,7 @@ func TestClassifyColumnName(t *testing.T) {
 		{`"user".x.*`, `"user".x.*`, ``},
 		{`x.user.*`, `x.user.*`, ``},
 
-		{`foo@bar`, ``, `syntax error at or near "@"`},
+		{`foo@bar`, ``, `at or near "@": syntax error`},
 	}
 
 	for _, tc := range testCases {
@@ -373,11 +372,13 @@ func (f *fakeSource) ResolveColumnItemTestResults(res tree.ColumnResolutionResul
 }
 
 func TestResolveQualifiedStar(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	f := &fakeSource{t: t}
 	sqlutils.RunResolveQualifiedStarTest(t, f)
 }
 
 func TestResolveColumnItem(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	f := &fakeSource{t: t}
 	sqlutils.RunResolveColumnItemTest(t, f)
 }
@@ -448,7 +449,7 @@ func (fakeResResult) NameResolutionResult() {}
 
 // LookupObject implements the TableNameResolver interface.
 func (f *fakeMetadata) LookupObject(
-	_ context.Context, requireMutable bool, dbName, scName, tbName string,
+	_ context.Context, lookupFlags tree.ObjectLookupFlags, dbName, scName, tbName string,
 ) (found bool, obMeta tree.NameResolutionResult, err error) {
 	defer func() {
 		f.t.Logf("LookupObject(%s, %s, %s) -> found %v meta %v err %v",
@@ -524,6 +525,7 @@ func newFakeMetadata() *fakeMetadata {
 }
 
 func TestResolveTablePatternOrName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	type spath = sessiondata.SearchPath
 
 	var mpath = func(args ...string) spath { return sessiondata.MakeSearchPath(args) }
@@ -719,7 +721,8 @@ func TestResolveTablePatternOrName(t *testing.T) {
 					ctPrefix = tpv.Catalog()
 				case *tree.TableName:
 					if tc.expected {
-						found, obMeta, err = tpv.ResolveExisting(ctx, fakeResolver, false /*requireMutable*/, tc.curDb, tc.searchPath)
+						flags := tree.ObjectLookupFlags{}
+						found, obMeta, err = tpv.ResolveExisting(ctx, fakeResolver, flags, tc.curDb, tc.searchPath)
 					} else {
 						found, scMeta, err = tpv.ResolveTarget(ctx, fakeResolver, tc.curDb, tc.searchPath)
 					}

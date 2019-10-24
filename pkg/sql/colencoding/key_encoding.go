@@ -1,28 +1,25 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package colencoding
 
 import (
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // DecodeIndexKeyToCols decodes an index key into the idx'th position of the
@@ -67,7 +64,8 @@ func DecodeIndexKeyToCols(
 			}
 
 			length := int(ancestor.SharedPrefixLen)
-			key, err = DecodeKeyValsToCols(vecs, idx, indexColIdx[:length], types[:length], colDirs[:length], key)
+			key, err = DecodeKeyValsToCols(vecs, idx, indexColIdx[:length], types[:length], colDirs[:length],
+				nil /* unseen */, key)
 			if err != nil {
 				return nil, false, err
 			}
@@ -98,7 +96,7 @@ func DecodeIndexKeyToCols(
 		}
 	}
 
-	key, err = DecodeKeyValsToCols(vecs, idx, indexColIdx, types, colDirs, key)
+	key, err = DecodeKeyValsToCols(vecs, idx, indexColIdx, types, colDirs, nil /* unseen */, key)
 	if err != nil {
 		return nil, false, err
 	}
@@ -119,6 +117,9 @@ func DecodeIndexKeyToCols(
 // result to the idx'th slot of the input slice of exec.ColVecs. If the
 // directions slice is nil, the direction used will default to
 // encoding.Ascending.
+// If the unseen int set is non-nil, upon decoding the column with ordinal i,
+// i will be removed from the set to facilitate tracking whether or not columns
+// have been observed during decoding.
 // See the analog in sqlbase/index_encoding.go.
 func DecodeKeyValsToCols(
 	vecs []coldata.Vec,
@@ -126,6 +127,7 @@ func DecodeKeyValsToCols(
 	indexColIdx []int,
 	types []types.T,
 	directions []sqlbase.IndexDescriptor_Direction,
+	unseen *util.FastIntSet,
 	key []byte,
 ) ([]byte, error) {
 	for j := range types {
@@ -139,6 +141,9 @@ func DecodeKeyValsToCols(
 			// Don't need the coldata - skip it.
 			key, err = skipTableKey(&types[j], key, enc)
 		} else {
+			if unseen != nil {
+				unseen.Remove(i)
+			}
 			key, err = decodeTableKeyToCol(vecs[i], idx, &types[j], key, enc)
 		}
 		if err != nil {
@@ -150,12 +155,12 @@ func DecodeKeyValsToCols(
 
 // decodeTableKeyToCol decodes a value encoded by EncodeTableKey, writing the result
 // to the idx'th slot of the input exec.Vec.
-// See the analog, DecodeTableKey, in
+// See the analog, DecodeTableKey, in sqlbase/column_type_encoding.go.
 func decodeTableKeyToCol(
 	vec coldata.Vec, idx uint16, valType *types.T, key []byte, dir sqlbase.IndexDescriptor_Direction,
 ) ([]byte, error) {
 	if (dir != sqlbase.IndexDescriptor_ASC) && (dir != sqlbase.IndexDescriptor_DESC) {
-		return nil, pgerror.AssertionFailedf("invalid direction: %d", log.Safe(dir))
+		return nil, errors.AssertionFailedf("invalid direction: %d", log.Safe(dir))
 	}
 	var isNull bool
 	if key, isNull = encoding.DecodeIfNull(key); isNull {
@@ -181,8 +186,6 @@ func decodeTableKeyToCol(
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
 		switch valType.Width() {
-		case 8:
-			vec.Int8()[idx] = int8(i)
 		case 16:
 			vec.Int16()[idx] = int16(i)
 		case 32:
@@ -213,8 +216,8 @@ func decodeTableKeyToCol(
 		} else {
 			rkey, r, err = encoding.DecodeBytesDescending(key, nil)
 		}
-		vec.Bytes()[idx] = r
-	case types.DateFamily:
+		vec.Bytes().Set(int(idx), r)
+	case types.DateFamily, types.OidFamily:
 		var t int64
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, t, err = encoding.DecodeVarintAscending(key)
@@ -223,7 +226,7 @@ func decodeTableKeyToCol(
 		}
 		vec.Int64()[idx] = t
 	default:
-		return rkey, pgerror.AssertionFailedf("unsupported type %+v", log.Safe(valType))
+		return rkey, errors.AssertionFailedf("unsupported type %+v", log.Safe(valType))
 	}
 	return rkey, err
 }
@@ -236,7 +239,7 @@ func skipTableKey(
 	valType *types.T, key []byte, dir sqlbase.IndexDescriptor_Direction,
 ) ([]byte, error) {
 	if (dir != sqlbase.IndexDescriptor_ASC) && (dir != sqlbase.IndexDescriptor_DESC) {
-		return nil, pgerror.AssertionFailedf("invalid direction: %d", log.Safe(dir))
+		return nil, errors.AssertionFailedf("invalid direction: %d", log.Safe(dir))
 	}
 	var isNull bool
 	if key, isNull = encoding.DecodeIfNull(key); isNull {
@@ -270,7 +273,7 @@ func skipTableKey(
 			rkey, _, err = encoding.DecodeDecimalDescending(key, nil)
 		}
 	default:
-		return key, pgerror.AssertionFailedf("unsupported type %+v", log.Safe(valType))
+		return key, errors.AssertionFailedf("unsupported type %+v", log.Safe(valType))
 	}
 	if err != nil {
 		return key, err
@@ -300,8 +303,6 @@ func UnmarshalColumnValueToCol(
 		var v int64
 		v, err = value.GetInt()
 		switch typ.Width() {
-		case 8:
-			vec.Int8()[idx] = int8(v)
 		case 16:
 			vec.Int16()[idx] = int16(v)
 		case 32:
@@ -320,13 +321,13 @@ func UnmarshalColumnValueToCol(
 	case types.BytesFamily, types.StringFamily:
 		var v []byte
 		v, err = value.GetBytes()
-		vec.Bytes()[idx] = v
+		vec.Bytes().Set(int(idx), v)
 	case types.DateFamily:
 		var v int64
 		v, err = value.GetInt()
 		vec.Int64()[idx] = v
 	default:
-		return pgerror.AssertionFailedf("unsupported column type: %s", log.Safe(typ.Family()))
+		return errors.AssertionFailedf("unsupported column type: %s", log.Safe(typ.Family()))
 	}
 	return err
 }

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package parser
 
@@ -19,6 +15,7 @@ import (
 	"go/constant"
 	"go/token"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 	"unsafe"
 
@@ -335,7 +332,7 @@ func (s *scanner) scan(lval *sqlSymType) {
 		switch s.peek() {
 		case '&': // &&
 			s.pos++
-			lval.id = INET_CONTAINS_OR_CONTAINED_BY
+			lval.id = AND_AND
 			return
 		}
 		return
@@ -544,7 +541,36 @@ func (s *scanner) scanIdent(lval *sqlSymType) {
 		lval.str = lex.NormalizeName(s.in[start:s.pos])
 	}
 
-	lval.id = lex.GetKeywordID(lval.str)
+	isExperimental := false
+	kw := lval.str
+	switch {
+	case strings.HasPrefix(lval.str, "experimental_"):
+		kw = lval.str[13:]
+		isExperimental = true
+	case strings.HasPrefix(lval.str, "testing_"):
+		kw = lval.str[8:]
+		isExperimental = true
+	}
+	lval.id = lex.GetKeywordID(kw)
+	if lval.id != lex.IDENT {
+		if isExperimental {
+			if _, ok := lex.AllowedExperimental[kw]; !ok {
+				// If the parsed token is not on the whitelisted set of keywords,
+				// then it might have been intended to be parsed as something else.
+				// In that case, re-tokenize the original string.
+				lval.id = lex.GetKeywordID(lval.str)
+			} else {
+				// It is a whitelisted keyword, so remember the shortened
+				// keyword for further processing.
+				lval.str = kw
+			}
+		}
+	} else {
+		// If the word after experimental_ or testing_ is an identifier,
+		// then we might have classified it incorrectly after removing the
+		// experimental_/testing_ prefix.
+		lval.id = lex.GetKeywordID(lval.str)
+	}
 }
 
 func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
@@ -616,7 +642,7 @@ func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
 			lval.str = fmt.Sprintf("could not make constant float from literal %q", lval.str)
 			return
 		}
-		lval.union.val = &tree.NumVal{Value: floatConst, OrigString: lval.str}
+		lval.union.val = tree.NewNumVal(floatConst, lval.str, false /* negative */)
 	} else {
 		if isHex && s.pos == start+2 {
 			lval.id = ERROR
@@ -641,7 +667,7 @@ func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
 			lval.str = fmt.Sprintf("could not make constant int from literal %q", lval.str)
 			return
 		}
-		lval.union.val = &tree.NumVal{Value: intConst, OrigString: lval.str}
+		lval.union.val = tree.NewNumVal(intConst, lval.str, false /* negative */)
 	}
 }
 

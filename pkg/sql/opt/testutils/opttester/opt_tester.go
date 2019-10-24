@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package opttester
 
@@ -22,6 +18,8 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,13 +38,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
-	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/pmezard/go-difflib/difflib"
 )
 
@@ -165,6 +164,10 @@ type Flags struct {
 	// SaveTablesPrefix specifies the prefix of the table to create or print
 	// for each subexpression in the query.
 	SaveTablesPrefix string
+
+	// File specifies the name of the file to import. This field is only used by
+	// the import command.
+	File string
 }
 
 // New constructs a new instance of the OptTester for the given SQL statement.
@@ -180,9 +183,8 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 
 	// Set any OptTester-wide session flags here.
 
-	// Enable zigzag joins for all opt tests. Execbuilder tests exercise
-	// cases where this flag is false.
 	ot.evalCtx.SessionData.ZigzagJoinEnabled = true
+	ot.evalCtx.SessionData.OptimizerFKs = true
 	ot.evalCtx.SessionData.ReorderJoinsLimit = opt.DefaultJoinOrderLimit
 
 	return ot
@@ -251,6 +253,14 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    target expression as a table. The name of this table must be provided
 //    with the table flag.
 //
+//  - import [flags]
+//
+//    Imports a file containing exec-ddl commands in order to add tables and/or
+//    stats to the catalog. This allows commonly-used schemas such as TPC-C or
+//    TPC-H to be used by multiple test files without copying the schemas and
+//    stats multiple times. The file name must be provided with the file flag.
+//    The path of the file should be relative to testutils/opttester/testdata.
+//
 // Supported flags:
 //
 //  - format: controls the formatting of expressions for build, opt, and
@@ -299,6 +309,9 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    Otherwise, outputs the name of the table that would be created for each
 //    subexpression.
 //
+//  - file: used to set the name of the file to be imported. This is used by
+//    the import command.
+//
 func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 	// Allow testcases to override the flags.
 	for _, a := range d.CmdArgs {
@@ -334,28 +347,36 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 	case "build":
 		e, err := ot.OptBuild()
 		if err != nil {
-			text := strings.TrimSpace(err.Error())
-			if pgerr, ok := pgerror.GetPGCause(err); ok {
+			if errors.HasAssertionFailure(err) {
+				d.Fatalf(tb, "%+v", err)
+			}
+			pgerr := pgerror.Flatten(err)
+			text := strings.TrimSpace(pgerr.Error())
+			if pgerr.Code != pgcode.Uncategorized {
 				// Output Postgres error code if it's available.
 				return fmt.Sprintf("error (%s): %s\n", pgerr.Code, text)
 			}
 			return fmt.Sprintf("error: %s\n", text)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat)
+		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
 
 	case "norm":
 		e, err := ot.OptNorm()
 		if err != nil {
-			text := strings.TrimSpace(err.Error())
-			if pgerr, ok := pgerror.GetPGCause(err); ok {
+			if errors.HasAssertionFailure(err) {
+				d.Fatalf(tb, "%+v", err)
+			}
+			pgerr := pgerror.Flatten(err)
+			text := strings.TrimSpace(pgerr.Error())
+			if pgerr.Code != pgcode.Uncategorized {
 				// Output Postgres error code if it's available.
 				return fmt.Sprintf("error (%s): %s\n", pgerr.Code, text)
 			}
 			return fmt.Sprintf("error: %s\n", text)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat)
+		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
 
 	case "opt":
 		e, err := ot.Optimize()
@@ -363,7 +384,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat)
+		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
 
 	case "optsteps":
 		result, err := ot.OptSteps()
@@ -399,7 +420,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat)
+		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
 
 	case "exprnorm":
 		e, err := ot.ExprNorm()
@@ -407,7 +428,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat)
+		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
 
 	case "save-tables":
 		e, err := ot.SaveTables()
@@ -415,7 +436,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat)
+		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
 
 	case "stats":
 		result, err := ot.Stats(d)
@@ -423,6 +444,10 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		return result
+
+	case "import":
+		ot.Import(tb)
+		return ""
 
 	default:
 		d.Fatalf(tb, "unsupported command: %s", d.Cmd)
@@ -588,7 +613,7 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 			if err != nil {
 				return fmt.Errorf("invalid colstat column %v", v)
 			}
-			cols.Add(col)
+			cols.Add(opt.ColumnID(col))
 		}
 		f.ColStats = append(f.ColStats, cols)
 
@@ -627,6 +652,12 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 			return fmt.Errorf("save-tables-prefix requires one argument")
 		}
 		f.SaveTablesPrefix = arg.Vals[0]
+
+	case "file":
+		if len(arg.Vals) != 1 {
+			return fmt.Errorf("file requires one argument")
+		}
+		f.File = arg.Vals[0]
 
 	default:
 		return fmt.Errorf("unknown argument: %s", arg.Key)
@@ -849,7 +880,7 @@ func (ot *OptTester) OptSteps() (string, error) {
 			return "", err
 		}
 
-		next = memo.FormatExpr(os.Root(), ot.Flags.ExprFormat)
+		next = memo.FormatExpr(os.Root(), ot.Flags.ExprFormat, ot.catalog)
 
 		// This call comes after setting "next", because we want to output the
 		// final expression, even though there were no diffs from the previous
@@ -982,14 +1013,14 @@ func (ot *OptTester) ExploreTrace() (string, error) {
 		ot.output("%s\n", et.LastRuleName())
 		ot.separator("=")
 		ot.output("Source expression:\n")
-		ot.indent(memo.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat))
+		ot.indent(memo.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat, ot.catalog))
 		newNodes := et.NewExprs()
 		if len(newNodes) == 0 {
 			ot.output("\nNo new expressions.\n")
 		}
 		for i := range newNodes {
 			ot.output("\nNew expression %d of %d:\n", i+1, len(newNodes))
-			ot.indent(memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat))
+			ot.indent(memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat, ot.catalog))
 		}
 	}
 	return ot.builder.String(), nil
@@ -1007,6 +1038,23 @@ func (ot *OptTester) Stats(d *datadriven.TestData) (string, error) {
 
 	st := statsTester{}
 	return st.testStats(catalog, d, ot.Flags.Table)
+}
+
+// Import imports a file containing exec-ddl commands in order to add tables
+// and/or stats to the catalog. This allows commonly-used schemas such as
+// TPC-C or TPC-H to be used by multiple test files without copying the schemas
+// and stats multiple times.
+func (ot *OptTester) Import(tb testing.TB) {
+	// Find the file to be imported in opttester/testdata.
+	_, optTesterFile, _, ok := runtime.Caller(1)
+	if !ok {
+		tb.Fatalf("unable to find file %s", ot.Flags.File)
+	}
+	path := filepath.Join(filepath.Dir(optTesterFile), "testdata", ot.Flags.File)
+	datadriven.RunTest(tb.(*testing.T), path, func(d *datadriven.TestData) string {
+		tester := New(ot.catalog, d.Input)
+		return tester.RunCommand(tb.(*testing.T), d)
+	})
 }
 
 // SaveTables optimizes the given query and saves the subexpressions as tables
@@ -1037,11 +1085,10 @@ func (ot *OptTester) SaveTables() (opt.Expr, error) {
 			if err != nil {
 				return err
 			}
-
-			for i, n := 0, r.ChildCount(); i < n; i++ {
-				if err := traverse(r.Child(i)); err != nil {
-					return err
-				}
+		}
+		for i, n := 0, e.ChildCount(); i < n; i++ {
+			if err := traverse(e.Child(i)); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -1109,8 +1156,8 @@ func (ot *OptTester) createTableAs(name tree.TableName, rel memo.RelExpr) (*test
 	}
 
 	relProps := rel.Relational()
-	pres := rel.RequiredPhysical().Presentation
 	outputCols := relProps.OutputCols
+	colNameGen := memo.NewColumnNameGenerator(rel)
 
 	// Create each of the columns and their estimated stats for the test catalog
 	// table.
@@ -1118,17 +1165,8 @@ func (ot *OptTester) createTableAs(name tree.TableName, rel memo.RelExpr) (*test
 	jsonStats := make([]stats.JSONStatistic, outputCols.Len())
 	i := 0
 	for col, ok := outputCols.Next(0); ok; col, ok = outputCols.Next(col + 1) {
-		colMeta := rel.Memo().Metadata().ColumnMeta(opt.ColumnID(col))
-		colName := colMeta.Alias
-
-		// Check whether the presentation has a different name for this column, and
-		// use it if available.
-		for j := range pres {
-			if pres[j].ID == opt.ColumnID(col) {
-				colName = pres[j].Alias
-				break
-			}
-		}
+		colMeta := rel.Memo().Metadata().ColumnMeta(col)
+		colName := colNameGen.GenerateName(col)
 
 		columns[i] = &testcat.Column{
 			Ordinal:  i,
@@ -1139,7 +1177,7 @@ func (ot *OptTester) createTableAs(name tree.TableName, rel memo.RelExpr) (*test
 		}
 
 		// Make sure we have estimated stats for this column.
-		colSet := util.MakeFastIntSet(col)
+		colSet := opt.MakeColSet(col)
 		memo.RequestColStat(&ot.evalCtx, rel, colSet)
 		stat, ok := relProps.Stats.ColStats.Lookup(colSet)
 		if !ok {

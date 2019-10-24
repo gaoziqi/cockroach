@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -60,9 +55,9 @@ func TestSnapshotRaftLogLimit(t *testing.T) {
 		bytesWritten += int64(len(blob))
 	}
 
-	for _, snapType := range []string{snapTypePreemptive, snapTypeRaft} {
-		t.Run(snapType, func(t *testing.T) {
-			lastIndex, err := (*replicaRaftStorage)(repl).LastIndex()
+	for _, snapType := range []SnapshotRequest_Type{SnapshotRequest_PREEMPTIVE, SnapshotRequest_RAFT} {
+		t.Run(snapType.String(), func(t *testing.T) {
+			lastIndex, err := repl.GetLastIndex()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -94,9 +89,9 @@ func TestSnapshotRaftLogLimit(t *testing.T) {
 			}
 
 			err = ss.Send(ctx, stream, header, outSnap)
-			if snapType == snapTypePreemptive {
+			if snapType == SnapshotRequest_PREEMPTIVE {
 				if !testutils.IsError(err, "aborting snapshot because raft log is too large") {
-					t.Fatalf("unexpected error: %v", err)
+					t.Fatalf("unexpected error: %+v", err)
 				}
 			} else {
 				if err != nil {
@@ -119,7 +114,7 @@ func TestSnapshotPreemptiveOnUninitializedReplica(t *testing.T) {
 	store, _ := createTestStore(t, testStoreOpts{}, stopper)
 
 	// Create an uninitialized replica.
-	repl, created, err := store.getOrCreateReplica(ctx, 77, 1, nil)
+	repl, created, err := store.getOrCreateReplica(ctx, 77, 1, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +135,7 @@ func TestSnapshotPreemptiveOnUninitializedReplica(t *testing.T) {
 		t.Fatal("mock snapshot isn't preemptive")
 	}
 
-	if _, err := store.canApplySnapshot(
+	if _, err := store.canApplyPreemptiveSnapshot(
 		ctx, header, true, /* authoritative */
 	); !testutils.IsError(err, "intersects existing range") {
 		t.Fatal(err)

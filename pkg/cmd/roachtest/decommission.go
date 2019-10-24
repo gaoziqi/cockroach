@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -239,7 +234,7 @@ func runDecommission(t *test, c *cluster, nodes int, duration time.Duration) {
 	}
 }
 
-func registerDecommission(r *registry) {
+func registerDecommission(r *testRegistry) {
 	const numNodes = 4
 	duration := time.Hour
 
@@ -285,6 +280,15 @@ func runDecommissionAcceptance(ctx context.Context, t *test, c *cluster) {
 			args = append(args, strconv.Itoa(target))
 		}
 		return execCLI(ctx, t, c, runNode, args...)
+	}
+
+	getCsvNumCols := func(csvStr string) (cols int, err error) {
+		reader := csv.NewReader(strings.NewReader(csvStr))
+		records, err := reader.Read()
+		if err != nil {
+			return 0, errors.Errorf("error reading csv input: \n %v\n errors:%s", csvStr, err)
+		}
+		return len(records), nil
 	}
 
 	matchCSV := func(csvStr string, matchColRow [][]string) (err error) {
@@ -335,9 +339,47 @@ func runDecommissionAcceptance(ctx context.Context, t *test, c *cluster) {
 		"No more data reported on target nodes. " +
 			"Please verify cluster health before removing the nodes.",
 	}
-	statusHeader := []string{
+
+	// Different output here to be backwards compatible with earlier
+	// versions of cockroach (versions pre commit 888813c, which
+	// extends the node status command to include locality information).
+	statusHeaderWithLocality := []string{
+		"id", "address", "sql_address", "build", "started_at", "updated_at", "locality", "is_available", "is_live",
+	}
+	statusHeaderNoLocality := []string{
+		"id", "address", "sql_address", "build", "started_at", "updated_at", "is_available", "is_live",
+	}
+	statusHeaderNoLocalityNoSQLAddress := []string{
 		"id", "address", "build", "started_at", "updated_at", "is_available", "is_live",
 	}
+	getStatusCsvOutput := func(ids []string, numCols int) [][]string {
+		var res [][]string
+		switch numCols {
+		case len(statusHeaderNoLocality):
+			res = append(res, statusHeaderNoLocality)
+		case len(statusHeaderWithLocality):
+			res = append(res, statusHeaderWithLocality)
+		case len(statusHeaderNoLocalityNoSQLAddress):
+			res = append(res, statusHeaderNoLocalityNoSQLAddress)
+		default:
+			t.Fatalf(
+				"Expected status output numCols to be either %d, %d or %d, found %d",
+				len(statusHeaderNoLocalityNoSQLAddress),
+				len(statusHeaderNoLocality),
+				len(statusHeaderWithLocality),
+				numCols,
+			)
+		}
+		for _, id := range ids {
+			build := []string{id}
+			for i := 0; i < numCols-1; i++ {
+				build = append(build, `.*`)
+			}
+			res = append(res, build)
+		}
+		return res
+	}
+
 	waitLiveDeprecated := "--wait=live is deprecated and is treated as --wait=all"
 
 	t.l.Printf("decommissioning first node from the second, polling the status manually\n")
@@ -388,13 +430,11 @@ func runDecommissionAcceptance(ctx context.Context, t *test, c *cluster) {
 		if err != nil {
 			t.Fatalf("node-status failed: %v", err)
 		}
-		exp := [][]string{
-			statusHeader,
-			{`1`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
-			{`2`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
-			{`3`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
-			{`4`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
+		numCols, err := getCsvNumCols(o)
+		if err != nil {
+			t.Fatal(err)
 		}
+		exp := getStatusCsvOutput([]string{`1`, `2`, `3`, `4`}, numCols)
 		if err := matchCSV(o, exp); err != nil {
 			t.Fatal(err)
 		}
@@ -457,8 +497,11 @@ func runDecommissionAcceptance(ctx context.Context, t *test, c *cluster) {
 		exp := [][]string{
 			decommissionHeader,
 			// Expect the same as usual, except this time the node should be draining
-			// because it shut down cleanly (thanks to `quit --decommission`).
-			{"3", "true", "0", "true", "true"},
+			// because it shut down cleanly (thanks to `quit --decommission`). It turns
+			// out that while it will always manage to mark itself as draining during a
+			// graceful shutdown, gossip may not yet have told this node. It's rare,
+			// but seems to happen (#41249).
+			{"3", "true", "0", "true", "true|false"},
 			decommissionFooter,
 		}
 		if err := matchCSV(o, exp); err != nil {
@@ -581,13 +624,11 @@ func runDecommissionAcceptance(ctx context.Context, t *test, c *cluster) {
 		if err != nil {
 			t.Fatalf("node-status failed: %v", err)
 		}
-
-		exp := [][]string{
-			statusHeader,
-			{`2`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
-			{`3`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
-			{`4`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
+		numCols, err := getCsvNumCols(o)
+		if err != nil {
+			t.Fatal(err)
 		}
+		exp := getStatusCsvOutput([]string{`2`, `3`, `4`}, numCols)
 		if err := matchCSV(o, exp); err != nil {
 			time.Sleep(time.Second)
 			continue
@@ -610,14 +651,11 @@ func runDecommissionAcceptance(ctx context.Context, t *test, c *cluster) {
 		if err != nil {
 			t.Fatalf("node-status failed: %v", err)
 		}
-
-		exp := [][]string{
-			statusHeader,
-			{`2`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
-			{`3`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
-			{`4`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
-			{`5`, `.*`, `.*`, `.*`, `.*`, `.*`, `.*`},
+		numCols, err := getCsvNumCols(o)
+		if err != nil {
+			t.Fatal(err)
 		}
+		exp := getStatusCsvOutput([]string{`2`, `3`, `4`, `5`}, numCols)
 		return matchCSV(o, exp)
 	}); err != nil {
 		t.Fatal(err)

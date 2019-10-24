@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -37,7 +32,7 @@ import (
 //
 // Once DistSQL queries provide more testing knobs, these tests can likely be
 // replaced with unit tests.
-func registerCancel(r *registry) {
+func registerCancel(r *testRegistry) {
 	runCancel := func(ctx context.Context, t *test, c *cluster,
 		queries []string, warehouses int, useDistsql bool) {
 		c.Put(ctx, cockroach, "./cockroach", c.All())
@@ -61,8 +56,8 @@ func registerCancel(r *registry) {
 			t.Status("running queries to cancel")
 			for _, q := range queries {
 				sem := make(chan struct{}, 1)
-				go func() {
-					fmt.Printf("executing \"%s\"\n", q)
+				go func(q string) {
+					t.l.Printf("executing \"%s\"\n", q)
 					sem <- struct{}{}
 					_, err := conn.Exec(queryPrefix + q)
 					if err == nil {
@@ -72,7 +67,7 @@ func registerCancel(r *registry) {
 						fmt.Printf("query failed with error: %s\n", err)
 					}
 					sem <- struct{}{}
-				}()
+				}(q)
 
 				<-sem
 

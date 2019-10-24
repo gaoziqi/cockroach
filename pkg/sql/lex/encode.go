@@ -7,17 +7,13 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code was derived from https://github.com/youtube/vitess.
 
@@ -30,9 +26,11 @@ import (
 	"fmt"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/stringencoding"
+	"github.com/cockroachdb/errors"
 )
 
 var mustQuoteMap = map[byte]bool{
@@ -142,7 +140,7 @@ func EncodeUnrestrictedSQLIdent(buf *bytes.Buffer, s string, flags EncodeFlags) 
 		buf.WriteString(s)
 		return
 	}
-	encodeEscapedSQLIdent(buf, s)
+	EncodeEscapedSQLIdent(buf, s)
 }
 
 // EncodeRestrictedSQLIdent writes the identifier in s to buf. The
@@ -154,13 +152,13 @@ func EncodeRestrictedSQLIdent(buf *bytes.Buffer, s string, flags EncodeFlags) {
 		buf.WriteString(s)
 		return
 	}
-	encodeEscapedSQLIdent(buf, s)
+	EncodeEscapedSQLIdent(buf, s)
 }
 
-// encodeEscapedSQLIdent writes the identifier in s to buf. The
+// EncodeEscapedSQLIdent writes the identifier in s to buf. The
 // identifier is always quoted. Double quotes inside the identifier
 // are escaped.
-func encodeEscapedSQLIdent(buf *bytes.Buffer, s string) {
+func EncodeEscapedSQLIdent(buf *bytes.Buffer, s string) {
 	buf.WriteByte('"')
 	start := 0
 	for i, n := 0, len(s); i < n; i++ {
@@ -307,7 +305,7 @@ func DecodeRawBytesToByteArray(data string, be sessiondata.BytesEncodeFormat) ([
 				continue
 			}
 			if i >= len(data)-1 {
-				return nil, pgerror.New(pgerror.CodeInvalidEscapeSequenceError,
+				return nil, pgerror.New(pgcode.InvalidEscapeSequence,
 					"bytea encoded value ends with escape character")
 			}
 			if data[i+1] == '\\' {
@@ -316,14 +314,14 @@ func DecodeRawBytesToByteArray(data string, be sessiondata.BytesEncodeFormat) ([
 				continue
 			}
 			if i+3 >= len(data) {
-				return nil, pgerror.New(pgerror.CodeInvalidEscapeSequenceError,
+				return nil, pgerror.New(pgcode.InvalidEscapeSequence,
 					"bytea encoded value ends with incomplete escape sequence")
 			}
 			b := byte(0)
 			for j := 1; j <= 3; j++ {
 				octDigit := data[i+j]
 				if octDigit < '0' || octDigit > '7' {
-					return nil, pgerror.New(pgerror.CodeInvalidEscapeSequenceError,
+					return nil, pgerror.New(pgcode.InvalidEscapeSequence,
 						"invalid bytea escape sequence")
 				}
 				b = (b << 3) | (octDigit - '0')
@@ -337,7 +335,7 @@ func DecodeRawBytesToByteArray(data string, be sessiondata.BytesEncodeFormat) ([
 		return base64.StdEncoding.DecodeString(data)
 
 	default:
-		return nil, pgerror.AssertionFailedf("unhandled format: %s", be)
+		return nil, errors.AssertionFailedf("unhandled format: %s", be)
 	}
 }
 

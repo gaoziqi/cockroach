@@ -1,22 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -26,7 +23,7 @@ import (
 func (b *Builder) buildExplain(explain *tree.Explain, inScope *scope) (outScope *scope) {
 	opts, err := explain.ParseOptions()
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
 
 	// We don't allow the statement under Explain to reference outer columns, so we
@@ -52,7 +49,7 @@ func (b *Builder) buildExplain(explain *tree.Explain, inScope *scope) (outScope 
 			telemetry.Inc(sqltelemetry.ExplainDistSQLUseCounter)
 		}
 		if analyze && tree.IsStmtParallelized(explain.Statement) {
-			panic(pgerror.Newf(pgerror.CodeFeatureNotSupportedError,
+			panic(pgerror.Newf(pgcode.FeatureNotSupported,
 				"EXPLAIN ANALYZE does not support RETURNING NOTHING statements"))
 		}
 		cols = sqlbase.ExplainDistSQLColumns
@@ -65,8 +62,12 @@ func (b *Builder) buildExplain(explain *tree.Explain, inScope *scope) (outScope 
 		}
 		cols = sqlbase.ExplainOptColumns
 
+	case tree.ExplainVec:
+		telemetry.Inc(sqltelemetry.ExplainVecUseCounter)
+		cols = sqlbase.ExplainVecColumns
+
 	default:
-		panic(pgerror.Newf(pgerror.CodeFeatureNotSupportedError,
+		panic(pgerror.Newf(pgcode.FeatureNotSupported,
 			"EXPLAIN ANALYZE does not support RETURNING NOTHING statements"))
 	}
 	b.synthesizeResultColumns(outScope, cols)

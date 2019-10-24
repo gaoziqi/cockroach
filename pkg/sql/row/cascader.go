@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package row
 
@@ -20,12 +16,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // cascader is used to handle all referential integrity cascading actions.
@@ -59,31 +58,29 @@ func makeDeleteCascader(
 	alloc *sqlbase.DatumAlloc,
 ) (*cascader, error) {
 	if evalCtx == nil {
-		return nil, pgerror.AssertionFailedf("evalContext is nil")
+		return nil, errors.AssertionFailedf("evalContext is nil")
 	}
 	var required bool
-Outer:
-	for _, referencedIndex := range table.AllNonDropIndexes() {
-		for _, ref := range referencedIndex.ReferencedBy {
-			referencingTable, ok := tablesByID[ref.Table]
-			if !ok {
-				return nil, pgerror.AssertionFailedf("could not find table:%d in table descriptor map", ref.Table)
-			}
-			if referencingTable.IsAdding {
-				// We can assume that a table being added but not yet public is empty,
-				// and thus does not need to be checked for cascading.
-				continue
-			}
-			referencingIndex, err := referencingTable.Desc.FindIndexByID(ref.Index)
-			if err != nil {
-				return nil, err
-			}
-			if referencingIndex.ForeignKey.OnDelete == sqlbase.ForeignKeyReference_CASCADE ||
-				referencingIndex.ForeignKey.OnDelete == sqlbase.ForeignKeyReference_SET_DEFAULT ||
-				referencingIndex.ForeignKey.OnDelete == sqlbase.ForeignKeyReference_SET_NULL {
-				required = true
-				break Outer
-			}
+	for i := range table.InboundFKs {
+		ref := &table.InboundFKs[i]
+		referencingTable, ok := tablesByID[ref.OriginTableID]
+		if !ok {
+			return nil, errors.AssertionFailedf("could not find table:%d in table descriptor map", ref.OriginTableID)
+		}
+		if referencingTable.IsAdding {
+			// We can assume that a table being added but not yet public is empty,
+			// and thus does not need to be checked for cascading.
+			continue
+		}
+		foundFK, err := referencingTable.Desc.FindFKForBackRef(table.ID, ref)
+		if err != nil {
+			return nil, err
+		}
+		if foundFK.OnDelete == sqlbase.ForeignKeyReference_CASCADE ||
+			foundFK.OnDelete == sqlbase.ForeignKeyReference_SET_DEFAULT ||
+			foundFK.OnDelete == sqlbase.ForeignKeyReference_SET_NULL {
+			required = true
+			break
 		}
 	}
 	if !required {
@@ -116,17 +113,17 @@ func makeUpdateCascader(
 	alloc *sqlbase.DatumAlloc,
 ) (*cascader, error) {
 	if evalCtx == nil {
-		return nil, pgerror.AssertionFailedf("evalContext is nil")
+		return nil, errors.AssertionFailedf("evalContext is nil")
 	}
 	var required bool
 	colIDs := make(map[sqlbase.ColumnID]struct{})
 	for i := range updateCols {
 		colIDs[updateCols[i].ID] = struct{}{}
 	}
-Outer:
-	for _, referencedIndex := range table.AllNonDropIndexes() {
+	for i := range table.InboundFKs {
+		ref := &table.InboundFKs[i]
 		var match bool
-		for _, colID := range referencedIndex.ColumnIDs {
+		for _, colID := range ref.ReferencedColumnIDs {
 			if _, exists := colIDs[colID]; exists {
 				match = true
 				break
@@ -135,26 +132,24 @@ Outer:
 		if !match {
 			continue
 		}
-		for _, ref := range referencedIndex.ReferencedBy {
-			referencingTable, ok := tablesByID[ref.Table]
-			if !ok {
-				return nil, pgerror.AssertionFailedf("could not find table:%d in table descriptor map", ref.Table)
-			}
-			if referencingTable.IsAdding {
-				// We can assume that a table being added but not yet public is empty,
-				// and thus does not need to be checked for cascading.
-				continue
-			}
-			referencingIndex, err := referencingTable.Desc.FindIndexByID(ref.Index)
-			if err != nil {
-				return nil, err
-			}
-			if referencingIndex.ForeignKey.OnUpdate == sqlbase.ForeignKeyReference_CASCADE ||
-				referencingIndex.ForeignKey.OnUpdate == sqlbase.ForeignKeyReference_SET_DEFAULT ||
-				referencingIndex.ForeignKey.OnUpdate == sqlbase.ForeignKeyReference_SET_NULL {
-				required = true
-				break Outer
-			}
+		referencingTable, ok := tablesByID[ref.OriginTableID]
+		if !ok {
+			return nil, errors.AssertionFailedf("could not find table:%d in table descriptor map", ref.OriginTableID)
+		}
+		if referencingTable.IsAdding {
+			// We can assume that a table being added but not yet public is empty,
+			// and thus does not need to be checked for cascading.
+			continue
+		}
+		foundFK, err := referencingTable.Desc.FindFKForBackRef(table.ID, ref)
+		if err != nil {
+			return nil, err
+		}
+		if foundFK.OnUpdate == sqlbase.ForeignKeyReference_CASCADE ||
+			foundFK.OnUpdate == sqlbase.ForeignKeyReference_SET_DEFAULT ||
+			foundFK.OnUpdate == sqlbase.ForeignKeyReference_SET_NULL {
+			required = true
+			break
 		}
 	}
 	if !required {
@@ -219,7 +214,7 @@ func spanForIndexValues(
 			}
 			if nulls && notNulls {
 				// TODO(bram): expand this error to show more details.
-				return roachpb.Span{}, pgerror.Newf(pgerror.CodeForeignKeyViolationError,
+				return roachpb.Span{}, pgerror.Newf(pgcode.ForeignKeyViolation,
 					"foreign key violation: MATCH FULL does not allow mixing of null and nonnull values %s",
 					values,
 				)
@@ -232,10 +227,10 @@ func spanForIndexValues(
 		}
 
 	case sqlbase.ForeignKeyReference_PARTIAL:
-		return roachpb.Span{}, pgerror.UnimplementedWithIssue(20305, "MATCH PARTIAL not supported")
+		return roachpb.Span{}, unimplemented.NewWithIssue(20305, "MATCH PARTIAL not supported")
 
 	default:
-		return roachpb.Span{}, pgerror.AssertionFailedf("unknown composite key match type: %v", match)
+		return roachpb.Span{}, errors.AssertionFailedf("unknown composite key match type: %v", match)
 	}
 	span, _, err := sqlbase.EncodePartialIndexSpan(table.TableDesc(), index, prefixLen, indexColIDs, values, keyPrefix)
 	if err != nil {
@@ -270,7 +265,7 @@ func batchRequestForIndexValues(
 		if found, ok := values.colIDtoRowIndex[referencedColID]; ok {
 			colIDtoRowIndex[referencingIndex.ColumnIDs[i]] = found
 		} else {
-			return roachpb.BatchRequest{}, nil, pgerror.Newf(pgerror.CodeForeignKeyViolationError,
+			return roachpb.BatchRequest{}, nil, pgerror.Newf(pgcode.ForeignKeyViolation,
 				"missing value for column %q in multi-part foreign key", referencedIndex.ColumnNames[i],
 			)
 		}
@@ -402,7 +397,7 @@ func (c *cascader) addRowDeleter(
 	if rowDeleter, exists := c.rowDeleters[table.ID]; exists {
 		rowFetcher, existsFetcher := c.deleterRowFetchers[table.ID]
 		if !existsFetcher {
-			return Deleter{}, Fetcher{}, pgerror.AssertionFailedf("no corresponding row fetcher for the row deleter for table: (%d)%s",
+			return Deleter{}, Fetcher{}, errors.AssertionFailedf("no corresponding row fetcher for the row deleter for table: (%d)%s",
 				table.ID, table.Name,
 			)
 		}
@@ -461,7 +456,7 @@ func (c *cascader) addRowUpdater(
 	if existsUpdater {
 		rowFetcher, existsFetcher := c.updaterRowFetchers[table.ID]
 		if !existsFetcher {
-			return Updater{}, Fetcher{}, pgerror.AssertionFailedf("no corresponding row fetcher for the row updater for table: (%d)%s",
+			return Updater{}, Fetcher{}, errors.AssertionFailedf("no corresponding row fetcher for the row updater for table: (%d)%s",
 				table.ID, table.Name,
 			)
 		}
@@ -477,6 +472,7 @@ func (c *cascader) addRowUpdater(
 		table.Columns,
 		nil, /* requestedCol */
 		UpdaterDefault,
+		CheckFKs,
 		c.alloc,
 	)
 	if err != nil {
@@ -731,6 +727,11 @@ func (c *cascader) updateRows(
 			if err != nil {
 				return nil, nil, nil, 0, err
 			}
+			// If the default expression is nil, treat it as a SET NULL case.
+			if !column.HasDefault() {
+				referencingIndexValuesByColIDs[columnID] = tree.DNull
+				continue
+			}
 			parsedExpr, err := parser.ParseExpr(*column.DefaultExpr)
 			if err != nil {
 				return nil, nil, nil, 0, err
@@ -869,7 +870,7 @@ func (c *cascader) updateRows(
 									if err != nil {
 										return nil, nil, nil, 0, err
 									}
-									return nil, nil, nil, 0, pgerror.Newf(pgerror.CodeNullValueNotAllowedError,
+									return nil, nil, nil, 0, pgerror.Newf(pgcode.NullValueNotAllowed,
 										"cannot cascade a null value into %q as it violates a NOT NULL constraint",
 										tree.ErrString(tree.NewUnresolvedName(database.Name, tree.PublicSchema, referencingTable.Name, column.Name)))
 								}
@@ -880,7 +881,7 @@ func (c *cascader) updateRows(
 							updateRow[rowIndex] = rowToUpdate[fetchRowIndex]
 							continue
 						}
-						return nil, nil, nil, 0, pgerror.AssertionFailedf("could find find colID %d in either updated columns or the fetched row",
+						return nil, nil, nil, 0, errors.AssertionFailedf("could find find colID %d in either updated columns or the fetched row",
 							colID,
 						)
 					}
@@ -897,7 +898,7 @@ func (c *cascader) updateRows(
 							updateRow[rowIndex] = rowToUpdate[fetchRowIndex]
 							continue
 						}
-						return nil, nil, nil, 0, pgerror.AssertionFailedf("could find find colID %d in either the index columns or the fetched row",
+						return nil, nil, nil, 0, errors.AssertionFailedf("could find find colID %d in either the index columns or the fetched row",
 							colID,
 						)
 					}
@@ -1034,107 +1035,117 @@ func (c *cascader) cascadeAll(
 		if !exists {
 			break
 		}
-		for _, referencedIndex := range elem.table.AllNonDropIndexes() {
-			for _, ref := range referencedIndex.ReferencedBy {
-				referencingTable, ok := c.fkTables[ref.Table]
-				if !ok {
-					return pgerror.AssertionFailedf("could not find table:%d in table descriptor map", ref.Table)
-				}
-				if referencingTable.IsAdding {
-					// We can assume that a table being added but not yet public is empty,
-					// and thus does not need to be checked for cascading.
-					continue
-				}
-				referencingIndex, err := referencingTable.Desc.FindIndexByID(ref.Index)
-				if err != nil {
-					return err
-				}
-				if elem.updatedValues == nil {
-					// Deleting a row.
-					switch referencingIndex.ForeignKey.OnDelete {
-					case sqlbase.ForeignKeyReference_CASCADE:
-						deletedRows, colIDtoRowIndex, startIndex, err := c.deleteRows(
+		for i := range elem.table.InboundFKs {
+			ref := &elem.table.InboundFKs[i]
+			referencingTable, ok := c.fkTables[ref.OriginTableID]
+			if !ok {
+				return errors.AssertionFailedf("could not find table:%d in table descriptor map", ref.OriginTableID)
+			}
+			if referencingTable.IsAdding {
+				// We can assume that a table being added but not yet public is empty,
+				// and thus does not need to be checked for cascading.
+				continue
+			}
+			foundFK, err := referencingTable.Desc.FindFKForBackRef(elem.table.ID, ref)
+			if err != nil {
+				return err
+			}
+			referencedIndex, err := elem.table.TableDesc().FindIndexByID(ref.LegacyReferencedIndex)
+			if err != nil {
+				return err
+			}
+			referencingIndex, err := referencingTable.Desc.TableDesc().FindIndexByID(ref.LegacyOriginIndex)
+			if err != nil {
+				return err
+			}
+			if elem.updatedValues == nil {
+				// Deleting a row.
+				switch foundFK.OnDelete {
+				case sqlbase.ForeignKeyReference_CASCADE:
+					deletedRows, colIDtoRowIndex, startIndex, err := c.deleteRows(
+						ctx,
+						referencedIndex,
+						referencingTable.Desc,
+						referencingIndex,
+						// Cascades in the DELETE direction always use MATCH SIMPLE, since
+						// values in referenced tables are allowed to be partially NULL -
+						// they just won't cascade.
+						sqlbase.ForeignKeyReference_SIMPLE,
+						elem,
+						traceKV,
+					)
+					if err != nil {
+						return err
+					}
+					if deletedRows != nil && deletedRows.Len() > startIndex {
+						// If a row was deleted, add the table to the queue.
+						if err := cascadeQ.enqueue(
 							ctx,
-							referencedIndex,
 							referencingTable.Desc,
-							referencingIndex,
-							ref.Match,
-							elem,
-							traceKV,
-						)
-						if err != nil {
+							deletedRows,
+							nil, /* updatedValues */
+							colIDtoRowIndex,
+							startIndex,
+						); err != nil {
 							return err
-						}
-						if deletedRows != nil && deletedRows.Len() > startIndex {
-							// If a row was deleted, add the table to the queue.
-							if err := cascadeQ.enqueue(
-								ctx,
-								referencingTable.Desc,
-								deletedRows,
-								nil, /* updatedValues */
-								colIDtoRowIndex,
-								startIndex,
-							); err != nil {
-								return err
-							}
-						}
-					case sqlbase.ForeignKeyReference_SET_NULL, sqlbase.ForeignKeyReference_SET_DEFAULT:
-						originalAffectedRows, updatedAffectedRows, colIDtoRowIndex, startIndex, err := c.updateRows(
-							ctx,
-							referencedIndex,
-							referencingTable.Desc,
-							referencingIndex,
-							ref.Match,
-							elem,
-							referencingIndex.ForeignKey.OnDelete,
-							traceKV,
-						)
-						if err != nil {
-							return err
-						}
-						if originalAffectedRows != nil && originalAffectedRows.Len() > startIndex {
-							// A row was updated, so let's add it to the queue.
-							if err := cascadeQ.enqueue(
-								ctx,
-								referencingTable.Desc,
-								originalAffectedRows,
-								updatedAffectedRows,
-								colIDtoRowIndex,
-								startIndex,
-							); err != nil {
-								return err
-							}
 						}
 					}
-				} else {
-					// Updating a row.
-					switch referencingIndex.ForeignKey.OnUpdate {
-					case sqlbase.ForeignKeyReference_CASCADE, sqlbase.ForeignKeyReference_SET_NULL, sqlbase.ForeignKeyReference_SET_DEFAULT:
-						originalAffectedRows, updatedAffectedRows, colIDtoRowIndex, startIndex, err := c.updateRows(
+				case sqlbase.ForeignKeyReference_SET_NULL, sqlbase.ForeignKeyReference_SET_DEFAULT:
+					originalAffectedRows, updatedAffectedRows, colIDtoRowIndex, startIndex, err := c.updateRows(
+						ctx,
+						referencedIndex,
+						referencingTable.Desc,
+						referencingIndex,
+						sqlbase.ForeignKeyReference_SIMPLE,
+						elem,
+						foundFK.OnDelete,
+						traceKV,
+					)
+					if err != nil {
+						return err
+					}
+					if originalAffectedRows != nil && originalAffectedRows.Len() > startIndex {
+						// A row was updated, so let's add it to the queue.
+						if err := cascadeQ.enqueue(
 							ctx,
-							referencedIndex,
 							referencingTable.Desc,
-							referencingIndex,
-							ref.Match,
-							elem,
-							referencingIndex.ForeignKey.OnUpdate,
-							traceKV,
-						)
-						if err != nil {
+							originalAffectedRows,
+							updatedAffectedRows,
+							colIDtoRowIndex,
+							startIndex,
+						); err != nil {
 							return err
 						}
-						if originalAffectedRows != nil && originalAffectedRows.Len() > startIndex {
-							// A row was updated, so let's add it to the queue.
-							if err := cascadeQ.enqueue(
-								ctx,
-								referencingTable.Desc,
-								originalAffectedRows,
-								updatedAffectedRows,
-								colIDtoRowIndex,
-								startIndex,
-							); err != nil {
-								return err
-							}
+					}
+				}
+			} else {
+				// Updating a row.
+				switch foundFK.OnUpdate {
+				case sqlbase.ForeignKeyReference_CASCADE, sqlbase.ForeignKeyReference_SET_NULL, sqlbase.ForeignKeyReference_SET_DEFAULT:
+					originalAffectedRows, updatedAffectedRows, colIDtoRowIndex, startIndex, err := c.updateRows(
+						ctx,
+						referencedIndex,
+						referencingTable.Desc,
+						referencingIndex,
+						sqlbase.ForeignKeyReference_SIMPLE,
+						elem,
+						foundFK.OnUpdate,
+						traceKV,
+					)
+					if err != nil {
+						return err
+					}
+					if originalAffectedRows != nil && originalAffectedRows.Len() > startIndex {
+						// A row was updated, so let's add it to the queue.
+						if err := cascadeQ.enqueue(
+							ctx,
+							referencingTable.Desc,
+							originalAffectedRows,
+							updatedAffectedRows,
+							colIDtoRowIndex,
+							startIndex,
+						); err != nil {
+							return err
 						}
 					}
 				}
@@ -1152,7 +1163,7 @@ func (c *cascader) cascadeAll(
 		}
 		rowDeleter, exists := c.rowDeleters[tableID]
 		if !exists {
-			return pgerror.AssertionFailedf("could not find row deleter for table %d", tableID)
+			return errors.AssertionFailedf("could not find row deleter for table %d", tableID)
 		}
 		for deletedRows.Len() > 0 {
 			if err := rowDeleter.Fks.addAllIdxChecks(ctx, deletedRows.At(0), traceKV); err != nil {
@@ -1175,7 +1186,7 @@ func (c *cascader) cascadeAll(
 		// Fetch the original and updated rows for the updater.
 		originalRows, originalRowsExists := c.originalRows[tableID]
 		if !originalRowsExists {
-			return pgerror.AssertionFailedf("could not find original rows for table %d", tableID)
+			return errors.AssertionFailedf("could not find original rows for table %d", tableID)
 		}
 		totalRows := originalRows.Len()
 		if totalRows == 0 {
@@ -1184,11 +1195,11 @@ func (c *cascader) cascadeAll(
 
 		updatedRows, updatedRowsExists := c.updatedRows[tableID]
 		if !updatedRowsExists {
-			return pgerror.AssertionFailedf("could not find updated rows for table %d", tableID)
+			return errors.AssertionFailedf("could not find updated rows for table %d", tableID)
 		}
 
 		if totalRows != updatedRows.Len() {
-			return pgerror.AssertionFailedf("original rows length:%d not equal to updated rows length:%d for table %d",
+			return errors.AssertionFailedf("original rows length:%d not equal to updated rows length:%d for table %d",
 				totalRows, updatedRows.Len(), tableID,
 			)
 		}

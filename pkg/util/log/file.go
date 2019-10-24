@@ -1,17 +1,13 @@
 // Copyright 2013 Google Inc. All Rights Reserved.
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code originated in the github.com/golang/glog package.
 
@@ -106,8 +102,9 @@ func (l *DirName) IsSet() bool {
 	return res
 }
 
-// DirSet returns true of the log directory has been changed from its default.
-func DirSet() bool { return logging.logDir.IsSet() }
+// DirSet returns true of the log directory for the main logger has
+// been changed from its default.
+func DirSet() bool { return mainLog.logDir.IsSet() }
 
 // FileNamePattern matches log files to avoid exposing non-log files
 // accidentally and it splits the details of the filename into groups for easy
@@ -276,12 +273,12 @@ func create(
 // ListLogFiles returns a slice of FileInfo structs for each log file
 // on the local node, in any of the configured log directories.
 func ListLogFiles() ([]FileInfo, error) {
-	return logging.listLogFiles()
+	return mainLog.listLogFiles()
 }
 
-func (l *loggingT) listLogFiles() ([]FileInfo, error) {
+func (l *loggerT) listLogFiles() ([]FileInfo, error) {
 	var results []FileInfo
-	dir, err := logging.logDir.get()
+	dir, err := l.logDir.get()
 	if err != nil {
 		// No log directory configured: simply indicate that there are no
 		// log files.
@@ -315,8 +312,10 @@ func (l *loggingT) listLogFiles() ([]FileInfo, error) {
 // current directory, with the added feature that simple (base name)
 // file names will be searched in this process's log directory if not
 // found in the current directory.
+//
+// TODO(knz): make this work for secondary loggers too.
 func GetLogReader(filename string, restricted bool) (io.ReadCloser, error) {
-	dir, err := logging.logDir.get()
+	dir, err := mainLog.logDir.get()
 	if err != nil {
 		return nil, err
 	}

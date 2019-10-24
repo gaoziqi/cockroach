@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -110,15 +106,13 @@ func (n *renameTableNode) startExec(params runParams) error {
 	tableDesc.SetName(newTn.Table())
 	tableDesc.ParentID = targetDbDesc.ID
 
-	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
 	newTbKey := sqlbase.NewTableKey(targetDbDesc.ID, newTn.Table()).Key()
 
-	if err := tableDesc.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
+	if err := tableDesc.Validate(ctx, p.txn); err != nil {
 		return err
 	}
 
 	descID := tableDesc.GetID()
-	descDesc := sqlbase.WrapDescriptor(tableDesc)
 
 	renameDetails := sqlbase.TableDescriptor_NameInfo{
 		ParentID: prevDbDesc.ID,
@@ -133,10 +127,11 @@ func (n *renameTableNode) startExec(params runParams) error {
 	// has made sure it's not in use any more.
 	b := &client.Batch{}
 	if p.extendedEvalCtx.Tracing.KVTracingEnabled() {
-		log.VEventf(ctx, 2, "Put %s -> %s", descKey, descDesc)
 		log.VEventf(ctx, 2, "CPut %s -> %d", newTbKey, descID)
 	}
-	b.Put(descKey, descDesc)
+	if err := writeDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(), p.EvalContext().Settings, b, descID, tableDesc.TableDesc()); err != nil {
+		return err
+	}
 	b.CPut(newTbKey, descID, nil)
 
 	if err := p.txn.Run(ctx, b); err != nil {

@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -22,8 +18,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/workload/querybench"
 	"github.com/lib/pq"
 )
@@ -52,6 +49,12 @@ type tpchBenchSpec struct {
 	ScaleFactor     int
 	benchType       tpchBench
 	numRunsPerQuery int
+	// minVersion specifies the minimum version of CRDB nodes. If omitted, it
+	// will default to maybeMinVersionForFixturesImport.
+	minVersion string
+	// maxLatency is the expected maximum time that a query will take to execute
+	// needed to correctly initialize histograms.
+	maxLatency time.Duration
 }
 
 // runTPCHBench runs sets of queries against CockroachDB clusters in different
@@ -65,8 +68,8 @@ type tpchBenchSpec struct {
 // This benchmark runs with a single load generator node running a single
 // worker.
 func runTPCHBench(ctx context.Context, t *test, c *cluster, b tpchBenchSpec) {
-	roachNodes := c.Range(1, c.nodes-1)
-	loadNode := c.Node(c.nodes)
+	roachNodes := c.Range(1, c.spec.NodeCount-1)
+	loadNode := c.Node(c.spec.NodeCount)
 
 	t.Status("copying binaries")
 	c.Put(ctx, cockroach, "./cockroach", roachNodes)
@@ -100,15 +103,21 @@ func runTPCHBench(ctx context.Context, t *test, c *cluster, b tpchBenchSpec) {
 		// run b.numRunsPerQuery number of times.
 		maxOps := b.numRunsPerQuery * numQueries
 
+		vectorizeSetting := ""
+		if b.benchType == tpchVec {
+			vectorizeSetting = "experimental_on"
+		}
 		// Run with only one worker to get best-case single-query performance.
 		cmd := fmt.Sprintf(
 			"./workload run querybench --db=tpch --concurrency=1 --query-file=%s "+
-				"--num-runs=%d --max-ops=%d --vectorized=%t {pgurl%s} --histograms=logs/stats.json",
+				"--num-runs=%d --max-ops=%d --vectorize=%s {pgurl%s} "+
+				"--histograms="+perfArtifactsDir+"/stats.json --histograms-max-latency=%s",
 			filename,
 			b.numRunsPerQuery,
 			maxOps,
-			b.benchType == tpchVec,
+			vectorizeSetting,
 			roachNodes,
+			b.maxLatency.String(),
 		)
 		if err := c.RunE(ctx, loadNode, cmd); err != nil {
 			t.Fatal(err)
@@ -180,7 +189,7 @@ func loadTPCHBench(
 		if err := db.QueryRowContext(
 			ctx, `SELECT count(*) FROM tpch.supplier`,
 		).Scan(&supplierCardinality); err != nil {
-			if pqErr, ok := err.(*pq.Error); !(ok && pqErr.Code == pgerror.CodeUndefinedTableError) {
+			if pqErr, ok := err.(*pq.Error); !(ok && pqErr.Code == pgcode.UndefinedTable) {
 				return err
 			}
 			// Table does not exist. Set cardinality to 0.
@@ -199,12 +208,12 @@ func loadTPCHBench(
 
 		// If the scale factor was smaller than the required scale factor, wipe the
 		// cluster and restore.
-		m.ExpectDeaths(int32(c.nodes))
+		m.ExpectDeaths(int32(c.spec.NodeCount))
 		c.Wipe(ctx, roachNodes)
 		c.Start(ctx, t, roachNodes)
 		m.ResetDeaths()
 	} else if pqErr, ok := err.(*pq.Error); !ok ||
-		string(pqErr.Code) != pgerror.CodeInvalidCatalogNameError {
+		string(pqErr.Code) != pgcode.InvalidCatalogName {
 		return err
 	}
 
@@ -215,7 +224,7 @@ func loadTPCHBench(
 	return err
 }
 
-func registerTPCHBenchSpec(r *registry, b tpchBenchSpec) {
+func registerTPCHBenchSpec(r *testRegistry, b tpchBenchSpec) {
 	nameParts := []string{
 		"tpchbench",
 		b.benchType.String(),
@@ -226,18 +235,22 @@ func registerTPCHBenchSpec(r *registry, b tpchBenchSpec) {
 
 	// Add a load generator node.
 	numNodes := b.Nodes + 1
+	minVersion := b.minVersion
+	if minVersion == `` {
+		minVersion = maybeMinVersionForFixturesImport(cloud)
+	}
 
 	r.Add(testSpec{
 		Name:       strings.Join(nameParts, "/"),
 		Cluster:    makeClusterSpec(numNodes),
-		MinVersion: maybeMinVersionForFixturesImport(cloud),
+		MinVersion: minVersion,
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runTPCHBench(ctx, t, c, b)
 		},
 	})
 }
 
-func registerTPCHBench(r *registry) {
+func registerTPCHBench(r *testRegistry) {
 	specs := []tpchBenchSpec{
 		{
 			Nodes:           3,
@@ -245,6 +258,7 @@ func registerTPCHBench(r *registry) {
 			ScaleFactor:     1,
 			benchType:       sql20,
 			numRunsPerQuery: 3,
+			maxLatency:      100 * time.Second,
 		},
 		{
 			Nodes:           3,
@@ -252,6 +266,8 @@ func registerTPCHBench(r *registry) {
 			ScaleFactor:     1,
 			benchType:       tpch,
 			numRunsPerQuery: 3,
+			minVersion:      `v19.1.0`,
+			maxLatency:      500 * time.Second,
 		},
 		{
 			Nodes:           3,
@@ -259,6 +275,8 @@ func registerTPCHBench(r *registry) {
 			ScaleFactor:     1,
 			benchType:       tpchVec,
 			numRunsPerQuery: 3,
+			minVersion:      `v19.1.0`,
+			maxLatency:      500 * time.Second,
 		},
 	}
 

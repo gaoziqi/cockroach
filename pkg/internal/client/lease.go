@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package client
 
@@ -55,8 +51,9 @@ type LeaseManager struct {
 type Lease struct {
 	key roachpb.Key
 	val struct {
-		sem   chan struct{}
-		lease *LeaseVal
+		sem      chan struct{}
+		lease    *LeaseVal
+		leaseRaw roachpb.Value
 	}
 }
 
@@ -108,7 +105,19 @@ func (m *LeaseManager) AcquireLease(ctx context.Context, key roachpb.Key) (*Leas
 			Owner:      m.clientID,
 			Expiration: m.clock.Now().Add(m.leaseDuration.Nanoseconds(), 0),
 		}
-		return txn.Put(ctx, key, lease.val.lease)
+		var leaseRaw roachpb.Value
+		if err := leaseRaw.SetProto(lease.val.lease); err != nil {
+			return err
+		}
+		if err := txn.Put(ctx, key, &leaseRaw); err != nil {
+			return err
+		}
+		// After using newRaw as an arg to CPut, we're not allowed to modify it.
+		// Passing it back to CPut again (which is the whole point of keeping it
+		// around) will clear and re-init the checksum, so defensively copy it before
+		// we save it.
+		lease.val.leaseRaw = roachpb.Value{RawBytes: append([]byte(nil), leaseRaw.RawBytes...)}
+		return nil
 	}); err != nil {
 		return nil, err
 	}
@@ -154,8 +163,11 @@ func (m *LeaseManager) ExtendLease(ctx context.Context, l *Lease) error {
 		Owner:      m.clientID,
 		Expiration: m.clock.Now().Add(m.leaseDuration.Nanoseconds(), 0),
 	}
-
-	if err := m.db.CPut(ctx, l.key, newVal, l.val.lease); err != nil {
+	var newRaw roachpb.Value
+	if err := newRaw.SetProto(newVal); err != nil {
+		return err
+	}
+	if err := m.db.CPut(ctx, l.key, &newRaw, &l.val.leaseRaw); err != nil {
 		if _, ok := err.(*roachpb.ConditionFailedError); ok {
 			// Something is wrong - immediately expire the local lease state.
 			l.val.lease.Expiration = hlc.Timestamp{}
@@ -164,6 +176,11 @@ func (m *LeaseManager) ExtendLease(ctx context.Context, l *Lease) error {
 		return err
 	}
 	l.val.lease = newVal
+	// After using newRaw as an arg to CPut, we're not allowed to modify it.
+	// Passing it back to CPut again (which is the whole point of keeping it
+	// around) will clear and re-init the checksum, so defensively copy it before
+	// we save it.
+	l.val.leaseRaw = roachpb.Value{RawBytes: append([]byte(nil), newRaw.RawBytes...)}
 	return nil
 }
 
@@ -177,5 +194,5 @@ func (m *LeaseManager) ReleaseLease(ctx context.Context, l *Lease) error {
 	}
 	defer func() { <-l.val.sem }()
 
-	return m.db.CPut(ctx, l.key, nil, l.val.lease)
+	return m.db.CPut(ctx, l.key, nil, &l.val.leaseRaw)
 }

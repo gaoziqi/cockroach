@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,8 +14,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
@@ -28,7 +24,7 @@ import (
 // be constructed with Create(), after which it is a PlanNode and can be treated
 // as such.
 type rowSourceToPlanNode struct {
-	source    distsqlrun.RowSource
+	source    execinfra.RowSource
 	forwarder metadataForwarder
 
 	// originalPlanNode is the original planNode that the wrapped RowSource got
@@ -52,7 +48,7 @@ var _ planNode = &rowSourceToPlanNode{}
 // that this rowSourceToPlanNode is wrapping originally replaced. That planNode
 // will be closed when this one is closed.
 func makeRowSourceToPlanNode(
-	s distsqlrun.RowSource,
+	s execinfra.RowSource,
 	forwarder metadataForwarder,
 	planCols sqlbase.ResultColumns,
 	originalPlanNode planNode,
@@ -75,7 +71,7 @@ func (r *rowSourceToPlanNode) startExec(params runParams) error {
 
 func (r *rowSourceToPlanNode) Next(params runParams) (bool, error) {
 	for {
-		var p *distsqlpb.ProducerMetadata
+		var p *execinfrapb.ProducerMetadata
 		r.row, p = r.source.Next()
 
 		if p != nil {

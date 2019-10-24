@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -30,8 +26,6 @@ var noColumns = make(sqlbase.ResultColumns, 0)
 // The returned slice is *not* mutable. To modify the result column
 // set, implement a separate recursion (e.g. needed_columns.go) or use
 // planMutableColumns defined below.
-//
-// Available after newPlan().
 func planColumns(plan planNode) sqlbase.ResultColumns {
 	return getPlanColumns(plan, false)
 }
@@ -53,8 +47,6 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return n.columns
 	case *groupNode:
 		return n.columns
-	case *hookFnNode:
-		return n.header
 	case *joinNode:
 		return n.columns
 	case *ordinalityNode:
@@ -63,8 +55,6 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return n.columns
 	case *scanNode:
 		return n.resultColumns
-	case *sortNode:
-		return n.columns
 	case *unionNode:
 		return n.columns
 	case *valuesNode:
@@ -100,23 +90,34 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 
 	// Nodes with a fixed schema.
 	case *scrubNode:
-		return n.getColumns(mut, scrubColumns)
+		return n.getColumns(mut, sqlbase.ScrubColumns)
 	case *explainDistSQLNode:
 		return n.getColumns(mut, sqlbase.ExplainDistSQLColumns)
+	case *explainVecNode:
+		return n.getColumns(mut, sqlbase.ExplainVecColumns)
 	case *relocateNode:
-		return n.getColumns(mut, relocateNodeColumns)
+		return n.getColumns(mut, sqlbase.AlterTableRelocateColumns)
 	case *scatterNode:
-		return n.getColumns(mut, scatterNodeColumns)
+		return n.getColumns(mut, sqlbase.AlterTableScatterColumns)
 	case *showFingerprintsNode:
-		return n.getColumns(mut, showFingerprintsColumns)
+		return n.getColumns(mut, sqlbase.ShowFingerprintsColumns)
 	case *splitNode:
-		return n.getColumns(mut, splitNodeColumns)
+		return n.getColumns(mut, sqlbase.AlterTableSplitColumns)
 	case *unsplitNode:
-		return n.getColumns(mut, unsplitNodeColumns)
+		return n.getColumns(mut, sqlbase.AlterTableUnsplitColumns)
+	case *unsplitAllNode:
+		return n.getColumns(mut, sqlbase.AlterTableUnsplitColumns)
 	case *showTraceReplicaNode:
 		return n.getColumns(mut, sqlbase.ShowReplicaTraceColumns)
 	case *sequenceSelectNode:
-		return n.getColumns(mut, sequenceSelectColumns)
+		return n.getColumns(mut, sqlbase.SequenceSelectColumns)
+	case *exportNode:
+		return n.getColumns(mut, sqlbase.ExportColumns)
+
+	// The columns in the hookFnNode are returned by the hook function; we don't
+	// know if they can be modified in place or not.
+	case *hookFnNode:
+		return n.getColumns(mut, n.header)
 
 	// Nodes that have the same schema as their source or their
 	// valueNode helper.
@@ -138,6 +139,10 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return getPlanColumns(n.source, mut)
 	case *scanBufferNode:
 		return getPlanColumns(n.buffer, mut)
+	case *sortNode:
+		return getPlanColumns(n.plan, mut)
+	case *recursiveCTENode:
+		return getPlanColumns(n.initial, mut)
 
 	case *rowSourceToPlanNode:
 		return n.planCols

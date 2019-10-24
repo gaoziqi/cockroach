@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package bench
 
@@ -28,6 +24,8 @@ import (
 // stubFactory is a do-nothing implementation of exec.Factory, used for testing.
 type stubFactory struct{}
 
+var _ exec.Factory = &stubFactory{}
+
 func (f *stubFactory) ConstructValues(
 	rows [][]tree.TypedExpr, cols sqlbase.ResultColumns,
 ) (exec.Node, error) {
@@ -43,6 +41,7 @@ func (f *stubFactory) ConstructScan(
 	reverse bool,
 	maxResults uint64,
 	reqOrdering exec.OutputOrdering,
+	rowCount float64,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -98,6 +97,7 @@ func (f *stubFactory) ConstructMergeJoin(
 	onCond tree.TypedExpr,
 	leftOrdering, rightOrdering sqlbase.ColumnOrdering,
 	reqOrdering exec.OutputOrdering,
+	leftEqColsAreKey, rightEqColsAreKey bool,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -119,7 +119,7 @@ func (f *stubFactory) ConstructScalarGroupBy(
 }
 
 func (f *stubFactory) ConstructDistinct(
-	input exec.Node, distinctCols, orderedCols exec.ColumnOrdinalSet,
+	input exec.Node, distinctCols, orderedCols exec.ColumnOrdinalSet, reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -131,7 +131,7 @@ func (f *stubFactory) ConstructSetOp(
 }
 
 func (f *stubFactory) ConstructSort(
-	input exec.Node, ordering sqlbase.ColumnOrdering,
+	input exec.Node, ordering sqlbase.ColumnOrdering, alreadyOrderedPrefix int,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -141,7 +141,11 @@ func (f *stubFactory) ConstructOrdinality(input exec.Node, colName string) (exec
 }
 
 func (f *stubFactory) ConstructIndexJoin(
-	input exec.Node, table cat.Table, cols exec.ColumnOrdinalSet, reqOrdering exec.OutputOrdering,
+	input exec.Node,
+	table cat.Table,
+	keyCols []exec.ColumnOrdinal,
+	tableCols exec.ColumnOrdinalSet,
+	reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -151,7 +155,8 @@ func (f *stubFactory) ConstructLookupJoin(
 	input exec.Node,
 	table cat.Table,
 	index cat.Index,
-	keyCols []exec.ColumnOrdinal,
+	eqCols []exec.ColumnOrdinal,
+	eqColsAreKey bool,
 	lookupCols exec.ColumnOrdinalSet,
 	onCond tree.TypedExpr,
 	reqOrdering exec.OutputOrdering,
@@ -199,7 +204,9 @@ func (f *stubFactory) RenameColumns(input exec.Node, colNames []string) (exec.No
 	return struct{}{}, nil
 }
 
-func (f *stubFactory) ConstructPlan(root exec.Node, subqueries []exec.Subquery) (exec.Plan, error) {
+func (f *stubFactory) ConstructPlan(
+	root exec.Node, subqueries []exec.Subquery, postqueries []exec.Node,
+) (exec.Plan, error) {
 	return struct{}{}, nil
 }
 
@@ -223,8 +230,10 @@ func (f *stubFactory) ConstructInsert(
 	input exec.Node,
 	table cat.Table,
 	insertCols exec.ColumnOrdinalSet,
+	returnCols exec.ColumnOrdinalSet,
 	checks exec.CheckOrdinalSet,
-	rowsNeeded bool,
+	allowAutoCommit bool,
+	skipFKChecks bool,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -234,8 +243,11 @@ func (f *stubFactory) ConstructUpdate(
 	table cat.Table,
 	fetchCols exec.ColumnOrdinalSet,
 	updateCols exec.ColumnOrdinalSet,
+	returnCols exec.ColumnOrdinalSet,
 	checks exec.CheckOrdinalSet,
-	rowsNeeded bool,
+	passthrough sqlbase.ResultColumns,
+	allowAutoCommit bool,
+	skipFKChecks bool,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -247,20 +259,30 @@ func (f *stubFactory) ConstructUpsert(
 	insertCols exec.ColumnOrdinalSet,
 	fetchCols exec.ColumnOrdinalSet,
 	updateCols exec.ColumnOrdinalSet,
+	returnCols exec.ColumnOrdinalSet,
 	checks exec.CheckOrdinalSet,
-	rowsNeeded bool,
+	allowAutoCommit bool,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
 
 func (f *stubFactory) ConstructDelete(
-	input exec.Node, table cat.Table, fetchCols exec.ColumnOrdinalSet, rowsNeeded bool,
+	input exec.Node,
+	table cat.Table,
+	fetchCols exec.ColumnOrdinalSet,
+	returnCols exec.ColumnOrdinalSet,
+	allowAutoCommit bool,
+	skipFKChecks bool,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
 
 func (f *stubFactory) ConstructDeleteRange(
-	table cat.Table, needed exec.ColumnOrdinalSet, indexConstraint *constraint.Constraint,
+	table cat.Table,
+	needed exec.ColumnOrdinalSet,
+	indexConstraint *constraint.Constraint,
+	maxReturnedKeys int,
+	allowAutoCommit bool,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -276,7 +298,84 @@ func (f *stubFactory) ConstructSequenceSelect(seq cat.Sequence) (exec.Node, erro
 }
 
 func (f *stubFactory) ConstructSaveTable(
-	input exec.Node, table *cat.DataSourceName,
+	input exec.Node, table *cat.DataSourceName, colNames []string,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructErrorIfRows(
+	input exec.Node, mkErr func(tree.Datums) error,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructOpaque(metadata opt.OpaqueMetadata) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructAlterTableSplit(
+	index cat.Index, input exec.Node, expiration tree.TypedExpr,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructAlterTableUnsplit(
+	index cat.Index, input exec.Node,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructAlterTableUnsplitAll(index cat.Index) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructAlterTableRelocate(
+	index cat.Index, input exec.Node, relocateLease bool,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructBuffer(value exec.Node, label string) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructScanBuffer(ref exec.Node, label string) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructRecursiveCTE(
+	initial exec.Node, fn exec.RecursiveCTEIterationFn, label string,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructControlJobs(
+	command tree.JobCommand, input exec.Node,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructCancelQueries(input exec.Node, ifExists bool) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructCancelSessions(input exec.Node, ifExists bool) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructCreateView(
+	schema cat.Schema,
+	viewName string,
+	temporary bool,
+	viewQuery string,
+	columns sqlbase.ResultColumns,
+	deps opt.ViewDeps,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructExport(
+	input exec.Node, fileName tree.TypedExpr, fileFormat string, options []exec.KVOption,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }

@@ -1,23 +1,19 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
 import (
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -26,12 +22,12 @@ import (
 // versions and maximum age.
 type GarbageCollector struct {
 	Threshold hlc.Timestamp
-	policy    config.GCPolicy
+	policy    zonepb.GCPolicy
 }
 
 // MakeGarbageCollector allocates and returns a new GC, with expiration
 // computed based on current time and policy.TTLSeconds.
-func MakeGarbageCollector(now hlc.Timestamp, policy config.GCPolicy) GarbageCollector {
+func MakeGarbageCollector(now hlc.Timestamp, policy zonepb.GCPolicy) GarbageCollector {
 	ttlNanos := int64(policy.TTLSeconds) * 1E9
 	return GarbageCollector{
 		Threshold: hlc.Timestamp{WallTime: now.WallTime - ttlNanos},

@@ -1,45 +1,60 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
-func registerKV(r *registry) {
+func registerKV(r *testRegistry) {
 	type kvOptions struct {
 		nodes       int
 		cpus        int
 		readPercent int
 		batchSize   int
 		blockSize   int
+		splits      int // 0 implies default, negative implies 0
 		encryption  bool
+		sequential  bool
+		duration    time.Duration
+		tags        []string
+	}
+	computeNumSplits := func(opts kvOptions) int {
+		// TODO(ajwerner): set this default to a more sane value or remove it and
+		// rely on load-based splitting.
+		const defaultNumSplits = 1000
+		switch {
+		case opts.splits == 0:
+			return defaultNumSplits
+		case opts.splits < 0:
+			return 0
+		default:
+			return opts.splits
+		}
 	}
 	runKV := func(ctx context.Context, t *test, c *cluster, opts kvOptions) {
-		nodes := c.nodes - 1
+		nodes := c.spec.NodeCount - 1
 		c.Put(ctx, cockroach, "./cockroach", c.Range(1, nodes))
 		c.Put(ctx, workload, "./workload", c.Node(nodes+1))
 		c.Start(ctx, t, c.Range(1, nodes), startArgs(fmt.Sprintf("--encrypt=%t", opts.encryption)))
@@ -48,9 +63,14 @@ func registerKV(r *registry) {
 		m := newMonitor(ctx, c, c.Range(1, nodes))
 		m.Go(func(ctx context.Context) error {
 			concurrency := ifLocal("", " --concurrency="+fmt.Sprint(nodes*64))
-			duration := " --duration=" + ifLocal("10s", "10m")
-			readPercent := fmt.Sprintf(" --read-percent=%d", opts.readPercent)
 
+			splits := " --splits=" + strconv.Itoa(computeNumSplits(opts))
+			if opts.duration == 0 {
+				opts.duration = 10 * time.Minute
+			}
+			duration := " --duration=" + ifLocal("10s", opts.duration.String())
+			readPercent := fmt.Sprintf(" --read-percent=%d", opts.readPercent)
+			histograms := " --histograms=" + perfArtifactsDir + "/stats.json"
 			var batchSize string
 			if opts.batchSize > 0 {
 				batchSize = fmt.Sprintf(" --batch=%d", opts.batchSize)
@@ -62,10 +82,14 @@ func registerKV(r *registry) {
 					opts.blockSize, opts.blockSize)
 			}
 
-			cmd := fmt.Sprintf(
-				"./workload run kv --init --splits=1000 --histograms=logs/stats.json"+
-					concurrency+duration+readPercent+batchSize+blockSize+" {pgurl:1-%d}",
-				nodes)
+			var sequential string
+			if opts.sequential {
+				splits = "" // no splits
+				sequential = " --sequential"
+			}
+			cmd := fmt.Sprintf("./workload run kv --init"+
+				histograms+concurrency+splits+duration+readPercent+batchSize+blockSize+sequential+
+				" {pgurl:1-%d}", nodes)
 			c.Run(ctx, c.Node(nodes+1), cmd)
 			return nil
 		})
@@ -80,8 +104,12 @@ func registerKV(r *registry) {
 		{nodes: 1, cpus: 32, readPercent: 95},
 		{nodes: 3, cpus: 8, readPercent: 0},
 		{nodes: 3, cpus: 8, readPercent: 95},
+		{nodes: 3, cpus: 8, readPercent: 0, splits: -1 /* no splits */},
+		{nodes: 3, cpus: 8, readPercent: 95, splits: -1 /* no splits */},
 		{nodes: 3, cpus: 32, readPercent: 0},
 		{nodes: 3, cpus: 32, readPercent: 95},
+		{nodes: 3, cpus: 32, readPercent: 0, splits: -1 /* no splits */},
+		{nodes: 3, cpus: 32, readPercent: 95, splits: -1 /* no splits */},
 
 		// Configs with large block sizes.
 		{nodes: 3, cpus: 8, readPercent: 0, blockSize: 1 << 12 /* 4 KB */},
@@ -107,11 +135,22 @@ func registerKV(r *registry) {
 		{nodes: 1, cpus: 8, readPercent: 95, encryption: true},
 		{nodes: 3, cpus: 8, readPercent: 0, encryption: true},
 		{nodes: 3, cpus: 8, readPercent: 95, encryption: true},
+
+		// Configs with a sequential access pattern.
+		{nodes: 3, cpus: 32, readPercent: 0, sequential: true},
+		{nodes: 3, cpus: 32, readPercent: 95, sequential: true},
+
+		// Weekly larger scale configurations.
+		{nodes: 32, cpus: 8, readPercent: 0, tags: []string{"weekly"}, duration: time.Hour},
+		{nodes: 32, cpus: 8, readPercent: 95, tags: []string{"weekly"}, duration: time.Hour},
 	} {
 		opts := opts
 
 		var nameParts []string
 		nameParts = append(nameParts, fmt.Sprintf("kv%d", opts.readPercent))
+		if len(opts.tags) > 0 {
+			nameParts = append(nameParts, strings.Join(opts.tags, "/"))
+		}
 		nameParts = append(nameParts, fmt.Sprintf("enc=%t", opts.encryption))
 		nameParts = append(nameParts, fmt.Sprintf("nodes=%d", opts.nodes))
 		if opts.cpus != 8 { // support legacy test name which didn't include cpu
@@ -122,6 +161,12 @@ func registerKV(r *registry) {
 		}
 		if opts.blockSize != 0 { // support legacy test name which didn't include block size
 			nameParts = append(nameParts, fmt.Sprintf("size=%dkb", opts.blockSize>>10))
+		}
+		if opts.splits != 0 { // support legacy test name which didn't include splits
+			nameParts = append(nameParts, fmt.Sprintf("splt=%d", computeNumSplits(opts)))
+		}
+		if opts.sequential {
+			nameParts = append(nameParts, fmt.Sprintf("seq"))
 		}
 
 		minVersion := "v2.0.0"
@@ -136,19 +181,27 @@ func registerKV(r *registry) {
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runKV(ctx, t, c, opts)
 			},
+			Tags: opts.tags,
 		})
 	}
 }
 
-func registerKVContention(r *registry) {
+func registerKVContention(r *testRegistry) {
 	const nodes = 4
 	r.Add(testSpec{
-		Name:    fmt.Sprintf("kv/contention/nodes=%d", nodes),
-		Cluster: makeClusterSpec(nodes + 1),
+		Name:       fmt.Sprintf("kv/contention/nodes=%d", nodes),
+		MinVersion: "v19.2.0",
+		Cluster:    makeClusterSpec(nodes + 1),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			c.Put(ctx, cockroach, "./cockroach", c.Range(1, nodes))
 			c.Put(ctx, workload, "./workload", c.Node(nodes+1))
-			c.Start(ctx, t, c.Range(1, nodes))
+
+			// Start the cluster with an extremely high txn liveness threshold.
+			// If requests ever get stuck on a transaction that was abandoned
+			// then it will take 2m for them to get unstuck, at which point the
+			// QPS threshold check in the test is likely to fail.
+			args := startArgs("--env=COCKROACH_TXN_LIVENESS_HEARTBEAT_MULTIPLIER=120")
+			c.Start(ctx, t, args, c.Range(1, nodes))
 
 			// Enable request tracing, which is a good tool for understanding
 			// how different transactions are interacting.
@@ -181,8 +234,8 @@ func registerKVContention(r *registry) {
 
 				// Assert that the average throughput stayed above a certain
 				// threshold. In this case, assert that max throughput only
-				// dipped below 10 qps for 5% of the time.
-				const minQPS = 10
+				// dipped below 100 qps for 5% of the time.
+				const minQPS = 100
 				verifyTxnPerSecond(ctx, c, t, c.Node(1), start, end, minQPS, 0.05)
 				return nil
 			})
@@ -191,13 +244,13 @@ func registerKVContention(r *registry) {
 	})
 }
 
-func registerKVQuiescenceDead(r *registry) {
+func registerKVQuiescenceDead(r *testRegistry) {
 	r.Add(testSpec{
 		Name:       "kv/quiescence/nodes=3",
 		Cluster:    makeClusterSpec(4),
 		MinVersion: "v2.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			nodes := c.nodes - 1
+			nodes := c.spec.NodeCount - 1
 			c.Put(ctx, cockroach, "./cockroach", c.Range(1, nodes))
 			c.Put(ctx, workload, "./workload", c.Node(nodes+1))
 			c.Start(ctx, t, c.Range(1, nodes))
@@ -272,13 +325,13 @@ func registerKVQuiescenceDead(r *registry) {
 	})
 }
 
-func registerKVGracefulDraining(r *registry) {
+func registerKVGracefulDraining(r *testRegistry) {
 	r.Add(testSpec{
 		Skip:    "https://github.com/cockroachdb/cockroach/issues/33501",
 		Name:    "kv/gracefuldraining/nodes=3",
 		Cluster: makeClusterSpec(4),
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			nodes := c.nodes - 1
+			nodes := c.spec.NodeCount - 1
 			c.Put(ctx, cockroach, "./cockroach", c.Range(1, nodes))
 			c.Put(ctx, workload, "./workload", c.Node(nodes+1))
 			c.Start(ctx, t, c.Range(1, nodes))
@@ -383,7 +436,7 @@ func registerKVGracefulDraining(r *registry) {
 	})
 }
 
-func registerKVSplits(r *registry) {
+func registerKVSplits(r *testRegistry) {
 	for _, item := range []struct {
 		quiesce bool
 		splits  int
@@ -406,7 +459,7 @@ func registerKVSplits(r *registry) {
 			Timeout: item.timeout,
 			Cluster: makeClusterSpec(4),
 			Run: func(ctx context.Context, t *test, c *cluster) {
-				nodes := c.nodes - 1
+				nodes := c.spec.NodeCount - 1
 				c.Put(ctx, cockroach, "./cockroach", c.Range(1, nodes))
 				c.Put(ctx, workload, "./workload", c.Node(nodes+1))
 				c.Start(ctx, t, c.Range(1, nodes),
@@ -436,9 +489,9 @@ func registerKVSplits(r *registry) {
 	}
 }
 
-func registerKVScalability(r *registry) {
+func registerKVScalability(r *testRegistry) {
 	runScalability := func(ctx context.Context, t *test, c *cluster, percent int) {
-		nodes := c.nodes - 1
+		nodes := c.spec.NodeCount - 1
 
 		c.Put(ctx, cockroach, "./cockroach", c.Range(1, nodes))
 		c.Put(ctx, workload, "./workload", c.Node(nodes+1))
@@ -480,5 +533,138 @@ func registerKVScalability(r *registry) {
 				},
 			})
 		}
+	}
+}
+
+func registerKVRangeLookups(r *testRegistry) {
+	type rangeLookupWorkloadType int
+	const (
+		splitWorkload rangeLookupWorkloadType = iota
+		relocateWorkload
+	)
+
+	const (
+		nodes = 8
+		cpus  = 8
+	)
+
+	runRangeLookups := func(ctx context.Context, t *test, c *cluster, workers int, workloadType rangeLookupWorkloadType, maximumRangeLookupsPerSec float64) {
+		nodes := c.spec.NodeCount - 1
+		doneInit := make(chan struct{})
+		doneWorkload := make(chan struct{})
+		c.Put(ctx, cockroach, "./cockroach", c.Range(1, nodes))
+		c.Put(ctx, workload, "./workload", c.Node(nodes+1))
+		c.Start(ctx, t, c.Range(1, nodes))
+
+		t.Status("running workload")
+
+		conns := make([]*gosql.DB, nodes)
+		for i := 0; i < nodes; i++ {
+			conns[i] = c.Conn(ctx, i+1)
+		}
+		defer func() {
+			for i := 0; i < nodes; i++ {
+				conns[i].Close()
+			}
+		}()
+		waitForFullReplication(t, conns[0])
+
+		m := newMonitor(ctx, c, c.Range(1, nodes))
+		m.Go(func(ctx context.Context) error {
+			defer close(doneWorkload)
+			cmd := fmt.Sprintf("./workload init kv --splits=1000 {pgurl:1}")
+			if err := c.RunE(ctx, c.Node(nodes+1), cmd); err != nil {
+				return err
+			}
+			close(doneInit)
+			concurrency := ifLocal("", " --concurrency="+fmt.Sprint(nodes*64))
+			duration := " --duration=" + ifLocal("10s", "10m")
+			readPercent := " --read-percent=50"
+			// We run kv with --tolerate-errors, since the relocate workload is
+			// expected to create `result is ambiguous (removing replica)` errors.
+			cmd = fmt.Sprintf("./workload run kv --tolerate-errors"+
+				concurrency+duration+readPercent+
+				" {pgurl:1-%d}", nodes)
+			start := timeutil.Now()
+			if err := c.RunE(ctx, c.Node(nodes+1), cmd); err != nil {
+				return err
+			}
+			end := timeutil.Now()
+			verifyLookupsPerSec(ctx, c, t, c.Node(1), start, end, maximumRangeLookupsPerSec)
+			return nil
+		})
+
+		<-doneInit
+		for i := 0; i < workers; i++ {
+			m.Go(func(ctx context.Context) error {
+				for {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-doneWorkload:
+						return nil
+					default:
+					}
+
+					conn := conns[c.Range(1, nodes).randNode()[0]-1]
+					switch workloadType {
+					case splitWorkload:
+						_, err := conn.ExecContext(ctx, `
+							ALTER TABLE
+								kv.kv
+							SPLIT AT
+								VALUES (CAST(floor(random() * 9223372036854775808) AS INT))
+						`)
+						if err != nil && !pgerror.IsSQLRetryableError(err) {
+							return err
+						}
+					case relocateWorkload:
+						newReplicas := rand.Perm(nodes)[:3]
+						_, err := conn.ExecContext(ctx, `
+							ALTER TABLE
+								kv.kv
+							EXPERIMENTAL_RELOCATE
+								SELECT ARRAY[$1, $2, $3], CAST(floor(random() * 9223372036854775808) AS INT)
+						`, newReplicas[0]+1, newReplicas[1]+1, newReplicas[2]+1)
+						if err != nil && !pgerror.IsSQLRetryableError(err) && !isExpectedRelocateError(err) {
+							return err
+						}
+					default:
+						panic("unexpected")
+					}
+				}
+			})
+		}
+		m.Wait()
+	}
+	for _, item := range []struct {
+		workers                   int
+		workloadType              rangeLookupWorkloadType
+		maximumRangeLookupsPerSec float64
+	}{
+		{2, splitWorkload, 15.0},
+		// Relocates are expected to fail periodically when relocating random
+		// ranges, so use more workers.
+		{4, relocateWorkload, 50.0},
+	} {
+		// For use in closure.
+		item := item
+		var workloadName string
+		switch item.workloadType {
+		case splitWorkload:
+			workloadName = "split"
+		case relocateWorkload:
+			workloadName = "relocate"
+		default:
+			panic("unexpected")
+		}
+		r.Add(testSpec{
+			Name:       fmt.Sprintf("kv50/rangelookups/%s/nodes=%d", workloadName, nodes),
+			MinVersion: "v19.2.0",
+			Cluster:    makeClusterSpec(nodes+1, cpu(cpus)),
+			Run: func(ctx context.Context, t *test, c *cluster) {
+				runRangeLookups(ctx, t, c, item.workers, item.workloadType, item.maximumRangeLookupsPerSec)
+			},
+		})
 	}
 }

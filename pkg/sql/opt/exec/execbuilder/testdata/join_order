@@ -1,4 +1,4 @@
-# LogicTest: local-opt
+# LogicTest: local
 
 statement ok
 CREATE TABLE bx (
@@ -35,6 +35,8 @@ SET CLUSTER SETTING sql.defaults.reorder_joins_limit = -1
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM abc, bx, cy WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
+·                    distributed         false            ·                         ·
+·                    vectorized          false            ·                         ·
 render               ·                   ·                (a, b, c, d, b, x, c, y)  ·
  │                   render 0            a                ·                         ·
  │                   render 1            b                ·                         ·
@@ -67,21 +69,29 @@ SET reorder_joins_limit = 3
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM abc, bx, cy WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
-render                 ·         ·            (a, b, c, d, b, x, c, y)  ·
- │                     render 0  a            ·                         ·
- │                     render 1  b            ·                         ·
- │                     render 2  c            ·                         ·
- │                     render 3  d            ·                         ·
- │                     render 4  b            ·                         ·
- │                     render 5  x            ·                         ·
- │                     render 6  c            ·                         ·
- │                     render 7  y            ·                         ·
- └── lookup-join       ·         ·            (a, b, c, d, c, y, b, x)  ·
-      │                table     bx@primary   ·                         ·
-      │                type      inner        ·                         ·
-      └── lookup-join  ·         ·            (a, b, c, d, c, y)        ·
-           │           table     cy@primary   ·                         ·
-           │           type      inner        ·                         ·
-           └── scan    ·         ·            (a, b, c, d)              ·
-·                      table     abc@primary  ·                         ·
-·                      spans     /1-/1/#      ·                         ·
+·                      distributed            false        ·                         ·
+·                      vectorized             true         ·                         ·
+render                 ·                      ·            (a, b, c, d, b, x, c, y)  ·
+ │                     render 0               a            ·                         ·
+ │                     render 1               b            ·                         ·
+ │                     render 2               c            ·                         ·
+ │                     render 3               d            ·                         ·
+ │                     render 4               b            ·                         ·
+ │                     render 5               x            ·                         ·
+ │                     render 6               c            ·                         ·
+ │                     render 7               y            ·                         ·
+ └── lookup-join       ·                      ·            (a, b, c, d, c, y, b, x)  ·
+      │                table                  bx@primary   ·                         ·
+      │                type                   inner        ·                         ·
+      │                equality               (b) = (b)    ·                         ·
+      │                equality cols are key  ·            ·                         ·
+      │                parallel               ·            ·                         ·
+      └── lookup-join  ·                      ·            (a, b, c, d, c, y)        ·
+           │           table                  cy@primary   ·                         ·
+           │           type                   inner        ·                         ·
+           │           equality               (c) = (c)    ·                         ·
+           │           equality cols are key  ·            ·                         ·
+           │           parallel               ·            ·                         ·
+           └── scan    ·                      ·            (a, b, c, d)              ·
+·                      table                  abc@primary  ·                         ·
+·                      spans                  /1-/1/#      ·                         ·

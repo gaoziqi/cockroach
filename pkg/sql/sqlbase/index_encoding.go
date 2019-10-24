@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -21,12 +17,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // This file contains facilities to encode primary and secondary
@@ -239,6 +235,61 @@ func MakeSpanFromEncDatums(
 		endKey = startKey.PrefixEnd()
 	}
 	return roachpb.Span{Key: startKey, EndKey: endKey}, nil
+}
+
+// NeededColumnFamilyIDs returns a slice of FamilyIDs which contain
+// the families needed to load a set of neededCols
+func NeededColumnFamilyIDs(
+	colIdxMap map[ColumnID]int, families []ColumnFamilyDescriptor, neededCols util.FastIntSet,
+) []FamilyID {
+	// Column family 0 is always included so we can distinguish null rows from
+	// absent rows.
+	needed := []FamilyID{0}
+	for i := range families {
+		family := &families[i]
+		if family.ID == 0 {
+			// Already added above.
+			continue
+		}
+		for _, columnID := range family.ColumnIDs {
+			columnOrdinal := colIdxMap[columnID]
+			if neededCols.Contains(columnOrdinal) {
+				needed = append(needed, family.ID)
+				break
+			}
+		}
+	}
+
+	// TODO(solon): There is a further optimization possible here: if there is at
+	// least one non-nullable column in the needed column families, we can
+	// potentially omit the primary family, since the primary keys are encoded
+	// in all families. (Note that composite datums are an exception.)
+
+	return needed
+}
+
+// SplitSpanIntoSeparateFamilies can only be used to split a span representing
+// a single row point lookup into separate spans that request particular
+// families from neededFamilies instead of requesting all the families.
+// It is up to the client to verify whether the requested span
+// represents a single row lookup, and when the span splitting is appropriate.
+func SplitSpanIntoSeparateFamilies(span roachpb.Span, neededFamilies []FamilyID) roachpb.Spans {
+	var resultSpans roachpb.Spans
+	for i, familyID := range neededFamilies {
+		var tempSpan roachpb.Span
+		tempSpan.Key = make(roachpb.Key, len(span.Key))
+		copy(tempSpan.Key, span.Key)
+		tempSpan.Key = keys.MakeFamilyKey(tempSpan.Key, uint32(familyID))
+		tempSpan.EndKey = tempSpan.Key.PrefixEnd()
+		if i > 0 && familyID == neededFamilies[i-1]+1 {
+			// This column family is adjacent to the previous one. We can merge
+			// the two spans into one.
+			resultSpans[len(resultSpans)-1].EndKey = tempSpan.EndKey
+		} else {
+			resultSpans = append(resultSpans, tempSpan)
+		}
+	}
+	return resultSpans
 }
 
 // makeKeyFromEncDatums creates an index key by concatenating keyPrefix with the
@@ -681,7 +732,7 @@ func EncodeInvertedIndexKeys(
 	keyPrefix []byte,
 ) (key [][]byte, err error) {
 	if len(index.ColumnIDs) > 1 {
-		return nil, pgerror.AssertionFailedf("trying to apply inverted index to more than one column")
+		return nil, errors.AssertionFailedf("trying to apply inverted index to more than one column")
 	}
 
 	var val tree.Datum
@@ -706,7 +757,7 @@ func EncodeInvertedIndexTableKeys(val tree.Datum, inKey []byte) (key [][]byte, e
 	case *tree.DJSON:
 		return json.EncodeInvertedIndexKeys(inKey, (t.JSON))
 	}
-	return nil, pgerror.AssertionFailedf("trying to apply inverted index to non JSON type")
+	return nil, errors.AssertionFailedf("trying to apply inverted index to non JSON type")
 }
 
 // EncodeSecondaryIndex encodes key/values for a secondary

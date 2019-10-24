@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -24,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -49,6 +46,11 @@ func (p *planner) CreateSequence(ctx context.Context, n *tree.CreateSequence) (p
 }
 
 func (n *createSequenceNode) startExec(params runParams) error {
+	// TODO(arul): Allow temporary sequences once temp tables work for regular tables.
+	if n.n.Temporary {
+		return unimplemented.NewWithIssuef(5807,
+			"temporary sequences are unsupported")
+	}
 	tKey := sqlbase.NewTableKey(n.dbDesc.ID, n.n.Name.Table())
 	if exists, err := descExists(params.ctx, params.p.txn, tKey.Key()); err == nil && exists {
 		if n.n.IfNotExists {
@@ -81,7 +83,7 @@ func doCreateSequence(
 	privs := dbDesc.GetPrivileges()
 
 	desc, err := MakeSequenceTableDesc(name.Table(), opts,
-		dbDesc.ID, id, params.p.txn.CommitTimestamp(), privs, params.EvalContext().Settings)
+		dbDesc.ID, id, params.creationTimeForNewTableDescriptor(), privs, params.EvalContext().Settings)
 	if err != nil {
 		return err
 	}
@@ -102,7 +104,7 @@ func doCreateSequence(
 		return err
 	}
 
-	if err := desc.Validate(params.ctx, params.p.txn, params.extendedEvalCtx.Settings); err != nil {
+	if err := desc.Validate(params.ctx, params.p.txn); err != nil {
 		return err
 	}
 
@@ -141,7 +143,7 @@ func MakeSequenceTableDesc(
 	privileges *sqlbase.PrivilegeDescriptor,
 	settings *cluster.Settings,
 ) (sqlbase.MutableTableDescriptor, error) {
-	desc := InitTableDescriptor(id, parentID, sequenceName, creationTime, privileges)
+	desc := InitTableDescriptor(id, parentID, sequenceName, creationTime, privileges, false /* temporary */)
 
 	// Mimic a table with one column, "value".
 	desc.Columns = []sqlbase.ColumnDescriptor{
@@ -182,5 +184,5 @@ func MakeSequenceTableDesc(
 	// immediately.
 	desc.State = sqlbase.TableDescriptor_PUBLIC
 
-	return desc, desc.ValidateTable(settings)
+	return desc, desc.ValidateTable()
 }

@@ -15,8 +15,8 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -53,11 +53,11 @@ func TestCloudBackupRestoreS3(t *testing.T) {
 	prefix := fmt.Sprintf("TestBackupRestoreS3-%d", timeutil.Now().UnixNano())
 	uri := url.URL{Scheme: "s3", Host: bucket, Path: prefix}
 	values := uri.Query()
-	values.Add(storageccl.S3AccessKeyParam, creds.AccessKeyID)
-	values.Add(storageccl.S3SecretParam, creds.SecretAccessKey)
+	values.Add(cloud.S3AccessKeyParam, creds.AccessKeyID)
+	values.Add(cloud.S3SecretParam, creds.SecretAccessKey)
 	uri.RawQuery = values.Encode()
 
-	backupAndRestore(ctx, t, tc, uri.String(), numAccounts)
+	backupAndRestore(ctx, t, tc, []string{uri.String()}, []string{uri.String()}, numAccounts)
 }
 
 // TestBackupRestoreGoogleCloudStorage hits the real GCS and so could
@@ -77,7 +77,7 @@ func TestCloudBackupRestoreGoogleCloudStorage(t *testing.T) {
 	defer cleanupFn()
 	prefix := fmt.Sprintf("TestBackupRestoreGoogleCloudStorage-%d", timeutil.Now().UnixNano())
 	uri := url.URL{Scheme: "gs", Host: bucket, Path: prefix}
-	backupAndRestore(ctx, t, tc, uri.String(), numAccounts)
+	backupAndRestore(ctx, t, tc, []string{uri.String()}, []string{uri.String()}, numAccounts)
 }
 
 // TestBackupRestoreAzure hits the real Azure Blob Storage and so could
@@ -104,9 +104,9 @@ func TestCloudBackupRestoreAzure(t *testing.T) {
 	prefix := fmt.Sprintf("TestBackupRestoreAzure-%d", timeutil.Now().UnixNano())
 	uri := url.URL{Scheme: "azure", Host: bucket, Path: prefix}
 	values := uri.Query()
-	values.Add(storageccl.AzureAccountNameParam, accountName)
-	values.Add(storageccl.AzureAccountKeyParam, accountKey)
+	values.Add(cloud.AzureAccountNameParam, accountName)
+	values.Add(cloud.AzureAccountKeyParam, accountKey)
 	uri.RawQuery = values.Encode()
 
-	backupAndRestore(ctx, t, tc, uri.String(), numAccounts)
+	backupAndRestore(ctx, t, tc, []string{uri.String()}, []string{uri.String()}, numAccounts)
 }

@@ -22,6 +22,7 @@ ok1  CREATE TABLE ok1 (
      ),
      FAMILY "primary" (a, b)
 )
+-- Warning: Partitioned table with no zone configurations.
 
 # Verify that secondary indexes with a partition for NULLs can actually store
 # NULLs.
@@ -48,6 +49,7 @@ ok2  CREATE TABLE ok2 (
      ),
      FAMILY "primary" (a, b)
 )
+-- Warning: Partitioned table with no zone configurations.
 
 statement ok
 CREATE TABLE ok3 (
@@ -80,6 +82,7 @@ ok3  CREATE TABLE ok3 (
      ),
      FAMILY "primary" (a, b)
 )
+-- Warning: Partitioned table with no zone configurations.
 
 statement ok
 CREATE TABLE indexes (a INT PRIMARY KEY, b INT)
@@ -107,7 +110,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS i4 ON indexes (b) PARTITION BY LIST (b) (
     PARTITION p4 VALUES IN (1)
 )
 
-statement error PARTITION p1: name must be unique \(used in both index "i1" and index "i5"\)
+statement error PARTITION p1: name must be unique \(used twice in index "i5"\)
+CREATE INDEX i5 ON indexes (b) PARTITION BY LIST (b) (
+    PARTITION p1 VALUES IN (1),
+    PARTITION p1 VALUES IN (2)
+)
+
+# Partition names can be reused across indexes.
+statement ok
 CREATE INDEX i5 ON indexes (b) PARTITION BY LIST (b) (
     PARTITION p1 VALUES IN (1)
 )
@@ -131,5 +141,9 @@ indexes  CREATE TABLE indexes (
          UNIQUE INDEX i4 (b ASC) PARTITION BY LIST (b) (
            PARTITION p4 VALUES IN ((1))
          ),
+         INDEX i5 (b ASC) PARTITION BY LIST (b) (
+           PARTITION p1 VALUES IN ((1))
+         ),
          FAMILY "primary" (a, b)
 )
+-- Warning: Partitioned table with no zone configurations.

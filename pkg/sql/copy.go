@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -23,6 +19,7 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -31,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 )
 
 // copyMachine supports the Copy-in pgwire subprotocol (COPY...FROM STDIN). The
@@ -71,6 +69,10 @@ type copyMachine struct {
 	// data.
 	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time)
 
+	// execInsertPlan is a function to be used to execute the plan (stored in the
+	// planner) which performs an INSERT.
+	execInsertPlan func(ctx context.Context, p *planner, res RestrictedCommandResult) error
+
 	txnOpt copyTxnOpt
 
 	// p is the planner used to plan inserts. preparePlanner() needs to be called
@@ -91,6 +93,7 @@ func newCopyMachine(
 	txnOpt copyTxnOpt,
 	execCfg *ExecutorConfig,
 	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time),
+	execInsertPlan func(ctx context.Context, p *planner, res RestrictedCommandResult) error,
 ) (_ *copyMachine, retErr error) {
 	c := &copyMachine{
 		conn:    conn,
@@ -98,8 +101,9 @@ func newCopyMachine(
 		columns: n.Columns,
 		txnOpt:  txnOpt,
 		// The planner will be prepared before use.
-		p:            planner{execCfg: execCfg},
-		resetPlanner: resetPlanner,
+		p:              planner{execCfg: execCfg},
+		resetPlanner:   resetPlanner,
+		execInsertPlan: execInsertPlan,
 	}
 	c.resetPlanner(&c.p, nil /* txn */, time.Time{} /* txnTS */, time.Time{} /* stmtTS */)
 	c.parsingEvalCtx = c.p.EvalContext()
@@ -109,14 +113,14 @@ func newCopyMachine(
 		retErr = cleanup(ctx, retErr)
 	}()
 
-	tableDesc, err := ResolveExistingObject(ctx, &c.p, &n.Table, true /*required*/, ResolveRequireTableDesc)
+	tableDesc, err := ResolveExistingObject(ctx, &c.p, &n.Table, tree.ObjectLookupFlagsWithRequired(), ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
 	if err := c.p.CheckPrivilege(ctx, tableDesc, privilege.INSERT); err != nil {
 		return nil, err
 	}
-	cols, err := c.p.processColumns(tableDesc, n.Columns,
+	cols, err := sqlbase.ProcessTargetColumns(tableDesc, n.Columns,
 		true /* ensureColumns */, false /* allowMutations */)
 	if err != nil {
 		return nil, err
@@ -179,8 +183,7 @@ Loop:
 			}
 			break Loop
 		case pgwirebase.ClientMsgCopyFail:
-			return pgerror.Newf(pgerror.CodeDataExceptionError,
-				"client canceled COPY")
+			return errors.Newf("client canceled COPY")
 		case pgwirebase.ClientMsgFlush, pgwirebase.ClientMsgSync:
 			// Spec says to "ignore Flush and Sync messages received during copy-in mode".
 		default:
@@ -316,7 +319,8 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 	c.rows = c.rows[:0]
 	c.rowsMemAcc.Clear(ctx)
 
-	in := tree.Insert{
+	c.p.stmt = &Statement{}
+	c.p.stmt.AST = &tree.Insert{
 		Table:   c.table,
 		Columns: c.columns,
 		Rows: &tree.Select{
@@ -324,29 +328,24 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 		},
 		Returning: tree.AbsentReturningClause,
 	}
-	insertNode, err := c.p.Insert(ctx, &in, nil /* desiredTypes */)
-	if err != nil {
+	if err := c.p.makeOptimizerPlan(ctx); err != nil {
 		return err
 	}
-	defer insertNode.Close(ctx)
 
-	params := runParams{
-		ctx:             ctx,
-		extendedEvalCtx: &c.p.extendedEvalCtx,
-		p:               &c.p,
-	}
-	if err := startExec(params, insertNode); err != nil {
-		return err
-	}
-	rows, err := countRowsAffected(params, insertNode)
+	var res bufferedCommandResult
+	err := c.execInsertPlan(ctx, &c.p, &res)
 	if err != nil {
 		return err
 	}
-	if rows != numRows {
-		log.Fatalf(params.ctx, "didn't insert all buffered rows and yet no error was reported. "+
+	if err := res.Err(); err != nil {
+		return err
+	}
+
+	if rows := res.RowsAffected(); rows != numRows {
+		log.Fatalf(ctx, "didn't insert all buffered rows and yet no error was reported. "+
 			"Inserted %d out of %d rows.", rows, numRows)
 	}
-	c.insertedRows += rows
+	c.insertedRows += numRows
 
 	return nil
 }
@@ -355,7 +354,7 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 	var err error
 	parts := bytes.Split(line, fieldDelim)
 	if len(parts) != len(c.resultColumns) {
-		return pgerror.Newf(pgerror.CodeProtocolViolationError,
+		return pgerror.Newf(pgcode.ProtocolViolation,
 			"expected %d values, got %d", len(c.resultColumns), len(parts))
 	}
 	exprs := make(tree.Exprs, len(parts))
@@ -412,7 +411,7 @@ func decodeCopy(in string) (string, error) {
 		buf.WriteString(in[start:i])
 		i++
 		if i >= n {
-			return "", pgerror.Newf(pgerror.CodeSyntaxError,
+			return "", pgerror.Newf(pgcode.Syntax,
 				"unknown escape sequence: %q", in[i-1:])
 		}
 
@@ -423,13 +422,13 @@ func decodeCopy(in string) (string, error) {
 			// \x can be followed by 1 or 2 hex digits.
 			i++
 			if i >= n {
-				return "", pgerror.Newf(pgerror.CodeSyntaxError,
+				return "", pgerror.Newf(pgcode.Syntax,
 					"unknown escape sequence: %q", in[i-2:])
 			}
 			ch = in[i]
 			digit, ok := decodeHexDigit(ch)
 			if !ok {
-				return "", pgerror.Newf(pgerror.CodeSyntaxError,
+				return "", pgerror.Newf(pgcode.Syntax,
 					"unknown escape sequence: %q", in[i-2:i])
 			}
 			if i+1 < n {
@@ -459,7 +458,7 @@ func decodeCopy(in string) (string, error) {
 			}
 			buf.WriteByte(digit)
 		} else {
-			return "", pgerror.Newf(pgerror.CodeSyntaxError,
+			return "", pgerror.Newf(pgcode.Syntax,
 				"unknown escape sequence: %q", in[i-1:i+1])
 		}
 		start = i + 1

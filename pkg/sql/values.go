@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,11 +14,13 @@ import (
 	"context"
 	"strconv"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 type valuesNode struct {
@@ -54,7 +52,7 @@ func (p *planner) Values(
 	case *tree.ValuesClause:
 		n = t
 	default:
-		return nil, pgerror.AssertionFailedf("unhandled case in values: %T %v", origN, origN)
+		return nil, errors.AssertionFailedf("unhandled case in values: %T %v", origN, origN)
 	}
 
 	if len(n.Rows) == 0 {
@@ -103,7 +101,7 @@ func (p *planner) Values(
 			} else if v.columns[i].Typ.Family() == types.UnknownFamily {
 				v.columns[i].Typ = typ
 			} else if typ.Family() != types.UnknownFamily && !typ.Equivalent(v.columns[i].Typ) {
-				return nil, pgerror.Newf(pgerror.CodeDatatypeMismatchError,
+				return nil, pgerror.Newf(pgcode.DatatypeMismatch,
 					"VALUES types %s and %s cannot be matched", typ, v.columns[i].Typ)
 			}
 
@@ -190,7 +188,7 @@ func (n *valuesNode) Close(ctx context.Context) {
 
 func newValuesListLenErr(exp, got int) error {
 	return pgerror.Newf(
-		pgerror.CodeSyntaxError,
+		pgcode.Syntax,
 		"VALUES lists must all be the same length, expected %d columns, found %d",
 		exp, got)
 }

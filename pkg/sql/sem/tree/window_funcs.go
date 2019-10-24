@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -18,10 +14,10 @@ import (
 	"context"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // IndexedRows are rows with the corresponding indices.
@@ -188,7 +184,7 @@ func (wfr *WindowFrameRun) FrameStartIdx(ctx context.Context, evalCtx *EvalConte
 				return valueAt.Compare(evalCtx, value) >= 0
 			}), wfr.err
 		default:
-			return 0, pgerror.AssertionFailedf(
+			return 0, errors.AssertionFailedf(
 				"unexpected WindowFrameBoundType in RANGE mode: %d",
 				log.Safe(wfr.Frame.Bounds.StartBound.BoundType))
 		}
@@ -213,7 +209,7 @@ func (wfr *WindowFrameRun) FrameStartIdx(ctx context.Context, evalCtx *EvalConte
 			}
 			return idx, nil
 		default:
-			return 0, pgerror.AssertionFailedf(
+			return 0, errors.AssertionFailedf(
 				"unexpected WindowFrameBoundType in ROWS mode: %d",
 				log.Safe(wfr.Frame.Bounds.StartBound.BoundType))
 		}
@@ -242,12 +238,12 @@ func (wfr *WindowFrameRun) FrameStartIdx(ctx context.Context, evalCtx *EvalConte
 			}
 			return wfr.PeerHelper.GetFirstPeerIdx(peerGroupNum), nil
 		default:
-			return 0, pgerror.AssertionFailedf(
+			return 0, errors.AssertionFailedf(
 				"unexpected WindowFrameBoundType in GROUPS mode: %d",
 				log.Safe(wfr.Frame.Bounds.StartBound.BoundType))
 		}
 	default:
-		return 0, pgerror.AssertionFailedf("unexpected WindowFrameMode: %d", wfr.Frame.Mode)
+		return 0, errors.AssertionFailedf("unexpected WindowFrameMode: %d", wfr.Frame.Mode)
 	}
 }
 
@@ -258,7 +254,8 @@ func (wfr *WindowFrameRun) IsDefaultFrame() bool {
 		return true
 	}
 	if wfr.Frame.Bounds.StartBound.BoundType == UnboundedPreceding {
-		return wfr.Frame.Bounds.EndBound == nil || wfr.Frame.Bounds.EndBound.BoundType == CurrentRow
+		return wfr.DefaultFrameExclusion() &&
+			(wfr.Frame.Bounds.EndBound == nil || wfr.Frame.Bounds.EndBound.BoundType == CurrentRow)
 	}
 	return false
 }
@@ -350,7 +347,7 @@ func (wfr *WindowFrameRun) FrameEndIdx(ctx context.Context, evalCtx *EvalContext
 		case UnboundedFollowing:
 			return wfr.unboundedFollowing(), nil
 		default:
-			return 0, pgerror.AssertionFailedf(
+			return 0, errors.AssertionFailedf(
 				"unexpected WindowFrameBoundType in RANGE mode: %d",
 				log.Safe(wfr.Frame.Bounds.EndBound.BoundType))
 		}
@@ -379,7 +376,7 @@ func (wfr *WindowFrameRun) FrameEndIdx(ctx context.Context, evalCtx *EvalContext
 		case UnboundedFollowing:
 			return wfr.unboundedFollowing(), nil
 		default:
-			return 0, pgerror.AssertionFailedf(
+			return 0, errors.AssertionFailedf(
 				"unexpected WindowFrameBoundType in ROWS mode: %d",
 				log.Safe(wfr.Frame.Bounds.EndBound.BoundType))
 		}
@@ -413,17 +410,18 @@ func (wfr *WindowFrameRun) FrameEndIdx(ctx context.Context, evalCtx *EvalContext
 		case UnboundedFollowing:
 			return wfr.unboundedFollowing(), nil
 		default:
-			return 0, pgerror.AssertionFailedf(
+			return 0, errors.AssertionFailedf(
 				"unexpected WindowFrameBoundType in GROUPS mode: %d",
 				log.Safe(wfr.Frame.Bounds.EndBound.BoundType))
 		}
 	default:
-		return 0, pgerror.AssertionFailedf(
+		return 0, errors.AssertionFailedf(
 			"unexpected WindowFrameMode: %d", log.Safe(wfr.Frame.Mode))
 	}
 }
 
-// FrameSize returns the number of rows in the current frame.
+// FrameSize returns the number of rows in the current frame (taking into
+// account - if present - a filter and a frame exclusion).
 func (wfr *WindowFrameRun) FrameSize(ctx context.Context, evalCtx *EvalContext) (int, error) {
 	if wfr.Frame == nil {
 		return wfr.DefaultFrameSize(), nil
@@ -437,6 +435,17 @@ func (wfr *WindowFrameRun) FrameSize(ctx context.Context, evalCtx *EvalContext) 
 		return 0, err
 	}
 	size := frameEndIdx - frameStartIdx
+	if !wfr.noFilter() || !wfr.DefaultFrameExclusion() {
+		size = 0
+		for idx := frameStartIdx; idx < frameEndIdx; idx++ {
+			if skipped, err := wfr.IsRowSkipped(ctx, idx); err != nil {
+				return 0, err
+			} else if skipped {
+				continue
+			}
+			size++
+		}
+	}
 	if size <= 0 {
 		size = 0
 	}
@@ -511,6 +520,112 @@ func (wfr *WindowFrameRun) RangeModeWithOffsets() bool {
 	return wfr.Frame.Mode == RANGE && wfr.Frame.Bounds.HasOffset()
 }
 
+// FullPartitionIsInWindow checks whether we have such a window frame that all
+// rows of the partition are inside of the window for each of the rows.
+func (wfr *WindowFrameRun) FullPartitionIsInWindow() bool {
+	// Note that we do not need to check whether a filter is present because
+	// application of the filter to a row does not depend on the position of the
+	// row or whether it is inside of the window frame.
+	if wfr.Frame == nil || !wfr.DefaultFrameExclusion() {
+		return false
+	}
+	if wfr.Frame.Bounds.EndBound == nil {
+		// If the end bound is omitted, it is CURRENT ROW (the default value) which
+		// doesn't guarantee full partition in the window for all rows.
+		return false
+	}
+	// precedingConfirmed and followingConfirmed indicate whether, for every row,
+	// all preceding and following, respectively, rows are always in the window.
+	precedingConfirmed := wfr.Frame.Bounds.StartBound.BoundType == UnboundedPreceding
+	followingConfirmed := wfr.Frame.Bounds.EndBound.BoundType == UnboundedFollowing
+	if wfr.Frame.Mode == ROWS || wfr.Frame.Mode == GROUPS {
+		// Every peer group in GROUPS modealways contains at least one row, so
+		// treating GROUPS as ROWS here is a subset of the cases when we should
+		// return true.
+		if wfr.Frame.Bounds.StartBound.BoundType == OffsetPreceding {
+			// Both ROWS and GROUPS have an offset of integer type, so this type
+			// conversion is safe.
+			startOffset := wfr.StartBoundOffset.(*DInt)
+			// The idea of this conditional is that to confirm that all preceding
+			// rows will always be in the window, we only need to look at the last
+			// row: if startOffset is at least as large as the number of rows in the
+			// partition before the last one, then it will be true for the first to
+			// last, second to last, etc.
+			precedingConfirmed = precedingConfirmed || *startOffset >= DInt(wfr.Rows.Len()-1)
+		}
+		if wfr.Frame.Bounds.EndBound.BoundType == OffsetFollowing {
+			// Both ROWS and GROUPS have an offset of integer type, so this type
+			// conversion is safe.
+			endOffset := wfr.EndBoundOffset.(*DInt)
+			// The idea of this conditional is that to confirm that all following
+			// rows will always be in the window, we only need to look at the first
+			// row: if endOffset is at least as large as the number of rows in the
+			// partition after the first one, then it will be true for the second,
+			// third, etc rows as well.
+			followingConfirmed = followingConfirmed || *endOffset >= DInt(wfr.Rows.Len()-1)
+		}
+	}
+	return precedingConfirmed && followingConfirmed
+}
+
+const noFilterIdx = -1
+
+// noFilter returns whether a filter is present.
+func (wfr *WindowFrameRun) noFilter() bool {
+	return wfr.FilterColIdx == noFilterIdx
+}
+
+// DefaultFrameExclusion returns true if optional frame exclusion is omitted.
+func (wfr *WindowFrameRun) DefaultFrameExclusion() bool {
+	return wfr.Frame == nil || wfr.Frame.Exclusion == NoExclusion
+}
+
+// isRowExcluded returns whether the row at index idx should be excluded from
+// the window frame of the current row.
+func (wfr *WindowFrameRun) isRowExcluded(idx int) (bool, error) {
+	if wfr.DefaultFrameExclusion() {
+		// By default, no rows are excluded.
+		return false, nil
+	}
+	switch wfr.Frame.Exclusion {
+	case ExcludeCurrentRow:
+		return idx == wfr.RowIdx, nil
+	case ExcludeGroup:
+		curRowFirstPeerIdx := wfr.PeerHelper.GetFirstPeerIdx(wfr.CurRowPeerGroupNum)
+		curRowPeerGroupRowCount := wfr.PeerHelper.GetRowCount(wfr.CurRowPeerGroupNum)
+		return curRowFirstPeerIdx <= idx && idx < curRowFirstPeerIdx+curRowPeerGroupRowCount, nil
+	case ExcludeTies:
+		curRowFirstPeerIdx := wfr.PeerHelper.GetFirstPeerIdx(wfr.CurRowPeerGroupNum)
+		curRowPeerGroupRowCount := wfr.PeerHelper.GetRowCount(wfr.CurRowPeerGroupNum)
+		return curRowFirstPeerIdx <= idx && idx < curRowFirstPeerIdx+curRowPeerGroupRowCount && idx != wfr.RowIdx, nil
+	default:
+		return false, errors.AssertionFailedf("unexpected WindowFrameExclusion")
+	}
+}
+
+// IsRowSkipped returns whether a row at index idx is skipped from the window
+// frame (it can either be filtered out according to the filter clause or
+// excluded according to the frame exclusion clause) and any error if it
+// occurs.
+func (wfr *WindowFrameRun) IsRowSkipped(ctx context.Context, idx int) (bool, error) {
+	if !wfr.noFilter() {
+		row, err := wfr.Rows.GetRow(ctx, idx)
+		if err != nil {
+			return false, err
+		}
+		d, err := row.GetDatum(wfr.FilterColIdx)
+		if err != nil {
+			return false, err
+		}
+		if d != DBoolTrue {
+			// Row idx is filtered out from the window frame, so it is skipped.
+			return true, nil
+		}
+	}
+	// If a row is excluded from the window frame, it is skipped.
+	return wfr.isRowExcluded(idx)
+}
+
 // WindowFunc performs a computation on each row using data from a provided *WindowFrameRun.
 type WindowFunc interface {
 	// Compute computes the window function for the provided window frame, given the
@@ -520,6 +635,10 @@ type WindowFunc interface {
 	// that have come before it (like in an AggregateFunc). As such, this approach does
 	// not present any exploitable associativity/commutativity for optimization.
 	Compute(context.Context, *EvalContext, *WindowFrameRun) (Datum, error)
+
+	// Reset resets the window function which allows for reusing it when
+	// computing over different partitions.
+	Reset(context.Context)
 
 	// Close allows the window function to free any memory it requested during execution,
 	// such as during the execution of an aggregation like CONCAT_AGG or ARRAY_AGG.

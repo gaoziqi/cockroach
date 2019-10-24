@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -18,9 +14,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
 
@@ -42,7 +40,7 @@ func LimitValueWidth(typ *types.T, inVal tree.Datum, name *string) (outVal tree.
 		}
 
 		if typ.Width() > 0 && utf8.RuneCountInString(sv) > int(typ.Width()) {
-			return nil, pgerror.Newf(pgerror.CodeStringDataRightTruncationError,
+			return nil, pgerror.Newf(pgcode.StringDataRightTruncation,
 				"value too long for type %s (column %q)",
 				typ.SQLString(), tree.ErrNameStringP(name))
 		}
@@ -55,7 +53,7 @@ func LimitValueWidth(typ *types.T, inVal tree.Datum, name *string) (outVal tree.
 				// We're performing bounds checks inline with Go's implementation of min and max ints in Math.go.
 				shifted := v >> width
 				if (v >= 0 && shifted > 0) || (v < 0 && shifted < -1) {
-					return nil, pgerror.Newf(pgerror.CodeNumericValueOutOfRangeError,
+					return nil, pgerror.Newf(pgcode.NumericValueOutOfRange,
 						"integer out of range for type %s (column %q)",
 						typ.Name(), tree.ErrNameStringP(name))
 				}
@@ -68,12 +66,12 @@ func LimitValueWidth(typ *types.T, inVal tree.Datum, name *string) (outVal tree.
 				switch typ.Oid() {
 				case oid.T_varbit:
 					if bitLen > uint(typ.Width()) {
-						return nil, pgerror.Newf(pgerror.CodeStringDataRightTruncationError,
+						return nil, pgerror.Newf(pgcode.StringDataRightTruncation,
 							"bit string length %d too large for type %s", bitLen, typ.SQLString())
 					}
 				default:
 					if bitLen != uint(typ.Width()) {
-						return nil, pgerror.Newf(pgerror.CodeStringDataLengthMismatchError,
+						return nil, pgerror.Newf(pgcode.StringDataLengthMismatch,
 							"bit string length %d does not match type %s", bitLen, typ.SQLString())
 					}
 				}
@@ -94,8 +92,7 @@ func LimitValueWidth(typ *types.T, inVal tree.Datum, name *string) (outVal tree.
 			outDec.Set(&inDec.Decimal)
 			err := tree.LimitDecimalWidth(&outDec.Decimal, int(typ.Precision()), int(typ.Scale()))
 			if err != nil {
-				return nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
-					"type %s (column %q)",
+				return nil, errors.Wrapf(err, "type %s (column %q)",
 					typ.SQLString(), tree.ErrNameStringP(name))
 			}
 			return &outDec, nil
@@ -142,7 +139,7 @@ func CheckDatumTypeFitsColumnType(col *ColumnDescriptor, typ *types.T) error {
 		return nil
 	}
 	if !typ.Equivalent(&col.Type) {
-		return pgerror.Newf(pgerror.CodeDatatypeMismatchError,
+		return pgerror.Newf(pgcode.DatatypeMismatch,
 			"value type %s doesn't match type %s of column %q",
 			typ.String(), col.Type.String(), tree.ErrNameString(col.Name))
 	}

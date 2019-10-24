@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // Note that there's also lease_internal_test.go, in package sql.
 
@@ -33,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -579,7 +575,7 @@ func isDeleted(tableID sqlbase.ID, cfg *config.SystemConfig) bool {
 	if err := val.GetProto(&descriptor); err != nil {
 		panic("unable to unmarshal table descriptor")
 	}
-	table := descriptor.GetTable()
+	table := descriptor.Table(val.Timestamp)
 	return table.Dropped()
 }
 
@@ -1018,7 +1014,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 
 	checkDeadlineErr := func(err error, t *testing.T) {
 		pqe, ok := err.(*pq.Error)
-		if !ok || pqe.Code != pgerror.CodeSerializationFailureError ||
+		if !ok || pqe.Code != pgcode.SerializationFailure ||
 			!testutils.IsError(err, "RETRY_COMMIT_DEADLINE_EXCEEDED") {
 			t.Fatalf("expected deadline exceeded, got: %v", err)
 		}
@@ -1650,11 +1646,12 @@ CREATE TABLE t.test0 (k CHAR PRIMARY KEY, v CHAR);
 			// Look up the descriptor.
 			descKey := sqlbase.MakeDescMetadataKey(descID)
 			dbDesc := &sqlbase.Descriptor{}
-			if err := txn.GetProto(ctx, descKey, dbDesc); err != nil {
+			ts, err := txn.GetProtoTs(ctx, descKey, dbDesc)
+			if err != nil {
 				t.Fatalf("error while reading proto: %v", err)
 			}
 			// Look at the descriptor that comes back from the database.
-			dbTable := dbDesc.GetTable()
+			dbTable := dbDesc.Table(ts)
 
 			if dbTable.Version != table.Version || dbTable.ModificationTime != table.ModificationTime {
 				t.Fatalf("db has version %d at ts %s, expected version %d at ts %s",

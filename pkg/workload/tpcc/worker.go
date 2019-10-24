@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
@@ -183,12 +178,10 @@ func (w *worker) run(ctx context.Context) error {
 	w.permIdx++
 
 	warehouseID := w.warehouse
-	if w.config.doWaits {
-		// Wait out the entire keying and think time even if the context is
-		// expired. This prevents all workers from immediately restarting when
-		// the workload's ramp period expires, which can overload a cluster.
-		time.Sleep(time.Duration(txInfo.keyingTime) * time.Second)
-	}
+	// Wait out the entire keying and think time even if the context is
+	// expired. This prevents all workers from immediately restarting when
+	// the workload's ramp period expires, which can overload a cluster.
+	time.Sleep(time.Duration(float64(txInfo.keyingTime) * float64(time.Second) * w.config.waitFraction))
 
 	// Run transactions with a background context because we don't want to
 	// cancel them when the context expires. Instead, let them finish normally
@@ -202,16 +195,14 @@ func (w *worker) run(ctx context.Context) error {
 		w.hists.Get(txInfo.name).Record(elapsed)
 	}
 
-	if w.config.doWaits {
-		// 5.2.5.4: Think time is taken independently from a negative exponential
-		// distribution. Think time = -log(r) * u, where r is a uniform random number
-		// between 0 and 1 and u is the mean think time per operation.
-		// Each distribution is truncated at 10 times its mean value.
-		thinkTime := -math.Log(rand.Float64()) * txInfo.thinkTime
-		if thinkTime > (txInfo.thinkTime * 10) {
-			thinkTime = txInfo.thinkTime * 10
-		}
-		time.Sleep(time.Duration(thinkTime) * time.Second)
+	// 5.2.5.4: Think time is taken independently from a negative exponential
+	// distribution. Think time = -log(r) * u, where r is a uniform random number
+	// between 0 and 1 and u is the mean think time per operation.
+	// Each distribution is truncated at 10 times its mean value.
+	thinkTime := -math.Log(rand.Float64()) * txInfo.thinkTime
+	if thinkTime > (txInfo.thinkTime * 10) {
+		thinkTime = txInfo.thinkTime * 10
 	}
+	time.Sleep(time.Duration(thinkTime * float64(time.Second) * w.config.waitFraction))
 	return ctx.Err()
 }

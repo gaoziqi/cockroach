@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package encoding
 
@@ -110,8 +106,6 @@ const (
 	// EncodedDurationMaxLen is the largest number of bytes used when encoding a
 	// Duration.
 	EncodedDurationMaxLen = 1 + 3*binary.MaxVarintLen64 // 3 varints are encoded.
-	// BytesDescMarker is exported for testing.
-	BytesDescMarker = bytesDescMarker
 )
 
 // Direction for ordering results.
@@ -125,18 +119,6 @@ const (
 )
 
 const escapeLength = 2
-
-// Reverse returns the opposite direction.
-func (d Direction) Reverse() Direction {
-	switch d {
-	case Ascending:
-		return Descending
-	case Descending:
-		return Ascending
-	default:
-		panic(fmt.Sprintf("Invalid direction %d", d))
-	}
-}
 
 // EncodeUint32Ascending encodes the uint32 value using a big-endian 4 byte
 // representation. The bytes are appended to the supplied buffer and
@@ -1424,7 +1406,7 @@ func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bo
 //  - For non-table keys, we never have NotNull.
 //  - For table keys, we always explicitly pass in Ascending and Descending for
 //    all key values, including NotNulls. The only case we do not pass in
-//    direction is during a SHOW EXPERIMENTAL_RANGES ON TABLE parent and there exists
+//    direction is during a SHOW RANGES ON TABLE parent and there exists
 //    an interleaved split key. Note that interleaved keys cannot have NotNull
 //    values except for the interleaved sentinel.
 //
@@ -1432,7 +1414,7 @@ func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bo
 // non-table keys encode values with Ascending.
 //
 // The only case where we end up defaulting direction for table keys is for
-// interleaved split keys in SHOW EXPERIMENTAL_RANGES ON TABLE parent. Since
+// interleaved split keys in SHOW RANGES ON TABLE parent. Since
 // interleaved prefixes are defined on the primary key (and primary key values
 // are always encoded Ascending), this will always print out the correct key
 // even if we don't have directions for the child index's columns.

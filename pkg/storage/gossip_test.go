@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -172,14 +168,15 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 	// Take down the first node and replace it with a new one.
 	oldNodeIdx := 0
 	newServerArgs := serverArgs
-	newServerArgs.Addr = tc.Servers[oldNodeIdx].ServingAddr()
+	newServerArgs.Addr = tc.Servers[oldNodeIdx].ServingRPCAddr()
+	newServerArgs.SQLAddr = tc.Servers[oldNodeIdx].ServingSQLAddr()
 	newServerArgs.PartOfCluster = true
-	newServerArgs.JoinAddr = tc.Servers[1].ServingAddr()
+	newServerArgs.JoinAddr = tc.Servers[1].ServingRPCAddr()
 	log.Infof(ctx, "stopping server %d", oldNodeIdx)
 	tc.StopServer(oldNodeIdx)
 	tc.AddServer(t, newServerArgs)
 
-	tc.WaitForStores(t, tc.Server(1).Gossip())
+	tc.WaitForStores(t, tc.Server(1).GossipI().(*gossip.Gossip))
 
 	// Ensure that all servers still running are responsive. If the two remaining
 	// original nodes don't refresh their connection to the address of the first
@@ -190,7 +187,7 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 		}
 		kvClient := server.DB()
 		if err := kvClient.Put(ctx, fmt.Sprintf("%d", i), i); err != nil {
-			t.Errorf("failed Put to node %d: %s", i, err)
+			t.Errorf("failed Put to node %d: %+v", i, err)
 		}
 	}
 }

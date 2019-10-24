@@ -1,24 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package props
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // AvailableRuleProps is a bit set that indicates when lazily-populated Rule
@@ -45,8 +41,11 @@ const (
 	// is populated.
 	HasHoistableSubquery
 
-	// JoinSize is set when the Scalar.Rule.JoinSize field is populated.
+	// JoinSize is set when the Relational.Rule.JoinSize field is populated.
 	JoinSize
+
+	// WithUses is set when the Shared.Rule.WithUses field is populated.
+	WithUses
 )
 
 // Shared are properties that are shared by both relational and scalar
@@ -165,6 +164,14 @@ type Shared struct {
 	// HasPlaceholder is true if the subtree rooted at this expression contains
 	// at least one Placeholder operator.
 	HasPlaceholder bool
+
+	// Rule props are lazily calculated and typically only apply to a single
+	// rule. See the comment above Relational.Rule for more details.
+	Rule struct {
+		// WithUses tracks the number of times each With expression has been
+		// referenced in the given expression.
+		WithUses map[opt.WithID]int
+	}
 }
 
 // Relational properties describe the content and characteristics of relational
@@ -426,7 +433,10 @@ func (s *Scalar) SetAvailable(p AvailableRuleProps) {
 //
 func (s *Shared) Verify() {
 	if s.HasCorrelatedSubquery && !s.HasSubquery {
-		panic(pgerror.AssertionFailedf("HasSubquery cannot be false if HasCorrelatedSubquery is true"))
+		panic(errors.AssertionFailedf("HasSubquery cannot be false if HasCorrelatedSubquery is true"))
+	}
+	if s.CanMutate && !s.CanHaveSideEffects {
+		panic(errors.AssertionFailedf("CanHaveSideEffects cannot be false if CanMutate is true"))
 	}
 }
 
@@ -444,17 +454,23 @@ func (r *Relational) Verify() {
 	r.FuncDeps.Verify()
 
 	if !r.NotNullCols.SubsetOf(r.OutputCols) {
-		panic(pgerror.AssertionFailedf("not null cols %s not a subset of output cols %s",
+		panic(errors.AssertionFailedf("not null cols %s not a subset of output cols %s",
 			log.Safe(r.NotNullCols), log.Safe(r.OutputCols)))
 	}
 	if r.OuterCols.Intersects(r.OutputCols) {
-		panic(pgerror.AssertionFailedf("outer cols %s intersect output cols %s",
+		panic(errors.AssertionFailedf("outer cols %s intersect output cols %s",
 			log.Safe(r.OuterCols), log.Safe(r.OutputCols)))
 	}
 	if r.FuncDeps.HasMax1Row() {
 		if r.Cardinality.Max > 1 {
-			panic(pgerror.AssertionFailedf(
+			panic(errors.AssertionFailedf(
 				"max cardinality must be <= 1 if FDs have max 1 row: %s", r.Cardinality))
+		}
+	}
+	if r.IsAvailable(PruneCols) {
+		if !r.Rule.PruneCols.SubsetOf(r.OutputCols) {
+			panic(errors.AssertionFailedf("prune cols %s must be a subset of output cols %s",
+				log.Safe(r.Rule.PruneCols), log.Safe(r.OutputCols)))
 		}
 	}
 }
@@ -464,12 +480,12 @@ func (r *Relational) Verify() {
 // the same group).
 func (r *Relational) VerifyAgainst(other *Relational) {
 	if !r.OutputCols.Equals(other.OutputCols) {
-		panic(pgerror.AssertionFailedf("output cols mismatch: %s vs %s", log.Safe(r.OutputCols), log.Safe(other.OutputCols)))
+		panic(errors.AssertionFailedf("output cols mismatch: %s vs %s", log.Safe(r.OutputCols), log.Safe(other.OutputCols)))
 	}
 
 	if r.Cardinality.Max < other.Cardinality.Min ||
 		r.Cardinality.Min > other.Cardinality.Max {
-		panic(pgerror.AssertionFailedf("cardinality mismatch: %s vs %s", log.Safe(r.Cardinality), log.Safe(other.Cardinality)))
+		panic(errors.AssertionFailedf("cardinality mismatch: %s vs %s", log.Safe(r.Cardinality), log.Safe(other.Cardinality)))
 	}
 
 	// NotNullCols, FuncDeps are best effort, so they might differ.

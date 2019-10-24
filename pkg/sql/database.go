@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -21,8 +17,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -82,7 +78,7 @@ func getKeysForDatabaseDescriptor(
 	dbDesc *sqlbase.DatabaseDescriptor,
 ) (zoneKey roachpb.Key, nameKey roachpb.Key, descKey roachpb.Key) {
 	zoneKey = config.MakeZoneKey(uint32(dbDesc.ID))
-	nameKey = sqlbase.MakeNameMetadataKey(keys.RootNamespaceID, dbDesc.GetName())
+	nameKey = sqlbase.NewDatabaseKey(dbDesc.GetName()).Key()
 	descKey = sqlbase.MakeDescMetadataKey(dbDesc.ID)
 	return
 }
@@ -170,7 +166,7 @@ func (dc *databaseCache) getCachedDatabaseDescByID(
 
 	database := desc.GetDatabase()
 	if database == nil {
-		return nil, pgerror.Newf(pgerror.CodeWrongObjectTypeError, "[%d] is not a database", id)
+		return nil, pgerror.Newf(pgcode.WrongObjectType, "[%d] is not a database", id)
 	}
 
 	return database, database.Validate()
@@ -196,7 +192,7 @@ func (dc *databaseCache) getDatabaseDesc(
 		if err := txnRunner(ctx, func(ctx context.Context, txn *client.Txn) error {
 			a := UncachedPhysicalAccessor{}
 			desc, err = a.GetDatabaseDesc(ctx, txn, name,
-				DatabaseLookupFlags{required: required})
+				tree.DatabaseLookupFlags{Required: required})
 			return err
 		}); err != nil {
 			return nil, err
@@ -214,8 +210,10 @@ func (dc *databaseCache) getDatabaseDescByID(
 	ctx context.Context, txn *client.Txn, id sqlbase.ID,
 ) (*sqlbase.DatabaseDescriptor, error) {
 	desc, err := dc.getCachedDatabaseDescByID(id)
-	if err != nil {
-		log.VEventf(ctx, 3, "error getting database descriptor from cache: %s", err)
+	if desc == nil || err != nil {
+		if err != nil {
+			log.VEventf(ctx, 3, "error getting database descriptor from cache: %s", err)
+		}
 		desc, err = MustGetDatabaseDescByID(ctx, txn, id)
 	}
 	return desc, err
@@ -301,7 +299,7 @@ func (p *planner) renameDatabase(
 
 	if err := p.txn.Run(ctx, b); err != nil {
 		if _, ok := err.(*roachpb.ConditionFailedError); ok {
-			return pgerror.Newf(pgerror.CodeDuplicateDatabaseError,
+			return pgerror.Newf(pgcode.DuplicateDatabase,
 				"the new database name %q already exists", newName)
 		}
 		return err

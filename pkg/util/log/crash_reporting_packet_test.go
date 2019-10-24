@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log_test
 
@@ -28,7 +24,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	raven "github.com/getsentry/raven-go"
+	"github.com/kr/pretty"
 )
+
+// Renumber lines so they're stable no matter what changes above. (We
+// could make the regexes accept any string of digits, but we also
+// want to make sure that the correct line numbers get captured).
+//
+//line crash_reporting_packet_test.go:1000
 
 // interceptingTransport is an implementation of raven.Transport that delegates
 // calls to the Send method to the send function contained within.
@@ -103,9 +106,9 @@ func TestCrashReportingPacket(t *testing.T) {
 			message := prefix
 			// gccgo stack traces are different in the presence of function literals.
 			if runtime.Compiler == "gccgo" {
-				message += "82"
+				message += "[0-9]+" // TODO(bdarnell): verify on gccgo
 			} else {
-				message += "85"
+				message += "1053"
 			}
 			message += ": " + panicPre
 			return message
@@ -114,9 +117,9 @@ func TestCrashReportingPacket(t *testing.T) {
 			message := prefix
 			// gccgo stack traces are different in the presence of function literals.
 			if runtime.Compiler == "gccgo" {
-				message += "88"
+				message += "[0-9]+" // TODO(bdarnell): verify on gccgo
 			} else {
-				message += "93"
+				message += "1061"
 			}
 			message += ": " + panicPost
 			return message
@@ -199,11 +202,13 @@ func TestInternalErrorReporting(t *testing.T) {
 
 	p := packets[0]
 
-	// Work aronud the linter.
+	t.Logf("%# v", pretty.Formatter(p))
+
+	// Work around the linter.
 	// We don't care about "slow matchstring" below because there are only few iterations.
 	m := func(a, b string) (bool, error) { return regexp.MatchString(a, b) }
 
-	if ok, _ := m(`builtins.go.* %s \| string`, p.Message); !ok {
+	if ok, _ := m(`builtins.go:\d+:.*`, p.Message); !ok {
 		t.Errorf("expected assertion error location in message, got:\n%s", p.Message)
 	}
 
@@ -211,20 +216,29 @@ func TestInternalErrorReporting(t *testing.T) {
 		t.Errorf("expected builtins in culprit, got %q", p.Culprit)
 	}
 
-	if ok, _ := m(
-		".*builtins.go.*\n.*eval.go.*Eval",
-		p.Extra["stacktrace_0"].(string),
-	); !ok {
-		t.Errorf("expected builtins, Eval in first stack trace, got:\n%s",
-			p.Extra["stacktrace_0"])
+	expectedExtra := []struct {
+		key   string
+		reVal string
+	}{
+		{"1: details", "%s\n.*<string>"},
+		{"2: stacktrace", `.*builtins.go.*\n.*eval.go.*Eval`},
+		{"3: details", `%s\(\).*\n.*force_assertion_error`},
+		{"4: stacktrace", ".*eval.go.*Eval"},
 	}
-
-	if ok, _ := m(
-		".*eval.go.*Eval",
-		p.Extra["stacktrace_1"].(string),
-	); !ok {
-		t.Errorf("expected eval in second stack trace, got:\n%s",
-			p.Extra["stacktrace_1"])
+	for _, ex := range expectedExtra {
+		data, ok := p.Extra[ex.key]
+		if !ok {
+			t.Errorf("expected detail %q in extras, was not found", ex.key)
+			continue
+		}
+		sdata, ok := data.(string)
+		if !ok {
+			t.Errorf("expected detail %q of type string, found %T (%q)", ex.key, data, data)
+			continue
+		}
+		if ok, _ := m(ex.reVal, sdata); !ok {
+			t.Errorf("expected detail %q to match:\n%s\ngot:\n%s", ex.key, ex.reVal, sdata)
+		}
 	}
 
 	if len(p.Interfaces) < 2 {
@@ -237,8 +251,15 @@ func TestInternalErrorReporting(t *testing.T) {
 		switch part := iv.(type) {
 		case *raven.Message:
 			if ok, _ := m(
-				`\(0\) builtins.go:\d+: %s \| string`+"\n"+
-					`\(1\) eval.go:\d+: %s\(\) \| crdb_internal.force_assertion_error`,
+				`\*errors.errorString\n`+
+					`\*safedetails.withSafeDetails: %s \(1\)\n`+
+					`builtins.go:\d+: \*withstack.withStack \(2\)\n`+
+					`\*assert.withAssertionFailure\n`+
+					`\*errutil.withMessage\n`+
+					`\*safedetails.withSafeDetails: %s\(\) \(3\)\n`+
+					`eval.go:\d+: \*withstack.withStack \(4\)\n`+
+					`\*telemetrykeys.withTelemetry: crdb_internal.force_assertion_error\(\) \(5\)\n`+
+					`\(check the extra data payloads\)`,
 				part.Message,
 			); !ok {
 				t.Errorf("expected stack of message, got:\n%s", part.Message)
@@ -246,7 +267,7 @@ func TestInternalErrorReporting(t *testing.T) {
 			msgCount++
 		case *raven.Exception:
 			if ok, _ := m(
-				`builtins.go:\d+: %s \| string`,
+				`builtins.go:\d+:.*: %s`,
 				part.Value,
 			); !ok {
 				t.Errorf("expected builtin in exception head, got:\n%s", part.Value)

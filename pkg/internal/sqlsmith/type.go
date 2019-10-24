@@ -1,44 +1,85 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlsmith
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 func typeFromName(name string) *types.T {
 	typ, err := parser.ParseType(name)
 	if err != nil {
-		panic(pgerror.AssertionFailedf("failed to parse type: %v", name))
+		panic(errors.AssertionFailedf("failed to parse type: %v", name))
 	}
 	return typ
 }
 
 // pickAnyType returns a concrete type if typ is types.Any or types.AnyArray,
 // otherwise typ.
-func pickAnyType(s *scope, typ *types.T) *types.T {
+func (s *Smither) pickAnyType(typ *types.T) (_ *types.T, ok bool) {
 	switch typ.Family() {
 	case types.AnyFamily:
-		return sqlbase.RandType(s.schema.rnd)
+		typ = s.randType()
 	case types.ArrayFamily:
 		if typ.ArrayContents().Family() == types.AnyFamily {
-			return sqlbase.RandArrayContentsType(s.schema.rnd)
+			typ = sqlbase.RandArrayContentsType(s.rnd)
 		}
 	}
-	return typ
+	return typ, s.allowedType(typ)
+}
+
+func (s *Smither) randScalarType() *types.T {
+	for {
+		t := sqlbase.RandScalarType(s.rnd)
+		if !s.allowedType(t) {
+			continue
+		}
+		return t
+	}
+}
+
+func (s *Smither) randType() *types.T {
+	for {
+		t := sqlbase.RandType(s.rnd)
+		if !s.allowedType(t) {
+			continue
+		}
+		return t
+	}
+}
+
+// allowedType returns whether t is ok to be used. This is useful to filter
+// out undesirable types to enable certain execution paths to be taken (like
+// vectorization).
+func (s *Smither) allowedType(types ...*types.T) bool {
+	for _, t := range types {
+		if s.vectorizable && typeconv.FromColumnType(t) == coltypes.Unhandled {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Smither) makeDesiredTypes() []*types.T {
+	var typs []*types.T
+	for {
+		typs = append(typs, s.randType())
+		if s.d6() < 2 || !s.canRecurse() {
+			break
+		}
+	}
+	return typs
 }

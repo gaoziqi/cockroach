@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package delegate
 
@@ -20,32 +16,65 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
 
 func (d *delegator) delegateShowCreate(n *tree.ShowCreate) (tree.Statement, error) {
+	sqltelemetry.IncrementShowCounter(sqltelemetry.Create)
 	const showCreateQuery = `
-     SELECT %[3]s AS table_name,
-            create_statement
-       FROM %[4]s.crdb_internal.create_statements
-      WHERE (database_name IS NULL OR database_name = %[1]s)
-        AND schema_name = %[5]s
-        AND descriptor_name = %[2]s`
+    SELECT
+			%[3]s AS table_name,
+			array_to_string(
+				array_cat(
+					ARRAY[create_statement],
+					zone_configuration_statements
+				),
+				e';\n'
+			)
+				AS create_statement
+		FROM
+			%[4]s.crdb_internal.create_statements
+		WHERE
+			(database_name IS NULL OR database_name = %[1]s)
+			AND schema_name = %[5]s
+			AND descriptor_name = %[2]s
+	`
 
 	return d.showTableDetails(n.Name, showCreateQuery)
 }
 
 func (d *delegator) delegateShowIndexes(n *tree.ShowIndexes) (tree.Statement, error) {
-	const getIndexesQuery = `
-    SELECT table_name,
-           index_name,
-           non_unique::BOOL,
-           seq_in_index,
-           column_name,
-           direction,
-           storing::BOOL,
-           implicit::BOOL
-    FROM %[4]s.information_schema.statistics
-    WHERE table_catalog=%[1]s AND table_schema=%[5]s AND table_name=%[2]s`
+	getIndexesQuery := `
+SELECT
+	table_name,
+	index_name,
+	non_unique::BOOL,
+	seq_in_index,
+	column_name,
+	direction,
+	storing::BOOL,
+	implicit::BOOL`
+
+	if n.WithComment {
+		getIndexesQuery += `,
+	obj_description(pg_class.oid) AS comment`
+	}
+
+	getIndexesQuery += `
+FROM
+	%[4]s.information_schema.statistics`
+
+	if n.WithComment {
+		getIndexesQuery += `
+	LEFT JOIN pg_class ON
+		statistics.index_name = pg_class.relname`
+	}
+
+	getIndexesQuery += `
+WHERE
+	table_catalog=%[1]s
+	AND table_schema=%[5]s
+	AND table_name=%[2]s`
 
 	return d.showTableDetails(n.Table, getIndexesQuery)
 }

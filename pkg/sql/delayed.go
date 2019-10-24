@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -31,9 +27,6 @@ type delayedNode struct {
 	plan        planNode
 }
 
-// delayedNode implements the autoCommitNode interface.
-var _ autoCommitNode = &delayedNode{}
-
 type nodeConstructor func(context.Context, *planner) (planNode, error)
 
 func (d *delayedNode) Next(params runParams) (bool, error) { return d.plan.Next(params) }
@@ -43,13 +36,6 @@ func (d *delayedNode) Close(ctx context.Context) {
 	if d.plan != nil {
 		d.plan.Close(ctx)
 		d.plan = nil
-	}
-}
-
-// enableAutoCommit is part of the autoCommitNode interface.
-func (d *delayedNode) enableAutoCommit() {
-	if ac, ok := d.plan.(autoCommitNode); ok {
-		ac.enableAutoCommit()
 	}
 }
 

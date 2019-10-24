@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -28,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -56,6 +53,7 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 	"golang.org/x/time/rate"
@@ -76,7 +74,7 @@ func (s *Store) TestSender() client.Sender {
 		// If the client hasn't set ba.Range, we do it a favor and figure out the
 		// range to which the request needs to go.
 		//
-		// NOTE: We don't use keys.Range(ba) here because that does some
+		// NOTE: We don't use keys.Range(ba.Requests) here because that does some
 		// validation on the batch, and some tests using this sender don't like
 		// that.
 		key, err := keys.Addr(ba.Requests[0].GetInner().Header().Key)
@@ -108,7 +106,7 @@ type testSenderFactory struct {
 }
 
 func (f *testSenderFactory) TransactionalSender(
-	typ client.TxnType, coordMeta roachpb.TxnCoordMeta,
+	typ client.TxnType, coordMeta roachpb.TxnCoordMeta, _ roachpb.UserPriority,
 ) client.TxnSender {
 	return client.NewMockTransactionalSender(
 		func(
@@ -154,7 +152,7 @@ func (db *testSender) Send(
 		return nil, roachpb.NewErrorf("%s method not supported", et.Method())
 	}
 	// Lookup range and direct request.
-	rs, err := keys.Range(ba)
+	rs, err := keys.Range(ba.Requests)
 	if err != nil {
 		return nil, roachpb.NewError(err)
 	}
@@ -426,7 +424,7 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 
 		// Bootstrap with a fake ident.
 		if err := InitEngine(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion()); err != nil {
-			t.Errorf("error bootstrapping store: %s", err)
+			t.Errorf("error bootstrapping store: %+v", err)
 		}
 
 		// Verify we can read the store ident after a flush.
@@ -434,7 +432,7 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := ReadStoreIdent(ctx, eng); err != nil {
-			t.Fatalf("unable to read store ident: %s", err)
+			t.Fatalf("unable to read store ident: %+v", err)
 		}
 
 		// Bootstrap the system ranges.
@@ -450,27 +448,27 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 			ctx, eng, kvs /* initialValues */, cfg.Settings.Version.BootstrapVersion().Version,
 			1 /* numStores */, splits, cfg.Clock.PhysicalNow(),
 		); err != nil {
-			t.Errorf("failure to create first range: %s", err)
+			t.Errorf("failure to create first range: %+v", err)
 		}
 	}
 
 	// Now, attempt to initialize a store with a now-bootstrapped range.
 	store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 	if err := store.Start(ctx, stopper); err != nil {
-		t.Fatalf("failure initializing bootstrapped store: %s", err)
+		t.Fatalf("failure initializing bootstrapped store: %+v", err)
 	}
 
 	for i := 1; i <= store.ReplicaCount(); i++ {
 		r, err := store.GetReplica(roachpb.RangeID(i))
 		if err != nil {
-			t.Fatalf("failure fetching range %d: %s", i, err)
+			t.Fatalf("failure fetching range %d: %+v", i, err)
 		}
 		rs := r.GetMVCCStats()
 
 		// Stats should agree with a recomputation.
 		now := r.store.Clock().Now()
 		if ms, err := rditer.ComputeStatsForRange(r.Desc(), eng, now.WallTime); err != nil {
-			t.Errorf("failure computing range's stats: %s", err)
+			t.Errorf("failure computing range's stats: %+v", err)
 		} else if ms != rs {
 			t.Errorf("expected range's stats to agree with recomputation: %s", pretty.Diff(ms, rs))
 		}
@@ -489,7 +487,7 @@ func TestBootstrapOfNonEmptyStore(t *testing.T) {
 
 	// Put some random garbage into the engine.
 	if err := eng.Put(engine.MakeMVCCMetadataKey(roachpb.Key("foo")), []byte("bar")); err != nil {
-		t.Errorf("failure putting key foo into engine: %s", err)
+		t.Errorf("failure putting key foo into engine: %+v", err)
 	}
 	cfg := TestStoreConfig(nil)
 	cfg.Transport = NewDummyRaftTransport(cfg.Settings)
@@ -499,14 +497,14 @@ func TestBootstrapOfNonEmptyStore(t *testing.T) {
 	switch err := errors.Cause(store.Start(ctx, stopper)); err.(type) {
 	case *NotBootstrappedError:
 	default:
-		t.Errorf("unexpected error initializing un-bootstrapped store: %v", err)
+		t.Errorf("unexpected error initializing un-bootstrapped store: %+v", err)
 	}
 
 	// Bootstrap should fail on non-empty engine.
 	switch err := errors.Cause(InitEngine(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion())); err.(type) {
 	case *NotBootstrappedError:
 	default:
-		t.Errorf("unexpected error bootstrapping non-empty store: %v", err)
+		t.Errorf("unexpected error bootstrapping non-empty store: %+v", err)
 	}
 }
 
@@ -572,8 +570,8 @@ func TestStoreAddRemoveRanges(t *testing.T) {
 	// Try to remove range 1 again.
 	if err := store.RemoveReplica(context.Background(), repl1, repl1.Desc().NextReplicaID, RemoveOptions{
 		DestroyData: true,
-	}); err == nil {
-		t.Fatal("expected error re-removing same range")
+	}); err != nil {
+		t.Fatalf("didn't expect error re-removing same range: %v", err)
 	}
 	// Try to add a range with previously-used (but now removed) ID.
 	repl2Dup := createReplica(store, 1, roachpb.RKey("a"), roachpb.RKey("b"))
@@ -715,11 +713,10 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 
 	// Verify that removal of a replica marks it as destroyed so that future raft
 	// commands on the Replica will silently be dropped.
-	if err := repl1.withRaftGroup(true, func(r *raft.RawNode) (bool, error) {
+	err = repl1.withRaftGroup(true, func(r *raft.RawNode) (bool, error) {
 		return true, errors.Errorf("unexpectedly created a raft group")
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
+	require.Equal(t, errRemoved, err)
 
 	repl1.mu.Lock()
 	expErr := roachpb.NewError(repl1.mu.destroyStatus.err)
@@ -731,7 +728,7 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 	}
 
 	if _, _, _, pErr := repl1.evalAndPropose(
-		context.Background(), lease, roachpb.BatchRequest{}, nil, &allSpans,
+		context.Background(), lease, &roachpb.BatchRequest{}, &allSpans, endCmds{},
 	); !pErr.Equal(expErr) {
 		t.Fatalf("expected error %s, but got %v", expErr, pErr)
 	}
@@ -1338,34 +1335,30 @@ func TestStoreSendBadRange(t *testing.T) {
 // See #702
 // TODO(bdarnell): convert tests that use this function to use AdminSplit instead.
 func splitTestRange(store *Store, key, splitKey roachpb.RKey, t *testing.T) *Replica {
+	ctx := context.Background()
 	repl := store.LookupReplica(key)
-	if repl == nil {
-		t.Fatalf("couldn't lookup range for key %q", key)
-	}
-	desc, err := store.NewRangeDescriptor(
-		context.Background(), splitKey, repl.Desc().EndKey, repl.Desc().InternalReplicas)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NotNil(t, repl)
+	rangeID, err := store.AllocateRangeID(ctx)
+	require.NoError(t, err)
+	rhsDesc := roachpb.NewRangeDescriptor(
+		rangeID, splitKey, repl.Desc().EndKey, repl.Desc().Replicas())
 	// Minimal amount of work to keep this deprecated machinery working: Write
 	// some required Raft keys.
-	if _, err := stateloader.WriteInitialState(
-		context.Background(), store.engine, enginepb.MVCCStats{},
-		*desc, roachpb.Lease{}, hlc.Timestamp{}, hlc.Timestamp{},
-		store.ClusterSettings().Version.Version().Version,
-		stateloader.TruncatedStateUnreplicated,
-	); err != nil {
-		t.Fatal(err)
-	}
-	newRng, err := NewReplica(desc, store, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cv := store.ClusterSettings().Version.Version().Version
+	_, err = stateloader.WriteInitialState(
+		context.Background(), store.engine, enginepb.MVCCStats{}, *rhsDesc, roachpb.Lease{},
+		hlc.Timestamp{}, cv, stateloader.TruncatedStateUnreplicated,
+	)
+	require.NoError(t, err)
+	newRng, err := NewReplica(rhsDesc, store, 0)
+	require.NoError(t, err)
 	newLeftDesc := *repl.Desc()
 	newLeftDesc.EndKey = splitKey
-	if err = store.SplitRange(repl.AnnotateCtx(context.TODO()), repl, newRng, newLeftDesc); err != nil {
-		t.Fatal(err)
-	}
+	err = store.SplitRange(repl.AnnotateCtx(context.TODO()), repl, newRng, &roachpb.SplitTrigger{
+		RightDesc: *rhsDesc,
+		LeftDesc:  newLeftDesc,
+	})
+	require.NoError(t, err)
 	return newRng
 }
 
@@ -1402,8 +1395,10 @@ func TestStoreSendOutOfRange(t *testing.T) {
 // allocated in successive blocks.
 func TestStoreRangeIDAllocation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(ctx)
 	store, _ := createTestStore(t,
 		testStoreOpts{
 			// This test was written before test stores could start with more than one
@@ -1415,15 +1410,9 @@ func TestStoreRangeIDAllocation(t *testing.T) {
 	// Range IDs should be allocated from ID 2 (first allocated range)
 	// to rangeIDAllocCount * 3 + 1.
 	for i := 0; i < rangeIDAllocCount*3; i++ {
-		replicas := []roachpb.ReplicaDescriptor{{StoreID: store.StoreID()}}
-		desc, err := store.NewRangeDescriptor(context.Background(),
-			roachpb.RKey(fmt.Sprintf("%03d", i)), roachpb.RKey(fmt.Sprintf("%03d", i+1)), replicas)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if desc.RangeID != roachpb.RangeID(2+i) {
-			t.Errorf("expected range id %d; got %d", 2+i, desc.RangeID)
-		}
+		rangeID, err := store.AllocateRangeID(ctx)
+		require.NoError(t, err)
+		require.EqualValues(t, 2+i, rangeID)
 	}
 }
 
@@ -1509,8 +1498,8 @@ func TestStoreSetRangesMaxBytes(t *testing.T) {
 	}
 
 	// Set zone configs.
-	config.TestingSetZoneConfig(baseID, config.ZoneConfig{RangeMaxBytes: proto.Int64(1 << 20)})
-	config.TestingSetZoneConfig(baseID+2, config.ZoneConfig{RangeMaxBytes: proto.Int64(2 << 20)})
+	config.TestingSetZoneConfig(baseID, zonepb.ZoneConfig{RangeMaxBytes: proto.Int64(1 << 20)})
+	config.TestingSetZoneConfig(baseID+2, zonepb.ZoneConfig{RangeMaxBytes: proto.Int64(2 << 20)})
 
 	// Despite faking the zone configs, we still need to have a system config
 	// entry so that the store picks up the new zone configs. This new system
@@ -1579,6 +1568,7 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 		manual.Increment(100)
 		// Now, try a put using the pusher's txn.
 		h.Txn = pusher
+		h.DeferWriteTooOldError = true
 		resultCh := make(chan *roachpb.Error, 1)
 		go func() {
 			_, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), h, &pArgs)
@@ -1766,7 +1756,8 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 			{
 				args := putArgs(key, []byte("value2"))
 				assignSeqNumsForReqs(pushee, &args)
-				if _, pErr := client.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Txn: pushee}, &args); pErr != nil {
+				h := roachpb.Header{Txn: pushee, DeferWriteTooOldError: true}
+				if _, pErr := client.SendWrappedWith(ctx, store.TestSender(), h, &args); pErr != nil {
 					t.Fatal(pErr)
 				}
 			}
@@ -1896,7 +1887,7 @@ func TestStoreResolveWriteIntentNoTxn(t *testing.T) {
 	if ok, err := engine.MVCCGetProto(
 		context.Background(), store.Engine(), txnKey, hlc.Timestamp{}, &txn, engine.MVCCGetOptions{},
 	); !ok || err != nil {
-		t.Fatalf("not found or err: %s", err)
+		t.Fatalf("not found or err: %+v", err)
 	}
 	if txn.Status != roachpb.ABORTED {
 		t.Errorf("expected pushee to be aborted; got %s", txn.Status)
@@ -2489,12 +2480,10 @@ func TestStoreScanMultipleIntents(t *testing.T) {
 	// in a single batch.
 	manual.Increment(txnwait.TxnLivenessThreshold.Nanoseconds() + 1)
 
-	// Query the range with a single INCONSISTENT scan, which should
-	// cause all intents to be resolved.
+	// Query the range with a single scan, which should cause all intents
+	// to be resolved.
 	sArgs := scanArgs(key1, key10.Next())
-	if _, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{
-		ReadConsistency: roachpb.INCONSISTENT,
-	}, &sArgs); pErr != nil {
+	if _, pErr := client.SendWrapped(context.Background(), store.TestSender(), &sArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -2760,7 +2749,7 @@ func TestStoreRangePlaceholders(t *testing.T) {
 		t.Fatalf("could not re-add placeholder after removal, got %s", err)
 	}
 	if err := s.addPlaceholderLocked(placeholder1); !testutils.IsError(err, ".*overlaps with existing KeyRange") {
-		t.Fatalf("should not be able to add ReplicaPlaceholder for the same key twice, got: %v", err)
+		t.Fatalf("should not be able to add ReplicaPlaceholder for the same key twice, got: %+v", err)
 	}
 
 	// Test cannot double delete a placeholder.
@@ -2782,7 +2771,7 @@ func TestStoreRangePlaceholders(t *testing.T) {
 
 	// Test that placeholder cannot clobber existing replica.
 	if err := s.addPlaceholderLocked(placeholder1); !testutils.IsError(err, ".*overlaps with existing KeyRange") {
-		t.Fatalf("should not be able to add ReplicaPlaceholder when Replica already exists, got: %v", err)
+		t.Fatalf("should not be able to add ReplicaPlaceholder when Replica already exists, got: %+v", err)
 	}
 
 	// Test that Placeholder deletion doesn't delete replicas.
@@ -2813,9 +2802,7 @@ func TestStoreRemovePlaceholderOnError(t *testing.T) {
 	}
 
 	// Generate a minimal fake snapshot.
-	snapData := &roachpb.RaftSnapshotData{
-		RangeDescriptor: *repl1.Desc(),
-	}
+	snapData := &roachpb.RaftSnapshotData{}
 	data, err := protoutil.Marshal(snapData)
 	if err != nil {
 		t.Fatal(err)
@@ -2847,7 +2834,7 @@ func TestStoreRemovePlaceholderOnError(t *testing.T) {
 		},
 	}
 	const expected = "preemptive snapshot from term 0 received"
-	if err := s.processRaftSnapshotRequest(ctx, snapHeader,
+	if err := s.processPreemptiveSnapshotRequest(ctx, snapHeader,
 		IncomingSnapshot{
 			SnapUUID: uuid.MakeV4(),
 			State:    &storagepb.ReplicaState{Desc: repl1.Desc()},
@@ -2879,7 +2866,8 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 	s := tc.store
 	ctx := context.Background()
 
-	// Clobber the existing range so we can test nonoverlapping placeholders.
+	// Clobber the existing range and recreated it with an uninitialized
+	// descriptor so we can test nonoverlapping placeholders.
 	repl1, err := s.GetReplica(1)
 	if err != nil {
 		t.Fatal(err)
@@ -2890,19 +2878,24 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	uninitDesc := roachpb.RangeDescriptor{RangeID: repl1.Desc().RangeID}
+	cv := s.ClusterSettings().Version.Version().Version
 	if _, err := stateloader.WriteInitialState(
-		ctx, s.Engine(), enginepb.MVCCStats{}, *repl1.Desc(),
-		roachpb.Lease{}, hlc.Timestamp{}, hlc.Timestamp{},
-		s.ClusterSettings().Version.Version().Version,
-		stateloader.TruncatedStateUnreplicated,
+		ctx, s.Engine(), enginepb.MVCCStats{}, uninitDesc, roachpb.Lease{},
+		hlc.Timestamp{}, cv, stateloader.TruncatedStateUnreplicated,
 	); err != nil {
+		t.Fatal(err)
+	}
+	uninitRepl1, err := NewReplica(&uninitDesc, s, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.addReplicaToRangeMapLocked(uninitRepl1); err != nil {
 		t.Fatal(err)
 	}
 
 	// Generate a minimal fake snapshot.
-	snapData := &roachpb.RaftSnapshotData{
-		RangeDescriptor: *repl1.Desc(),
-	}
+	snapData := &roachpb.RaftSnapshotData{}
 	data, err := protoutil.Marshal(snapData)
 	if err != nil {
 		t.Fatal(err)
@@ -2961,104 +2954,6 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 		}
 		return nil
 	})
-}
-
-// Test that we set proper tombstones for removed replicas and use the
-// tombstone to reject attempts to create a replica with a lesser ID.
-func TestRemovedReplicaTombstone(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	const rangeID = 1
-	creatingReplica := roachpb.ReplicaDescriptor{
-		NodeID:    2,
-		StoreID:   2,
-		ReplicaID: 2,
-	}
-
-	// All test cases assume that the starting replica ID is 1. This assumption
-	// is enforced by a check within the test logic.
-	testCases := []struct {
-		setReplicaID      roachpb.ReplicaID // set the existing replica to this before removing it
-		descNextReplicaID roachpb.ReplicaID // the descriptor's NextReplicaID during replica removal
-		createReplicaID   roachpb.ReplicaID // try creating a replica at this ID
-		expectCreated     bool
-	}{
-		{1, 2, 2, true},
-		{1, 2, 1, false},
-		{1, 2, 1, false},
-		{1, 3, 1, false},
-		{1, 3, 2, false},
-		{1, 3, 3, true},
-		{1, 99, 98, false},
-		{1, 99, 99, true},
-		{2, 2, 2, false},
-		{2, 2, 3, true},
-		{2, 2, 99, true},
-		{98, 2, 98, false},
-		{98, 2, 99, true},
-	}
-	for _, c := range testCases {
-		t.Run("", func(t *testing.T) {
-			tc := testContext{}
-			stopper := stop.NewStopper()
-			ctx := context.TODO()
-			defer stopper.Stop(ctx)
-			tc.Start(t, stopper)
-			s := tc.store
-
-			repl1, err := s.GetReplica(rangeID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			repl1.mu.Lock()
-			if repl1.mu.replicaID != 1 {
-				repl1.mu.Unlock()
-				t.Fatalf("test precondition not met; expected ReplicaID=1, got %d", repl1.mu.replicaID)
-			}
-			repl1.mu.Unlock()
-
-			// Try to trigger a race where the replica ID gets increased during the GC
-			// process by taking the store lock and inserting a short sleep to cause
-			// the goroutine to start running the setReplicaID call.
-			errChan := make(chan error)
-
-			func() {
-				repl1.raftMu.Lock()
-				defer repl1.raftMu.Unlock()
-				s.mu.Lock()
-				defer s.mu.Unlock()
-				repl1.mu.Lock()
-				defer repl1.mu.Unlock()
-
-				go func() {
-					errChan <- s.RemoveReplica(ctx, repl1, c.descNextReplicaID, RemoveOptions{DestroyData: true})
-				}()
-
-				time.Sleep(1 * time.Millisecond)
-
-				if err := repl1.setReplicaIDRaftMuLockedMuLocked(c.setReplicaID); err != nil {
-					t.Fatal(err)
-				}
-			}()
-
-			if err := <-errChan; testutils.IsError(err, "replica ID has changed") {
-				// We didn't trigger the race, so just return success.
-				return
-			} else if err != nil {
-				t.Fatal(err)
-			}
-
-			_, created, err := s.getOrCreateReplica(ctx, rangeID, c.createReplicaID, &creatingReplica)
-			if created != c.expectCreated {
-				t.Errorf("expected s.getOrCreateReplica(%d, %d, %v).created=%v, got %v",
-					rangeID, c.createReplicaID, creatingReplica, c.expectCreated, created)
-			}
-			if !c.expectCreated && !testutils.IsError(err, "raft group deleted") {
-				t.Errorf("expected s.getOrCreateReplica(%d, %d, %v).err='raft group deleted', got %v",
-					rangeID, c.createReplicaID, creatingReplica, err)
-			}
-		})
-	}
 }
 
 type fakeSnapshotStream struct {

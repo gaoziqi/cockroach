@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -23,8 +19,9 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/constraint"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
@@ -540,15 +537,15 @@ func TestConstraintsCheck(t *testing.T) {
 
 	testCases := []struct {
 		name        string
-		constraints []config.Constraints
+		constraints []zonepb.Constraints
 		expected    map[roachpb.StoreID]bool
 	}{
 		{
 			name: "required constraint",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 				},
 			},
@@ -559,10 +556,10 @@ func TestConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "required locality constraints",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Key: "datacenter", Value: "us", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Key: "datacenter", Value: "us", Type: zonepb.Constraint_REQUIRED},
 					},
 				},
 			},
@@ -575,10 +572,10 @@ func TestConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "prohibited constraints",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_PROHIBITED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_PROHIBITED},
 					},
 				},
 			},
@@ -590,10 +587,10 @@ func TestConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "prohibited locality constraints",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Key: "datacenter", Value: "us", Type: config.Constraint_PROHIBITED},
+					Constraints: []zonepb.Constraint{
+						{Key: "datacenter", Value: "us", Type: zonepb.Constraint_PROHIBITED},
 					},
 				},
 			},
@@ -603,12 +600,12 @@ func TestConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "positive constraints are ignored",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "a", Type: config.Constraint_DEPRECATED_POSITIVE},
-						{Value: "b", Type: config.Constraint_DEPRECATED_POSITIVE},
-						{Value: "c", Type: config.Constraint_DEPRECATED_POSITIVE},
+					Constraints: []zonepb.Constraint{
+						{Value: "a", Type: zonepb.Constraint_DEPRECATED_POSITIVE},
+						{Value: "b", Type: zonepb.Constraint_DEPRECATED_POSITIVE},
+						{Value: "c", Type: zonepb.Constraint_DEPRECATED_POSITIVE},
 					},
 				},
 			},
@@ -622,10 +619,10 @@ func TestConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "positive locality constraints are ignored",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Key: "datacenter", Value: "eur", Type: config.Constraint_DEPRECATED_POSITIVE},
+					Constraints: []zonepb.Constraint{
+						{Key: "datacenter", Value: "eur", Type: zonepb.Constraint_DEPRECATED_POSITIVE},
 					},
 				},
 			},
@@ -639,10 +636,10 @@ func TestConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "NumReplicas doesn't affect constraint checking",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Key: "datacenter", Value: "eur", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Key: "datacenter", Value: "eur", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
@@ -653,16 +650,16 @@ func TestConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "multiple per-replica constraints are respected",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Key: "datacenter", Value: "eur", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Key: "datacenter", Value: "eur", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
@@ -694,7 +691,7 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 
 	testCases := []struct {
 		name              string
-		constraints       []config.Constraints
+		constraints       []zonepb.Constraints
 		zoneNumReplicas   int32
 		existing          []roachpb.StoreID
 		expectedValid     map[roachpb.StoreID]bool
@@ -702,10 +699,10 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 	}{
 		{
 			name: "prohibited constraint",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_PROHIBITED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_PROHIBITED},
 					},
 				},
 			},
@@ -719,10 +716,10 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "required constraint",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 				},
 			},
@@ -735,10 +732,10 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "required constraint with NumReplicas",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 3,
 				},
@@ -755,16 +752,16 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "multiple required constraints with NumReplicas",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "a", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "a", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
@@ -785,16 +782,16 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "multiple required constraints with NumReplicas and existing replicas",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "a", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "a", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
@@ -810,16 +807,16 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "multiple required constraints with NumReplicas and not enough existing replicas",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "a", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "a", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 2,
 				},
@@ -838,16 +835,16 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "multiple required constraints with NumReplicas and sum(NumReplicas) < zone.NumReplicas",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "a", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "a", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
@@ -870,16 +867,16 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "multiple required constraints with sum(NumReplicas) < zone.NumReplicas and not enough existing replicas",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "a", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "a", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 2,
 				},
@@ -902,11 +899,11 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			zone := &config.ZoneConfig{
+			zone := &zonepb.ZoneConfig{
 				Constraints: tc.constraints,
 				NumReplicas: proto.Int32(tc.zoneNumReplicas),
 			}
-			analyzed := analyzeConstraints(
+			analyzed := constraint.AnalyzeConstraints(
 				context.Background(), getTestStoreDesc, testStoreReplicas(tc.existing), zone)
 			for _, s := range testStores {
 				valid, necessary := allocateConstraintsCheck(s, analyzed)
@@ -931,16 +928,16 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 	}
 	testCases := []struct {
 		name            string
-		constraints     []config.Constraints
+		constraints     []zonepb.Constraints
 		zoneNumReplicas int32
 		expected        map[roachpb.StoreID]expected
 	}{
 		{
 			name: "prohibited constraint",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_PROHIBITED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_PROHIBITED},
 					},
 				},
 			},
@@ -953,10 +950,10 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "required constraint",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 				},
 			},
@@ -969,10 +966,10 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "required constraint with NumReplicas",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 2,
 				},
@@ -986,16 +983,16 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "multiple required constraints with NumReplicas",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "a", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "a", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 1,
 				},
@@ -1008,10 +1005,10 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 		},
 		{
 			name: "required constraint with NumReplicas and sum(NumReplicas) < zone.NumReplicas",
-			constraints: []config.Constraints{
+			constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "b", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "b", Type: zonepb.Constraint_REQUIRED},
 					},
 					NumReplicas: 2,
 				},
@@ -1035,11 +1032,12 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 					StoreID: storeID,
 				})
 			}
-			zone := &config.ZoneConfig{
+			zone := &zonepb.ZoneConfig{
 				Constraints: tc.constraints,
 				NumReplicas: proto.Int32(tc.zoneNumReplicas),
 			}
-			analyzed := analyzeConstraints(context.Background(), getTestStoreDesc, existing, zone)
+			analyzed := constraint.AnalyzeConstraints(
+				context.Background(), getTestStoreDesc, existing, zone)
 			for storeID, expected := range tc.expected {
 				valid, necessary := removeConstraintsCheck(testStores[storeID], analyzed)
 				if e, a := expected.valid, valid; e != a {
@@ -1178,11 +1176,9 @@ func TestShouldRebalanceDiversity(t *testing.T) {
 		filteredSL := tc.sl
 		filteredSL.stores = append([]roachpb.StoreDescriptor(nil), filteredSL.stores...)
 		existingNodeLocalities := make(map[roachpb.NodeID]roachpb.Locality)
-		rangeInfo := RangeInfo{
-			Desc: &roachpb.RangeDescriptor{},
-		}
+		var replicas []roachpb.ReplicaDescriptor
 		for _, nodeID := range tc.existingNodeIDs {
-			rangeInfo.Desc.InternalReplicas = append(rangeInfo.Desc.InternalReplicas, roachpb.ReplicaDescriptor{
+			replicas = append(replicas, roachpb.ReplicaDescriptor{
 				NodeID:  nodeID,
 				StoreID: roachpb.StoreID(nodeID),
 			})
@@ -1197,8 +1193,8 @@ func TestShouldRebalanceDiversity(t *testing.T) {
 		targets := rebalanceCandidates(
 			context.Background(),
 			filteredSL,
-			analyzedConstraints{},
-			rangeInfo,
+			constraint.AnalyzedConstraints{},
+			replicas,
 			existingNodeLocalities,
 			func(nodeID roachpb.NodeID) string {
 				locality := localityForNodeID(tc.sl, nodeID)
@@ -1491,8 +1487,6 @@ func TestBalanceScore(t *testing.T) {
 	sRangesUnderfull := sMean
 	sRangesUnderfull.RangeCount = 500
 
-	ri := RangeInfo{}
-
 	testCases := []struct {
 		sc       roachpb.StoreCapacity
 		expected float64
@@ -1503,7 +1497,7 @@ func TestBalanceScore(t *testing.T) {
 		{sRangesUnderfull, 1},
 	}
 	for i, tc := range testCases {
-		if a, e := balanceScore(storeList, tc.sc, ri, options), tc.expected; a.totalScore() != e {
+		if a, e := balanceScore(storeList, tc.sc, options), tc.expected; a.totalScore() != e {
 			t.Errorf("%d: balanceScore(storeList, %+v) got %s; want %.2f", i, tc.sc, a, e)
 		}
 	}

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package builtins
 
@@ -18,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -177,8 +174,6 @@ var _ tree.WindowFunc = &firstValueWindow{}
 var _ tree.WindowFunc = &lastValueWindow{}
 var _ tree.WindowFunc = &nthValueWindow{}
 
-const noFilterIdx = -1
-
 // aggregateWindowFunc aggregates over the the current row's window frame, using
 // the internal tree.AggregateFunc to perform the aggregation.
 type aggregateWindowFunc struct {
@@ -199,25 +194,17 @@ func NewAggregateWindowFunc(
 func (w *aggregateWindowFunc) Compute(
 	ctx context.Context, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun,
 ) (tree.Datum, error) {
-	if !wfr.FirstInPeerGroup() {
+	if !wfr.FirstInPeerGroup() && wfr.DefaultFrameExclusion() {
 		return w.peerRes, nil
 	}
 
 	// Accumulate all values in the peer group at the same time, as these
 	// must return the same value.
 	for i := 0; i < wfr.PeerHelper.GetRowCount(wfr.CurRowPeerGroupNum); i++ {
-		if wfr.FilterColIdx != noFilterIdx {
-			row, err := wfr.Rows.GetRow(ctx, wfr.RowIdx+i)
-			if err != nil {
-				return nil, err
-			}
-			datum, err := row.GetDatum(wfr.FilterColIdx)
-			if err != nil {
-				return nil, err
-			}
-			if datum != tree.DBoolTrue {
-				continue
-			}
+		if skipped, err := wfr.IsRowSkipped(ctx, wfr.RowIdx+i); err != nil {
+			return nil, err
+		} else if skipped {
+			continue
 		}
 		args, err := wfr.ArgsWithRowOffset(ctx, i)
 		if err != nil {
@@ -244,7 +231,13 @@ func (w *aggregateWindowFunc) Compute(
 	return w.peerRes, nil
 }
 
-func (w *aggregateWindowFunc) Close(ctx context.Context, evalCtx *tree.EvalContext) {
+// Reset implements tree.WindowFunc interface.
+func (w *aggregateWindowFunc) Reset(ctx context.Context) {
+	w.agg.Reset(ctx)
+	w.peerRes = nil
+}
+
+func (w *aggregateWindowFunc) Close(ctx context.Context, _ *tree.EvalContext) {
 	w.agg.Close(ctx)
 }
 
@@ -276,8 +269,17 @@ func newFramableAggregateWindow(
 func (w *framableAggregateWindowFunc) Compute(
 	ctx context.Context, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun,
 ) (tree.Datum, error) {
-	if !wfr.FirstInPeerGroup() {
+	if !wfr.FirstInPeerGroup() && wfr.DefaultFrameExclusion() {
 		return w.agg.peerRes, nil
+	}
+	if wfr.FullPartitionIsInWindow() {
+		// Full partition is always inside of the window, and aggregations will
+		// return the same result for all of the rows, so we're actually performing
+		// the aggregation once, on the first row, and reuse the result for all
+		// other rows.
+		if wfr.RowIdx > 0 {
+			return w.agg.peerRes, nil
+		}
 	}
 	if !w.shouldReset {
 		// We should not reset, so we will use the same aggregateWindowFunc.
@@ -301,18 +303,10 @@ func (w *framableAggregateWindowFunc) Compute(
 		return nil, err
 	}
 	for i := frameStartIdx; i < frameEndIdx; i++ {
-		if wfr.FilterColIdx != noFilterIdx {
-			row, err := wfr.Rows.GetRow(ctx, i)
-			if err != nil {
-				return nil, err
-			}
-			datum, err := row.GetDatum(wfr.FilterColIdx)
-			if err != nil {
-				return nil, err
-			}
-			if datum != tree.DBoolTrue {
-				continue
-			}
+		if skipped, err := wfr.IsRowSkipped(ctx, i); err != nil {
+			return nil, err
+		} else if skipped {
+			continue
 		}
 		args, err := wfr.ArgsByRowIdx(ctx, i)
 		if err != nil {
@@ -339,6 +333,11 @@ func (w *framableAggregateWindowFunc) Compute(
 	return w.agg.peerRes, nil
 }
 
+// Reset implements tree.WindowFunc interface.
+func (w *framableAggregateWindowFunc) Reset(ctx context.Context) {
+	w.agg.Reset(ctx)
+}
+
 func (w *framableAggregateWindowFunc) Close(ctx context.Context, evalCtx *tree.EvalContext) {
 	w.agg.Close(ctx, evalCtx)
 }
@@ -356,6 +355,9 @@ func (rowNumberWindow) Compute(
 ) (tree.Datum, error) {
 	return tree.NewDInt(tree.DInt(wfr.RowIdx + 1 /* one-indexed */)), nil
 }
+
+// Reset implements tree.WindowFunc interface.
+func (rowNumberWindow) Reset(context.Context) {}
 
 func (rowNumberWindow) Close(context.Context, *tree.EvalContext) {}
 
@@ -375,6 +377,11 @@ func (w *rankWindow) Compute(
 		w.peerRes = tree.NewDInt(tree.DInt(wfr.Rank()))
 	}
 	return w.peerRes, nil
+}
+
+// Reset implements tree.WindowFunc interface.
+func (w *rankWindow) Reset(context.Context) {
+	w.peerRes = nil
 }
 
 func (w *rankWindow) Close(context.Context, *tree.EvalContext) {}
@@ -397,6 +404,12 @@ func (w *denseRankWindow) Compute(
 		w.peerRes = tree.NewDInt(tree.DInt(w.denseRank))
 	}
 	return w.peerRes, nil
+}
+
+// Reset implements tree.WindowFunc interface.
+func (w *denseRankWindow) Reset(context.Context) {
+	w.denseRank = 0
+	w.peerRes = nil
 }
 
 func (w *denseRankWindow) Close(context.Context, *tree.EvalContext) {}
@@ -428,6 +441,11 @@ func (w *percentRankWindow) Compute(
 	return w.peerRes, nil
 }
 
+// Reset implements tree.WindowFunc interface.
+func (w *percentRankWindow) Reset(context.Context) {
+	w.peerRes = nil
+}
+
 func (w *percentRankWindow) Close(context.Context, *tree.EvalContext) {}
 
 // cumulativeDistWindow computes the relative rank of the current row using:
@@ -450,6 +468,11 @@ func (w *cumulativeDistWindow) Compute(
 	return w.peerRes, nil
 }
 
+// Reset implements tree.WindowFunc interface.
+func (w *cumulativeDistWindow) Reset(context.Context) {
+	w.peerRes = nil
+}
+
 func (w *cumulativeDistWindow) Close(context.Context, *tree.EvalContext) {}
 
 // ntileWindow computes an integer ranging from 1 to the argument value, dividing
@@ -466,7 +489,7 @@ func newNtileWindow([]*types.T, *tree.EvalContext) tree.WindowFunc {
 }
 
 var errInvalidArgumentForNtile = pgerror.Newf(
-	pgerror.CodeInvalidParameterValueError, "argument of ntile() must be greater than zero")
+	pgcode.InvalidParameterValue, "argument of ntile() must be greater than zero")
 
 func (w *ntileWindow) Compute(
 	ctx context.Context, _ *tree.EvalContext, wfr *tree.WindowFrameRun,
@@ -516,6 +539,14 @@ func (w *ntileWindow) Compute(
 		w.curBucketCount = 1
 	}
 	return w.ntile, nil
+}
+
+// Reset implements tree.WindowFunc interface.
+func (w *ntileWindow) Reset(context.Context) {
+	w.boundary = 0
+	w.curBucketCount = 0
+	w.ntile = nil
+	w.remainder = 0
 }
 
 func (w *ntileWindow) Close(context.Context, *tree.EvalContext) {}
@@ -581,6 +612,9 @@ func (w *leadLagWindow) Compute(
 	return args[0], nil
 }
 
+// Reset implements tree.WindowFunc interface.
+func (w *leadLagWindow) Reset(context.Context) {}
+
 func (w *leadLagWindow) Close(context.Context, *tree.EvalContext) {}
 
 // firstValueWindow returns value evaluated at the row that is the first row of the window frame.
@@ -597,12 +631,27 @@ func (firstValueWindow) Compute(
 	if err != nil {
 		return nil, err
 	}
-	row, err := wfr.Rows.GetRow(ctx, frameStartIdx)
+	frameEndIdx, err := wfr.FrameEndIdx(ctx, evalCtx)
 	if err != nil {
 		return nil, err
 	}
-	return row.GetDatum(int(wfr.ArgsIdxs[0]))
+	for idx := frameStartIdx; idx < frameEndIdx; idx++ {
+		if skipped, err := wfr.IsRowSkipped(ctx, idx); err != nil {
+			return nil, err
+		} else if !skipped {
+			row, err := wfr.Rows.GetRow(ctx, idx)
+			if err != nil {
+				return nil, err
+			}
+			return row.GetDatum(int(wfr.ArgsIdxs[0]))
+		}
+	}
+	// All rows are skipped from the frame, so it is empty, and we return NULL.
+	return tree.DNull, nil
 }
+
+// Reset implements tree.WindowFunc interface.
+func (firstValueWindow) Reset(context.Context) {}
 
 func (firstValueWindow) Close(context.Context, *tree.EvalContext) {}
 
@@ -616,16 +665,31 @@ func newLastValueWindow([]*types.T, *tree.EvalContext) tree.WindowFunc {
 func (lastValueWindow) Compute(
 	ctx context.Context, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun,
 ) (tree.Datum, error) {
+	frameStartIdx, err := wfr.FrameStartIdx(ctx, evalCtx)
+	if err != nil {
+		return nil, err
+	}
 	frameEndIdx, err := wfr.FrameEndIdx(ctx, evalCtx)
 	if err != nil {
 		return nil, err
 	}
-	row, err := wfr.Rows.GetRow(ctx, frameEndIdx-1)
-	if err != nil {
-		return nil, err
+	for idx := frameEndIdx - 1; idx >= frameStartIdx; idx-- {
+		if skipped, err := wfr.IsRowSkipped(ctx, idx); err != nil {
+			return nil, err
+		} else if !skipped {
+			row, err := wfr.Rows.GetRow(ctx, idx)
+			if err != nil {
+				return nil, err
+			}
+			return row.GetDatum(int(wfr.ArgsIdxs[0]))
+		}
 	}
-	return row.GetDatum(int(wfr.ArgsIdxs[0]))
+	// All rows are skipped from the frame, so it is empty, and we return NULL.
+	return tree.DNull, nil
 }
+
+// Reset implements tree.WindowFunc interface.
+func (lastValueWindow) Reset(context.Context) {}
 
 func (lastValueWindow) Close(context.Context, *tree.EvalContext) {}
 
@@ -638,7 +702,7 @@ func newNthValueWindow([]*types.T, *tree.EvalContext) tree.WindowFunc {
 }
 
 var errInvalidArgumentForNthValue = pgerror.Newf(
-	pgerror.CodeInvalidParameterValueError, "argument of nth_value() must be greater than zero")
+	pgcode.InvalidParameterValue, "argument of nth_value() must be greater than zero")
 
 func (nthValueWindow) Compute(
 	ctx context.Context, evalCtx *tree.EvalContext, wfr *tree.WindowFrameRun,
@@ -657,23 +721,51 @@ func (nthValueWindow) Compute(
 		return nil, errInvalidArgumentForNthValue
 	}
 
-	frameSize, err := wfr.FrameSize(ctx, evalCtx)
-	if err != nil {
-		return nil, err
-	}
-	if nth > frameSize {
-		return tree.DNull, nil
-	}
-
 	frameStartIdx, err := wfr.FrameStartIdx(ctx, evalCtx)
 	if err != nil {
 		return nil, err
 	}
-	row, err := wfr.Rows.GetRow(ctx, frameStartIdx+nth-1)
+	frameEndIdx, err := wfr.FrameEndIdx(ctx, evalCtx)
+	if err != nil {
+		return nil, err
+	}
+	if nth > frameEndIdx-frameStartIdx {
+		// The requested index is definitely outside of the window frame, so we
+		// return NULL.
+		return tree.DNull, nil
+	}
+	var idx int
+	// Note that we do not need to check whether a filter is present because
+	// filters are only supported for aggregate functions.
+	if wfr.DefaultFrameExclusion() {
+		// We subtract 1 because nth is counting from 1.
+		idx = frameStartIdx + nth - 1
+	} else {
+		ith := 0
+		for idx = frameStartIdx; idx < frameEndIdx; idx++ {
+			if skipped, err := wfr.IsRowSkipped(ctx, idx); err != nil {
+				return nil, err
+			} else if !skipped {
+				ith++
+				if ith == nth {
+					// idx now points at the desired row.
+					break
+				}
+			}
+		}
+		if idx == frameEndIdx {
+			// The requested index is outside of the window frame, so we return NULL.
+			return tree.DNull, nil
+		}
+	}
+	row, err := wfr.Rows.GetRow(ctx, idx)
 	if err != nil {
 		return nil, err
 	}
 	return row.GetDatum(int(wfr.ArgsIdxs[0]))
 }
+
+// Reset implements tree.WindowFunc interface.
+func (nthValueWindow) Reset(context.Context) {}
 
 func (nthValueWindow) Close(context.Context, *tree.EvalContext) {}

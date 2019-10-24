@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package client
 
@@ -30,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -59,7 +56,7 @@ func TestTxnSnowballTrace(t *testing.T) {
 	log.Event(ctx, "txn complete")
 	sp.Finish()
 	collectedSpans := tracing.GetRecording(sp)
-	dump := tracing.FormatRecordedSpans(collectedSpans)
+	dump := collectedSpans.String()
 	// dump:
 	//    0.105ms      0.000ms    event:inside txn
 	//    0.275ms      0.171ms    event:client.Txn did AutoCommit. err: <nil>
@@ -490,4 +487,25 @@ func TestUpdateDeadlineMaybe(t *testing.T) {
 	if d := *txn.deadline(); d != pastDeadline {
 		t.Errorf("unexpected deadline: %s", d)
 	}
+}
+
+// Test that, if SetSystemConfigTrigger() fails, the systemConfigTrigger has not
+// been set.
+func TestAnchoringErrorNoTrigger(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	mc := hlc.NewManualClock(1)
+	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	db := NewDB(
+		testutils.MakeAmbientCtx(),
+		MakeMockTxnSenderFactory(
+			func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
+			) (*roachpb.BatchResponse, *roachpb.Error) {
+				return nil, nil
+			}),
+		clock)
+	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */, RootTxn)
+	require.Error(t, txn.SetSystemConfigTrigger(), "unimplemented")
+	require.False(t, txn.systemConfigTrigger)
 }

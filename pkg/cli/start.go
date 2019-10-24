@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -65,24 +61,47 @@ import (
 // The function takes a filename to write the profile to.
 var jemallocHeapDump func(string) error
 
-// StartCmd starts a node by initializing the stores and joining
+// startCmd starts a node by initializing the stores and joining
 // the cluster.
-var StartCmd = &cobra.Command{
+var startCmd = &cobra.Command{
 	Use:   "start",
-	Short: "start a node",
+	Short: "start a node in a multi-node cluster",
 	Long: `
 Start a CockroachDB node, which will export data from one or more
 storage devices, specified via --store flags.
 
-If no cluster exists yet and this is the first node, no additional
-flags are required. If the cluster already exists, and this node is
-uninitialized, specify the --join flag to point to any healthy node
-(or list of nodes) already part of the cluster.
+Specify the --join flag to point to another node or nodes that are
+part of the same cluster. The other nodes do not need to be started
+yet, and if the address of the other nodes to be added are not yet
+known it is legal for the first node to join itself.
+
+If --join is not specified, the cluster will also be initialized.
+THIS BEHAVIOR IS DEPRECATED; consider using 'cockroach init' or
+'cockroach start-single-node' instead.
 `,
-	Example: `  cockroach start --insecure --store=attrs=ssd,path=/mnt/ssd1 [--join=host:port,[host:port]]`,
+	Example: `  cockroach start --insecure --store=attrs=ssd,path=/mnt/ssd1 --join=host:port,[host:port]`,
 	Args:    cobra.NoArgs,
-	RunE:    maybeShoutError(MaybeDecorateGRPCError(runStart)),
+	RunE:    maybeShoutError(MaybeDecorateGRPCError(runStartJoin)),
 }
+
+// startSingleNodeCmd starts a node by initializing the stores.
+var startSingleNodeCmd = &cobra.Command{
+	Use:   "start-single-node",
+	Short: "start a single-node cluster",
+	Long: `
+Start a CockroachDB node, which will export data from one or more
+storage devices, specified via --store flags.
+The cluster will also be automatically initialized with
+replication disabled (replication factor = 1).
+`,
+	Example: `  cockroach start-single-node --insecure --store=attrs=ssd,path=/mnt/ssd1`,
+	Args:    cobra.NoArgs,
+	RunE:    maybeShoutError(MaybeDecorateGRPCError(runStartSingleNode)),
+}
+
+// StartCmds exports startCmd and startSingleNodeCmds so that other
+// packages can add flags to them.
+var StartCmds = []*cobra.Command{startCmd, startSingleNodeCmd}
 
 // maxSizePerProfile is the maximum total size in bytes for profiles per
 // profile type.
@@ -387,11 +406,32 @@ func initTempStorageConfig(
 	return tempStorageConfig, nil
 }
 
+var errCannotUseJoin = errors.New("cannot use --join with 'cockroach start-single-node' -- use 'cockrach start' instead")
+
+func runStartSingleNode(cmd *cobra.Command, args []string) error {
+	joinFlag := flagSetForCmd(cmd).Lookup(cliflags.Join.Name)
+	if joinFlag.Changed {
+		return errCannotUseJoin
+	}
+	// Now actually set the flag as changed so that the start code
+	// doesn't warn that it was not set.
+	joinFlag.Changed = true
+	return runStart(cmd, args, true /*disableReplication*/)
+}
+
+func runStartJoin(cmd *cobra.Command, args []string) error {
+	return runStart(cmd, args, false /*disableReplication*/)
+}
+
 // runStart starts the cockroach node using --store as the list of
 // storage devices ("stores") on this machine and --join as the list
 // of other active nodes used to join this node to the cockroach
 // cluster, if this is its first time connecting.
-func runStart(cmd *cobra.Command, args []string) error {
+//
+// If the argument disableReplication is true and we are starting
+// a fresh cluster, the replication factor will be disabled in
+// all zone configs.
+func runStart(cmd *cobra.Command, args []string, disableReplication bool) error {
 	tBegin := timeutil.Now()
 
 	// First things first: if the user wants background processing,
@@ -442,16 +482,25 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// additional server configuration tweaks for the startup process
 	// must be necessarily non-logging-related, as logging parameters
 	// cannot be picked up beyond this point.
-	stopper, err := setupAndInitializeLoggingAndProfiling(ctx)
+	stopper, err := setupAndInitializeLoggingAndProfiling(ctx, cmd)
 	if err != nil {
 		return err
 	}
 
 	serverCfg.GoroutineDumpDirName = logOutputDirectory()
-	serverCfg.HeapProfileDirName = logOutputDirectory()
+
+	heapProfileDir := filepath.Join(logOutputDirectory(), base.HeapProfileDir)
+	serverCfg.HeapProfileDirName = heapProfileDir
 	// We don't care about GRPCs fairly verbose logs in most client commands,
 	// but when actually starting a server, we enable them.
 	grpcutil.SetSeverity(log.Severity_WARNING)
+
+	// Check the --join flag.
+	if !flagSetForCmd(cmd).Lookup(cliflags.Join.Name).Changed {
+		log.Shout(ctx, log.Severity_WARNING,
+			"running 'cockroach start' without --join is deprecated.\n"+
+				"Consider using 'cockroach start-single-node' or 'cockroach init' instead.")
+	}
 
 	// Now perform additional configuration tweaks specific to the start
 	// command.
@@ -491,6 +540,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// registered.
 	reportConfiguration(ctx)
 
+	// Until/unless CockroachDB embeds its own tz database, we want
+	// an early sanity check. It's better to inform the user early
+	// than to get surprising errors during SQL queries.
+	checkTzDatabaseAvailability(ctx)
+
 	// ReadyFn will be called when the server has started listening on
 	// its network sockets, but perhaps before it has done bootstrapping
 	// and thus before Start() completes.
@@ -506,6 +560,31 @@ func runStart(cmd *cobra.Command, args []string) error {
 			log.Infof(ctx, "PID file: %s", startCtx.pidFile)
 			if err := ioutil.WriteFile(startCtx.pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644); err != nil {
 				log.Errorf(ctx, "failed writing the PID: %v", err)
+			}
+		}
+
+		// If the invoker has requested an URL update, do it now that
+		// the server is ready to accept SQL connections.
+		// (Note: as stated above, ReadyFn is called after the server
+		// has started listening on its socket, but possibly before
+		// the cluster has been initialized and can start processing requests.
+		// This is OK for SQL clients, as the connection will be accepted
+		// by the network listener and will just wait/suspend until
+		// the cluster initializes, at which point it will be picked up
+		// and let the client go through, transparently.)
+		if startCtx.listeningURLFile != "" {
+			log.Infof(ctx, "listening URL file: %s", startCtx.listeningURLFile)
+			// (Re-)compute the client connection URL. We cannot do this
+			// earlier (e.g. above, in the runStart function) because
+			// at this time the address and port have not been resolved yet.
+			pgURL, err := serverCfg.PGURL(url.User(security.RootUser))
+			if err != nil {
+				log.Errorf(ctx, "failed computing the URL: %v", err)
+				return
+			}
+
+			if err = ioutil.WriteFile(startCtx.listeningURLFile, []byte(fmt.Sprintf("%s\n", pgURL)), 0644); err != nil {
+				log.Errorf(ctx, "failed writing the URL: %v", err)
 			}
 		}
 
@@ -630,24 +709,45 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 			// Start up the update check loop.
 			// We don't do this in (*server.Server).Start() because we don't want it
 			// in tests.
-			if !envutil.EnvOrDefaultBool("COCKROACH_SKIP_UPDATE_CHECK", false) {
+			if !cluster.TelemetryOptOut() {
 				s.PeriodicallyCheckForUpdates(ctx)
+			}
+
+			initialBoot := s.InitialBoot()
+
+			if disableReplication && initialBoot {
+				// For start-single-node, set the default replication factor to
+				// 1 so as to avoid warning message and unnecessary rebalance
+				// churn.
+				if err := cliDisableReplication(ctx, s); err != nil {
+					log.Errorf(ctx, "could not disable replication: %v", err)
+					return err
+				}
+				log.Shout(ctx, log.Severity_INFO,
+					"Replication was disabled for this cluster.\n"+
+						"When/if adding nodes in the future, update zone configurations to increase the replication factor.")
 			}
 
 			// Now inform the user that the server is running and tell the
 			// user about its run-time derived parameters.
-			pgURL, err := serverCfg.PGURL(url.User(security.RootUser))
-			if err != nil {
-				return err
-			}
 			var buf bytes.Buffer
 			info := build.GetInfo()
 			tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
 			fmt.Fprintf(tw, "CockroachDB node starting at %s (took %0.1fs)\n", timeutil.Now(), timeutil.Since(tBegin).Seconds())
 			fmt.Fprintf(tw, "build:\t%s %s @ %s (%s)\n", info.Distribution, info.Tag, info.Time, info.GoVersion)
 			fmt.Fprintf(tw, "webui:\t%s\n", serverCfg.AdminURL())
+
+			// (Re-)compute the client connection URL. We cannot do this
+			// earlier (e.g. above, in the runStart function) because
+			// at this time the address and port have not been resolved yet.
+			pgURL, err := serverCfg.PGURL(url.User(security.RootUser))
+			if err != nil {
+				log.Errorf(ctx, "failed computing the URL: %v", err)
+				return err
+			}
 			fmt.Fprintf(tw, "sql:\t%s\n", pgURL)
-			fmt.Fprintf(tw, "client flags:\t%s\n", clientFlags())
+
+			fmt.Fprintf(tw, "RPC client flags:\t%s\n", clientFlagsRPC())
 			if len(serverCfg.SocketFile) != 0 {
 				fmt.Fprintf(tw, "socket:\t%s\n", serverCfg.SocketFile)
 			}
@@ -672,7 +772,7 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 			for i, spec := range serverCfg.Stores.Specs {
 				fmt.Fprintf(tw, "store[%d]:\t%s\n", i, spec)
 			}
-			initialBoot := s.InitialBoot()
+			fmt.Fprintf(tw, "storage engine: \t%s\n", serverCfg.StorageEngine.String())
 			nodeID := s.NodeID()
 			if initialBoot {
 				if nodeID == server.FirstNodeID {
@@ -684,12 +784,17 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 				fmt.Fprintf(tw, "status:\trestarted pre-existing node\n")
 			}
 
+			if baseCfg.ClusterName != "" {
+				fmt.Fprintf(tw, "cluster name:\t%s\n", baseCfg.ClusterName)
+			}
+
 			// Remember the cluster ID for log file rotation.
 			clusterID := s.ClusterID().String()
 			log.SetClusterID(clusterID)
 			fmt.Fprintf(tw, "clusterID:\t%s\n", clusterID)
-
 			fmt.Fprintf(tw, "nodeID:\t%d\n", nodeID)
+
+			// Collect the formatted string and show it to the user.
 			if err := tw.Flush(); err != nil {
 				return err
 			}
@@ -697,21 +802,6 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 			log.Infof(ctx, "node startup completed:\n%s", msg)
 			if !startCtx.inBackground && !log.LoggingToStderr(log.Severity_INFO) {
 				fmt.Print(msg)
-			}
-
-			// If the invoker has requested an URL update, do it now that
-			// the server is ready to accept SQL connections. We do this
-			// here and not in ReadyFn because we need to wait for bootstrap
-			// to complete.
-			if startCtx.listeningURLFile != "" {
-				log.Infof(ctx, "listening URL file: %s", startCtx.listeningURLFile)
-				pgURL, err := serverCfg.PGURL(url.User(security.RootUser))
-				if err == nil {
-					err = ioutil.WriteFile(startCtx.listeningURLFile, []byte(fmt.Sprintf("%s\n", pgURL)), 0644)
-				}
-				if err != nil {
-					log.Error(ctx, err)
-				}
 			}
 
 			return nil
@@ -886,7 +976,7 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 }
 
 func hintServerCmdFlags(ctx context.Context, cmd *cobra.Command) {
-	pf := cmd.Flags()
+	pf := flagSetForCmd(cmd)
 
 	listenAddrSpecified := pf.Lookup(cliflags.ListenAddr.Name).Changed || pf.Lookup(cliflags.ServerHost.Name).Changed
 	advAddrSpecified := pf.Lookup(cliflags.AdvertiseAddr.Name).Changed || pf.Lookup(cliflags.AdvertiseHost.Name).Changed
@@ -902,11 +992,10 @@ func hintServerCmdFlags(ctx context.Context, cmd *cobra.Command) {
 	}
 }
 
-func clientFlags() string {
+func clientFlagsRPC() string {
 	flags := []string{os.Args[0], "<client cmd>"}
-	host, port, err := net.SplitHostPort(serverCfg.AdvertiseAddr)
-	if err == nil {
-		flags = append(flags, "--host="+host+":"+port)
+	if serverCfg.AdvertiseAddr != "" {
+		flags = append(flags, "--host="+serverCfg.AdvertiseAddr)
 	}
 	if startCtx.serverInsecure {
 		flags = append(flags, "--insecure")
@@ -914,6 +1003,15 @@ func clientFlags() string {
 		flags = append(flags, "--certs-dir="+startCtx.serverSSLCertsDir)
 	}
 	return strings.Join(flags, " ")
+}
+
+func checkTzDatabaseAvailability(ctx context.Context) {
+	if _, err := timeutil.LoadLocation("America/New_York"); err != nil {
+		log.Shout(ctx, log.Severity_ERROR,
+			"unable to load named time zones, time zone support will be degraded.\n"+
+				"Hint: check that the time zone database is installed on your system, or\n"+
+				"set the ZONEINFO environment variable to a Go time zone .zip archive.")
+	}
 }
 
 func reportConfiguration(ctx context.Context) {
@@ -978,12 +1076,15 @@ func logOutputDirectory() string {
 // logging output directory and the verbosity level of stderr logging.
 // We only do this for the "start" command which is why this work
 // occurs here and not in an OnInitialize function.
-func setupAndInitializeLoggingAndProfiling(ctx context.Context) (*stop.Stopper, error) {
+func setupAndInitializeLoggingAndProfiling(
+	ctx context.Context, cmd *cobra.Command,
+) (*stop.Stopper, error) {
 	// Default the log directory to the "logs" subdirectory of the first
 	// non-memory store. If more than one non-memory stores is detected,
 	// print a warning.
 	ambiguousLogDirs := false
-	if !startCtx.logDir.IsSet() && !startCtx.logDirFlag.Changed {
+	lf := cmd.Flags().Lookup(logflags.LogDirName)
+	if !startCtx.logDir.IsSet() && !lf.Changed {
 		// We only override the log directory if the user has not explicitly
 		// disabled file logging using --log-dir="".
 		newDir := ""
@@ -1035,6 +1136,9 @@ func setupAndInitializeLoggingAndProfiling(ctx context.Context) (*stop.Stopper, 
 		// Start the log file GC daemon to remove files that make the log
 		// directory too large.
 		log.StartGCDaemon(ctx)
+
+		// We have a valid logging directory. Configure RocksDB to log into it.
+		engine.InitRocksDBLogger(ctx)
 	}
 
 	outputDirectory := "."
@@ -1102,9 +1206,6 @@ func addrWithDefaultHost(addr string) (string, error) {
 	}
 	if host == "" {
 		host = "localhost"
-	}
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
 	}
 	return net.JoinHostPort(host, port), nil
 }

@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -24,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -37,16 +34,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/growstack"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/logtags"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
@@ -81,6 +79,13 @@ var (
 		Measurement: "Batch KV Requests",
 		Unit:        metric.Unit_COUNT,
 	}
+
+	metaDiskStalls = metric.Metadata{
+		Name:        "engine.stalls",
+		Help:        "Number of disk stalls detected on this node",
+		Measurement: "Disk stalls detected",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // Cluster settings.
@@ -108,16 +113,18 @@ var (
 )
 
 type nodeMetrics struct {
-	Latency *metric.Histogram
-	Success *metric.Counter
-	Err     *metric.Counter
+	Latency    *metric.Histogram
+	Success    *metric.Counter
+	Err        *metric.Counter
+	DiskStalls *metric.Counter
 }
 
 func makeNodeMetrics(reg *metric.Registry, histogramWindow time.Duration) nodeMetrics {
 	nm := nodeMetrics{
-		Latency: metric.NewLatency(metaExecLatency, histogramWindow),
-		Success: metric.NewCounter(metaExecSuccess),
-		Err:     metric.NewCounter(metaExecError),
+		Latency:    metric.NewLatency(metaExecLatency, histogramWindow),
+		Success:    metric.NewCounter(metaExecSuccess),
+		Err:        metric.NewCounter(metaExecError),
+		DiskStalls: metric.NewCounter(metaDiskStalls),
 	}
 	reg.AddMetricStruct(nm)
 	return nm
@@ -187,7 +194,7 @@ func allocateStoreIDs(
 // GetBootstrapSchema returns the schema which will be used to bootstrap a new
 // server.
 func GetBootstrapSchema(
-	defaultZoneConfig *config.ZoneConfig, defaultSystemZoneConfig *config.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) sqlbase.MetadataSchema {
 	return sqlbase.MakeMetadataSchema(defaultZoneConfig, defaultSystemZoneConfig)
 }
@@ -204,8 +211,8 @@ func bootstrapCluster(
 	ctx context.Context,
 	engines []engine.Engine,
 	bootstrapVersion cluster.ClusterVersion,
-	defaultZoneConfig *config.ZoneConfig,
-	defaultSystemZoneConfig *config.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig,
+	defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) (uuid.UUID, error) {
 	clusterID := uuid.MakeV4()
 	// TODO(andrei): It'd be cool if this method wouldn't do anything to engines
@@ -304,8 +311,8 @@ func (n *Node) bootstrapCluster(
 	ctx context.Context,
 	engines []engine.Engine,
 	bootstrapVersion cluster.ClusterVersion,
-	defaultZoneConfig *config.ZoneConfig,
-	defaultSystemZoneConfig *config.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig,
+	defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) error {
 	if n.initialBoot || n.clusterID.Get() != uuid.Nil {
 		return fmt.Errorf("cluster has already been initialized with ID %s", n.clusterID.Get())
@@ -335,8 +342,9 @@ func (n *Node) onClusterVersionChange(cv cluster.ClusterVersion) {
 // NodeDescriptor is available, to help bootstrapping.
 func (n *Node) start(
 	ctx context.Context,
-	addr net.Addr,
+	addr, sqlAddr net.Addr,
 	initializedEngines, emptyEngines []engine.Engine,
+	clusterName string,
 	attrs roachpb.Attributes,
 	locality roachpb.Locality,
 	cv cluster.ClusterVersion,
@@ -383,9 +391,11 @@ func (n *Node) start(
 	n.Descriptor = roachpb.NodeDescriptor{
 		NodeID:          nodeID,
 		Address:         util.MakeUnresolvedAddr(addr.Network(), addr.String()),
+		SQLAddress:      util.MakeUnresolvedAddr(sqlAddr.Network(), sqlAddr.String()),
 		Attrs:           attrs,
 		Locality:        locality,
 		LocalityAddress: localityAddress,
+		ClusterName:     clusterName,
 		ServerVersion:   n.storeCfg.Settings.Version.ServerVersion,
 		BuildTag:        build.GetInfo().Tag,
 		StartedAt:       n.startedAt,
@@ -901,14 +911,12 @@ func (n *Node) batchInternal(
 	}
 
 	var br *roachpb.BatchResponse
-
 	if err := n.stopper.RunTaskWithErr(ctx, "node.Node: batch", func(ctx context.Context) error {
 		var finishSpan func(*roachpb.BatchResponse)
 		// Shadow ctx from the outer function. Written like this to pass the linter.
 		ctx, finishSpan = n.setupSpanForIncomingRPC(ctx, grpcutil.IsLocalRequestContext(ctx))
-		defer func(br **roachpb.BatchResponse) {
-			finishSpan(*br)
-		}(&br)
+		// NB: wrapped to delay br evaluation to its value when returning.
+		defer func() { finishSpan(br) }()
 		if log.HasSpanOrEvent(ctx) {
 			log.Event(ctx, args.Summary())
 		}
@@ -936,8 +944,6 @@ func (n *Node) batchInternal(
 func (n *Node) Batch(
 	ctx context.Context, args *roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, error) {
-	growStack()
-
 	// NB: Node.Batch is called directly for "local" calls. We don't want to
 	// carry the associated log tags forward as doing so makes adding additional
 	// log tags more expensive and makes local calls differ from remote calls.
@@ -1023,6 +1029,8 @@ func (n *Node) setupSpanForIncomingRPC(
 func (n *Node) RangeFeed(
 	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) error {
+	growstack.Grow()
+
 	pErr := n.stores.RangeFeed(args, stream)
 	if pErr != nil {
 		var event roachpb.RangeFeedEvent
@@ -1032,24 +1040,4 @@ func (n *Node) RangeFeed(
 		return stream.Send(&event)
 	}
 	return nil
-}
-
-var growStackGlobal = false
-
-//go:noinline
-func growStack() {
-	// Goroutine stacks currently start at 2 KB in size. The code paths through
-	// the storage package often need a stack that is 32 KB in size. The stack
-	// growth is mildly expensive making it useful to trick the runtime into
-	// growing the stack early. Since goroutine stacks grow in multiples of 2 and
-	// start at 2 KB in size, by placing a 16 KB object on the stack early in the
-	// lifetime of a goroutine we force the runtime to use a 32 KB stack for the
-	// goroutine.
-	var buf [16 << 10] /* 16 KB */ byte
-	if growStackGlobal {
-		// Make sure the compiler doesn't optimize away buf.
-		for i := range buf {
-			buf[i] = byte(i)
-		}
-	}
 }

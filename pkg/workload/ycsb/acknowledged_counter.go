@@ -1,17 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ycsb
 
@@ -54,18 +49,20 @@ func (c *AcknowledgedCounter) Last() uint64 {
 }
 
 // Acknowledge marks v as being acknowledged.
-func (c *AcknowledgedCounter) Acknowledge(v uint64) error {
+func (c *AcknowledgedCounter) Acknowledge(v uint64) (uint64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.mu.window[v&windowMask] {
-		return errors.Errorf("Number of pending acknowledgements exceeded window size: %d has been acknowledged, but %d is not acknowledged", v, c.mu.count)
+		return 0, errors.Errorf("Number of pending acknowledgements exceeded window size: %d has been acknowledged, but %d is not acknowledged", v, c.mu.count)
 	}
 
 	c.mu.window[v&windowMask] = true
+	count := uint64(0)
 	for c.mu.window[c.mu.count&windowMask] {
 		c.mu.window[c.mu.count&windowMask] = false
 		c.mu.count++
+		count++
 	}
-	return nil
+	return count, nil
 }

@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-opt
-
 # The following tables form the interleaved hierarchy:
 #   name:             primary key:                # rows:   'a' = id mod X :
 #   parent1           (pid1)                      40        8
@@ -586,3 +584,8 @@ query TTTTTTTT
 SELECT * FROM small_child_fam JOIN large_parent_fam USING (a)
 ----
 first  second  third_child  second  third  fourth  fifth  sixth
+
+query T
+SELECT feature_name FROM crdb_internal.feature_usage WHERE feature_name='sql.plan.interleaved-table-join' AND usage_count > 0
+----
+sql.plan.interleaved-table-join

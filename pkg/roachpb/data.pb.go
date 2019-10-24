@@ -87,7 +87,7 @@ func (x ValueType) String() string {
 	return proto.EnumName(ValueType_name, int32(x))
 }
 func (ValueType) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{0}
+	return fileDescriptor_data_56eb522f44593a65, []int{0}
 }
 
 // ReplicaChangeType is a parameter of ChangeReplicasTrigger.
@@ -111,7 +111,7 @@ func (x ReplicaChangeType) String() string {
 	return proto.EnumName(ReplicaChangeType_name, int32(x))
 }
 func (ReplicaChangeType) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{1}
+	return fileDescriptor_data_56eb522f44593a65, []int{1}
 }
 
 // TransactionStatus specifies possible states for a transaction.
@@ -163,7 +163,7 @@ func (x TransactionStatus) String() string {
 	return proto.EnumName(TransactionStatus_name, int32(x))
 }
 func (TransactionStatus) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{2}
+	return fileDescriptor_data_56eb522f44593a65, []int{2}
 }
 
 // Span is a key range with an inclusive start Key and an exclusive end Key.
@@ -174,15 +174,13 @@ type Span struct {
 	// contains only a single key. Otherwise, it must order strictly after Key.
 	// In such a case, the Span encompasses the key range from Key to EndKey,
 	// including Key and excluding EndKey.
-	EndKey               Key      `protobuf:"bytes,4,opt,name=end_key,json=endKey,proto3,casttype=Key" json:"end_key,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	EndKey Key `protobuf:"bytes,4,opt,name=end_key,json=endKey,proto3,casttype=Key" json:"end_key,omitempty"`
 }
 
 func (m *Span) Reset()      { *m = Span{} }
 func (*Span) ProtoMessage() {}
 func (*Span) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{0}
+	return fileDescriptor_data_56eb522f44593a65, []int{0}
 }
 func (m *Span) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -227,16 +225,14 @@ type Value struct {
 	// Its contents may be modified on the next call to Value.SetFoo.
 	RawBytes []byte `protobuf:"bytes,1,opt,name=raw_bytes,json=rawBytes,proto3" json:"raw_bytes,omitempty"`
 	// Timestamp of value.
-	Timestamp            hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
-	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
-	XXX_sizecache        int32         `json:"-"`
+	Timestamp hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
 }
 
 func (m *Value) Reset()         { *m = Value{} }
 func (m *Value) String() string { return proto.CompactTextString(m) }
 func (*Value) ProtoMessage()    {}
 func (*Value) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{1}
+	return fileDescriptor_data_56eb522f44593a65, []int{1}
 }
 func (m *Value) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -264,17 +260,15 @@ var xxx_messageInfo_Value proto.InternalMessageInfo
 // KeyValue is a pair of Key and Value for returned Key/Value pairs
 // from ScanRequest/ScanResponse. It embeds a Key and a Value.
 type KeyValue struct {
-	Key                  Key      `protobuf:"bytes,1,opt,name=key,proto3,casttype=Key" json:"key,omitempty"`
-	Value                Value    `protobuf:"bytes,2,opt,name=value,proto3" json:"value"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Key   Key   `protobuf:"bytes,1,opt,name=key,proto3,casttype=Key" json:"key,omitempty"`
+	Value Value `protobuf:"bytes,2,opt,name=value,proto3" json:"value"`
 }
 
 func (m *KeyValue) Reset()         { *m = KeyValue{} }
 func (m *KeyValue) String() string { return proto.CompactTextString(m) }
 func (*KeyValue) ProtoMessage()    {}
 func (*KeyValue) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{2}
+	return fileDescriptor_data_56eb522f44593a65, []int{2}
 }
 func (m *KeyValue) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -303,18 +297,16 @@ var xxx_messageInfo_KeyValue proto.InternalMessageInfo
 // StoreIdent is written to the underlying storage engine at a
 // store-reserved system key (KeyLocalIdent).
 type StoreIdent struct {
-	ClusterID            github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"cluster_id"`
-	NodeID               NodeID                                              `protobuf:"varint,2,opt,name=node_id,json=nodeId,proto3,casttype=NodeID" json:"node_id,omitempty"`
-	StoreID              StoreID                                             `protobuf:"varint,3,opt,name=store_id,json=storeId,proto3,casttype=StoreID" json:"store_id,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}                                            `json:"-"`
-	XXX_sizecache        int32                                               `json:"-"`
+	ClusterID github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,1,opt,name=cluster_id,json=clusterId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"cluster_id"`
+	NodeID    NodeID                                              `protobuf:"varint,2,opt,name=node_id,json=nodeId,proto3,casttype=NodeID" json:"node_id,omitempty"`
+	StoreID   StoreID                                             `protobuf:"varint,3,opt,name=store_id,json=storeId,proto3,casttype=StoreID" json:"store_id,omitempty"`
 }
 
 func (m *StoreIdent) Reset()         { *m = StoreIdent{} }
 func (m *StoreIdent) String() string { return proto.CompactTextString(m) }
 func (*StoreIdent) ProtoMessage()    {}
 func (*StoreIdent) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{3}
+	return fileDescriptor_data_56eb522f44593a65, []int{3}
 }
 func (m *StoreIdent) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -346,17 +338,15 @@ var xxx_messageInfo_StoreIdent proto.InternalMessageInfo
 // allows the final bookkeeping for the split to be completed and the
 // new range put into operation.
 type SplitTrigger struct {
-	LeftDesc             RangeDescriptor `protobuf:"bytes,1,opt,name=left_desc,json=leftDesc,proto3" json:"left_desc"`
-	RightDesc            RangeDescriptor `protobuf:"bytes,2,opt,name=right_desc,json=rightDesc,proto3" json:"right_desc"`
-	XXX_NoUnkeyedLiteral struct{}        `json:"-"`
-	XXX_sizecache        int32           `json:"-"`
+	LeftDesc  RangeDescriptor `protobuf:"bytes,1,opt,name=left_desc,json=leftDesc,proto3" json:"left_desc"`
+	RightDesc RangeDescriptor `protobuf:"bytes,2,opt,name=right_desc,json=rightDesc,proto3" json:"right_desc"`
 }
 
 func (m *SplitTrigger) Reset()         { *m = SplitTrigger{} }
 func (m *SplitTrigger) String() string { return proto.CompactTextString(m) }
 func (*SplitTrigger) ProtoMessage()    {}
 func (*SplitTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{4}
+	return fileDescriptor_data_56eb522f44593a65, []int{4}
 }
 func (m *SplitTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -397,16 +387,14 @@ type MergeTrigger struct {
 	// before it stopped responding to requests altogether (in anticipation of
 	// being subsumed). It is suitable for use as the timestamp cache's low water
 	// mark for the keys previously owned by the subsumed range.
-	FreezeStart          hlc.Timestamp `protobuf:"bytes,5,opt,name=freeze_start,json=freezeStart,proto3" json:"freeze_start"`
-	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
-	XXX_sizecache        int32         `json:"-"`
+	FreezeStart hlc.Timestamp `protobuf:"bytes,5,opt,name=freeze_start,json=freezeStart,proto3" json:"freeze_start"`
 }
 
 func (m *MergeTrigger) Reset()         { *m = MergeTrigger{} }
 func (m *MergeTrigger) String() string { return proto.CompactTextString(m) }
 func (*MergeTrigger) ProtoMessage()    {}
 func (*MergeTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{5}
+	return fileDescriptor_data_56eb522f44593a65, []int{5}
 }
 func (m *MergeTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -431,21 +419,49 @@ func (m *MergeTrigger) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_MergeTrigger proto.InternalMessageInfo
 
+// ChangeReplicasTrigger carries out a replication change. The Added() and Removed()
+// methods return the replicas being added and removed, respectively. If more than
+// one change is specified (i.e. len(Added())+len(Removed()) exceeds one), this
+// initiates an atomic replication change in which the "removed" replicas are
+// of type VOTER_OUTGOING. This joint configuration is left via another
+// ChangeReplicasTrigger which does not specify any additions nor removals.
 type ChangeReplicasTrigger struct {
-	ChangeType ReplicaChangeType `protobuf:"varint,1,opt,name=change_type,json=changeType,proto3,enum=cockroach.roachpb.ReplicaChangeType" json:"change_type,omitempty"`
+	// TODO(tbg): remove once we know that no trigger using this will ever be
+	// applied (this will require something like #39182).
+	//
+	// TODO(tbg): when removing this, also rename internal_x_replicas to just
+	// x_replicas and remove the getter.
+	DeprecatedChangeType ReplicaChangeType `protobuf:"varint,1,opt,name=deprecated_change_type,json=deprecatedChangeType,proto3,enum=cockroach.roachpb.ReplicaChangeType" json:"deprecated_change_type,omitempty"`
 	// The replica being modified.
-	Replica ReplicaDescriptor `protobuf:"bytes,2,opt,name=replica,proto3" json:"replica"`
+	// TODO(tbg): remove once we know that no trigger using this will ever be
+	// applied (this will require something like #39182).
+	DeprecatedReplica ReplicaDescriptor `protobuf:"bytes,2,opt,name=deprecated_replica,json=deprecatedReplica,proto3" json:"deprecated_replica"`
 	// The new replica list with this change applied.
-	UpdatedReplicas      []ReplicaDescriptor `protobuf:"bytes,3,rep,name=updated_replicas,json=updatedReplicas,proto3" json:"updated_replicas"`
-	NextReplicaID        ReplicaID           `protobuf:"varint,4,opt,name=next_replica_id,json=nextReplicaId,proto3,casttype=ReplicaID" json:"next_replica_id,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}            `json:"-"`
-	XXX_sizecache        int32               `json:"-"`
+	DeprecatedUpdatedReplicas []ReplicaDescriptor `protobuf:"bytes,3,rep,name=deprecated_updated_replicas,json=deprecatedUpdatedReplicas,proto3" json:"deprecated_updated_replicas"`
+	// The next replica id to use with this change applied.
+	DeprecatedNextReplicaID ReplicaID `protobuf:"varint,4,opt,name=deprecated_next_replica_id,json=deprecatedNextReplicaId,proto3,casttype=ReplicaID" json:"deprecated_next_replica_id,omitempty"`
+	// The updated range descriptor. If desc is non-nil, then it overrides
+	// updated_replicas and next_replica_id. This incremental addition is needed
+	// to maintain backwards compatibility.
+	// TODO(jeffreyxiao): Remove deprecated_updated_replicas and
+	// deprecated_next_replica_id in 20.1.
+	Desc *RangeDescriptor `protobuf:"bytes,5,opt,name=desc,proto3" json:"desc,omitempty"`
+	// The new replicas added to the range descriptor in this change, exactly as
+	// they appear in the updated range descriptor.
+	InternalAddedReplicas []ReplicaDescriptor `protobuf:"bytes,6,rep,name=internal_added_replicas,json=internalAddedReplicas,proto3" json:"internal_added_replicas"`
+	// The replicas whose removal is being initiated in this change. If the
+	// replica is still present as an outgoing voter in the updated descriptor
+	// (i.e. if this is a full atomic replication change), then the replica here
+	// must match that in the descriptor; otherwise it must match the replica
+	// removed from the descriptor in the course of this change (which is itself
+	// not visible to this trigger).
+	InternalRemovedReplicas []ReplicaDescriptor `protobuf:"bytes,7,rep,name=internal_removed_replicas,json=internalRemovedReplicas,proto3" json:"internal_removed_replicas"`
 }
 
 func (m *ChangeReplicasTrigger) Reset()      { *m = ChangeReplicasTrigger{} }
 func (*ChangeReplicasTrigger) ProtoMessage() {}
 func (*ChangeReplicasTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{6}
+	return fileDescriptor_data_56eb522f44593a65, []int{6}
 }
 func (m *ChangeReplicasTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -480,16 +496,14 @@ type ModifiedSpanTrigger struct {
 	// with heartbeats to extend the expiration timestamp. Changes to the
 	// range lease for the range containing node liveness triggers re-gossip
 	// of the entire node liveness key range.
-	NodeLivenessSpan     *Span    `protobuf:"bytes,2,opt,name=node_liveness_span,json=nodeLivenessSpan,proto3" json:"node_liveness_span,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	NodeLivenessSpan *Span `protobuf:"bytes,2,opt,name=node_liveness_span,json=nodeLivenessSpan,proto3" json:"node_liveness_span,omitempty"`
 }
 
 func (m *ModifiedSpanTrigger) Reset()         { *m = ModifiedSpanTrigger{} }
 func (m *ModifiedSpanTrigger) String() string { return proto.CompactTextString(m) }
 func (*ModifiedSpanTrigger) ProtoMessage()    {}
 func (*ModifiedSpanTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{7}
+	return fileDescriptor_data_56eb522f44593a65, []int{7}
 }
 func (m *ModifiedSpanTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -517,27 +531,25 @@ var xxx_messageInfo_ModifiedSpanTrigger proto.InternalMessageInfo
 // StickyBitTrigger indicates that the sticky bit of a range should be changed.
 // This trigger is used in two cases:
 // 1. Unsplitting a range. Note that unsplitting and merging are different
-//    operations. Unsplitting a range will only remove the sticky bit
-//    associated with the range.
+//    operations. Unsplitting a range will only update the expiration time
+//    associated with the range to hlc.Timestamp{}.
 // 2. Splitting at the start key of a range. In this case, no range is split but
-//    the sticky bit is still set, so we need to use this trigger instead of
-//    SplitTrigger.
+//    the sticky bit is might be updated, so we need to use this trigger instead
+//    of SplitTrigger.
 //
 // Note that the sticky_bit should always be set to the same timestamp used to
 // update the range descriptor and it's the client's responsibility that the
 // timestamps are aligned.
 type StickyBitTrigger struct {
 	// Set to nil to remove a RangeDescriptor's sticky bit.
-	StickyBit            *hlc.Timestamp `protobuf:"bytes,1,opt,name=sticky_bit,json=stickyBit,proto3" json:"sticky_bit,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}       `json:"-"`
-	XXX_sizecache        int32          `json:"-"`
+	StickyBit hlc.Timestamp `protobuf:"bytes,1,opt,name=sticky_bit,json=stickyBit,proto3" json:"sticky_bit"`
 }
 
 func (m *StickyBitTrigger) Reset()         { *m = StickyBitTrigger{} }
 func (m *StickyBitTrigger) String() string { return proto.CompactTextString(m) }
 func (*StickyBitTrigger) ProtoMessage()    {}
 func (*StickyBitTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{8}
+	return fileDescriptor_data_56eb522f44593a65, []int{8}
 }
 func (m *StickyBitTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -570,15 +582,13 @@ type InternalCommitTrigger struct {
 	ChangeReplicasTrigger *ChangeReplicasTrigger `protobuf:"bytes,3,opt,name=change_replicas_trigger,json=changeReplicasTrigger,proto3" json:"change_replicas_trigger,omitempty"`
 	ModifiedSpanTrigger   *ModifiedSpanTrigger   `protobuf:"bytes,4,opt,name=modified_span_trigger,json=modifiedSpanTrigger,proto3" json:"modified_span_trigger,omitempty"`
 	StickyBitTrigger      *StickyBitTrigger      `protobuf:"bytes,5,opt,name=sticky_bit_trigger,json=stickyBitTrigger,proto3" json:"sticky_bit_trigger,omitempty"`
-	XXX_NoUnkeyedLiteral  struct{}               `json:"-"`
-	XXX_sizecache         int32                  `json:"-"`
 }
 
 func (m *InternalCommitTrigger) Reset()         { *m = InternalCommitTrigger{} }
 func (m *InternalCommitTrigger) String() string { return proto.CompactTextString(m) }
 func (*InternalCommitTrigger) ProtoMessage()    {}
 func (*InternalCommitTrigger) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{9}
+	return fileDescriptor_data_56eb522f44593a65, []int{9}
 }
 func (m *InternalCommitTrigger) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -639,17 +649,15 @@ func (m *InternalCommitTrigger) GetStickyBitTrigger() *StickyBitTrigger {
 }
 
 type ObservedTimestamp struct {
-	NodeID               NodeID        `protobuf:"varint,1,opt,name=node_id,json=nodeId,proto3,casttype=NodeID" json:"node_id,omitempty"`
-	Timestamp            hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
-	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
-	XXX_sizecache        int32         `json:"-"`
+	NodeID    NodeID        `protobuf:"varint,1,opt,name=node_id,json=nodeId,proto3,casttype=NodeID" json:"node_id,omitempty"`
+	Timestamp hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
 }
 
 func (m *ObservedTimestamp) Reset()         { *m = ObservedTimestamp{} }
 func (m *ObservedTimestamp) String() string { return proto.CompactTextString(m) }
 func (*ObservedTimestamp) ProtoMessage()    {}
 func (*ObservedTimestamp) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{10}
+	return fileDescriptor_data_56eb522f44593a65, []int{10}
 }
 func (m *ObservedTimestamp) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -694,24 +702,21 @@ type Transaction struct {
 	// coordinator to indicate client activity. Concurrent transactions will
 	// avoid aborting a transaction if it observes recent-enough activity.
 	LastHeartbeat hlc.Timestamp `protobuf:"bytes,5,opt,name=last_heartbeat,json=lastHeartbeat,proto3" json:"last_heartbeat"`
-	// The original timestamp at which the transaction started. For serializable
-	// transactions, if the timestamp drifts from the original timestamp, the
-	// transaction will retry unless we manage to "refresh the reads" - see
-	// refreshed_timestamp.
+	// The timestamp at which the transaction's current epoch started. For
+	// serializable transactions, if the timestamp drifts from the original
+	// timestamp, the transaction will retry unless we manage to "refresh the
+	// reads" - see refreshed_timestamp.
 	//
 	// This timestamp is the one at which all reads occur, unless
-	// refreshed_timestamp is set.
-	//
-	// Note that writes do not occur at this timestamp; they instead occur at the
-	// provisional commit timestamp, meta.Timestamp.
+	// refreshed_timestamp is set. Intent writes do not occur at this timestamp;
+	// they instead occur at the provisional commit timestamp, meta.Timestamp.
 	OrigTimestamp hlc.Timestamp `protobuf:"bytes,6,opt,name=orig_timestamp,json=origTimestamp,proto3" json:"orig_timestamp"`
-	// Initial Timestamp + clock skew. Reads which encounter values with
-	// timestamps between timestamp and max_timestamp trigger a txn
-	// retry error, unless the node being read is listed in observed_timestamps
-	// (in which case no more read uncertainty can occur).
-	// The case max_timestamp < timestamp is possible for transactions which have
-	// been pushed; in this case, max_timestamp should be ignored.
-	MaxTimestamp hlc.Timestamp `protobuf:"bytes,7,opt,name=max_timestamp,json=maxTimestamp,proto3" json:"max_timestamp"`
+	// This flag is set if the transaction's original timestamp was
+	// "leaked" beyond the transaction (i.e. if returned via NOW() or
+	// transaction_timestamp()). If true, this prevents optimizations
+	// which commit at a higher timestamp without resorting to a
+	// client-side retry.
+	OrigTimestampWasObserved bool `protobuf:"varint,16,opt,name=orig_timestamp_was_observed,json=origTimestampWasObserved,proto3" json:"orig_timestamp_was_observed,omitempty"`
 	// The refreshed timestamp is the timestamp at which the transaction
 	// can commit without necessitating a serializable restart. This
 	// value is forwarded to the transaction's current timestamp (meta.timestamp)
@@ -725,11 +730,38 @@ type Transaction struct {
 	// orig_timestamp needs to be used as a lower bound timestamp for the
 	// time-bound iterator used to resolve intents - i.e. there can be intents to
 	// resolve up to the timestamp that the txn started with.
+	//
+	// TODO(nvanbenschoten): this second paragraph is no longer true. The only
+	// place that relies on orig_timestamp being fixed over an entire epoch is
+	// v19.1 nodes use of Transaction.InclusiveTimeBounds. In v20.1 we can remove
+	// this field and update orig_timestamp in place, removing a lot of awkward
+	// code where we forward orig_timestamp by refreshed_timestamp. Doing so will
+	// also address the TODOs in cmd_refresh.go and cmd_refresh_range.go.
+	// Additionally, it will present a good opportunity to rename the field to
+	// read_timestamp.
 	RefreshedTimestamp hlc.Timestamp `protobuf:"bytes,15,opt,name=refreshed_timestamp,json=refreshedTimestamp,proto3" json:"refreshed_timestamp"`
+	// Deprecated min timestamp was used to keep track of the earliest timestamp
+	// that any epoch of the transaction used. This was set only if the
+	// transaction is restarted and the epoch is bumped. It was used during
+	// intent resolution to more efficiently scan for intents.
+	//
+	// The timestamp has since been replaced by TxnMeta.MinTimestamp.
+	//
+	// TODO(nvanbenschoten): remove in v20.1.
+	DeprecatedMinTimestamp hlc.Timestamp `protobuf:"bytes,14,opt,name=deprecated_min_timestamp,json=deprecatedMinTimestamp,proto3" json:"deprecated_min_timestamp"`
+	// Initial Timestamp + clock skew. Reads which encounter values with
+	// timestamps between timestamp and max_timestamp trigger a txn
+	// retry error, unless the node being read is listed in observed_timestamps
+	// (in which case no more read uncertainty can occur).
+	// The case max_timestamp < timestamp is possible for transactions which have
+	// been pushed; in this case, max_timestamp should be ignored.
+	MaxTimestamp hlc.Timestamp `protobuf:"bytes,7,opt,name=max_timestamp,json=maxTimestamp,proto3" json:"max_timestamp"`
 	// A list of <NodeID, timestamp> pairs. The list maps NodeIDs to timestamps
 	// as observed from their local clock during this transaction. The purpose of
 	// this list is to avoid uncertainty related restarts which normally occur
 	// when reading a value in the near future as per the max_timestamp field.
+	//
+	// ### Meaning:
 	//
 	// Morally speaking, having an entry for a node in this list means that this
 	// node has been visited before, and that no more uncertainty restarts are
@@ -747,6 +779,8 @@ type Transaction struct {
 	// with a timestamp that is at least high as our entry in the list for node A,
 	// so no future operation on node A will be uncertain.
 	//
+	// ### Correctness:
+	//
 	// Thus, expressed properly, we can say that when a node has been read from
 	// successfully before by a transaction, uncertainty for values written by a
 	// leaseholder on that node is restricted to values with timestamps in the
@@ -754,12 +788,14 @@ type Transaction struct {
 	// placed on the uncertainty window because we are guaranteed that at the time
 	// that the transaction first visited the node, none of the Ranges that it was
 	// a leaseholder for had served any writes at higher timestamps than the clock
-	// reading we observe. This implies that any writes that the transaction may
-	// later see written by leaseholders on this node at higher timestamps than
-	// the observed timestamp could not have taken place causally before this
-	// transaction and can be ignored for the purposes of uncertainty.
+	// reading we observe. This implies the following property:
 	//
-	// There are two invariants necessary for this guarantee to hold:
+	//    Any writes that the transaction may later see written by leaseholders on
+	//    this node at higher timestamps than the observed timestamp could not have
+	//    taken place causally before this transaction and can be ignored for the
+	//    purposes of uncertainty.
+	//
+	// There are two invariants necessary for this property to hold:
 	// 1. a leaseholder's clock must always be equal to or greater than the timestamp
 	//    of all writes that it has served. This is trivial to enforce for
 	//    non-transactional writes. It is more complicated for transactional writes
@@ -779,11 +815,24 @@ type Transaction struct {
 	//    invariant holds for all leaseholders, given that a Range's initial
 	//    leaseholder assumes responsibility for an empty range with no writes.
 	//
+	// ### Usage:
 	//
-	// When this list holds a corresponding entry for the node who owns that lease
-	// that the current request is executing under, we can run the command with
-	// the list's timestamp as the top boundary of our uncertainty interval,
-	// limiting (and often avoiding) uncertainty restarts.
+	// The property ensures that when this list holds a corresponding entry for
+	// the node who owns the lease that the current request is executing under, we
+	// can run the request with the list's timestamp as the upper bound for its
+	// uncertainty interval, limiting (and often avoiding) uncertainty restarts.
+	// We do this by lowering the request's max_timestamp down to the timestamp in
+	// the observed timestamp entry, which is done in Replica.limitTxnMaxTimestamp.
+	//
+	// However, as stated, the correctness property only holds for values at
+	// higher timestamps than the observed timestamp written *by leaseholders on
+	// this node*. This is critical, as the property tells us nothing about values
+	// written by leaseholders on different nodes, even if a lease for one of
+	// those Ranges has since moved to a node that we have an observed timestamp
+	// entry for. To accommodate this limitation, Replica.limitTxnMaxTimestamp
+	// first forwards the timestamp in the observed timestamp entry by the start
+	// timestamp of the lease that the request is executing under before using it
+	// to limit the request's uncertainty interval.
 	//
 	// When a transaction is first initialized on a node, it may use a timestamp
 	// from the local hybrid logical clock to initialize the corresponding entry
@@ -796,15 +845,6 @@ type Transaction struct {
 	// slice should be treated as immutable and all updates should be performed
 	// on a copy of the slice.
 	ObservedTimestamps []ObservedTimestamp `protobuf:"bytes,8,rep,name=observed_timestamps,json=observedTimestamps,proto3" json:"observed_timestamps"`
-	// Writing is true if the transaction has previously sent a Begin transaction
-	// (i.e. if it ever attempted to perform a write, so if it ever attempted to
-	// leave intents (across retries)). The flag will be set even if the BeginTxn
-	// batch failed.
-	// When set, the AbortCache must be checked by reads so that they don't miss
-	// to see the txn's previous writes.
-	// TODO(nvanbenschoten): This comment is only true when interacting with 2.1
-	// nodes. This field can be completely removed in 19.2.
-	DeprecatedWriting bool `protobuf:"varint,9,opt,name=deprecated_writing,json=deprecatedWriting,proto3" json:"deprecated_writing,omitempty"`
 	// If this is true, the transaction must retry. Relevant only for
 	// SNAPSHOT transactions: a SERIALIZABLE transaction would have to
 	// retry anyway due to its commit timestamp having moved forward (whenever
@@ -840,25 +880,12 @@ type Transaction struct {
 	// treated as immutable and all updates should be performed on a copy of the
 	// slice.
 	InFlightWrites []SequencedWrite `protobuf:"bytes,17,rep,name=in_flight_writes,json=inFlightWrites,proto3" json:"in_flight_writes"`
-	// Epoch zero timestamp is used to keep track of the earliest timestamp
-	// that any epoch of the transaction used. This is set only if the
-	// transaction is restarted and the epoch is bumped. It is used during
-	// intent resolution to more efficiently scan for intents.
-	EpochZeroTimestamp hlc.Timestamp `protobuf:"bytes,14,opt,name=epoch_zero_timestamp,json=epochZeroTimestamp,proto3" json:"epoch_zero_timestamp"`
-	// This flag is set if the transaction's original timestamp was
-	// "leaked" beyond the transaction (i.e. if returned via NOW() or
-	// transaction_timestamp()). If true, this prevents optimizations
-	// which commit at a higher timestamp without resorting to a
-	// client-side retry.
-	OrigTimestampWasObserved bool     `protobuf:"varint,16,opt,name=orig_timestamp_was_observed,json=origTimestampWasObserved,proto3" json:"orig_timestamp_was_observed,omitempty"`
-	XXX_NoUnkeyedLiteral     struct{} `json:"-"`
-	XXX_sizecache            int32    `json:"-"`
 }
 
 func (m *Transaction) Reset()      { *m = Transaction{} }
 func (*Transaction) ProtoMessage() {}
 func (*Transaction) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{11}
+	return fileDescriptor_data_56eb522f44593a65, []int{11}
 }
 func (m *Transaction) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -900,22 +927,15 @@ type TransactionRecord struct {
 	enginepb.TxnMeta `protobuf:"bytes,1,opt,name=meta,proto3,embedded=meta" json:"meta"`
 	Status           TransactionStatus `protobuf:"varint,4,opt,name=status,proto3,enum=cockroach.roachpb.TransactionStatus" json:"status,omitempty"`
 	LastHeartbeat    hlc.Timestamp     `protobuf:"bytes,5,opt,name=last_heartbeat,json=lastHeartbeat,proto3" json:"last_heartbeat"`
-	// TODO(nvanbenschoten): We can't accurately determine this value from
-	// intents, so we'd like to avoid ever needing to synthesize it. 2.1 nodes
-	// will assert that it is set, so we set it for now, but we should stop doing
-	// that in the future. Removing this in 2.3 shouldn't cause any issues.
-	OrigTimestamp        hlc.Timestamp    `protobuf:"bytes,6,opt,name=orig_timestamp,json=origTimestamp,proto3" json:"orig_timestamp"`
-	IntentSpans          []Span           `protobuf:"bytes,11,rep,name=intent_spans,json=intentSpans,proto3" json:"intent_spans"`
-	InFlightWrites       []SequencedWrite `protobuf:"bytes,17,rep,name=in_flight_writes,json=inFlightWrites,proto3" json:"in_flight_writes"`
-	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
-	XXX_sizecache        int32            `json:"-"`
+	IntentSpans      []Span            `protobuf:"bytes,11,rep,name=intent_spans,json=intentSpans,proto3" json:"intent_spans"`
+	InFlightWrites   []SequencedWrite  `protobuf:"bytes,17,rep,name=in_flight_writes,json=inFlightWrites,proto3" json:"in_flight_writes"`
 }
 
 func (m *TransactionRecord) Reset()         { *m = TransactionRecord{} }
 func (m *TransactionRecord) String() string { return proto.CompactTextString(m) }
 func (*TransactionRecord) ProtoMessage()    {}
 func (*TransactionRecord) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{12}
+	return fileDescriptor_data_56eb522f44593a65, []int{12}
 }
 func (m *TransactionRecord) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -942,18 +962,16 @@ var xxx_messageInfo_TransactionRecord proto.InternalMessageInfo
 
 // A Intent is a Span together with a Transaction metadata and its status.
 type Intent struct {
-	Span                 `protobuf:"bytes,1,opt,name=span,proto3,embedded=span" json:"span"`
-	Txn                  enginepb.TxnMeta  `protobuf:"bytes,2,opt,name=txn,proto3" json:"txn"`
-	Status               TransactionStatus `protobuf:"varint,3,opt,name=status,proto3,enum=cockroach.roachpb.TransactionStatus" json:"status,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}          `json:"-"`
-	XXX_sizecache        int32             `json:"-"`
+	Span   `protobuf:"bytes,1,opt,name=span,proto3,embedded=span" json:"span"`
+	Txn    enginepb.TxnMeta  `protobuf:"bytes,2,opt,name=txn,proto3" json:"txn"`
+	Status TransactionStatus `protobuf:"varint,3,opt,name=status,proto3,enum=cockroach.roachpb.TransactionStatus" json:"status,omitempty"`
 }
 
 func (m *Intent) Reset()         { *m = Intent{} }
 func (m *Intent) String() string { return proto.CompactTextString(m) }
 func (*Intent) ProtoMessage()    {}
 func (*Intent) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{13}
+	return fileDescriptor_data_56eb522f44593a65, []int{13}
 }
 func (m *Intent) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -983,16 +1001,14 @@ type SequencedWrite struct {
 	// The key that the write was made at.
 	Key Key `protobuf:"bytes,1,opt,name=key,proto3,casttype=Key" json:"key,omitempty"`
 	// The sequence number of the request that created the write.
-	Sequence             github_com_cockroachdb_cockroach_pkg_storage_engine_enginepb.TxnSeq `protobuf:"varint,2,opt,name=sequence,proto3,casttype=github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb.TxnSeq" json:"sequence,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}                                                            `json:"-"`
-	XXX_sizecache        int32                                                               `json:"-"`
+	Sequence github_com_cockroachdb_cockroach_pkg_storage_engine_enginepb.TxnSeq `protobuf:"varint,2,opt,name=sequence,proto3,casttype=github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb.TxnSeq" json:"sequence,omitempty"`
 }
 
 func (m *SequencedWrite) Reset()         { *m = SequencedWrite{} }
 func (m *SequencedWrite) String() string { return proto.CompactTextString(m) }
 func (*SequencedWrite) ProtoMessage()    {}
 func (*SequencedWrite) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{14}
+	return fileDescriptor_data_56eb522f44593a65, []int{14}
 }
 func (m *SequencedWrite) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -1050,15 +1066,13 @@ type Lease struct {
 	// (see Lease.Equivalent). Two adjacent leases that are equivalent will have
 	// the same sequence number and two adjacent leases that are not equivalent
 	// will have different sequence numbers.
-	Sequence             LeaseSequence `protobuf:"varint,7,opt,name=sequence,proto3,casttype=LeaseSequence" json:"sequence,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
-	XXX_sizecache        int32         `json:"-"`
+	Sequence LeaseSequence `protobuf:"varint,7,opt,name=sequence,proto3,casttype=LeaseSequence" json:"sequence,omitempty"`
 }
 
 func (m *Lease) Reset()      { *m = Lease{} }
 func (*Lease) ProtoMessage() {}
 func (*Lease) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{15}
+	return fileDescriptor_data_56eb522f44593a65, []int{15}
 }
 func (m *Lease) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -1096,16 +1110,14 @@ type AbortSpanEntry struct {
 	// it was aborted.
 	Timestamp hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp"`
 	// The priority of the transaction.
-	Priority             github_com_cockroachdb_cockroach_pkg_storage_engine_enginepb.TxnPriority `protobuf:"varint,3,opt,name=priority,proto3,casttype=github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb.TxnPriority" json:"priority,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}                                                                 `json:"-"`
-	XXX_sizecache        int32                                                                    `json:"-"`
+	Priority github_com_cockroachdb_cockroach_pkg_storage_engine_enginepb.TxnPriority `protobuf:"varint,3,opt,name=priority,proto3,casttype=github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb.TxnPriority" json:"priority,omitempty"`
 }
 
 func (m *AbortSpanEntry) Reset()         { *m = AbortSpanEntry{} }
 func (m *AbortSpanEntry) String() string { return proto.CompactTextString(m) }
 func (*AbortSpanEntry) ProtoMessage()    {}
 func (*AbortSpanEntry) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{16}
+	return fileDescriptor_data_56eb522f44593a65, []int{16}
 }
 func (m *AbortSpanEntry) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -1152,26 +1164,23 @@ type TxnCoordMeta struct {
 	// the transaction can continue.
 	RefreshReads  []Span `protobuf:"bytes,4,rep,name=refresh_reads,json=refreshReads,proto3" json:"refresh_reads"`
 	RefreshWrites []Span `protobuf:"bytes,5,rep,name=refresh_writes,json=refreshWrites,proto3" json:"refresh_writes"`
-	// refresh_invalid indicates that spans were discarded or not collected
-	// (i.e. because of a dist SQL processor running a version before refreshing
-	// was introduced). This is false if all spans encountered during the
-	// transaction which need refreshing have been collected to the refresh_reads
-	// and refresh_writes span slices.
+	// refresh_invalid indicates that spans were discarded or not collected (i.e.
+	// because the memory budget for tracking reads was exceeded). This is false
+	// if all spans encountered during the transaction which need refreshing have
+	// been collected to the refresh_reads and refresh_writes span slices.
 	RefreshInvalid bool `protobuf:"varint,7,opt,name=refresh_invalid,json=refreshInvalid,proto3" json:"refresh_invalid,omitempty"`
 	// in_flight_writes stores all writes that are in-flight and have not yet
 	// been proven to have succeeded. Any client wishing to send a request that
 	// overlaps with them must chain on to their success using a QueryIntent
 	// request.
-	InFlightWrites       []SequencedWrite `protobuf:"bytes,8,rep,name=in_flight_writes,json=inFlightWrites,proto3" json:"in_flight_writes"`
-	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
-	XXX_sizecache        int32            `json:"-"`
+	InFlightWrites []SequencedWrite `protobuf:"bytes,8,rep,name=in_flight_writes,json=inFlightWrites,proto3" json:"in_flight_writes"`
 }
 
 func (m *TxnCoordMeta) Reset()         { *m = TxnCoordMeta{} }
 func (m *TxnCoordMeta) String() string { return proto.CompactTextString(m) }
 func (*TxnCoordMeta) ProtoMessage()    {}
 func (*TxnCoordMeta) Descriptor() ([]byte, []int) {
-	return fileDescriptor_data_aebddfc8270530a2, []int{17}
+	return fileDescriptor_data_56eb522f44593a65, []int{17}
 }
 func (m *TxnCoordMeta) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -1352,22 +1361,41 @@ func (this *ChangeReplicasTrigger) Equal(that interface{}) bool {
 	} else if this == nil {
 		return false
 	}
-	if this.ChangeType != that1.ChangeType {
+	if this.DeprecatedChangeType != that1.DeprecatedChangeType {
 		return false
 	}
-	if !this.Replica.Equal(&that1.Replica) {
+	if !this.DeprecatedReplica.Equal(&that1.DeprecatedReplica) {
 		return false
 	}
-	if len(this.UpdatedReplicas) != len(that1.UpdatedReplicas) {
+	if len(this.DeprecatedUpdatedReplicas) != len(that1.DeprecatedUpdatedReplicas) {
 		return false
 	}
-	for i := range this.UpdatedReplicas {
-		if !this.UpdatedReplicas[i].Equal(&that1.UpdatedReplicas[i]) {
+	for i := range this.DeprecatedUpdatedReplicas {
+		if !this.DeprecatedUpdatedReplicas[i].Equal(&that1.DeprecatedUpdatedReplicas[i]) {
 			return false
 		}
 	}
-	if this.NextReplicaID != that1.NextReplicaID {
+	if this.DeprecatedNextReplicaID != that1.DeprecatedNextReplicaID {
 		return false
+	}
+	if !this.Desc.Equal(that1.Desc) {
+		return false
+	}
+	if len(this.InternalAddedReplicas) != len(that1.InternalAddedReplicas) {
+		return false
+	}
+	for i := range this.InternalAddedReplicas {
+		if !this.InternalAddedReplicas[i].Equal(&that1.InternalAddedReplicas[i]) {
+			return false
+		}
+	}
+	if len(this.InternalRemovedReplicas) != len(that1.InternalRemovedReplicas) {
+		return false
+	}
+	for i := range this.InternalRemovedReplicas {
+		if !this.InternalRemovedReplicas[i].Equal(&that1.InternalRemovedReplicas[i]) {
+			return false
+		}
 	}
 	return true
 }
@@ -1417,7 +1445,7 @@ func (this *StickyBitTrigger) Equal(that interface{}) bool {
 	} else if this == nil {
 		return false
 	}
-	if !this.StickyBit.Equal(that1.StickyBit) {
+	if !this.StickyBit.Equal(&that1.StickyBit) {
 		return false
 	}
 	return true
@@ -1519,10 +1547,16 @@ func (this *Transaction) Equal(that interface{}) bool {
 	if !this.OrigTimestamp.Equal(&that1.OrigTimestamp) {
 		return false
 	}
-	if !this.MaxTimestamp.Equal(&that1.MaxTimestamp) {
+	if this.OrigTimestampWasObserved != that1.OrigTimestampWasObserved {
 		return false
 	}
 	if !this.RefreshedTimestamp.Equal(&that1.RefreshedTimestamp) {
+		return false
+	}
+	if !this.DeprecatedMinTimestamp.Equal(&that1.DeprecatedMinTimestamp) {
+		return false
+	}
+	if !this.MaxTimestamp.Equal(&that1.MaxTimestamp) {
 		return false
 	}
 	if len(this.ObservedTimestamps) != len(that1.ObservedTimestamps) {
@@ -1532,9 +1566,6 @@ func (this *Transaction) Equal(that interface{}) bool {
 		if !this.ObservedTimestamps[i].Equal(&that1.ObservedTimestamps[i]) {
 			return false
 		}
-	}
-	if this.DeprecatedWriting != that1.DeprecatedWriting {
-		return false
 	}
 	if this.WriteTooOld != that1.WriteTooOld {
 		return false
@@ -1554,12 +1585,6 @@ func (this *Transaction) Equal(that interface{}) bool {
 		if !this.InFlightWrites[i].Equal(&that1.InFlightWrites[i]) {
 			return false
 		}
-	}
-	if !this.EpochZeroTimestamp.Equal(&that1.EpochZeroTimestamp) {
-		return false
-	}
-	if this.OrigTimestampWasObserved != that1.OrigTimestampWasObserved {
-		return false
 	}
 	return true
 }
@@ -1589,9 +1614,6 @@ func (this *TransactionRecord) Equal(that interface{}) bool {
 		return false
 	}
 	if !this.LastHeartbeat.Equal(&that1.LastHeartbeat) {
-		return false
-	}
-	if !this.OrigTimestamp.Equal(&that1.OrigTimestamp) {
 		return false
 	}
 	if len(this.IntentSpans) != len(that1.IntentSpans) {
@@ -1928,21 +1950,21 @@ func (m *ChangeReplicasTrigger) MarshalTo(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.ChangeType != 0 {
+	if m.DeprecatedChangeType != 0 {
 		dAtA[i] = 0x8
 		i++
-		i = encodeVarintData(dAtA, i, uint64(m.ChangeType))
+		i = encodeVarintData(dAtA, i, uint64(m.DeprecatedChangeType))
 	}
 	dAtA[i] = 0x12
 	i++
-	i = encodeVarintData(dAtA, i, uint64(m.Replica.Size()))
-	n10, err := m.Replica.MarshalTo(dAtA[i:])
+	i = encodeVarintData(dAtA, i, uint64(m.DeprecatedReplica.Size()))
+	n10, err := m.DeprecatedReplica.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n10
-	if len(m.UpdatedReplicas) > 0 {
-		for _, msg := range m.UpdatedReplicas {
+	if len(m.DeprecatedUpdatedReplicas) > 0 {
+		for _, msg := range m.DeprecatedUpdatedReplicas {
 			dAtA[i] = 0x1a
 			i++
 			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
@@ -1953,10 +1975,44 @@ func (m *ChangeReplicasTrigger) MarshalTo(dAtA []byte) (int, error) {
 			i += n
 		}
 	}
-	if m.NextReplicaID != 0 {
+	if m.DeprecatedNextReplicaID != 0 {
 		dAtA[i] = 0x20
 		i++
-		i = encodeVarintData(dAtA, i, uint64(m.NextReplicaID))
+		i = encodeVarintData(dAtA, i, uint64(m.DeprecatedNextReplicaID))
+	}
+	if m.Desc != nil {
+		dAtA[i] = 0x2a
+		i++
+		i = encodeVarintData(dAtA, i, uint64(m.Desc.Size()))
+		n11, err := m.Desc.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n11
+	}
+	if len(m.InternalAddedReplicas) > 0 {
+		for _, msg := range m.InternalAddedReplicas {
+			dAtA[i] = 0x32
+			i++
+			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.InternalRemovedReplicas) > 0 {
+		for _, msg := range m.InternalRemovedReplicas {
+			dAtA[i] = 0x3a
+			i++
+			i = encodeVarintData(dAtA, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(dAtA[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
 	}
 	return i, nil
 }
@@ -1990,11 +2046,11 @@ func (m *ModifiedSpanTrigger) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0x12
 		i++
 		i = encodeVarintData(dAtA, i, uint64(m.NodeLivenessSpan.Size()))
-		n11, err := m.NodeLivenessSpan.MarshalTo(dAtA[i:])
+		n12, err := m.NodeLivenessSpan.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n11
+		i += n12
 	}
 	return i, nil
 }
@@ -2014,16 +2070,14 @@ func (m *StickyBitTrigger) MarshalTo(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.StickyBit != nil {
-		dAtA[i] = 0xa
-		i++
-		i = encodeVarintData(dAtA, i, uint64(m.StickyBit.Size()))
-		n12, err := m.StickyBit.MarshalTo(dAtA[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n12
+	dAtA[i] = 0xa
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.StickyBit.Size()))
+	n13, err := m.StickyBit.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
 	}
+	i += n13
 	return i, nil
 }
 
@@ -2046,51 +2100,51 @@ func (m *InternalCommitTrigger) MarshalTo(dAtA []byte) (int, error) {
 		dAtA[i] = 0xa
 		i++
 		i = encodeVarintData(dAtA, i, uint64(m.SplitTrigger.Size()))
-		n13, err := m.SplitTrigger.MarshalTo(dAtA[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n13
-	}
-	if m.MergeTrigger != nil {
-		dAtA[i] = 0x12
-		i++
-		i = encodeVarintData(dAtA, i, uint64(m.MergeTrigger.Size()))
-		n14, err := m.MergeTrigger.MarshalTo(dAtA[i:])
+		n14, err := m.SplitTrigger.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n14
 	}
-	if m.ChangeReplicasTrigger != nil {
-		dAtA[i] = 0x1a
+	if m.MergeTrigger != nil {
+		dAtA[i] = 0x12
 		i++
-		i = encodeVarintData(dAtA, i, uint64(m.ChangeReplicasTrigger.Size()))
-		n15, err := m.ChangeReplicasTrigger.MarshalTo(dAtA[i:])
+		i = encodeVarintData(dAtA, i, uint64(m.MergeTrigger.Size()))
+		n15, err := m.MergeTrigger.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n15
 	}
-	if m.ModifiedSpanTrigger != nil {
-		dAtA[i] = 0x22
+	if m.ChangeReplicasTrigger != nil {
+		dAtA[i] = 0x1a
 		i++
-		i = encodeVarintData(dAtA, i, uint64(m.ModifiedSpanTrigger.Size()))
-		n16, err := m.ModifiedSpanTrigger.MarshalTo(dAtA[i:])
+		i = encodeVarintData(dAtA, i, uint64(m.ChangeReplicasTrigger.Size()))
+		n16, err := m.ChangeReplicasTrigger.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n16
 	}
-	if m.StickyBitTrigger != nil {
-		dAtA[i] = 0x2a
+	if m.ModifiedSpanTrigger != nil {
+		dAtA[i] = 0x22
 		i++
-		i = encodeVarintData(dAtA, i, uint64(m.StickyBitTrigger.Size()))
-		n17, err := m.StickyBitTrigger.MarshalTo(dAtA[i:])
+		i = encodeVarintData(dAtA, i, uint64(m.ModifiedSpanTrigger.Size()))
+		n17, err := m.ModifiedSpanTrigger.MarshalTo(dAtA[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n17
+	}
+	if m.StickyBitTrigger != nil {
+		dAtA[i] = 0x2a
+		i++
+		i = encodeVarintData(dAtA, i, uint64(m.StickyBitTrigger.Size()))
+		n18, err := m.StickyBitTrigger.MarshalTo(dAtA[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n18
 	}
 	return i, nil
 }
@@ -2118,11 +2172,11 @@ func (m *ObservedTimestamp) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x12
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.Timestamp.Size()))
-	n18, err := m.Timestamp.MarshalTo(dAtA[i:])
+	n19, err := m.Timestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n18
+	i += n19
 	return i, nil
 }
 
@@ -2144,11 +2198,11 @@ func (m *Transaction) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.TxnMeta.Size()))
-	n19, err := m.TxnMeta.MarshalTo(dAtA[i:])
+	n20, err := m.TxnMeta.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n19
+	i += n20
 	if len(m.Name) > 0 {
 		dAtA[i] = 0x12
 		i++
@@ -2163,27 +2217,27 @@ func (m *Transaction) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x2a
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.LastHeartbeat.Size()))
-	n20, err := m.LastHeartbeat.MarshalTo(dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n20
-	dAtA[i] = 0x32
-	i++
-	i = encodeVarintData(dAtA, i, uint64(m.OrigTimestamp.Size()))
-	n21, err := m.OrigTimestamp.MarshalTo(dAtA[i:])
+	n21, err := m.LastHeartbeat.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n21
-	dAtA[i] = 0x3a
+	dAtA[i] = 0x32
 	i++
-	i = encodeVarintData(dAtA, i, uint64(m.MaxTimestamp.Size()))
-	n22, err := m.MaxTimestamp.MarshalTo(dAtA[i:])
+	i = encodeVarintData(dAtA, i, uint64(m.OrigTimestamp.Size()))
+	n22, err := m.OrigTimestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n22
+	dAtA[i] = 0x3a
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.MaxTimestamp.Size()))
+	n23, err := m.MaxTimestamp.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n23
 	if len(m.ObservedTimestamps) > 0 {
 		for _, msg := range m.ObservedTimestamps {
 			dAtA[i] = 0x42
@@ -2195,16 +2249,6 @@ func (m *Transaction) MarshalTo(dAtA []byte) (int, error) {
 			}
 			i += n
 		}
-	}
-	if m.DeprecatedWriting {
-		dAtA[i] = 0x48
-		i++
-		if m.DeprecatedWriting {
-			dAtA[i] = 1
-		} else {
-			dAtA[i] = 0
-		}
-		i++
 	}
 	if len(m.IntentSpans) > 0 {
 		for _, msg := range m.IntentSpans {
@@ -2230,20 +2274,20 @@ func (m *Transaction) MarshalTo(dAtA []byte) (int, error) {
 	}
 	dAtA[i] = 0x72
 	i++
-	i = encodeVarintData(dAtA, i, uint64(m.EpochZeroTimestamp.Size()))
-	n23, err := m.EpochZeroTimestamp.MarshalTo(dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n23
-	dAtA[i] = 0x7a
-	i++
-	i = encodeVarintData(dAtA, i, uint64(m.RefreshedTimestamp.Size()))
-	n24, err := m.RefreshedTimestamp.MarshalTo(dAtA[i:])
+	i = encodeVarintData(dAtA, i, uint64(m.DeprecatedMinTimestamp.Size()))
+	n24, err := m.DeprecatedMinTimestamp.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n24
+	dAtA[i] = 0x7a
+	i++
+	i = encodeVarintData(dAtA, i, uint64(m.RefreshedTimestamp.Size()))
+	n25, err := m.RefreshedTimestamp.MarshalTo(dAtA[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n25
 	if m.OrigTimestampWasObserved {
 		dAtA[i] = 0x80
 		i++
@@ -2291,11 +2335,11 @@ func (m *TransactionRecord) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0xa
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.TxnMeta.Size()))
-	n25, err := m.TxnMeta.MarshalTo(dAtA[i:])
+	n26, err := m.TxnMeta.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n25
+	i += n26
 	if m.Status != 0 {
 		dAtA[i] = 0x20
 		i++
@@ -2304,15 +2348,7 @@ func (m *TransactionRecord) MarshalTo(dAtA []byte) (int, error) {
 	dAtA[i] = 0x2a
 	i++
 	i = encodeVarintData(dAtA, i, uint64(m.LastHeartbeat.Size()))
-	n26, err := m.LastHeartbeat.MarshalTo(dAtA[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n26
-	dAtA[i] = 0x32
-	i++
-	i = encodeVarintData(dAtA, i, uint64(m.OrigTimestamp.Size()))
-	n27, err := m.OrigTimestamp.MarshalTo(dAtA[i:])
+	n27, err := m.LastHeartbeat.MarshalTo(dAtA[i:])
 	if err != nil {
 		return 0, err
 	}
@@ -2661,7 +2697,6 @@ func NewPopulatedTransaction(r randyData, easy bool) *Transaction {
 			this.ObservedTimestamps[i] = *v9
 		}
 	}
-	this.DeprecatedWriting = bool(bool(r.Intn(2) == 0))
 	if r.Intn(10) != 0 {
 		v10 := r.Intn(5)
 		this.IntentSpans = make([]Span, v10)
@@ -2672,7 +2707,7 @@ func NewPopulatedTransaction(r randyData, easy bool) *Transaction {
 	}
 	this.WriteTooOld = bool(bool(r.Intn(2) == 0))
 	v12 := hlc.NewPopulatedTimestamp(r, easy)
-	this.EpochZeroTimestamp = *v12
+	this.DeprecatedMinTimestamp = *v12
 	v13 := hlc.NewPopulatedTimestamp(r, easy)
 	this.RefreshedTimestamp = *v13
 	this.OrigTimestampWasObserved = bool(bool(r.Intn(2) == 0))
@@ -2696,22 +2731,20 @@ func NewPopulatedTransactionRecord(r randyData, easy bool) *TransactionRecord {
 	this.Status = TransactionStatus([]int32{0, 3, 1, 2}[r.Intn(4)])
 	v17 := hlc.NewPopulatedTimestamp(r, easy)
 	this.LastHeartbeat = *v17
-	v18 := hlc.NewPopulatedTimestamp(r, easy)
-	this.OrigTimestamp = *v18
 	if r.Intn(10) != 0 {
-		v19 := r.Intn(5)
-		this.IntentSpans = make([]Span, v19)
-		for i := 0; i < v19; i++ {
-			v20 := NewPopulatedSpan(r, easy)
-			this.IntentSpans[i] = *v20
+		v18 := r.Intn(5)
+		this.IntentSpans = make([]Span, v18)
+		for i := 0; i < v18; i++ {
+			v19 := NewPopulatedSpan(r, easy)
+			this.IntentSpans[i] = *v19
 		}
 	}
 	if r.Intn(10) != 0 {
-		v21 := r.Intn(5)
-		this.InFlightWrites = make([]SequencedWrite, v21)
-		for i := 0; i < v21; i++ {
-			v22 := NewPopulatedSequencedWrite(r, easy)
-			this.InFlightWrites[i] = *v22
+		v20 := r.Intn(5)
+		this.InFlightWrites = make([]SequencedWrite, v20)
+		for i := 0; i < v20; i++ {
+			v21 := NewPopulatedSequencedWrite(r, easy)
+			this.InFlightWrites[i] = *v21
 		}
 	}
 	if !easy && r.Intn(10) != 0 {
@@ -2721,9 +2754,9 @@ func NewPopulatedTransactionRecord(r randyData, easy bool) *TransactionRecord {
 
 func NewPopulatedSequencedWrite(r randyData, easy bool) *SequencedWrite {
 	this := &SequencedWrite{}
-	v23 := r.Intn(100)
-	this.Key = make(Key, v23)
-	for i := 0; i < v23; i++ {
+	v22 := r.Intn(100)
+	this.Key = make(Key, v22)
+	for i := 0; i < v22; i++ {
 		this.Key[i] = byte(r.Intn(256))
 	}
 	this.Sequence = github_com_cockroachdb_cockroach_pkg_storage_engine_enginepb.TxnSeq(r.Int31())
@@ -2737,13 +2770,13 @@ func NewPopulatedSequencedWrite(r randyData, easy bool) *SequencedWrite {
 
 func NewPopulatedLease(r randyData, easy bool) *Lease {
 	this := &Lease{}
-	v24 := hlc.NewPopulatedTimestamp(r, easy)
-	this.Start = *v24
+	v23 := hlc.NewPopulatedTimestamp(r, easy)
+	this.Start = *v23
 	if r.Intn(10) != 0 {
 		this.Expiration = hlc.NewPopulatedTimestamp(r, easy)
 	}
-	v25 := NewPopulatedReplicaDescriptor(r, easy)
-	this.Replica = *v25
+	v24 := NewPopulatedReplicaDescriptor(r, easy)
+	this.Replica = *v24
 	if r.Intn(10) != 0 {
 		this.DeprecatedStartStasis = hlc.NewPopulatedTimestamp(r, easy)
 	}
@@ -2765,13 +2798,13 @@ func NewPopulatedLease(r randyData, easy bool) *Lease {
 
 func NewPopulatedAbortSpanEntry(r randyData, easy bool) *AbortSpanEntry {
 	this := &AbortSpanEntry{}
-	v26 := r.Intn(100)
-	this.Key = make(Key, v26)
-	for i := 0; i < v26; i++ {
+	v25 := r.Intn(100)
+	this.Key = make(Key, v25)
+	for i := 0; i < v25; i++ {
 		this.Key[i] = byte(r.Intn(256))
 	}
-	v27 := hlc.NewPopulatedTimestamp(r, easy)
-	this.Timestamp = *v27
+	v26 := hlc.NewPopulatedTimestamp(r, easy)
+	this.Timestamp = *v26
 	this.Priority = github_com_cockroachdb_cockroach_pkg_storage_engine_enginepb.TxnPriority(r.Int31())
 	if r.Intn(2) == 0 {
 		this.Priority *= -1
@@ -2800,9 +2833,9 @@ func randUTF8RuneData(r randyData) rune {
 	return rune(ru + 61)
 }
 func randStringData(r randyData) string {
-	v28 := r.Intn(100)
-	tmps := make([]rune, v28)
-	for i := 0; i < v28; i++ {
+	v27 := r.Intn(100)
+	tmps := make([]rune, v27)
+	for i := 0; i < v27; i++ {
 		tmps[i] = randUTF8RuneData(r)
 	}
 	return string(tmps)
@@ -2824,11 +2857,11 @@ func randFieldData(dAtA []byte, r randyData, fieldNumber int, wire int) []byte {
 	switch wire {
 	case 0:
 		dAtA = encodeVarintPopulateData(dAtA, uint64(key))
-		v29 := r.Int63()
+		v28 := r.Int63()
 		if r.Intn(2) == 0 {
-			v29 *= -1
+			v28 *= -1
 		}
-		dAtA = encodeVarintPopulateData(dAtA, uint64(v29))
+		dAtA = encodeVarintPopulateData(dAtA, uint64(v28))
 	case 1:
 		dAtA = encodeVarintPopulateData(dAtA, uint64(key))
 		dAtA = append(dAtA, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
@@ -2953,19 +2986,35 @@ func (m *ChangeReplicasTrigger) Size() (n int) {
 	}
 	var l int
 	_ = l
-	if m.ChangeType != 0 {
-		n += 1 + sovData(uint64(m.ChangeType))
+	if m.DeprecatedChangeType != 0 {
+		n += 1 + sovData(uint64(m.DeprecatedChangeType))
 	}
-	l = m.Replica.Size()
+	l = m.DeprecatedReplica.Size()
 	n += 1 + l + sovData(uint64(l))
-	if len(m.UpdatedReplicas) > 0 {
-		for _, e := range m.UpdatedReplicas {
+	if len(m.DeprecatedUpdatedReplicas) > 0 {
+		for _, e := range m.DeprecatedUpdatedReplicas {
 			l = e.Size()
 			n += 1 + l + sovData(uint64(l))
 		}
 	}
-	if m.NextReplicaID != 0 {
-		n += 1 + sovData(uint64(m.NextReplicaID))
+	if m.DeprecatedNextReplicaID != 0 {
+		n += 1 + sovData(uint64(m.DeprecatedNextReplicaID))
+	}
+	if m.Desc != nil {
+		l = m.Desc.Size()
+		n += 1 + l + sovData(uint64(l))
+	}
+	if len(m.InternalAddedReplicas) > 0 {
+		for _, e := range m.InternalAddedReplicas {
+			l = e.Size()
+			n += 1 + l + sovData(uint64(l))
+		}
+	}
+	if len(m.InternalRemovedReplicas) > 0 {
+		for _, e := range m.InternalRemovedReplicas {
+			l = e.Size()
+			n += 1 + l + sovData(uint64(l))
+		}
 	}
 	return n
 }
@@ -2992,10 +3041,8 @@ func (m *StickyBitTrigger) Size() (n int) {
 	}
 	var l int
 	_ = l
-	if m.StickyBit != nil {
-		l = m.StickyBit.Size()
-		n += 1 + l + sovData(uint64(l))
-	}
+	l = m.StickyBit.Size()
+	n += 1 + l + sovData(uint64(l))
 	return n
 }
 
@@ -3069,9 +3116,6 @@ func (m *Transaction) Size() (n int) {
 			n += 1 + l + sovData(uint64(l))
 		}
 	}
-	if m.DeprecatedWriting {
-		n += 2
-	}
 	if len(m.IntentSpans) > 0 {
 		for _, e := range m.IntentSpans {
 			l = e.Size()
@@ -3081,7 +3125,7 @@ func (m *Transaction) Size() (n int) {
 	if m.WriteTooOld {
 		n += 2
 	}
-	l = m.EpochZeroTimestamp.Size()
+	l = m.DeprecatedMinTimestamp.Size()
 	n += 1 + l + sovData(uint64(l))
 	l = m.RefreshedTimestamp.Size()
 	n += 1 + l + sovData(uint64(l))
@@ -3109,8 +3153,6 @@ func (m *TransactionRecord) Size() (n int) {
 		n += 1 + sovData(uint64(m.Status))
 	}
 	l = m.LastHeartbeat.Size()
-	n += 1 + l + sovData(uint64(l))
-	l = m.OrigTimestamp.Size()
 	n += 1 + l + sovData(uint64(l))
 	if len(m.IntentSpans) > 0 {
 		for _, e := range m.IntentSpans {
@@ -4019,9 +4061,9 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ChangeType", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedChangeType", wireType)
 			}
-			m.ChangeType = 0
+			m.DeprecatedChangeType = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowData
@@ -4031,14 +4073,14 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.ChangeType |= (ReplicaChangeType(b) & 0x7F) << shift
+				m.DeprecatedChangeType |= (ReplicaChangeType(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
 		case 2:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Replica", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedReplica", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4062,13 +4104,13 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.Replica.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.DeprecatedReplica.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
 		case 3:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field UpdatedReplicas", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedUpdatedReplicas", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4092,16 +4134,16 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.UpdatedReplicas = append(m.UpdatedReplicas, ReplicaDescriptor{})
-			if err := m.UpdatedReplicas[len(m.UpdatedReplicas)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			m.DeprecatedUpdatedReplicas = append(m.DeprecatedUpdatedReplicas, ReplicaDescriptor{})
+			if err := m.DeprecatedUpdatedReplicas[len(m.DeprecatedUpdatedReplicas)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
 		case 4:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NextReplicaID", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedNextReplicaID", wireType)
 			}
-			m.NextReplicaID = 0
+			m.DeprecatedNextReplicaID = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowData
@@ -4111,11 +4153,106 @@ func (m *ChangeReplicasTrigger) Unmarshal(dAtA []byte) error {
 				}
 				b := dAtA[iNdEx]
 				iNdEx++
-				m.NextReplicaID |= (ReplicaID(b) & 0x7F) << shift
+				m.DeprecatedNextReplicaID |= (ReplicaID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+		case 5:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Desc", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Desc == nil {
+				m.Desc = &RangeDescriptor{}
+			}
+			if err := m.Desc.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InternalAddedReplicas", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.InternalAddedReplicas = append(m.InternalAddedReplicas, ReplicaDescriptor{})
+			if err := m.InternalAddedReplicas[len(m.InternalAddedReplicas)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 7:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InternalRemovedReplicas", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.InternalRemovedReplicas = append(m.InternalRemovedReplicas, ReplicaDescriptor{})
+			if err := m.InternalRemovedReplicas[len(m.InternalRemovedReplicas)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipData(dAtA[iNdEx:])
@@ -4294,9 +4431,6 @@ func (m *StickyBitTrigger) Unmarshal(dAtA []byte) error {
 			postIndex := iNdEx + msglen
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
-			}
-			if m.StickyBit == nil {
-				m.StickyBit = &hlc.Timestamp{}
 			}
 			if err := m.StickyBit.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
@@ -4865,26 +4999,6 @@ func (m *Transaction) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		case 9:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedWriting", wireType)
-			}
-			var v int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				v |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			m.DeprecatedWriting = bool(v != 0)
 		case 11:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field IntentSpans", wireType)
@@ -4938,7 +5052,7 @@ func (m *Transaction) Unmarshal(dAtA []byte) error {
 			m.WriteTooOld = bool(v != 0)
 		case 14:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field EpochZeroTimestamp", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DeprecatedMinTimestamp", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4962,7 +5076,7 @@ func (m *Transaction) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.EpochZeroTimestamp.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.DeprecatedMinTimestamp.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -5173,36 +5287,6 @@ func (m *TransactionRecord) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if err := m.LastHeartbeat.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 6:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field OrigTimestamp", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := dAtA[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.OrigTimestamp.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -6212,136 +6296,140 @@ var (
 	ErrIntOverflowData   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("roachpb/data.proto", fileDescriptor_data_aebddfc8270530a2) }
+func init() { proto.RegisterFile("roachpb/data.proto", fileDescriptor_data_56eb522f44593a65) }
 
-var fileDescriptor_data_aebddfc8270530a2 = []byte{
-	// 2042 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xdc, 0x58, 0xcd, 0x6f, 0xdb, 0xc8,
-	0x15, 0x37, 0x45, 0xca, 0xa2, 0x9e, 0x3e, 0x4c, 0x4f, 0xe2, 0x44, 0xcd, 0xa2, 0x52, 0x56, 0x29,
-	0xda, 0x20, 0xd8, 0xc8, 0x68, 0xd2, 0x16, 0x68, 0xb0, 0x2d, 0xaa, 0xaf, 0x24, 0x54, 0x2c, 0x39,
-	0x4b, 0xd1, 0x09, 0x36, 0x8b, 0x05, 0x4b, 0x91, 0x63, 0x89, 0x88, 0x44, 0x6a, 0xc9, 0x91, 0x63,
-	0xed, 0x5f, 0xb0, 0xb7, 0xee, 0xa1, 0x87, 0xa2, 0xa7, 0x00, 0xbd, 0xf5, 0x1f, 0x68, 0x4f, 0xbd,
-	0x36, 0x97, 0x02, 0x7b, 0x6a, 0x8b, 0x1e, 0x84, 0x56, 0xbd, 0xf4, 0xdc, 0xa3, 0x81, 0x02, 0xc5,
-	0x0c, 0x87, 0x12, 0x1d, 0x2b, 0x86, 0x5c, 0x6f, 0x81, 0xa2, 0x17, 0x7b, 0xf8, 0xe6, 0xbd, 0xdf,
-	0xcc, 0xbc, 0x8f, 0xdf, 0x9b, 0x11, 0x20, 0xdf, 0x33, 0xad, 0xc1, 0xb8, 0xb7, 0x6b, 0x9b, 0xc4,
-	0xac, 0x8c, 0x7d, 0x8f, 0x78, 0x68, 0xdb, 0xf2, 0xac, 0x97, 0x4c, 0x5e, 0xe1, 0xb3, 0x37, 0xae,
-	0x45, 0x6a, 0x23, 0x4c, 0xcc, 0xa5, 0xea, 0x8d, 0x72, 0x40, 0x3c, 0xdf, 0xec, 0xe3, 0x5d, 0xec,
-	0xf6, 0x1d, 0x37, 0xfa, 0x47, 0xf5, 0x8e, 0x2c, 0x8b, 0xeb, 0xdc, 0x3a, 0x4f, 0xe7, 0x3e, 0x57,
-	0x2a, 0x4c, 0x88, 0x33, 0xdc, 0x1d, 0x0c, 0xad, 0x5d, 0xe2, 0x8c, 0x70, 0x40, 0xcc, 0xd1, 0x98,
-	0xcf, 0x5c, 0xed, 0x7b, 0x7d, 0x8f, 0x0d, 0x77, 0xe9, 0x28, 0x94, 0x96, 0x3f, 0x05, 0xa9, 0x3b,
-	0x36, 0x5d, 0xf4, 0x0d, 0x10, 0x5f, 0xe2, 0x69, 0x41, 0xbc, 0x29, 0xdc, 0xce, 0xd6, 0x52, 0x27,
-	0xb3, 0x92, 0xf8, 0x04, 0x4f, 0x35, 0x2a, 0x43, 0x37, 0x21, 0x85, 0x5d, 0xdb, 0xa0, 0xd3, 0xd2,
-	0xe9, 0xe9, 0x4d, 0xec, 0xda, 0x4f, 0xf0, 0xf4, 0x41, 0xf6, 0x17, 0xaf, 0x4b, 0x1b, 0xbf, 0x7d,
-	0x5d, 0x12, 0xfe, 0xf1, 0xba, 0x24, 0xb4, 0x24, 0x59, 0x50, 0x12, 0x2d, 0x49, 0x4e, 0x28, 0x62,
-	0x79, 0x04, 0xc9, 0x67, 0xe6, 0x70, 0x82, 0xd1, 0x7b, 0x90, 0xf6, 0xcd, 0x57, 0x46, 0x6f, 0x4a,
-	0x70, 0x50, 0x10, 0x28, 0x8c, 0x26, 0xfb, 0xe6, 0xab, 0x1a, 0xfd, 0x46, 0x55, 0x48, 0x2f, 0x76,
-	0x5b, 0x48, 0xdc, 0x14, 0x6e, 0x67, 0xee, 0x7d, 0xb3, 0xb2, 0x74, 0x1e, 0x3d, 0x52, 0x65, 0x30,
-	0xb4, 0x2a, 0x7a, 0xa4, 0x54, 0x93, 0xde, 0xcc, 0x4a, 0x1b, 0xda, 0xd2, 0xea, 0x81, 0x44, 0x97,
-	0x2e, 0x7f, 0x02, 0xf2, 0x13, 0x3c, 0x0d, 0x57, 0xe4, 0x27, 0x12, 0x56, 0x9c, 0xe8, 0x7b, 0x90,
-	0x3c, 0xa2, 0x3a, 0x7c, 0xad, 0x42, 0xe5, 0x4c, 0xa0, 0x2a, 0x0c, 0x83, 0x2f, 0x13, 0x2a, 0x97,
-	0xff, 0x24, 0x00, 0x74, 0x89, 0xe7, 0x63, 0xd5, 0xc6, 0x2e, 0x41, 0x7d, 0x00, 0x6b, 0x38, 0x09,
-	0x08, 0xf6, 0x0d, 0xc7, 0xe6, 0xcb, 0x3c, 0xa6, 0xfa, 0x7f, 0x99, 0x95, 0xee, 0xf7, 0x1d, 0x32,
-	0x98, 0xf4, 0x2a, 0x96, 0x37, 0xda, 0x5d, 0x60, 0xdb, 0xbd, 0xe5, 0x78, 0x77, 0xfc, 0xb2, 0xbf,
-	0xcb, 0x42, 0x35, 0x99, 0x38, 0x76, 0xe5, 0xe0, 0x40, 0x6d, 0xcc, 0x67, 0xa5, 0x74, 0x3d, 0x04,
-	0x54, 0x1b, 0x5a, 0x9a, 0x63, 0xab, 0x36, 0xba, 0x0b, 0x29, 0xd7, 0xb3, 0x31, 0x5d, 0x85, 0xee,
-	0x37, 0x59, 0xbb, 0x3a, 0x9f, 0x95, 0x36, 0x3b, 0x9e, 0x8d, 0xd5, 0xc6, 0xc9, 0x62, 0xa4, 0x6d,
-	0x52, 0x25, 0xd5, 0x46, 0xdf, 0x05, 0x99, 0x26, 0x0a, 0xd3, 0x17, 0x99, 0xfe, 0xb5, 0xf9, 0xac,
-	0x94, 0x0a, 0x77, 0x4e, 0x0d, 0xa2, 0xa1, 0x96, 0x0a, 0xc2, 0xd3, 0x94, 0x7f, 0x2d, 0x40, 0xb6,
-	0x3b, 0x1e, 0x3a, 0x44, 0xf7, 0x9d, 0x7e, 0x1f, 0xfb, 0xa8, 0x09, 0xe9, 0x21, 0x3e, 0x24, 0x86,
-	0x8d, 0x03, 0x8b, 0x1d, 0x2d, 0x73, 0xaf, 0xbc, 0xc2, 0x49, 0x9a, 0xe9, 0xf6, 0x71, 0x03, 0x07,
-	0x96, 0xef, 0x8c, 0x89, 0xe7, 0x73, 0x77, 0xc9, 0xd4, 0x94, 0x4a, 0xd1, 0x23, 0x00, 0xdf, 0xe9,
-	0x0f, 0x38, 0x4e, 0xe2, 0x82, 0x38, 0x69, 0x66, 0x4b, 0xc5, 0x61, 0x74, 0x5b, 0x92, 0x2c, 0x2a,
-	0x52, 0x79, 0x9e, 0x80, 0x6c, 0x1b, 0xfb, 0x7d, 0xfc, 0x3f, 0xba, 0x59, 0xe4, 0x82, 0x12, 0x02,
-	0xd1, 0xba, 0x34, 0x02, 0x62, 0x92, 0x80, 0x15, 0x4e, 0xe6, 0xde, 0x07, 0x31, 0x38, 0x5e, 0xcc,
-	0x95, 0xb0, 0x8a, 0x2b, 0x51, 0x31, 0x57, 0xda, 0xcf, 0xea, 0xf5, 0x2e, 0xb5, 0xa9, 0x5d, 0xa3,
-	0xc0, 0xf3, 0x59, 0x29, 0xaf, 0x51, 0xb4, 0x85, 0x5c, 0xcb, 0x33, 0xf4, 0xf6, 0x91, 0x65, 0xb1,
-	0x6f, 0xf4, 0x10, 0xb2, 0x87, 0x3e, 0xc6, 0x9f, 0x63, 0xba, 0x96, 0x4f, 0x0a, 0xc9, 0xf5, 0x0b,
-	0x28, 0x13, 0x1a, 0x76, 0xa9, 0xdd, 0x29, 0x27, 0xff, 0x21, 0x01, 0x3b, 0xf5, 0x01, 0x3d, 0xa9,
-	0x86, 0xc7, 0x43, 0xc7, 0x32, 0x83, 0xa5, 0xb7, 0x33, 0x16, 0x9b, 0x30, 0xc8, 0x74, 0x8c, 0x99,
-	0xbf, 0xf3, 0xf7, 0xbe, 0xb5, 0xca, 0x4f, 0xa1, 0x61, 0x88, 0xa2, 0x4f, 0xc7, 0x58, 0x03, 0x6b,
-	0x31, 0x46, 0x0d, 0x48, 0xf9, 0xa1, 0x02, 0x77, 0xf5, 0x39, 0x10, 0x67, 0x9c, 0x1d, 0x99, 0xa2,
-	0x03, 0x50, 0x26, 0x63, 0xdb, 0x24, 0xd8, 0x36, 0xb8, 0x28, 0x28, 0x88, 0x37, 0xc5, 0x0b, 0xc2,
-	0x6d, 0x71, 0x8c, 0xe8, 0xa8, 0xe8, 0x21, 0x6c, 0xb9, 0xf8, 0x98, 0x44, 0x98, 0xb4, 0x92, 0x24,
-	0x56, 0x49, 0xc5, 0xf9, 0xac, 0x94, 0xeb, 0xe0, 0x63, 0xc2, 0x55, 0x59, 0x3d, 0xa5, 0x17, 0x1f,
-	0x5a, 0xce, 0x8d, 0xcd, 0xd9, 0x0f, 0x64, 0xca, 0x8b, 0x8c, 0x98, 0xbe, 0x14, 0xe0, 0x4a, 0xdb,
-	0xb3, 0x9d, 0x43, 0x07, 0xdb, 0x94, 0x6f, 0x23, 0x6f, 0x7e, 0x00, 0x28, 0x98, 0x06, 0x04, 0x8f,
-	0x0c, 0xcb, 0x73, 0x0f, 0x9d, 0xbe, 0x11, 0x8c, 0x4d, 0x97, 0x39, 0x55, 0xd6, 0x94, 0x70, 0xa6,
-	0xce, 0x26, 0x18, 0x49, 0x37, 0x01, 0x31, 0x26, 0x18, 0x3a, 0x47, 0xd8, 0xc5, 0x41, 0x10, 0x6a,
-	0x87, 0xfe, 0xbb, 0xbe, 0xe2, 0xc0, 0xd4, 0x48, 0x53, 0xa8, 0xc9, 0x1e, 0xb7, 0xa0, 0x12, 0xce,
-	0x95, 0xcf, 0x40, 0xe9, 0x12, 0xc7, 0x7a, 0x39, 0xad, 0x2d, 0xeb, 0xfe, 0x43, 0x80, 0x80, 0xc9,
-	0x8c, 0x9e, 0x43, 0x78, 0x2d, 0x9d, 0x9f, 0x48, 0x5a, 0x3a, 0x88, 0x40, 0x38, 0xee, 0xef, 0x44,
-	0xd8, 0x51, 0x5d, 0x82, 0x7d, 0xd7, 0x1c, 0xd6, 0xbd, 0xd1, 0x68, 0x89, 0xde, 0x80, 0x5c, 0x40,
-	0x59, 0xc6, 0x20, 0xa1, 0x80, 0x2f, 0x50, 0x5a, 0xb9, 0xf3, 0x25, 0x1b, 0x69, 0xd9, 0x20, 0xce,
-	0x4d, 0x0d, 0xc8, 0x8d, 0x68, 0xf9, 0x2f, 0x50, 0x12, 0xef, 0x44, 0x89, 0xd3, 0x84, 0x96, 0x1d,
-	0xc5, 0x49, 0xe3, 0xa7, 0x70, 0x9d, 0xa7, 0x71, 0x94, 0x38, 0x0b, 0x3c, 0x91, 0xe1, 0xdd, 0x5e,
-	0x81, 0xb7, 0xb2, 0x22, 0xb4, 0x1d, 0x6b, 0x65, 0xa1, 0xbc, 0x80, 0x9d, 0x11, 0x8f, 0x38, 0x8b,
-	0xd3, 0x02, 0x3f, 0xe4, 0x82, 0x6f, 0xaf, 0xda, 0xef, 0xd9, 0x0c, 0xd1, 0xae, 0x8c, 0x56, 0xa4,
-	0xcd, 0x47, 0x80, 0x96, 0x71, 0x5a, 0x00, 0x87, 0x85, 0x7f, 0x6b, 0x95, 0x3b, 0xdf, 0x0a, 0xb4,
-	0xa6, 0x04, 0x6f, 0x49, 0x1e, 0xc8, 0x5f, 0xf0, 0xfe, 0x5d, 0xfe, 0x99, 0x00, 0xdb, 0xfb, 0xbd,
-	0x00, 0xfb, 0x47, 0xd8, 0x5e, 0xc4, 0x39, 0xde, 0x85, 0x84, 0x35, 0xba, 0xd0, 0xd7, 0xd0, 0xd2,
-	0xe5, 0xe8, 0x46, 0x51, 0xfe, 0x63, 0x0a, 0x32, 0xba, 0x6f, 0xba, 0x81, 0x69, 0x11, 0xc7, 0x73,
-	0xd1, 0x63, 0x90, 0xe8, 0xfd, 0x89, 0xe7, 0xcf, 0x9d, 0x35, 0x58, 0x55, 0x3f, 0x76, 0xdb, 0x98,
-	0x98, 0x35, 0x99, 0x2e, 0xf2, 0xd5, 0xac, 0x24, 0x68, 0x0c, 0x01, 0x21, 0x90, 0x5c, 0x73, 0x14,
-	0x5e, 0x04, 0xd2, 0x1a, 0x1b, 0xa3, 0x0f, 0x61, 0x93, 0x92, 0xf6, 0x24, 0x64, 0xed, 0xd5, 0xe4,
-	0x16, 0xdb, 0x4d, 0x97, 0xe9, 0x6a, 0xdc, 0x06, 0xb5, 0x20, 0x3f, 0x34, 0x03, 0x62, 0x0c, 0xb0,
-	0xe9, 0x93, 0x1e, 0x36, 0x2f, 0xc4, 0xc7, 0x39, 0x6a, 0xfa, 0x38, 0xb2, 0xa4, 0x58, 0x9e, 0xef,
-	0xf4, 0x8d, 0xa5, 0x27, 0x37, 0x2f, 0x80, 0x45, 0x4d, 0x97, 0xf1, 0x7b, 0x0c, 0xb9, 0x91, 0x79,
-	0x1c, 0x83, 0x4a, 0xad, 0x0f, 0x95, 0x1d, 0x99, 0xc7, 0x4b, 0xa4, 0x4f, 0xe0, 0x8a, 0xc7, 0xd3,
-	0x63, 0x09, 0x17, 0x14, 0xe4, 0x77, 0xf2, 0xee, 0x99, 0x64, 0xe2, 0xb0, 0xc8, 0x7b, 0x7b, 0x22,
-	0x40, 0x77, 0x01, 0xd9, 0x78, 0xec, 0x63, 0x8b, 0x91, 0xfa, 0x2b, 0xdf, 0x21, 0x8e, 0xdb, 0x2f,
-	0xa4, 0x19, 0x21, 0x6e, 0x2f, 0x67, 0x9e, 0x87, 0x13, 0xe8, 0x27, 0x90, 0x75, 0x5c, 0x82, 0x5d,
-	0xc2, 0x4a, 0x2c, 0x28, 0x64, 0xd8, 0x26, 0xde, 0xc5, 0x85, 0x51, 0xd7, 0x0b, 0x4d, 0xa8, 0x24,
-	0x40, 0x65, 0xc8, 0xd1, 0x55, 0xb0, 0x41, 0x3c, 0xcf, 0xf0, 0x86, 0x76, 0x21, 0xcb, 0xd6, 0xca,
-	0x30, 0xa1, 0xee, 0x79, 0xfb, 0x43, 0x1b, 0x1d, 0xc0, 0x55, 0x3c, 0xf6, 0xac, 0x81, 0xf1, 0x39,
-	0xf6, 0xbd, 0x98, 0x0b, 0xf3, 0xeb, 0xbb, 0x10, 0x31, 0x80, 0x17, 0xd8, 0xf7, 0x96, 0x8e, 0xd4,
-	0xe1, 0x8a, 0x8f, 0x0f, 0x7d, 0x1c, 0x0c, 0xe2, 0x9e, 0x2c, 0x6c, 0x5d, 0x00, 0x75, 0x61, 0xbf,
-	0x44, 0xfd, 0x11, 0xbc, 0x77, 0x3a, 0x69, 0x8c, 0x57, 0x66, 0x60, 0x44, 0xae, 0x2e, 0x28, 0xec,
-	0x78, 0x85, 0x53, 0xc9, 0xf1, 0xdc, 0x0c, 0xa2, 0x18, 0xa1, 0x8f, 0x40, 0x71, 0x5c, 0xe3, 0x70,
-	0xc8, 0x6e, 0x30, 0xcc, 0x09, 0x41, 0x61, 0x9b, 0x79, 0xf5, 0xfd, 0x55, 0x5e, 0xc5, 0x9f, 0x4d,
-	0xb0, 0x6b, 0x85, 0x01, 0x89, 0xee, 0xcb, 0x79, 0xc7, 0x7d, 0xc8, 0xec, 0x99, 0x30, 0x38, 0xf3,
-	0x3c, 0x10, 0x15, 0xa9, 0x25, 0xc9, 0x39, 0x25, 0x5f, 0xfe, 0xb9, 0x04, 0xdb, 0xb1, 0x52, 0xd2,
-	0xb0, 0xe5, 0xf9, 0xf6, 0xd7, 0x58, 0xde, 0xff, 0x9f, 0xa5, 0x7c, 0xf9, 0xa4, 0xff, 0x2f, 0x04,
-	0x59, 0x8e, 0x05, 0x38, 0xa1, 0x88, 0x8b, 0x30, 0xa7, 0x14, 0xb9, 0x25, 0xc9, 0xb2, 0x92, 0x6e,
-	0x49, 0x72, 0x5a, 0x81, 0x96, 0x24, 0x83, 0x92, 0x69, 0x49, 0x72, 0x56, 0xc9, 0x85, 0x49, 0xd0,
-	0x92, 0xe4, 0xbc, 0xb2, 0xd5, 0x92, 0xe4, 0x2d, 0x45, 0x69, 0x49, 0xb2, 0xa2, 0x6c, 0x97, 0x7f,
-	0x2f, 0xc0, 0xa6, 0xca, 0xb6, 0x8b, 0xbe, 0x0f, 0xd2, 0xe2, 0x4a, 0x74, 0xce, 0x19, 0x63, 0x81,
-	0xa7, 0xea, 0xa8, 0x06, 0x22, 0x39, 0x8e, 0xae, 0x46, 0x17, 0xc9, 0xa0, 0xf0, 0x70, 0xd4, 0x38,
-	0x96, 0x3c, 0xe2, 0xc5, 0x93, 0x87, 0x5f, 0x86, 0x7e, 0x29, 0x40, 0xfe, 0xb4, 0xfb, 0xce, 0x7b,
-	0x97, 0x5a, 0x20, 0x07, 0x5c, 0x99, 0x3f, 0xf5, 0x1e, 0x9d, 0xcc, 0x4a, 0xf5, 0xb5, 0x1e, 0x93,
-	0xef, 0xf8, 0x71, 0x80, 0x1e, 0xac, 0x8b, 0x3f, 0xd3, 0x16, 0xc0, 0xb1, 0xb6, 0xfa, 0x2f, 0x11,
-	0x92, 0x7b, 0xd8, 0x0c, 0x30, 0xfa, 0x21, 0x24, 0xc3, 0xb7, 0x83, 0xb0, 0x7e, 0x52, 0x86, 0x16,
-	0xe8, 0x53, 0x00, 0x7c, 0x3c, 0x76, 0x7c, 0x93, 0xfa, 0x60, 0xbd, 0x4e, 0x5f, 0xfc, 0xe7, 0xac,
-	0x74, 0x23, 0x76, 0x92, 0x07, 0x65, 0xdf, 0x74, 0x6d, 0x77, 0x32, 0x1c, 0x9a, 0xbd, 0x21, 0x2e,
-	0x6b, 0x31, 0xc0, 0xf8, 0x3b, 0x41, 0xfc, 0xcf, 0xdf, 0x09, 0x13, 0xb8, 0x1e, 0xeb, 0x2a, 0x6c,
-	0xe3, 0xf4, 0x6f, 0xe0, 0x44, 0x2f, 0xb3, 0x4b, 0xee, 0x78, 0x67, 0x89, 0xce, 0xde, 0x52, 0x5d,
-	0x86, 0x8d, 0x3a, 0x90, 0x19, 0xfb, 0xde, 0xd8, 0x0b, 0x28, 0xbf, 0x07, 0xeb, 0xb1, 0x47, 0x7e,
-	0x3e, 0x2b, 0xc1, 0x53, 0x6e, 0xa5, 0x77, 0x35, 0x88, 0x10, 0xf4, 0x00, 0x5d, 0x85, 0x24, 0x6b,
-	0x23, 0x8c, 0x3b, 0x44, 0x2d, 0xfc, 0x40, 0x77, 0x63, 0x59, 0x43, 0x9b, 0xba, 0x58, 0xdb, 0x3e,
-	0x99, 0x95, 0x72, 0x2c, 0xb2, 0x51, 0xee, 0xc5, 0xe3, 0x1f, 0xb1, 0x71, 0x79, 0x2e, 0x40, 0xbe,
-	0xda, 0xf3, 0x7c, 0x46, 0x0a, 0x4d, 0x97, 0xf8, 0xd3, 0xf3, 0x92, 0xf3, 0xf2, 0x37, 0x3a, 0x34,
-	0x00, 0x79, 0xec, 0x3b, 0x9e, 0xef, 0x90, 0x29, 0xff, 0x69, 0x62, 0xef, 0x64, 0x56, 0x7a, 0x7c,
-	0xd9, 0xfc, 0x7e, 0xca, 0x31, 0xb5, 0x05, 0x7a, 0x3c, 0xc9, 0x13, 0x90, 0xd5, 0x8f, 0xdd, 0xba,
-	0xe7, 0xf9, 0x36, 0xad, 0x70, 0xf4, 0x83, 0x90, 0x1a, 0xc2, 0x4c, 0x2f, 0x9e, 0x5f, 0xd3, 0x71,
-	0x3a, 0xb8, 0x05, 0x39, 0xcb, 0x1b, 0x8d, 0x4c, 0xd7, 0x36, 0x2c, 0x6f, 0xe2, 0x92, 0xf0, 0x04,
-	0x5a, 0x96, 0x0b, 0xeb, 0x54, 0x86, 0x6a, 0x90, 0xe3, 0x2d, 0xd9, 0xf0, 0xb1, 0x69, 0xd3, 0xf4,
-	0x5a, 0x83, 0x9b, 0xb3, 0xdc, 0x46, 0xa3, 0x26, 0xa8, 0x01, 0xf9, 0x08, 0x83, 0x53, 0x73, 0x72,
-	0x1d, 0x90, 0x68, 0xe1, 0x90, 0x8f, 0xd1, 0x77, 0x60, 0x2b, 0x42, 0x71, 0xdc, 0x23, 0x73, 0xe8,
-	0xd8, 0x2c, 0x39, 0x64, 0x2d, 0x02, 0x57, 0x43, 0xe9, 0xca, 0x5e, 0x20, 0x5f, 0xaa, 0x17, 0x2c,
-	0x3a, 0xc0, 0xa6, 0x92, 0xba, 0xf3, 0x1b, 0x01, 0xd2, 0xec, 0xc7, 0x34, 0xf6, 0xec, 0xcf, 0x40,
-	0xea, 0xa0, 0xf3, 0xa4, 0xb3, 0xff, 0xbc, 0xa3, 0x6c, 0xa0, 0x14, 0x88, 0x6a, 0x47, 0x57, 0x04,
-	0x94, 0x86, 0xe4, 0xc3, 0xbd, 0xfd, 0xaa, 0xae, 0x24, 0xe8, 0xb0, 0xf6, 0xb1, 0xde, 0xec, 0x2a,
-	0x22, 0xba, 0x02, 0x5b, 0x8d, 0xe6, 0x9e, 0xda, 0x56, 0xf5, 0x66, 0xc3, 0x08, 0x85, 0x32, 0x92,
-	0x41, 0xd2, 0xd5, 0x76, 0x53, 0x91, 0x28, 0x54, 0xa3, 0x59, 0x57, 0xdb, 0xd5, 0x3d, 0x25, 0x89,
-	0x76, 0x60, 0x7b, 0xa9, 0x1b, 0x89, 0xd3, 0x28, 0x0b, 0x72, 0xe3, 0x40, 0xab, 0xea, 0xea, 0x7e,
-	0x47, 0xd9, 0xa4, 0xd8, 0xfa, 0xc1, 0xd3, 0xbd, 0xa6, 0x02, 0x74, 0xa2, 0xa6, 0xea, 0x55, 0x4d,
-	0xab, 0x7e, 0xac, 0x64, 0x50, 0x1e, 0x80, 0x82, 0x76, 0x9b, 0x9a, 0xda, 0xec, 0x2a, 0x76, 0x99,
-	0x76, 0xad, 0xd4, 0x9d, 0x1f, 0xc3, 0xf6, 0x99, 0xdf, 0x30, 0xd0, 0x16, 0x64, 0xaa, 0x8d, 0x86,
-	0xa1, 0x35, 0x9f, 0xee, 0xa9, 0xf5, 0xaa, 0xb2, 0x81, 0x10, 0xe4, 0xb5, 0x66, 0x7b, 0xff, 0x59,
-	0x73, 0x21, 0x13, 0x6e, 0x48, 0x5f, 0xfc, 0xaa, 0xb8, 0x71, 0x67, 0xff, 0xd4, 0xdd, 0x26, 0x6c,
-	0x0f, 0x74, 0xd7, 0x4f, 0x9b, 0x9d, 0x86, 0xda, 0x79, 0xa4, 0x6c, 0xd0, 0x8f, 0xae, 0x5e, 0x7d,
-	0x44, 0x3f, 0x44, 0x94, 0x83, 0x74, 0x7d, 0xbf, 0xdd, 0x56, 0x75, 0xbd, 0xd9, 0x50, 0x04, 0x3a,
-	0x57, 0xad, 0xed, 0x6b, 0xf4, 0x23, 0x11, 0x02, 0xd6, 0xde, 0x7f, 0xf3, 0xb7, 0xe2, 0xc6, 0x9b,
-	0x79, 0x51, 0xf8, 0x6a, 0x5e, 0x14, 0xfe, 0x3c, 0x2f, 0x0a, 0x7f, 0x9d, 0x17, 0x85, 0x2f, 0xff,
-	0x5e, 0xdc, 0x78, 0x91, 0xe2, 0xe1, 0xe9, 0x6d, 0xb2, 0x5f, 0x75, 0xef, 0xff, 0x3b, 0x00, 0x00,
-	0xff, 0xff, 0xa2, 0xd8, 0x37, 0xee, 0x8f, 0x16, 0x00, 0x00,
+var fileDescriptor_data_56eb522f44593a65 = []byte{
+	// 2110 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcc, 0x58, 0xcd, 0x6f, 0xdb, 0xc8,
+	0x15, 0x37, 0x4d, 0x4a, 0xa2, 0x9e, 0x3e, 0x4c, 0x4f, 0xe2, 0x44, 0x49, 0x50, 0x29, 0x55, 0x8a,
+	0x36, 0x0d, 0x76, 0x65, 0x34, 0x69, 0x17, 0x68, 0xd0, 0x16, 0xd5, 0x57, 0x12, 0x29, 0x96, 0x9d,
+	0x1d, 0xd1, 0x09, 0xb2, 0xdb, 0x80, 0xa5, 0xc8, 0xb1, 0xcc, 0x46, 0x22, 0xb5, 0x24, 0xe5, 0x58,
+	0xfd, 0x0b, 0xf6, 0xd6, 0x3d, 0x16, 0x3d, 0x05, 0xe8, 0xad, 0x97, 0x9e, 0x8a, 0xf6, 0xd4, 0x6b,
+	0x73, 0x2a, 0x72, 0xeb, 0xa2, 0x07, 0xa1, 0x55, 0x2e, 0x3d, 0xf7, 0x18, 0xa0, 0x40, 0x31, 0xc3,
+	0x21, 0x45, 0xc7, 0x8a, 0x21, 0xc1, 0xbb, 0xc0, 0x5e, 0x24, 0xf2, 0xcd, 0x7b, 0xbf, 0x37, 0xf3,
+	0xbe, 0x87, 0x80, 0x5c, 0x47, 0x37, 0x0e, 0x47, 0xbd, 0x6d, 0x53, 0xf7, 0xf5, 0xca, 0xc8, 0x75,
+	0x7c, 0x07, 0x6d, 0x1a, 0x8e, 0xf1, 0x9c, 0xd1, 0x2b, 0x7c, 0xf5, 0xea, 0xa5, 0x90, 0x6d, 0x48,
+	0x7c, 0x7d, 0xce, 0x7a, 0xb5, 0xec, 0xf9, 0x8e, 0xab, 0xf7, 0xc9, 0x36, 0xb1, 0xfb, 0x96, 0x1d,
+	0xfe, 0x51, 0xbe, 0x23, 0xc3, 0xe0, 0x3c, 0x37, 0xce, 0xe2, 0xb9, 0xc3, 0x99, 0x0a, 0x63, 0xdf,
+	0x1a, 0x6c, 0x1f, 0x0e, 0x8c, 0x6d, 0xdf, 0x1a, 0x12, 0xcf, 0xd7, 0x87, 0x23, 0xbe, 0x72, 0xb1,
+	0xef, 0xf4, 0x1d, 0xf6, 0xb8, 0x4d, 0x9f, 0x02, 0x6a, 0xf9, 0x19, 0x48, 0xdd, 0x91, 0x6e, 0xa3,
+	0x2b, 0x20, 0x3e, 0x27, 0x93, 0x82, 0x78, 0x5d, 0xb8, 0x99, 0xad, 0xa5, 0xde, 0x4e, 0x4b, 0xe2,
+	0x43, 0x32, 0xc1, 0x94, 0x86, 0xae, 0x43, 0x8a, 0xd8, 0xa6, 0x46, 0x97, 0xa5, 0x93, 0xcb, 0x49,
+	0x62, 0x9b, 0x0f, 0xc9, 0xe4, 0x6e, 0xf6, 0xb7, 0x2f, 0x4b, 0x6b, 0x7f, 0x79, 0x59, 0x12, 0xfe,
+	0xf3, 0xb2, 0x24, 0xb4, 0x25, 0x59, 0x50, 0xd6, 0xdb, 0x92, 0xbc, 0xae, 0x88, 0xe5, 0x21, 0x24,
+	0x1e, 0xeb, 0x83, 0x31, 0x41, 0xd7, 0x20, 0xed, 0xea, 0x2f, 0xb4, 0xde, 0xc4, 0x27, 0x5e, 0x41,
+	0xa0, 0x30, 0x58, 0x76, 0xf5, 0x17, 0x35, 0xfa, 0x8e, 0xaa, 0x90, 0x8e, 0x76, 0x5b, 0x58, 0xbf,
+	0x2e, 0xdc, 0xcc, 0xdc, 0xfe, 0x56, 0x65, 0x6e, 0x3c, 0x7a, 0xa4, 0xca, 0xe1, 0xc0, 0xa8, 0xa8,
+	0x21, 0x53, 0x4d, 0x7a, 0x35, 0x2d, 0xad, 0xe1, 0xb9, 0xd4, 0x5d, 0x89, 0xaa, 0x2e, 0x7f, 0x0a,
+	0xf2, 0x43, 0x32, 0x09, 0x34, 0xf2, 0x13, 0x09, 0x0b, 0x4e, 0xf4, 0x43, 0x48, 0x1c, 0x51, 0x1e,
+	0xae, 0xab, 0x50, 0x39, 0xe5, 0xa8, 0x0a, 0xc3, 0xe0, 0x6a, 0x02, 0xe6, 0xf2, 0x3f, 0x04, 0x80,
+	0xae, 0xef, 0xb8, 0xa4, 0x65, 0x12, 0xdb, 0x47, 0x7d, 0x00, 0x63, 0x30, 0xf6, 0x7c, 0xe2, 0x6a,
+	0x96, 0xc9, 0xd5, 0x3c, 0xa0, 0xfc, 0xff, 0x9c, 0x96, 0xee, 0xf4, 0x2d, 0xff, 0x70, 0xdc, 0xab,
+	0x18, 0xce, 0x70, 0x3b, 0xc2, 0x36, 0x7b, 0xf3, 0xe7, 0xed, 0xd1, 0xf3, 0xfe, 0x36, 0x73, 0xd5,
+	0x78, 0x6c, 0x99, 0x95, 0xfd, 0xfd, 0x56, 0x63, 0x36, 0x2d, 0xa5, 0xeb, 0x01, 0x60, 0xab, 0x81,
+	0xd3, 0x1c, 0xbb, 0x65, 0xa2, 0x0f, 0x21, 0x65, 0x3b, 0x26, 0xa1, 0x5a, 0xe8, 0x7e, 0x13, 0xb5,
+	0x8b, 0xb3, 0x69, 0x29, 0xb9, 0xeb, 0x98, 0xa4, 0xd5, 0x78, 0x1b, 0x3d, 0xe1, 0x24, 0x65, 0x6a,
+	0x99, 0xe8, 0x07, 0x20, 0xd3, 0x40, 0x61, 0xfc, 0x22, 0xe3, 0xbf, 0x34, 0x9b, 0x96, 0x52, 0xc1,
+	0xce, 0xa9, 0x40, 0xf8, 0x88, 0x53, 0x5e, 0x70, 0x9a, 0xf2, 0x1f, 0x04, 0xc8, 0x76, 0x47, 0x03,
+	0xcb, 0x57, 0x5d, 0xab, 0xdf, 0x27, 0x2e, 0x6a, 0x42, 0x7a, 0x40, 0x0e, 0x7c, 0xcd, 0x24, 0x9e,
+	0xc1, 0x8e, 0x96, 0xb9, 0x5d, 0x5e, 0x60, 0x24, 0xac, 0xdb, 0x7d, 0xd2, 0x20, 0x9e, 0xe1, 0x5a,
+	0x23, 0xdf, 0x71, 0xb9, 0xb9, 0x64, 0x2a, 0x4a, 0xa9, 0xe8, 0x3e, 0x80, 0x6b, 0xf5, 0x0f, 0x39,
+	0xce, 0xfa, 0x8a, 0x38, 0x69, 0x26, 0x4b, 0xc9, 0x81, 0x77, 0xdb, 0x92, 0x2c, 0x2a, 0x52, 0x79,
+	0xb6, 0x0e, 0xd9, 0x0e, 0x71, 0xfb, 0xe4, 0x1b, 0xba, 0x59, 0x64, 0x83, 0x12, 0x00, 0xd1, 0xbc,
+	0xd4, 0x3c, 0x5f, 0xf7, 0x3d, 0x96, 0x38, 0x99, 0xdb, 0x1f, 0xc4, 0xe0, 0x78, 0x32, 0x57, 0x82,
+	0x2c, 0xae, 0x84, 0xc9, 0x5c, 0xe9, 0x3c, 0xae, 0xd7, 0xbb, 0x54, 0xa6, 0x76, 0x89, 0x02, 0xcf,
+	0xa6, 0xa5, 0x3c, 0xa6, 0x68, 0x11, 0x1d, 0xe7, 0x19, 0x7a, 0xe7, 0xc8, 0x30, 0xd8, 0x3b, 0xba,
+	0x07, 0xd9, 0x03, 0x97, 0x90, 0x5f, 0x13, 0xaa, 0xcb, 0xf5, 0x0b, 0x89, 0xe5, 0x13, 0x28, 0x13,
+	0x08, 0x76, 0xa9, 0xdc, 0x09, 0x23, 0xff, 0x31, 0x01, 0x5b, 0xf5, 0x43, 0x7a, 0x52, 0x4c, 0x46,
+	0x03, 0xcb, 0xd0, 0xbd, 0xd0, 0xda, 0x9f, 0xc0, 0x25, 0x93, 0x8c, 0x5c, 0x62, 0xe8, 0x3e, 0x31,
+	0x35, 0x83, 0xf1, 0x68, 0xfe, 0x64, 0x44, 0x98, 0xe9, 0xf3, 0xb7, 0xbf, 0xb3, 0xc8, 0x64, 0x01,
+	0x46, 0x00, 0xa8, 0x4e, 0x46, 0x04, 0x5f, 0x9c, 0x63, 0xcc, 0xa9, 0xe8, 0x29, 0xa0, 0x18, 0xb6,
+	0x1b, 0x48, 0x71, 0x57, 0x9c, 0x81, 0x7b, 0xca, 0x19, 0x9b, 0x73, 0x14, 0xce, 0x82, 0x7e, 0x05,
+	0xd7, 0x62, 0xd0, 0xe3, 0x91, 0x19, 0x57, 0xe1, 0x15, 0xc4, 0xeb, 0xe2, 0x8a, 0x3a, 0xae, 0xcc,
+	0xe1, 0xf6, 0x03, 0xb4, 0xd0, 0x52, 0x88, 0xc0, 0xd5, 0x98, 0x2e, 0x9b, 0x1c, 0xfb, 0xa1, 0x22,
+	0x9a, 0x93, 0x12, 0xcb, 0xc9, 0x9b, 0xb3, 0x69, 0xe9, 0x72, 0x23, 0xe2, 0xda, 0x25, 0xc7, 0x3e,
+	0x97, 0x67, 0x39, 0x9a, 0x8e, 0x5e, 0xf0, 0x65, 0x73, 0x21, 0x97, 0x89, 0x3e, 0x02, 0x89, 0x85,
+	0x6a, 0x62, 0xd9, 0x50, 0xc5, 0x8c, 0x1f, 0xf5, 0xe0, 0xb2, 0x65, 0xfb, 0xc4, 0xb5, 0xf5, 0x81,
+	0xa6, 0x9b, 0x66, 0xdc, 0x0c, 0xc9, 0x95, 0xcd, 0xb0, 0x15, 0x42, 0x55, 0x29, 0x52, 0x64, 0x82,
+	0x03, 0xb8, 0x12, 0xe9, 0x70, 0xc9, 0xd0, 0x39, 0x8a, 0x6b, 0x49, 0xad, 0xac, 0x25, 0xda, 0x30,
+	0x0e, 0xb0, 0x42, 0x3d, 0x77, 0x65, 0xda, 0x79, 0x58, 0xe9, 0xff, 0x42, 0x80, 0x0b, 0x1d, 0xc7,
+	0xb4, 0x0e, 0x2c, 0x62, 0xd2, 0x8e, 0x16, 0xc6, 0xeb, 0x07, 0x80, 0xbc, 0x89, 0xe7, 0x93, 0xa1,
+	0x66, 0x38, 0xf6, 0x81, 0xd5, 0xd7, 0xbc, 0x91, 0x6e, 0xb3, 0x58, 0x95, 0xb1, 0x12, 0xac, 0xd4,
+	0xd9, 0x02, 0x6b, 0x83, 0x4d, 0x40, 0xac, 0xd6, 0x0e, 0xac, 0x23, 0x62, 0x13, 0xcf, 0x0b, 0xb8,
+	0x83, 0x08, 0xbc, 0xbc, 0x60, 0xc3, 0x54, 0x08, 0x2b, 0x54, 0x64, 0x87, 0x4b, 0x50, 0x0a, 0xef,
+	0x46, 0xbf, 0x00, 0xa5, 0xeb, 0x5b, 0xc6, 0xf3, 0x49, 0x6d, 0x5e, 0x59, 0x6b, 0x00, 0x1e, 0xa3,
+	0x69, 0x3d, 0xcb, 0xe7, 0xd5, 0x6a, 0xb9, 0x5e, 0xe7, 0x85, 0x50, 0x1c, 0xfd, 0xaf, 0x22, 0x6c,
+	0xb5, 0xb8, 0x59, 0xea, 0xce, 0x70, 0x38, 0xd7, 0xd1, 0x80, 0x9c, 0x47, 0xab, 0xb9, 0xe6, 0x07,
+	0x04, 0xae, 0xa6, 0xb4, 0x70, 0xff, 0xf3, 0xaa, 0x8f, 0xb3, 0x5e, 0xbc, 0x07, 0x34, 0x20, 0x37,
+	0xa4, 0x65, 0x36, 0x42, 0x59, 0x7f, 0x2f, 0x4a, 0xbc, 0x1c, 0xe3, 0xec, 0x30, 0x5e, 0x9c, 0x7f,
+	0x09, 0x97, 0x79, 0x8d, 0x08, 0xdd, 0x1f, 0xe1, 0x89, 0x0c, 0xef, 0xe6, 0x02, 0xbc, 0x85, 0x95,
+	0x07, 0x6f, 0x19, 0xef, 0x29, 0x48, 0x5b, 0x43, 0xee, 0x77, 0xe6, 0xad, 0x08, 0x3f, 0xa8, 0xb9,
+	0xdf, 0x5d, 0xb4, 0xdf, 0xd3, 0x71, 0x82, 0x2f, 0x0c, 0x17, 0x04, 0xcf, 0xc7, 0x80, 0xe6, 0xde,
+	0x8a, 0x80, 0x83, 0x84, 0xbb, 0xb1, 0xc8, 0x9c, 0xef, 0xb8, 0x1b, 0x2b, 0xde, 0x3b, 0x94, 0xbb,
+	0xf2, 0xe7, 0x7c, 0x4e, 0x2a, 0xff, 0x46, 0x80, 0xcd, 0xbd, 0x9e, 0x47, 0xdc, 0x23, 0x62, 0x46,
+	0xde, 0x8e, 0x77, 0x7b, 0x61, 0x89, 0x6e, 0xff, 0x15, 0x8c, 0x4e, 0x72, 0x38, 0xb9, 0x95, 0xff,
+	0x94, 0x82, 0x8c, 0xea, 0xea, 0xb6, 0xa7, 0x1b, 0xbe, 0xe5, 0xd8, 0xe8, 0x01, 0x48, 0x74, 0x4e,
+	0xe5, 0xf1, 0x73, 0x6b, 0x89, 0xee, 0xa5, 0x1e, 0xdb, 0x1d, 0xe2, 0xeb, 0x35, 0x99, 0x2a, 0x79,
+	0x3d, 0x2d, 0x09, 0x98, 0x21, 0x20, 0x04, 0x92, 0xad, 0x0f, 0x83, 0x81, 0x2b, 0x8d, 0xd9, 0x33,
+	0xfa, 0x09, 0x24, 0x69, 0x73, 0x1c, 0x07, 0xdd, 0x71, 0x71, 0xe7, 0x88, 0xed, 0xa6, 0xcb, 0x78,
+	0x31, 0x97, 0x41, 0x6d, 0xc8, 0x0f, 0x74, 0xcf, 0xd7, 0x0e, 0x89, 0xee, 0xfa, 0x3d, 0xa2, 0xaf,
+	0xd4, 0xf7, 0x72, 0x54, 0xf4, 0x41, 0x28, 0x49, 0xb1, 0x1c, 0xd7, 0xea, 0x6b, 0x73, 0x4b, 0x26,
+	0x57, 0xc0, 0xa2, 0xa2, 0x73, 0xff, 0x3d, 0x80, 0xdc, 0x50, 0x3f, 0x8e, 0x41, 0xa5, 0x96, 0x87,
+	0xca, 0x0e, 0xf5, 0xe3, 0x39, 0xd2, 0xa7, 0x70, 0xc1, 0xe1, 0xe1, 0x31, 0x87, 0xf3, 0x0a, 0xf2,
+	0x7b, 0xab, 0xe7, 0xa9, 0x60, 0xe2, 0xb0, 0xc8, 0x79, 0x77, 0xc1, 0x43, 0x3f, 0x87, 0x2c, 0xad,
+	0xa9, 0xb6, 0xcf, 0x72, 0xc6, 0x2b, 0x64, 0x18, 0xea, 0xfb, 0x4a, 0x5c, 0x38, 0x2e, 0x04, 0x22,
+	0x94, 0xe2, 0xa1, 0x32, 0xe4, 0x5e, 0xb8, 0x96, 0x4f, 0x34, 0xdf, 0x71, 0x34, 0x67, 0x60, 0x16,
+	0xb2, 0xac, 0xa6, 0x66, 0x18, 0x51, 0x75, 0x9c, 0xbd, 0x81, 0x89, 0x9e, 0x41, 0x21, 0xd6, 0x09,
+	0x87, 0x96, 0x1d, 0xb3, 0x4b, 0x7e, 0x79, 0xbb, 0xc4, 0x26, 0x8e, 0x8e, 0x65, 0xcf, 0x2d, 0xa4,
+	0xc2, 0x05, 0x97, 0x1c, 0xb8, 0xc4, 0x3b, 0x8c, 0x9b, 0xa8, 0xb0, 0xb1, 0x3c, 0x32, 0x8a, 0xe4,
+	0xe7, 0xa8, 0x3f, 0x85, 0x6b, 0x27, 0xa3, 0x41, 0x7b, 0xa1, 0x7b, 0x5a, 0x68, 0xc3, 0x82, 0xc2,
+	0x8e, 0x59, 0x38, 0xe1, 0xf5, 0x27, 0xba, 0x17, 0x1a, 0x1f, 0x7d, 0x0c, 0x8a, 0x65, 0x6b, 0x07,
+	0x03, 0x36, 0x02, 0x32, 0x63, 0x78, 0x85, 0x4d, 0x66, 0xdd, 0x6f, 0x2f, 0xb2, 0x2e, 0xf9, 0x6c,
+	0x4c, 0x6c, 0x83, 0x98, 0x4f, 0x28, 0x27, 0xdf, 0x55, 0xde, 0xb2, 0xef, 0x31, 0x79, 0x46, 0xf4,
+	0x4e, 0xdd, 0xaf, 0x44, 0x45, 0x6a, 0x4b, 0x72, 0x5a, 0x81, 0xb6, 0x24, 0xe7, 0x94, 0x7c, 0xf9,
+	0xef, 0x22, 0x6c, 0xc6, 0x32, 0x05, 0x13, 0xc3, 0x71, 0xcd, 0xaf, 0x30, 0x7b, 0xbf, 0x39, 0x99,
+	0x7a, 0xfe, 0xb0, 0xfd, 0x1a, 0xdc, 0x23, 0xc7, 0x5c, 0xb3, 0xae, 0x88, 0x91, 0x83, 0x92, 0x4a,
+	0xaa, 0x2d, 0xc9, 0x29, 0x45, 0x6e, 0x4b, 0xb2, 0xac, 0xa4, 0x23, 0x97, 0x81, 0x92, 0x69, 0x4b,
+	0x72, 0x56, 0xc9, 0x05, 0xee, 0x6b, 0x4b, 0x72, 0x5e, 0xd9, 0x68, 0x4b, 0xf2, 0x86, 0xa2, 0xb4,
+	0x25, 0x59, 0x51, 0x36, 0xcb, 0x7f, 0x13, 0x20, 0xd9, 0x62, 0x9b, 0x46, 0x3f, 0x02, 0x29, 0x9a,
+	0x58, 0xce, 0x38, 0x69, 0xcc, 0x65, 0x94, 0x1d, 0xd5, 0x40, 0xf4, 0x8f, 0xc3, 0xc9, 0x65, 0x15,
+	0xdf, 0x07, 0x47, 0xa4, 0xc2, 0x31, 0xb7, 0x8b, 0xab, 0xbb, 0x9d, 0x4f, 0x29, 0xbf, 0x13, 0x20,
+	0x7f, 0xd2, 0x88, 0x67, 0x5d, 0xcc, 0x0d, 0x90, 0x3d, 0xce, 0xcc, 0xef, 0xba, 0xf7, 0xdf, 0x4e,
+	0x4b, 0xf5, 0xa5, 0x6e, 0xd3, 0xef, 0xf9, 0x3a, 0x42, 0x0f, 0xd6, 0x25, 0x9f, 0xe1, 0x08, 0x38,
+	0xd6, 0xef, 0xfe, 0x27, 0x42, 0x62, 0x87, 0xe8, 0x1e, 0x41, 0x3f, 0x86, 0x44, 0x70, 0x79, 0x5a,
+	0x61, 0x22, 0x0b, 0x24, 0xd0, 0x33, 0x00, 0x72, 0x3c, 0xb2, 0x5c, 0x9d, 0xda, 0x60, 0xb9, 0x16,
+	0x5c, 0xfc, 0xef, 0xb4, 0x74, 0x35, 0x76, 0x92, 0xbb, 0x65, 0x57, 0xb7, 0x4d, 0x7b, 0x3c, 0x18,
+	0xe8, 0xbd, 0x01, 0x29, 0xe3, 0x18, 0x20, 0x6a, 0x40, 0x2a, 0xbc, 0x08, 0x89, 0x2b, 0x5f, 0x84,
+	0x42, 0x51, 0x34, 0x86, 0xd8, 0x35, 0x22, 0xb8, 0x27, 0xd2, 0x5f, 0xcf, 0x0a, 0xaf, 0xa6, 0xe7,
+	0xdc, 0xf1, 0xd6, 0x1c, 0x9d, 0x5d, 0x26, 0xbb, 0x0c, 0x1b, 0xed, 0x42, 0x66, 0xe4, 0x3a, 0x23,
+	0xc7, 0xa3, 0xf5, 0xd9, 0x5b, 0x2e, 0xef, 0xf3, 0xb3, 0x69, 0x09, 0x1e, 0x71, 0x29, 0xb5, 0x8b,
+	0x21, 0x44, 0x50, 0x3d, 0x74, 0x11, 0x12, 0x64, 0xe4, 0x18, 0x87, 0xac, 0x3f, 0x8b, 0x38, 0x78,
+	0x41, 0x1f, 0xc6, 0xa2, 0x86, 0x76, 0x5b, 0xb1, 0xb6, 0xf9, 0x76, 0x5a, 0xca, 0x31, 0xcf, 0x86,
+	0xb1, 0x17, 0xf7, 0x7f, 0x58, 0x4d, 0xcb, 0x33, 0x01, 0xf2, 0xd5, 0x9e, 0xe3, 0xb2, 0xd2, 0xd0,
+	0xb4, 0x7d, 0x77, 0x72, 0x56, 0x70, 0x9e, 0x7f, 0xd4, 0x42, 0x87, 0x20, 0x8f, 0x5c, 0xcb, 0x71,
+	0x2d, 0x7f, 0xc2, 0xbf, 0xcd, 0xec, 0xbc, 0x9d, 0x96, 0x1e, 0x9c, 0x37, 0xbe, 0x1f, 0x71, 0x4c,
+	0x1c, 0xa1, 0xc7, 0x83, 0x7c, 0x1d, 0xb2, 0xea, 0xb1, 0x5d, 0x77, 0x1c, 0xd7, 0xa4, 0x19, 0x8e,
+	0x3e, 0x0a, 0x4a, 0x43, 0x10, 0xe9, 0xc5, 0xb3, 0x73, 0x3a, 0x5e, 0x0e, 0x6e, 0x40, 0xce, 0x70,
+	0x86, 0x43, 0xdd, 0x36, 0x35, 0xc3, 0x19, 0xdb, 0x7e, 0x70, 0x02, 0x9c, 0xe5, 0xc4, 0x3a, 0xa5,
+	0xa1, 0x1a, 0xe4, 0x78, 0x4b, 0xd5, 0x5c, 0xa2, 0x9b, 0x34, 0xbc, 0x96, 0xa8, 0xd0, 0x59, 0x2e,
+	0x83, 0xa9, 0x08, 0x6a, 0x40, 0x3e, 0xc4, 0xe0, 0x05, 0x3a, 0xb1, 0x0c, 0x48, 0xa8, 0x38, 0xa8,
+	0xca, 0xe8, 0x7b, 0xb0, 0x11, 0xa2, 0x58, 0xf6, 0x91, 0x3e, 0xb0, 0x4c, 0x16, 0x1c, 0x32, 0x0e,
+	0xc1, 0x5b, 0x01, 0x75, 0x61, 0x47, 0x90, 0xcf, 0xd5, 0x11, 0xa2, 0x3e, 0x90, 0x54, 0x52, 0xb7,
+	0xfe, 0x2c, 0x40, 0x9a, 0x7d, 0x4d, 0x64, 0x9f, 0x38, 0x32, 0x90, 0xda, 0xdf, 0x7d, 0xb8, 0xbb,
+	0xf7, 0x64, 0x57, 0x59, 0x43, 0x29, 0x10, 0x5b, 0xbb, 0xaa, 0x22, 0xa0, 0x34, 0x24, 0xee, 0xed,
+	0xec, 0x55, 0x55, 0x65, 0x9d, 0x3e, 0xd6, 0x9e, 0xaa, 0xcd, 0xae, 0x22, 0xa2, 0x0b, 0xb0, 0xd1,
+	0x68, 0xee, 0xb4, 0x3a, 0x2d, 0xb5, 0xd9, 0xd0, 0x02, 0xa2, 0x8c, 0x64, 0x90, 0xd4, 0x56, 0xa7,
+	0xa9, 0x48, 0x14, 0xaa, 0xd1, 0xac, 0xb7, 0x3a, 0xd5, 0x1d, 0x25, 0x81, 0xb6, 0x60, 0x73, 0xce,
+	0x1b, 0x92, 0xd3, 0x28, 0x0b, 0x72, 0x63, 0x1f, 0x57, 0xd5, 0xd6, 0xde, 0xae, 0x92, 0xa4, 0xd8,
+	0xea, 0xfe, 0xa3, 0x9d, 0xa6, 0x02, 0x74, 0xa1, 0xd6, 0x52, 0xab, 0x18, 0x57, 0x9f, 0x2a, 0x19,
+	0x94, 0x07, 0xa0, 0xa0, 0xdd, 0x26, 0x6e, 0x35, 0xbb, 0x8a, 0x59, 0xa6, 0x5d, 0x2b, 0x75, 0xeb,
+	0x67, 0xb0, 0x79, 0xea, 0xcb, 0x0d, 0xda, 0x80, 0x4c, 0xb5, 0xd1, 0xd0, 0x70, 0xf3, 0xd1, 0x4e,
+	0xab, 0x5e, 0x55, 0xd6, 0x10, 0x82, 0x3c, 0x6e, 0x76, 0xf6, 0x1e, 0x37, 0x23, 0x9a, 0x70, 0x55,
+	0xfa, 0xfc, 0xf7, 0xc5, 0xb5, 0x5b, 0x7b, 0x27, 0xa6, 0x92, 0xa0, 0x3d, 0xd0, 0x5d, 0x3f, 0x6a,
+	0xee, 0x36, 0x5a, 0xbb, 0xf7, 0x95, 0x35, 0xfa, 0xd2, 0x55, 0xab, 0xf7, 0xe9, 0x8b, 0x88, 0x72,
+	0x90, 0xae, 0xef, 0x75, 0x3a, 0x2d, 0x55, 0x6d, 0x36, 0x14, 0x81, 0xae, 0x55, 0x6b, 0x7b, 0x98,
+	0xbe, 0xac, 0x07, 0x80, 0xb5, 0xef, 0xbf, 0xfa, 0x77, 0x71, 0xed, 0xd5, 0xac, 0x28, 0xbc, 0x9e,
+	0x15, 0x85, 0x2f, 0x67, 0x45, 0xe1, 0x5f, 0xb3, 0xa2, 0xf0, 0xc5, 0x9b, 0xe2, 0xda, 0xeb, 0x37,
+	0xc5, 0xb5, 0x2f, 0xdf, 0x14, 0xd7, 0x3e, 0x49, 0x71, 0x37, 0xf5, 0x92, 0xec, 0xf3, 0xf6, 0x9d,
+	0xff, 0x07, 0x00, 0x00, 0xff, 0xff, 0xd3, 0xba, 0x56, 0x1f, 0x98, 0x17, 0x00, 0x00,
 }

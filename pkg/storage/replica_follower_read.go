@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -39,8 +35,22 @@ var FollowerReadsEnabled = settings.RegisterBoolSetting(
 // acquired, whether the read only batch can be served as a follower
 // read despite the error.
 func (r *Replica) canServeFollowerRead(
-	ctx context.Context, ba roachpb.BatchRequest, pErr *roachpb.Error,
+	ctx context.Context, ba *roachpb.BatchRequest, pErr *roachpb.Error,
 ) *roachpb.Error {
+	// There's no known reason that a non-VOTER_FULL replica couldn't serve follower
+	// reads (or RangeFeed), but as of the time of writing, these are expected
+	// to be short-lived, so it's not worth working out the edge-cases. Revisit if
+	// we add long-lived learners or feel that incoming/outgoing voters also need
+	// to be able to serve follower reads.
+	repDesc, err := r.GetReplicaDescriptor()
+	if err != nil {
+		return roachpb.NewError(err)
+	}
+	if typ := repDesc.GetType(); typ != roachpb.VOTER_FULL {
+		log.Eventf(ctx, "%s replicas cannot serve follower reads", typ)
+		return pErr
+	}
+
 	canServeFollowerRead := false
 	if lErr, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); ok &&
 		lErr.LeaseHolder != nil && lErr.Lease.Type() == roachpb.LeaseEpoch &&

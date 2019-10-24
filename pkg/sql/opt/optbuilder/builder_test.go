@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder_test
 
@@ -31,8 +27,8 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils/datadriven"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/datadriven"
 )
 
 // TestBuilder runs data-driven testcases of the form
@@ -49,7 +45,7 @@ import (
 //    Builds a memo structure from a SQL scalar expression and outputs a
 //    representation of the "expression view" of the memo structure.
 //
-//    The supported args (in addition to the ones supported by OptTester:
+//    The supported args (in addition to the ones supported by OptTester):
 //
 //      - vars=(type1,type2,...)
 //
@@ -103,6 +99,7 @@ func TestBuilder(t *testing.T) {
 				ctx := context.Background()
 				semaCtx := tree.MakeSemaContext()
 				evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+				evalCtx.SessionData.OptimizerFKs = true
 
 				var o xform.Optimizer
 				o.Init(&evalCtx)
@@ -118,7 +115,7 @@ func TestBuilder(t *testing.T) {
 				if err != nil {
 					return fmt.Sprintf("error: %s\n", strings.TrimSpace(err.Error()))
 				}
-				f := memo.MakeExprFmtCtx(tester.Flags.ExprFormat, o.Memo())
+				f := memo.MakeExprFmtCtx(tester.Flags.ExprFormat, o.Memo(), catalog)
 				f.FormatExpr(o.Memo().RootExpr())
 				return f.Buffer.String()
 

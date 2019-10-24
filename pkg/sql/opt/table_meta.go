@@ -1,24 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package opt
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // TableID uniquely identifies the usage of a table within the scope of a
@@ -56,7 +52,7 @@ func (t TableID) ColumnID(ord int) ColumnID {
 func (t TableID) ColumnOrdinal(id ColumnID) int {
 	if util.RaceEnabled {
 		if id < t.firstColID() {
-			panic(pgerror.AssertionFailedf("ordinal cannot be negative"))
+			panic(errors.AssertionFailedf("ordinal cannot be negative"))
 		}
 	}
 	return int(id - t.firstColID())
@@ -138,6 +134,12 @@ type TableMeta struct {
 
 	// anns annotates the table metadata with arbitrary data.
 	anns [maxTableAnnIDCount]interface{}
+
+	// constraints stores the list of validated check constraints on the table
+	// stored in the ScalarExpr form so they can possibly be used as filters
+	// in certain queries. See comment above GenerateConstrainedScans for more
+	// detail.
+	constraints []ScalarExpr
 }
 
 // clearAnnotations resets all the table annotations; used when copying a
@@ -157,7 +159,7 @@ func (tm *TableMeta) IndexColumns(indexOrd int) ColSet {
 	var indexCols ColSet
 	for i, n := 0, index.ColumnCount(); i < n; i++ {
 		ord := index.Column(i).Ordinal
-		indexCols.Add(int(tm.MetaID.ColumnID(ord)))
+		indexCols.Add(tm.MetaID.ColumnID(ord))
 	}
 	return indexCols
 }
@@ -170,9 +172,26 @@ func (tm *TableMeta) IndexKeyColumns(indexOrd int) ColSet {
 	var indexCols ColSet
 	for i, n := 0, index.KeyColumnCount(); i < n; i++ {
 		ord := index.Column(i).Ordinal
-		indexCols.Add(int(tm.MetaID.ColumnID(ord)))
+		indexCols.Add(tm.MetaID.ColumnID(ord))
 	}
 	return indexCols
+}
+
+// ConstraintCount returns the number of validated check constraints that are
+// applied to the table.
+func (tm *TableMeta) ConstraintCount() int {
+	return len(tm.constraints)
+}
+
+// Constraint looks up the ith valid table constraint on the table where
+// i < ConstraintCount().
+func (tm *TableMeta) Constraint(i int) ScalarExpr {
+	return tm.constraints[i]
+}
+
+// AddConstraint adds a valid table constraint to the table's metadata.
+func (tm *TableMeta) AddConstraint(constraint ScalarExpr) {
+	tm.constraints = append(tm.constraints, constraint)
 }
 
 // TableAnnotation returns the given annotation that is associated with the
@@ -204,7 +223,7 @@ func (md *Metadata) SetTableAnnotation(tabID TableID, tabAnnID TableAnnID, ann i
 // See the TableAnnID comment for more details and a usage example.
 func NewTableAnnID() TableAnnID {
 	if tableAnnIDCount == maxTableAnnIDCount {
-		panic(pgerror.AssertionFailedf(
+		panic(errors.AssertionFailedf(
 			"can't allocate table annotation id; increase maxTableAnnIDCount to allow"))
 	}
 	cnt := tableAnnIDCount

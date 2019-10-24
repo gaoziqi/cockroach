@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -20,14 +16,17 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/errors"
 )
 
-var enclosingError = pgerror.Newf(pgerror.CodeInvalidTextRepresentationError, "array must be enclosed in { and }")
-var extraTextError = pgerror.Newf(pgerror.CodeInvalidTextRepresentationError, "extra text after closing right brace")
-var nestedArraysNotSupportedError = pgerror.UnimplementedWithIssueDetail(32552, "strcast", "nested arrays not supported")
-var malformedError = pgerror.Newf(pgerror.CodeInvalidTextRepresentationError, "malformed array")
+var enclosingError = pgerror.Newf(pgcode.InvalidTextRepresentation, "array must be enclosed in { and }")
+var extraTextError = pgerror.Newf(pgcode.InvalidTextRepresentation, "extra text after closing right brace")
+var nestedArraysNotSupportedError = unimplemented.NewWithIssueDetail(32552, "strcast", "nested arrays not supported")
+var malformedError = pgerror.Newf(pgcode.InvalidTextRepresentation, "malformed array")
 
 var isQuoteChar = func(ch byte) bool {
 	return ch == '"'
@@ -73,10 +72,10 @@ func (p *parseState) gobbleString(isTerminatingChar func(ch byte) bool) (out str
 }
 
 type parseState struct {
-	s       string
-	evalCtx *EvalContext
-	result  *DArray
-	t       *types.T
+	s      string
+	ctx    ParseTimeContext
+	result *DArray
+	t      *types.T
 }
 
 func (p *parseState) advance() {
@@ -138,7 +137,10 @@ func (p *parseState) parseElement() error {
 		}
 	}
 
-	d, err := PerformCast(p.evalCtx, NewDString(next), p.t)
+	d, err := parseStringAs(p.t, next, p.ctx)
+	if d == nil && err == nil {
+		return errors.AssertionFailedf("unknown type %s (%T)", p.t, p.t)
+	}
 	if err != nil {
 		return err
 	}
@@ -146,13 +148,24 @@ func (p *parseState) parseElement() error {
 }
 
 // ParseDArrayFromString parses the string-form of constructing arrays, handling
-// cases such as `'{1,2,3}'::INT[]`.
-func ParseDArrayFromString(evalCtx *EvalContext, s string, t *types.T) (*DArray, error) {
+// cases such as `'{1,2,3}'::INT[]`. The input type t is the type of the
+// parameter of the array to parse.
+func ParseDArrayFromString(ctx ParseTimeContext, s string, t *types.T) (*DArray, error) {
+	ret, err := doParseDArrayFromString(ctx, s, t)
+	if err != nil {
+		return ret, makeParseError(s, types.MakeArray(t), err)
+	}
+	return ret, nil
+}
+
+// doParseDArraryFromString does most of the work of ParseDArrayFromString,
+// except the error it returns isn't prettified as a parsing error.
+func doParseDArrayFromString(ctx ParseTimeContext, s string, t *types.T) (*DArray, error) {
 	parser := parseState{
-		s:       s,
-		evalCtx: evalCtx,
-		result:  NewDArray(t),
-		t:       t,
+		s:      s,
+		ctx:    ctx,
+		result: NewDArray(t),
+		t:      t,
 	}
 
 	parser.eatWhitespace()

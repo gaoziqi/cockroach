@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -43,7 +39,7 @@ func (r *Replica) gossipFirstRange(ctx context.Context) {
 	if err := r.store.Gossip().AddInfo(
 		gossip.KeySentinel, r.store.ClusterID().GetBytes(),
 		r.store.cfg.SentinelGossipTTL()); err != nil {
-		log.Errorf(ctx, "failed to gossip sentinel: %s", err)
+		log.Errorf(ctx, "failed to gossip sentinel: %+v", err)
 	}
 	if log.V(1) {
 		log.Infof(ctx, "gossiping first range from store %d, r%d: %s",
@@ -51,7 +47,7 @@ func (r *Replica) gossipFirstRange(ctx context.Context) {
 	}
 	if err := r.store.Gossip().AddInfoProto(
 		gossip.KeyFirstRangeDescriptor, r.mu.state.Desc, configGossipTTL); err != nil {
-		log.Errorf(ctx, "failed to gossip first range metadata: %s", err)
+		log.Errorf(ctx, "failed to gossip first range metadata: %+v", err)
 	}
 }
 
@@ -139,7 +135,7 @@ func (r *Replica) MaybeGossipNodeLiveness(ctx context.Context, span roachpb.Span
 	// Call evaluateBatch instead of Send to avoid reacquiring latches.
 	rec := NewReplicaEvalContext(r, todoSpanSet)
 	br, result, pErr :=
-		evaluateBatch(ctx, storagebase.CmdIDKey(""), r.store.Engine(), rec, nil, ba, true /* readOnly */)
+		evaluateBatch(ctx, storagebase.CmdIDKey(""), r.store.Engine(), rec, nil, &ba, true /* readOnly */)
 	if pErr != nil {
 		return errors.Wrapf(pErr.GoError(), "couldn't scan node liveness records in span %s", span)
 	}
@@ -179,7 +175,7 @@ func (r *Replica) loadSystemConfig(ctx context.Context) (*config.SystemConfigEnt
 	// Call evaluateBatch instead of Send to avoid reacquiring latches.
 	rec := NewReplicaEvalContext(r, todoSpanSet)
 	br, result, pErr := evaluateBatch(
-		ctx, storagebase.CmdIDKey(""), r.store.Engine(), rec, nil, ba, true, /* readOnly */
+		ctx, storagebase.CmdIDKey(""), r.store.Engine(), rec, nil, &ba, true, /* readOnly */
 	)
 	if pErr != nil {
 		return nil, pErr.GoError()
@@ -262,7 +258,7 @@ func (r *Replica) maybeGossipFirstRange(ctx context.Context) *roachpb.Error {
 			r.store.StoreID(), r.RangeID)
 	}
 	if err := r.store.Gossip().AddClusterID(r.store.ClusterID()); err != nil {
-		log.Errorf(ctx, "failed to gossip cluster ID: %s", err)
+		log.Errorf(ctx, "failed to gossip cluster ID: %+v", err)
 	}
 
 	if r.store.cfg.TestingKnobs.DisablePeriodicGossips {

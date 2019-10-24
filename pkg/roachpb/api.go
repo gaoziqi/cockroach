@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package roachpb
 
@@ -110,6 +106,13 @@ const (
 func IsReadOnly(args Request) bool {
 	flags := args.flags()
 	return (flags&isRead) != 0 && (flags&isWrite) == 0
+}
+
+// IsReadAndWrite returns true if the request both reads and writes
+// (such as conditional puts).
+func IsReadAndWrite(args Request) bool {
+	flags := args.flags()
+	return (flags&isRead) != 0 && (flags&isWrite) != 0
 }
 
 // IsTransactional returns true if the request may be part of a
@@ -282,6 +285,21 @@ func (dr *DeleteRangeResponse) combine(c combinable) error {
 	}
 	return nil
 }
+
+var _ combinable = &DeleteRangeResponse{}
+
+// combine implements the combinable interface.
+func (dr *RevertRangeResponse) combine(c combinable) error {
+	otherDR := c.(*RevertRangeResponse)
+	if dr != nil {
+		if err := dr.ResponseHeader.combine(otherDR.Header()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var _ combinable = &RevertRangeResponse{}
 
 // combine implements the combinable interface.
 func (rr *ResolveIntentRangeResponse) combine(c combinable) error {
@@ -475,6 +493,9 @@ func (*DeleteRangeRequest) Method() Method { return DeleteRange }
 func (*ClearRangeRequest) Method() Method { return ClearRange }
 
 // Method implements the Request interface.
+func (*RevertRangeRequest) Method() Method { return RevertRange }
+
+// Method implements the Request interface.
 func (*ScanRequest) Method() Method { return Scan }
 
 // Method implements the Request interface.
@@ -623,6 +644,12 @@ func (drr *DeleteRangeRequest) ShallowCopy() Request {
 
 // ShallowCopy implements the Request interface.
 func (crr *ClearRangeRequest) ShallowCopy() Request {
+	shallowCopy := *crr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
+func (crr *RevertRangeRequest) ShallowCopy() Request {
 	shallowCopy := *crr
 	return &shallowCopy
 }
@@ -966,22 +993,20 @@ func (*PutRequest) flags() int {
 	return isWrite | isTxn | isTxnWrite | consultsTSCache | canBackpressure
 }
 
-// ConditionalPut effectively reads and may not write, so must update
-// the timestamp cache. Note that on ConditionFailedErrors
-// ConditionalPut returns the read data and must update the timestamp
-// cache. ConditionalPuts do not require a refresh because on write-too-old
-// errors, they return an error immediately instead of continuing a
-// serializable transaction to be retried at end transaction.
+// ConditionalPut effectively reads without writing if it hits a
+// ConditionFailedError, so it must update the timestamp cache in this case.
+// ConditionalPuts do not require a refresh because on write-too-old errors,
+// they return an error immediately instead of continuing a serializable
+// transaction to be retried at end transaction.
 func (*ConditionalPutRequest) flags() int {
 	return isRead | isWrite | isTxn | isTxnWrite | consultsTSCache | updatesReadTSCache | updatesTSCacheOnErr | canBackpressure
 }
 
-// InitPut, like ConditionalPut, effectively reads and may not write.
-// It also may return the actual data read on ConditionFailedErrors,
-// so must update the timestamp cache on errors. InitPuts do not require
-// a refresh because on write-too-old errors, they return an error
-// immediately instead of continuing a serializable transaction to be
-// retried at end transaction.
+// InitPut, like ConditionalPut, effectively reads without writing if it hits a
+// ConditionFailedError, so it must update the timestamp cache in this case.
+// InitPuts do not require a refresh because on write-too-old errors, they
+// return an error immediately instead of continuing a serializable transaction
+// to be retried at end transaction.
 func (*InitPutRequest) flags() int {
 	return isRead | isWrite | isTxn | isTxnWrite | consultsTSCache | updatesReadTSCache | updatesTSCacheOnErr | canBackpressure
 }
@@ -1026,7 +1051,12 @@ func (drr *DeleteRangeRequest) flags() int {
 // Note that ClearRange commands cannot be part of a transaction as
 // they clear all MVCC versions.
 func (*ClearRangeRequest) flags() int { return isWrite | isRange | isAlone }
-func (*ScanRequest) flags() int       { return isRead | isRange | isTxn | updatesReadTSCache | needsRefresh }
+
+// Note that RevertRange commands cannot be part of a transaction as
+// they clear all MVCC versions above their target time.
+func (*RevertRangeRequest) flags() int { return isWrite | isRange }
+
+func (*ScanRequest) flags() int { return isRead | isRange | isTxn | updatesReadTSCache | needsRefresh }
 func (*ReverseScanRequest) flags() int {
 	return isRead | isRange | isReverse | isTxn | updatesReadTSCache | needsRefresh
 }
@@ -1120,7 +1150,7 @@ func (etr *EndTransactionRequest) IsParallelCommit() bool {
 }
 
 // Keys returns credentials in an aws.Config.
-func (b *ExportStorage_S3) Keys() *aws.Config {
+func (b *ExternalStorage_S3) Keys() *aws.Config {
 	return &aws.Config{
 		Credentials: credentials.NewStaticCredentials(b.AccessKey, b.Secret, b.TempToken),
 	}
@@ -1154,4 +1184,70 @@ func (e *RangeFeedEvent) MustSetValue(value interface{}) {
 	if !e.SetValue(value) {
 		panic(fmt.Sprintf("%T excludes %T", e, value))
 	}
+}
+
+// MakeReplicationChanges returns a slice of changes of the given type with an
+// item for each target.
+func MakeReplicationChanges(
+	changeType ReplicaChangeType, targets ...ReplicationTarget,
+) []ReplicationChange {
+	chgs := make([]ReplicationChange, 0, len(targets))
+	for _, target := range targets {
+		chgs = append(chgs, ReplicationChange{
+			ChangeType: changeType,
+			Target:     target,
+		})
+	}
+	return chgs
+}
+
+// AddChanges adds a batch of changes to the request in a backwards-compatible
+// way.
+func (acrr *AdminChangeReplicasRequest) AddChanges(chgs ...ReplicationChange) {
+	acrr.InternalChanges = append(acrr.InternalChanges, chgs...)
+
+	acrr.DeprecatedChangeType = chgs[0].ChangeType
+	for _, chg := range chgs {
+		acrr.DeprecatedTargets = append(acrr.DeprecatedTargets, chg.Target)
+	}
+}
+
+// ReplicationChanges is a slice of ReplicationChange.
+type ReplicationChanges []ReplicationChange
+
+func (rc ReplicationChanges) byType(typ ReplicaChangeType) []ReplicationTarget {
+	var sl []ReplicationTarget
+	for _, chg := range rc {
+		if chg.ChangeType == typ {
+			sl = append(sl, chg.Target)
+		}
+	}
+	return sl
+}
+
+// Additions returns a slice of all contained replication changes that add replicas.
+func (rc ReplicationChanges) Additions() []ReplicationTarget {
+	return rc.byType(ADD_REPLICA)
+}
+
+// Removals returns a slice of all contained replication changes that remove replicas.
+func (rc ReplicationChanges) Removals() []ReplicationTarget {
+	return rc.byType(REMOVE_REPLICA)
+}
+
+// Changes returns the changes requested by this AdminChangeReplicasRequest, taking
+// the deprecated method of doing so into account.
+func (acrr *AdminChangeReplicasRequest) Changes() []ReplicationChange {
+	if len(acrr.InternalChanges) > 0 {
+		return acrr.InternalChanges
+	}
+
+	sl := make([]ReplicationChange, len(acrr.DeprecatedTargets))
+	for _, target := range acrr.DeprecatedTargets {
+		sl = append(sl, ReplicationChange{
+			ChangeType: acrr.DeprecatedChangeType,
+			Target:     target,
+		})
+	}
+	return sl
 }

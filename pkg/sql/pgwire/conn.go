@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgwire
 
@@ -22,19 +18,17 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -43,13 +37,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -79,6 +73,9 @@ type conn struct {
 
 	// stmtBuf is populated with commands queued for execution by this conn.
 	stmtBuf sql.StmtBuf
+
+	// res is used to avoid allocations in the conn's ClientComm implementation.
+	res commandResult
 
 	// err is an error, accessed atomically. It represents any error encountered
 	// while accessing the underlying network connection. This can read via
@@ -182,6 +179,7 @@ func newConn(
 		sv:          sv,
 	}
 	c.stmtBuf.Init()
+	c.res.released = true
 	c.writerState.fi.buf = &c.writerState.buf
 	c.writerState.fi.lastFlushed = -1
 	c.writerState.fi.cmdStarts = make(map[sql.CmdPos]int)
@@ -532,9 +530,15 @@ func (c *conn) processCommandsAsync(
 			if pgwireKnobs != nil && pgwireKnobs.CatchPanics {
 				if r := recover(); r != nil {
 					// Catch the panic and return it to the client as an error.
-					pge := pgerror.Newf(pgerror.CodeCrashShutdownError, "caught fatal error: %v", r)
-					pge.Detail = string(debug.Stack())
-					retErr = pge
+					if err, ok := r.(error); ok {
+						// Mask the cause but keep the details.
+						retErr = errors.Handled(err)
+					} else {
+						retErr = errors.Newf("%+v", r)
+					}
+					retErr = pgerror.WithCandidateCode(retErr, pgcode.CrashShutdown)
+					// Add a prefix. This also adds a stack trace.
+					retErr = errors.Wrap(retErr, "caught fatal error")
 					_ = writeErr(
 						ctx, &sqlServer.GetExecutorConfig().Settings.SV, retErr,
 						&c.msgBuilder, &c.writerState.buf)
@@ -840,6 +844,10 @@ func (c *conn) handleClose(ctx context.Context, buf *pgwirebase.ReadBuffer) erro
 		})
 }
 
+// If no format codes are provided then all arguments/result-columns use
+// the default format, text.
+var formatCodesAllText = []pgwirebase.FormatCode{pgwirebase.FormatText}
+
 // handleBind queues instructions for creating a portal from a prepared
 // statement.
 // An error is returned iff the statement buffer has been closed. In that case,
@@ -864,31 +872,32 @@ func (c *conn) handleBind(ctx context.Context, buf *pgwirebase.ReadBuffer) error
 	if err != nil {
 		return c.stmtBuf.Push(ctx, sql.SendError{Err: err})
 	}
-	lenCodes := numQArgFormatCodes
-	if lenCodes == 0 {
-		lenCodes = 1
-	}
-	qArgFormatCodes := make([]pgwirebase.FormatCode, lenCodes)
+	var qArgFormatCodes []pgwirebase.FormatCode
 	switch numQArgFormatCodes {
 	case 0:
 		// No format codes means all arguments are passed as text.
-		qArgFormatCodes[0] = pgwirebase.FormatText
+		qArgFormatCodes = formatCodesAllText
 	case 1:
 		// `1` means read one code and apply it to every argument.
 		ch, err := buf.GetUint16()
 		if err != nil {
 			return c.stmtBuf.Push(ctx, sql.SendError{Err: err})
 		}
-		fmtCode := pgwirebase.FormatCode(ch)
-		qArgFormatCodes[0] = fmtCode
+		code := pgwirebase.FormatCode(ch)
+		if code == pgwirebase.FormatText {
+			qArgFormatCodes = formatCodesAllText
+		} else {
+			qArgFormatCodes = []pgwirebase.FormatCode{code}
+		}
 	default:
+		qArgFormatCodes = make([]pgwirebase.FormatCode, numQArgFormatCodes)
 		// Read one format code for each argument and apply it to that argument.
 		for i := range qArgFormatCodes {
-			code, err := buf.GetUint16()
+			ch, err := buf.GetUint16()
 			if err != nil {
 				return c.stmtBuf.Push(ctx, sql.SendError{Err: err})
 			}
-			qArgFormatCodes[i] = pgwirebase.FormatCode(code)
+			qArgFormatCodes[i] = pgwirebase.FormatCode(ch)
 		}
 	}
 
@@ -929,17 +938,19 @@ func (c *conn) handleBind(ctx context.Context, buf *pgwirebase.ReadBuffer) error
 	switch numColumnFormatCodes {
 	case 0:
 		// All columns will use the text format.
-		columnFormatCodes = make([]pgwirebase.FormatCode, 1)
-		columnFormatCodes[0] = pgwirebase.FormatText
+		columnFormatCodes = formatCodesAllText
 	case 1:
-		// All columns will use the one specficied format.
+		// All columns will use the one specified format.
 		ch, err := buf.GetUint16()
 		if err != nil {
 			return c.stmtBuf.Push(ctx, sql.SendError{Err: err})
 		}
-		fmtCode := pgwirebase.FormatCode(ch)
-		columnFormatCodes = make([]pgwirebase.FormatCode, 1)
-		columnFormatCodes[0] = fmtCode
+		code := pgwirebase.FormatCode(ch)
+		if code == pgwirebase.FormatText {
+			columnFormatCodes = formatCodesAllText
+		} else {
+			columnFormatCodes = []pgwirebase.FormatCode{code}
+		}
 	default:
 		columnFormatCodes = make([]pgwirebase.FormatCode, numColumnFormatCodes)
 		// Read one format code for each column and apply it to that column.
@@ -1029,36 +1040,6 @@ func (fi *flushInfo) registerCmd(pos sql.CmdPos) {
 		return
 	}
 	fi.cmdStarts[pos] = fi.buf.Len()
-}
-
-// convertToErrWithPGCode recognizes errs that should have SQL error codes to be
-// reported to the client and converts err to them. If this doesn't apply, err
-// is returned.
-// Note that this returns a new error, and details from the original error are
-// not preserved in any way (except possibly the message).
-//
-// TODO(andrei): sqlbase.ConvertBatchError() seems to serve similar purposes, but
-// it's called from more specialized contexts. Consider unifying the two.
-func convertToErrWithPGCode(err error) error {
-	if err == nil {
-		return nil
-	}
-
-	// If the error was wrapped, get to the cause. Otherwise the cast
-	// below will not see what's really happening.
-	wrappedErr := errors.Cause(err)
-
-	switch wrappedErr.(type) {
-	case *roachpb.TransactionRetryWithProtoRefreshError:
-		return sqlbase.NewRetryError(err)
-	case *roachpb.AmbiguousResultError:
-		// TODO(andrei): Once DistSQL starts executing writes, we'll need a
-		// different mechanism to marshal AmbiguousResultErrors from the executing
-		// nodes.
-		return sqlbase.NewStatementCompletionUnknownError(err)
-	default:
-		return err
-	}
 }
 
 func cookTag(tagStr string, buf []byte, stmtType tree.StatementType, rowsAffected int) []byte {
@@ -1167,6 +1148,13 @@ func (c *conn) bufferCommandComplete(tag []byte) {
 	}
 }
 
+func (c *conn) bufferPortalSuspended() {
+	c.msgBuilder.initMsg(pgwirebase.ServerMsgPortalSuspended)
+	if err := c.msgBuilder.finishMsg(&c.writerState.buf); err != nil {
+		panic(fmt.Sprintf("unexpected err from buffer: %s", err))
+	}
+}
+
 func (c *conn) bufferErr(err error) {
 	// TODO(andrei,knz): This would benefit from a context with the
 	// current connection log tags.
@@ -1186,44 +1174,31 @@ func (c *conn) bufferEmptyQueryResponse() {
 func writeErr(
 	ctx context.Context, sv *settings.Values, err error, msgBuilder *writeBuffer, w io.Writer,
 ) error {
+	// Record telemetry for the error.
 	sqltelemetry.RecordError(ctx, err, sv)
+
+	// Now send the error to the client.
+	pgErr := pgerror.Flatten(err)
+
 	msgBuilder.initMsg(pgwirebase.ServerMsgErrorResponse)
 
 	msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSeverity)
 	msgBuilder.writeTerminatedString("ERROR")
 
-	pgErr, ok := pgerror.GetPGCause(err)
-	var code string
-	if ok {
-		code = pgErr.Code
-	} else {
-		// The error was not decorated as an pgerror.Error. We don't know
-		// its code, in fact we don't know pretty much anything about it.
-		// We're going to let it flow to the user as a XXUUU error.
-		// We don't use CodeInternalError here (XX000) because internal
-		// errors have gain special status "please tell us about it
-		// ASAP" in CockroachDB.
-		code = pgerror.CodeUncategorizedError
-		// However, we'll keep track of the number of occurrences in
-		// telemetry. Over time, we'll want this count to go down
-		// (i.e. more errors becoming qualified).
-		telemetry.Inc(sqltelemetry.UncategorizedErrorCounter)
-	}
-
 	msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSQLState)
-	msgBuilder.writeTerminatedString(code)
+	msgBuilder.writeTerminatedString(pgErr.Code)
 
-	if ok && pgErr.Detail != "" {
+	if pgErr.Detail != "" {
 		msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFileldDetail)
 		msgBuilder.writeTerminatedString(pgErr.Detail)
 	}
 
-	if ok && pgErr.Hint != "" {
+	if pgErr.Hint != "" {
 		msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFileldHint)
 		msgBuilder.writeTerminatedString(pgErr.Hint)
 	}
 
-	if ok && pgErr.Source != nil {
+	if pgErr.Source != nil {
 		errCtx := pgErr.Source
 		if errCtx.File != "" {
 			msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSrcFile)
@@ -1242,7 +1217,7 @@ func writeErr(
 	}
 
 	msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldMsgPrimary)
-	msgBuilder.writeTerminatedString(err.Error())
+	msgBuilder.writeTerminatedString(pgErr.Message)
 
 	msgBuilder.nullTerminate()
 	return msgBuilder.finishMsg(w)
@@ -1282,7 +1257,7 @@ func (c *conn) writeRowDescription(
 	c.msgBuilder.putInt16(int16(len(columns)))
 	for i, column := range columns {
 		if log.V(2) {
-			log.Infof(ctx, "pgwire: writing column %s of type: %T", column.Name, column.Typ)
+			log.Infof(ctx, "pgwire: writing column %s of type: %s", column.Name, column.Typ)
 		}
 		c.msgBuilder.writeTerminatedString(column.Name)
 		typ := pgTypeForParserType(column.Typ)
@@ -1402,70 +1377,63 @@ func (c *conn) CreateStatementResult(
 	pos sql.CmdPos,
 	formatCodes []pgwirebase.FormatCode,
 	conv sessiondata.DataConversionConfig,
+	limit int,
+	portalName string,
+	implicitTxn bool,
 ) sql.CommandResult {
-	res := c.makeCommandResult(descOpt, pos, stmt, formatCodes, conv)
-	return &res
+	return c.newCommandResult(descOpt, pos, stmt, formatCodes, conv, limit, portalName, implicitTxn)
 }
 
 // CreateSyncResult is part of the sql.ClientComm interface.
 func (c *conn) CreateSyncResult(pos sql.CmdPos) sql.SyncResult {
-	res := c.makeMiscResult(pos, readyForQuery)
-	return &res
+	return c.newMiscResult(pos, readyForQuery)
 }
 
 // CreateFlushResult is part of the sql.ClientComm interface.
 func (c *conn) CreateFlushResult(pos sql.CmdPos) sql.FlushResult {
-	res := c.makeMiscResult(pos, flush)
-	return &res
+	return c.newMiscResult(pos, flush)
 }
 
 // CreateDrainResult is part of the sql.ClientComm interface.
 func (c *conn) CreateDrainResult(pos sql.CmdPos) sql.DrainResult {
-	res := c.makeMiscResult(pos, noCompletionMsg)
-	return &res
+	return c.newMiscResult(pos, noCompletionMsg)
 }
 
 // CreateBindResult is part of the sql.ClientComm interface.
 func (c *conn) CreateBindResult(pos sql.CmdPos) sql.BindResult {
-	res := c.makeMiscResult(pos, bindComplete)
-	return &res
+	return c.newMiscResult(pos, bindComplete)
 }
 
 // CreatePrepareResult is part of the sql.ClientComm interface.
 func (c *conn) CreatePrepareResult(pos sql.CmdPos) sql.ParseResult {
-	res := c.makeMiscResult(pos, parseComplete)
-	return &res
+	return c.newMiscResult(pos, parseComplete)
 }
 
 // CreateDescribeResult is part of the sql.ClientComm interface.
 func (c *conn) CreateDescribeResult(pos sql.CmdPos) sql.DescribeResult {
-	res := c.makeMiscResult(pos, noCompletionMsg)
-	return &res
+	return c.newMiscResult(pos, noCompletionMsg)
 }
 
 // CreateEmptyQueryResult is part of the sql.ClientComm interface.
 func (c *conn) CreateEmptyQueryResult(pos sql.CmdPos) sql.EmptyQueryResult {
-	res := c.makeMiscResult(pos, emptyQueryResponse)
-	return &res
+	return c.newMiscResult(pos, emptyQueryResponse)
 }
 
 // CreateDeleteResult is part of the sql.ClientComm interface.
 func (c *conn) CreateDeleteResult(pos sql.CmdPos) sql.DeleteResult {
-	res := c.makeMiscResult(pos, closeComplete)
-	return &res
+	return c.newMiscResult(pos, closeComplete)
 }
 
 // CreateErrorResult is part of the sql.ClientComm interface.
 func (c *conn) CreateErrorResult(pos sql.CmdPos) sql.ErrorResult {
-	res := c.makeMiscResult(pos, noCompletionMsg)
+	res := c.newMiscResult(pos, noCompletionMsg)
 	res.errExpected = true
-	return &res
+	return res
 }
 
 // CreateCopyInResult is part of the sql.ClientComm interface.
 func (c *conn) CreateCopyInResult(pos sql.CmdPos) sql.CopyInResult {
-	res := c.makeMiscResult(pos, noCompletionMsg)
-	return &res
+	return c.newMiscResult(pos, noCompletionMsg)
 }
 
 // pgwireReader is an io.Reader that wraps a conn, maintaining its metrics as

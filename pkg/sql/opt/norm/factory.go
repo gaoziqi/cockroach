@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package norm
 
@@ -18,10 +14,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // ReplaceFunc is the callback function passed to the Factory.Replace method.
@@ -48,13 +45,6 @@ type MatchedRuleFunc func(ruleName opt.RuleName) bool
 // were constructed, it is nil. Additional expressions beyond the first can be
 // accessed by following the NextExpr links on the target expression.
 type AppliedRuleFunc func(ruleName opt.RuleName, source, target opt.Expr)
-
-// placeholderError wraps errors that occur during placeholder assignment, and
-// is passed as an argument to panic. The panic is caught and converted back to
-// an error by AssignPlaceholders.
-type placeholderError struct {
-	error
-}
 
 // Factory constructs a normalized expression tree within the memo. As each
 // kind of expression is constructed by the factory, it transitively runs
@@ -110,7 +100,15 @@ func (f *Factory) Init(evalCtx *tree.EvalContext) {
 // DetachMemo extracts the memo from the optimizer, and then re-initializes the
 // factory so that its reuse will not impact the detached memo. This method is
 // used to extract a read-only memo during the PREPARE phase.
+//
+// Before extracting the memo, DetachMemo first clears all column statistics in
+// the memo. This is used to free up the potentially large amount of memory
+// used by histograms. This does not affect the quality of the plan used at
+// execution time, since the stats are just recalculated anyway when
+// placeholders are assigned. If there are no placeholders, there is no need
+// for column statistics, since the memo is already fully optimized.
 func (f *Factory) DetachMemo() *memo.Memo {
+	f.mem.ClearColStats(f.mem.RootExpr())
 	detach := f.mem
 	f.mem = nil
 	f.Init(f.evalCtx)
@@ -193,7 +191,7 @@ func (f *Factory) CopyAndReplace(
 	from memo.RelExpr, fromProps *physical.Required, replace ReplaceFunc,
 ) {
 	if !f.mem.IsEmpty() {
-		panic(pgerror.AssertionFailedf("destination memo must be empty"))
+		panic(errors.AssertionFailedf("destination memo must be empty"))
 	}
 
 	// Copy all metadata to the target memo so that referenced tables and columns
@@ -218,8 +216,8 @@ func (f *Factory) AssignPlaceholders(from *memo.Memo) (err error) {
 			// for `if err != nil` throughout the construction code. This is only
 			// possible because the code does not update shared state and does not
 			// manipulate locks.
-			if bldErr, ok := r.(placeholderError); ok {
-				err = bldErr.error
+			if ok, e := errorutil.ShouldCatch(r); ok {
+				err = e
 			} else {
 				panic(r)
 			}
@@ -233,7 +231,7 @@ func (f *Factory) AssignPlaceholders(from *memo.Memo) (err error) {
 		if placeholder, ok := e.(*memo.PlaceholderExpr); ok {
 			d, err := e.(*memo.PlaceholderExpr).Value.Eval(f.evalCtx)
 			if err != nil {
-				panic(placeholderError{err})
+				panic(err)
 			}
 			return f.ConstructConstVal(d, placeholder.DataType())
 		}
@@ -306,12 +304,8 @@ func (f *Factory) ConstructJoin(
 		return f.ConstructLeftJoinApply(left, right, on, private)
 	case opt.RightJoinOp:
 		return f.ConstructRightJoin(left, right, on, private)
-	case opt.RightJoinApplyOp:
-		return f.ConstructRightJoinApply(left, right, on, private)
 	case opt.FullJoinOp:
 		return f.ConstructFullJoin(left, right, on, private)
-	case opt.FullJoinApplyOp:
-		return f.ConstructFullJoinApply(left, right, on, private)
 	case opt.SemiJoinOp:
 		return f.ConstructSemiJoin(left, right, on, private)
 	case opt.SemiJoinApplyOp:
@@ -321,7 +315,7 @@ func (f *Factory) ConstructJoin(
 	case opt.AntiJoinApplyOp:
 		return f.ConstructAntiJoinApply(left, right, on, private)
 	}
-	panic(pgerror.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
+	panic(errors.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
 }
 
 // ConstructConstVal constructs one of the constant value operators from the

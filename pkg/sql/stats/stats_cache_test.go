@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stats
 
@@ -24,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -37,7 +34,7 @@ import (
 )
 
 func insertTableStat(
-	ctx context.Context, db *client.DB, ex sqlutil.InternalExecutor, stat *TableStatistic,
+	ctx context.Context, db *client.DB, ex sqlutil.InternalExecutor, stat *TableStatisticProto,
 ) error {
 	insertStatStmt := `
 INSERT INTO system.table_statistics ("tableID", "statisticID", name, "columnIDs", "createdAt",
@@ -65,8 +62,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	if len(stat.Name) != 0 {
 		args[2] = stat.Name
 	}
-	if stat.Histogram != nil {
-		histogramBytes, err := protoutil.Marshal(stat.Histogram)
+	if stat.HistogramData != nil {
+		histogramBytes, err := protoutil.Marshal(stat.HistogramData)
 		if err != nil {
 			return err
 		}
@@ -97,7 +94,10 @@ func lookupTableStats(
 }
 
 func checkStatsForTable(
-	ctx context.Context, sc *TableStatisticsCache, expected []*TableStatistic, tableID sqlbase.ID,
+	ctx context.Context,
+	sc *TableStatisticsCache,
+	expected []*TableStatisticProto,
+	tableID sqlbase.ID,
 ) error {
 	// Initially the stats won't be in the cache.
 	if statsList, ok := lookupTableStats(ctx, sc, tableID); ok {
@@ -110,7 +110,7 @@ func checkStatsForTable(
 	if err != nil {
 		return errors.Errorf(err.Error())
 	}
-	if !reflect.DeepEqual(statsList, expected) {
+	if !checkStats(statsList, expected) {
 		return errors.Errorf("for lookup of key %d, expected stats %s, got %s", tableID, expected, statsList)
 	}
 
@@ -121,12 +121,24 @@ func checkStatsForTable(
 	return nil
 }
 
+func checkStats(actual []*TableStatistic, expected []*TableStatisticProto) bool {
+	if len(actual) == 0 && len(expected) == 0 {
+		// DeepEqual differentiates between nil and empty slices, we don't.
+		return true
+	}
+	var protoList []*TableStatisticProto
+	for i := range actual {
+		protoList = append(protoList, &actual[i].TableStatisticProto)
+	}
+	return reflect.DeepEqual(protoList, expected)
+}
+
 func initTestData(
 	ctx context.Context, db *client.DB, ex sqlutil.InternalExecutor,
-) (map[sqlbase.ID][]*TableStatistic, error) {
+) (map[sqlbase.ID][]*TableStatisticProto, error) {
 	// The expected stats must be ordered by TableID+, CreatedAt- so they can
 	// later be compared with the returned stats using reflect.DeepEqual.
-	expStatsList := []TableStatistic{
+	expStatsList := []TableStatisticProto{
 		{
 			TableID:       sqlbase.ID(100),
 			StatisticID:   0,
@@ -136,7 +148,7 @@ func initTestData(
 			RowCount:      32,
 			DistinctCount: 30,
 			NullCount:     0,
-			Histogram: &HistogramData{ColumnType: *types.Int, Buckets: []HistogramData_Bucket{
+			HistogramData: &HistogramData{ColumnType: *types.Int, Buckets: []HistogramData_Bucket{
 				{NumEq: 3, NumRange: 30, UpperBound: encoding.EncodeVarintAscending(nil, 3000)}},
 			},
 		},
@@ -172,7 +184,7 @@ func initTestData(
 
 	// Insert the stats into system.table_statistics
 	// and store them in maps for fast retrieval.
-	expectedStats := make(map[sqlbase.ID][]*TableStatistic)
+	expectedStats := make(map[sqlbase.ID][]*TableStatisticProto)
 	for i := range expStatsList {
 		stat := &expStatsList[i]
 
@@ -213,7 +225,7 @@ func TestCacheBasic(t *testing.T) {
 	// Create a cache and iteratively query the cache for each tableID. This
 	// will result in the cache getting populated. When the stats cache size is
 	// exceeded, entries should be evicted according to the LRU policy.
-	sc := NewTableStatisticsCache(2 /* cacheSize */, s.Gossip(), db, ex)
+	sc := NewTableStatisticsCache(2 /* cacheSize */, s.GossipI().(*gossip.Gossip), db, ex)
 	for _, tableID := range tableIDs {
 		if err := checkStatsForTable(ctx, sc, expectedStats[tableID], tableID); err != nil {
 			t.Fatal(err)
@@ -267,7 +279,7 @@ func TestCacheWait(t *testing.T) {
 	}
 	sort.Sort(tableIDs)
 
-	sc := NewTableStatisticsCache(len(tableIDs), s.Gossip(), db, ex)
+	sc := NewTableStatisticsCache(len(tableIDs), s.GossipI().(*gossip.Gossip), db, ex)
 	for _, tableID := range tableIDs {
 		if err := checkStatsForTable(ctx, sc, expectedStats[tableID], tableID); err != nil {
 			t.Fatal(err)
@@ -287,7 +299,7 @@ func TestCacheWait(t *testing.T) {
 				stats, err := sc.GetTableStats(ctx, id)
 				if err != nil {
 					t.Error(err)
-				} else if !reflect.DeepEqual(stats, expectedStats[id]) {
+				} else if !checkStats(stats, expectedStats[id]) {
 					t.Errorf("for table %d, expected stats %s, got %s", id, expectedStats[id], stats)
 				}
 				wg.Done()

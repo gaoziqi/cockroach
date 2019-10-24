@@ -1,17 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package intentresolver
 
@@ -250,11 +245,13 @@ func (ir *IntentResolver) ProcessWriteIntentError(
 	var cleanup func(*roachpb.WriteIntentError, *enginepb.TxnMeta)
 	if len(wiErr.Intents) == 1 && len(wiErr.Intents[0].Span.EndKey) == 0 {
 		var done bool
+		var pErr *roachpb.Error
 		// Note that the write intent error may be mutated here in the event
 		// that this pusher is queued to wait for a different transaction
 		// instead.
-		if cleanup, wiErr, done = ir.contentionQ.add(ctx, wiErr, h); done {
-			return cleanup, nil
+		cleanup, wiErr, done, pErr = ir.contentionQ.add(ctx, wiErr, h)
+		if done || pErr != nil {
+			return cleanup, pErr
 		}
 	}
 
@@ -436,7 +433,6 @@ func (ir *IntentResolver) MaybePushTransactions(
 			PusheeTxn:       pushTxn,
 			PushTo:          h.Timestamp.Next(),
 			InclusivePushTo: true,
-			DeprecatedNow:   b.Header.Timestamp,
 			PushType:        pushType,
 		})
 	}
@@ -611,7 +607,7 @@ func (ir *IntentResolver) CleanupTxnIntentsAsync(
 			intents := roachpb.AsIntents(et.Txn.IntentSpans, &et.Txn)
 			if err := ir.cleanupFinishedTxnIntents(ctx, rangeID, &et.Txn, intents, now, et.Poison, nil); err != nil {
 				if ir.every.ShouldLog() {
-					log.Warningf(ctx, "failed to cleanup transaction intents: %s", err)
+					log.Warningf(ctx, "failed to cleanup transaction intents: %v", err)
 				}
 			}
 		}); err != nil {
@@ -698,7 +694,6 @@ func (ir *IntentResolver) CleanupTxnIntentsOnGCAsync(
 						TxnMeta: enginepb.TxnMeta{Priority: enginepb.MaxTxnPriority},
 					},
 					PusheeTxn:       txn.TxnMeta,
-					DeprecatedNow:   b.Header.Timestamp,
 					PushType:        roachpb.PUSH_ABORT,
 					InclusivePushTo: true,
 				})
@@ -727,7 +722,7 @@ func (ir *IntentResolver) CleanupTxnIntentsOnGCAsync(
 			err := ir.cleanupFinishedTxnIntents(ctx, rangeID, txn, intents, now, false /* poison */, onCleanupComplete)
 			if err != nil {
 				if ir.every.ShouldLog() {
-					log.Warningf(ctx, "failed to cleanup transaction intents: %s", err)
+					log.Warningf(ctx, "failed to cleanup transaction intents: %+v", err)
 				}
 			}
 		},
@@ -851,14 +846,14 @@ func (ir *IntentResolver) lookupRangeID(ctx context.Context, key roachpb.Key) ro
 	rKey, err := keys.Addr(key)
 	if err != nil {
 		if ir.every.ShouldLog() {
-			log.Warningf(ctx, "failed to resolve addr for key %q: %v", key, err)
+			log.Warningf(ctx, "failed to resolve addr for key %q: %+v", key, err)
 		}
 		return 0
 	}
 	rDesc, err := ir.rdc.LookupRangeDescriptor(ctx, rKey)
 	if err != nil {
 		if ir.every.ShouldLog() {
-			log.Warningf(ctx, "failed to look up range descriptor for key %q: %v", key, err)
+			log.Warningf(ctx, "failed to look up range descriptor for key %q: %+v", key, err)
 		}
 		return 0
 	}

@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -20,7 +15,7 @@ import (
 	"fmt"
 )
 
-func registerLedger(r *registry) {
+func registerLedger(r *testRegistry) {
 	const nodes = 6
 	const azs = "us-central1-a,us-central1-b,us-central1-c"
 	r.Add(testSpec{
@@ -39,9 +34,9 @@ func registerLedger(r *registry) {
 			m := newMonitor(ctx, c, roachNodes)
 			m.Go(func(ctx context.Context) error {
 				concurrency := ifLocal("", " --concurrency="+fmt.Sprint(nodes*32))
-				duration := " --duration=" + ifLocal("10s", "30m")
+				duration := " --duration=" + ifLocal("10s", "10m")
 
-				cmd := fmt.Sprintf("./workload run ledger --init --histograms=logs/stats.json"+
+				cmd := fmt.Sprintf("./workload run ledger --init --histograms="+perfArtifactsDir+"/stats.json"+
 					concurrency+duration+" {pgurl%s}", gatewayNodes)
 				c.Run(ctx, loadNode, cmd)
 				return nil

@@ -1,38 +1,31 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlsmith
 
 import (
-	"math/rand"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-func (s *scope) makeStmt() (stmt tree.Statement, ok bool) {
-	idx := s.schema.stmtSampler.Next()
-	return s.schema.statements[idx].fn(s)
+func (s *Smither) makeStmt() (stmt tree.Statement, ok bool) {
+	idx := s.stmtSampler.Next()
+	return s.statements[idx].fn(s)
 }
 
-func (s *scope) makeSelectStmt(
+func (s *Smither) makeSelectStmt(
 	desiredTypes []*types.T, refs colRefs, withTables tableRefs,
 ) (stmt tree.SelectStatement, stmtRefs colRefs, tables tableRefs, ok bool) {
 	if s.canRecurse() {
 		for {
-			idx := s.schema.selectStmts.Next()
+			idx := s.selectStmts.Next()
 			expr, exprRefs, tables, ok := selectStmts[idx].fn(s, desiredTypes, refs, withTables)
 			if ok {
 				return expr, exprRefs, tables, ok
@@ -42,25 +35,26 @@ func (s *scope) makeSelectStmt(
 	return makeValuesSelect(s, desiredTypes, refs, withTables)
 }
 
-func makeSchemaTable(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
-	expr, _, exprRefs, ok := s.getSchemaTable()
+func makeSchemaTable(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+	expr, _, _, exprRefs, ok := s.getSchemaTable()
 	return expr, exprRefs, ok
 }
 
-func (s *scope) getSchemaTable() (tree.TableExpr, *tableRef, colRefs, bool) {
-	table, ok := s.schema.getRandTable()
+func (s *Smither) getSchemaTable() (tree.TableExpr, *tree.TableName, *tableRef, colRefs, bool) {
+	table, ok := s.getRandTable()
 	if !ok {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
-	alias := s.schema.name("tab")
-	expr, refs := s.tableExpr(table, tree.NewUnqualifiedTableName(alias))
+	alias := s.name("tab")
+	name := tree.NewUnqualifiedTableName(alias)
+	expr, refs := s.tableExpr(table, name)
 	return &tree.AliasedTableExpr{
 		Expr: expr,
 		As:   tree.AliasClause{Alias: alias},
-	}, table, refs, true
+	}, name, table, refs, true
 }
 
-func (s *scope) tableExpr(table *tableRef, name *tree.TableName) (tree.TableExpr, colRefs) {
+func (s *Smither) tableExpr(table *tableRef, name *tree.TableName) (tree.TableExpr, colRefs) {
 	refs := make(colRefs, len(table.Columns))
 	for i, c := range table.Columns {
 		refs[i] = &colRef{
@@ -92,10 +86,17 @@ var (
 		{1, makeUpdateReturning},
 	}
 	nonMutatingTableExprs = tableExprWeights{
-		{2, makeJoinExpr},
-		{3, makeSchemaTable},
+		{40, makeMergeJoinExpr},
+		{40, makeEquiJoinExpr},
+		{20, makeSchemaTable},
+		{10, makeJoinExpr},
 		{1, makeValuesTable},
-		{1, makeSelectTable},
+		{2, makeSelectTable},
+	}
+	vectorizableTableExprs = tableExprWeights{
+		{20, makeEquiJoinExpr},
+		{20, makeMergeJoinExpr},
+		{20, makeSchemaTable},
 	}
 	allTableExprs = append(mutatingTableExprs, nonMutatingTableExprs...)
 
@@ -137,12 +138,12 @@ func (ws tableExprWeights) Weights() []int {
 type (
 	statementWeight struct {
 		weight int
-		fn     func(s *scope) (tree.Statement, bool)
+		fn     func(s *Smither) (tree.Statement, bool)
 	}
 	statementWeights []statementWeight
 	tableExprWeight  struct {
 		weight int
-		fn     func(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool)
+		fn     func(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool)
 	}
 	tableExprWeights []tableExprWeight
 	selectStmtWeight struct {
@@ -154,16 +155,16 @@ type (
 	// has a limitation that CTE tables can only be used once, it returns a
 	// possibly modified list of those same withTables, where used tables have
 	// been removed.
-	selectStmt func(s *scope, desiredTypes []*types.T, refs colRefs, withTables tableRefs) (tree.SelectStatement, colRefs, tableRefs, bool)
+	selectStmt func(s *Smither, desiredTypes []*types.T, refs colRefs, withTables tableRefs) (tree.SelectStatement, colRefs, tableRefs, bool)
 )
 
 // makeTableExpr returns a tableExpr. If forJoin is true the tableExpr is
 // valid to be used as a join reference.
-func makeTableExpr(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+func makeTableExpr(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
 	if s.canRecurse() {
 		for i := 0; i < retryCount; i++ {
-			idx := s.schema.tableExprSampler.Next()
-			expr, exprRefs, ok := s.schema.tableExprs[idx].fn(s, refs, forJoin)
+			idx := s.tableExprSampler.Next()
+			expr, exprRefs, ok := s.tableExprs[idx].fn(s, refs, forJoin)
 			if ok {
 				return expr, exprRefs, ok
 			}
@@ -197,7 +198,7 @@ var joinTypes = []string{
 	tree.AstInner,
 }
 
-func makeJoinExpr(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+func makeJoinExpr(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
 	left, leftRefs, ok := makeTableExpr(s, refs, true)
 	if !ok {
 		return nil, nil, false
@@ -208,7 +209,7 @@ func makeJoinExpr(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs
 	}
 
 	joinExpr := &tree.JoinTableExpr{
-		JoinType: joinTypes[s.schema.rnd.Intn(len(joinTypes))],
+		JoinType: joinTypes[s.rnd.Intn(len(joinTypes))],
 		Left:     left,
 		Right:    right,
 	}
@@ -222,18 +223,174 @@ func makeJoinExpr(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs
 	return joinExpr, joinRefs, true
 }
 
+func makeEquiJoinExpr(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+	left, leftRefs, ok := makeTableExpr(s, refs, true)
+	if !ok {
+		return nil, nil, false
+	}
+	right, rightRefs, ok := makeTableExpr(s, refs, true)
+	if !ok {
+		return nil, nil, false
+	}
+
+	// Determine overlapping types.
+	var available [][2]tree.TypedExpr
+	for _, leftCol := range leftRefs {
+		for _, rightCol := range rightRefs {
+			if leftCol.typ.Equivalent(rightCol.typ) {
+				available = append(available, [2]tree.TypedExpr{
+					typedParen(leftCol.item, leftCol.typ),
+					typedParen(rightCol.item, rightCol.typ),
+				})
+			}
+		}
+	}
+	if len(available) == 0 {
+		// left and right didn't have any columns with the same type.
+		return nil, nil, false
+	}
+
+	s.rnd.Shuffle(len(available), func(i, j int) {
+		available[i], available[j] = available[j], available[i]
+	})
+
+	var cond tree.TypedExpr
+	for (cond == nil || s.coin()) && len(available) > 0 {
+		v := available[0]
+		available = available[1:]
+		expr := tree.NewTypedComparisonExpr(tree.EQ, v[0], v[1])
+		if cond == nil {
+			cond = expr
+		} else {
+			cond = tree.NewTypedAndExpr(cond, expr)
+		}
+	}
+
+	joinExpr := &tree.JoinTableExpr{
+		Left:  left,
+		Right: right,
+		Cond:  &tree.OnJoinCond{Expr: cond},
+	}
+	joinRefs := leftRefs.extend(rightRefs...)
+	return joinExpr, joinRefs, true
+}
+
+func makeMergeJoinExpr(s *Smither, _ colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+	// A merge join is an equijoin where both sides are sorted in the same
+	// direction. Do this by looking for two indexes that have column
+	// prefixes that are the same type and direction. Identical indexes
+	// are fine.
+
+	// Start with some random index.
+	leftTableName, leftIdx, _, ok := s.getRandIndex()
+	if !ok {
+		return nil, nil, false
+	}
+
+	leftAlias := s.name("tab")
+	rightAlias := s.name("tab")
+	leftAliasName := tree.NewUnqualifiedTableName(leftAlias)
+	rightAliasName := tree.NewUnqualifiedTableName(rightAlias)
+
+	// Now look for one that satisfies our contraints (some shared prefix
+	// of type + direction), might end up being the same one. We rely on
+	// Go's non-deterministic map iteration ordering for randomness.
+	rightTableName, cols := func() (*tree.TableIndexName, [][2]colRef) {
+		s.lock.RLock()
+		defer s.lock.RUnlock()
+		for tbl, idxs := range s.indexes {
+			for idxName, idx := range idxs {
+				rightTableName := &tree.TableIndexName{
+					Table: tbl,
+					Index: tree.UnrestrictedName(idxName),
+				}
+				// cols keeps track of matching column pairs.
+				var cols [][2]colRef
+				for _, rightColElem := range idx.Columns {
+					rightCol := s.columns[tbl][rightColElem.Column]
+					leftColElem := leftIdx.Columns[len(cols)]
+					leftCol := s.columns[leftTableName.Table][leftColElem.Column]
+					if rightColElem.Direction != leftColElem.Direction {
+						break
+					}
+					if !rightCol.Type.Equivalent(leftCol.Type) {
+						break
+					}
+					cols = append(cols, [2]colRef{
+						{
+							typ:  leftCol.Type,
+							item: tree.NewColumnItem(leftAliasName, leftColElem.Column),
+						},
+						{
+							typ:  rightCol.Type,
+							item: tree.NewColumnItem(rightAliasName, rightColElem.Column),
+						},
+					})
+					if len(cols) >= len(leftIdx.Columns) {
+						break
+					}
+				}
+				if len(cols) > 0 {
+					return rightTableName, cols
+				}
+			}
+		}
+		// Since we can always match leftIdx we should never get here.
+		panic("unreachable")
+	}()
+
+	// joinRefs are limited to columns in the indexes (even if they don't
+	// appear in the join condition) because non-stored columns will cause
+	// a hash join.
+	var joinRefs colRefs
+	for _, pair := range cols {
+		joinRefs = append(joinRefs, &pair[0], &pair[1])
+	}
+
+	var cond tree.TypedExpr
+	// Pick some prefix of the available columns. Not randomized because it
+	// needs to match the index column order.
+	for (cond == nil || s.coin()) && len(cols) > 0 {
+		v := cols[0]
+		cols = cols[1:]
+		expr := tree.NewTypedComparisonExpr(
+			tree.EQ,
+			typedParen(v[0].item, v[0].typ),
+			typedParen(v[1].item, v[1].typ),
+		)
+		if cond == nil {
+			cond = expr
+		} else {
+			cond = tree.NewTypedAndExpr(cond, expr)
+		}
+	}
+
+	joinExpr := &tree.JoinTableExpr{
+		Left: &tree.AliasedTableExpr{
+			Expr: &leftTableName.Table,
+			As:   tree.AliasClause{Alias: leftAlias},
+		},
+		Right: &tree.AliasedTableExpr{
+			Expr: &rightTableName.Table,
+			As:   tree.AliasClause{Alias: rightAlias},
+		},
+		Cond: &tree.OnJoinCond{Expr: cond},
+	}
+	return joinExpr, joinRefs, true
+}
+
 // STATEMENTS
 
-func (s *scope) makeWith() (*tree.With, tableRefs) {
-	if s.schema.disableWith {
+func (s *Smither) makeWith() (*tree.With, tableRefs) {
+	if s.disableWith {
 		return nil, nil
 	}
 
 	// WITHs are pretty rare, so just ignore them a lot.
-	if coin() {
+	if s.coin() {
 		return nil, nil
 	}
-	ctes := make([]*tree.CTE, 0, d6()/2)
+	ctes := make([]*tree.CTE, 0, s.d6()/2)
 	if cap(ctes) == 0 {
 		return nil, nil
 	}
@@ -242,11 +399,11 @@ func (s *scope) makeWith() (*tree.With, tableRefs) {
 		var ok bool
 		var stmt tree.SelectStatement
 		var stmtRefs colRefs
-		stmt, stmtRefs, tables, ok = s.makeSelectStmt(makeDesiredTypes(s.schema.rnd), nil /* refs */, tables)
+		stmt, stmtRefs, tables, ok = s.makeSelectStmt(s.makeDesiredTypes(), nil /* refs */, tables)
 		if !ok {
 			continue
 		}
-		alias := s.schema.name("with")
+		alias := s.name("with")
 		tblName := tree.NewUnqualifiedTableName(alias)
 		cols := make(tree.NameList, len(stmtRefs))
 		defs := make([]*tree.ColumnTableDef, len(stmtRefs))
@@ -273,17 +430,6 @@ func (s *scope) makeWith() (*tree.With, tableRefs) {
 	return &tree.With{
 		CTEList: ctes,
 	}, tables
-}
-
-func makeDesiredTypes(rng *rand.Rand) []*types.T {
-	var typs []*types.T
-	for {
-		typs = append(typs, sqlbase.RandType(rng))
-		if d6() < 2 {
-			break
-		}
-	}
-	return typs
 }
 
 var orderDirections = []tree.Direction{
@@ -335,20 +481,19 @@ func (s *Smither) randStringComparison() tree.ComparisonOperator {
 
 // makeSelectTable returns a TableExpr of the form `(SELECT ...)`, which
 // would end up looking like `SELECT ... FROM (SELECT ...)`.
-func makeSelectTable(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
-	desiredTypes := makeDesiredTypes(s.schema.rnd)
-	stmt, _, ok := s.makeSelect(desiredTypes, refs)
+func makeSelectTable(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+	stmt, stmtRefs, ok := s.makeSelect(nil /* desiredTypes */, refs)
 	if !ok {
 		return nil, nil, false
 	}
 
-	table := s.schema.name("tab")
-	names := make(tree.NameList, len(desiredTypes))
-	clauseRefs := make(colRefs, len(desiredTypes))
-	for i, typ := range desiredTypes {
-		names[i] = s.schema.name("col")
+	table := s.name("tab")
+	names := make(tree.NameList, len(stmtRefs))
+	clauseRefs := make(colRefs, len(stmtRefs))
+	for i, ref := range stmtRefs {
+		names[i] = s.name("col")
 		clauseRefs[i] = &colRef{
-			typ: typ,
+			typ: ref.typ,
 			item: tree.NewColumnItem(
 				tree.NewUnqualifiedTableName(table),
 				names[i],
@@ -368,25 +513,27 @@ func makeSelectTable(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colR
 }
 
 func makeSelectClause(
-	s *scope, desiredTypes []*types.T, refs colRefs, withTables tableRefs,
+	s *Smither, desiredTypes []*types.T, refs colRefs, withTables tableRefs,
 ) (tree.SelectStatement, colRefs, tableRefs, bool) {
 	stmt, selectRefs, _, tables, ok := s.makeSelectClause(desiredTypes, refs, withTables)
 	return stmt, selectRefs, tables, ok
 }
 
-func (s *scope) makeSelectClause(
+func (s *Smither) makeSelectClause(
 	desiredTypes []*types.T, refs colRefs, withTables tableRefs,
 ) (clause *tree.SelectClause, selectRefs, orderByRefs colRefs, tables tableRefs, ok bool) {
-	clause = &tree.SelectClause{
-		From: &tree.From{},
+	if desiredTypes == nil && s.d9() == 1 {
+		return s.makeOrderedAggregate()
 	}
+
+	clause = &tree.SelectClause{}
 
 	var fromRefs colRefs
 	// Sometimes generate a SELECT with no FROM clause.
-	requireFrom := d6() != 1
-	for (requireFrom && len(clause.From.Tables) < 1) || coin() {
+	requireFrom := s.vectorizable || s.d6() != 1
+	for (requireFrom && len(clause.From.Tables) < 1) || s.canRecurse() {
 		var from tree.TableExpr
-		if len(withTables) == 0 || coin() {
+		if len(withTables) == 0 || s.coin() {
 			// Add a normal data source.
 			source, sourceRefs, sourceOk := makeTableExpr(s, refs, false)
 			if !sourceOk {
@@ -403,6 +550,10 @@ func (s *scope) makeSelectClause(
 			fromRefs = append(fromRefs, exprRefs...)
 		}
 		clause.From.Tables = append(clause.From.Tables, from)
+		// Restrict so that we don't have a crazy amount of rows due to many joins.
+		if len(clause.From.Tables) >= 4 {
+			break
+		}
 	}
 
 	selectListRefs := refs
@@ -413,7 +564,10 @@ func (s *scope) makeSelectClause(
 		orderByRefs = fromRefs
 		selectListRefs = selectListRefs.extend(fromRefs...)
 
-		if d6() <= 2 {
+		// TODO(mjibson): vec only supports GROUP BYs on fully-ordered
+		// columns, which we could support here. Also see #39240 which
+		// will support this more generally.
+		if !s.vectorizable && s.d6() <= 2 && s.canRecurse() {
 			// Enable GROUP BY. Choose some random subset of the
 			// fromRefs.
 			// TODO(mjibson): Refence handling and aggregation functions
@@ -425,11 +579,11 @@ func (s *scope) makeSelectClause(
 			// column in an aggregate function. It's also possible
 			// the where and order by exprs are not correct.
 			groupByRefs := fromRefs.extend()
-			s.schema.rnd.Shuffle(len(groupByRefs), func(i, j int) {
+			s.rnd.Shuffle(len(groupByRefs), func(i, j int) {
 				groupByRefs[i], groupByRefs[j] = groupByRefs[j], groupByRefs[i]
 			})
 			var groupBy tree.GroupBy
-			for (len(groupBy) < 1 || coin()) && len(groupBy) < len(groupByRefs) {
+			for (len(groupBy) < 1 || s.coin()) && len(groupBy) < len(groupByRefs) {
 				groupBy = append(groupBy, groupByRefs[len(groupBy)].item)
 			}
 			groupByRefs = groupByRefs[:len(groupBy)]
@@ -440,7 +594,7 @@ func (s *scope) makeSelectClause(
 			// TODO(mjibson): also use this context sometimes in
 			// non-aggregate mode (select sum(x) from a).
 			ctx = groupByCtx
-		} else if d6() <= 1 {
+		} else if s.d6() <= 1 && s.canRecurse() {
 			// Enable window functions. This will enable them for all
 			// exprs, but makeFunc will only let a few through.
 			ctx = windowCtx
@@ -453,7 +607,12 @@ func (s *scope) makeSelectClause(
 	}
 	clause.Exprs = selectList
 
-	if d100() == 1 {
+	// TODO(mjibson): Vectorized only supports ordered distinct, and so
+	// this often produces queries that won't vec. However since it will
+	// also sometimes produce vec queries with the distinctChainOps node,
+	// we allow this here. Teach this how to correctly limit itself to
+	// distinct only on ordered columns.
+	if s.d100() == 1 {
 		clause.Distinct = true
 		// For SELECT DISTINCT, ORDER BY expressions must appear in select list.
 		orderByRefs = selectRefs
@@ -462,17 +621,111 @@ func (s *scope) makeSelectClause(
 	return clause, selectRefs, orderByRefs, withTables, true
 }
 
-func makeSelect(s *scope) (tree.Statement, bool) {
-	stmt, _, ok := s.makeSelect(makeDesiredTypes(s.schema.rnd), nil)
+func (s *Smither) makeOrderedAggregate() (
+	clause *tree.SelectClause,
+	selectRefs, orderByRefs colRefs,
+	tables tableRefs,
+	ok bool,
+) {
+	// We need a SELECT with a GROUP BY on ordered columns. Choose a random
+	// table and index from that table and pick a random prefix from it.
+	tableExpr, tableAlias, table, tableColRefs, ok := s.getSchemaTable()
+	if !ok {
+		return nil, nil, nil, nil, false
+	}
+	_, _, idxRefs, ok := s.getRandTableIndex(*table.TableName, *tableAlias)
+	if !ok {
+		return nil, nil, nil, nil, false
+	}
+
+	var groupBy tree.GroupBy
+	for (len(groupBy) < 1 || s.coin()) && len(groupBy) < len(idxRefs) {
+		groupBy = append(groupBy, idxRefs[len(groupBy)].item)
+	}
+	idxRefs = idxRefs[:len(groupBy)]
+	alias := s.name("col")
+	selectRefs = colRefs{
+		{
+			typ:  types.Int,
+			item: &tree.ColumnItem{ColumnName: alias},
+		},
+	}
+	return &tree.SelectClause{
+		Exprs: tree.SelectExprs{
+			{
+				Expr: countStar,
+				As:   tree.UnrestrictedName(alias),
+			},
+		},
+		From: tree.From{
+			Tables: tree.TableExprs{tableExpr},
+		},
+		Where:   s.makeWhere(tableColRefs),
+		GroupBy: groupBy,
+		Having:  s.makeHaving(idxRefs),
+	}, selectRefs, idxRefs, tableRefs{table}, true
+}
+
+var countStar = func() tree.TypedExpr {
+	fn := tree.FunDefs["count"]
+	typ := types.Int
+	return tree.NewTypedFuncExpr(
+		tree.ResolvableFunctionReference{FunctionReference: fn},
+		0, /* aggQualifier */
+		tree.TypedExprs{tree.UnqualifiedStar{}},
+		nil, /* filter */
+		nil, /* window */
+		typ,
+		&fn.FunctionProperties,
+		fn.Definition[0].(*tree.Overload),
+	)
+}()
+
+func makeSelect(s *Smither) (tree.Statement, bool) {
+	stmt, refs, ok := s.makeSelect(nil, nil)
+	if !ok {
+		return stmt, ok
+	}
+	if s.outputSort {
+		order := make(tree.OrderBy, len(refs))
+		for i, r := range refs {
+			order[i] = &tree.Order{
+				Expr:       r.item,
+				NullsOrder: tree.NullsFirst,
+			}
+		}
+		stmt = &tree.Select{
+			Select: &tree.SelectClause{
+				Exprs: tree.SelectExprs{
+					tree.SelectExpr{
+						Expr: tree.UnqualifiedStar{},
+					},
+				},
+				From: tree.From{
+					Tables: tree.TableExprs{
+						&tree.AliasedTableExpr{
+							Expr: &tree.Subquery{
+								Select: &tree.ParenSelect{Select: stmt},
+							},
+							As: tree.AliasClause{
+								Alias: s.name("tab"),
+							},
+						},
+					},
+				},
+			},
+			OrderBy: order,
+		}
+	}
 	return stmt, ok
 }
 
-func (s *scope) makeSelect(desiredTypes []*types.T, refs colRefs) (*tree.Select, colRefs, bool) {
+func (s *Smither) makeSelect(desiredTypes []*types.T, refs colRefs) (*tree.Select, colRefs, bool) {
 	withStmt, withTables := s.makeWith()
 	// Table references to CTEs can only be referenced once (cockroach
 	// limitation). Shuffle the tables and only pick each once.
 	// TODO(mjibson): remove this when cockroach supports full CTEs.
-	s.schema.rnd.Shuffle(len(withTables), func(i, j int) {
+	s.rnd.Shuffle(len(withTables), func(i, j int) {
 		withTables[i], withTables[j] = withTables[j], withTables[i]
 	})
 
@@ -485,23 +738,34 @@ func (s *scope) makeSelect(desiredTypes []*types.T, refs colRefs) (*tree.Select,
 		Select:  clause,
 		With:    withStmt,
 		OrderBy: s.makeOrderBy(orderByRefs),
-		Limit:   makeLimit(),
+		Limit:   makeLimit(s),
 	}
 
 	return &stmt, selectRefs, true
 }
 
-func (s *scope) makeSelectList(
+// makeSelectList generates SelectExprs corresponding to
+// desiredTypes. desiredTypes can be nil which causes types to be randomly
+// selected from refs, improving the chance they are chosen during
+// makeScalar. Especially useful with the AvoidConsts option.
+func (s *Smither) makeSelectList(
 	ctx Context, desiredTypes []*types.T, refs colRefs,
 ) (tree.SelectExprs, colRefs, bool) {
+	// If we don't have any desired types, generate some from the given refs.
 	if len(desiredTypes) == 0 {
-		panic("expected desiredTypes")
+		s.sample(len(refs), 6, func(i int) {
+			desiredTypes = append(desiredTypes, refs[i].typ)
+		})
+	}
+	// If we still don't have any then there weren't any refs.
+	if len(desiredTypes) == 0 {
+		desiredTypes = s.makeDesiredTypes()
 	}
 	result := make(tree.SelectExprs, len(desiredTypes))
 	selectRefs := make(colRefs, len(desiredTypes))
 	for i, t := range desiredTypes {
 		result[i].Expr = makeScalarContext(s, ctx, t, refs)
-		alias := s.schema.name("col")
+		alias := s.name("col")
 		result[i].As = tree.UnrestrictedName(alias)
 		selectRefs[i] = &colRef{
 			typ:  t,
@@ -511,13 +775,13 @@ func (s *scope) makeSelectList(
 	return result, selectRefs, true
 }
 
-func makeDelete(s *scope) (tree.Statement, bool) {
+func makeDelete(s *Smither) (tree.Statement, bool) {
 	stmt, _, ok := s.makeDelete(nil)
 	return stmt, ok
 }
 
-func (s *scope) makeDelete(refs colRefs) (*tree.Delete, *tableRef, bool) {
-	table, tableRef, tableRefs, ok := s.getSchemaTable()
+func (s *Smither) makeDelete(refs colRefs) (*tree.Delete, *tableRef, bool) {
+	table, _, tableRef, tableRefs, ok := s.getSchemaTable()
 	if !ok {
 		return nil, nil, false
 	}
@@ -526,7 +790,7 @@ func (s *scope) makeDelete(refs colRefs) (*tree.Delete, *tableRef, bool) {
 		Table:     table,
 		Where:     s.makeWhere(tableRefs),
 		OrderBy:   s.makeOrderBy(tableRefs),
-		Limit:     makeLimit(),
+		Limit:     makeLimit(s),
 		Returning: &tree.NoReturningClause{},
 	}
 	if del.Limit == nil {
@@ -536,14 +800,14 @@ func (s *scope) makeDelete(refs colRefs) (*tree.Delete, *tableRef, bool) {
 	return del, tableRef, true
 }
 
-func makeDeleteReturning(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+func makeDeleteReturning(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
 	if forJoin {
 		return nil, nil, false
 	}
 	return s.makeDeleteReturning(refs)
 }
 
-func (s *scope) makeDeleteReturning(refs colRefs) (tree.TableExpr, colRefs, bool) {
+func (s *Smither) makeDeleteReturning(refs colRefs) (tree.TableExpr, colRefs, bool) {
 	del, delRef, ok := s.makeDelete(refs)
 	if !ok {
 		return nil, nil, false
@@ -555,13 +819,13 @@ func (s *scope) makeDeleteReturning(refs colRefs) (tree.TableExpr, colRefs, bool
 	}, returningRefs, true
 }
 
-func makeUpdate(s *scope) (tree.Statement, bool) {
+func makeUpdate(s *Smither) (tree.Statement, bool) {
 	stmt, _, ok := s.makeUpdate(nil)
 	return stmt, ok
 }
 
-func (s *scope) makeUpdate(refs colRefs) (*tree.Update, *tableRef, bool) {
-	table, tableRef, tableRefs, ok := s.getSchemaTable()
+func (s *Smither) makeUpdate(refs colRefs) (*tree.Update, *tableRef, bool) {
+	table, _, tableRef, tableRefs, ok := s.getSchemaTable()
 	if !ok {
 		return nil, nil, false
 	}
@@ -574,14 +838,14 @@ func (s *scope) makeUpdate(refs colRefs) (*tree.Update, *tableRef, bool) {
 		Table:     table,
 		Where:     s.makeWhere(tableRefs),
 		OrderBy:   s.makeOrderBy(tableRefs),
-		Limit:     makeLimit(),
+		Limit:     makeLimit(s),
 		Returning: &tree.NoReturningClause{},
 	}
 	// Each row can be set at most once. Copy tableRefs to upRefs and remove
 	// elements from it as we use them.
 	upRefs := tableRefs.extend()
-	for (len(update.Exprs) < 1 || coin()) && len(upRefs) > 0 {
-		n := s.schema.rnd.Intn(len(upRefs))
+	for (len(update.Exprs) < 1 || s.coin()) && len(upRefs) > 0 {
+		n := s.rnd.Intn(len(upRefs))
 		ref := upRefs[n]
 		upRefs = append(upRefs[:n], upRefs[n+1:]...)
 		col := cols[ref.item.ColumnName]
@@ -612,14 +876,14 @@ func (s *scope) makeUpdate(refs colRefs) (*tree.Update, *tableRef, bool) {
 	return update, tableRef, true
 }
 
-func makeUpdateReturning(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+func makeUpdateReturning(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
 	if forJoin {
 		return nil, nil, false
 	}
 	return s.makeUpdateReturning(refs)
 }
 
-func (s *scope) makeUpdateReturning(refs colRefs) (tree.TableExpr, colRefs, bool) {
+func (s *Smither) makeUpdateReturning(refs colRefs) (tree.TableExpr, colRefs, bool) {
 	update, updateRef, ok := s.makeUpdate(refs)
 	if !ok {
 		return nil, nil, false
@@ -631,7 +895,7 @@ func (s *scope) makeUpdateReturning(refs colRefs) (tree.TableExpr, colRefs, bool
 	}, returningRefs, true
 }
 
-func makeInsert(s *scope) (tree.Statement, bool) {
+func makeInsert(s *Smither) (tree.Statement, bool) {
 	stmt, _, ok := s.makeInsert(nil)
 	return stmt, ok
 }
@@ -639,8 +903,8 @@ func makeInsert(s *scope) (tree.Statement, bool) {
 // makeInsert has only one valid reference: its table source, which can be
 // used only in the optional returning section. Hence the irregular return
 // signature.
-func (s *scope) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
-	table, tableRef, _, ok := s.getSchemaTable()
+func (s *Smither) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
+	table, _, tableRef, _, ok := s.getSchemaTable()
 	if !ok {
 		return nil, nil, false
 	}
@@ -653,11 +917,11 @@ func (s *scope) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
 
 	// Use DEFAULT VALUES only sometimes. A nil insert.Rows.Select indicates
 	// DEFAULT VALUES.
-	if d9() != 1 {
+	if s.d9() != 1 {
 		var desiredTypes []*types.T
 		var names tree.NameList
 
-		unnamed := coin()
+		unnamed := s.coin()
 
 		// Grab some subset of the columns of the table to attempt to insert into.
 		for _, c := range tableRef.Columns {
@@ -666,7 +930,7 @@ func (s *scope) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
 			if c.Computed.Computed {
 				continue
 			}
-			if unnamed || c.Nullable.Nullability == tree.NotNull || coin() {
+			if unnamed || c.Nullable.Nullability == tree.NotNull || s.coin() {
 				desiredTypes = append(desiredTypes, c.Type)
 				names = append(names, c.Name)
 			}
@@ -687,14 +951,14 @@ func (s *scope) makeInsert(refs colRefs) (*tree.Insert, *tableRef, bool) {
 	return insert, tableRef, true
 }
 
-func makeInsertReturning(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+func makeInsertReturning(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
 	if forJoin {
 		return nil, nil, false
 	}
 	return s.makeInsertReturning(refs)
 }
 
-func (s *scope) makeInsertReturning(refs colRefs) (tree.TableExpr, colRefs, bool) {
+func (s *Smither) makeInsertReturning(refs colRefs) (tree.TableExpr, colRefs, bool) {
 	insert, insertRef, ok := s.makeInsert(refs)
 	if !ok {
 		return nil, nil, false
@@ -706,14 +970,14 @@ func (s *scope) makeInsertReturning(refs colRefs) (tree.TableExpr, colRefs, bool
 	}, returningRefs, true
 }
 
-func makeValuesTable(s *scope, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
-	types := makeDesiredTypes(s.schema.rnd)
+func makeValuesTable(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
+	types := s.makeDesiredTypes()
 	values, valuesRefs := makeValues(s, types, refs)
 	return values, valuesRefs, true
 }
 
-func makeValues(s *scope, desiredTypes []*types.T, refs colRefs) (tree.TableExpr, colRefs) {
-	numRowsToInsert := d6()
+func makeValues(s *Smither, desiredTypes []*types.T, refs colRefs) (tree.TableExpr, colRefs) {
+	numRowsToInsert := s.d6()
 	values := tree.ValuesClause{
 		Rows: make([]tree.Exprs, numRowsToInsert),
 	}
@@ -725,11 +989,11 @@ func makeValues(s *scope, desiredTypes []*types.T, refs colRefs) (tree.TableExpr
 		}
 		values.Rows[i] = tuple
 	}
-	table := s.schema.name("tab")
+	table := s.name("tab")
 	names := make(tree.NameList, len(desiredTypes))
 	valuesRefs := make(colRefs, len(desiredTypes))
 	for i, typ := range desiredTypes {
-		names[i] = s.schema.name("col")
+		names[i] = s.name("col")
 		valuesRefs[i] = &colRef{
 			typ: typ,
 			item: tree.NewColumnItem(
@@ -755,7 +1019,7 @@ func makeValues(s *scope, desiredTypes []*types.T, refs colRefs) (tree.TableExpr
 }
 
 func makeValuesSelect(
-	s *scope, desiredTypes []*types.T, refs colRefs, withTables tableRefs,
+	s *Smither, desiredTypes []*types.T, refs colRefs, withTables tableRefs,
 ) (tree.SelectStatement, colRefs, tableRefs, bool) {
 	values, valuesRefs := makeValues(s, desiredTypes, refs)
 
@@ -767,7 +1031,7 @@ func makeValuesSelect(
 	// for how to achieve exactly that syntax as tree nodes, but it works.
 	return &tree.SelectClause{
 		Exprs: tree.SelectExprs{tree.StarSelectExpr()},
-		From: &tree.From{
+		From: tree.From{
 			Tables: tree.TableExprs{values},
 		},
 	}, valuesRefs, withTables, true
@@ -780,7 +1044,7 @@ var setOps = []tree.UnionType{
 }
 
 func makeSetOp(
-	s *scope, desiredTypes []*types.T, refs colRefs, withTables tableRefs,
+	s *Smither, desiredTypes []*types.T, refs colRefs, withTables tableRefs,
 ) (tree.SelectStatement, colRefs, tableRefs, bool) {
 	left, leftRefs, withTables, ok := s.makeSelectStmt(desiredTypes, refs, withTables)
 	if !ok {
@@ -793,57 +1057,60 @@ func makeSetOp(
 	}
 
 	return &tree.UnionClause{
-		Type:  setOps[s.schema.rnd.Intn(len(setOps))],
+		Type:  setOps[s.rnd.Intn(len(setOps))],
 		Left:  &tree.Select{Select: left},
 		Right: &tree.Select{Select: right},
-		All:   coin(),
+		All:   s.coin(),
 	}, leftRefs, withTables, true
 }
 
-func (s *scope) makeWhere(refs colRefs) *tree.Where {
-	if coin() {
+func (s *Smither) makeWhere(refs colRefs) *tree.Where {
+	if s.coin() {
 		where := makeBoolExpr(s, refs)
 		return tree.NewWhere("WHERE", where)
 	}
 	return nil
 }
 
-func (s *scope) makeHaving(refs colRefs) *tree.Where {
-	if coin() {
+func (s *Smither) makeHaving(refs colRefs) *tree.Where {
+	if s.coin() {
 		where := makeBoolExprContext(s, havingCtx, refs)
 		return tree.NewWhere("HAVING", where)
 	}
 	return nil
 }
 
-func (s *scope) makeOrderBy(refs colRefs) tree.OrderBy {
+func (s *Smither) makeOrderBy(refs colRefs) tree.OrderBy {
 	if len(refs) == 0 {
 		return nil
 	}
 	var ob tree.OrderBy
-	for coin() {
-		ref := refs[s.schema.rnd.Intn(len(refs))]
+	for s.coin() {
+		ref := refs[s.rnd.Intn(len(refs))]
 		// We don't support order by jsonb columns.
 		if ref.typ.Family() == types.JsonFamily {
 			continue
 		}
 		ob = append(ob, &tree.Order{
 			Expr:      ref.item,
-			Direction: s.schema.randDirection(),
+			Direction: s.randDirection(),
 		})
 	}
 	return ob
 }
 
-func makeLimit() *tree.Limit {
-	if d6() > 2 {
-		return &tree.Limit{Count: tree.NewDInt(tree.DInt(d100()))}
+func makeLimit(s *Smither) *tree.Limit {
+	if s.disableLimits {
+		return nil
+	}
+	if s.d6() > 2 {
+		return &tree.Limit{Count: tree.NewDInt(tree.DInt(s.d100()))}
 	}
 	return nil
 }
 
-func (s *scope) makeReturning(table *tableRef) (*tree.ReturningExprs, colRefs) {
-	desiredTypes := makeDesiredTypes(s.schema.rnd)
+func (s *Smither) makeReturning(table *tableRef) (*tree.ReturningExprs, colRefs) {
+	desiredTypes := s.makeDesiredTypes()
 
 	refs := make(colRefs, len(table.Columns))
 	for i, c := range table.Columns {
@@ -857,7 +1124,7 @@ func (s *scope) makeReturning(table *tableRef) (*tree.ReturningExprs, colRefs) {
 	returningRefs := make(colRefs, len(desiredTypes))
 	for i, t := range desiredTypes {
 		returning[i].Expr = makeScalar(s, t, refs)
-		alias := s.schema.name("ret")
+		alias := s.name("ret")
 		returning[i].As = tree.UnrestrictedName(alias)
 		returningRefs[i] = &colRef{
 			typ: t,

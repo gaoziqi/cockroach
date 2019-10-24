@@ -13,7 +13,6 @@ import (
 	gosql "database/sql"
 	"math/rand"
 	"strings"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -29,7 +28,7 @@ import (
 // duplicates, which the two cdctest.Validator implementations verify for the
 // real output of a changefeed. The output rows and resolved timestamps of the
 // tested feed are fed into them to check for anomalies.
-func RunNemesis(f TestFeedFactory, db *gosql.DB) (Validator, error) {
+func RunNemesis(f TestFeedFactory, db *gosql.DB, isSinkless bool) (Validator, error) {
 	// possible additional nemeses:
 	// - schema changes
 	// - merges
@@ -43,17 +42,18 @@ func RunNemesis(f TestFeedFactory, db *gosql.DB) (Validator, error) {
 	ctx := context.Background()
 	rng, _ := randutil.NewPseudoRand()
 
-	var usingRangeFeed bool
-	if err := db.QueryRow(
-		`SHOW CLUSTER SETTING changefeed.push.enabled`,
-	).Scan(&usingRangeFeed); err != nil {
-		return nil, err
+	eventPauseCount := 10
+	if isSinkless {
+		// Disable eventPause for sinkless changefeeds because we currently do not
+		// have "correct" pause and unpause mechanisms for changefeeds that aren't
+		// based on the jobs infrastructure. Enabling it for sinkless might require
+		// using "AS OF SYSTEM TIME" for sinkless changefeeds. See #41006 for more
+		// details.
+		eventPauseCount = 0
 	}
-
 	ns := &nemeses{
-		rowCount:    4,
-		db:          db,
-		usingPoller: !usingRangeFeed,
+		rowCount: 4,
+		db:       db,
 		// eventMix does not have to add to 100
 		eventMix: map[fsm.Event]int{
 			// eventTransact opens an UPSERT transaction is there is not one open. If
@@ -67,7 +67,7 @@ func RunNemesis(f TestFeedFactory, db *gosql.DB) (Validator, error) {
 
 			// eventPause PAUSEs the changefeed. The state machine will handle
 			// RESUMEing it.
-			// TODO(dan): This deadlocks eventPause{}: 10,
+			eventPause{}: eventPauseCount,
 
 			// eventPush pushes every open transaction by running a high priority
 			// SELECT.
@@ -75,11 +75,11 @@ func RunNemesis(f TestFeedFactory, db *gosql.DB) (Validator, error) {
 
 			// eventAbort aborts every open transaction by running a high priority
 			// DELETE.
-			// TODO(dan): This deadlocks eventAbort{}: 5,
+			eventAbort{}: 5,
 
 			// eventSplit splits between two random rows (the split is a no-op if it
 			// already exists).
-			// TODO(dan): This deadlocks eventSplit{}: 5,
+			eventSplit{}: 5,
 		},
 	}
 
@@ -172,10 +172,9 @@ const (
 )
 
 type nemeses struct {
-	rowCount    int
-	eventMix    map[fsm.Event]int
-	mixTotal    int
-	usingPoller bool
+	rowCount int
+	eventMix map[fsm.Event]int
+	mixTotal int
 
 	v  *CountValidator
 	db *gosql.DB
@@ -376,28 +375,6 @@ func transact(a fsm.Args) error {
 
 func noteFeedMessage(a fsm.Args) error {
 	ns := a.Extended.(*nemeses)
-
-	// The poller works by continually selecting a timestamp to be the next
-	// high-water and polling for changes between the last high-water and the new
-	// one. It doesn't push any unresolved intents (it would enter the txnwaitq,
-	// which would see the txn as live and hence not try to push it), so if we
-	// have an open transaction, it's possible that the poller is stuck waiting on
-	// it to resolve, which would cause the below call to `Next` to deadlock. This
-	// breaks that deadlock.
-	if ns.usingPoller {
-		nextDone := make(chan struct{})
-		defer close(nextDone)
-		go func() {
-			select {
-			case <-time.After(5 * time.Second):
-				log.Info(a.Ctx, "pushed open txn to break deadlock")
-				if err := push(a); err != nil {
-					panic(err)
-				}
-			case <-nextDone:
-			}
-		}()
-	}
 
 	m, err := ns.f.Next()
 	if err != nil {

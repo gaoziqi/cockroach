@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -38,15 +34,12 @@ func MakeNameMetadataKey(parentID ID, name string) roachpb.Key {
 
 // MakeAllDescsMetadataKey returns the key for all descriptors.
 func MakeAllDescsMetadataKey() roachpb.Key {
-	k := keys.MakeTablePrefix(uint32(DescriptorTable.ID))
-	return encoding.EncodeUvarintAscending(k, uint64(DescriptorTable.PrimaryIndex.ID))
+	return keys.DescMetadataPrefix()
 }
 
 // MakeDescMetadataKey returns the key for the descriptor.
 func MakeDescMetadataKey(descID ID) roachpb.Key {
-	k := MakeAllDescsMetadataKey()
-	k = encoding.EncodeUvarintAscending(k, uint64(descID))
-	return keys.MakeFamilyKey(k, uint32(DescriptorTable.Columns[1].ID))
+	return keys.DescMetadataKey(uint32(descID))
 }
 
 // IndexKeyValDirs returns the corresponding encoding.Directions for all the

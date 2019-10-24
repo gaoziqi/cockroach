@@ -7,17 +7,13 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This code was derived from https://github.com/youtube/vitess.
 
@@ -79,8 +75,9 @@ const (
 
 // ShowBackup represents a SHOW BACKUP statement.
 type ShowBackup struct {
-	Path    Expr
-	Details BackupDetails
+	Path                 Expr
+	Details              BackupDetails
+	ShouldIncludeSchemas bool
 }
 
 // Format implements the NodeFormatter interface.
@@ -90,6 +87,9 @@ func (node *ShowBackup) Format(ctx *FmtCtx) {
 		ctx.WriteString("RANGES ")
 	} else if node.Details == BackupFileDetails {
 		ctx.WriteString("FILES ")
+	}
+	if node.ShouldIncludeSchemas {
+		ctx.WriteString("SCHEMAS ")
 	}
 	ctx.FormatNode(node.Path)
 }
@@ -111,11 +111,17 @@ func (node *ShowColumns) Format(ctx *FmtCtx) {
 }
 
 // ShowDatabases represents a SHOW DATABASES statement.
-type ShowDatabases struct{}
+type ShowDatabases struct {
+	WithComment bool
+}
 
 // Format implements the NodeFormatter interface.
 func (node *ShowDatabases) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW DATABASES")
+
+	if node.WithComment {
+		ctx.WriteString(" WITH COMMENT")
+	}
 }
 
 // ShowTraceType is an enum of SHOW TRACE variants.
@@ -146,13 +152,34 @@ func (node *ShowTraceForSession) Format(ctx *FmtCtx) {
 
 // ShowIndexes represents a SHOW INDEX statement.
 type ShowIndexes struct {
-	Table *UnresolvedObjectName
+	Table       *UnresolvedObjectName
+	WithComment bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowIndexes) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW INDEXES FROM ")
 	ctx.FormatNode(node.Table)
+
+	if node.WithComment {
+		ctx.WriteString(" WITH COMMENT")
+	}
+}
+
+// ShowDatabaseIndexes represents a SHOW INDEXES FROM DATABASE statement.
+type ShowDatabaseIndexes struct {
+	Database    Name
+	WithComment bool
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowDatabaseIndexes) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW INDEXES FROM DATABASE ")
+	ctx.FormatNode(&node.Database)
+
+	if node.WithComment {
+		ctx.WriteString(" WITH COMMENT")
+	}
 }
 
 // ShowQueries represents a SHOW QUERIES statement
@@ -176,10 +203,16 @@ func (node *ShowQueries) Format(ctx *FmtCtx) {
 
 // ShowJobs represents a SHOW JOBS statement
 type ShowJobs struct {
+	// If non-nil, a select statement that provides the job ids to be shown.
+	Jobs *Select
+
 	// If Automatic is true, show only automatically-generated jobs such
 	// as automatic CREATE STATISTICS jobs. If Automatic is false, show
 	// only non-automatically-generated jobs.
 	Automatic bool
+
+	// Whether to block and wait for completion of all running jobs to be displayed.
+	Block bool
 }
 
 // Format implements the NodeFormatter interface.
@@ -189,6 +222,13 @@ func (node *ShowJobs) Format(ctx *FmtCtx) {
 		ctx.WriteString("AUTOMATIC ")
 	}
 	ctx.WriteString("JOBS")
+	if node.Block {
+		ctx.WriteString(" WHEN COMPLETE")
+	}
+	if node.Jobs != nil {
+		ctx.WriteString(" ")
+		ctx.FormatNode(node.Jobs)
+	}
 }
 
 // ShowSessions represents a SHOW SESSIONS statement
@@ -360,20 +400,45 @@ func (node *ShowRoles) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW ROLES")
 }
 
-// ShowRanges represents a SHOW EXPERIMENTAL_RANGES statement.
+// ShowRanges represents a SHOW RANGES statement.
 type ShowRanges struct {
 	TableOrIndex TableIndexName
+	DatabaseName Name
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowRanges) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW EXPERIMENTAL_RANGES FROM ")
+	ctx.WriteString("SHOW RANGES FROM ")
+	if node.DatabaseName != "" {
+		ctx.WriteString("DATABASE ")
+		ctx.FormatNode(&node.DatabaseName)
+	} else if node.TableOrIndex.Index != "" {
+		ctx.WriteString("INDEX ")
+		ctx.FormatNode(&node.TableOrIndex)
+	} else {
+		ctx.WriteString("TABLE ")
+		ctx.FormatNode(&node.TableOrIndex)
+	}
+}
+
+// ShowRangeForRow represents a SHOW RANGE FOR ROW statement.
+type ShowRangeForRow struct {
+	TableOrIndex TableIndexName
+	Row          Exprs
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowRangeForRow) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW RANGE FROM ")
 	if node.TableOrIndex.Index != "" {
 		ctx.WriteString("INDEX ")
 	} else {
 		ctx.WriteString("TABLE ")
 	}
 	ctx.FormatNode(&node.TableOrIndex)
+	ctx.WriteString(" FOR ROW (")
+	ctx.FormatNode(&node.Row)
+	ctx.WriteString(")")
 }
 
 // ShowFingerprints represents a SHOW EXPERIMENTAL_FINGERPRINTS statement.
@@ -411,4 +476,30 @@ type ShowHistogram struct {
 // Format implements the NodeFormatter interface.
 func (node *ShowHistogram) Format(ctx *FmtCtx) {
 	ctx.Printf("SHOW HISTOGRAM %d", node.HistogramID)
+}
+
+// ShowPartitions represents a SHOW PARTITIONS statement.
+type ShowPartitions struct {
+	IsDB     bool
+	Database Name
+
+	IsIndex bool
+	Index   TableIndexName
+
+	IsTable bool
+	Table   *UnresolvedObjectName
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowPartitions) Format(ctx *FmtCtx) {
+	if node.IsDB {
+		ctx.Printf("SHOW PARTITIONS FROM DATABASE ")
+		ctx.FormatNode(&node.Database)
+	} else if node.IsIndex {
+		ctx.Printf("SHOW PARTITIONS FROM INDEX ")
+		ctx.FormatNode(&node.Index)
+	} else {
+		ctx.Printf("SHOW PARTITIONS FROM TABLE ")
+		ctx.FormatNode(node.Table)
+	}
 }

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -20,13 +16,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 //
@@ -76,10 +74,6 @@ type virtualSchemaTable struct {
 	// virtualTableNode. This function returns a virtualTableGenerator function
 	// which generates the next row of the virtual table when called.
 	generator func(ctx context.Context, p *planner, db *DatabaseDescriptor) (virtualTableGenerator, error)
-
-	// delegate, if non-nil, uses delegateQuery to reroute a query on this virtual
-	// table into another more efficient query.
-	delegate func(ctx context.Context, p *planner, db *DatabaseDescriptor) (planNode, error)
 }
 
 // virtualSchemaView represents a view within a virtualSchema
@@ -123,9 +117,10 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 		id,
 		hlc.Timestamp{}, /* creationTime */
 		publicSelectPrivileges,
-		nil, /* affected */
-		nil, /* semaCtx */
-		nil, /* evalCtx */
+		nil,   /* affected */
+		nil,   /* semaCtx */
+		nil,   /* evalCtx */
+		false, /* temporary */
 	)
 	return mutDesc.TableDescriptor, err
 }
@@ -151,15 +146,19 @@ func (v virtualSchemaView) initVirtualTableDesc(
 
 	create := stmt.AST.(*tree.CreateView)
 
-	mutDesc, err := MakeViewTableDesc(
-		create,
-		v.resultColumns,
-		0,
+	columns := v.resultColumns
+	if len(create.ColumnNames) != 0 {
+		columns = overrideColumnNames(columns, create.ColumnNames)
+	}
+	mutDesc, err := makeViewTableDesc(
+		create.Name.Table(),
+		tree.AsStringWithFlags(create.AsSource, tree.FmtParsable),
+		0, /* parentID */
 		id,
-		hlc.Timestamp{},
+		columns,
+		hlc.Timestamp{}, /* creationTime */
 		publicSelectPrivileges,
-		nil, // semaCtx
-		nil, // evalCtx
+		nil, /* semaCtx */
 	)
 	return mutDesc.TableDescriptor, err
 }
@@ -210,16 +209,17 @@ type virtualDefEntry struct {
 
 type virtualTableConstructor func(context.Context, *planner, string) (planNode, error)
 
-var errInvalidDbPrefix = pgerror.New(pgerror.CodeUndefinedObjectError,
-	"cannot access virtual schema in anonymous database",
-).SetHintf("verify that the current database is set")
+var errInvalidDbPrefix = errors.WithHint(
+	pgerror.New(pgcode.UndefinedObject,
+		"cannot access virtual schema in anonymous database"),
+	"verify that the current database is set")
 
 func newInvalidVirtualSchemaError() error {
-	return pgerror.AssertionFailedf("virtualSchema cannot have both the populate and generator functions defined")
+	return errors.AssertionFailedf("virtualSchema cannot have both the populate and generator functions defined")
 }
 
 func newInvalidVirtualDefEntryError() error {
-	return pgerror.AssertionFailedf("virtualDefEntry.virtualDef must be a virtualSchemaTable")
+	return errors.AssertionFailedf("virtualDefEntry.virtualDef must be a virtualSchemaTable")
 }
 
 // getPlanInfo returns the column metadata and a constructor for a new
@@ -241,7 +241,7 @@ func (e virtualDefEntry) getPlanInfo() (sqlbase.ResultColumns, virtualTableConst
 		if dbName != "" {
 			var err error
 			dbDesc, err = p.LogicalSchemaAccessor().GetDatabaseDesc(ctx, p.txn, dbName,
-				DatabaseLookupFlags{required: true})
+				tree.DatabaseLookupFlags{Required: true, AvoidCached: p.avoidCachedDescriptors})
 			if err != nil {
 				return nil, err
 			}
@@ -253,10 +253,6 @@ func (e virtualDefEntry) getPlanInfo() (sqlbase.ResultColumns, virtualTableConst
 
 		switch def := e.virtualDef.(type) {
 		case virtualSchemaTable:
-			if def.delegate != nil {
-				return def.delegate(ctx, p, dbDesc)
-			}
-
 			if def.generator != nil && def.populate != nil {
 				return nil, newInvalidVirtualSchemaError()
 			}
@@ -322,13 +318,13 @@ func NewVirtualSchemaHolder(
 			tableDesc, err := def.initVirtualTableDesc(ctx, st, id)
 
 			if err != nil {
-				return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
-					"failed to initialize %s", log.Safe(def.getSchema()))
+				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
+					"failed to initialize %s", errors.Safe(def.getSchema()))
 			}
 
 			if schema.tableValidator != nil {
 				if err := schema.tableValidator(&tableDesc); err != nil {
-					return nil, pgerror.NewAssertionErrorWithWrappedErrf(err, "programmer error")
+					return nil, errors.NewAssertionErrorWithWrappedErrf(err, "programmer error")
 				}
 			}
 
@@ -399,7 +395,7 @@ func (vs *VirtualSchemaHolder) getVirtualTableEntry(tn *tree.TableName) (virtual
 			return t, nil
 		}
 		if _, ok := db.allTableNames[tableName]; ok {
-			return virtualDefEntry{}, pgerror.Unimplementedf(tn.Schema()+"."+tableName,
+			return virtualDefEntry{}, unimplemented.Newf(tn.Schema()+"."+tableName,
 				"virtual schema table not implemented: %s.%s", tn.Schema(), tableName)
 		}
 		return virtualDefEntry{}, sqlbase.NewUndefinedRelationError(tn)

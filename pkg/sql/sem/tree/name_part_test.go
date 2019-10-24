@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -20,9 +16,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestUnresolvedObjectName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		in, out  string
 		expanded string
@@ -31,10 +29,10 @@ func TestUnresolvedObjectName(t *testing.T) {
 		{`a`, `a`, `""."".a`, ``},
 		{`a.b`, `a.b`, `"".a.b`, ``},
 		{`a.b.c`, `a.b.c`, `a.b.c`, ``},
-		{`a.b.c.d`, ``, ``, `syntax error at or near "\."`},
+		{`a.b.c.d`, ``, ``, `at or near "\.": syntax error`},
 		{`a.""`, ``, ``, `invalid table name: a\.""`},
 		{`a.b.""`, ``, ``, `invalid table name: a\.b\.""`},
-		{`a.b.c.""`, ``, ``, `syntax error at or near "\."`},
+		{`a.b.c.""`, ``, ``, `at or near "\.": syntax error`},
 		{`a."".c`, ``, ``, `invalid table name: a\.""\.c`},
 
 		// CockroachDB extension: empty catalog name.
@@ -46,8 +44,8 @@ func TestUnresolvedObjectName(t *testing.T) {
 		{`x.user.y`, `x."user".y`, `x."user".y`, ``},
 		{`x.user`, `x."user"`, `"".x."user"`, ``},
 
-		{`foo@bar`, ``, ``, `syntax error at or near "@"`},
-		{`test.*`, ``, ``, `syntax error at or near "\*"`},
+		{`foo@bar`, ``, ``, `at or near "@": syntax error`},
+		{`test.*`, ``, ``, `at or near "\*": syntax error`},
 	}
 
 	for _, tc := range testCases {
@@ -75,6 +73,7 @@ func TestUnresolvedObjectName(t *testing.T) {
 // TestUnresolvedNameAnnotation verifies that we use the annotation
 // to produce a fully qualified name when required.
 func TestUnresolvedNameAnnotation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	aIdx := tree.AnnotationIdx(1)
 	u, err := tree.NewUnresolvedObjectName(1, [3]string{"t"}, aIdx)
 	if err != nil {

@@ -1,19 +1,16 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "db.h"
 #include <algorithm>
+#include <iostream>
 #include <rocksdb/convenience.h>
 #include <rocksdb/perf_context.h>
 #include <rocksdb/sst_file_writer.h>
@@ -31,12 +28,16 @@
 #include "fmt.h"
 #include "getter.h"
 #include "godefs.h"
+#include "incremental_iterator.h"
 #include "iterator.h"
 #include "merge.h"
 #include "options.h"
+#include "protos/roachpb/errors.pb.h"
+#include "row_counter.h"
 #include "snapshot.h"
 #include "status.h"
 #include "table_props.h"
+#include "timestamp.h"
 
 using namespace cockroach;
 
@@ -131,7 +132,6 @@ DBIterState DBIterGetState(DBIterator* iter) {
 
   return state;
 }
-
 }  // namespace
 
 namespace cockroach {
@@ -242,7 +242,6 @@ DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions db_opts) {
   options.env = env_mgr->db_env;
 
   rocksdb::DB* db_ptr;
-
   rocksdb::Status status;
   if (db_opts.read_only) {
     status = rocksdb::DB::OpenForReadOnly(options, db_dir, &db_ptr);
@@ -269,10 +268,9 @@ DBStatus DBCreateCheckpoint(DBEngine* db, DBSlice dir) {
   // NB: passing 0 for log_size_for_flush forces a WAL sync, i.e. makes sure
   // that the checkpoint is up to date.
   status = cp_ptr->CreateCheckpoint(cp_dir, 0 /* log_size_for_flush */);
-  delete(cp_ptr);
+  delete (cp_ptr);
   return ToDBStatus(status);
 }
-
 
 DBStatus DBDestroy(DBSlice dir) {
   rocksdb::Options options;
@@ -529,6 +527,132 @@ DBStatus DBEnvDeleteDirAndFiles(DBEngine* db, DBSlice dir) { return db->EnvDelet
 
 DBStatus DBEnvLinkFile(DBEngine* db, DBSlice oldname, DBSlice newname) {
   return db->EnvLinkFile(oldname, newname);
+}
+
+DBIterState DBCheckForKeyCollisions(DBIterator* existingIter, DBIterator* sstIter,
+                                    MVCCStatsResult* skippedKVStats, DBString* write_intent) {
+  DBIterState state = {};
+  memset(skippedKVStats, 0, sizeof(*skippedKVStats));
+
+  while (existingIter->rep->Valid() && sstIter->rep->Valid()) {
+    rocksdb::Slice sstKey;
+    rocksdb::Slice existingKey;
+    DBTimestamp existing_ts = kZeroTimestamp;
+    DBTimestamp sst_ts = kZeroTimestamp;
+    if (!DecodeKey(sstIter->rep->key(), &sstKey, &sst_ts) ||
+        !DecodeKey(existingIter->rep->key(), &existingKey, &existing_ts)) {
+      state.valid = false;
+      state.status = FmtStatus("unable to decode key");
+      return state;
+    }
+
+    // Encountered an inline value or a write intent.
+    if (existing_ts == kZeroTimestamp) {
+      cockroach::storage::engine::enginepb::MVCCMetadata meta;
+      if (!meta.ParseFromArray(existingIter->rep->value().data(),
+                               existingIter->rep->value().size())) {
+        state.status = FmtStatus("failed to parse meta");
+        state.valid = false;
+        return state;
+      }
+
+      // Check for an inline value, as these are only used in non-user data.
+      // This method is currently used by AddSSTable when performing an IMPORT
+      // INTO. We do not expect to encounter any inline values, and thus we
+      // report an error.
+      if (meta.has_raw_bytes()) {
+        state.status = FmtStatus("InlineError");
+      } else if (meta.has_txn()) {
+        // Check for a write intent.
+        //
+        // TODO(adityamaru): Currently, we raise a WriteIntentError on
+        // encountering all intents. This is because, we do not expect to
+        // encounter many intents during IMPORT INTO as we lock the key space we
+        // are importing into. Older write intents could however be found in the
+        // target key space, which will require appropriate resolution logic.
+        cockroach::roachpb::WriteIntentError err;
+        cockroach::roachpb::Intent* intent = err.add_intents();
+        intent->mutable_span()->set_key(existingIter->rep->key().data(),
+                                        existingIter->rep->key().size());
+        intent->mutable_txn()->CopyFrom(meta.txn());
+
+        *write_intent = ToDBString(err.SerializeAsString());
+        state.status = FmtStatus("WriteIntentError");
+      } else {
+        state.status = FmtStatus("intent without transaction");
+      }
+
+      state.valid = false;
+      return state;
+    }
+
+    DBKey targetKey;
+    memset(&targetKey, 0, sizeof(targetKey));
+    int compare = kComparator.Compare(existingKey, sstKey);
+    if (compare == 0) {
+      // If the colliding key is a tombstone in the existing data, and the
+      // timestamp of the sst key is greater than or equal to the timestamp of
+      // the tombstone, then this is not considered a collision. We move the
+      // iterator over the existing data to the next potentially colliding key
+      // (skipping all versions of the deleted key), and resume iteration.
+      //
+      // If the ts of the sst key is less than that of the tombstone it is
+      // changing existing data, and we treat this as a collision.
+      if (existingIter->rep->value().empty() && sst_ts >= existing_ts) {
+        DBIterNext(existingIter, true /* skip_current_key_versions */);
+        continue;
+      }
+
+      // If the ingested KV has an identical timestamp and value as the existing
+      // data then we do not consider it to be a collision. We move the iterator
+      // over the existing data to the next potentially colliding key (skipping
+      // all versions of the current key), and resume iteration.
+      bool has_equal_timestamp = existing_ts == sst_ts;
+      bool has_equal_value =
+          kComparator.Compare(existingIter->rep->value(), sstIter->rep->value()) == 0;
+      if (has_equal_timestamp && has_equal_value) {
+        // Even though we skip over the KVs described above, their stats have
+        // already been accounted for resulting in a problem of double-counting.
+        // To solve this we send back the stats of these skipped KVs so that we
+        // can subtract them later. This enables us to construct accurate
+        // MVCCStats and prevents expensive recomputation in the future.
+        const int64_t meta_key_size = sstKey.size() + 1;
+        const int64_t meta_val_size = 0;
+        int64_t total_bytes = meta_key_size + meta_val_size;
+
+        // Update the skipped stats to account fot the skipped meta key.
+        skippedKVStats->live_bytes += total_bytes;
+        skippedKVStats->live_count++;
+        skippedKVStats->key_bytes += meta_key_size;
+        skippedKVStats->val_bytes += meta_val_size;
+        skippedKVStats->key_count++;
+
+        // Update the stats to account for the skipped versioned key/value.
+        total_bytes = sstIter->rep->value().size() + kMVCCVersionTimestampSize;
+        skippedKVStats->live_bytes += total_bytes;
+        skippedKVStats->key_bytes += kMVCCVersionTimestampSize;
+        skippedKVStats->val_bytes += sstIter->rep->value().size();
+        skippedKVStats->val_count++;
+
+        DBIterNext(existingIter, true /* skip_current_key_versions */);
+        continue;
+      }
+
+      state.valid = false;
+      state.key.key = ToDBSlice(sstKey);
+      state.status = FmtStatus("key collision");
+      return state;
+    } else if (compare < 0) {
+      targetKey.key = ToDBSlice(sstKey);
+      DBIterSeek(existingIter, targetKey);
+    } else if (compare > 0) {
+      targetKey.key = ToDBSlice(existingKey);
+      DBIterSeek(sstIter, targetKey);
+    }
+  }
+
+  state.valid = true;
+  return state;
 }
 
 DBIterator* DBNewIter(DBEngine* db, DBIterOptions iter_options) {
@@ -801,12 +925,13 @@ DBSstFileWriter* DBSstFileWriterNew() {
   rocksdb::BlockBasedTableOptions table_options;
   // Larger block size (4kb default) means smaller file at the expense of more
   // scanning during lookups.
-  table_options.block_size = 64 * 1024;
+  table_options.block_size = 32 * 1024;
   // The original LevelDB compatible format. We explicitly set the checksum too
   // to guard against the silent version upconversion. See
   // https://github.com/facebook/rocksdb/blob/972f96b3fbae1a4675043bdf4279c9072ad69645/include/rocksdb/table.h#L198
   table_options.format_version = 0;
   table_options.checksum = rocksdb::kCRC32c;
+  table_options.whole_key_filtering = false;
 
   rocksdb::Options* options = new rocksdb::Options();
   options->comparator = &kComparator;
@@ -835,12 +960,20 @@ DBStatus DBSstFileWriterOpen(DBSstFileWriter* fw) {
   return kSuccess;
 }
 
-DBStatus DBSstFileWriterAdd(DBSstFileWriter* fw, DBKey key, DBSlice val) {
-  rocksdb::Status status = fw->rep.Put(EncodeKey(key), ToSlice(val));
+namespace {
+DBStatus DBSstFileWriterAddRaw(DBSstFileWriter* fw, const rocksdb::Slice key,
+                               const rocksdb::Slice val) {
+  rocksdb::Status status = fw->rep.Put(key, val);
   if (!status.ok()) {
     return ToDBStatus(status);
   }
+
   return kSuccess;
+}
+}  // namespace
+
+DBStatus DBSstFileWriterAdd(DBSstFileWriter* fw, DBKey key, DBSlice val) {
+  return DBSstFileWriterAddRaw(fw, EncodeKey(key), ToSlice(val));
 }
 
 DBStatus DBSstFileWriterDelete(DBSstFileWriter* fw, DBKey key) {
@@ -851,20 +984,26 @@ DBStatus DBSstFileWriterDelete(DBSstFileWriter* fw, DBKey key) {
   return kSuccess;
 }
 
-DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data) {
-  rocksdb::Status status = fw->rep.Finish();
+DBStatus DBSstFileWriterDeleteRange(DBSstFileWriter* fw, DBKey start, DBKey end) {
+  rocksdb::Status status = fw->rep.DeleteRange(EncodeKey(start), EncodeKey(end));
   if (!status.ok()) {
     return ToDBStatus(status);
   }
+  return kSuccess;
+}
 
+DBStatus DBSstFileWriterCopyData(DBSstFileWriter* fw, DBString* data) {
   uint64_t file_size;
-  status = fw->memenv->GetFileSize("sst", &file_size);
+  rocksdb::Status status = fw->memenv->GetFileSize("sst", &file_size);
   if (!status.ok()) {
     return ToDBStatus(status);
+  }
+  if (file_size == 0) {
+    return kSuccess;
   }
 
   const rocksdb::EnvOptions soptions;
-  rocksdb::unique_ptr<rocksdb::SequentialFile> sst;
+  std::unique_ptr<rocksdb::SequentialFile> sst;
   status = fw->memenv->NewSequentialFile("sst", &sst, soptions);
   if (!status.ok()) {
     return ToDBStatus(status);
@@ -899,6 +1038,23 @@ DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data) {
   return kSuccess;
 }
 
+DBStatus DBSstFileWriterTruncate(DBSstFileWriter* fw, DBString* data) {
+  DBStatus status = DBSstFileWriterCopyData(fw, data);
+  if (status.data != NULL) {
+    return status;
+  }
+  return ToDBStatus(fw->memenv->Truncate("sst", 0));
+}
+
+DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data) {
+  rocksdb::Status status = fw->rep.Finish();
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+
+  return DBSstFileWriterCopyData(fw, data);
+}
+
 void DBSstFileWriterClose(DBSstFileWriter* fw) { delete fw; }
 
 DBStatus DBLockFile(DBSlice filename, DBFileLock* lock) {
@@ -908,4 +1064,71 @@ DBStatus DBLockFile(DBSlice filename, DBFileLock* lock) {
 
 DBStatus DBUnlockFile(DBFileLock lock) {
   return ToDBStatus(rocksdb::Env::Default()->UnlockFile((rocksdb::FileLock*)lock));
+}
+
+DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIterOptions iter_opts,
+                       DBEngine* engine, DBString* data, DBString* write_intent,
+                       DBString* summary) {
+  DBSstFileWriter* writer = DBSstFileWriterNew();
+  DBStatus status = DBSstFileWriterOpen(writer);
+  if (status.data != NULL) {
+    return status;
+  }
+
+  DBIncrementalIterator iter(engine, iter_opts, start, end, write_intent);
+
+  roachpb::BulkOpSummary bulkop_summary;
+  RowCounter row_counter;
+
+  bool skip_current_key_versions = !export_all_revisions;
+  DBIterState state;
+  const std::string end_key = EncodeKey(end);
+  for (state = iter.seek(start);; state = iter.next(skip_current_key_versions)) {
+    if (state.status.data != NULL) {
+      DBSstFileWriterClose(writer);
+      return state.status;
+    } else if (!state.valid || kComparator.Compare(iter.key(), end_key) >= 0) {
+      break;
+    }
+
+    rocksdb::Slice decoded_key;
+    int64_t wall_time = 0;
+    int32_t logical_time = 0;
+
+    if (!DecodeKey(iter.key(), &decoded_key, &wall_time, &logical_time)) {
+      DBSstFileWriterClose(writer);
+      return ToDBString("Unable to decode key");
+    }
+
+    // Skip tombstone (len=0) records when start time is zero (non-incremental)
+    // and we are not exporting all versions.
+    bool is_skipping_deletes = start.wall_time == 0 && start.logical == 0 && !export_all_revisions;
+    if (is_skipping_deletes && iter.value().size() == 0) {
+      continue;
+    }
+
+    // Insert key into sst and update statistics.
+    status = DBSstFileWriterAddRaw(writer, iter.key(), iter.value());
+    if (status.data != NULL) {
+      DBSstFileWriterClose(writer);
+      return status;
+    }
+
+    if (!row_counter.Count((iter.key()), &bulkop_summary)) {
+      return ToDBString("Error in row counter");
+    }
+    bulkop_summary.set_data_size(bulkop_summary.data_size() + decoded_key.size() +
+                                 iter.value().size());
+  }
+  *summary = ToDBString(bulkop_summary.SerializeAsString());
+
+  if (bulkop_summary.data_size() == 0) {
+    DBSstFileWriterClose(writer);
+    return kSuccess;
+  }
+
+  auto res = DBSstFileWriterFinish(writer, data);
+  DBSstFileWriterClose(writer);
+
+  return res;
 }

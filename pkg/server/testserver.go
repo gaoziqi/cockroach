@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -28,6 +24,7 @@ import (
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -37,8 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -48,8 +46,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -67,6 +65,9 @@ func makeTestConfig(st *cluster.Settings) Config {
 	// Test servers start in secure mode by default.
 	cfg.Insecure = false
 
+	// Configure test storage engine.
+	cfg.StorageEngine = engine.TestStorageEngine
+
 	// Configure the default in-memory temp storage for all tests unless
 	// otherwise configured.
 	cfg.TempStorageConfig = base.DefaultTestTempStorageConfig(st)
@@ -80,10 +81,13 @@ func makeTestConfig(st *cluster.Settings) Config {
 
 	// Addr defaults to localhost with port set at time of call to
 	// Start() to an available port. May be overridden later (as in
-	// makeTestConfigFromParams). Call TestServer.ServingAddr() for the
-	// full address (including bound port).
+	// makeTestConfigFromParams). Call TestServer.ServingRPCAddr() and
+	// .ServingSQLAddr() for the full address (including bound port).
 	cfg.Addr = util.TestAddr.String()
+	cfg.SQLAddr = util.TestAddr.String()
 	cfg.AdvertiseAddr = util.TestAddr.String()
+	cfg.SQLAdvertiseAddr = util.TestAddr.String()
+	cfg.SplitListenSQL = true
 	cfg.HTTPAddr = util.TestAddr.String()
 	// Set standard user for intra-cluster traffic.
 	cfg.User = security.NodeUser
@@ -114,6 +118,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.JoinAddr != "" {
 		cfg.JoinList = []string{params.JoinAddr}
 	}
+	cfg.ClusterName = params.ClusterName
 	cfg.Insecure = params.Insecure
 	cfg.SocketFile = params.SocketFile
 	cfg.RetryOptions = params.RetryOptions
@@ -156,22 +161,32 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.SQLMemoryPoolSize = params.SQLMemoryPoolSize
 	}
 
-	cfg.JoinList = []string{params.JoinAddr}
+	if params.JoinAddr != "" {
+		cfg.JoinList = []string{params.JoinAddr}
+	}
 	if cfg.Insecure {
 		// Whenever we can (i.e. in insecure mode), use IsolatedTestAddr
 		// to prevent issues that can occur when running a test under
 		// stress.
 		cfg.Addr = util.IsolatedTestAddr.String()
 		cfg.AdvertiseAddr = util.IsolatedTestAddr.String()
+		cfg.SQLAddr = util.IsolatedTestAddr.String()
+		cfg.SQLAdvertiseAddr = util.IsolatedTestAddr.String()
 		cfg.HTTPAddr = util.IsolatedTestAddr.String()
 	} else {
 		cfg.Addr = util.TestAddr.String()
 		cfg.AdvertiseAddr = util.TestAddr.String()
+		cfg.SQLAddr = util.TestAddr.String()
+		cfg.SQLAdvertiseAddr = util.TestAddr.String()
 		cfg.HTTPAddr = util.TestAddr.String()
 	}
 	if params.Addr != "" {
 		cfg.Addr = params.Addr
 		cfg.AdvertiseAddr = params.Addr
+	}
+	if params.SQLAddr != "" {
+		cfg.SQLAddr = params.SQLAddr
+		cfg.SQLAdvertiseAddr = params.SQLAddr
 	}
 	if params.HTTPAddr != "" {
 		cfg.HTTPAddr = params.HTTPAddr
@@ -252,7 +267,12 @@ func (ts *TestServer) Stopper() *stop.Stopper {
 	return ts.stopper
 }
 
-// Gossip returns the gossip instance used by the TestServer.
+// GossipI is part of TestServerInterface.
+func (ts *TestServer) GossipI() interface{} {
+	return ts.Gossip()
+}
+
+// Gossip is like GossipI but returns the real type instead of interface{}.
 func (ts *TestServer) Gossip() *gossip.Gossip {
 	if ts != nil {
 		return ts.gossip
@@ -308,10 +328,18 @@ func (ts *TestServer) PGServer() *pgwire.Server {
 	return nil
 }
 
+// RaftTransport returns the RaftTransport used by the TestServer.
+func (ts *TestServer) RaftTransport() *storage.RaftTransport {
+	if ts != nil {
+		return ts.raftTransport
+	}
+	return nil
+}
+
 // Start starts the TestServer by bootstrapping an in-memory store
 // (defaults to maximum of 100M). The server is started, launching the
 // node RPC server and all HTTP endpoints. Use the value of
-// TestServer.ServingAddr() after Start() for client connections.
+// TestServer.ServingRPCAddr() after Start() for client connections.
 // Use TestServer.Stopper().Stop() to shutdown the server after the test
 // completes.
 func (ts *TestServer) Start(params base.TestServerArgs) error {
@@ -363,7 +391,7 @@ func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
 // ExpectedInitialRangeCount returns the expected number of ranges that should
 // be on the server after bootstrap.
 func ExpectedInitialRangeCount(
-	db *client.DB, defaultZoneConfig *config.ZoneConfig, defaultSystemZoneConfig *config.ZoneConfig,
+	db *client.DB, defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) (int, error) {
 	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(context.Background(), db, defaultZoneConfig, defaultSystemZoneConfig)
 	if err != nil {
@@ -406,9 +434,14 @@ func (ts *TestServer) Engines() []engine.Engine {
 	return ts.engines
 }
 
-// ServingAddr returns the server's address. Should be used by clients.
-func (ts *TestServer) ServingAddr() string {
+// ServingRPCAddr returns the server's RPC address. Should be used by clients.
+func (ts *TestServer) ServingRPCAddr() string {
 	return ts.cfg.AdvertiseAddr
+}
+
+// ServingSQLAddr returns the server's SQL address. Should be used by clients.
+func (ts *TestServer) ServingSQLAddr() string {
+	return ts.cfg.SQLAdvertiseAddr
 }
 
 // HTTPAddr returns the server's HTTP address. Should be used by clients.
@@ -416,9 +449,16 @@ func (ts *TestServer) HTTPAddr() string {
 	return ts.cfg.HTTPAddr
 }
 
-// Addr returns the server's listening address.
-func (ts *TestServer) Addr() string {
+// RPCAddr returns the server's listening RPC address.
+// Note: use ServingRPCAddr() instead unless there is a specific reason not to.
+func (ts *TestServer) RPCAddr() string {
 	return ts.cfg.Addr
+}
+
+// SQLAddr returns the server's listening SQL address.
+// Note: use ServingSQLAddr() instead unless there is a specific reason not to.
+func (ts *TestServer) SQLAddr() string {
+	return ts.cfg.SQLAddr
 }
 
 // WriteSummaries implements TestServerInterface.
@@ -560,9 +600,15 @@ func (ts *TestServer) GetNodeLiveness() *storage.NodeLiveness {
 	return ts.nodeLiveness
 }
 
-// DistSender exposes the Server's DistSender.
-func (ts *TestServer) DistSender() *kv.DistSender {
+// DistSenderI is part of DistSendeInterface.
+func (ts *TestServer) DistSenderI() interface{} {
 	return ts.distSender
+}
+
+// DistSender is like DistSenderI(), but returns the real type instead of
+// interface{}.
+func (ts *TestServer) DistSender() *kv.DistSender {
+	return ts.DistSenderI().(*kv.DistSender)
 }
 
 // DistSQLServer is part of TestServerInterface.
@@ -572,7 +618,7 @@ func (ts *TestServer) DistSQLServer() interface{} {
 
 // SetDistSQLSpanResolver is part of TestServerInterface.
 func (ts *Server) SetDistSQLSpanResolver(spanResolver interface{}) {
-	ts.execCfg.DistSQLPlanner.SetSpanResolver(spanResolver.(distsqlplan.SpanResolver))
+	ts.execCfg.DistSQLPlanner.SetSpanResolver(spanResolver.(physicalplan.SpanResolver))
 }
 
 // GetFirstStoreID is part of TestServerInterface.
@@ -638,8 +684,8 @@ func (ts *TestServer) SplitRange(
 		RequestHeader: roachpb.RequestHeader{
 			Key: splitKey,
 		},
-		SplitKey: splitKey,
-		Manual:   true,
+		SplitKey:       splitKey,
+		ExpirationTime: hlc.MaxTimestamp,
 	}
 	_, pErr := client.SendWrapped(ctx, ts.DB().NonTransactionalSender(), &splitReq)
 	if pErr != nil {
@@ -760,6 +806,39 @@ func (ts *TestServer) GCSystemLog(
 	ctx context.Context, table string, timestampLowerBound, timestampUpperBound time.Time,
 ) (time.Time, int64, error) {
 	return ts.gcSystemLog(ctx, table, timestampLowerBound, timestampUpperBound)
+}
+
+// ForceTableGC sends a GCRequest for the ranges corresponding to a table.
+func (ts *TestServer) ForceTableGC(
+	ctx context.Context, database, table string, timestamp hlc.Timestamp,
+) error {
+	tableIDQuery := `
+ SELECT tables.id FROM system.namespace tables
+   JOIN system.namespace dbs ON dbs.id = tables."parentID"
+   WHERE dbs.name = $1 AND tables.name = $2
+ `
+	row, err := ts.internalExecutor.QueryRow(
+		ctx, "resolve-table-id", nil /* txn */, tableIDQuery, database, table)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return errors.Errorf("table not found")
+	}
+	if len(row) != 1 {
+		return errors.AssertionFailedf("expected 1 column from internal query")
+	}
+	tableID := uint32(*row[0].(*tree.DInt))
+	tblKey := roachpb.Key(keys.MakeTablePrefix(tableID))
+	gcr := roachpb.GCRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key:    tblKey,
+			EndKey: tblKey.PrefixEnd(),
+		},
+		Threshold: timestamp,
+	}
+	_, pErr := client.SendWrapped(ctx, ts.distSender, &gcr)
+	return pErr.GoError()
 }
 
 type testServerFactoryImpl struct{}

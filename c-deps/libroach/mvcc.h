@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #pragma once
 
@@ -257,7 +253,18 @@ template <bool reverse> class mvccScanner {
 
     const bool own_intent = (meta_.txn().id() == txn_id_);
     const DBTimestamp meta_timestamp = ToDBTimestamp(meta_.timestamp());
-    if (timestamp_ < meta_timestamp && !own_intent) {
+    // meta_timestamp is the timestamp of an intent value, which we may or may
+    // not end up ignoring, depending on factors codified below. If we do ignore
+    // the intent then we want to read at a lower timestamp that's strictly
+    // below the intent timestamp (to skip the intent), but also does not exceed
+    // our read timestamp (to avoid erroneously picking up future committed
+    // values); this timestamp is prev_timestamp.
+    const DBTimestamp prev_timestamp =
+        timestamp_ < meta_timestamp ? timestamp_ : PrevTimestamp(meta_timestamp);
+    // Intents for other transactions are visible at or below:
+    //   max(txn.max_timestamp, read_timestamp)
+    const DBTimestamp max_visible_timestamp = check_uncertainty_ ? txn_max_timestamp_ : timestamp_;
+    if (max_visible_timestamp < meta_timestamp && !own_intent) {
       // 5. The key contains an intent, but we're reading before the
       // intent. Seek to the desired version. Note that if we own the
       // intent (i.e. we're reading transactionally) we want to read
@@ -281,7 +288,7 @@ template <bool reverse> class mvccScanner {
         return false;
       }
       intents_->Put(cur_raw_key_, cur_value_);
-      return seekVersion(PrevTimestamp(ToDBTimestamp(meta_.timestamp())), false);
+      return seekVersion(prev_timestamp, false);
     }
 
     if (!own_intent) {
@@ -318,7 +325,7 @@ template <bool reverse> class mvccScanner {
         // transaction all together. We ignore the intent by insisting that the
         // timestamp we're reading at is a historical timestamp < the intent
         // timestamp.
-        return seekVersion(PrevTimestamp(ToDBTimestamp(meta_.timestamp())), false);
+        return seekVersion(prev_timestamp, false);
       }
     }
 
@@ -336,7 +343,7 @@ template <bool reverse> class mvccScanner {
     // restarted and an earlier iteration wrote the value we're now
     // reading. In this case, we ignore the intent and read the
     // previous value as if the transaction were starting fresh.
-    return seekVersion(PrevTimestamp(ToDBTimestamp(meta_.timestamp())), false);
+    return seekVersion(prev_timestamp, false);
   }
 
   // nextKey advances the iterator to point to the next MVCC key
@@ -401,6 +408,12 @@ template <bool reverse> class mvccScanner {
     for (int i = 0; i < iters_before_seek_; ++i) {
       rocksdb::Slice peeked_key;
       if (!iterPeekPrev(&peeked_key)) {
+        return false;
+      }
+      if (peeked_key.empty()) {
+        // `iterPeekPrev()` may return true even when it did not find a key. This
+        // case is indicated by `peeked_key.empty()`. In that case there is not
+        // going to be any prev key, so we are done.
         return false;
       }
       if (peeked_key != key_buf_) {

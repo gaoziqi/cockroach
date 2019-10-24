@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -104,12 +100,12 @@ func (t *truncateNode) startExec(params runParams) error {
 		tableDesc := toTraverse[idx]
 		toTraverse = toTraverse[:idx]
 
-		maybeEnqueue := func(ref sqlbase.ForeignKeyReference, msg string) error {
+		maybeEnqueue := func(tableID sqlbase.ID, msg string) error {
 			// Check if we're already truncating the referencing table.
-			if _, ok := toTruncate[ref.Table]; ok {
+			if _, ok := toTruncate[tableID]; ok {
 				return nil
 			}
-			other, err := p.Tables().getMutableTableVersionByID(ctx, ref.Table, p.txn)
+			other, err := p.Tables().getMutableTableVersionByID(ctx, tableID, p.txn)
 			if err != nil {
 				return err
 			}
@@ -129,15 +125,15 @@ func (t *truncateNode) startExec(params runParams) error {
 			return nil
 		}
 
-		for _, idx := range tableDesc.AllNonDropIndexes() {
-			for _, ref := range idx.ReferencedBy {
-				if err := maybeEnqueue(ref, "referenced by foreign key from"); err != nil {
-					return err
-				}
+		for i := range tableDesc.InboundFKs {
+			fk := &tableDesc.InboundFKs[i]
+			if err := maybeEnqueue(fk.OriginTableID, "referenced by foreign key from"); err != nil {
+				return err
 			}
-
+		}
+		for _, idx := range tableDesc.AllNonDropIndexes() {
 			for _, ref := range idx.InterleavedBy {
-				if err := maybeEnqueue(ref, "interleaved by"); err != nil {
+				if err := maybeEnqueue(ref.Table, "interleaved by"); err != nil {
 					return err
 				}
 			}
@@ -212,13 +208,15 @@ func (p *planner) truncateTable(
 	//
 	// TODO(vivek): Fix properly along with #12123.
 	zoneKey := config.MakeZoneKey(uint32(tableDesc.ID))
-	nameKey := sqlbase.MakeNameMetadataKey(tableDesc.ParentID, tableDesc.GetName())
+	nameKey := sqlbase.NewTableKey(tableDesc.ParentID, tableDesc.GetName()).Key()
 	b := &client.Batch{}
 	// Use CPut because we want to remove a specific name -> id map.
 	if traceKV {
 		log.VEventf(ctx, 2, "CPut %s -> nil", nameKey)
 	}
-	b.CPut(nameKey, nil, tableDesc.ID)
+	var existingIDVal roachpb.Value
+	existingIDVal.SetInt(int64(tableDesc.ID))
+	b.CPut(nameKey, nil, &existingIDVal)
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
 	}
@@ -276,7 +274,7 @@ func (p *planner) truncateTable(
 	}
 
 	// Reassign comment.
-	if err := reassignComment(ctx, p, tableDesc, newID); err != nil {
+	if err := reassignComment(ctx, p, tableDesc, newTableDesc); err != nil {
 		return err
 	}
 
@@ -342,26 +340,25 @@ func reassignReferencedTables(
 					changed = true
 				}
 			}
-
-			if index.ForeignKey.IsSet() {
-				if to := index.ForeignKey.Table; to == oldID {
-					index.ForeignKey.Table = newID
-					changed = true
-				}
-			}
-
-			origRefs := index.ReferencedBy
-			index.ReferencedBy = nil
-			for _, ref := range origRefs {
-				if ref.Table == oldID {
-					ref.Table = newID
-					changed = true
-				}
-				index.ReferencedBy = append(index.ReferencedBy, ref)
-			}
 			return nil
 		}); err != nil {
 			return false, err
+		}
+		for i := range table.OutboundFKs {
+			fk := &table.OutboundFKs[i]
+			if fk.ReferencedTableID == oldID {
+				fk.ReferencedTableID = newID
+				fk.LegacyUpgradedFromOriginReference.Table = newID
+				changed = true
+			}
+		}
+		for i := range table.InboundFKs {
+			fk := &table.InboundFKs[i]
+			if fk.OriginTableID == oldID {
+				fk.OriginTableID = newID
+				fk.LegacyUpgradedFromReferencedReference.Table = newID
+				changed = true
+			}
 		}
 
 		for i, dest := range table.DependsOn {
@@ -383,9 +380,9 @@ func reassignReferencedTables(
 	return changed, nil
 }
 
-// reassignComment reassign comment on table
+// reassignComment reassign comment on table.
 func reassignComment(
-	ctx context.Context, p *planner, oldTableDesc *sqlbase.MutableTableDescriptor, newID sqlbase.ID,
+	ctx context.Context, p *planner, oldTableDesc, newTableDesc *sqlbase.MutableTableDescriptor,
 ) error {
 	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
 		ctx,
@@ -405,7 +402,7 @@ func reassignComment(
 			p.txn,
 			"UPSERT INTO system.comments VALUES ($1, $2, 0, $3)",
 			keys.TableCommentType,
-			newID,
+			newTableDesc.ID,
 			comment[0])
 		if err != nil {
 			return err
@@ -425,7 +422,14 @@ func reassignComment(
 
 	for i := range oldTableDesc.Columns {
 		id := oldTableDesc.Columns[i].ID
-		err = reassignColumnComment(ctx, p, oldTableDesc.ID, newID, id)
+		err = reassignColumnComment(ctx, p, oldTableDesc.ID, newTableDesc.ID, id)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, indexDesc := range oldTableDesc.Indexes {
+		err = reassignIndexComment(ctx, p, oldTableDesc.ID, newTableDesc.ID, indexDesc.ID)
 		if err != nil {
 			return err
 		}
@@ -434,7 +438,7 @@ func reassignComment(
 	return nil
 }
 
-// reassignComment reassign comment on column
+// reassignColumnComment reassign comment on column.
 func reassignColumnComment(
 	ctx context.Context, p *planner, oldID sqlbase.ID, newID sqlbase.ID, columnID sqlbase.ColumnID,
 ) error {
@@ -472,6 +476,41 @@ func reassignColumnComment(
 			keys.ColumnCommentType,
 			oldID,
 			columnID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// reassignIndexComment reassigns a comment on an index.
+func reassignIndexComment(
+	ctx context.Context, p *planner, oldTableID, newTableID sqlbase.ID, indexID sqlbase.IndexID,
+) error {
+	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+		ctx,
+		"select-index-comment",
+		p.txn,
+		`SELECT comment FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3`,
+		keys.IndexCommentType,
+		oldTableID,
+		indexID)
+	if err != nil {
+		return err
+	}
+
+	if comment != nil {
+		err = p.upsertIndexComment(
+			ctx,
+			newTableID,
+			indexID,
+			string(tree.MustBeDString(comment[0])))
+		if err != nil {
+			return err
+		}
+
+		err = p.removeIndexComment(ctx, oldTableID, indexID)
 		if err != nil {
 			return err
 		}

@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -47,10 +42,10 @@ func TestSpanSetBatch(t *testing.T) {
 
 	// Write values outside the range that we can try to read later.
 	if err := eng.Put(outsideKey, []byte("value")); err != nil {
-		t.Fatalf("direct write failed: %s", err)
+		t.Fatalf("direct write failed: %+v", err)
 	}
 	if err := eng.Put(outsideKey3, []byte("value")); err != nil {
-		t.Fatalf("direct write failed: %s", err)
+		t.Fatalf("direct write failed: %+v", err)
 	}
 
 	batch := spanset.NewBatch(eng.NewBatch(), &ss)
@@ -58,10 +53,10 @@ func TestSpanSetBatch(t *testing.T) {
 
 	// Writes inside the range work. Write twice for later read testing.
 	if err := batch.Put(insideKey, []byte("value")); err != nil {
-		t.Fatalf("failed to write inside the range: %s", err)
+		t.Fatalf("failed to write inside the range: %+v", err)
 	}
 	if err := batch.Put(insideKey2, []byte("value2")); err != nil {
-		t.Fatalf("failed to write inside the range: %s", err)
+		t.Fatalf("failed to write inside the range: %+v", err)
 	}
 
 	// Writes outside the range fail. We try to cover all write methods
@@ -95,7 +90,7 @@ func TestSpanSetBatch(t *testing.T) {
 	// Reads inside the range work.
 	//lint:ignore SA1019 historical usage of deprecated batch.Get is OK
 	if value, err := batch.Get(insideKey); err != nil {
-		t.Errorf("failed to read inside the range: %s", err)
+		t.Errorf("failed to read inside the range: %+v", err)
 	} else if !bytes.Equal(value, []byte("value")) {
 		t.Errorf("failed to read previously written value, got %q", value)
 	}
@@ -150,7 +145,7 @@ func TestSpanSetBatch(t *testing.T) {
 			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
 		} else if err != nil {
 			// Scanning out of bounds sets Valid() to false but is not an error.
-			t.Errorf("unexpected error on iterator: %s", err)
+			t.Errorf("unexpected error on iterator: %+v", err)
 		}
 	}()
 
@@ -186,7 +181,7 @@ func TestSpanSetBatch(t *testing.T) {
 	if ok, err := iter.Valid(); ok {
 		t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
 	} else if err != nil {
-		t.Errorf("unexpected error on iterator: %s", err)
+		t.Errorf("unexpected error on iterator: %+v", err)
 	}
 	// Seeking back in bounds restores validity.
 	iter.SeekReverse(insideKey)

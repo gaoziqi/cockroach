@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "engine.h"
 #include "db.h"
@@ -235,8 +231,7 @@ DBStatus DBImpl::GetTickersAndHistograms(DBTickersAndHistogramsResult* stats) {
   const std::shared_ptr<rocksdb::Statistics>& s = opts.statistics;
   stats->tickers_len = rocksdb::TickersNameMap.size();
   // We malloc the result so it can be deallocated by the caller using free().
-  stats->tickers = static_cast<TickerInfo*>(
-      malloc(stats->tickers_len * sizeof(TickerInfo)));
+  stats->tickers = static_cast<TickerInfo*>(malloc(stats->tickers_len * sizeof(TickerInfo)));
   if (stats->tickers == nullptr) {
     return FmtStatus("malloc failed");
   }
@@ -247,8 +242,8 @@ DBStatus DBImpl::GetTickersAndHistograms(DBTickersAndHistogramsResult* stats) {
 
   stats->histograms_len = rocksdb::HistogramsNameMap.size();
   // We malloc the result so it can be deallocated by the caller using free().
-  stats->histograms = static_cast<HistogramInfo*>(
-      malloc(stats->histograms_len * sizeof(HistogramInfo)));
+  stats->histograms =
+      static_cast<HistogramInfo*>(malloc(stats->histograms_len * sizeof(HistogramInfo)));
   if (stats->histograms == nullptr) {
     return FmtStatus("malloc failed");
   }
@@ -354,7 +349,7 @@ DBStatus DBImpl::EnvWriteFile(DBSlice path, DBSlice contents) {
   rocksdb::Status s;
 
   const rocksdb::EnvOptions soptions;
-  rocksdb::unique_ptr<rocksdb::WritableFile> destfile;
+  std::unique_ptr<rocksdb::WritableFile> destfile;
   s = this->rep->GetEnv()->NewWritableFile(ToString(path), &destfile, soptions);
   if (!s.ok()) {
     return ToDBStatus(s);
@@ -372,7 +367,7 @@ DBStatus DBImpl::EnvWriteFile(DBSlice path, DBSlice contents) {
 DBStatus DBImpl::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
   rocksdb::Status status;
   const rocksdb::EnvOptions soptions;
-  rocksdb::unique_ptr<rocksdb::WritableFile> rocksdb_file;
+  std::unique_ptr<rocksdb::WritableFile> rocksdb_file;
 
   // Create the file.
   status = this->rep->GetEnv()->NewWritableFile(ToString(path), &rocksdb_file, soptions);

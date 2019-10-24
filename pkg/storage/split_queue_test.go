@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -20,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -33,13 +30,14 @@ import (
 func TestSplitQueueShouldQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
+	ctx := context.Background()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(ctx)
 	tc.Start(t, stopper)
 
 	// Set zone configs.
-	config.TestingSetZoneConfig(2000, config.ZoneConfig{RangeMaxBytes: proto.Int64(32 << 20)})
-	config.TestingSetZoneConfig(2002, config.ZoneConfig{RangeMaxBytes: proto.Int64(32 << 20)})
+	config.TestingSetZoneConfig(2000, zonepb.ZoneConfig{RangeMaxBytes: proto.Int64(32 << 20)})
+	config.TestingSetZoneConfig(2002, zonepb.ZoneConfig{RangeMaxBytes: proto.Int64(32 << 20)})
 
 	testCases := []struct {
 		start, end roachpb.RKey
@@ -88,14 +86,15 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 		repl.mu.Lock()
 		repl.mu.state.Stats = &enginepb.MVCCStats{KeyBytes: test.bytes}
 		repl.mu.Unlock()
-		zoneConfig := config.DefaultZoneConfig()
+		zoneConfig := zonepb.DefaultZoneConfig()
 		zoneConfig.RangeMaxBytes = proto.Int64(test.maxBytes)
 		repl.SetZoneConfig(&zoneConfig)
 
 		// Testing using shouldSplitRange instead of shouldQueue to avoid using the splitFinder
 		// This tests the merge queue behavior too as a result. For splitFinder tests,
 		// see split/split_test.go.
-		shouldQ, priority := shouldSplitRange(repl.Desc(), repl.GetMVCCStats(), repl.GetMaxBytes(), cfg)
+		shouldQ, priority := shouldSplitRange(
+			ctx, repl.Desc(), repl.GetMVCCStats(), repl.GetMaxBytes(), cfg)
 		if shouldQ != test.shouldQ {
 			t.Errorf("%d: should queue expected %t; got %t", i, test.shouldQ, shouldQ)
 		}

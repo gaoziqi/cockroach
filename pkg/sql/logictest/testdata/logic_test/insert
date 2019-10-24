@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-opt
-
 statement error pgcode 42P01 relation "kv" does not exist
 INSERT INTO kv VALUES ('a', 'b')
 
@@ -363,13 +361,13 @@ CREATE TABLE nocols()
 statement error INSERT has more expressions than target columns, 2 expressions for 0 targets
 INSERT INTO nocols VALUES (true, default)
 
-statement error unimplemented at or near "k"
+statement error at or near "k": syntax error: unimplemented
 INSERT INTO kv (kv.k) VALUES ('hello')
 
-statement error unimplemented at or near "*"
+statement error at or near "\*": syntax error: unimplemented
 INSERT INTO kv (k.*) VALUES ('hello')
 
-statement error unimplemented at or near "v"
+statement error at or near "v": syntax error: unimplemented
 INSERT INTO kv (k.v) VALUES ('hello')
 
 
@@ -467,7 +465,8 @@ CREATE TABLE sw (
  cc VARCHAR COLLATE en,
  dc VARCHAR(3) COLLATE en,
  ec STRING COLLATE en,
- fc STRING(3) COLLATE en
+ fc STRING(3) COLLATE en,
+ FAMILY "primary" (a, b, c, d, e, f, g, ac, bc, cc, dc, ec, fc, rowid)
 )
 
 query T
@@ -575,7 +574,7 @@ CREATE TABLE src(x VARCHAR PRIMARY KEY);
                        y VARCHAR CHECK(length(y) < 4) REFERENCES src(x))
 
 # Sanity check that the FK constraints gets actually validated
-statement error foreign key violation
+statement error foreign key
 INSERT INTO derived(x) VALUES('xxx')
 
 statement error value too long for type CHAR\(3\)
@@ -622,7 +621,10 @@ COMMIT
 subtest regression_32759_33012
 
 statement ok
-CREATE TABLE t32759(x INT, y STRING NOT NULL DEFAULT 'b', z INT)
+CREATE TABLE t32759 (
+  x INT, y STRING DEFAULT 'b' NOT NULL, z INT,
+  FAMILY "primary" (x, z, rowid)
+)
 
 statement ok
 BEGIN; ALTER TABLE t32759 DROP COLUMN y
@@ -638,8 +640,7 @@ CREATE TABLE t32759 (
 )
 
 # Check that values cannot be inserted into the dropped column.
-# HP and CBO return different errors, so accept both.
-statement error [column "y" does not exist | column "y" is being backfilled]
+statement error column "y" does not exist
 INSERT INTO t32759(x, y, z) VALUES (2, 'c', 2)
 
 statement ok

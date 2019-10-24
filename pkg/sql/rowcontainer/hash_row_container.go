@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rowcontainer
 
@@ -571,6 +567,7 @@ func (h *HashDiskRowContainer) NewBucketIterator(
 		diskRowIterator:      h.NewIterator(ctx).(*diskRowIterator),
 	}
 	if err := ret.Reset(ctx, row); err != nil {
+		ret.Close()
 		return nil, err
 	}
 	return ret, nil
@@ -768,21 +765,21 @@ type HashDiskBackedRowContainer struct {
 
 var _ HashRowContainer = &HashDiskBackedRowContainer{}
 
-// MakeHashDiskBackedRowContainer makes a HashDiskBackedRowContainer.
+// NewHashDiskBackedRowContainer makes a HashDiskBackedRowContainer.
 // mrc (the first argument) can either be nil (in which case
 // HashMemRowContainer will be built upon an empty MemRowContainer) or non-nil
 // (in which case mrc is used as underlying MemRowContainer under
 // HashMemRowContainer). The latter case is used by the hashJoiner since when
 // initializing HashDiskBackedRowContainer it will have accumulated rows from
 // both sides of the join in MemRowContainers, and we can reuse one of them.
-func MakeHashDiskBackedRowContainer(
+func NewHashDiskBackedRowContainer(
 	mrc *MemRowContainer,
 	evalCtx *tree.EvalContext,
 	memoryMonitor *mon.BytesMonitor,
 	diskMonitor *mon.BytesMonitor,
 	engine diskmap.Factory,
-) HashDiskBackedRowContainer {
-	return HashDiskBackedRowContainer{
+) *HashDiskBackedRowContainer {
+	return &HashDiskBackedRowContainer{
 		mrc:              mrc,
 		evalCtx:          evalCtx,
 		memoryMonitor:    memoryMonitor,

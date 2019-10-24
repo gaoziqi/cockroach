@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -23,12 +19,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 // The following tests need both the type checking infrastructure and also
 // all the built-in function definitions to be active.
 
 func TestTypeCheck(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		expr string
 		// The expected serialized expression after type-checking. This tests both
@@ -85,17 +83,17 @@ func TestTypeCheck(t *testing.T) {
 		{`1 BETWEEN 2 AND 3`, `1:::INT8 BETWEEN 2:::INT8 AND 3:::INT8`},
 		{`4 BETWEEN 2.4 AND 5.5::float`, `4:::INT8 BETWEEN 2.4:::DECIMAL AND 5.5:::FLOAT8::FLOAT8`},
 		{`count(3)`, `count(3:::INT8)`},
-		{`ARRAY['a', 'b', 'c']`, `ARRAY['a':::STRING, 'b':::STRING, 'c':::STRING]`},
-		{`ARRAY[1.5, 2.5, 3.5]`, `ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]`},
+		{`ARRAY['a', 'b', 'c']`, `ARRAY['a':::STRING, 'b':::STRING, 'c':::STRING]:::STRING[]`},
+		{`ARRAY[1.5, 2.5, 3.5]`, `ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]:::DECIMAL[]`},
 		{`ARRAY[NULL]`, `ARRAY[NULL]`},
-		{`ARRAY[NULL]:::int[]`, `ARRAY[NULL]`},
-		{`ARRAY[NULL, NULL]:::int[]`, `ARRAY[NULL, NULL]`},
-		{`ARRAY[]::INT8[]`, `ARRAY[]::INT8[]`},
-		{`ARRAY[]:::INT8[]`, `ARRAY[]`},
-		{`1 = ANY ARRAY[1.5, 2.5, 3.5]`, `1:::DECIMAL = ANY ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]`},
-		{`true = SOME (ARRAY[true, false])`, `true = SOME ARRAY[true, false]`},
-		{`1.3 = ALL ARRAY[1, 2, 3]`, `1.3:::DECIMAL = ALL ARRAY[1:::DECIMAL, 2:::DECIMAL, 3:::DECIMAL]`},
-		{`1.3 = ALL ((ARRAY[]))`, `1.3:::DECIMAL = ALL ARRAY[]`},
+		{`ARRAY[NULL]:::int[]`, `ARRAY[NULL]:::INT8[]`},
+		{`ARRAY[NULL, NULL]:::int[]`, `ARRAY[NULL, NULL]:::INT8[]`},
+		{`ARRAY[]::INT8[]`, `ARRAY[]:::INT8[]::INT8[]`},
+		{`ARRAY[]:::INT8[]`, `ARRAY[]:::INT8[]`},
+		{`1 = ANY ARRAY[1.5, 2.5, 3.5]`, `1:::DECIMAL = ANY ARRAY[1.5:::DECIMAL, 2.5:::DECIMAL, 3.5:::DECIMAL]:::DECIMAL[]`},
+		{`true = SOME (ARRAY[true, false])`, `true = SOME ARRAY[true, false]:::BOOL[]`},
+		{`1.3 = ALL ARRAY[1, 2, 3]`, `1.3:::DECIMAL = ALL ARRAY[1:::DECIMAL, 2:::DECIMAL, 3:::DECIMAL]:::DECIMAL[]`},
+		{`1.3 = ALL ((ARRAY[]))`, `1.3:::DECIMAL = ALL ARRAY[]:::DECIMAL[]`},
 		{`NULL = ALL ARRAY[1.5, 2.5, 3.5]`, `NULL`},
 		{`NULL = ALL ARRAY[NULL, NULL]`, `NULL`},
 		{`1 = ALL NULL`, `NULL`},
@@ -152,11 +150,11 @@ func TestTypeCheck(t *testing.T) {
 		{`(pg_get_keywords()).word`, `(pg_get_keywords()).word`},
 		{
 			`(information_schema._pg_expandarray(ARRAY[1,3])).x`,
-			`(information_schema._pg_expandarray(ARRAY[1:::INT8, 3:::INT8])).x`,
+			`(information_schema._pg_expandarray(ARRAY[1:::INT8, 3:::INT8]:::INT8[])).x`,
 		},
 		{
 			`(information_schema._pg_expandarray(ARRAY[1:::INT8, 3:::INT8])).*`,
-			`information_schema._pg_expandarray(ARRAY[1:::INT8, 3:::INT8])`,
+			`information_schema._pg_expandarray(ARRAY[1:::INT8, 3:::INT8]:::INT8[])`,
 		},
 		{`((ROW (1) AS a)).*`, `((1:::INT8,) AS a)`},
 		{`((('1'||'', 1+1) AS a, b)).*`, `(('1':::STRING, 2:::INT8) AS a, b)`},
@@ -193,6 +191,7 @@ func TestTypeCheck(t *testing.T) {
 }
 
 func TestTypeCheckError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	testData := []struct {
 		expr     string
 		expected string

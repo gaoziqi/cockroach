@@ -3,32 +3,14 @@
 exec-ddl
 CREATE TABLE a (k INT PRIMARY KEY, i INT, f FLOAT, s STRING, j JSON)
 ----
-TABLE a
- ├── k int not null
- ├── i int
- ├── f float
- ├── s string
- ├── j jsonb
- └── INDEX primary
-      └── k int not null
 
 exec-ddl
 CREATE TABLE xy (x INT PRIMARY KEY, y INT)
 ----
-TABLE xy
- ├── x int not null
- ├── y int
- └── INDEX primary
-      └── x int not null
 
 exec-ddl
 CREATE TABLE uv (u INT PRIMARY KEY, v INT)
 ----
-TABLE uv
- ├── u int not null
- ├── v int
- └── INDEX primary
-      └── u int not null
 
 # Don't allow ORDER BY column to be eliminated if it has a side effect.
 opt
@@ -133,7 +115,7 @@ SELECT CASE WHEN i<0 THEN (SELECT y FROM xy WHERE x=i LIMIT 1) ELSE 5 END FROM a
 ----
 project
  ├── columns: case:8(int)
- ├── left-join
+ ├── left-join (hash)
  │    ├── columns: i:2(int) x:6(int) y:7(int)
  │    ├── fd: (6)-->(7)
  │    ├── scan a
@@ -158,7 +140,7 @@ project
       ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb) x:6(int) y:7(int)
       ├── key: (1,6)
       ├── fd: (1)-->(2-5), (6)-->(7)
-      ├── left-join
+      ├── left-join (hash)
       │    ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb) x:6(int) y:7(int)
       │    ├── key: (1,6)
       │    ├── fd: (1)-->(2-5), (6)-->(7)
@@ -321,7 +303,7 @@ project
       ├── side-effects
       ├── key: (1,6)
       ├── fd: (1)-->(2-5), (6)-->(8)
-      ├── left-join
+      ├── left-join (hash)
       │    ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb) x:6(int) y:8(decimal)
       │    ├── key: (1,6)
       │    ├── fd: (1)-->(2-5), (6)-->(8)

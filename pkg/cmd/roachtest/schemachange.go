@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -25,7 +20,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-func registerSchemaChangeKV(r *registry) {
+func registerSchemaChangeKV(r *testRegistry) {
 	r.Add(testSpec{
 		Name:    `schemachange/mixed/kv`,
 		Cluster: makeClusterSpec(5),
@@ -50,7 +45,7 @@ func registerSchemaChangeKV(r *registry) {
 			m.Wait()
 
 			c.Run(ctx, c.Node(1), `./workload init kv --drop --db=test`)
-			for node := 1; node <= c.nodes; node++ {
+			for node := 1; node <= c.spec.NodeCount; node++ {
 				node := node
 				// TODO(dan): Ideally, the test would fail if this queryload failed,
 				// but we can't put it in monitor as-is because the test deadlocks.
@@ -288,11 +283,11 @@ func findIndexProblem(
 	return nil
 }
 
-func registerSchemaChangeIndexTPCC1000(r *registry) {
+func registerSchemaChangeIndexTPCC1000(r *testRegistry) {
 	r.Add(makeIndexAddTpccTest(makeClusterSpec(5, cpu(16)), 1000, time.Hour*2))
 }
 
-func registerSchemaChangeIndexTPCC100(r *registry) {
+func registerSchemaChangeIndexTPCC100(r *testRegistry) {
 	r.Add(makeIndexAddTpccTest(makeClusterSpec(5), 100, time.Minute*15))
 }
 
@@ -304,7 +299,9 @@ func makeIndexAddTpccTest(spec clusterSpec, warehouses int, length time.Duration
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runTPCC(ctx, t, c, tpccOptions{
 				Warehouses: warehouses,
-				Extra:      "--wait=false --tolerate-errors",
+				// We limit the number of workers because the default results in a lot
+				// of connections which can lead to OOM issues (see #40566).
+				Extra: fmt.Sprintf("--wait=false --tolerate-errors --workers=%d", warehouses),
 				During: func(ctx context.Context) error {
 					return runAndLogStmts(ctx, t, c, "addindex", []string{
 						`CREATE UNIQUE INDEX ON tpcc.order (o_entry_d, o_w_id, o_d_id, o_carrier_id, o_id);`,
@@ -315,11 +312,11 @@ func makeIndexAddTpccTest(spec clusterSpec, warehouses int, length time.Duration
 				Duration: length,
 			})
 		},
-		MinVersion: "v2.2.0",
+		MinVersion: "v19.1.0",
 	}
 }
 
-func registerSchemaChangeBulkIngest(r *registry) {
+func registerSchemaChangeBulkIngest(r *testRegistry) {
 	r.Add(makeSchemaChangeBulkIngestTest(5, 100000000, time.Minute*20))
 }
 
@@ -328,7 +325,7 @@ func makeSchemaChangeBulkIngestTest(numNodes, numRows int, length time.Duration)
 		Name:    "schemachange/bulkingest",
 		Cluster: makeClusterSpec(numNodes),
 		Timeout: length * 2,
-		// `fixtures import` (with the experimental-workload paths) is not supported in 2.1
+		// `fixtures import` (with the workload paths) is not supported in 2.1
 		MinVersion: "v19.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			// Configure column a to have sequential ascending values, and columns b and c to be constant.
@@ -341,8 +338,8 @@ func makeSchemaChangeBulkIngestTest(numNodes, numRows int, length time.Duration)
 			cNum := 1
 			payloadBytes := 4
 
-			crdbNodes := c.Range(1, c.nodes-1)
-			workloadNode := c.Node(c.nodes)
+			crdbNodes := c.Range(1, c.spec.NodeCount-1)
+			workloadNode := c.Node(c.spec.NodeCount)
 
 			c.Put(ctx, cockroach, "./cockroach")
 			c.Put(ctx, workload, "./workload", workloadNode)
@@ -367,7 +364,7 @@ func makeSchemaChangeBulkIngestTest(numNodes, numRows int, length time.Duration)
 			}
 			cmdWriteAndRead := fmt.Sprintf(
 				"./workload run bulkingest --duration %s {pgurl:1-%d} --a %d --b %d --c %d --payload-bytes %d",
-				indexDuration.String(), c.nodes-1, aNum, bNum, cNum, payloadBytes,
+				indexDuration.String(), c.spec.NodeCount-1, aNum, bNum, cNum, payloadBytes,
 			)
 			m.Go(func(ctx context.Context) error {
 				c.Run(ctx, workloadNode, cmdWriteAndRead)
@@ -399,6 +396,65 @@ func makeSchemaChangeBulkIngestTest(numNodes, numRows int, length time.Duration)
 
 			m.Wait()
 		},
+	}
+}
+
+func registerMixedSchemaChangesTPCC1000(r *testRegistry) {
+	r.Add(makeMixedSchemaChanges(makeClusterSpec(5, cpu(16)), 1000, time.Hour*3))
+}
+
+func makeMixedSchemaChanges(spec clusterSpec, warehouses int, length time.Duration) testSpec {
+	return testSpec{
+		Name:    "schemachange/mixed/tpcc",
+		Cluster: spec,
+		Timeout: length * 3,
+		Run: func(ctx context.Context, t *test, c *cluster) {
+			runTPCC(ctx, t, c, tpccOptions{
+				Warehouses: warehouses,
+				// We limit the number of workers because the default results in a lot
+				// of connections which can lead to OOM issues (see #40566).
+				Extra: fmt.Sprintf("--wait=false --tolerate-errors --workers=%d", warehouses),
+				During: func(ctx context.Context) error {
+					if t.IsBuildVersion(`v19.2.0`) {
+						if err := runAndLogStmts(ctx, t, c, "mixed-schema-changes-19.2", []string{
+							// CREATE TABLE AS with a specified primary key was added in 19.2.
+							`CREATE TABLE tpcc.orderpks (o_w_id, o_d_id, o_id, PRIMARY KEY(o_w_id, o_d_id, o_id)) AS select o_w_id, o_d_id, o_id FROM tpcc.order;`,
+						}); err != nil {
+							return err
+						}
+					} else {
+						if err := runAndLogStmts(ctx, t, c, "mixed-schema-changes-19.1", []string{
+							`CREATE TABLE tpcc.orderpks (o_w_id, o_d_id, o_id, PRIMARY KEY(o_w_id, o_d_id, o_id));`,
+							// We can't populate the table with CREATE TABLE AS, so just
+							// insert the rows. AOST is used to reduce contention.
+							`INSERT INTO tpcc.orderpks SELECT o_w_id, o_d_id, o_id FROM tpcc.order AS OF SYSTEM TIME '-1s';`,
+						}); err != nil {
+							return err
+						}
+					}
+					return runAndLogStmts(ctx, t, c, "mixed-schema-changes", []string{
+						`CREATE INDEX ON tpcc.order (o_carrier_id);`,
+
+						`CREATE TABLE tpcc.customerpks (c_w_id INT, c_d_id INT, c_id INT, FOREIGN KEY (c_w_id, c_d_id, c_id) REFERENCES tpcc.customer (c_w_id, c_d_id, c_id));`,
+
+						`ALTER TABLE tpcc.order ADD COLUMN orderdiscount INT DEFAULT 0;`,
+						`ALTER TABLE tpcc.order ADD CONSTRAINT nodiscount CHECK (orderdiscount = 0);`,
+
+						`ALTER TABLE tpcc.orderpks ADD CONSTRAINT warehouse_id FOREIGN KEY (o_w_id) REFERENCES tpcc.warehouse (w_id);`,
+
+						// The FK constraint on tpcc.district referencing tpcc.warehouse is
+						// unvalidated, thus this operation will not be a noop.
+						`ALTER TABLE tpcc.district VALIDATE CONSTRAINT fk_d_w_id_ref_warehouse;`,
+
+						`ALTER TABLE tpcc.orderpks RENAME TO tpcc.readytodrop;`,
+						`TRUNCATE TABLE tpcc.readytodrop CASCADE;`,
+						`DROP TABLE tpcc.readytodrop CASCADE;`,
+					})
+				},
+				Duration: length,
+			})
+		},
+		MinVersion: "v19.1.0",
 	}
 }
 

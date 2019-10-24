@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -20,9 +16,27 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
+)
+
+// SpecializedVectorizedBuiltin is used to map overloads
+// to the vectorized operator that is specific to
+// that implementation of the builtin function.
+type SpecializedVectorizedBuiltin int
+
+// TODO (rohany): What is the best place to put this list?
+// I want to put it in builtins or exec, but those create an import
+// cycle with exec. tree is imported by both of them, so
+// this package seems like a good place to do it.
+
+// Keep this list alphabetized so that it is easy to manage.
+const (
+	_ SpecializedVectorizedBuiltin = iota
+	SubstringStringIntInt
 )
 
 // Overload is one of the overloads of a built-in function.
@@ -56,6 +70,10 @@ type Overload struct {
 	// counter, if non-nil, should be incremented upon successful
 	// type check of expressions using this overload.
 	counter telemetry.Counter
+
+	// SpecializedVecBuiltin is used to let the vectorized engine
+	// know when an Overload has a specialized vectorized operator.
+	SpecializedVecBuiltin SpecializedVectorizedBuiltin
 }
 
 // params implements the overloadImpl interface.
@@ -395,7 +413,7 @@ func typeCheckOverloadedExprs(
 	ctx *SemaContext, desired *types.T, overloads []overloadImpl, inBinOp bool, exprs ...Expr,
 ) ([]TypedExpr, []overloadImpl, error) {
 	if len(overloads) > math.MaxUint8 {
-		return nil, nil, pgerror.AssertionFailedf("too many overloads (%d > 255)", len(overloads))
+		return nil, nil, errors.AssertionFailedf("too many overloads (%d > 255)", len(overloads))
 	}
 
 	var s typeCheckOverloadState
@@ -408,7 +426,7 @@ func typeCheckOverloadedExprs(
 		// Only one overload can be provided if it has parameters with HomogeneousType.
 		if _, ok := overload.params().(HomogeneousType); ok {
 			if len(overloads) > 1 {
-				return nil, nil, pgerror.AssertionFailedf(
+				return nil, nil, errors.AssertionFailedf(
 					"only one overload can have HomogeneousType parameters")
 			}
 			typedExprs, _, err := TypeCheckSameTypedExprs(ctx, desired, exprs...)
@@ -428,7 +446,7 @@ func typeCheckOverloadedExprs(
 		for _, i := range s.resolvableIdxs {
 			typ, err := exprs[i].TypeCheck(ctx, types.Any)
 			if err != nil {
-				return nil, nil, pgerror.Wrapf(err, pgerror.CodeInvalidParameterValueError,
+				return nil, nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue,
 					"error type checking resolved expression:")
 			}
 			s.typedExprs[i] = typ
@@ -738,7 +756,7 @@ func defaultTypeCheck(ctx *SemaContext, s *typeCheckOverloadState, errorOnPlaceh
 	for _, i := range s.constIdxs {
 		typ, err := s.exprs[i].TypeCheck(ctx, types.Any)
 		if err != nil {
-			return pgerror.Wrapf(err, pgerror.CodeInvalidParameterValueError,
+			return pgerror.Wrapf(err, pgcode.InvalidParameterValue,
 				"error type checking constant value")
 		}
 		s.typedExprs[i] = typ
@@ -782,12 +800,12 @@ func checkReturn(
 			typ, err := s.exprs[i].TypeCheck(ctx, des)
 			if err != nil {
 				return false, s.typedExprs, nil, pgerror.Wrapf(
-					err, pgerror.CodeInvalidParameterValueError,
+					err, pgcode.InvalidParameterValue,
 					"error type checking constant value",
 				)
 			}
 			if des != nil && !typ.ResolvedType().Equivalent(des) {
-				return false, nil, nil, pgerror.AssertionFailedf(
+				return false, nil, nil, errors.AssertionFailedf(
 					"desired constant value type %s but set type %s",
 					log.Safe(des), log.Safe(typ.ResolvedType()),
 				)

@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"cloud.google.com/go/storage"
@@ -35,6 +36,10 @@ import (
 const (
 	fixtureGCSURIScheme = `gs`
 )
+
+func init() {
+	workload.ImportDataLoader = ImportDataLoader{}
+}
 
 // FixtureConfig describes a storage place for fixtures.
 type FixtureConfig struct {
@@ -261,14 +266,20 @@ func MakeFixture(
 	if _, err := sqlDB.Exec(`CREATE DATABASE IF NOT EXISTS ` + dbName); err != nil {
 		return Fixture{}, err
 	}
-	const direct, stats, skipPostLoad, csvServer = false, false, true, ""
-	if _, err := ImportFixture(
-		ctx, sqlDB, gen, dbName, direct, filesPerNode, stats, skipPostLoad, csvServer,
-	); err != nil {
+	l := ImportDataLoader{
+		FilesPerNode: filesPerNode,
+	}
+	// NB: Intentionally don't use workloadsql.Setup because it runs the PostLoad
+	// hooks (adding foreign keys, etc), but historically the BACKUPs created by
+	// `fixtures make` didn't have them. Instead they're added by `fixtures load`.
+	// Ideally, the PostLoad hooks would be idempotent and we could include them
+	// here (but still run them on load for old fixtures without them), but that
+	// yak will remain unshaved.
+	if _, err := l.InitialDataLoad(ctx, sqlDB, gen); err != nil {
 		return Fixture{}, err
 	}
-	g := ctxgroup.WithContext(ctx)
 
+	g := ctxgroup.WithContext(ctx)
 	for _, t := range gen.Tables() {
 		t := t
 		g.Go(func() error {
@@ -279,11 +290,42 @@ func MakeFixture(
 			return err
 		})
 	}
-
 	if err := g.Wait(); err != nil {
 		return Fixture{}, err
 	}
+
 	return GetFixture(ctx, gcs, config, gen)
+}
+
+// ImportDataLoader is an InitialDataLoader implementation that loads data with
+// IMPORT. The zero-value gets some sane defaults for the tunable settings.
+type ImportDataLoader struct {
+	FilesPerNode int
+	InjectStats  bool
+	CSVServer    string
+}
+
+// InitialDataLoad implements the InitialDataLoader interface.
+func (l ImportDataLoader) InitialDataLoad(
+	ctx context.Context, db *gosql.DB, gen workload.Generator,
+) (int64, error) {
+	if l.FilesPerNode == 0 {
+		l.FilesPerNode = 1
+	}
+
+	log.Infof(ctx, "starting import of %d tables", len(gen.Tables()))
+	start := timeutil.Now()
+	const useConnectionDB = ``
+	bytes, err := ImportFixture(
+		ctx, db, gen, useConnectionDB, l.FilesPerNode, l.InjectStats, l.CSVServer)
+	if err != nil {
+		return 0, errors.Wrap(err, `importing fixture`)
+	}
+	elapsed := timeutil.Since(start)
+	log.Infof(ctx, "imported %s bytes in %d tables (took %s, %s)",
+		humanizeutil.IBytes(bytes), len(gen.Tables()), elapsed, humanizeutil.DataRate(bytes, elapsed))
+
+	return bytes, nil
 }
 
 // ImportFixture works like MakeFixture, but instead of stopping halfway or
@@ -295,10 +337,8 @@ func ImportFixture(
 	sqlDB *gosql.DB,
 	gen workload.Generator,
 	dbName string,
-	directIngestion bool,
 	filesPerNode int,
 	injectStats bool,
-	skipPostLoad bool,
 	csvServer string,
 ) (int64, error) {
 	for _, t := range gen.Tables() {
@@ -317,7 +357,7 @@ func ImportFixture(
 	var bytesAtomic int64
 	g := ctxgroup.WithContext(ctx)
 	tables := gen.Tables()
-	if injectStats && len(tables) > 0 && len(tables[0].Stats) > 0 {
+	if injectStats && tablesHaveStats(tables) {
 		// Turn off automatic stats temporarily so we don't trigger stats creation
 		// after the IMPORT. We will inject stats inside importFixtureTable.
 		// TODO(rytaft): It would be better if the automatic statistics code would
@@ -329,7 +369,7 @@ func ImportFixture(
 
 	pathPrefix := csvServer
 	if pathPrefix == `` {
-		pathPrefix = `experimental-workload://`
+		pathPrefix = `workload://`
 	}
 
 	for _, t := range tables {
@@ -337,18 +377,13 @@ func ImportFixture(
 		paths := csvServerPaths(pathPrefix, gen, table, numNodes*filesPerNode)
 		g.GoCtx(func(ctx context.Context) error {
 			tableBytes, err := importFixtureTable(
-				ctx, sqlDB, dbName, table, paths, directIngestion, `` /* output */, injectStats)
+				ctx, sqlDB, dbName, table, paths, `` /* output */, injectStats)
 			atomic.AddInt64(&bytesAtomic, tableBytes)
 			return errors.Wrapf(err, `importing table %s`, table.Name)
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return 0, err
-	}
-	if !skipPostLoad {
-		if err := runPostLoadSteps(ctx, sqlDB, gen); err != nil {
-			return 0, err
-		}
 	}
 	return atomic.LoadInt64(&bytesAtomic), nil
 }
@@ -359,14 +394,14 @@ func importFixtureTable(
 	dbName string,
 	table workload.Table,
 	paths []string,
-	directIngestion bool,
 	output string,
 	injectStats bool,
 ) (int64, error) {
 	start := timeutil.Now()
 	var buf bytes.Buffer
 	var params []interface{}
-	fmt.Fprintf(&buf, `IMPORT TABLE "%s"."%s" %s CSV DATA (`, dbName, table.Name, table.Schema)
+	qualifiedTableName := makeQualifiedTableName(dbName, &table)
+	fmt.Fprintf(&buf, `IMPORT TABLE %s %s CSV DATA (`, qualifiedTableName, table.Schema)
 	// Generate $1,...,$N-1, where N is the number of csv paths.
 	for _, path := range paths {
 		params = append(params, path)
@@ -379,9 +414,6 @@ func importFixtureTable(
 	if len(output) > 0 {
 		params = append(params, output)
 		fmt.Fprintf(&buf, `, transform=$%d`, len(params))
-	}
-	if directIngestion {
-		buf.WriteString(`, experimental_direct_ingestion`)
 	}
 	var rows, index, tableBytes int64
 	var discard driver.Value
@@ -398,10 +430,23 @@ func importFixtureTable(
 
 	// Inject pre-calculated stats.
 	if injectStats && len(table.Stats) > 0 {
-		err = injectStatistics(dbName, &table, sqlDB)
+		if err := injectStatistics(qualifiedTableName, &table, sqlDB); err != nil {
+			return 0, err
+		}
 	}
 
-	return tableBytes, err
+	return tableBytes, nil
+}
+
+// tablesHaveStats returns whether any of the provided tables have associated
+// table statistics to inject.
+func tablesHaveStats(tables []workload.Table) bool {
+	for _, t := range tables {
+		if len(t.Stats) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // disableAutoStats disables automatic stats if they are enabled and returns
@@ -439,25 +484,52 @@ func disableAutoStats(ctx context.Context, sqlDB *gosql.DB) func() {
 }
 
 // injectStatistics injects pre-calculated statistics for the given table.
-func injectStatistics(dbName string, table *workload.Table, sqlDB *gosql.DB) error {
+func injectStatistics(qualifiedTableName string, table *workload.Table, sqlDB *gosql.DB) error {
 	var encoded []byte
 	encoded, err := json.Marshal(table.Stats)
 	if err != nil {
 		return err
 	}
-	_, err = sqlDB.Exec(fmt.Sprintf(`ALTER TABLE "%s"."%s" INJECT STATISTICS '%s'`,
-		dbName, table.Name, encoded))
-	return err
+	if _, err := sqlDB.Exec(
+		fmt.Sprintf(`ALTER TABLE %s INJECT STATISTICS '%s'`, qualifiedTableName, encoded),
+	); err != nil {
+		if strings.Contains(err.Error(), "syntax error") {
+			// This syntax was added in v2.1, so ignore the syntax error
+			// if run against versions earlier than this.
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// makeQualifiedTableName constructs a qualified table name from the specified
+// database name and table.
+func makeQualifiedTableName(dbName string, table *workload.Table) string {
+	if dbName == "" {
+		return fmt.Sprintf(`"%s"`, table.Name)
+	}
+	return fmt.Sprintf(`"%s"."%s"`, dbName, table.Name)
 }
 
 // RestoreFixture loads a fixture into a CockroachDB cluster. An enterprise
 // license is required to have been set in the cluster.
 func RestoreFixture(
-	ctx context.Context, sqlDB *gosql.DB, fixture Fixture, database string,
+	ctx context.Context, sqlDB *gosql.DB, fixture Fixture, database string, injectStats bool,
 ) (int64, error) {
 	var bytesAtomic int64
 	g := ctxgroup.WithContext(ctx)
 	genName := fixture.Generator.Meta().Name
+	tables := fixture.Generator.Tables()
+	if injectStats && tablesHaveStats(tables) {
+		// Turn off automatic stats temporarily so we don't trigger stats creation
+		// after the RESTORE.
+		// TODO(rytaft): It would be better if the automatic statistics code would
+		// just trigger a no-op if there are new stats available so we wouldn't
+		// have to disable and re-enable automatic stats here.
+		enableFn := disableAutoStats(ctx, sqlDB)
+		defer enableFn()
+	}
 	for _, table := range fixture.Tables {
 		table := table
 		g.GoCtx(func(ctx context.Context) error {
@@ -481,27 +553,18 @@ func RestoreFixture(
 	if err := g.Wait(); err != nil {
 		return 0, err
 	}
-	if err := runPostLoadSteps(ctx, sqlDB, fixture.Generator); err != nil {
-		return 0, err
-	}
-	return atomic.LoadInt64(&bytesAtomic), nil
-}
-
-func runPostLoadSteps(ctx context.Context, sqlDB *gosql.DB, gen workload.Generator) error {
-	if h, ok := gen.(workload.Hookser); ok {
-		if hooks := h.Hooks(); hooks.PostLoad != nil {
-			if err := hooks.PostLoad(sqlDB); err != nil {
-				return errors.Wrap(err, `PostLoad hook`)
+	if injectStats {
+		for i := range tables {
+			t := &tables[i]
+			if len(t.Stats) > 0 {
+				qualifiedTableName := makeQualifiedTableName(genName, t)
+				if err := injectStatistics(qualifiedTableName, t, sqlDB); err != nil {
+					return 0, err
+				}
 			}
 		}
 	}
-	const splitConcurrency = 384 // TODO(dan): Don't hardcode this.
-	for _, table := range gen.Tables() {
-		if err := workload.Split(ctx, sqlDB, table, splitConcurrency); err != nil {
-			return errors.Wrapf(err, `splitting %s`, table.Name)
-		}
-	}
-	return nil
+	return atomic.LoadInt64(&bytesAtomic), nil
 }
 
 // ListFixtures returns the object paths to all fixtures stored in a FixtureConfig.

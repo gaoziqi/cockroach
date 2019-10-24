@@ -13,19 +13,18 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 func init() {
-	distsqlrun.NewChangeAggregatorProcessor = newChangeAggregatorProcessor
-	distsqlrun.NewChangeFrontierProcessor = newChangeFrontierProcessor
+	rowexec.NewChangeAggregatorProcessor = newChangeAggregatorProcessor
+	rowexec.NewChangeFrontierProcessor = newChangeFrontierProcessor
 }
 
 const (
@@ -72,13 +71,6 @@ func distChangefeedFlow(
 		return err
 	}
 
-	execCfg := phs.ExecCfg()
-	if PushEnabled.Get(&execCfg.Settings.SV) {
-		telemetry.Count(`changefeed.run.push.enabled`)
-	} else {
-		telemetry.Count(`changefeed.run.push.disabled`)
-	}
-
 	spansTS := details.StatementTime
 	var initialHighWater hlc.Timestamp
 	if h := progress.GetHighWater(); h != nil && *h != (hlc.Timestamp{}) {
@@ -88,6 +80,7 @@ func distChangefeedFlow(
 		spansTS = initialHighWater
 	}
 
+	execCfg := phs.ExecCfg()
 	trackedSpans, err := fetchSpansForTargets(ctx, execCfg.DB, details.Targets, spansTS)
 	if err != nil {
 		return err
@@ -112,28 +105,28 @@ func distChangefeedFlow(
 		}
 	}
 
-	changeAggregatorProcs := make([]distsqlplan.Processor, 0, len(spanPartitions))
+	changeAggregatorProcs := make([]physicalplan.Processor, 0, len(spanPartitions))
 	for _, sp := range spanPartitions {
 		// TODO(dan): Merge these watches with the span-level resolved
 		// timestamps from the job progress.
-		watches := make([]distsqlpb.ChangeAggregatorSpec_Watch, len(sp.Spans))
+		watches := make([]execinfrapb.ChangeAggregatorSpec_Watch, len(sp.Spans))
 		for i, nodeSpan := range sp.Spans {
-			watches[i] = distsqlpb.ChangeAggregatorSpec_Watch{
+			watches[i] = execinfrapb.ChangeAggregatorSpec_Watch{
 				Span:            nodeSpan,
 				InitialResolved: initialHighWater,
 			}
 		}
 
-		changeAggregatorProcs = append(changeAggregatorProcs, distsqlplan.Processor{
+		changeAggregatorProcs = append(changeAggregatorProcs, physicalplan.Processor{
 			Node: sp.Node,
-			Spec: distsqlpb.ProcessorSpec{
-				Core: distsqlpb.ProcessorCoreUnion{
-					ChangeAggregator: &distsqlpb.ChangeAggregatorSpec{
+			Spec: execinfrapb.ProcessorSpec{
+				Core: execinfrapb.ProcessorCoreUnion{
+					ChangeAggregator: &execinfrapb.ChangeAggregatorSpec{
 						Watches: watches,
 						Feed:    details,
 					},
 				},
-				Output: []distsqlpb.OutputRouterSpec{{Type: distsqlpb.OutputRouterSpec_PASS_THROUGH}},
+				Output: []execinfrapb.OutputRouterSpec{{Type: execinfrapb.OutputRouterSpec_PASS_THROUGH}},
 			},
 		})
 	}
@@ -141,7 +134,7 @@ func distChangefeedFlow(
 	// static. Currently there is no way for them to change after the changefeed
 	// is created, even if it is paused and unpaused, but #28982 describes some
 	// ways that this might happen in the future.
-	changeFrontierSpec := distsqlpb.ChangeFrontierSpec{
+	changeFrontierSpec := execinfrapb.ChangeFrontierSpec{
 		TrackedSpans: trackedSpans,
 		Feed:         details,
 		JobID:        jobID,
@@ -150,7 +143,7 @@ func distChangefeedFlow(
 	var p sql.PhysicalPlan
 
 	stageID := p.NewStageID()
-	p.ResultRouters = make([]distsqlplan.ProcessorIdx, len(changeAggregatorProcs))
+	p.ResultRouters = make([]physicalplan.ProcessorIdx, len(changeAggregatorProcs))
 	for i, proc := range changeAggregatorProcs {
 		proc.Spec.StageID = stageID
 		pIdx := p.AddProcessor(proc)
@@ -159,8 +152,8 @@ func distChangefeedFlow(
 
 	p.AddSingleGroupStage(
 		gatewayNodeID,
-		distsqlpb.ProcessorCoreUnion{ChangeFrontier: &changeFrontierSpec},
-		distsqlpb.PostProcessSpec{},
+		execinfrapb.ProcessorCoreUnion{ChangeFrontier: &changeFrontierSpec},
+		execinfrapb.PostProcessSpec{},
 		changefeedResultTypes,
 	)
 
@@ -195,11 +188,11 @@ func distChangefeedFlow(
 
 	// Copy the evalCtx, as dsp.Run() might change it.
 	evalCtxCopy := *evalCtx
-	dsp.Run(planCtx, noTxn, &p, recv, &evalCtxCopy, finishedSetupFn)
+	dsp.Run(planCtx, noTxn, &p, recv, &evalCtxCopy, finishedSetupFn)()
 	return resultRows.Err()
 }
 
-// changefeedResultWriter implements the `distsqlrun.resultWriter` that sends
+// changefeedResultWriter implements the `rowexec.resultWriter` that sends
 // the received rows back over the given channel.
 type changefeedResultWriter struct {
 	rowsCh       chan<- tree.Datums

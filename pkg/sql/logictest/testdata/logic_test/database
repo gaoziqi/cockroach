@@ -1,4 +1,4 @@
-# LogicTest: local local-opt
+# LogicTest: local
 
 statement ok
 CREATE DATABASE a
@@ -21,6 +21,19 @@ defaultdb
 postgres
 system
 test
+
+statement ok
+COMMENT ON DATABASE a IS 'A'
+
+query TT colnames
+SHOW DATABASES WITH COMMENT
+----
+database_name  comment
+a              A
+defaultdb      NULL
+postgres       NULL
+system         NULL
+test           NULL
 
 query T colnames
 SHOW SCHEMAS FROM a
@@ -156,7 +169,7 @@ SELECT * FROM b.a
 
 user testuser
 
-statement error only superusers are allowed to CREATE DATABASE
+statement error only users with the admin role are allowed to CREATE DATABASE
 CREATE DATABASE privs
 
 user root

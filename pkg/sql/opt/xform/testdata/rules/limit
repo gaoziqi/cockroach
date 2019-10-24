@@ -10,24 +10,6 @@ CREATE TABLE a
     INDEX si_idx (s DESC, i) STORING (j)
 )
 ----
-TABLE a
- ├── k int not null
- ├── i int
- ├── f float
- ├── s string
- ├── j jsonb
- ├── INDEX primary
- │    └── k int not null
- ├── INDEX s_idx
- │    ├── s string
- │    ├── k int not null
- │    ├── i int (storing)
- │    └── f float (storing)
- └── INDEX si_idx
-      ├── s string desc
-      ├── i int
-      ├── k int not null
-      └── j jsonb (storing)
 
 # --------------------------------------------------
 # PushLimitIntoScan
@@ -73,13 +55,14 @@ limit
  ├── cardinality: [0 - 1]
  ├── key: ()
  ├── fd: ()-->(2,4)
- ├── sort
+ ├── sort (segmented)
  │    ├── columns: i:2(int) s:4(string)
  │    ├── cardinality: [0 - 10]
  │    ├── ordering: +4,+2
  │    └── scan a@s_idx
  │         ├── columns: i:2(int) s:4(string)
- │         └── limit: 10
+ │         ├── limit: 10
+ │         └── ordering: +4
  └── const: 1 [type=int]
 
 # Don't push when scan doesn't satisfy limit's ordering.
@@ -126,7 +109,7 @@ memo (optimized, ~6KB, required=[presentation: s:4])
  ├── G2: (select G4 G5) (scan a@s_idx,cols=(4),constrained) (scan a@si_idx,cols=(4),constrained)
  │    └── []
  │         ├── best: (scan a@s_idx,cols=(4),constrained)
- │         └── cost: 10.41
+ │         └── cost: 10.51
  ├── G3: (const 1)
  ├── G4: (scan a,cols=(4)) (scan a@s_idx,cols=(4)) (scan a@si_idx,cols=(4))
  │    └── []
@@ -144,15 +127,6 @@ memo (optimized, ~6KB, required=[presentation: s:4])
 exec-ddl
 CREATE TABLE kuv (k INT PRIMARY KEY, u INT, v INT, INDEX (u))
 ----
-TABLE kuv
- ├── k int not null
- ├── u int
- ├── v int
- ├── INDEX primary
- │    └── k int not null
- └── INDEX secondary
-      ├── u int
-      └── k int not null
 
 opt
 SELECT * FROM kuv ORDER BY u LIMIT 5
@@ -182,7 +156,7 @@ limit
  ├── key: (1)
  ├── fd: (1)-->(2,3)
  ├── ordering: +2,+3
- ├── sort
+ ├── sort (segmented)
  │    ├── columns: k:1(int!null) u:2(int!null) v:3(int)
  │    ├── key: (1)
  │    ├── fd: (1)-->(2,3)
@@ -191,11 +165,13 @@ limit
  │         ├── columns: k:1(int!null) u:2(int!null) v:3(int)
  │         ├── key: (1)
  │         ├── fd: (1)-->(2,3)
+ │         ├── ordering: +2
  │         └── scan kuv@secondary
  │              ├── columns: k:1(int!null) u:2(int!null)
  │              ├── constraint: /2/1: [/2 - /9]
  │              ├── key: (1)
- │              └── fd: (1)-->(2)
+ │              ├── fd: (1)-->(2)
+ │              └── ordering: +2
  └── const: 5 [type=int]
 
 exec-ddl
@@ -209,25 +185,6 @@ CREATE TABLE abcd (
   UNIQUE INDEX bcd (b,c,d)
 )
 ----
-TABLE abcd
- ├── a int not null
- ├── b int
- ├── c int
- ├── d int
- ├── INDEX primary
- │    └── a int not null
- ├── INDEX b
- │    ├── b int
- │    └── a int not null
- ├── INDEX cd
- │    ├── c int
- │    ├── d int
- │    └── a int not null
- └── INDEX bcd
-      ├── b int
-      ├── c int
-      ├── d int
-      └── a int not null (storing)
 
 opt
 EXPLAIN SELECT * FROM abcd@b WHERE a >= 20 AND a <= 30 ORDER BY b DESC LIMIT 5
@@ -243,11 +200,13 @@ explain
       ├── ordering: -2
       ├── sort
       │    ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+      │    ├── cardinality: [0 - 11]
       │    ├── key: (1)
       │    ├── fd: (1)-->(2-4), (2-4)~~>(1)
       │    ├── ordering: -2
       │    └── select
       │         ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+      │         ├── cardinality: [0 - 11]
       │         ├── key: (1)
       │         ├── fd: (1)-->(2-4), (2-4)~~>(1)
       │         ├── index-join abcd
@@ -286,11 +245,13 @@ Initial expression
              ├── fd: (1)-->(2-4), (2-4)~~>(1)
              ├── sort
              │    ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+             │    ├── cardinality: [0 - 11]
              │    ├── key: (1)
              │    ├── fd: (1)-->(2-4), (2-4)~~>(1)
              │    ├── ordering: -2
              │    └── select
              │         ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+             │         ├── cardinality: [0 - 11]
              │         ├── key: (1)
              │         ├── fd: (1)-->(2-4), (2-4)~~>(1)
              │         ├── scan abcd
@@ -321,11 +282,13 @@ SimplifySelectFilters
               ├── fd: (1)-->(2-4), (2-4)~~>(1)
               ├── sort
               │    ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+  -           │    ├── cardinality: [0 - 11]
               │    ├── key: (1)
               │    ├── fd: (1)-->(2-4), (2-4)~~>(1)
               │    ├── ordering: -2
               │    └── select
               │         ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+  -           │         ├── cardinality: [0 - 11]
               │         ├── key: (1)
               │         ├── fd: (1)-->(2-4), (2-4)~~>(1)
               │         ├── scan abcd
@@ -358,11 +321,13 @@ ConsolidateSelectFilters
               ├── fd: (1)-->(2-4), (2-4)~~>(1)
               ├── sort
               │    ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+  +           │    ├── cardinality: [0 - 11]
               │    ├── key: (1)
               │    ├── fd: (1)-->(2-4), (2-4)~~>(1)
               │    ├── ordering: -2
               │    └── select
               │         ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+  +           │         ├── cardinality: [0 - 11]
               │         ├── key: (1)
               │         ├── fd: (1)-->(2-4), (2-4)~~>(1)
               │         ├── scan abcd
@@ -397,11 +362,13 @@ GenerateIndexScans
   -           ├── fd: (1)-->(2-4), (2-4)~~>(1)
   -           ├── sort
   -           │    ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+  -           │    ├── cardinality: [0 - 11]
   -           │    ├── key: (1)
   -           │    ├── fd: (1)-->(2-4), (2-4)~~>(1)
   -           │    ├── ordering: -2
   -           │    └── select
   -           │         ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+  -           │         ├── cardinality: [0 - 11]
   -           │         ├── key: (1)
   -           │         ├── fd: (1)-->(2-4), (2-4)~~>(1)
   -           │         ├── scan abcd
@@ -414,11 +381,13 @@ GenerateIndexScans
   -           └── const: 5 [type=int]
   +      ├── sort
   +      │    ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+  +      │    ├── cardinality: [0 - 11]
   +      │    ├── key: (1)
   +      │    ├── fd: (1)-->(2-4), (2-4)~~>(1)
   +      │    ├── ordering: -2
   +      │    └── select
   +      │         ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+  +      │         ├── cardinality: [0 - 11]
   +      │         ├── key: (1)
   +      │         ├── fd: (1)-->(2-4), (2-4)~~>(1)
   +      │         ├── index-join abcd
@@ -454,11 +423,13 @@ Final best expression
         ├── ordering: -2
         ├── sort
         │    ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+        │    ├── cardinality: [0 - 11]
         │    ├── key: (1)
         │    ├── fd: (1)-->(2-4), (2-4)~~>(1)
         │    ├── ordering: -2
         │    └── select
         │         ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int)
+        │         ├── cardinality: [0 - 11]
         │         ├── key: (1)
         │         ├── fd: (1)-->(2-4), (2-4)~~>(1)
         │         ├── index-join abcd
@@ -473,3 +444,59 @@ Final best expression
         │         └── filters
         │              └── (a >= 20) AND (a <= 30) [type=bool, outer=(1), constraints=(/1: [/20 - /30]; tight)]
         └── const: 5 [type=int]
+
+# --------------------------------------------------
+# PushLimitIntoOffset + GenerateLimitedScans
+# --------------------------------------------------
+
+# Regression testing for #30416.
+# The limit is pushed down the offset and so an appropriate index scan is used
+# over a primary key scan.
+opt
+SELECT * from a ORDER BY s LIMIT 10 OFFSET 10
+----
+offset
+ ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb)
+ ├── internal-ordering: +4
+ ├── cardinality: [0 - 10]
+ ├── key: (1)
+ ├── fd: (1)-->(2-5)
+ ├── ordering: +4
+ ├── index-join a
+ │    ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb)
+ │    ├── cardinality: [0 - 20]
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-5)
+ │    ├── ordering: +4
+ │    └── scan a@s_idx
+ │         ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string)
+ │         ├── limit: 20
+ │         ├── key: (1)
+ │         ├── fd: (1)-->(2-4)
+ │         └── ordering: +4
+ └── const: 10 [type=int]
+
+# The right index is used for the limited scan based on the order.
+opt
+SELECT * from a ORDER BY s DESC LIMIT 10 OFFSET 10
+----
+offset
+ ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb)
+ ├── internal-ordering: -4
+ ├── cardinality: [0 - 10]
+ ├── key: (1)
+ ├── fd: (1)-->(2-5)
+ ├── ordering: -4
+ ├── index-join a
+ │    ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb)
+ │    ├── cardinality: [0 - 20]
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-5)
+ │    ├── ordering: -4
+ │    └── scan a@si_idx
+ │         ├── columns: k:1(int!null) i:2(int) s:4(string) j:5(jsonb)
+ │         ├── limit: 20
+ │         ├── key: (1)
+ │         ├── fd: (1)-->(2,4,5)
+ │         └── ordering: -4
+ └── const: 10 [type=int]

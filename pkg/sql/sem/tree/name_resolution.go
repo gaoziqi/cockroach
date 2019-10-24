@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -19,6 +15,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 )
@@ -257,7 +254,7 @@ type SchemaMeta interface {
 // is used to specify if a MutableTableDescriptor is to be returned in the
 // result.
 type TableNameExistingResolver interface {
-	LookupObject(ctx context.Context, requireMutation bool, dbName, scName, obName string) (
+	LookupObject(ctx context.Context, flags ObjectLookupFlags, dbName, scName, obName string) (
 		found bool, objMeta NameResolutionResult, err error,
 	)
 }
@@ -273,14 +270,14 @@ type NameResolutionResult interface {
 func (t *TableName) ResolveExisting(
 	ctx context.Context,
 	r TableNameExistingResolver,
-	requireMutable bool,
+	lookupFlags ObjectLookupFlags,
 	curDb string,
 	searchPath sessiondata.SearchPath,
 ) (bool, NameResolutionResult, error) {
 	if t.ExplicitSchema {
 		if t.ExplicitCatalog {
 			// Already 3 parts: nothing to search. Delegate to the resolver.
-			return r.LookupObject(ctx, requireMutable, t.Catalog(), t.Schema(), t.Table())
+			return r.LookupObject(ctx, lookupFlags, t.Catalog(), t.Schema(), t.Table())
 		}
 		// Two parts: D.T.
 		// Try to use the current database, and be satisfied if it's sufficient to find the object.
@@ -290,14 +287,14 @@ func (t *TableName) ResolveExisting(
 		// database is not set. For example, `select * from
 		// pg_catalog.pg_tables` is meant to show all tables across all
 		// databases when there is no current database set.
-		if found, objMeta, err := r.LookupObject(ctx, requireMutable, curDb, t.Schema(), t.Table()); found || err != nil {
+		if found, objMeta, err := r.LookupObject(ctx, lookupFlags, curDb, t.Schema(), t.Table()); found || err != nil {
 			if err == nil {
 				t.CatalogName = Name(curDb)
 			}
 			return found, objMeta, err
 		}
 		// No luck so far. Compatibility with CockroachDB v1.1: try D.public.T instead.
-		if found, objMeta, err := r.LookupObject(ctx, requireMutable, t.Schema(), PublicSchema, t.Table()); found || err != nil {
+		if found, objMeta, err := r.LookupObject(ctx, lookupFlags, t.Schema(), PublicSchema, t.Table()); found || err != nil {
 			if err == nil {
 				t.CatalogName = t.SchemaName
 				t.SchemaName = PublicSchemaName
@@ -312,7 +309,7 @@ func (t *TableName) ResolveExisting(
 	// This is a naked table name. Use the search path.
 	iter := searchPath.Iter()
 	for next, ok := iter.Next(); ok; next, ok = iter.Next() {
-		if found, objMeta, err := r.LookupObject(ctx, requireMutable, curDb, next, t.Table()); found || err != nil {
+		if found, objMeta, err := r.LookupObject(ctx, lookupFlags, curDb, next, t.Table()); found || err != nil {
 			if err == nil {
 				t.CatalogName = Name(curDb)
 				t.SchemaName = Name(next)
@@ -435,7 +432,7 @@ func (n *UnresolvedName) ResolveFunction(
 		// The Star part of the condition is really an assertion. The
 		// parser should not have let this star propagate to a point where
 		// this method is called.
-		return nil, pgerror.Newf(pgerror.CodeInvalidNameError,
+		return nil, pgerror.Newf(pgcode.InvalidName,
 			"invalid function name: %s", n)
 	}
 
@@ -482,7 +479,7 @@ func (n *UnresolvedName) ResolveFunction(
 				extraMsg = fmt.Sprintf(", but %s() exists", rdef.Name)
 			}
 			return nil, pgerror.Newf(
-				pgerror.CodeUndefinedFunctionError, "unknown function: %s()%s", ErrString(n), extraMsg)
+				pgcode.UndefinedFunction, "unknown function: %s()%s", ErrString(n), extraMsg)
 		}
 	}
 
@@ -490,14 +487,50 @@ func (n *UnresolvedName) ResolveFunction(
 }
 
 func newInvColRef(fmt string, n *UnresolvedName) error {
-	return pgerror.NewWithDepthf(1, pgerror.CodeInvalidColumnReferenceError, fmt, n)
+	return pgerror.NewWithDepthf(1, pgcode.InvalidColumnReference, fmt, n)
 }
 
 func newInvTableNameError(n fmt.Stringer) error {
-	return pgerror.NewWithDepthf(1, pgerror.CodeInvalidNameError,
+	return pgerror.NewWithDepthf(1, pgcode.InvalidName,
 		"invalid table name: %s", n)
 }
 
 func newSourceNotFoundError(fmt string, args ...interface{}) error {
-	return pgerror.NewWithDepthf(1, pgerror.CodeUndefinedTableError, fmt, args...)
+	return pgerror.NewWithDepthf(1, pgcode.UndefinedTable, fmt, args...)
+}
+
+// CommonLookupFlags is the common set of flags for the various accessor interfaces.
+type CommonLookupFlags struct {
+	// if required is set, lookup will return an error if the item is not found.
+	Required bool
+	// if AvoidCached is set, lookup will avoid the cache (if any).
+	AvoidCached bool
+}
+
+// DatabaseLookupFlags is the flag struct suitable for GetDatabaseDesc().
+type DatabaseLookupFlags = CommonLookupFlags
+
+// DatabaseListFlags is the flag struct suitable for GetObjectNames().
+type DatabaseListFlags struct {
+	CommonLookupFlags
+	// ExplicitPrefix, when set, will cause the returned table names to
+	// have an explicit schema and catalog part.
+	ExplicitPrefix bool
+}
+
+// ObjectLookupFlags is the flag struct suitable for GetObjectDesc().
+type ObjectLookupFlags struct {
+	CommonLookupFlags
+	// return a MutableTableDescriptor
+	RequireMutable bool
+	IncludeOffline bool
+}
+
+// ObjectLookupFlagsWithRequired returns a default ObjectLookupFlags object
+// with just the Required flag true. This is a common configuration of the
+// flags.
+func ObjectLookupFlagsWithRequired() ObjectLookupFlags {
+	return ObjectLookupFlags{
+		CommonLookupFlags: CommonLookupFlags{Required: true},
+	}
 }

@@ -7,15 +7,6 @@ CREATE TABLE abcde (
     "e:write-only" INT NOT NULL
 )
 ----
-TABLE abcde
- ├── a int not null
- ├── b int
- ├── c int not null
- ├── d int
- ├── rowid int not null (hidden)
- ├── e int not null (mutation)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 exec-ddl
 CREATE TABLE xyz (
@@ -24,12 +15,6 @@ CREATE TABLE xyz (
     z FLOAT8
 )
 ----
-TABLE xyz
- ├── x string not null
- ├── y int not null
- ├── z float
- └── INDEX primary
-      └── x string not null
 
 # Properties with no RETURNING clause.
 build
@@ -72,6 +57,7 @@ project
       ├── side-effects, mutations
       ├── key: (5)
       ├── fd: ()-->(1), (5)-->(2-4)
+      ├── prune: (1-4)
       └── select
            ├── columns: a:7(int!null) b:8(int) c:9(int!null) d:10(int) rowid:11(int!null) e:12(int)
            ├── key: (11)
@@ -107,6 +93,7 @@ project
       ├── side-effects, mutations
       ├── key: ()
       ├── fd: ()-->(1-5)
+      ├── prune: (1-4)
       └── select
            ├── columns: a:7(int!null) b:8(int) c:9(int!null) d:10(int) rowid:11(int!null) e:12(int)
            ├── cardinality: [0 - 1]
@@ -140,6 +127,7 @@ project
       ├── side-effects, mutations
       ├── key: (5)
       ├── fd: (2)==(3), (3)==(2), (5)-->(1-4)
+      ├── prune: (1-4)
       └── select
            ├── columns: a:7(int!null) b:8(int!null) c:9(int!null) d:10(int) rowid:11(int!null) e:12(int)
            ├── key: (11)

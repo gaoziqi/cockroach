@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
@@ -18,13 +14,16 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/exprgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
 // Builder holds the context needed for building a memo structure from a SQL
@@ -53,6 +52,12 @@ import (
 // See factory.go and memo.go inside the opt/xform package for more details
 // about the memo structure.
 type Builder struct {
+
+	// -- Control knobs --
+	//
+	// These fields can be set before calling Build to control various aspects of
+	// the building process.
+
 	// AllowUnsupportedExpr is a control knob: if set, when building a scalar, the
 	// builder takes any TypedExpr node that it doesn't recognize and wraps that
 	// expression in an UnsupportedExpr node. This is temporary; it is used for
@@ -64,9 +69,10 @@ type Builder struct {
 	// This is used when re-preparing invalidated queries.
 	KeepPlaceholders bool
 
-	// IsCorrelated is set to true during semantic analysis if a scalar variable was
-	// pulled from an outer scope, that is, if the query was found to be correlated.
-	IsCorrelated bool
+	// -- Results --
+	//
+	// These fields are set during the building process and can be used after
+	// Build is called.
 
 	// HadPlaceholders is set to true if we replaced any placeholders with their
 	// values.
@@ -80,12 +86,11 @@ type Builder struct {
 	factory *norm.Factory
 	stmt    tree.Statement
 
-	ctx              context.Context
-	semaCtx          *tree.SemaContext
-	evalCtx          *tree.EvalContext
-	catalog          cat.Catalog
-	exprTransformCtx transform.ExprTransformContext
-	scopeAlloc       []scope
+	ctx        context.Context
+	semaCtx    *tree.SemaContext
+	evalCtx    *tree.EvalContext
+	catalog    cat.Catalog
+	scopeAlloc []scope
 
 	// If set, the planner will skip checking for the SELECT privilege when
 	// resolving data sources (tables, views, etc). This is used when compiling
@@ -100,6 +105,30 @@ type Builder struct {
 	// subquery contains a pointer to the subquery which is currently being built
 	// (if any).
 	subquery *subquery
+
+	// If set, we are processing a view definition; in this case, catalog caches
+	// are disabled and certain statements (like mutations) are disallowed.
+	insideViewDef bool
+
+	// If set, we are collecting view dependencies in viewDeps. This can only
+	// happen inside view definitions.
+	//
+	// When a view depends on another view, we only want to track the dependency
+	// on the inner view itself, and not the transitive dependencies (so
+	// trackViewDeps would be false inside that inner view).
+	trackViewDeps bool
+	viewDeps      opt.ViewDeps
+
+	// If set, the data source names in the AST are rewritten to the fully
+	// qualified version (after resolution). Used to construct the strings for
+	// CREATE VIEW and CREATE TABLE AS queries.
+	// TODO(radu): modifying the AST in-place is hacky; we will need to switch to
+	// using AST annotations.
+	qualifyDataSourceNamesInAST bool
+
+	// isCorrelated is set to true if we already reported to telemetry that the
+	// query contains a correlated subquery.
+	isCorrelated bool
 }
 
 // New creates a new Builder structure initialized with the given
@@ -126,21 +155,18 @@ func New(
 // Builder.factory from the parsed SQL statement in Builder.stmt. See the
 // comment above the Builder type declaration for details.
 //
-// If any subroutines panic with a builderError or pgerror.Error as part of the
-// build process, the panic is caught here and returned as an error.
+// If any subroutines panic with a non-runtime error as part of the build
+// process, the panic is caught here and returned as an error.
 func (b *Builder) Build() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			// This code allows us to propagate semantic and internal errors without
-			// adding lots of checks for `if err != nil` throughout the code. This is
-			// only possible because the code does not update shared state and does
-			// not manipulate locks.
-			switch e := r.(type) {
-			case builderError:
-				err = e.error
-			case *pgerror.Error:
+			// This code allows us to propagate errors without adding lots of checks
+			// for `if err != nil` throughout the construction code. This is only
+			// possible because the code does not update shared state and does not
+			// manipulate locks.
+			if ok, e := errorutil.ShouldCatch(r); ok {
 				err = e
-			default:
+			} else {
 				panic(r)
 			}
 		}
@@ -161,20 +187,11 @@ func (b *Builder) Build() (err error) {
 	return nil
 }
 
-// builderError is used to wrap errors returned by various external APIs that
-// occur during the build process. It exists for us to be able to panic on these
-// errors and then catch them inside Builder.Build even if they are not
-// pgerror.Error.
-type builderError struct {
-	error
-}
-
 // unimplementedWithIssueDetailf formats according to a format
 // specifier and returns a Postgres error with the
-// pg code FeatureNotSupported, wrapped in a
-// builderError.
+// pg code FeatureNotSupported.
 func unimplementedWithIssueDetailf(issue int, detail, format string, args ...interface{}) error {
-	return pgerror.UnimplementedWithIssueDetailf(issue, detail, format, args...)
+	return unimplemented.NewWithIssueDetailf(issue, detail, format, args...)
 }
 
 // buildStmt builds a set of memo groups that represent the given SQL
@@ -196,16 +213,22 @@ func unimplementedWithIssueDetailf(issue int, detail, format string, args ...int
 func (b *Builder) buildStmt(
 	stmt tree.Statement, desiredTypes []*types.T, inScope *scope,
 ) (outScope *scope) {
+	if b.insideViewDef {
+		// A black list of statements that can't be used from inside a view.
+		switch stmt := stmt.(type) {
+		case *tree.Delete, *tree.Insert, *tree.Update, *tree.CreateTable, *tree.CreateView,
+			*tree.Split, *tree.Unsplit, *tree.Relocate,
+			*tree.ControlJobs, *tree.CancelQueries, *tree.CancelSessions:
+			panic(pgerror.Newf(
+				pgcode.Syntax, "%s cannot be used inside a view definition", stmt.StatementTag(),
+			))
+		}
+	}
+
 	// NB: The case statements are sorted lexicographically.
 	switch stmt := stmt.(type) {
-	case *tree.CreateTable:
-		return b.buildCreateTable(stmt, inScope)
-
 	case *tree.Delete:
 		return b.buildDelete(stmt, inScope)
-
-	case *tree.Explain:
-		return b.buildExplain(stmt, inScope)
 
 	case *tree.Insert:
 		return b.buildInsert(stmt, inScope)
@@ -216,16 +239,48 @@ func (b *Builder) buildStmt(
 	case *tree.Select:
 		return b.buildSelect(stmt, desiredTypes, inScope)
 
-	case *tree.ShowTraceForSession:
-		return b.buildShowTrace(stmt, inScope)
-
 	case *tree.Update:
 		return b.buildUpdate(stmt, inScope)
 
+	case *tree.CreateTable:
+		return b.buildCreateTable(stmt, inScope)
+
+	case *tree.CreateView:
+		return b.buildCreateView(stmt, inScope)
+
+	case *tree.Explain:
+		return b.buildExplain(stmt, inScope)
+
+	case *tree.ShowTraceForSession:
+		return b.buildShowTrace(stmt, inScope)
+
+	case *tree.Split:
+		return b.buildAlterTableSplit(stmt, inScope)
+
+	case *tree.Unsplit:
+		return b.buildAlterTableUnsplit(stmt, inScope)
+
+	case *tree.Relocate:
+		return b.buildAlterTableRelocate(stmt, inScope)
+
+	case *tree.ControlJobs:
+		return b.buildControlJobs(stmt, inScope)
+
+	case *tree.CancelQueries:
+		return b.buildCancelQueries(stmt, inScope)
+
+	case *tree.CancelSessions:
+		return b.buildCancelSessions(stmt, inScope)
+
+	case *tree.Export:
+		return b.buildExport(stmt, inScope)
+
 	default:
+		// See if this statement can be rewritten to another statement using the
+		// delegate functionality.
 		newStmt, err := delegate.TryDelegate(b.ctx, b.catalog, b.evalCtx, stmt)
 		if err != nil {
-			panic(builderError{err})
+			panic(err)
 		}
 		if newStmt != nil {
 			// Many delegate implementations resolve objects. It would be tedious to
@@ -233,6 +288,14 @@ func (b *Builder) buildStmt(
 			// invalidation). We don't care about caching plans for these statements.
 			b.DisableMemoReuse = true
 			return b.buildStmt(newStmt, desiredTypes, inScope)
+		}
+
+		// See if we have an opaque handler registered for this statement type.
+		if outScope := b.tryBuildOpaque(stmt, inScope); outScope != nil {
+			// The opaque handler may resolve objects; we don't care about caching
+			// plans for these statements.
+			b.DisableMemoReuse = true
+			return outScope
 		}
 		panic(unimplementedWithIssueDetailf(34848, stmt.StatementTag(), "unsupported statement: %T", stmt))
 	}

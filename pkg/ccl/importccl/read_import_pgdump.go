@@ -18,15 +18,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 )
 
 type postgreStream struct {
@@ -266,7 +270,9 @@ func readPostgresCreateTable(
 					continue
 				}
 				for _, constraint := range constraints {
-					if err := sql.ResolveFK(evalCtx.Ctx(), nil /* txn */, fks.resolver, desc, constraint, backrefs, sql.NewTable); err != nil {
+					if err := sql.ResolveFK(
+						evalCtx.Ctx(), nil /* txn */, fks.resolver, desc, constraint, backrefs, sql.NewTable, tree.ValidationDefault, settings,
+					); err != nil {
 						return nil, err
 					}
 				}
@@ -287,9 +293,6 @@ func readPostgresCreateTable(
 			return ret, nil
 		}
 		if err != nil {
-			if pg, ok := pgerror.GetPGCause(err); ok {
-				return nil, errors.Errorf("%s\n%s", pg.Message, pg.Detail)
-			}
 			return nil, errors.Wrap(err, "postgres parse error")
 		}
 		switch stmt := stmt.(type) {
@@ -373,7 +376,7 @@ func readPostgresCreateTable(
 
 func getTableName(tn *tree.TableName) (string, error) {
 	if sc := tn.Schema(); sc != "" && sc != "public" {
-		return "", pgerror.Unimplementedf(
+		return "", unimplemented.Newf(
 			"import non-public schema",
 			"non-public schemas unsupported: %s", sc,
 		)
@@ -384,7 +387,7 @@ func getTableName(tn *tree.TableName) (string, error) {
 // getTableName variant for UnresolvedObjectName.
 func getTableName2(u *tree.UnresolvedObjectName) (string, error) {
 	if u.NumParts >= 2 && u.Parts[1] != "public" {
-		return "", pgerror.Unimplementedf(
+		return "", unimplemented.Newf(
 			"import non-public schema",
 			"non-public schemas unsupported: %s", u.Parts[1],
 		)
@@ -393,9 +396,9 @@ func getTableName2(u *tree.UnresolvedObjectName) (string, error) {
 }
 
 type pgDumpReader struct {
-	tables map[string]*rowConverter
-	descs  map[string]*sqlbase.TableDescriptor
-	kvCh   chan []roachpb.KeyValue
+	tables map[string]*row.DatumRowConverter
+	descs  map[string]*execinfrapb.ReadImportDataSpec_ImportTable
+	kvCh   chan row.KVBatch
 	opts   roachpb.PgDumpOptions
 }
 
@@ -403,15 +406,15 @@ var _ inputConverter = &pgDumpReader{}
 
 // newPgDumpReader creates a new inputConverter for pg_dump files.
 func newPgDumpReader(
-	kvCh chan []roachpb.KeyValue,
+	kvCh chan row.KVBatch,
 	opts roachpb.PgDumpOptions,
-	descs map[string]*sqlbase.TableDescriptor,
+	descs map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
 	evalCtx *tree.EvalContext,
 ) (*pgDumpReader, error) {
-	converters := make(map[string]*rowConverter, len(descs))
-	for name, desc := range descs {
-		if desc.IsTable() {
-			conv, err := newRowConverter(desc, evalCtx, kvCh)
+	converters := make(map[string]*row.DatumRowConverter, len(descs))
+	for name, table := range descs {
+		if table.Desc.IsTable() {
+			conv, err := row.NewDatumRowConverter(table.Desc, nil /* targetColNames */, evalCtx, kvCh)
 			if err != nil {
 				return nil, err
 			}
@@ -437,18 +440,22 @@ func (m *pgDumpReader) readFiles(
 	ctx context.Context,
 	dataFiles map[int32]string,
 	format roachpb.IOFileFormat,
-	progressFn func(float32) error,
-	settings *cluster.Settings,
+	makeExternalStorage cloud.ExternalStorageFactory,
 ) error {
-	return readInputFiles(ctx, dataFiles, format, m.readFile, progressFn, settings)
+	return readInputFiles(ctx, dataFiles, format, m.readFile, makeExternalStorage)
 }
 
 func (m *pgDumpReader) readFile(
-	ctx context.Context, input io.Reader, inputIdx int32, inputName string, progressFn progressFn,
+	ctx context.Context, input *fileReader, inputIdx int32, inputName string, rejected chan string,
 ) error {
 	var inserts, count int64
 	ps := newPostgreStream(input, int(m.opts.MaxRowSize))
 	semaCtx := &tree.SemaContext{}
+	for _, conv := range m.tables {
+		conv.KvBatch.Source = inputIdx
+		conv.FractionFn = input.ReadFraction
+	}
+
 	for {
 		stmt, err := ps.Next()
 		if err == io.EOF {
@@ -483,23 +490,23 @@ func (m *pgDumpReader) readFile(
 			startingCount := count
 			for _, tuple := range values.Rows {
 				count++
-				if expected, got := len(conv.visibleCols), len(tuple); expected != got {
+				if expected, got := len(conv.VisibleCols), len(tuple); expected != got {
 					return errors.Errorf("expected %d values, got %d: %v", expected, got, tuple)
 				}
 				for i, expr := range tuple {
-					typed, err := expr.TypeCheck(semaCtx, conv.visibleColTypes[i])
+					typed, err := expr.TypeCheck(semaCtx, conv.VisibleColTypes[i])
 					if err != nil {
 						return errors.Wrapf(err, "reading row %d (%d in insert statement %d)",
 							count, count-startingCount, inserts)
 					}
-					converted, err := typed.Eval(conv.evalCtx)
+					converted, err := typed.Eval(conv.EvalCtx)
 					if err != nil {
 						return errors.Wrapf(err, "reading row %d (%d in insert statement %d)",
 							count, count-startingCount, inserts)
 					}
-					conv.datums[i] = converted
+					conv.Datums[i] = converted
 				}
-				if err := conv.row(ctx, inputIdx, count); err != nil {
+				if err := conv.Row(ctx, inputIdx, count); err != nil {
 					return err
 				}
 			}
@@ -516,11 +523,11 @@ func (m *pgDumpReader) readFile(
 				return errors.Errorf("missing schema info for requested table %q", name)
 			}
 			if conv != nil {
-				if expected, got := len(conv.visibleCols), len(i.Columns); expected != got {
+				if expected, got := len(conv.VisibleCols), len(i.Columns); expected != got {
 					return errors.Errorf("expected %d columns, got %d", expected, got)
 				}
 				for colI, col := range i.Columns {
-					if string(col) != conv.visibleCols[colI].Name {
+					if string(col) != conv.VisibleCols[colI].Name {
 						return errors.Errorf("COPY columns do not match table columns for table %s", name)
 					}
 				}
@@ -529,7 +536,7 @@ func (m *pgDumpReader) readFile(
 				row, err := ps.Next()
 				// We expect an explicit copyDone here. io.EOF is unexpected.
 				if err == io.EOF {
-					return makeRowErr(inputName, count, pgerror.CodeProtocolViolationError,
+					return makeRowErr(inputName, count, pgcode.ProtocolViolation,
 						"unexpected EOF")
 				}
 				if row == errCopyDone {
@@ -537,34 +544,34 @@ func (m *pgDumpReader) readFile(
 				}
 				count++
 				if err != nil {
-					return wrapRowErr(err, inputName, count, pgerror.CodeDataExceptionError, "")
+					return wrapRowErr(err, inputName, count, pgcode.Uncategorized, "")
 				}
 				if !importing {
 					continue
 				}
 				switch row := row.(type) {
 				case copyData:
-					if expected, got := len(conv.visibleCols), len(row); expected != got {
-						return makeRowErr(inputName, count, pgerror.CodeSyntaxError,
+					if expected, got := len(conv.VisibleCols), len(row); expected != got {
+						return makeRowErr(inputName, count, pgcode.Syntax,
 							"expected %d values, got %d", expected, got)
 					}
 					for i, s := range row {
 						if s == nil {
-							conv.datums[i] = tree.DNull
+							conv.Datums[i] = tree.DNull
 						} else {
-							conv.datums[i], err = tree.ParseDatumStringAs(conv.visibleColTypes[i], *s, conv.evalCtx)
+							conv.Datums[i], err = tree.ParseDatumStringAs(conv.VisibleColTypes[i], *s, conv.EvalCtx)
 							if err != nil {
-								col := conv.visibleCols[i]
-								return wrapRowErr(err, inputName, count, pgerror.CodeSyntaxError,
+								col := conv.VisibleCols[i]
+								return wrapRowErr(err, inputName, count, pgcode.Syntax,
 									"parse %q as %s", col.Name, col.Type.SQLString())
 							}
 						}
 					}
-					if err := conv.row(ctx, inputIdx, count); err != nil {
+					if err := conv.Row(ctx, inputIdx, count); err != nil {
 						return err
 					}
 				default:
-					return makeRowErr(inputName, count, pgerror.CodeDataExceptionError,
+					return makeRowErr(inputName, count, pgcode.Uncategorized,
 						"unexpected: %v", row)
 				}
 			}
@@ -615,13 +622,15 @@ func (m *pgDumpReader) readFile(
 			if seq == nil {
 				break
 			}
-			key, val, err := sql.MakeSequenceKeyVal(seq, val, isCalled)
+			key, val, err := sql.MakeSequenceKeyVal(seq.Desc, val, isCalled)
 			if err != nil {
-				return wrapRowErr(err, inputName, count, pgerror.CodeDataExceptionError, "")
+				return wrapRowErr(err, inputName, count, pgcode.Uncategorized, "")
 			}
 			kv := roachpb.KeyValue{Key: key}
 			kv.Value.SetInt(val)
-			m.kvCh <- []roachpb.KeyValue{kv}
+			m.kvCh <- row.KVBatch{
+				Source: inputIdx, KVs: []roachpb.KeyValue{kv}, Progress: input.ReadFraction(),
+			}
 		default:
 			if log.V(3) {
 				log.Infof(ctx, "ignoring %T stmt: %v", i, i)
@@ -630,7 +639,7 @@ func (m *pgDumpReader) readFile(
 		}
 	}
 	for _, conv := range m.tables {
-		if err := conv.sendBatch(ctx); err != nil {
+		if err := conv.SendBatch(ctx); err != nil {
 			return err
 		}
 	}

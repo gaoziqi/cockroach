@@ -101,7 +101,7 @@
 #       be ordered before PushFilterIntoJoinLeft (otherwise,
 #       PushFilterIntoJoinLeft might need to be applied multiple times).
 [MapFilterIntoJoinLeft, Normalize]
-(InnerJoin | InnerJoinApply | RightJoin | RightJoinApply | SemiJoin | SemiJoinApply
+(InnerJoin | InnerJoinApply | RightJoin | SemiJoin | SemiJoinApply
     $left:* & ^(HasOuterCols $left)
     $right:*
     $on:[
@@ -148,6 +148,42 @@
     $private
 )
 
+# MapEqualityIntoJoinLeftAndRight checks whether it is possible to map
+# equality conditions in a join to use different variables so that the
+# number of conditions crossing both sides of a join are minimized. If so,
+# the MapEqualityConditions function performs this mapping to construct new
+# filters.
+#
+# For example, consider this query:
+#
+#   SELECT * FROM a, b WHERE a.x = b.x AND b.x = a.y;
+#
+# As written, both equality conditions contain variables from both sides of
+# the join. We can rewrite this query, however, so that only one condition
+# spans both sides:
+#
+#   SELECT * FROM a, b WHERE a.x = a.y AND b.x = a.y;
+#
+# Now the condition a.x = a.y is fully bound by the left side of the join,
+# and is available to be pushed down by PushFilterIntoJoinLeft.
+#
+# See the MapEqualityConditions function for more details.
+[MapEqualityIntoJoinLeftAndRight, Normalize]
+(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply | RightJoin |
+ SemiJoin | SemiJoinApply | AntiJoin | AntiJoinApply
+    $left:* & ^(HasOuterCols $left)
+    $right:* & ^(HasOuterCols $right)
+    $on:* & (CanMapJoinOpEqualities $on $leftCols:(OutputCols $left) $rightCols:(OutputCols $right))
+    $private:*
+)
+=>
+((OpName)
+    $left
+    $right
+    (MapJoinOpEqualities $on $leftCols $rightCols)
+    $private
+)
+
 # PushFilterIntoJoinLeft pushes Join filter conditions into the left side of the
 # join. This is possible in the case of InnerJoin and RightJoin, as long as the
 # condition has no dependencies on the right side of the join. Left and Full
@@ -171,7 +207,7 @@
 #
 # Citations: [1]
 [PushFilterIntoJoinLeft, Normalize]
-(InnerJoin | InnerJoinApply | RightJoin | RightJoinApply | SemiJoin | SemiJoinApply
+(InnerJoin | InnerJoinApply | RightJoin | SemiJoin | SemiJoinApply
     $left:* & ^(HasOuterCols $left)
     $right:*
     $on:[
@@ -224,7 +260,7 @@
 # join only populates the right side with NULL values when it would otherwise
 # not be present.
 [SimplifyLeftJoinWithoutFilters, Normalize]
-(LeftJoin | LeftJoinApply | FullJoin | FullJoinApply
+(LeftJoin | LeftJoinApply | FullJoin
     $left:*
     $right:* & ^(CanHaveZeroRows $right)
     $on:[]
@@ -245,7 +281,7 @@
 # join only populates the left side with NULL values when it would otherwise not
 # be present.
 [SimplifyRightJoinWithoutFilters, Normalize]
-(RightJoin | RightJoinApply | FullJoin | FullJoinApply
+(RightJoin | FullJoin
     $left:* & ^(CanHaveZeroRows $left)
     $right:*
     $on:[]
@@ -278,7 +314,7 @@
 #   =>
 #   SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id
 [SimplifyLeftJoinWithFilters, Normalize]
-(LeftJoin | LeftJoinApply | FullJoin | FullJoinApply
+(LeftJoin | LeftJoinApply | FullJoin
     $left:*
     $right:*
     $on:^[] & (JoinFiltersMatchAllLeftRows $left $right $on)
@@ -299,7 +335,7 @@
 # is symmetric with SimplifyLeftJoinWithFilters; see that rule for more details
 # and examples.
 [SimplifyRightJoinWithFilters, Normalize]
-(RightJoin | RightJoinApply | FullJoin | FullJoinApply
+(RightJoin | FullJoin
     $left:*
     $right:*
     $on:^[] & (JoinFiltersMatchAllLeftRows $right $left $on)
@@ -325,6 +361,16 @@
 =>
 $left
 
+# SimplifyZeroCardinalitySemiJoin converts a SemiJoin operator to an empty
+# Values when it's known that the right input never returns any rows.
+[SimplifyZeroCardinalitySemiJoin, Normalize]
+(SemiJoin | SemiJoinApply
+    $left:*
+    $right:* & (HasZeroRows $right)
+)
+=>
+(ConstructEmptyValues (OutputCols $left))
+
 # EliminateAntiJoin discards an AntiJoin operator when it's known that the right
 # input never returns any rows.
 [EliminateAntiJoin, Normalize]
@@ -334,6 +380,18 @@ $left
 )
 =>
 $left
+
+# SimplifyZeroCardinalityAntiJoin converts an AntiJoin operator to an empty
+# Values when it's known that the right input never returns zero rows, and
+# there is no join condition.
+[SimplifyZeroCardinalityAntiJoin, Normalize]
+(AntiJoin | AntiJoinApply
+    $left:*
+    $right:* & ^(CanHaveZeroRows $right)
+    []
+)
+=>
+(ConstructEmptyValues (OutputCols $left))
 
 # EliminateJoinNoColsLeft eliminates an InnerJoin with a one row, zero column
 # left input set. These can be produced when a Values, scalar GroupBy, or other

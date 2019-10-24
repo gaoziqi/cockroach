@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stateloader
 
@@ -74,10 +70,6 @@ func (rsl StateLoader) Load(
 	s.Lease = &lease
 
 	if s.GCThreshold, err = rsl.LoadGCThreshold(ctx, reader); err != nil {
-		return storagepb.ReplicaState{}, err
-	}
-
-	if s.TxnSpanGCThreshold, err = rsl.LoadTxnSpanGCThreshold(ctx, reader); err != nil {
 		return storagepb.ReplicaState{}, err
 	}
 
@@ -147,9 +139,6 @@ func (rsl StateLoader) Save(
 		return enginepb.MVCCStats{}, err
 	}
 	if err := rsl.SetGCThreshold(ctx, eng, ms, state.GCThreshold); err != nil {
-		return enginepb.MVCCStats{}, err
-	}
-	if err := rsl.SetTxnSpanGCThreshold(ctx, eng, ms, state.TxnSpanGCThreshold); err != nil {
 		return enginepb.MVCCStats{}, err
 	}
 	if truncStateType == TruncatedStateLegacyReplicated {
@@ -304,7 +293,8 @@ func (rsl StateLoader) SetRangeAppliedState(
 	return engine.MVCCPutProto(ctx, eng, ms, rsl.RangeAppliedStateKey(), hlc.Timestamp{}, nil, &as)
 }
 
-// MigrateToRangeAppliedStateKey TODO
+// MigrateToRangeAppliedStateKey deletes the keys that were replaced by the
+// RangeAppliedState key.
 func (rsl StateLoader) MigrateToRangeAppliedStateKey(
 	ctx context.Context, eng engine.ReadWriter, ms *enginepb.MVCCStats,
 ) error {
@@ -404,7 +394,11 @@ func (rsl StateLoader) CalcAppliedIndexSysBytes(appliedIndex, leaseAppliedIndex 
 func (rsl StateLoader) writeLegacyMVCCStatsInternal(
 	ctx context.Context, eng engine.ReadWriter, newMS *enginepb.MVCCStats,
 ) error {
-	return engine.MVCCPutProto(ctx, eng, nil, rsl.RangeStatsLegacyKey(), hlc.Timestamp{}, nil, newMS)
+	// NB: newMS is copied to prevent conditional calls to this method from
+	// causing the stats argument to escape. This is legacy code which does
+	// not need to be optimized for performance.
+	newMSCopy := *newMS
+	return engine.MVCCPutProto(ctx, eng, nil, rsl.RangeStatsLegacyKey(), hlc.Timestamp{}, nil, &newMSCopy)
 }
 
 // SetLegacyMVCCStats overwrites the legacy MVCC stats key.
@@ -471,26 +465,16 @@ func (rsl StateLoader) SetGCThreshold(
 		rsl.RangeLastGCKey(), hlc.Timestamp{}, nil, threshold)
 }
 
-// LoadTxnSpanGCThreshold loads the transaction GC threshold.
-func (rsl StateLoader) LoadTxnSpanGCThreshold(
+// LoadLegacyTxnSpanGCThreshold loads the legacy transaction GC threshold. This
+// field is NOT populated in the ReplicaState value returned by StateLoader.Load.
+// TODO(nvanbenschoten): Remove in 20.1.
+func (rsl StateLoader) LoadLegacyTxnSpanGCThreshold(
 	ctx context.Context, reader engine.Reader,
 ) (*hlc.Timestamp, error) {
 	var t hlc.Timestamp
 	_, err := engine.MVCCGetProto(ctx, reader, rsl.RangeTxnSpanGCThresholdKey(),
 		hlc.Timestamp{}, &t, engine.MVCCGetOptions{})
 	return &t, err
-}
-
-// SetTxnSpanGCThreshold overwrites the transaction GC threshold.
-func (rsl StateLoader) SetTxnSpanGCThreshold(
-	ctx context.Context, eng engine.ReadWriter, ms *enginepb.MVCCStats, threshold *hlc.Timestamp,
-) error {
-	if threshold == nil {
-		return errors.New("cannot persist nil TxnSpanGCThreshold")
-	}
-
-	return engine.MVCCPutProto(ctx, eng, ms,
-		rsl.RangeTxnSpanGCThresholdKey(), hlc.Timestamp{}, nil, threshold)
 }
 
 // The rest is not technically part of ReplicaState.
@@ -557,13 +541,21 @@ func (rsl StateLoader) LoadRaftTruncatedState(
 
 // SetRaftTruncatedState overwrites the truncated state.
 func (rsl StateLoader) SetRaftTruncatedState(
-	ctx context.Context, eng engine.ReadWriter, truncState *roachpb.RaftTruncatedState,
+	ctx context.Context, eng engine.Writer, truncState *roachpb.RaftTruncatedState,
 ) error {
 	if (*truncState == roachpb.RaftTruncatedState{}) {
 		return errors.New("cannot persist empty RaftTruncatedState")
 	}
-	return engine.MVCCPutProto(ctx, eng, nil, /* ms */
-		rsl.RaftTruncatedStateKey(), hlc.Timestamp{}, nil, truncState)
+	// "Blind" because ms == nil and timestamp == hlc.Timestamp{}.
+	return engine.MVCCBlindPutProto(
+		ctx,
+		eng,
+		nil, /* ms */
+		rsl.RaftTruncatedStateKey(),
+		hlc.Timestamp{}, /* timestamp */
+		truncState,
+		nil, /* txn */
+	)
 }
 
 // LoadHardState loads the HardState.
@@ -582,10 +574,18 @@ func (rsl StateLoader) LoadHardState(
 
 // SetHardState overwrites the HardState.
 func (rsl StateLoader) SetHardState(
-	ctx context.Context, batch engine.ReadWriter, st raftpb.HardState,
+	ctx context.Context, batch engine.Writer, hs raftpb.HardState,
 ) error {
-	return engine.MVCCPutProto(ctx, batch, nil,
-		rsl.RaftHardStateKey(), hlc.Timestamp{}, nil, &st)
+	// "Blind" because ms == nil and timestamp == hlc.Timestamp{}.
+	return engine.MVCCBlindPutProto(
+		ctx,
+		batch,
+		nil, /* ms */
+		rsl.RaftHardStateKey(),
+		hlc.Timestamp{}, /* timestamp */
+		&hs,
+		nil, /* txn */
+	)
 }
 
 // SynthesizeRaftState creates a Raft state which synthesizes both a HardState

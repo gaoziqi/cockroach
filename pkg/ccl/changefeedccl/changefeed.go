@@ -12,7 +12,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -36,17 +35,6 @@ var changefeedPollInterval = func() *settings.DurationSetting {
 	s.SetSensitive()
 	return s
 }()
-
-// PushEnabled is a cluster setting that triggers all subsequently
-// created/unpaused changefeeds to receive kv changes via RangeFeed push
-// (instead of ExportRequest polling).
-var PushEnabled = settings.RegisterBoolSetting(
-	"changefeed.push.enabled",
-	"if set, changed are pushed instead of pulled. This requires the "+
-		"kv.rangefeed.enabled setting. See "+
-		base.DocsURL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`),
-	true,
-)
 
 const (
 	jsonMetaSentinel = `__crdb__`
@@ -162,11 +150,13 @@ func kvsToRows(
 // emitEntries connects to a sink, receives rows from a closure, and repeatedly
 // emits them to the sink. It returns a closure that may be repeatedly called to
 // advance the changefeed and which returns span-level resolved timestamp
-// updates. The returned closure is not threadsafe.
+// updates. The returned closure is not threadsafe. Note that rows read from
+// `inputFn` which precede or equal the Frontier of `sf` will not be emitted
+// because they're provably duplicates.
 func emitEntries(
 	settings *cluster.Settings,
 	details jobspb.ChangefeedDetails,
-	watchedSpans []roachpb.Span,
+	sf *spanFrontier,
 	encoder Encoder,
 	sink Sink,
 	inputFn func(context.Context) ([]emitEntry, error),
@@ -175,6 +165,18 @@ func emitEntries(
 ) func(context.Context) ([]jobspb.ResolvedSpan, error) {
 	var scratch bufalloc.ByteAllocator
 	emitRowFn := func(ctx context.Context, row encodeRow) error {
+		// Ensure that row updates are strictly newer than the least resolved timestamp
+		// being tracked by the local span frontier. The poller should not be forwarding
+		// row updates that have timestamps less than or equal to any resolved timestamp
+		// it's forwarded before.
+		// TODO(aayush): This should be an assertion once we're confident this can never
+		// happen under any circumstance.
+		if !sf.Frontier().Less(row.updated) {
+			log.Errorf(ctx, "cdc ux violation: detected timestamp %s that is less than "+
+				"or equal to the local frontier %s.", cloudStorageFormatTime(row.updated),
+				cloudStorageFormatTime(sf.Frontier()))
+			return nil
+		}
 		var keyCopy, valueCopy []byte
 		encodedKey, err := encoder.EncodeKey(row)
 		if err != nil {
@@ -203,12 +205,8 @@ func emitEntries(
 		return nil
 	}
 
-	// This SpanFrontier only tracks the spans being watched on this node.
-	// (There is a different SpanFrontier elsewhere for the entire changefeed.)
-	watchedSF := makeSpanFrontier(watchedSpans...)
-
 	var lastFlush time.Time
-	// TODO(dan): We could keep these in `watchedSF` to eliminate dups.
+	// TODO(dan): We could keep these in `sf` to eliminate dups.
 	var resolvedSpans []jobspb.ResolvedSpan
 
 	return func(ctx context.Context) ([]jobspb.ResolvedSpan, error) {
@@ -234,7 +232,7 @@ func emitEntries(
 				}
 			}
 			if input.resolved != nil {
-				_ = watchedSF.Forward(input.resolved.Span, input.resolved.Timestamp)
+				_ = sf.Forward(input.resolved.Span, input.resolved.Timestamp)
 				resolvedSpans = append(resolvedSpans, *input.resolved)
 			}
 		}

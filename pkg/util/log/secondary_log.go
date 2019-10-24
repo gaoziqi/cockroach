@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log
 
@@ -28,8 +24,9 @@ import (
 // whose logging events go to a different file than the main logging
 // facility.
 type SecondaryLogger struct {
-	logger          loggingT
+	logger          loggerT
 	msgCount        uint64
+	enableMsgCount  bool
 	forceSyncWrites bool
 }
 
@@ -48,30 +45,34 @@ var secondaryLogRegistry struct {
 //
 // The logger's GC daemon stops when the provided context is canceled.
 func NewSecondaryLogger(
-	ctx context.Context, dirName *DirName, fileNamePrefix string, enableGc, forceSyncWrites bool,
+	ctx context.Context,
+	dirName *DirName,
+	fileNamePrefix string,
+	enableGc bool,
+	forceSyncWrites bool,
+	enableMsgCount bool,
 ) *SecondaryLogger {
-	logging.mu.Lock()
-	defer logging.mu.Unlock()
+	mainLog.mu.Lock()
+	defer mainLog.mu.Unlock()
 	var dir string
 	if dirName != nil {
 		dir = dirName.String()
 	}
 	if dir == "" {
-		dir = logging.logDir.String()
+		dir = mainLog.logDir.String()
 	}
 	l := &SecondaryLogger{
-		logger: loggingT{
+		logger: loggerT{
 			logDir:           DirName{name: dir},
-			noStderrRedirect: true,
 			prefix:           program + "-" + fileNamePrefix,
-			stderrThreshold:  logging.stderrThreshold,
 			fileThreshold:    Severity_INFO,
-			syncWrites:       forceSyncWrites || logging.syncWrites,
+			noStderrRedirect: true,
 			gcNotify:         make(chan struct{}, 1),
-			disableDaemons:   logging.disableDaemons,
 		},
 		forceSyncWrites: forceSyncWrites,
+		enableMsgCount:  enableMsgCount,
 	}
+	l.logger.mu.syncWrites = forceSyncWrites || mainLog.mu.syncWrites
 
 	// Ensure the registry knows about this logger.
 	secondaryLogRegistry.mu.Lock()
@@ -86,16 +87,33 @@ func NewSecondaryLogger(
 	return l
 }
 
-// Logf logs an event on a secondary logger.
-func (l *SecondaryLogger) Logf(ctx context.Context, format string, args ...interface{}) {
-	file, line, _ := caller.Lookup(1)
+func (l *SecondaryLogger) output(
+	ctx context.Context, sev Severity, format string, args ...interface{},
+) {
+	file, line, _ := caller.Lookup(2)
 	var buf strings.Builder
 	formatTags(ctx, &buf)
 
-	// Add a counter. This is important for auditing.
-	counter := atomic.AddUint64(&l.msgCount, 1)
-	fmt.Fprintf(&buf, "%d ", counter)
+	if l.enableMsgCount {
+		// Add a counter. This is important for the SQL audit logs.
+		counter := atomic.AddUint64(&l.msgCount, 1)
+		fmt.Fprintf(&buf, "%d ", counter)
+	}
 
-	fmt.Fprintf(&buf, format, args...)
+	if format == "" {
+		fmt.Fprint(&buf, args...)
+	} else {
+		fmt.Fprintf(&buf, format, args...)
+	}
 	l.logger.outputLogEntry(Severity_INFO, file, line, buf.String())
+}
+
+// Logf logs an event on a secondary logger.
+func (l *SecondaryLogger) Logf(ctx context.Context, format string, args ...interface{}) {
+	l.output(ctx, Severity_INFO, format, args...)
+}
+
+// LogSev logs an event at the specified severity on a secondary logger.
+func (l *SecondaryLogger) LogSev(ctx context.Context, sev Severity, args ...interface{}) {
+	l.output(ctx, Severity_INFO, "", args...)
 }

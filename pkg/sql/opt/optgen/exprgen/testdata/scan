@@ -1,17 +1,6 @@
 exec-ddl
 CREATE TABLE abc (a INT, b INT, c INT, INDEX ab(a, b))
 ----
-TABLE abc
- ├── a int
- ├── b int
- ├── c int
- ├── rowid int not null (hidden)
- ├── INDEX primary
- │    └── rowid int not null (hidden)
- └── INDEX ab
-      ├── a int
-      ├── b int
-      └── rowid int not null (hidden)
 
 expr
 (Scan [ (Table "abc") (Cols "a") ])
@@ -56,7 +45,7 @@ expr
 ----
 select
  ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int) t.public.abc.c:3(int)
- ├── stats: [rows=9.9, distinct(1)=1, null(1)=0]
+ ├── stats: [rows=10, distinct(1)=1, null(1)=0]
  ├── cost: 1080.03
  ├── fd: ()-->(1)
  ├── prune: (2,3)

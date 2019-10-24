@@ -1,27 +1,21 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package movr
 
 import (
 	"encoding/json"
-	"strings"
 
 	"golang.org/x/exp/rand"
 )
 
-const alpha = `abcdefghijklmnopqrstuvwxyz`
 const numerals = `1234567890`
 
 var vehicleTypes = [...]string{`skateboard`, `bike`, `scooter`}
@@ -35,26 +29,6 @@ func randString(rng *rand.Rand, length int, alphabet string) string {
 		buf[i] = alphabet[rng.Intn(len(alphabet))]
 	}
 	return string(buf)
-}
-
-func randWord(rng *rand.Rand) string {
-	return randString(rng, 7, alpha)
-}
-
-func randParagraph(rng *rand.Rand) string {
-	words := make([]string, rng.Intn(100))
-	for i := range words {
-		words[i] = randWord(rng)
-	}
-	return strings.Join(words, ` `)
-}
-
-func randName(rng *rand.Rand) string {
-	return randString(rng, 7, alpha) + ` ` + randString(rng, 10, alpha)
-}
-
-func randAddress(rng *rand.Rand) string {
-	return randString(rng, 20, alpha)
 }
 
 func randCreditCard(rng *rand.Rand) string {
@@ -75,6 +49,16 @@ func randVehicleStatus(rng *rand.Rand) string {
 	default:
 		return `lost`
 	}
+}
+
+func randLatLong(rng *rand.Rand) (float64, float64) {
+	lat, long := float64(-180+rng.Intn(360)), float64(-90+rng.Intn(180))
+	return lat, long
+}
+
+func randCity(rng *rand.Rand) string {
+	idx := rng.Int31n(int32(len(cities)))
+	return cities[idx].city
 }
 
 func randVehicleMetadata(rng *rand.Rand, vehicleType string) string {

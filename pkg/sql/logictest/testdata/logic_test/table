@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
-
 statement ok
 SET DATABASE = ""
 
@@ -62,6 +60,9 @@ CREATE TABLE c (
   UNIQUE (bar)
 )
 
+statement ok
+COMMENT ON INDEX c_foo_idx IS 'index_comment'
+
 query TTBITTBB colnames
 SHOW INDEXES FROM c
 ----
@@ -76,6 +77,23 @@ c           c_foo_bar_idx  true        2             bar          DESC       fal
 c           c_foo_bar_idx  true        3             id           ASC        false    true
 c           c_bar_key      false       1             bar          ASC        false    false
 c           c_bar_key      false       2             id           ASC        false    true
+
+query TTBITTBBT colnames
+SHOW INDEXES FROM c WITH COMMENT
+----
+table_name  index_name     non_unique  seq_in_index  column_name  direction  storing  implicit  comment
+c           primary        false       1             id           ASC        false    false     NULL
+c           primary        false       1             id           ASC        false    false     NULL
+c           primary        false       1             id           ASC        false    false     NULL
+c           c_foo_idx      true        1             foo          ASC        false    false     index_comment
+c           c_foo_idx      true        2             id           ASC        false    true      index_comment
+c           c_foo_idx1     true        1             foo          ASC        false    false     NULL
+c           c_foo_idx1     true        2             id           ASC        false    true      NULL
+c           c_foo_bar_idx  true        1             foo          ASC        false    false     NULL
+c           c_foo_bar_idx  true        2             bar          DESC       false    false     NULL
+c           c_foo_bar_idx  true        3             id           ASC        false    true      NULL
+c           c_bar_key      false       1             bar          ASC        false    false     NULL
+c           c_bar_key      false       2             id           ASC        false    true      NULL
 
 # primary keys can never be null
 
@@ -183,10 +201,10 @@ users       bar         false       2             name         ASC        false 
 statement error precision for type float must be at least 1 bit
 CREATE TABLE test.precision (x FLOAT(0))
 
-statement error scale \(2\) must be between 0 and precision \(0\) at or near "\)"
+statement error at or near "\)": syntax error: scale \(2\) must be between 0 and precision \(0\)
 CREATE TABLE test.precision (x DECIMAL(0, 2))
 
-statement error scale \(4\) must be between 0 and precision \(2\) at or near "\)"
+statement error at or near "\)": syntax error: scale \(4\) must be between 0 and precision \(2\)
 CREATE TABLE test.precision (x DECIMAL(2, 4))
 
 query TT
@@ -221,11 +239,11 @@ CREATE TABLE test.dupe_generated (
 query TTTTB colnames
 SHOW CONSTRAINTS FROM test.dupe_generated
 ----
-table_name      constraint_name  constraint_type  details           validated
-dupe_generated  check_bar        CHECK            CHECK (bar > 2)   true
-dupe_generated  check_foo        CHECK            CHECK (foo > 2)   true
-dupe_generated  check_foo1       CHECK            CHECK (foo < 10)  true
-dupe_generated  check_foo2       CHECK            CHECK (foo > 1)   true
+table_name      constraint_name  constraint_type  details             validated
+dupe_generated  check_bar        CHECK            CHECK ((bar > 2))   true
+dupe_generated  check_foo        CHECK            CHECK ((foo > 2))   true
+dupe_generated  check_foo1       CHECK            CHECK ((foo < 10))  true
+dupe_generated  check_foo2       CHECK            CHECK ((foo > 1))   true
 
 statement ok
 CREATE TABLE test.named_constraints (
@@ -271,13 +289,13 @@ test.public.named_constraints  CREATE TABLE named_constraints (
 query TTTTB colnames
 SHOW CONSTRAINTS FROM test.named_constraints
 ----
-table_name         constraint_name  constraint_type  details                                  validated
-named_constraints  bar              UNIQUE           UNIQUE (id ASC, name ASC)                true
-named_constraints  ck1              CHECK            CHECK (length(nickname) < 10)            true
-named_constraints  ck2              CHECK            CHECK (length(nickname) < length(name))  true
-named_constraints  pk               PRIMARY KEY      PRIMARY KEY (id ASC)                     true
-named_constraints  uq               UNIQUE           UNIQUE (email ASC)                       true
-named_constraints  uq2              UNIQUE           UNIQUE (username ASC)                    true
+table_name         constraint_name  constraint_type  details                                    validated
+named_constraints  bar              UNIQUE           UNIQUE (id ASC, name ASC)                  true
+named_constraints  ck1              CHECK            CHECK ((length(nickname) < 10))            true
+named_constraints  ck2              CHECK            CHECK ((length(nickname) < length(name)))  true
+named_constraints  pk               PRIMARY KEY      PRIMARY KEY (id ASC)                       true
+named_constraints  uq               UNIQUE           UNIQUE (email ASC)                         true
+named_constraints  uq2              UNIQUE           UNIQUE (username ASC)                      true
 
 statement error duplicate constraint name: "pk"
 CREATE TABLE test.dupe_named_constraints (
@@ -463,7 +481,7 @@ query TT
 SHOW CREATE TABLE test.null_default
 ----
 test.public.null_default  CREATE TABLE null_default (
-                          ts TIMESTAMP NULL DEFAULT NULL,
+                          ts TIMESTAMP NULL,
                           FAMILY "primary" (ts, rowid)
 )
 

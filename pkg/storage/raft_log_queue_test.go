@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -36,6 +32,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/tracker"
 )
 
 func TestShouldTruncate(t *testing.T) {
@@ -89,10 +86,13 @@ func TestGetQuorumIndex(t *testing.T) {
 	}
 	for i, c := range testCases {
 		status := &raft.Status{
-			Progress: make(map[uint64]raft.Progress),
+			Progress: make(map[uint64]tracker.Progress),
 		}
 		for j, v := range c.progress {
-			status.Progress[uint64(j)] = raft.Progress{State: raft.ProgressStateReplicate, Match: v}
+			status.Progress[uint64(j)] = tracker.Progress{
+				State: tracker.StateReplicate,
+				Match: v,
+			}
 		}
 		quorumMatchedIndex := getQuorumIndex(status)
 		if c.expected != quorumMatchedIndex {
@@ -103,10 +103,10 @@ func TestGetQuorumIndex(t *testing.T) {
 	// Verify that only replicating followers are taken into account (i.e. others
 	// are treated as Match == 0).
 	status := &raft.Status{
-		Progress: map[uint64]raft.Progress{
-			1: {State: raft.ProgressStateReplicate, Match: 100},
-			2: {State: raft.ProgressStateSnapshot, Match: 100},
-			3: {State: raft.ProgressStateReplicate, Match: 90},
+		Progress: map[uint64]tracker.Progress{
+			1: {State: tracker.StateReplicate, Match: 100},
+			2: {State: tracker.StateSnapshot, Match: 100},
+			3: {State: tracker.StateReplicate, Match: 90},
 		},
 	}
 	assert.Equal(t, uint64(90), getQuorumIndex(status))
@@ -132,13 +132,13 @@ func TestComputeTruncateDecision(t *testing.T) {
 		{
 			// Nothing to truncate.
 			[]uint64{1, 2}, 100, 1, 1, 0,
-			"should truncate: false [truncate 0 entries to first index 1 (chosen via: quorum)]"},
+			"should truncate: false [truncate 0 entries to first index 1 (chosen via: last index)]"},
 		{
 			// Nothing to truncate on this replica, though a quorum elsewhere has more progress.
 			// NB this couldn't happen if we're truly the Raft leader, unless we appended to our
 			// own log asynchronously.
 			[]uint64{1, 5, 5}, 100, 1, 1, 0,
-			"should truncate: false [truncate 0 entries to first index 1 (chosen via: followers)]",
+			"should truncate: false [truncate 0 entries to first index 1 (chosen via: last index)]",
 		},
 		{
 			// We're not truncating anything, but one follower is already cut off. There's no pending
@@ -149,7 +149,7 @@ func TestComputeTruncateDecision(t *testing.T) {
 		{
 			// The happy case.
 			[]uint64{5, 5, 5}, 100, 2, 5, 0,
-			"should truncate: false [truncate 3 entries to first index 5 (chosen via: quorum)]",
+			"should truncate: false [truncate 3 entries to first index 5 (chosen via: last index)]",
 		},
 		{
 			// No truncation, but the outstanding snapshot is made obsolete by the truncation. However
@@ -174,10 +174,10 @@ func TestComputeTruncateDecision(t *testing.T) {
 			[]uint64{1, 2, 3, 4}, 100, 2, 2, 0,
 			"should truncate: false [truncate 0 entries to first index 2 (chosen via: first index)]",
 		},
-		// If over targetSize, should truncate to quorum committed index. Minority will need snapshots.
+		// Don't truncate off active followers, even if over targetSize.
 		{
 			[]uint64{1, 3, 3, 4}, 2000, 1, 3, 0,
-			"should truncate: false [truncate 2 entries to first index 3 (chosen via: quorum); log too large (2.0 KiB > 1000 B); implies 1 Raft snapshot]",
+			"should truncate: false [truncate 0 entries to first index 1 (chosen via: followers); log too large (2.0 KiB > 1000 B)]",
 		},
 		// Don't truncate away pending snapshot, even when log too large.
 		{
@@ -186,11 +186,11 @@ func TestComputeTruncateDecision(t *testing.T) {
 		},
 		{
 			[]uint64{1, 3, 3, 4}, 2000, 2, 3, 0,
-			"should truncate: false [truncate 1 entries to first index 3 (chosen via: quorum); log too large (2.0 KiB > 1000 B)]",
+			"should truncate: false [truncate 0 entries to first index 2 (chosen via: first index); log too large (2.0 KiB > 1000 B)]",
 		},
 		{
 			[]uint64{1, 3, 3, 4}, 2000, 3, 3, 0,
-			"should truncate: false [truncate 0 entries to first index 3 (chosen via: quorum); log too large (2.0 KiB > 1000 B)]",
+			"should truncate: false [truncate 0 entries to first index 3 (chosen via: first index); log too large (2.0 KiB > 1000 B)]",
 		},
 		// The pending snapshot index affects the quorum commit index.
 		{
@@ -213,12 +213,17 @@ func TestComputeTruncateDecision(t *testing.T) {
 			"should truncate: false [truncate 0 entries to first index 2 (chosen via: first index)]",
 		}}
 	for i, c := range testCases {
-		t.Run(fmt.Sprintf("%+v", c), func(t *testing.T) {
+		t.Run("", func(t *testing.T) {
 			status := raft.Status{
-				Progress: make(map[uint64]raft.Progress),
+				Progress: make(map[uint64]tracker.Progress),
 			}
 			for j, v := range c.progress {
-				status.Progress[uint64(j)] = raft.Progress{RecentActive: true, State: raft.ProgressStateReplicate, Match: v, Next: v + 1}
+				status.Progress[uint64(j)] = tracker.Progress{
+					RecentActive: true,
+					State:        tracker.StateReplicate,
+					Match:        v,
+					Next:         v + 1,
+				}
 			}
 			input := truncateDecisionInput{
 				RaftStatus:                     status,
@@ -231,7 +236,7 @@ func TestComputeTruncateDecision(t *testing.T) {
 			}
 			decision := computeTruncateDecision(input)
 			if act, exp := decision.String(), c.exp; act != exp {
-				t.Errorf("%d: got:\n%s\nwanted:\n%s", i, act, exp)
+				t.Errorf("%d:\ngot:\n%s\nwanted:\n%s", i, act, exp)
 			}
 
 			// Verify the triggers that queue a range for recomputation. In
@@ -270,37 +275,37 @@ func TestComputeTruncateDecisionProgressStatusProbe(t *testing.T) {
 	exp := map[bool]map[bool]string{ // (tooLarge, active)
 		false: {
 			true:  "should truncate: false [truncate 0 entries to first index 10 (chosen via: probing follower)]",
-			false: "should truncate: true [truncate 190 entries to first index 200 (chosen via: followers)]",
+			false: "should truncate: false [truncate 0 entries to first index 10 (chosen via: first index)]",
 		},
 		true: {
 			true:  "should truncate: false [truncate 0 entries to first index 10 (chosen via: probing follower); log too large (2.0 KiB > 1.0 KiB)]",
-			false: "should truncate: true [truncate 290 entries to first index 300 (chosen via: quorum); log too large (2.0 KiB > 1.0 KiB); implies 1 Raft snapshot]",
+			false: "should truncate: true [truncate 190 entries to first index 200 (chosen via: followers); log too large (2.0 KiB > 1.0 KiB)]",
 		},
 	}
 
 	testutils.RunTrueAndFalse(t, "tooLarge", func(t *testing.T, tooLarge bool) {
 		testutils.RunTrueAndFalse(t, "active", func(t *testing.T, active bool) {
 			status := raft.Status{
-				Progress: make(map[uint64]raft.Progress),
+				Progress: make(map[uint64]tracker.Progress),
 			}
 			for j, v := range []uint64{100, 200, 300, 400, 500} {
-				var pr raft.Progress
+				var pr tracker.Progress
 				if v == 100 {
 					// A probing follower is probed with some index (Next) but
 					// it has a zero Match (i.e. no idea how much of its log
 					// agrees with ours).
-					pr = raft.Progress{
+					pr = tracker.Progress{
 						RecentActive: active,
-						State:        raft.ProgressStateProbe,
+						State:        tracker.StateProbe,
 						Match:        0,
 						Next:         v,
 					}
 				} else { // everyone else
-					pr = raft.Progress{
+					pr = tracker.Progress{
 						Match:        v,
 						Next:         v + 1,
 						RecentActive: true,
-						State:        raft.ProgressStateReplicate,
+						State:        tracker.StateReplicate,
 					}
 				}
 				status.Progress[uint64(j)] = pr
@@ -339,15 +344,15 @@ func TestTruncateDecisionNumSnapshots(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	status := raft.Status{
-		Progress: map[uint64]raft.Progress{
+		Progress: map[uint64]tracker.Progress{
 			// Fully caught up.
-			5: {State: raft.ProgressStateReplicate, Match: 11, Next: 12},
+			5: {State: tracker.StateReplicate, Match: 11, Next: 12},
 			// Behind.
-			6: {State: raft.ProgressStateReplicate, Match: 10, Next: 11},
+			6: {State: tracker.StateReplicate, Match: 10, Next: 11},
 			// Last MsgApp in flight, so basically caught up.
-			7: {State: raft.ProgressStateReplicate, Match: 10, Next: 12},
-			8: {State: raft.ProgressStateProbe},    // irrelevant
-			9: {State: raft.ProgressStateSnapshot}, // irrelevant
+			7: {State: tracker.StateReplicate, Match: 10, Next: 12},
+			8: {State: tracker.StateProbe},    // irrelevant
+			9: {State: tracker.StateSnapshot}, // irrelevant
 		},
 	}
 
@@ -378,12 +383,12 @@ func TestUpdateRaftStatusActivity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	type testCase struct {
-		prs        []raft.Progress
+		prs        []tracker.Progress
 		replicas   []roachpb.ReplicaDescriptor
 		lastUpdate lastUpdateTimesMap
 		now        time.Time
 
-		exp []raft.Progress
+		exp []tracker.Progress
 	}
 
 	now := timeutil.Now()
@@ -392,20 +397,20 @@ func TestUpdateRaftStatusActivity(t *testing.T) {
 		// No data, no crash.
 		{},
 		// No knowledge = no update.
-		{prs: []raft.Progress{{RecentActive: true}}, exp: []raft.Progress{{RecentActive: true}}},
-		{prs: []raft.Progress{{RecentActive: false}}, exp: []raft.Progress{{RecentActive: false}}},
+		{prs: []tracker.Progress{{RecentActive: true}}, exp: []tracker.Progress{{RecentActive: true}}},
+		{prs: []tracker.Progress{{RecentActive: false}}, exp: []tracker.Progress{{RecentActive: false}}},
 		// See replica in descriptor but then don't find it in the map. Assumes the follower is not
 		// active.
 		{
 			replicas: []roachpb.ReplicaDescriptor{{ReplicaID: 1}},
-			prs:      []raft.Progress{{RecentActive: true}},
-			exp:      []raft.Progress{{RecentActive: false}},
+			prs:      []tracker.Progress{{RecentActive: true}},
+			exp:      []tracker.Progress{{RecentActive: false}},
 		},
 		// Three replicas in descriptor. The first one responded recently, the second didn't,
 		// the third did but it doesn't have a Progress.
 		{
 			replicas: []roachpb.ReplicaDescriptor{{ReplicaID: 1}, {ReplicaID: 2}, {ReplicaID: 3}},
-			prs:      []raft.Progress{{RecentActive: false}, {RecentActive: true}},
+			prs:      []tracker.Progress{{RecentActive: false}, {RecentActive: true}},
 			lastUpdate: map[roachpb.ReplicaID]time.Time{
 				1: now.Add(-1 * MaxQuotaReplicaLivenessDuration / 2),
 				2: now.Add(-1 - MaxQuotaReplicaLivenessDuration),
@@ -413,7 +418,7 @@ func TestUpdateRaftStatusActivity(t *testing.T) {
 			},
 			now: now,
 
-			exp: []raft.Progress{{RecentActive: true}, {RecentActive: false}},
+			exp: []tracker.Progress{{RecentActive: true}, {RecentActive: false}},
 		},
 	}
 
@@ -421,11 +426,11 @@ func TestUpdateRaftStatusActivity(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run("", func(t *testing.T) {
-			prs := make(map[uint64]raft.Progress)
+			prs := make(map[uint64]tracker.Progress)
 			for i, pr := range tc.prs {
 				prs[uint64(i+1)] = pr
 			}
-			expPRs := make(map[uint64]raft.Progress)
+			expPRs := make(map[uint64]tracker.Progress)
 			for i, pr := range tc.exp {
 				expPRs[uint64(i+1)] = pr
 			}
@@ -467,6 +472,9 @@ func TestNewTruncateDecisionMaxSize(t *testing.T) {
 // removed.
 func TestNewTruncateDecision(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	t.Skip("https://github.com/cockroachdb/cockroach/issues/38584")
+
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
 	store, _ := createTestStore(t,
@@ -652,6 +660,7 @@ func TestSnapshotLogTruncationConstraints(t *testing.T) {
 
 	ctx := context.Background()
 	r := &Replica{}
+	var storeID roachpb.StoreID
 	id1, id2 := uuid.MakeV4(), uuid.MakeV4()
 	const (
 		index1 = 50
@@ -659,7 +668,7 @@ func TestSnapshotLogTruncationConstraints(t *testing.T) {
 	)
 
 	// Add first constraint.
-	r.addSnapshotLogTruncationConstraintLocked(ctx, id1, index1)
+	r.addSnapshotLogTruncationConstraintLocked(ctx, id1, index1, storeID)
 	exp1 := map[uuid.UUID]snapTruncationInfo{id1: {index: index1}}
 
 	// Make sure it registered.
@@ -668,14 +677,15 @@ func TestSnapshotLogTruncationConstraints(t *testing.T) {
 	// Add another constraint with the same id. Extremely unlikely in practice
 	// but we want to make sure it doesn't blow anything up. Collisions are
 	// handled by ignoring the colliding update.
-	r.addSnapshotLogTruncationConstraintLocked(ctx, id1, index2)
+	r.addSnapshotLogTruncationConstraintLocked(ctx, id1, index2, storeID)
 	assert.Equal(t, r.mu.snapshotLogTruncationConstraints, exp1)
 
 	// Helper that grabs the min constraint index (which can trigger GC as a
 	// byproduct) and asserts.
 	assertMin := func(exp uint64, now time.Time) {
 		t.Helper()
-		if maxIndex := r.getAndGCSnapshotLogTruncationConstraintsLocked(now); maxIndex != exp {
+		const anyRecipientStore roachpb.StoreID = 0
+		if maxIndex := r.getAndGCSnapshotLogTruncationConstraintsLocked(now, anyRecipientStore); maxIndex != exp {
 			t.Fatalf("unexpected max index %d, wanted %d", maxIndex, exp)
 		}
 	}
@@ -686,7 +696,7 @@ func TestSnapshotLogTruncationConstraints(t *testing.T) {
 
 	// Add another, higher, index. We're not going to notice it's around
 	// until the lower one disappears.
-	r.addSnapshotLogTruncationConstraintLocked(ctx, id2, index2)
+	r.addSnapshotLogTruncationConstraintLocked(ctx, id2, index2, storeID)
 
 	now := timeutil.Now()
 	// The colliding snapshot comes back. Or the original, we can't tell.
@@ -714,10 +724,11 @@ func TestSnapshotLogTruncationConstraints(t *testing.T) {
 func TestTruncateLog(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
+	cfg := TestStoreConfig(nil)
+	cfg.TestingKnobs.DisableRaftLogQueue = true
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	tc.Start(t, stopper)
-	tc.repl.store.SetRaftLogQueueActive(false)
+	tc.StartWithStoreConfig(t, stopper, cfg)
 
 	// Populate the log with 10 entries. Save the LastIndex after each write.
 	var indexes []uint64
@@ -879,10 +890,11 @@ func TestTruncateLogRecompute(t *testing.T) {
 	tc := testContext{
 		engine: eng,
 	}
+	cfg := TestStoreConfig(nil)
+	cfg.TestingKnobs.DisableRaftLogQueue = true
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
-	tc.Start(t, stopper)
-	tc.repl.store.SetRaftLogQueueActive(false)
+	tc.StartWithStoreConfig(t, stopper, cfg)
 
 	key := roachpb.Key("a")
 	repl := tc.store.LookupReplica(keys.MustAddr(key))

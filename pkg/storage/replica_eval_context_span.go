@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -23,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
@@ -87,6 +84,11 @@ func (rec *SpanSetReplicaEvalContext) NodeID() roachpb.NodeID {
 	return rec.i.NodeID()
 }
 
+// GetNodeLocality returns the node locality.
+func (rec *SpanSetReplicaEvalContext) GetNodeLocality() roachpb.Locality {
+	return rec.i.GetNodeLocality()
+}
+
 // Engine returns the engine.
 func (rec *SpanSetReplicaEvalContext) Engine() engine.Engine {
 	return rec.i.Engine()
@@ -147,12 +149,12 @@ func (rec SpanSetReplicaEvalContext) GetSplitQPS() float64 {
 // for the provided transaction information. See Replica.CanCreateTxnRecord
 // for details about its arguments, return values, and preconditions.
 func (rec SpanSetReplicaEvalContext) CanCreateTxnRecord(
-	txnID uuid.UUID, txnKey []byte, txnMinTSUpperBound hlc.Timestamp,
+	txnID uuid.UUID, txnKey []byte, txnMinTS hlc.Timestamp,
 ) (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
 	rec.ss.AssertAllowed(spanset.SpanReadOnly,
 		roachpb.Span{Key: keys.TransactionKey(txnKey, txnID)},
 	)
-	return rec.i.CanCreateTxnRecord(txnID, txnKey, txnMinTSUpperBound)
+	return rec.i.CanCreateTxnRecord(txnID, txnKey, txnMinTS)
 }
 
 // GetGCThreshold returns the GC threshold of the Range, typically updated when
@@ -163,15 +165,6 @@ func (rec SpanSetReplicaEvalContext) GetGCThreshold() hlc.Timestamp {
 		roachpb.Span{Key: keys.RangeLastGCKey(rec.GetRangeID())},
 	)
 	return rec.i.GetGCThreshold()
-}
-
-// GetTxnSpanGCThreshold returns the time of the Replica's last
-// transaction span GC.
-func (rec SpanSetReplicaEvalContext) GetTxnSpanGCThreshold() hlc.Timestamp {
-	rec.ss.AssertAllowed(spanset.SpanReadOnly,
-		roachpb.Span{Key: keys.RangeTxnSpanGCThresholdKey(rec.GetRangeID())},
-	)
-	return rec.i.GetTxnSpanGCThreshold()
 }
 
 // String implements Stringer.
@@ -203,4 +196,19 @@ func (rec SpanSetReplicaEvalContext) GetLease() (roachpb.Lease, roachpb.Lease) {
 // GetLimiters returns the per-store limiters.
 func (rec *SpanSetReplicaEvalContext) GetLimiters() *batcheval.Limiters {
 	return rec.i.GetLimiters()
+}
+
+// GetExternalStorage returns an ExternalStorage object, based on
+// information parsed from a URI, stored in `dest`.
+func (rec *SpanSetReplicaEvalContext) GetExternalStorage(
+	ctx context.Context, dest roachpb.ExternalStorage,
+) (cloud.ExternalStorage, error) {
+	return rec.i.GetExternalStorage(ctx, dest)
+}
+
+// GetExternalStorageFromURI returns an ExternalStorage object, based on the given URI.
+func (rec *SpanSetReplicaEvalContext) GetExternalStorageFromURI(
+	ctx context.Context, uri string,
+) (cloud.ExternalStorage, error) {
+	return rec.i.GetExternalStorageFromURI(ctx, uri)
 }

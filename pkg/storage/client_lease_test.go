@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -18,7 +14,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
@@ -106,7 +101,7 @@ func TestStoreRangeLeaseSwitcheroo(t *testing.T) {
 	// re-acquire, then check types again.
 	mtc.advanceClock(context.TODO())
 	if _, err := mtc.dbs[0].Inc(context.TODO(), splitKey, 1); err != nil {
-		t.Fatalf("failed to increment: %s", err)
+		t.Fatalf("failed to increment: %+v", err)
 	}
 
 	// We started with epoch ranges enabled, so verify we have an epoch lease.
@@ -123,7 +118,7 @@ func TestStoreRangeLeaseSwitcheroo(t *testing.T) {
 
 	mtc.advanceClock(context.TODO())
 	if _, err := mtc.dbs[0].Inc(context.TODO(), splitKey, 1); err != nil {
-		t.Fatalf("failed to increment: %s", err)
+		t.Fatalf("failed to increment: %+v", err)
 	}
 
 	// Verify we end up with an expiration lease on restart.
@@ -140,7 +135,7 @@ func TestStoreRangeLeaseSwitcheroo(t *testing.T) {
 
 	mtc.advanceClock(context.TODO())
 	if _, err := mtc.dbs[0].Inc(context.TODO(), splitKey, 1); err != nil {
-		t.Fatalf("failed to increment: %s", err)
+		t.Fatalf("failed to increment: %+v", err)
 	}
 
 	// Verify we end up with an epoch lease on restart.
@@ -168,7 +163,7 @@ func TestStoreGossipSystemData(t *testing.T) {
 		t.Fatal(pErr)
 	}
 	if _, err := mtc.dbs[0].Inc(context.TODO(), splitKey, 1); err != nil {
-		t.Fatalf("failed to increment: %s", err)
+		t.Fatalf("failed to increment: %+v", err)
 	}
 
 	mtc.stopStore(0)
@@ -196,7 +191,7 @@ func TestStoreGossipSystemData(t *testing.T) {
 		t.Fatal(err)
 	}
 	testutils.SucceedsSoon(t, func() error {
-		if !reflect.DeepEqual(getSystemConfig(), config.NewSystemConfig(sc.DefaultZoneConfig)) {
+		if !getSystemConfig().DefaultZoneConfig.Equal(sc.DefaultZoneConfig) {
 			return errors.New("system config not empty")
 		}
 		if getNodeLiveness() != (storagepb.Liveness{}) {
@@ -209,7 +204,7 @@ func TestStoreGossipSystemData(t *testing.T) {
 	// data is gossiped.
 	mtc.restartStore(0)
 	testutils.SucceedsSoon(t, func() error {
-		if reflect.DeepEqual(getSystemConfig(), config.NewSystemConfig(sc.DefaultZoneConfig)) {
+		if !getSystemConfig().DefaultZoneConfig.Equal(sc.DefaultZoneConfig) {
 			return errors.New("system config not gossiped")
 		}
 		if getNodeLiveness() == (storagepb.Liveness{}) {

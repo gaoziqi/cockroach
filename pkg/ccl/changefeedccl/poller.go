@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/intervalccl"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -23,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/covering"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -34,7 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // poller uses ExportRequest with the `ReturnSST` to repeatedly fetch every kv
@@ -111,96 +110,53 @@ func makePoller(
 		p.mu.highWater = highWater
 	}
 	p.tableHist = makeTableHistory(p.validateTable, highWater)
+
 	return p
-}
-
-// Run repeatedly polls and inserts changed kvs and resolved timestamps into a
-// buffer. It blocks forever and is intended to be run in a goroutine.
-//
-// During each poll, a new high-water mark is chosen. The relevant spans for the
-// configured tables are broken up by (possibly stale) range boundaries and
-// every changed KV between the old and new high-water is fetched via
-// ExportRequests. It backpressures sending the requests such that some maximum
-// number are inflight or being inserted into the buffer. Finally, after each
-// poll completes, a resolved timestamp notification is added to the buffer.
-func (p *poller) Run(ctx context.Context) error {
-	for {
-		// Wait for polling interval
-		p.mu.Lock()
-		lastHighwater := p.mu.highWater
-		p.mu.Unlock()
-
-		pollDuration := changefeedPollInterval.Get(&p.settings.SV)
-		pollDuration = pollDuration - timeutil.Since(timeutil.Unix(0, lastHighwater.WallTime))
-		if pollDuration > 0 {
-			log.VEventf(ctx, 1, `sleeping for %s`, pollDuration)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(pollDuration):
-			}
-		}
-
-		nextHighWater := p.clock.Now()
-
-		tableMetadataStart := timeutil.Now()
-		// Ingest table descriptors up to the next prospective highwater.
-		if err := p.updateTableHistory(ctx, nextHighWater); err != nil {
-			return err
-		}
-		p.metrics.TableMetadataNanos.Inc(timeutil.Since(tableMetadataStart).Nanoseconds())
-
-		// Determine if we are at a scanBoundary, and trigger a full scan if needed.
-		isFullScan := false
-		p.mu.Lock()
-		if len(p.mu.scanBoundaries) > 0 {
-			if p.mu.scanBoundaries[0].Equal(lastHighwater) {
-				// Perform a full scan of the latest value of all keys as of the
-				// boundary timestamp and consume the boundary.
-				isFullScan = true
-				nextHighWater = lastHighwater
-				p.mu.scanBoundaries = p.mu.scanBoundaries[1:]
-			} else if p.mu.scanBoundaries[0].Less(nextHighWater) {
-				// If we aren't currently at a scan boundary, but the next highwater
-				// would bring us past the scan boundary, set nextHighWater to the
-				// scan boundary. This will cause us to capture all changes up to the
-				// scan boundary, then consume the boundary on the next iteration.
-				nextHighWater = p.mu.scanBoundaries[0]
-			}
-		}
-		p.mu.Unlock()
-
-		if !isFullScan {
-			log.VEventf(ctx, 1, `changefeed poll (%s,%s]: %s`,
-				lastHighwater, nextHighWater, time.Duration(nextHighWater.WallTime-lastHighwater.WallTime))
-		} else {
-			log.VEventf(ctx, 1, `changefeed poll full scan @ %s`, nextHighWater)
-		}
-
-		spans, err := getSpansToProcess(ctx, p.db, p.spans)
-		if err != nil {
-			return err
-		}
-
-		if err := p.exportSpansParallel(ctx, spans, lastHighwater, nextHighWater, isFullScan); err != nil {
-			return err
-		}
-		p.mu.Lock()
-		p.mu.highWater = nextHighWater
-		p.mu.Unlock()
-	}
 }
 
 // RunUsingRangeFeeds performs the same task as the normal Run method, but uses
 // the experimental Rangefeed system to capture changes rather than the
 // poll-and-export method.  Note
 func (p *poller) RunUsingRangefeeds(ctx context.Context) error {
+	// Fetch the table descs as of the initial highWater and prime the table
+	// history with them. This addresses #41694 where we'd skip the rest of a
+	// backfill if the changefeed was paused/unpaused during it. The bug was that
+	// the changefeed wouldn't notice the table descriptor had changed (and thus
+	// we were in the backfill state) when it restarted.
+	if err := p.primeInitialTableDescs(ctx); err != nil {
+		return err
+	}
+
 	// Start polling tablehistory, which must be done concurrently with
 	// the individual rangefeed routines.
 	g := ctxgroup.WithContext(ctx)
 	g.GoCtx(p.pollTableHistory)
 	g.GoCtx(p.rangefeedImpl)
 	return g.Wait()
+}
+
+func (p *poller) primeInitialTableDescs(ctx context.Context) error {
+	p.mu.Lock()
+	initialTableDescTs := p.mu.highWater
+	p.mu.Unlock()
+	var initialDescs []*sqlbase.TableDescriptor
+	initialTableDescsFn := func(ctx context.Context, txn *client.Txn) error {
+		initialDescs = initialDescs[:0]
+		txn.SetFixedTimestamp(ctx, initialTableDescTs)
+		// Note that all targets are currently guaranteed to be tables.
+		for tableID := range p.details.Targets {
+			tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+			if err != nil {
+				return err
+			}
+			initialDescs = append(initialDescs, tableDesc)
+		}
+		return nil
+	}
+	if err := p.db.Txn(ctx, initialTableDescsFn); err != nil {
+		return err
+	}
+	return p.tableHist.IngestDescriptors(ctx, hlc.Timestamp{}, initialTableDescTs, initialDescs)
 }
 
 var errBoundaryReached = errors.New("scan boundary reached")
@@ -231,9 +187,9 @@ func (p *poller) rangefeedImpl(ctx context.Context) error {
 		}
 		p.mu.Unlock()
 		if scanTime != (hlc.Timestamp{}) {
-			if err := p.exportSpansParallel(
-				ctx, spans, scanTime, scanTime, true, /* fullScan */
-			); err != nil {
+			// TODO(dan): Now that we no longer have the poller, we should stop using
+			// ExportRequest and start using normal Scans.
+			if err := p.exportSpansParallel(ctx, spans, scanTime); err != nil {
 				return err
 			}
 		}
@@ -342,21 +298,33 @@ func (p *poller) rangefeedImpl(ctx context.Context) error {
 				} else if e.resolved != nil {
 					resolvedTS := e.resolved.Timestamp
 					boundaryBreak := false
+					// Make sure scan boundaries less than or equal to `resolvedTS` were
+					// added to the `scanBoundaries` list before proceeding.
+					if err := p.tableHist.WaitForTS(ctx, resolvedTS); err != nil {
+						return err
+					}
 					p.mu.Lock()
-					if len(p.mu.scanBoundaries) > 0 && p.mu.scanBoundaries[0].Less(resolvedTS) {
+					if len(p.mu.scanBoundaries) > 0 && !resolvedTS.Less(p.mu.scanBoundaries[0]) {
 						boundaryBreak = true
 						resolvedTS = p.mu.scanBoundaries[0]
 					}
 					p.mu.Unlock()
-					if err := p.buf.AddResolved(ctx, e.resolved.Span, resolvedTS); err != nil {
-						return err
-					}
 					if boundaryBreak {
+						// A boundary here means we're about to do a full scan (backfill)
+						// at this timestamp, so at the changefeed level the boundary
+						// itself is not resolved. Skip emitting this resolved timestamp
+						// because we want to trigger the scan first before resolving its
+						// scan boundary timestamp.
+						resolvedTS = resolvedTS.Prev()
 						frontier.Forward(e.resolved.Span, resolvedTS)
 						if frontier.Frontier() == resolvedTS {
 							// All component rangefeeds are now at the boundary.
 							// Break out of the ctxgroup by returning a sentinel error.
 							return errBoundaryReached
+						}
+					} else {
+						if err := p.buf.AddResolved(ctx, e.resolved.Span, resolvedTS); err != nil {
+							return err
 						}
 					}
 				}
@@ -385,33 +353,32 @@ func getSpansToProcess(
 		ranges, err = allRangeDescriptors(ctx, txn)
 		return err
 	}); err != nil {
-		return nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
-			"fetching range descriptors")
+		return nil, errors.Wrapf(err, "fetching range descriptors")
 	}
 
 	type spanMarker struct{}
 	type rangeMarker struct{}
 
-	var spanCovering intervalccl.Covering
+	var spanCovering covering.Covering
 	for _, span := range targetSpans {
-		spanCovering = append(spanCovering, intervalccl.Range{
+		spanCovering = append(spanCovering, covering.Range{
 			Start:   []byte(span.Key),
 			End:     []byte(span.EndKey),
 			Payload: spanMarker{},
 		})
 	}
 
-	var rangeCovering intervalccl.Covering
+	var rangeCovering covering.Covering
 	for _, rangeDesc := range ranges {
-		rangeCovering = append(rangeCovering, intervalccl.Range{
+		rangeCovering = append(rangeCovering, covering.Range{
 			Start:   []byte(rangeDesc.StartKey),
 			End:     []byte(rangeDesc.EndKey),
 			Payload: rangeMarker{},
 		})
 	}
 
-	chunks := intervalccl.OverlapCoveringMerge(
-		[]intervalccl.Covering{spanCovering, rangeCovering},
+	chunks := covering.OverlapCoveringMerge(
+		[]covering.Covering{spanCovering, rangeCovering},
 	)
 
 	var requests []roachpb.Span
@@ -425,7 +392,7 @@ func getSpansToProcess(
 }
 
 func (p *poller) exportSpansParallel(
-	ctx context.Context, spans []roachpb.Span, start, end hlc.Timestamp, isFullScan bool,
+	ctx context.Context, spans []roachpb.Span, ts hlc.Timestamp,
 ) error {
 	// Export requests for the various watched spans are executed in parallel,
 	// with a semaphore-enforced limit based on a cluster setting.
@@ -450,10 +417,10 @@ func (p *poller) exportSpansParallel(
 		g.GoCtx(func(ctx context.Context) error {
 			defer func() { <-exportsSem }()
 
-			err := p.exportSpan(ctx, span, start, end, isFullScan)
+			err := p.exportSpan(ctx, span, ts)
 			finished := atomic.AddInt64(&atomicFinished, 1)
 			if log.V(2) {
-				log.Infof(ctx, `exported %d of %d`, finished, len(spans))
+				log.Infof(ctx, `exported %d of %d: %v`, finished, len(spans), err)
 			}
 			if err != nil {
 				return err
@@ -464,61 +431,49 @@ func (p *poller) exportSpansParallel(
 	return g.Wait()
 }
 
-func (p *poller) exportSpan(
-	ctx context.Context, span roachpb.Span, start, end hlc.Timestamp, isFullScan bool,
-) error {
+func (p *poller) exportSpan(ctx context.Context, span roachpb.Span, ts hlc.Timestamp) error {
 	sender := p.db.NonTransactionalSender()
 	if log.V(2) {
-		log.Infof(ctx, `sending ExportRequest %s over (%s,%s]`, span, start, end)
+		log.Infof(ctx, `sending ExportRequest %s at %s`, span, ts)
 	}
 
-	header := roachpb.Header{Timestamp: end}
+	header := roachpb.Header{Timestamp: ts}
 	req := &roachpb.ExportRequest{
-		RequestHeader:                       roachpb.RequestHeaderFromSpan(span),
-		StartTime:                           start,
-		MVCCFilter:                          roachpb.MVCCFilter_All,
-		ReturnSST:                           true,
-		OmitChecksum:                        true,
-		EnableTimeBoundIteratorOptimization: true,
-	}
-	if isFullScan {
-		req.MVCCFilter = roachpb.MVCCFilter_Latest
-		req.StartTime = hlc.Timestamp{}
+		RequestHeader: roachpb.RequestHeaderFromSpan(span),
+		MVCCFilter:    roachpb.MVCCFilter_Latest,
+		ReturnSST:     true,
+		OmitChecksum:  true,
 	}
 
 	stopwatchStart := timeutil.Now()
 	exported, pErr := client.SendWrappedWith(ctx, sender, header, req)
 	exportDuration := timeutil.Since(stopwatchStart)
 	if log.V(2) {
-		log.Infof(ctx, `finished ExportRequest %s over (%s,%s] took %s`,
-			span, start, end, exportDuration)
+		log.Infof(ctx, `finished ExportRequest %s at %s took %s`,
+			span, ts.AsOfSystemTime(), exportDuration)
 	}
 	slowExportThreshold := 10 * changefeedPollInterval.Get(&p.settings.SV)
 	if exportDuration > slowExportThreshold {
-		log.Infof(ctx, "finished ExportRequest %s over (%s,%s] took %s behind by %s",
-			span, start, end, exportDuration, timeutil.Since(end.GoTime()))
+		log.Infof(ctx, "finished ExportRequest %s at %s took %s behind by %s",
+			span, ts, exportDuration, timeutil.Since(ts.GoTime()))
 	}
 
 	if pErr != nil {
 		err := pErr.GoError()
-		return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
-			`fetching changes for %s`, span)
+		return errors.Wrapf(err, `fetching changes for %s`, span)
 	}
 	p.metrics.PollRequestNanosHist.RecordValue(exportDuration.Nanoseconds())
 
 	// When outputting a full scan, we want to use the schema at the scan
 	// timestamp, not the schema at the value timestamp.
-	var schemaTimestamp hlc.Timestamp
-	if isFullScan {
-		schemaTimestamp = end
-	}
+	schemaTimestamp := ts
 	stopwatchStart = timeutil.Now()
 	for _, file := range exported.(*roachpb.ExportResponse).Files {
 		if err := p.slurpSST(ctx, file.SST, schemaTimestamp); err != nil {
 			return err
 		}
 	}
-	if err := p.buf.AddResolved(ctx, span, end); err != nil {
+	if err := p.buf.AddResolved(ctx, span, ts); err != nil {
 		return err
 	}
 
@@ -627,7 +582,7 @@ func allRangeDescriptors(ctx context.Context, txn *client.Txn) ([]roachpb.RangeD
 	rangeDescs := make([]roachpb.RangeDescriptor, len(rows))
 	for i, row := range rows {
 		if err := row.ValueProto(&rangeDescs[i]); err != nil {
-			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+			return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 				"%s: unable to unmarshal range descriptor", row.Key)
 		}
 	}
@@ -660,12 +615,12 @@ func (p *poller) validateTable(ctx context.Context, desc *sqlbase.TableDescripto
 			// interesting here.
 			if p.details.StatementTime.Less(boundaryTime) {
 				if boundaryTime.Less(p.mu.highWater) {
-					return pgerror.AssertionFailedf(
+					return errors.AssertionFailedf(
 						"error: detected table ID %d backfill completed at %s "+
 							"earlier than highwater timestamp %s",
-						log.Safe(desc.ID),
-						log.Safe(boundaryTime),
-						log.Safe(p.mu.highWater),
+						errors.Safe(desc.ID),
+						errors.Safe(boundaryTime),
+						errors.Safe(p.mu.highWater),
 					)
 				}
 				p.mu.scanBoundaries = append(p.mu.scanBoundaries, boundaryTime)

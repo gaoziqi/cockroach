@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -37,7 +33,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/workload/movr"     // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/tpcc"     // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/ycsb"     // registers workloads
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -67,12 +63,26 @@ func Main() {
 
 	defer log.RecoverAndReportPanic(context.Background(), &serverCfg.Settings.SV)
 
+	err := Run(os.Args[1:])
+	exitWithError(cmdName, err)
+}
+
+func exitWithError(cmdName string, err error) {
 	errCode := 0
-	if err := Run(os.Args[1:]); err != nil {
+	if err != nil {
+		// Display the error and its details/hints.
+		fmt.Fprintln(stderr, "Error:", err.Error())
+		maybeShowErrorDetails(stderr, err, false /* printNewline */)
+
+		// Remind the user of which command was being run.
 		fmt.Fprintf(stderr, "Failed running %q\n", cmdName)
+
+		// Finally, extract the error code, as optionally specified
+		// by the sub-command.
 		errCode = 1
-		if ec, ok := errors.Cause(err).(*cliError); ok {
-			errCode = ec.exitCode
+		var cliErr *cliError
+		if errors.As(err, &cliErr) {
+			errCode = cliErr.exitCode
 		}
 	}
 	os.Exit(errCode)
@@ -99,6 +109,20 @@ type cliError struct {
 }
 
 func (e *cliError) Error() string { return e.cause.Error() }
+
+// Cause implements causer.
+func (e *cliError) Cause() error { return e.cause }
+
+// Format implements fmt.Formatter.
+func (e *cliError) Format(s fmt.State, verb rune) { errors.FormatError(e, s, verb) }
+
+// FormatError implements errors.Formatter.
+func (e *cliError) FormatError(p errors.Printer) error {
+	if p.Detail() {
+		p.Printf("error with exit code: %d", e.exitCode)
+	}
+	return e.cause
+}
 
 // stderr aliases log.OrigStderr; we use an alias here so that tests
 // in this package can redirect the output of CLI commands to stdout
@@ -147,6 +171,10 @@ var cockroachCmd = &cobra.Command{
 	// Commands should manually print usage information when the error is,
 	// in fact, a result of a bad invocation, e.g. too many arguments.
 	SilenceUsage: true,
+	// Disable automatic printing of the error. We want to also print
+	// details and hints, which cobra does not do for us. Instead
+	// we do the printing in Main().
+	SilenceErrors: true,
 }
 
 func init() {
@@ -162,14 +190,14 @@ func init() {
 	})
 
 	cockroachCmd.AddCommand(
-		StartCmd,
+		startCmd,
+		startSingleNodeCmd,
 		initCmd,
 		certCmd,
 		quitCmd,
 
 		sqlShellCmd,
 		userCmd,
-		zoneCmd,
 		nodeCmd,
 		dumpCmd,
 

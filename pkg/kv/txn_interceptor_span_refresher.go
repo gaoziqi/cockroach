@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -43,11 +39,67 @@ var MaxTxnRefreshSpansBytes = settings.RegisterIntSetting(
 	256*1000,
 )
 
-// txnSpanRefresher is a txnInterceptor that collects the read spans
-// of a serializable transaction in the event we get a serializable
-// retry error. We can use the set of read spans to avoid retrying
-// the transaction if all the spans can be updated to the current
-// transaction timestamp.
+// txnSpanRefresher is a txnInterceptor that collects the read spans of a
+// serializable transaction in the event it gets a serializable retry error. It
+// can then use the set of read spans to avoid retrying the transaction if all
+// the spans can be updated to the current transaction timestamp.
+//
+// Serializable isolation mandates that transactions appear to have occurred in
+// some total order, where none of their component sub-operations appear to have
+// interleaved with sub-operations from other transactions. CockroachDB enforces
+// this isolation level by ensuring that all of a transaction's reads and writes
+// are performed at the same HLC timestamp. This timestamp is referred to as the
+// transaction's commit timestamp.
+//
+// As a transaction in CockroachDB executes at a certain provisional commit
+// timestamp, it lays down intents at this timestamp for any write operations
+// and ratchets various timestamp cache entries to this timestamp for any read
+// operations. If a transaction performs all of its reads and writes and is able
+// to commit at its original provisional commit timestamp then it may go ahead
+// and do so. However, for a number of reasons including conflicting reads and
+// writes, a transaction may discover that its provisional commit timestamp is
+// too low and that it needs to move this timestamp forward to commit.
+//
+// This poses a problem for operations that the transaction has already
+// completed at lower timestamps. Are the effects of these operations still
+// valid? The transaction is always free to perform a full restart at a higher
+// epoch, but this often requires iterating in a client-side retry loop and
+// performing all of the transaction's operations again. Intents are maintained
+// across retries to improve the chance that later epochs succeed, but it is
+// vastly preferable to avoid re-issuing these operations. Instead, it would be
+// ideal if the transaction could "move" each of its operations to its new
+// provisional commit timestamp without redoing them entirely.
+//
+// Only a single write intent can exist on a key and no reads are allowed above
+// the intent's timestamp until the intent is resolved, so a transaction is free
+// to move any of its intent to a higher timestamp. In fact, a synchronous
+// rewrite of these intents isn't even necessary because intent resolution will
+// already rewrite the intents at higher timestamp if necessary. So, moving
+// write intents to a higher timestamp can be performed implicitly by committing
+// their transaction at a higher timestamp. However, unlike intents created by
+// writes, timestamp cache entries created by reads only prevent writes on
+// overlapping keys from being written at or below their timestamp; they do
+// nothing to prevent writes on overlapping keys from being written above their
+// timestamp. This means that a transaction is not free to blindly move its
+// reads to a higher timestamp because writes from other transaction may have
+// already invalidated them. In effect, this means that transactions acquire
+// pessimistic write locks and optimistic read locks.
+//
+// The txnSpanRefresher is in charge of detecting when a transaction may want to
+// move its provisional commit timestamp forward and determining whether doing
+// so is safe given the reads that it has performed (i.e. its "optimistic read
+// locks"). When the interceptor decides to attempt to move a transaction's
+// timestamp forward, it first "refreshes" each of its reads. This refreshing
+// step revisits all of the key spans that the transaction has read and checks
+// whether any writes have occurred between the original time that these span
+// were read and the timestamp that the transaction now wants to commit at that
+// change the result of these reads. If any read would produce a different
+// result at the newer commit timestamp, the refresh fails and the transaction
+// is forced to fall back to a full transaction restart. However, if all of the
+// reads would produce exactly the same result at the newer commit timestamp,
+// the timestamp cache entries for these reads are updated and the transaction
+// is free to update its provisional commit timestamp without needing to
+// restart.
 type txnSpanRefresher struct {
 	st      *cluster.Settings
 	knobs   *ClientTestingKnobs
@@ -142,10 +194,31 @@ func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
 	ctx context.Context, ba roachpb.BatchRequest, maxRefreshAttempts int,
 ) (_ *roachpb.BatchResponse, _ *roachpb.Error, largestRefreshTS hlc.Timestamp) {
 	br, pErr := sr.wrapped.SendLocked(ctx, ba)
-	if pErr != nil && maxRefreshAttempts > 0 {
-		br, pErr, largestRefreshTS = sr.maybeRetrySend(ctx, ba, br, pErr, maxRefreshAttempts)
+	if pErr != nil {
+		if unwrappedErr, ok := maybeUnwrapMixedSuccessErr(pErr); ok {
+			log.VEventf(ctx, 2, "got partial success; cannot retry %s (pErr=%s)", ba, unwrappedErr)
+			return nil, unwrappedErr, hlc.Timestamp{}
+		}
+		if maxRefreshAttempts > 0 {
+			br, pErr, largestRefreshTS = sr.maybeRetrySend(ctx, ba, br, pErr, maxRefreshAttempts)
+		}
 	}
 	return br, pErr, largestRefreshTS
+}
+
+// maybeUnwrapMixedSuccessErr attempts to unwrap a mixed success error, and
+// returns whether it was successful or not. With mixed success, we can't
+// attempt a retry without potentially succeeding at the same conditional put or
+// increment request twice; so we return the wrapped error instead. Because the
+// dist sender splits up batches to send to multiple ranges in parallel, and
+// then combines the results, partial success makes it very difficult to
+// determine what can be retried.
+func maybeUnwrapMixedSuccessErr(pErr *roachpb.Error) (*roachpb.Error, bool) {
+	if mse, ok := pErr.GetDetail().(*roachpb.MixedSuccessError); ok {
+		pErr.SetDetail(mse.GetWrapped())
+		return pErr, true
+	}
+	return pErr, false
 }
 
 // maybeRetrySend attempts to catch serializable errors and avoid them by
@@ -159,17 +232,6 @@ func (sr *txnSpanRefresher) maybeRetrySend(
 	pErr *roachpb.Error,
 	maxRefreshAttempts int,
 ) (*roachpb.BatchResponse, *roachpb.Error, hlc.Timestamp) {
-	// With mixed success, we can't attempt a retry without potentially
-	// succeeding at the same conditional put or increment request
-	// twice; return the wrapped error instead. Because the dist sender
-	// splits up batches to send to multiple ranges in parallel, and
-	// then combines the results, partial success makes it very
-	// difficult to determine what can be retried.
-	if aPSErr, ok := pErr.GetDetail().(*roachpb.MixedSuccessError); ok {
-		log.VEventf(ctx, 2, "got partial success; cannot retry %s (pErr=%s)", ba, aPSErr.Wrapped)
-		return nil, aPSErr.Wrapped, hlc.Timestamp{}
-	}
-
 	// Check for an error which can be retried after updating spans.
 	canRetryTxn, retryTxn := roachpb.CanTransactionRetryAtRefreshedTimestamp(ctx, pErr)
 	if !canRetryTxn || !sr.canAutoRetry {
@@ -251,6 +313,7 @@ func (sr *txnSpanRefresher) tryUpdatingTxnSpans(
 	}
 
 	// Refresh all spans (merge first).
+	// TODO(nvanbenschoten): actually merge spans.
 	refreshSpanBa := roachpb.BatchRequest{}
 	refreshSpanBa.Txn = refreshTxn
 	addRefreshes := func(refreshes []roachpb.Span, write bool) {
@@ -349,12 +412,16 @@ func (sr *txnSpanRefresher) augmentMetaLocked(meta roachpb.TxnCoordMeta) {
 		sr.refreshReads = nil
 		sr.refreshWrites = nil
 	} else if !sr.refreshInvalid {
-		sr.refreshReads, _ = roachpb.MergeSpans(
-			append(append([]roachpb.Span(nil), sr.refreshReads...), meta.RefreshReads...),
-		)
-		sr.refreshWrites, _ = roachpb.MergeSpans(
-			append(append([]roachpb.Span(nil), sr.refreshWrites...), meta.RefreshWrites...),
-		)
+		if meta.RefreshReads != nil {
+			sr.refreshReads, _ = roachpb.MergeSpans(
+				append(append([]roachpb.Span(nil), sr.refreshReads...), meta.RefreshReads...),
+			)
+		}
+		if meta.RefreshWrites != nil {
+			sr.refreshWrites, _ = roachpb.MergeSpans(
+				append(append([]roachpb.Span(nil), sr.refreshWrites...), meta.RefreshWrites...),
+			)
+		}
 	}
 	// Recompute the size of the refreshes.
 	sr.refreshSpansBytes = 0

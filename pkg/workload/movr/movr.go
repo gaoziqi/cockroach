@@ -1,28 +1,25 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package movr
 
 import (
 	gosql "database/sql"
-	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/faker"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/exp/rand"
@@ -113,9 +110,6 @@ var cities = []struct {
 	{city: "seattle", locality: "us_west"},
 	{city: "san francisco", locality: "us_west"},
 	{city: "los angeles", locality: "us_west"},
-	{city: "chicago", locality: "us_central"},
-	{city: "detroit", locality: "us_central"},
-	{city: "minneapolis", locality: "us_central"},
 	{city: "amsterdam", locality: "eu_west"},
 	{city: "paris", locality: "eu_west"},
 	{city: "rome", locality: "eu_west"},
@@ -130,6 +124,9 @@ type movr struct {
 	numPromoCodes                     int
 
 	creationTime time.Time
+
+	fakerOnce sync.Once
+	faker     faker.Faker
 }
 
 func init() {
@@ -138,7 +135,7 @@ func init() {
 
 var movrMeta = workload.Meta{
 	Name:         `movr`,
-	Description:  `MovR is a fictional ride sharing company`,
+	Description:  `MovR is a fictional vehicle sharing company`,
 	Version:      `1.0.0`,
 	PublicFacing: true,
 	New: func() workload.Generator {
@@ -208,8 +205,110 @@ func (g *movr) Hooks() workload.Hooks {
 					}
 				}
 			}
+			return nil
+		},
+		// This partitioning step is intended for a 3 region cluster, which have the localities region=us-east1,
+		// region=us-west1, region=europe-west1.
+		Partition: func(db *gosql.DB) error {
+			// Create us-west, us-east and europe-west partitions.
+			q := `
+		ALTER TABLE users PARTITION BY LIST (city) (
+			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+		);
+		ALTER TABLE vehicles PARTITION BY LIST (city) (
+			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+		);
+		ALTER INDEX vehicles_auto_index_fk_city_ref_users PARTITION BY LIST (city) (
+			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+		);
+		ALTER TABLE rides PARTITION BY LIST (city) (
+			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+		);
+		ALTER INDEX rides_auto_index_fk_city_ref_users PARTITION BY LIST (city) (
+			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+		);
+		ALTER INDEX rides_auto_index_fk_vehicle_city_ref_vehicles PARTITION BY LIST (vehicle_city) (
+			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+		);
+		ALTER TABLE user_promo_codes PARTITION BY LIST (city) (
+			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+		);
+		ALTER TABLE vehicle_location_histories PARTITION BY LIST (city) (
+			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+		);
+	`
+			if _, err := db.Exec(q); err != nil {
+				return err
+			}
 
-			// TODO(dan): Partitions.
+			// Alter the partitions to place replicas in the appropriate zones.
+			q = `
+		ALTER PARTITION us_west OF INDEX users@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
+		ALTER PARTITION us_east OF INDEX users@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
+		ALTER PARTITION europe_west OF INDEX users@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
+
+		ALTER PARTITION us_west OF INDEX vehicles@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
+		ALTER PARTITION us_east OF INDEX vehicles@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
+		ALTER PARTITION europe_west OF INDEX vehicles@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
+
+		ALTER PARTITION us_west OF INDEX rides@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
+		ALTER PARTITION us_east OF INDEX rides@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
+		ALTER PARTITION europe_west OF INDEX rides@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
+
+		ALTER PARTITION us_west OF INDEX user_promo_codes@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
+		ALTER PARTITION us_east OF INDEX user_promo_codes@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
+		ALTER PARTITION europe_west OF INDEX user_promo_codes@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
+
+		ALTER PARTITION us_west OF INDEX vehicle_location_histories@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
+		ALTER PARTITION us_east OF INDEX vehicle_location_histories@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
+		ALTER PARTITION europe_west OF INDEX vehicle_location_histories@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
+	`
+			if _, err := db.Exec(q); err != nil {
+				return err
+			}
+
+			// Create some duplicate indexes for the promo_codes table.
+			q = `
+		CREATE INDEX promo_codes_idx_us_west ON promo_codes (code) STORING (description, creation_time, expiration_time, rules);
+		CREATE INDEX promo_codes_idx_europe_west ON promo_codes (code) STORING (description, creation_time, expiration_time, rules);
+	`
+			if _, err := db.Exec(q); err != nil {
+				return err
+			}
+
+			// Apply configurations to the index for fast reads.
+			q = `
+		ALTER TABLE promo_codes CONFIGURE ZONE USING num_replicas = 3,
+			constraints = '{"+region=us-east1": 1}',
+			lease_preferences = '[[+region=us-east1]]';
+		ALTER INDEX promo_codes@promo_codes_idx_us_west CONFIGURE ZONE USING
+			num_replicas = 3,
+			constraints = '{"+region=us-west1": 1}',
+			lease_preferences = '[[+region=us-west1]]';
+		ALTER INDEX promo_codes@promo_codes_idx_europe_west CONFIGURE ZONE USING
+			num_replicas = 3,
+			constraints = '{"+region=europe-west1": 1}',
+			lease_preferences = '[[+region=europe-west1]]';
+	`
+			if _, err := db.Exec(q); err != nil {
+				return err
+			}
 			return nil
 		},
 	}
@@ -217,6 +316,9 @@ func (g *movr) Hooks() workload.Hooks {
 
 // Tables implements the Generator interface.
 func (g *movr) Tables() []workload.Table {
+	g.fakerOnce.Do(func() {
+		g.faker = faker.NewFaker()
+	})
 	tables := make([]workload.Table, 6)
 	tables[TablesUsersIdx] = workload.Table{
 		Name:   `users`,
@@ -293,11 +395,11 @@ func (d cityDistributor) rowsForCity(cityIdx int) (min, max int) {
 	numPerCity := float64(d.numRows) / float64(len(cities))
 	min = int(math.Ceil(float64(cityIdx) * numPerCity))
 	max = int(math.Ceil(float64(cityIdx+1) * numPerCity))
-	if min >= int(d.numRows) {
-		min = int(d.numRows)
+	if min >= d.numRows {
+		min = d.numRows
 	}
-	if max >= int(d.numRows) {
-		max = int(d.numRows)
+	if max >= d.numRows {
+		max = d.numRows
 	}
 	return min, max
 }
@@ -317,11 +419,11 @@ func (g *movr) movrUsersInitialRow(rowIdx int) []interface{} {
 	id.DeterministicV4(uint64(rowIdx), uint64(g.users.numRows))
 
 	return []interface{}{
-		id.String(),         // id
-		city.city,           // city
-		randName(rng),       // name
-		randAddress(rng),    // address
-		randCreditCard(rng), // credit_card
+		id.String(),                // id
+		city.city,                  // city
+		g.faker.Name(rng),          // name
+		g.faker.StreetAddress(rng), // address
+		randCreditCard(rng),        // credit_card
 	}
 }
 
@@ -345,7 +447,7 @@ func (g *movr) movrVehiclesInitialRow(rowIdx int) []interface{} {
 		ownerID,                                // owner_id
 		g.creationTime.Format(timestampFormat), // creation_time
 		randVehicleStatus(rng),                 // status
-		randAddress(rng),                       // current_location
+		g.faker.StreetAddress(rng),             // current_location
 		randVehicleMetadata(rng, vehicleType),  // ext
 	}
 }
@@ -363,8 +465,8 @@ func (g *movr) movrRidesInitialRow(rowIdx int) []interface{} {
 	riderID := g.movrUsersInitialRow(riderRowIdx)[0]
 	vehicleRowIdx := g.vehicles.randRowInCity(rng, cityIdx)
 	vehicleID := g.movrVehiclesInitialRow(vehicleRowIdx)[0]
-	startTime := g.creationTime.Add(time.Duration(rng.Intn(30)) * time.Hour)
-	endTime := startTime.Add(time.Duration(rng.Intn(30)) * time.Hour)
+	startTime := g.creationTime.Add(-time.Duration(rng.Intn(30)) * 24 * time.Hour)
+	endTime := startTime.Add(time.Duration(rng.Intn(60)) * time.Hour)
 
 	return []interface{}{
 		id.String(),                       // id
@@ -372,8 +474,8 @@ func (g *movr) movrRidesInitialRow(rowIdx int) []interface{} {
 		city.city,                         // vehicle_city
 		riderID,                           // rider_id
 		vehicleID,                         // vehicle_id
-		randAddress(rng),                  // start_address
-		randAddress(rng),                  // end_address
+		g.faker.StreetAddress(rng),        // start_address
+		g.faker.StreetAddress(rng),        // end_address
 		startTime.Format(timestampFormat), // start_time
 		endTime.Format(timestampFormat),   // end_time
 		rng.Intn(100),                     // revenue
@@ -388,7 +490,7 @@ func (g *movr) movrVehicleLocationHistoriesInitialRow(rowIdx int) []interface{} 
 	rideRowIdx := g.rides.randRowInCity(rng, cityIdx)
 	rideID := g.movrRidesInitialRow(rideRowIdx)[0]
 	time := g.creationTime.Add(time.Duration(rowIdx) * time.Millisecond)
-	lat, long := float64(-180+rng.Intn(360)), float64(-90+rng.Intn(180))
+	lat, long := randLatLong(rng)
 
 	return []interface{}{
 		city.city,                    // city
@@ -401,13 +503,9 @@ func (g *movr) movrVehicleLocationHistoriesInitialRow(rowIdx int) []interface{} 
 
 func (g *movr) movrPromoCodesInitialRow(rowIdx int) []interface{} {
 	rng := rand.New(rand.NewSource(g.seed + uint64(rowIdx)))
-	codeParts := make([]string, 3)
-	for i := range codeParts {
-		codeParts[i] = randWord(rng)
-	}
-	code := fmt.Sprintf(`%s_%d`, strings.Join(codeParts, `_`), rowIdx)
-	description := randParagraph(rng)
-	expirationTime := g.creationTime.Add(-time.Duration(rng.Intn(30)) * 24 * time.Hour)
+	code := strings.ToLower(strings.Join(g.faker.Words(rng, 3), `_`))
+	description := g.faker.Paragraph(rng)
+	expirationTime := g.creationTime.Add(time.Duration(rng.Intn(30)) * 24 * time.Hour)
 	// TODO(dan): This is nil in the reference impl, is that intentional?
 	creationTime := expirationTime.Add(-time.Duration(rng.Intn(30)) * 24 * time.Hour)
 	const rulesJSON = `{"type": "percent_discount", "value": "10%"}`

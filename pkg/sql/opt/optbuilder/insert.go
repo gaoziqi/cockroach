@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
@@ -21,11 +17,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // excludedTableName is the name of a special Upsert data source. When a row
@@ -90,11 +88,24 @@ func init() {
 //   3. Computed columns which will be updated when a conflict is detected and
 //      that are dependent on one or more updated columns.
 //
-// In addition, the insert and update column expressions are merged into a
-// single set of upsert column expressions that toggle between the insert and
-// update values depending on whether the canary column is null.
+// A LEFT OUTER JOIN associates each row to insert with the corresponding
+// existing row (#1 above). If the row does not exist, then the existing columns
+// will be null-extended, per the semantics of LEFT OUTER JOIN. This behavior
+// allows the execution engine to test whether a given insert row conflicts with
+// an existing row in the table. One of the existing columns that is declared as
+// NOT NULL in the table schema is designated as a "canary column". When the
+// canary column is null after the join step, then it must have been null-
+// extended by the LEFT OUTER JOIN. Therefore, there is no existing row, and no
+// conflict. If the canary column is not null, then there is an existing row,
+// and a conflict.
 //
-// For example, if this is the schema and INSERT..ON CONFLICT statement:
+// The canary column is used in CASE statements to toggle between the insert and
+// update values for each row. If there is no conflict, the insert value is
+// used. Otherwise, the update value is used (or the existing value if there is
+// no update value for that column).
+//
+// Putting it all together, if this is the schema and INSERT..ON CONFLICT
+// statement:
 //
 //   CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
 //   INSERT INTO abc VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b=10
@@ -111,6 +122,10 @@ func init() {
 //   FROM (VALUES (1, 2, NULL)) AS ins(ins_a, ins_b, ins_c)
 //   LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
 //   ON ins_a = fetch_a
+//
+// Here, the fetch_a column has been designated as the canary column, since it
+// is NOT NULL in the schema. It is used as the CASE condition to decide between
+// the insert and update values for each row.
 //
 // The CASE expressions will often prevent the unnecessary evaluation of the
 // update expression in the case where an insertion needs to occur. In addition,
@@ -139,9 +154,9 @@ func init() {
 // ON CONFLICT clause is present, since it joins a new set of rows to the input
 // and thereby scrambles the input ordering.
 func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope) {
+	var ctes []cteSource
 	if ins.With != nil {
-		inScope = b.buildCTE(ins.With.CTEList, inScope)
-		defer b.checkCTEUsage(inScope)
+		inScope, ctes = b.buildCTEs(ins.With, inScope)
 	}
 
 	// INSERT INTO xx AS yy - we want to know about xx (tn) because
@@ -158,20 +173,20 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	if ins.OnConflict != nil {
 		// UPSERT and INDEX ON CONFLICT will read from the table to check for
 		// duplicates.
-		b.checkPrivilege(tn, tab, privilege.SELECT)
+		b.checkPrivilege(opt.DepByName(tn), tab, privilege.SELECT)
 
 		if !ins.OnConflict.DoNothing {
 			// UPSERT and INDEX ON CONFLICT DO UPDATE may modify rows if the
 			// DO NOTHING clause is not present.
-			b.checkPrivilege(tn, tab, privilege.UPDATE)
+			b.checkPrivilege(opt.DepByName(tn), tab, privilege.UPDATE)
 		}
 	}
 
 	var mb mutationBuilder
 	if ins.OnConflict != nil && ins.OnConflict.IsUpsertAlias() {
-		mb.init(b, opt.UpsertOp, tab, *alias)
+		mb.init(b, "upsert", tab, *alias)
 	} else {
-		mb.init(b, opt.InsertOp, tab, *alias)
+		mb.init(b, "insert", tab, *alias)
 	}
 
 	// Compute target columns in two cases:
@@ -296,6 +311,8 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		mb.buildUpsert(returning)
 	}
 
+	mb.outScope.expr = b.wrapWithCTEs(mb.outScope.expr, ctes)
+
 	return mb.outScope
 }
 
@@ -352,7 +369,7 @@ func (mb *mutationBuilder) needExistingRows() bool {
 // list of table columns that are the target of the Insert operation.
 func (mb *mutationBuilder) addTargetNamedColsForInsert(names tree.NameList) {
 	if len(mb.targetColList) != 0 {
-		panic(pgerror.AssertionFailedf("addTargetNamedColsForInsert cannot be called more than once"))
+		panic(errors.AssertionFailedf("addTargetNamedColsForInsert cannot be called more than once"))
 	}
 
 	// Add target table columns by the names specified in the Insert statement.
@@ -381,12 +398,12 @@ func (mb *mutationBuilder) checkPrimaryKeyForInsert() {
 		}
 
 		colID := mb.tabID.ColumnID(col.Ordinal)
-		if mb.targetColSet.Contains(int(colID)) {
+		if mb.targetColSet.Contains(colID) {
 			// The column is explicitly specified in the target name list.
 			continue
 		}
 
-		panic(pgerror.Newf(pgerror.CodeInvalidForeignKeyError,
+		panic(pgerror.Newf(pgcode.InvalidForeignKey,
 			"missing %q primary key column", col.ColName()))
 	}
 }
@@ -432,7 +449,7 @@ func (mb *mutationBuilder) checkForeignKeysForInsert() {
 			}
 
 			colID := mb.tabID.ColumnID(ord)
-			if mb.targetColSet.Contains(int(colID)) {
+			if mb.targetColSet.Contains(colID) {
 				// The column is explicitly specified in the target name list.
 				allMissing = false
 				continue
@@ -448,11 +465,11 @@ func (mb *mutationBuilder) checkForeignKeysForInsert() {
 		case 0:
 			// Do nothing.
 		case 1:
-			panic(pgerror.Newf(pgerror.CodeForeignKeyViolationError,
+			panic(pgerror.Newf(pgcode.ForeignKeyViolation,
 				"missing value for column %q in multi-part foreign key", missingCols[0]))
 		default:
 			sort.Strings(missingCols)
-			panic(pgerror.Newf(pgerror.CodeForeignKeyViolationError,
+			panic(pgerror.Newf(pgcode.ForeignKeyViolation,
 				"missing values for columns %q in multi-part foreign key", missingCols))
 		}
 	}
@@ -470,7 +487,7 @@ func (mb *mutationBuilder) checkForeignKeysForInsert() {
 // columns.
 func (mb *mutationBuilder) addTargetTableColsForInsert(maxCols int) {
 	if len(mb.targetColList) != 0 {
-		panic(pgerror.AssertionFailedf("addTargetTableColsForInsert cannot be called more than once"))
+		panic(errors.AssertionFailedf("addTargetTableColsForInsert cannot be called more than once"))
 	}
 
 	// Only consider non-mutation columns, since mutation columns are hidden from
@@ -556,9 +573,7 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 		// Type check the input column against the corresponding table column.
 		checkDatumTypeFitsColumnType(mb.tab.Column(ord), inCol.typ)
 
-		// Assign name of input column. Computed columns can refer to this column
-		// by its name.
-		inCol.table = *mb.tab.Name()
+		// Assign name of input column.
 		inCol.name = tree.Name(mb.md.ColumnMeta(mb.targetColList[i]).Alias)
 
 		// Record the ordinal position of the scope column that contains the
@@ -600,8 +615,10 @@ func (mb *mutationBuilder) buildInsert(returning tree.ReturningExprs) {
 	// Add any check constraint boolean columns to the input.
 	mb.addCheckConstraintCols()
 
+	mb.buildFKChecksForInsert()
+
 	private := mb.makeMutationPrivate(returning != nil)
-	mb.outScope.expr = mb.b.factory.ConstructInsert(mb.outScope.expr, private)
+	mb.outScope.expr = mb.b.factory.ConstructInsert(mb.outScope.expr, mb.checks, private)
 
 	mb.buildReturning(returning)
 }
@@ -641,11 +658,8 @@ func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tr
 		// Build the right side of the left outer join. Use a new metadata instance
 		// of the mutation table so that a different set of column IDs are used for
 		// the two tables in the self-join.
-		tn := mb.tab.Name().TableName
-		alias := tree.MakeUnqualifiedTableName(tree.Name(fmt.Sprintf("%s_%d", tn, idx+1)))
 		scanScope := mb.b.buildScan(
-			mb.tab,
-			&alias,
+			mb.b.addTable(mb.tab, &mb.alias),
 			nil, /* ordinals */
 			nil, /* indexFlags */
 			excludeMutations,
@@ -727,8 +741,7 @@ func (mb *mutationBuilder) buildInputForUpsert(
 	// because they can be used by computed update expressions. Use a different
 	// instance of table metadata so that col IDs do not overlap.
 	fetchScope := mb.b.buildScan(
-		mb.tab,
-		&mb.alias,
+		mb.b.addTable(mb.tab, &mb.alias),
 		nil, /* ordinals */
 		nil, /* indexFlags */
 		includeMutations,
@@ -856,7 +869,7 @@ func (mb *mutationBuilder) buildUpsert(returning tree.ReturningExprs) {
 	mb.addCheckConstraintCols()
 
 	private := mb.makeMutationPrivate(returning != nil)
-	mb.outScope.expr = mb.b.factory.ConstructUpsert(mb.outScope.expr, private)
+	mb.outScope.expr = mb.b.factory.ConstructUpsert(mb.outScope.expr, mb.checks, private)
 
 	mb.buildReturning(returning)
 }
@@ -923,9 +936,7 @@ func (mb *mutationBuilder) projectUpsertColumns() {
 		scopeCol := mb.b.synthesizeColumn(projectionsScope, alias, typ, nil /* expr */, caseExpr)
 		scopeColOrd := scopeOrdinal(len(projectionsScope.cols) - 1)
 
-		// Assign name to synthesized column. Check constraint columns may refer
-		// to columns in the table by name.
-		scopeCol.table = *mb.tab.Name()
+		// Assign name to synthesized column.
 		scopeCol.name = mb.tab.Column(i).ColName()
 
 		// Update the scope ordinals for the update columns that are involved in
@@ -970,7 +981,7 @@ func (mb *mutationBuilder) ensureUniqueConflictCols(cols tree.NameList) cat.Inde
 			return index
 		}
 	}
-	panic(pgerror.Newf(pgerror.CodeInvalidColumnReferenceError,
+	panic(pgerror.Newf(pgcode.InvalidColumnReference,
 		"there is no unique or exclusion constraint matching the ON CONFLICT specification"))
 }
 

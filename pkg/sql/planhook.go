@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -20,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -65,6 +60,12 @@ func (p *planner) RunParams(ctx context.Context) runParams {
 // We pass this as one interface, rather than individually passing each field or
 // interface as we find we need them, to avoid churn in the planHookFn sig and
 // the hooks that implement it.
+//
+// The PlanHookState is used by modules that are under the CCL. Since the OSS
+// modules cannot depend on the CCL modules, the CCL modules need to inform the
+// planner when they should be invoked (via plan hooks). The only way for the
+// CCL statements to get access to a "planner" is through this PlanHookState
+// that gets passed back due to this inversion of roles.
 type PlanHookState interface {
 	SchemaResolver
 	RunParams(ctx context.Context) runParams
@@ -90,7 +91,6 @@ type PlanHookState interface {
 	) (*DropUserNode, error)
 	GetAllUsersAndRoles(ctx context.Context) (map[string]bool, error)
 	BumpRoleMembershipTableVersion(ctx context.Context) error
-	Select(ctx context.Context, n *tree.Select, desiredTypes []*types.T) (planNode, error)
 	EvalAsOfTimestamp(asOf tree.AsOfClause) (hlc.Timestamp, error)
 	ResolveUncachedDatabaseByName(
 		ctx context.Context, dbName string, required bool) (*UncachedDatabaseDescriptor, error)
@@ -102,12 +102,16 @@ type PlanHookState interface {
 // AddPlanHook adds a hook used to short-circuit creating a planNode from a
 // tree.Statement. If the func returned by the hook is non-nil, it is used to
 // construct a planNode that runs that func in a goroutine during Start.
+//
+// See PlanHookState comments for information about why plan hooks are needed.
 func AddPlanHook(f planHookFn) {
 	planHooks = append(planHooks, f)
 }
 
 // AddWrappedPlanHook adds a hook used to short-circuit creating a planNode from a
 // tree.Statement. If the returned plan is non-nil, it is used directly by the planner.
+//
+// See PlanHookState comments for information about why plan hooks are needed.
 func AddWrappedPlanHook(f wrappedPlanHookFn) {
 	wrappedPlanHooks = append(wrappedPlanHooks, f)
 }
@@ -116,6 +120,8 @@ func AddWrappedPlanHook(f wrappedPlanHookFn) {
 // provided function during Start and serves the results it returns over the
 // channel.
 type hookFnNode struct {
+	optColumnsSlot
+
 	f        PlanHookRowFn
 	header   sqlbase.ResultColumns
 	subplans []planNode

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -19,13 +15,13 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
 type observeVerbosity int
@@ -228,14 +224,54 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *indexJoinNode:
 		if v.observer.attr != nil {
 			v.observer.attr(name, "table", fmt.Sprintf("%s@%s", n.table.desc.Name, n.table.index.Name))
+			inputCols := planColumns(n.input)
+			cols := make([]string, len(n.keyCols))
+			for i, c := range n.keyCols {
+				cols[i] = inputCols[c].Name
+			}
+			v.observer.attr(name, "key columns", strings.Join(cols, ", "))
 			v.expr(name, "filter", -1, n.table.filter)
 		}
-		v.visitConcrete(n.index)
+		n.input = v.visit(n.input)
 
 	case *lookupJoinNode:
 		if v.observer.attr != nil {
 			v.observer.attr(name, "table", fmt.Sprintf("%s@%s", n.table.desc.Name, n.table.index.Name))
 			v.observer.attr(name, "type", joinTypeStr(n.joinType))
+		}
+		var b bytes.Buffer
+		b.WriteByte('(')
+		inputCols := planColumns(n.input)
+		for i, c := range n.eqCols {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(inputCols[c].Name)
+		}
+		b.WriteString(") = (")
+		for i := range n.eqCols {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if i < len(n.table.index.ColumnNames) {
+				b.WriteString(n.table.index.ColumnNames[i])
+			} else {
+				id := n.table.index.ExtraColumnIDs[i-len(n.table.index.ColumnNames)]
+				col, err := n.table.desc.FindColumnByID(id)
+				if err != nil {
+					fmt.Fprintf(&b, "<error: %v>", err)
+				} else {
+					b.WriteString(col.Name)
+				}
+			}
+		}
+		b.WriteByte(')')
+		v.observer.attr(name, "equality", b.String())
+		if n.eqColsAreKey {
+			v.observer.attr(name, "equality cols are key", "")
+		}
+		if n.CanParallelize() {
+			v.observer.attr(name, "parallel", "")
 		}
 		if v.observer.expr != nil && n.onCond != nil && n.onCond != tree.DBoolTrue {
 			v.expr(name, "pred", -1, n.onCond)
@@ -352,14 +388,11 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 
 	case *sortNode:
 		if v.observer.attr != nil {
-			var columns sqlbase.ResultColumns
-			if n.plan != nil {
-				columns = planColumns(n.plan)
-			}
-			// We use n.ordering and not plan.Ordering() because
-			// plan.Ordering() does not include the added sort columns not
-			// present in the output.
+			columns := planColumns(n.plan)
 			v.observer.attr(name, "order", formatOrdering(n.ordering, columns))
+			if p := n.alreadyOrderedPrefix; p > 0 {
+				v.observer.attr(name, "already ordered", formatOrdering(n.ordering[:p], columns))
+			}
 		}
 		n.plan = v.visit(n.plan)
 
@@ -542,7 +575,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 
 	case *createViewNode:
 		if v.observer.attr != nil {
-			v.observer.attr(name, "query", tree.AsStringWithFlags(n.n.AsSource, tree.FmtParsable))
+			v.observer.attr(name, "query", n.viewQuery)
 		}
 
 	case *setVarNode:
@@ -568,6 +601,9 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *explainDistSQLNode:
 		n.plan = v.visit(n.plan)
 
+	case *explainVecNode:
+		n.plan = v.visit(n.plan)
+
 	case *ordinalityNode:
 		n.source = v.visit(n.source)
 
@@ -587,9 +623,6 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		n.plan = v.visit(n.plan)
 
 	case *explainPlanNode:
-		if v.observer.attr != nil {
-			v.observer.attr(name, "expanded", strconv.FormatBool(n.expanded))
-		}
 		n.plan = v.visit(n.plan)
 
 	case *cancelQueriesNode:
@@ -622,8 +655,28 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *errorIfRowsNode:
 		n.plan = v.visit(n.plan)
 
+	case *scanBufferNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "label", n.label)
+		}
+
 	case *bufferNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "label", n.label)
+		}
 		n.plan = v.visit(n.plan)
+
+	case *recursiveCTENode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "label", n.label)
+		}
+		n.initial = v.visit(n.initial)
+
+	case *exportNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "destination", n.fileName)
+		}
+		n.source = v.visit(n.source)
 	}
 }
 
@@ -645,12 +698,24 @@ func (v *planVisitor) metadataExpr(nodeName string, fieldName string, n int, exp
 	v.observer.expr(observeMetadata, nodeName, fieldName, n, expr)
 }
 
-func formatOrdering(ordering sqlbase.ColumnOrdering, cols sqlbase.ResultColumns) string {
-	var order physicalProps
-	for _, o := range ordering {
-		order.addOrderColumn(o.ColIdx, o.Direction)
+func formatOrdering(ordering sqlbase.ColumnOrdering, columns sqlbase.ResultColumns) string {
+	var buf bytes.Buffer
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	for i, o := range ordering {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		prefix := byte('+')
+		if o.Direction == encoding.Descending {
+			prefix = byte('-')
+		}
+		buf.WriteByte(prefix)
+
+		fmtCtx.FormatNameP(&columns[o.ColIdx].Name)
+		_, _ = fmtCtx.WriteTo(&buf)
 	}
-	return order.AsString(cols)
+	fmtCtx.Close()
+	return buf.String()
 }
 
 // nodeName returns the name of the given planNode as string.  The
@@ -660,10 +725,6 @@ func formatOrdering(ordering sqlbase.ColumnOrdering, cols sqlbase.ResultColumns)
 func nodeName(plan planNode) string {
 	// Some nodes have custom names depending on attributes.
 	switch n := plan.(type) {
-	case *sortNode:
-		if !n.needSort {
-			return "nosort"
-		}
 	case *scanNode:
 		if n.reverse {
 			return "revscan"
@@ -716,11 +777,13 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&alterUserSetPasswordNode{}): "alter user",
 	reflect.TypeOf(&applyJoinNode{}):            "apply-join",
 	reflect.TypeOf(&bufferNode{}):               "buffer node",
-	reflect.TypeOf(&commentOnColumnNode{}):      "comment on column",
-	reflect.TypeOf(&commentOnDatabaseNode{}):    "comment on database",
-	reflect.TypeOf(&commentOnTableNode{}):       "comment on table",
 	reflect.TypeOf(&cancelQueriesNode{}):        "cancel queries",
 	reflect.TypeOf(&cancelSessionsNode{}):       "cancel sessions",
+	reflect.TypeOf(&changePrivilegesNode{}):     "change privileges",
+	reflect.TypeOf(&commentOnColumnNode{}):      "comment on column",
+	reflect.TypeOf(&commentOnDatabaseNode{}):    "comment on database",
+	reflect.TypeOf(&commentOnIndexNode{}):       "comment on index",
+	reflect.TypeOf(&commentOnTableNode{}):       "comment on table",
 	reflect.TypeOf(&controlJobsNode{}):          "control jobs",
 	reflect.TypeOf(&createDatabaseNode{}):       "create database",
 	reflect.TypeOf(&createIndexNode{}):          "create index",
@@ -739,9 +802,11 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&dropTableNode{}):            "drop table",
 	reflect.TypeOf(&DropUserNode{}):             "drop user/role",
 	reflect.TypeOf(&dropViewNode{}):             "drop view",
-	reflect.TypeOf(&errorIfRowsNode{}):          "errorIfRows",
+	reflect.TypeOf(&errorIfRowsNode{}):          "error if rows",
 	reflect.TypeOf(&explainDistSQLNode{}):       "explain distsql",
 	reflect.TypeOf(&explainPlanNode{}):          "explain plan",
+	reflect.TypeOf(&explainVecNode{}):           "explain vectorized",
+	reflect.TypeOf(&exportNode{}):               "export",
 	reflect.TypeOf(&filterNode{}):               "filter",
 	reflect.TypeOf(&groupNode{}):                "group",
 	reflect.TypeOf(&hookFnNode{}):               "plugin",
@@ -753,6 +818,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&max1RowNode{}):              "max1row",
 	reflect.TypeOf(&ordinalityNode{}):           "ordinality",
 	reflect.TypeOf(&projectSetNode{}):           "project set",
+	reflect.TypeOf(&recursiveCTENode{}):         "recursive cte node",
 	reflect.TypeOf(&relocateNode{}):             "relocate",
 	reflect.TypeOf(&renameColumnNode{}):         "rename column",
 	reflect.TypeOf(&renameDatabaseNode{}):       "rename database",
@@ -777,6 +843,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&sortNode{}):                 "sort",
 	reflect.TypeOf(&splitNode{}):                "split",
 	reflect.TypeOf(&unsplitNode{}):              "unsplit",
+	reflect.TypeOf(&unsplitAllNode{}):           "unsplit all",
 	reflect.TypeOf(&spoolNode{}):                "spool",
 	reflect.TypeOf(&truncateNode{}):             "truncate",
 	reflect.TypeOf(&unaryNode{}):                "emptyrow",

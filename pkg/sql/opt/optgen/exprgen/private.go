@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package exprgen
 
@@ -120,7 +116,7 @@ func (eg *exprGen) addTable(name string) opt.TableID {
 	if !ok {
 		panic(errorf("non-table datasource %s not supported", name))
 	}
-	return eg.mem.Metadata().AddTable(tab)
+	return eg.mem.Metadata().AddTable(tab, &tn)
 }
 
 // findIndex looks for an index specified as "table@idx_name" among the tables
@@ -182,7 +178,7 @@ func (eg *exprGen) cardinalityFromStr(str string) props.Cardinality {
 func (eg *exprGen) intFromStr(str string) int {
 	val, err := strconv.Atoi(str)
 	if err != nil {
-		panic(errorf("expected number: %s (error: %v)", str, err))
+		panic(wrapf(err, "expected number: %s", str))
 	}
 	return val
 }
@@ -190,7 +186,7 @@ func (eg *exprGen) intFromStr(str string) int {
 func (eg *exprGen) statsFromStr(str string) props.Statistics {
 	var stats []stats.JSONStatistic
 	if err := json.Unmarshal([]byte(str), &stats); err != nil {
-		panic(errorf("error unmarshaling statistics: %v", err))
+		panic(wrapf(err, "error unmarshaling statistics"))
 	}
 	var result props.Statistics
 	if len(stats) == 0 {
@@ -204,7 +200,7 @@ func (eg *exprGen) statsFromStr(str string) props.Statistics {
 	for i := range stats {
 		var cols opt.ColSet
 		for _, colStr := range stats[i].Columns {
-			cols.Add(int(eg.LookupColumn(colStr)))
+			cols.Add(eg.LookupColumn(colStr))
 		}
 		s, added := result.ColStats.Add(cols)
 		if !added {

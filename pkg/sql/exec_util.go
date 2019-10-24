@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -30,6 +26,7 @@ import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -41,9 +38,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -61,8 +62,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/opentracing/opentracing-go"
 )
 
 // ClusterOrganization is the organization name.
@@ -116,18 +117,6 @@ var traceSessionEventLogEnabled = settings.RegisterBoolSetting(
 	"set to true to enable session tracing", false,
 )
 
-// OptimizerClusterMode controls the cluster default for when the cost-based optimizer is used.
-var OptimizerClusterMode = settings.RegisterEnumSetting(
-	"sql.defaults.optimizer",
-	"default cost-based optimizer mode",
-	"on",
-	map[int64]string{
-		int64(sessiondata.OptimizerLocal): "local",
-		int64(sessiondata.OptimizerOff):   "off",
-		int64(sessiondata.OptimizerOn):    "on",
-	},
-)
-
 // ReorderJoinsLimitClusterSettingName is the name of the cluster setting for
 // the maximum number of joins to reorder.
 const ReorderJoinsLimitClusterSettingName = "sql.defaults.reorder_joins_limit"
@@ -140,23 +129,45 @@ var ReorderJoinsLimitClusterValue = settings.RegisterValidatedIntSetting(
 	opt.DefaultJoinOrderLimit,
 	func(v int64) error {
 		if v < 0 {
-			return pgerror.Newf(pgerror.CodeInvalidParameterValueError,
+			return pgerror.Newf(pgcode.InvalidParameterValue,
 				"cannot set sql.defaults.reorder_joins_limit to a negative value: %d", v)
 		}
 		return nil
 	},
 )
 
+var optDrivenFKClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.experimental_optimizer_foreign_keys.enabled",
+	"enables optimizer-driven foreign key checks by default",
+	false,
+)
+
 // VectorizeClusterMode controls the cluster default for when automatic
 // vectorization is enabled.
 var VectorizeClusterMode = settings.RegisterEnumSetting(
-	"sql.defaults.experimental_vectorize",
-	"default experimental_vectorize mode",
-	"off",
+	"sql.defaults.vectorize",
+	"default vectorize mode",
+	"auto",
 	map[int64]string{
-		int64(sessiondata.VectorizeOff):    "off",
-		int64(sessiondata.VectorizeOn):     "on",
-		int64(sessiondata.VectorizeAlways): "always",
+		int64(sessiondata.VectorizeOff):            "off",
+		int64(sessiondata.VectorizeAuto):           "auto",
+		int64(sessiondata.VectorizeExperimentalOn): "experimental_on",
+	},
+)
+
+// VectorizeRowCountThresholdClusterValue controls the cluster default for the
+// vectorize row count threshold. When it is met, the vectorized execution
+// engine will be used if possible.
+var VectorizeRowCountThresholdClusterValue = settings.RegisterValidatedIntSetting(
+	"sql.defaults.vectorize_row_count_threshold",
+	"default vectorize row count threshold",
+	colexec.DefaultVectorizeRowCountThreshold,
+	func(v int64) error {
+		if v < 0 {
+			return pgerror.Newf(pgcode.InvalidParameterValue,
+				"cannot set sql.defaults.vectorize_row_count_threshold to a negative value: %d", v)
+		}
+		return nil
 	},
 )
 
@@ -258,6 +269,12 @@ var (
 		Help:        "Number of statements resulting in a planning or runtime error",
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
+	}
+	MetaSQLTxnLatency = metric.Metadata{
+		Name:        "sql.txn.latency",
+		Help:        "Latency of SQL transactions",
+		Measurement: "Latency",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 
 	// Below are the metadata for the statement started counters.
@@ -464,7 +481,7 @@ type nodeStatusGenerator interface {
 type ExecutorConfig struct {
 	Settings *cluster.Settings
 	NodeInfo
-	DefaultZoneConfig *config.ZoneConfig
+	DefaultZoneConfig *zonepb.ZoneConfig
 	Locality          roachpb.Locality
 	AmbientCtx        log.AmbientContext
 	DB                *client.DB
@@ -473,7 +490,7 @@ type ExecutorConfig struct {
 	RPCContext        *rpc.Context
 	LeaseManager      *LeaseManager
 	Clock             *hlc.Clock
-	DistSQLSrv        *distsqlrun.ServerImpl
+	DistSQLSrv        *distsql.ServerImpl
 	StatusServer      serverpb.StatusServer
 	MetricsRecorder   nodeStatusGenerator
 	SessionRegistry   *SessionRegistry
@@ -490,7 +507,7 @@ type ExecutorConfig struct {
 	TestingKnobs              ExecutorTestingKnobs
 	PGWireTestingKnobs        *PGWireTestingKnobs
 	SchemaChangerTestingKnobs *SchemaChangerTestingKnobs
-	DistSQLRunTestingKnobs    *distsqlrun.TestingKnobs
+	DistSQLRunTestingKnobs    *execinfra.TestingKnobs
 	EvalContextTestingKnobs   tree.EvalContextTestingKnobs
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval.
 	HistogramWindowInterval time.Duration
@@ -627,39 +644,6 @@ func (dc *databaseCacheHolder) updateSystemConfig(cfg *config.SystemConfig) {
 	dc.mu.Unlock()
 }
 
-// forEachRow calls the provided closure for each successful call to
-// planNode.Next with planNode.Values, making sure to properly track memory
-// usage.
-func forEachRow(params runParams, p planNode, f func(tree.Datums) error) error {
-	next, err := p.Next(params)
-	for ; next; next, err = p.Next(params) {
-		if err := f(p.Values()); err != nil {
-			return err
-		}
-	}
-	return err
-}
-
-// If the plan has a fast path we attempt to query that,
-// otherwise we fall back to counting via plan.Next().
-func countRowsAffected(params runParams, p planNode) (int, error) {
-	if a, ok := p.(planNodeFastPath); ok {
-		if count, res := a.FastPathResults(); res {
-			if params.extendedEvalCtx.Tracing.Enabled() {
-				log.VEvent(params.ctx, 2, "fast path completed")
-			}
-			return count, nil
-		}
-	}
-
-	count := 0
-	err := forEachRow(params, p, func(_ tree.Datums) error {
-		count++
-		return nil
-	})
-	return count, err
-}
-
 func shouldDistributeGivenRecAndMode(
 	rec distRecommendation, mode sessiondata.DistSQLExecMode,
 ) bool {
@@ -794,7 +778,7 @@ func checkResultType(typ *types.T) error {
 			// mixed signals -- that nested arrays appear to be supported
 			// in this case, and not in other cases (eg. CREATE). So we
 			// reject them in every case instead.
-			return pgerror.UnimplementedWithIssueDetail(32552,
+			return unimplemented.NewWithIssueDetail(32552,
 				"result", "arrays cannot have arrays as element type")
 		}
 	case types.AnyFamily:
@@ -849,7 +833,7 @@ func (p *planner) isAsOf(stmt tree.Statement) (*hlc.Timestamp, error) {
 		if !ok {
 			return nil, nil
 		}
-		if sc.From == nil || sc.From.AsOf.Expr == nil {
+		if sc.From.AsOf.Expr == nil {
 			return nil, nil
 		}
 
@@ -1269,8 +1253,9 @@ func (st *SessionTracing) StartTracing(
 			}
 			fmt.Fprintf(&desiredOptions, "%s%s", comma, recOption)
 
-			return pgerror.Newf(pgerror.CodeObjectNotInPrerequisiteStateError,
-				"tracing is already started with different options").SetHintf(
+			err := pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+				"tracing is already started with different options")
+			return errors.WithHintf(err,
 				"reset with SET tracing = off; SET tracing = %s", desiredOptions.String())
 		}
 
@@ -1801,11 +1786,15 @@ func (m *sessionDataMutator) SetReorderJoinsLimit(val int) {
 }
 
 func (m *sessionDataMutator) SetVectorize(val sessiondata.VectorizeExecMode) {
-	m.data.Vectorize = val
+	m.data.VectorizeMode = val
 }
 
-func (m *sessionDataMutator) SetOptimizerMode(val sessiondata.OptimizerMode) {
-	m.data.OptimizerMode = val
+func (m *sessionDataMutator) SetVectorizeRowCountThreshold(val uint64) {
+	m.data.VectorizeRowCountThreshold = val
+}
+
+func (m *sessionDataMutator) SetOptimizerFKs(val bool) {
+	m.data.OptimizerFKs = val
 }
 
 func (m *sessionDataMutator) SetSerialNormalizationMode(val sessiondata.SerialNormalizationMode) {
@@ -1840,72 +1829,65 @@ func (m *sessionDataMutator) SetSaveTablesPrefix(prefix string) {
 	m.data.SaveTablesPrefix = prefix
 }
 
+func (m *sessionDataMutator) SetTempTablesEnabled(val bool) {
+	m.data.TempTablesEnabled = val
+}
+
 // RecordLatestSequenceValue records that value to which the session incremented
 // a sequence.
 func (m *sessionDataMutator) RecordLatestSequenceVal(seqID uint32, val int64) {
 	m.data.SequenceState.RecordValue(seqID, val)
 }
 
-type sqlStatsCollectorImpl struct {
-	// sqlStats tracks per-application statistics for all
-	// applications on each node.
+type sqlStatsCollector struct {
+	// sqlStats tracks per-application statistics for all applications on each
+	// node.
 	sqlStats *sqlStats
-	// appStats track per-application SQL usage statistics. This is a pointer into
-	// sqlStats set as the session's current app.
+	// appStats track per-application SQL usage statistics. This is a pointer
+	// into sqlStats set as the session's current app.
 	appStats *appStats
-	// phaseTimes tracks session-level phase times. It is copied-by-value
-	// to each planner in session.newPlanner.
+	// phaseTimes tracks session-level phase times.
 	phaseTimes phaseTimes
 }
 
-// sqlStatsCollectorImpl implements the sqlStatsCollector interface.
-var _ sqlStatsCollector = &sqlStatsCollectorImpl{}
-
-// newSQLStatsCollectorImpl creates an instance of sqlStatsCollectorImpl.
-//
-// note that phaseTimes is an array, not a slice, so this performs a copy-by-value.
-func newSQLStatsCollectorImpl(
+// newSQLStatsCollector creates an instance of sqlStatsCollector. Note that
+// phaseTimes is an array, not a slice, so this performs a copy-by-value.
+func newSQLStatsCollector(
 	sqlStats *sqlStats, appStats *appStats, phaseTimes *phaseTimes,
-) *sqlStatsCollectorImpl {
-	return &sqlStatsCollectorImpl{
+) *sqlStatsCollector {
+	return &sqlStatsCollector{
 		sqlStats:   sqlStats,
 		appStats:   appStats,
 		phaseTimes: *phaseTimes,
 	}
 }
 
-// PhaseTimes is part of the sqlStatsCollector interface.
-func (s *sqlStatsCollectorImpl) PhaseTimes() *phaseTimes {
-	return &s.phaseTimes
-}
-
-// RecordStatement is part of the sqlStatsCollector interface.
-//
-// samplePlanDescription can be nil, as these are only sampled periodically per unique fingerprint.
-func (s *sqlStatsCollectorImpl) RecordStatement(
+// recordStatement records stats for one statement. samplePlanDescription can
+// be nil, as these are only sampled periodically per unique fingerprint.
+func (s *sqlStatsCollector) recordStatement(
 	stmt *Statement,
 	samplePlanDescription *roachpb.ExplainTreePlanNode,
 	distSQLUsed bool,
 	optUsed bool,
+	implicitTxn bool,
 	automaticRetryCount int,
 	numRows int,
 	err error,
 	parseLat, planLat, runLat, svcLat, ovhLat float64,
+	bytesRead, rowsRead int64,
 ) {
 	s.appStats.recordStatement(
-		stmt, samplePlanDescription, distSQLUsed, optUsed, automaticRetryCount, numRows, err,
-		parseLat, planLat, runLat, svcLat, ovhLat)
+		stmt, samplePlanDescription, distSQLUsed, optUsed, implicitTxn, automaticRetryCount, numRows, err,
+		parseLat, planLat, runLat, svcLat, ovhLat, bytesRead, rowsRead)
 }
 
-// SQLStats is part of the sqlStatsCollector interface.
-func (s *sqlStatsCollectorImpl) SQLStats() *sqlStats {
-	return s.sqlStats
+// recordTransaction records stats for one transaction.
+func (s *sqlStatsCollector) recordTransaction(txnTimeSec float64, ev txnEvent, implicit bool) {
+	s.appStats.recordTransaction(txnTimeSec, ev, implicit)
 }
 
-func (s *sqlStatsCollectorImpl) Reset(
-	sqlStats *sqlStats, appStats *appStats, phaseTimes *phaseTimes,
-) {
-	*s = sqlStatsCollectorImpl{
+func (s *sqlStatsCollector) reset(sqlStats *sqlStats, appStats *appStats, phaseTimes *phaseTimes) {
+	*s = sqlStatsCollector{
 		sqlStats:   sqlStats,
 		appStats:   appStats,
 		phaseTimes: *phaseTimes,

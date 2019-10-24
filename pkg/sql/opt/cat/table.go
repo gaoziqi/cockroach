@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cat
 
@@ -82,7 +78,7 @@ type Table interface {
 	// Public indexes are not currently being added or dropped from the table.
 	// This method should be used when mutation columns can be ignored (the common
 	// case). The returned indexes include the primary index, so the count is
-	// always >= 1.
+	// always >= 1 (except for virtual tables, which have no indexes).
 	IndexCount() int
 
 	// WritableIndexCount returns the number of public and write-only indexes
@@ -96,12 +92,13 @@ type Table interface {
 	// >= WritableIndexCount.
 	DeletableIndexCount() int
 
-	// Index returns the ith index, where i < IndexCount. The table's primary
-	// index is always the 0th index, and is always present (use cat.PrimaryIndex
-	// to select it). The primary index corresponds to the table's primary key.
-	// If a primary key was not explicitly specified, then the system implicitly
-	// creates one based on a hidden rowid column.
-	Index(i int) Index
+	// Index returns the ith index, where i < DeletableIndexCount. Except for
+	// virtual tables, the table's primary index is always the 0th index, and is
+	// always present (use cat.PrimaryIndex to select it). The primary index
+	// corresponds to the table's primary key. If a primary key was not
+	// explicitly specified, then the system implicitly creates one based on a
+	// hidden rowid column.
+	Index(i IndexOrdinal) Index
 
 	// StatisticCount returns the number of statistics available for the table.
 	StatisticCount() int
@@ -141,14 +138,17 @@ type Table interface {
 	InboundForeignKey(i int) ForeignKeyConstraint
 }
 
-// CheckConstraint is the SQL text for a check constraint on a table. Check
-// constraints are user-defined restrictions on the content of each row in a
-// table. For example, this check constraint ensures that only values greater
-// than zero can be inserted into the table:
+// CheckConstraint contains the SQL text and the validity status for a check
+// constraint on a table. Check constraints are user-defined restrictions
+// on the content of each row in a table. For example, this check constraint
+// ensures that only values greater than zero can be inserted into the table:
 //
 //   CREATE TABLE a (a INT CHECK (a > 0))
 //
-type CheckConstraint string
+type CheckConstraint struct {
+	Constraint string
+	Validated  bool
+}
 
 // TableStatistic is an interface to a table statistic. Each statistic is
 // associated with a set of columns.
@@ -168,15 +168,39 @@ type TableStatistic interface {
 
 	// DistinctCount returns the estimated number of distinct values on the
 	// columns of the statistic. If there are multiple columns, each "value" is a
-	// tuple with the values on each column. Rows where any statistic column have
-	// a NULL don't contribute to this count.
+	// tuple with the values on each column.
 	DistinctCount() uint64
 
 	// NullCount returns the estimated number of rows which have a NULL value on
 	// any column in the statistic.
 	NullCount() uint64
 
-	// TODO(radu): add Histogram().
+	// Histogram returns a slice of histogram buckets, sorted by UpperBound.
+	// It is only used for single-column stats (i.e., when ColumnCount() = 1),
+	// and it represents the distribution of values for that column.
+	// See HistogramBucket for more details.
+	Histogram() []HistogramBucket
+}
+
+// HistogramBucket contains the data for a single histogram bucket. Note
+// that NumEq, NumRange, and DistinctRange are floats so the statisticsBuilder
+// can apply filters to the histogram.
+type HistogramBucket struct {
+	// NumEq is the estimated number of values equal to UpperBound.
+	NumEq float64
+
+	// NumRange is the estimated number of values between the upper bound of the
+	// previous bucket and UpperBound (both boundaries are exclusive).
+	// The first bucket should always have NumRange=0.
+	NumRange float64
+
+	// DistinctRange is the estimated number of distinct values between the upper
+	// bound of the previous bucket and UpperBound (both boundaries are
+	// exclusive).
+	DistinctRange float64
+
+	// UpperBound is the upper bound of the bucket.
+	UpperBound tree.Datum
 }
 
 // ForeignKeyConstraint represents a foreign key constraint. A foreign key
@@ -217,4 +241,12 @@ type ForeignKeyConstraint interface {
 
 	// MatchMethod returns the method used for comparing composite foreign keys.
 	MatchMethod() tree.CompositeKeyMatchMethod
+
+	// DeleteReferenceAction returns the action to be performed if the foreign key
+	// constraint would be violated by a delete.
+	DeleteReferenceAction() tree.ReferenceAction
+
+	// UpdateReferenceAction returns the action to be performed if the foreign key
+	// constraint would be violated by an update.
+	UpdateReferenceAction() tree.ReferenceAction
 }

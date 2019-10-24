@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cat
 
@@ -38,6 +34,10 @@ type View interface {
 	// ColumnNames returns the name of the column at the ith ordinal position
 	// within the view, where i < ColumnNameCount.
 	ColumnName(i int) tree.Name
+
+	// IsSystemView returns true if this view is a system view (like
+	// crdb_internal.ranges).
+	IsSystemView() bool
 }
 
 // FormatView nicely formats a catalog view using a treeprinter for debugging
@@ -55,7 +55,7 @@ func FormatView(view View, tp treeprinter.Node) {
 		buf.WriteString(")")
 	}
 
-	child := tp.Childf("VIEW %s%s", view.Name().TableName, buf.String())
+	child := tp.Childf("VIEW %s%s", view.Name(), buf.String())
 
 	child.Child(view.Query())
 }

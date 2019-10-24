@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -24,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
@@ -367,6 +362,12 @@ var (
 		Measurement: "SSTables",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaRdbPendingCompaction = metric.Metadata{
+		Name:        "rocksdb.estimated-pending-compaction",
+		Help:        "Estimated pending compaction bytes",
+		Measurement: "Storage",
+		Unit:        metric.Unit_BYTES,
+	}
 
 	// Range event metrics.
 	metaRangeSplits = metric.Metadata{
@@ -402,6 +403,12 @@ var (
 	metaRangeSnapshotsNormalApplied = metric.Metadata{
 		Name:        "range.snapshots.normal-applied",
 		Help:        "Number of applied snapshots",
+		Measurement: "Snapshots",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRangeSnapshotsLearnerApplied = metric.Metadata{
+		Name:        "range.snapshots.learner-applied",
+		Help:        "Number of applied learner snapshots",
 		Measurement: "Snapshots",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -943,6 +950,18 @@ var (
 		Measurement: "Ingestions",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaAddSSTableEvalTotalDelay = metric.Metadata{
+		Name:        "addsstable.delay.total",
+		Help:        "Amount by which evaluation of AddSSTable requests was delayed",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaAddSSTableEvalEngineDelay = metric.Metadata{
+		Name:        "addsstable.delay.enginebackpressure",
+		Help:        "Amount by which evaluation of AddSSTable requests was delayed by storage-engine backpressure",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
 
 	// Encryption-at-rest metrics.
 	// TODO(mberhault): metrics for key age, per-key file/bytes counts.
@@ -967,7 +986,7 @@ type StoreMetrics struct {
 	registry *metric.Registry
 
 	// Replica metrics.
-	ReplicaCount                  *metric.Gauge // Does not include reserved replicas.
+	ReplicaCount                  *metric.Gauge // Does not include uninitialized or reserved replicas.
 	ReservedReplicaCount          *metric.Gauge
 	RaftLeaderCount               *metric.Gauge
 	RaftLeaderNotLeaseHolderCount *metric.Gauge
@@ -1033,6 +1052,7 @@ type StoreMetrics struct {
 	RdbTableReadersMemEstimate  *metric.Gauge
 	RdbReadAmplification        *metric.Gauge
 	RdbNumSSTables              *metric.Gauge
+	RdbPendingCompaction        *metric.Gauge
 
 	// TODO(mrtracy): This should be removed as part of #4465. This is only
 	// maintained to keep the current structure of NodeStatus; it would be
@@ -1046,6 +1066,7 @@ type StoreMetrics struct {
 	RangeRemoves                    *metric.Counter
 	RangeSnapshotsGenerated         *metric.Counter
 	RangeSnapshotsNormalApplied     *metric.Counter
+	RangeSnapshotsLearnerApplied    *metric.Counter
 	RangeSnapshotsPreemptiveApplied *metric.Counter
 	RangeRaftLeaderTransfers        *metric.Counter
 
@@ -1078,11 +1099,11 @@ type StoreMetrics struct {
 	RaftLogFollowerBehindCount *metric.Gauge
 	RaftLogTruncated           *metric.Counter
 
-	// A map for conveniently finding the appropriate metric. The individual
+	// An array for conveniently finding the appropriate metric. The individual
 	// metric references must exist as AddMetricStruct adds them by reflection
-	// on this struct and does not process map types.
+	// on this struct and does not process array types.
 	// TODO(arjun): eliminate this duplication.
-	raftRcvdMessages map[raftpb.MessageType]*metric.Counter
+	raftRcvdMessages [maxRaftMsgType + 1]*metric.Counter
 
 	RaftEnqueuedPending            *metric.Gauge
 	RaftCoalescedHeartbeatsPending *metric.Gauge
@@ -1154,9 +1175,11 @@ type StoreMetrics struct {
 
 	// AddSSTable stats: how many AddSSTable commands were proposed and how many
 	// were applied? How many applications required writing a copy?
-	AddSSTableProposals         *metric.Counter
-	AddSSTableApplications      *metric.Counter
-	AddSSTableApplicationCopies *metric.Counter
+	AddSSTableProposals           *metric.Counter
+	AddSSTableApplications        *metric.Counter
+	AddSSTableApplicationCopies   *metric.Counter
+	AddSSTableProposalTotalDelay  *metric.Counter
+	AddSSTableProposalEngineDelay *metric.Counter
 
 	// Encryption-at-rest stats.
 	// EncryptionAlgorithm is an enum representing the cipher in use, so we use a gauge.
@@ -1167,12 +1190,6 @@ type StoreMetrics struct {
 
 	// Closed timestamp metrics.
 	ClosedTimestampMaxBehindNanos *metric.Gauge
-
-	// Stats for efficient merges.
-	mu struct {
-		syncutil.Mutex
-		stats enginepb.MVCCStats
-	}
 }
 
 func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
@@ -1247,6 +1264,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RdbTableReadersMemEstimate:  metric.NewGauge(metaRdbTableReadersMemEstimate),
 		RdbReadAmplification:        metric.NewGauge(metaRdbReadAmplification),
 		RdbNumSSTables:              metric.NewGauge(metaRdbNumSSTables),
+		RdbPendingCompaction:        metric.NewGauge(metaRdbPendingCompaction),
 
 		// Range event metrics.
 		RangeSplits:                     metric.NewCounter(metaRangeSplits),
@@ -1255,6 +1273,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RangeRemoves:                    metric.NewCounter(metaRangeRemoves),
 		RangeSnapshotsGenerated:         metric.NewCounter(metaRangeSnapshotsGenerated),
 		RangeSnapshotsNormalApplied:     metric.NewCounter(metaRangeSnapshotsNormalApplied),
+		RangeSnapshotsLearnerApplied:    metric.NewCounter(metaRangeSnapshotsLearnerApplied),
 		RangeSnapshotsPreemptiveApplied: metric.NewCounter(metaRangeSnapshotsPreemptiveApplied),
 		RangeRaftLeaderTransfers:        metric.NewCounter(metaRangeRaftLeaderTransfers),
 
@@ -1282,7 +1301,6 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftRcvdMsgTransferLeader: metric.NewCounter(metaRaftRcvdTransferLeader),
 		RaftRcvdMsgTimeoutNow:     metric.NewCounter(metaRaftRcvdTimeoutNow),
 		RaftRcvdMsgDropped:        metric.NewCounter(metaRaftRcvdDropped),
-		raftRcvdMessages:          make(map[raftpb.MessageType]*metric.Counter, len(raftpb.MessageType_name)),
 
 		RaftEnqueuedPending: metric.NewGauge(metaRaftEnqueuedPending),
 
@@ -1360,9 +1378,11 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		BackpressuredOnSplitRequests: metric.NewGauge(metaBackpressuredOnSplitRequests),
 
 		// AddSSTable proposal + applications counters.
-		AddSSTableProposals:         metric.NewCounter(metaAddSSTableProposals),
-		AddSSTableApplications:      metric.NewCounter(metaAddSSTableApplications),
-		AddSSTableApplicationCopies: metric.NewCounter(metaAddSSTableApplicationCopies),
+		AddSSTableProposals:           metric.NewCounter(metaAddSSTableProposals),
+		AddSSTableApplications:        metric.NewCounter(metaAddSSTableApplications),
+		AddSSTableApplicationCopies:   metric.NewCounter(metaAddSSTableApplicationCopies),
+		AddSSTableProposalTotalDelay:  metric.NewCounter(metaAddSSTableEvalTotalDelay),
+		AddSSTableProposalEngineDelay: metric.NewCounter(metaAddSSTableEvalEngineDelay),
 
 		// Encryption-at-rest.
 		EncryptionAlgorithm: metric.NewGauge(metaEncryptionAlgorithm),
@@ -1392,41 +1412,35 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 	return sm
 }
 
-// updateGaugesLocked breaks out individual metrics from the MVCCStats object.
-// This process should be locked with each stat application to ensure that all
-// gauges increase/decrease in step with the application of updates. However,
-// this locking is not exposed to the registry level, and therefore a single
-// snapshot of these gauges in the registry might mix the values of two
+// incMVCCGauges increments each individual metric from an MVCCStats delta. The
+// method uses a series of atomic operations without any external locking, so a
+// single snapshot of these gauges in the registry might mix the values of two
 // subsequent updates.
-func (sm *StoreMetrics) updateMVCCGaugesLocked() {
-	sm.LiveBytes.Update(sm.mu.stats.LiveBytes)
-	sm.KeyBytes.Update(sm.mu.stats.KeyBytes)
-	sm.ValBytes.Update(sm.mu.stats.ValBytes)
-	sm.TotalBytes.Update(sm.mu.stats.Total())
-	sm.IntentBytes.Update(sm.mu.stats.IntentBytes)
-	sm.LiveCount.Update(sm.mu.stats.LiveCount)
-	sm.KeyCount.Update(sm.mu.stats.KeyCount)
-	sm.ValCount.Update(sm.mu.stats.ValCount)
-	sm.IntentCount.Update(sm.mu.stats.IntentCount)
-	sm.IntentAge.Update(sm.mu.stats.IntentAge)
-	sm.GcBytesAge.Update(sm.mu.stats.GCBytesAge)
-	sm.LastUpdateNanos.Update(sm.mu.stats.LastUpdateNanos)
-	sm.SysBytes.Update(sm.mu.stats.SysBytes)
-	sm.SysCount.Update(sm.mu.stats.SysCount)
+func (sm *StoreMetrics) incMVCCGauges(delta enginepb.MVCCStats) {
+	sm.LiveBytes.Inc(delta.LiveBytes)
+	sm.KeyBytes.Inc(delta.KeyBytes)
+	sm.ValBytes.Inc(delta.ValBytes)
+	sm.TotalBytes.Inc(delta.Total())
+	sm.IntentBytes.Inc(delta.IntentBytes)
+	sm.LiveCount.Inc(delta.LiveCount)
+	sm.KeyCount.Inc(delta.KeyCount)
+	sm.ValCount.Inc(delta.ValCount)
+	sm.IntentCount.Inc(delta.IntentCount)
+	sm.IntentAge.Inc(delta.IntentAge)
+	sm.GcBytesAge.Inc(delta.GCBytesAge)
+	sm.LastUpdateNanos.Inc(delta.LastUpdateNanos)
+	sm.SysBytes.Inc(delta.SysBytes)
+	sm.SysCount.Inc(delta.SysCount)
 }
 
-func (sm *StoreMetrics) addMVCCStats(stats enginepb.MVCCStats) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.mu.stats.Add(stats)
-	sm.updateMVCCGaugesLocked()
+func (sm *StoreMetrics) addMVCCStats(delta enginepb.MVCCStats) {
+	sm.incMVCCGauges(delta)
 }
 
-func (sm *StoreMetrics) subtractMVCCStats(stats enginepb.MVCCStats) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.mu.stats.Subtract(stats)
-	sm.updateMVCCGaugesLocked()
+func (sm *StoreMetrics) subtractMVCCStats(delta enginepb.MVCCStats) {
+	var neg enginepb.MVCCStats
+	neg.Subtract(delta)
+	sm.incMVCCGauges(neg)
 }
 
 func (sm *StoreMetrics) updateRocksDBStats(stats engine.Stats) {

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rangefeed
 
@@ -147,7 +143,7 @@ func (rts *resolvedTimestamp) consumeLogicalOp(op enginepb.MVCCLogicalOp) bool {
 
 	case *enginepb.MVCCWriteIntentOp:
 		rts.assertOpAboveRTS(op, t.Timestamp)
-		return rts.intentQ.IncRef(t.TxnID, t.TxnKey, t.Timestamp)
+		return rts.intentQ.IncRef(t.TxnID, t.TxnKey, t.TxnMinTimestamp, t.Timestamp)
 
 	case *enginepb.MVCCUpdateIntentOp:
 		return rts.intentQ.UpdateTS(t.TxnID, t.Timestamp)
@@ -283,14 +279,25 @@ func (rts *resolvedTimestamp) assertOpAboveRTS(op enginepb.MVCCLogicalOp, opTS h
 // along with a reference count of the number of unresolved intents created by
 // the transaction on a given range.
 type unresolvedTxn struct {
-	txnID     uuid.UUID
-	txnKey    roachpb.Key
-	timestamp hlc.Timestamp
-	refCount  int // count of unresolved intents
+	txnID           uuid.UUID
+	txnKey          roachpb.Key
+	txnMinTimestamp hlc.Timestamp
+	timestamp       hlc.Timestamp
+	refCount        int // count of unresolved intents
 
 	// The index of the item in the unresolvedTxnHeap, maintained by the
 	// heap.Interface methods.
 	index int
+}
+
+// asTxnMeta returns a TxnMeta representation of the unresolved transaction.
+func (t *unresolvedTxn) asTxnMeta() enginepb.TxnMeta {
+	return enginepb.TxnMeta{
+		ID:           t.txnID,
+		Key:          t.txnKey,
+		MinTimestamp: t.txnMinTimestamp,
+		Timestamp:    t.timestamp,
+	}
 }
 
 // unresolvedTxnHeap implements heap.Interface and holds unresolvedTxns.
@@ -395,27 +402,27 @@ func (uiq *unresolvedIntentQueue) Before(ts hlc.Timestamp) []*unresolvedTxn {
 // returns whether the update advanced the timestamp of the oldest transaction
 // in the queue.
 func (uiq *unresolvedIntentQueue) IncRef(
-	txnID uuid.UUID, txnKey roachpb.Key, ts hlc.Timestamp,
+	txnID uuid.UUID, txnKey roachpb.Key, txnMinTS, ts hlc.Timestamp,
 ) bool {
-	return uiq.updateTxn(txnID, txnKey, ts, +1)
+	return uiq.updateTxn(txnID, txnKey, txnMinTS, ts, +1)
 }
 
 // DecrRef decrements the reference count of the specified transaction. It
 // returns whether the update advanced the timestamp of the oldest transaction
 // in the queue.
 func (uiq *unresolvedIntentQueue) DecrRef(txnID uuid.UUID, ts hlc.Timestamp) bool {
-	return uiq.updateTxn(txnID, nil, ts, -1)
+	return uiq.updateTxn(txnID, nil, hlc.Timestamp{}, ts, -1)
 }
 
 // UpdateTS updates the timestamp of the specified transaction without modifying
 // its intent reference count. It returns whether the update advanced the
 // timestamp of the oldest transaction in the queue.
 func (uiq *unresolvedIntentQueue) UpdateTS(txnID uuid.UUID, ts hlc.Timestamp) bool {
-	return uiq.updateTxn(txnID, nil, ts, 0)
+	return uiq.updateTxn(txnID, nil, hlc.Timestamp{}, ts, 0)
 }
 
 func (uiq *unresolvedIntentQueue) updateTxn(
-	txnID uuid.UUID, txnKey roachpb.Key, ts hlc.Timestamp, delta int,
+	txnID uuid.UUID, txnKey roachpb.Key, txnMinTS, ts hlc.Timestamp, delta int,
 ) bool {
 	txn, ok := uiq.txns[txnID]
 	if !ok {
@@ -426,10 +433,11 @@ func (uiq *unresolvedIntentQueue) updateTxn(
 
 		// Add new txn to the queue.
 		txn = &unresolvedTxn{
-			txnID:     txnID,
-			txnKey:    txnKey,
-			timestamp: ts,
-			refCount:  delta,
+			txnID:           txnID,
+			txnKey:          txnKey,
+			txnMinTimestamp: txnMinTS,
+			timestamp:       ts,
+			refCount:        delta,
 		}
 		uiq.txns[txn.txnID] = txn
 		heap.Push(&uiq.minHeap, txn)
@@ -465,7 +473,7 @@ func (uiq *unresolvedIntentQueue) updateTxn(
 func (uiq *unresolvedIntentQueue) Del(txnID uuid.UUID) bool {
 	// This implementation is logically equivalent to the following, but
 	// it avoids underflow conditions:
-	//  return uiq.updateTxn(txnID, nil, hlc.Timestamp{}, math.MinInt64)
+	//  return uiq.updateTxn(txnID, nil, hlc.Timestamp{}, hlc.Timestamp{}, math.MinInt64)
 
 	txn, ok := uiq.txns[txnID]
 	if !ok {

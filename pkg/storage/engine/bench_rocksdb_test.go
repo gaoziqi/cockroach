@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
@@ -40,7 +36,7 @@ func setupMVCCRocksDB(b testing.TB, dir string) Engine {
 		cache,
 	)
 	if err != nil {
-		b.Fatalf("could not create new rocksdb db instance at %s: %v", dir, err)
+		b.Fatalf("could not create new rocksdb db instance at %s: %+v", dir, err)
 	}
 	return rocksdb
 }
@@ -314,6 +310,24 @@ func BenchmarkMVCCMergeTimeSeries_RocksDB(b *testing.B) {
 		b.Fatal(err)
 	}
 	runMVCCMerge(ctx, b, setupMVCCInMemRocksDB, &value, 1024)
+}
+
+// BenchmarkMVCCGetMergedTimeSeries computes performance of reading merged
+// time series data using `MVCCGet()`. Uses an in-memory engine.
+func BenchmarkMVCCGetMergedTimeSeries_RocksDB(b *testing.B) {
+	if testing.Short() {
+		b.Skip("short flag")
+	}
+	ctx := context.Background()
+	for _, numKeys := range []int{1, 16, 256} {
+		b.Run(fmt.Sprintf("numKeys=%d", numKeys), func(b *testing.B) {
+			for _, mergesPerKey := range []int{1, 16, 256} {
+				b.Run(fmt.Sprintf("mergesPerKey=%d", mergesPerKey), func(b *testing.B) {
+					runMVCCGetMergedValue(ctx, b, setupMVCCInMemRocksDB, numKeys, mergesPerKey)
+				})
+			}
+		})
+	}
 }
 
 // DeleteRange benchmarks below (using on-disk data).

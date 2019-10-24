@@ -18,12 +18,13 @@ import (
 	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // defaultScanBuffer is the default max row size of the PGCOPY and PGDUMP
@@ -31,19 +32,19 @@ import (
 const defaultScanBuffer = 1024 * 1024 * 4
 
 type pgCopyReader struct {
-	conv rowConverter
+	conv row.DatumRowConverter
 	opts roachpb.PgCopyOptions
 }
 
 var _ inputConverter = &pgCopyReader{}
 
 func newPgCopyReader(
-	kvCh chan []roachpb.KeyValue,
+	kvCh chan row.KVBatch,
 	opts roachpb.PgCopyOptions,
 	tableDesc *sqlbase.TableDescriptor,
 	evalCtx *tree.EvalContext,
 ) (*pgCopyReader, error) {
-	conv, err := newRowConverter(tableDesc, evalCtx, kvCh)
+	conv, err := row.NewDatumRowConverter(tableDesc, nil /* targetColNames */, evalCtx, kvCh)
 	if err != nil {
 		return nil, err
 	}
@@ -57,17 +58,16 @@ func (d *pgCopyReader) start(ctx ctxgroup.Group) {
 }
 
 func (d *pgCopyReader) inputFinished(ctx context.Context) {
-	close(d.conv.kvCh)
+	close(d.conv.KvCh)
 }
 
 func (d *pgCopyReader) readFiles(
 	ctx context.Context,
 	dataFiles map[int32]string,
 	format roachpb.IOFileFormat,
-	progressFn func(float32) error,
-	settings *cluster.Settings,
+	makeExternalStorage cloud.ExternalStorageFactory,
 ) error {
-	return readInputFiles(ctx, dataFiles, format, d.readFile, progressFn, settings)
+	return readInputFiles(ctx, dataFiles, format, d.readFile, makeExternalStorage)
 }
 
 type postgreStreamCopy struct {
@@ -257,7 +257,7 @@ func (c copyData) String() string {
 }
 
 func (d *pgCopyReader) readFile(
-	ctx context.Context, input io.Reader, inputIdx int32, inputName string, progressFn progressFn,
+	ctx context.Context, input *fileReader, inputIdx int32, inputName string, rejected chan string,
 ) error {
 	s := bufio.NewScanner(input)
 	s.Split(bufio.ScanLines)
@@ -267,6 +267,8 @@ func (d *pgCopyReader) readFile(
 		d.opts.Delimiter,
 		d.opts.Null,
 	)
+	d.conv.KvBatch.Source = inputIdx
+	d.conv.FractionFn = input.ReadFraction
 
 	for count := int64(1); ; count++ {
 		row, err := c.Next()
@@ -274,29 +276,29 @@ func (d *pgCopyReader) readFile(
 			break
 		}
 		if err != nil {
-			return wrapRowErr(err, inputName, count, pgerror.CodeDataExceptionError, "")
+			return wrapRowErr(err, inputName, count, pgcode.Uncategorized, "")
 		}
-		if len(row) != len(d.conv.visibleColTypes) {
-			return makeRowErr(inputName, count, pgerror.CodeSyntaxError,
-				"expected %d values, got %d", len(d.conv.visibleColTypes), len(row))
+		if len(row) != len(d.conv.VisibleColTypes) {
+			return makeRowErr(inputName, count, pgcode.Syntax,
+				"expected %d values, got %d", len(d.conv.VisibleColTypes), len(row))
 		}
 		for i, s := range row {
 			if s == nil {
-				d.conv.datums[i] = tree.DNull
+				d.conv.Datums[i] = tree.DNull
 			} else {
-				d.conv.datums[i], err = tree.ParseDatumStringAs(d.conv.visibleColTypes[i], *s, d.conv.evalCtx)
+				d.conv.Datums[i], err = tree.ParseDatumStringAs(d.conv.VisibleColTypes[i], *s, d.conv.EvalCtx)
 				if err != nil {
-					col := d.conv.visibleCols[i]
-					return wrapRowErr(err, inputName, count, pgerror.CodeSyntaxError,
+					col := d.conv.VisibleCols[i]
+					return wrapRowErr(err, inputName, count, pgcode.Syntax,
 						"parse %q as %s", col.Name, col.Type.SQLString())
 				}
 			}
 		}
 
-		if err := d.conv.row(ctx, inputIdx, count); err != nil {
-			return wrapRowErr(err, inputName, count, pgerror.CodeDataExceptionError, "")
+		if err := d.conv.Row(ctx, inputIdx, count); err != nil {
+			return wrapRowErr(err, inputName, count, pgcode.Uncategorized, "")
 		}
 	}
 
-	return d.conv.sendBatch(ctx)
+	return d.conv.SendBatch(ctx)
 }

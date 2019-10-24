@@ -51,10 +51,10 @@ TESTS := .
 ## Benchmarks to run for use with `make bench`.
 BENCHES :=
 
-## Space delimited list of logic test files to run, for make testlogic/testccllogic/testoptlogic/testplannerlogic.
+## Space delimited list of logic test files to run, for make testlogic/testccllogic/testoptlogic.
 FILES :=
 
-## Name of a logic test configuration to run, for make testlogic/testccllogic/testoptlogic/testplannerlogic.
+## Name of a logic test configuration to run, for make testlogic/testccllogic/testoptlogic.
 ## (default: all configs. It's not possible yet to specify multiple configs in this way.)
 TESTCONFIG :=
 
@@ -66,10 +66,10 @@ SUBTESTS :=
 LINTTIMEOUT := 20m
 
 ## Test timeout to use for regular tests.
-TESTTIMEOUT := 12m
+TESTTIMEOUT := 20m
 
 ## Test timeout to use for race tests.
-RACETIMEOUT := 25m
+RACETIMEOUT := 30m
 
 ## Test timeout to use for acceptance tests.
 ACCEPTANCETIMEOUT := 30m
@@ -88,6 +88,9 @@ CLUSTER :=
 
 ## Verbose allows turning on verbose output from the cmake builds.
 VERBOSE :=
+
+## Indicate the base root directory where to install
+DESTDIR :=
 
 DUPLFLAGS    := -t 100
 GOFLAGS      :=
@@ -130,6 +133,9 @@ help: ## Print help for targets with comments.
 		"make testlogic FILES='prepare fk'" "Run the logic tests in the files named prepare and fk." \
 		"make testlogic FILES=fk SUBTESTS='20042|20045'" "Run the logic tests within subtests 20042 and 20045 in the file named fk." \
 		"make testlogic TESTCONFIG=local" "Run the logic tests for the cluster configuration 'local'." \
+		"make fuzz" "Run all fuzz tests for 12m each (or whatever the default TESTTIMEOUT is)." \
+		"make fuzz PKG=./pkg/sql/... TESTTIMEOUT=1m" "Run all fuzz tests under the sql directory for 1m each." \
+		"make fuzz PKG=./pkg/sql/sem/tree TESTS=Decimal TESTTIMEOUT=1m" "Run the Decimal fuzz tests in the tree directory for 1m." \
 		"make check-libroach TESTS=ccl" "Run the libroach tests matching .*ccl.*"
 
 BUILDTYPE := development
@@ -303,13 +309,13 @@ bin/.bootstrap: $(GITHOOKS) Gopkg.lock | bin/.submodules-initialized
 		./vendor/github.com/cockroachdb/gostdlib/x/tools/cmd/goimports \
 		./vendor/github.com/cockroachdb/stress \
 		./vendor/github.com/golang/dep/cmd/dep \
-		./vendor/github.com/golang/lint/golint \
 		./vendor/github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway \
 		./vendor/github.com/kevinburke/go-bindata/go-bindata \
 		./vendor/github.com/kisielk/errcheck \
 		./vendor/github.com/mattn/goveralls \
 		./vendor/github.com/mibk/dupl \
 		./vendor/github.com/wadey/gocovmerge \
+		./vendor/golang.org/x/lint/golint \
 		./vendor/golang.org/x/perf/cmd/benchstat \
 		./vendor/golang.org/x/tools/cmd/goyacc \
 		./vendor/golang.org/x/tools/cmd/stringer \
@@ -382,6 +388,8 @@ ifneq ($(HOST_TRIPLE),$(TARGET_TRIPLE))
 is-cross-compile := 1
 endif
 
+target-is-windows := $(findstring w64,$(TARGET_TRIPLE))
+
 # CMAKE_TARGET_MESSAGES=OFF prevents CMake from printing progress messages
 # whenever a target is fully built to prevent spammy output from make when
 # c-deps are all already built. Progress messages are still printed when actual
@@ -410,6 +418,7 @@ JEMALLOC_SRC_DIR := $(C_DEPS_DIR)/jemalloc
 PROTOBUF_SRC_DIR := $(C_DEPS_DIR)/protobuf
 ROCKSDB_SRC_DIR  := $(C_DEPS_DIR)/rocksdb
 SNAPPY_SRC_DIR   := $(C_DEPS_DIR)/snappy
+LIBEDIT_SRC_DIR  := $(C_DEPS_DIR)/libedit
 LIBROACH_SRC_DIR := $(C_DEPS_DIR)/libroach
 KRB5_SRC_DIR     := $(C_DEPS_DIR)/krb5
 
@@ -418,7 +427,8 @@ use-stdmalloc          := $(findstring stdmalloc,$(TAGS))
 use-msan               := $(findstring msan,$(GOFLAGS))
 
 # User-requested build variants.
-USE_ROCKSDB_ASSERTIONS :=
+ENABLE_LIBROACH_ASSERTIONS ?=
+ENABLE_ROCKSDB_ASSERTIONS ?=
 
 BUILD_DIR := $(GOPATH)/native/$(TARGET_TRIPLE)
 
@@ -434,9 +444,10 @@ endif
 CRYPTOPP_DIR := $(BUILD_DIR)/cryptopp$(if $(use-msan),_msan)
 JEMALLOC_DIR := $(BUILD_DIR)/jemalloc$(if $(use-msan),_msan)
 PROTOBUF_DIR := $(BUILD_DIR)/protobuf$(if $(use-msan),_msan)
-ROCKSDB_DIR  := $(BUILD_DIR)/rocksdb$(if $(use-msan),_msan)$(if $(use-stdmalloc),_stdmalloc)$(if $(USE_ROCKSDB_ASSERTIONS),_assert)
+ROCKSDB_DIR  := $(BUILD_DIR)/rocksdb$(if $(use-msan),_msan)$(if $(use-stdmalloc),_stdmalloc)$(if $(ENABLE_ROCKSDB_ASSERTIONS),_assert)
 SNAPPY_DIR   := $(BUILD_DIR)/snappy$(if $(use-msan),_msan)
-LIBROACH_DIR := $(BUILD_DIR)/libroach$(if $(use-msan),_msan)
+LIBEDIT_DIR  := $(BUILD_DIR)/libedit$(if $(use-msan),_msan)
+LIBROACH_DIR := $(BUILD_DIR)/libroach$(if $(use-msan),_msan)$(if $(ENABLE_LIBROACH_ASSERTIONS),_assert)
 KRB5_DIR     := $(BUILD_DIR)/krb5$(if $(use-msan),_msan)
 # Can't share with protobuf because protoc is always built for the host.
 PROTOC_DIR := $(GOPATH)/native/$(HOST_TRIPLE)/protobuf
@@ -446,12 +457,16 @@ LIBJEMALLOC := $(JEMALLOC_DIR)/lib/libjemalloc.a
 LIBPROTOBUF := $(PROTOBUF_DIR)/libprotobuf.a
 LIBROCKSDB  := $(ROCKSDB_DIR)/librocksdb.a
 LIBSNAPPY   := $(SNAPPY_DIR)/libsnappy.a
+LIBEDIT     := $(LIBEDIT_DIR)/src/.libs/libedit.a
 LIBROACH    := $(LIBROACH_DIR)/libroach.a
 LIBROACHCCL := $(LIBROACH_DIR)/libroachccl.a
 LIBKRB5     := $(KRB5_DIR)/lib/libgssapi_krb5.a
 PROTOC 		 := $(PROTOC_DIR)/protoc
 
-C_LIBS_COMMON = $(if $(use-stdmalloc),,$(LIBJEMALLOC)) $(LIBPROTOBUF) $(LIBSNAPPY) $(LIBROCKSDB)
+C_LIBS_COMMON = \
+	$(if $(use-stdmalloc),,$(LIBJEMALLOC)) \
+	$(if $(target-is-windows),,$(LIBEDIT)) \
+	$(LIBPROTOBUF) $(LIBSNAPPY) $(LIBROCKSDB)
 C_LIBS_OSS = $(C_LIBS_COMMON) $(LIBROACH)
 C_LIBS_CCL = $(C_LIBS_COMMON) $(LIBCRYPTOPP) $(LIBROACHCCL)
 
@@ -484,22 +499,39 @@ native-tag := $(subst -,_,$(TARGET_TRIPLE))$(if $(use-stdmalloc),_stdmalloc)$(if
 # constraint `{native-tag}` and are built the first time a Make-driven build
 # encounters a given native tag. These tags are unset when building with the Go
 # toolchain directly, so these files are only compiled when building with Make.
-CGO_PKGS := cli server/status storage/engine ccl/storageccl/engineccl ccl/gssapiccl
-CGO_UNSUFFIXED_FLAGS_FILES := $(addprefix ./pkg/,$(addsuffix /zcgo_flags.go,$(CGO_PKGS)))
-CGO_SUFFIXED_FLAGS_FILES   := $(addprefix ./pkg/,$(addsuffix /zcgo_flags_$(native-tag).go,$(CGO_PKGS)))
-CGO_FLAGS_FILES := $(CGO_UNSUFFIXED_FLAGS_FILES) $(CGO_SUFFIXED_FLAGS_FILES)
+CGO_PKGS := \
+	pkg/cli \
+	pkg/server/status \
+	pkg/storage/engine \
+	pkg/ccl/storageccl/engineccl \
+	pkg/ccl/gssapiccl \
+	vendor/github.com/knz/go-libedit/unix
+vendor/github.com/knz/go-libedit/unix-package := libedit_unix
+CGO_UNSUFFIXED_FLAGS_FILES := $(addprefix ./,$(addsuffix /zcgo_flags.go,$(CGO_PKGS)))
+CGO_SUFFIXED_FLAGS_FILES   := $(addprefix ./,$(addsuffix /zcgo_flags_$(native-tag).go,$(CGO_PKGS)))
+BASE_CGO_FLAGS_FILES := $(CGO_UNSUFFIXED_FLAGS_FILES) $(CGO_SUFFIXED_FLAGS_FILES)
+CGO_FLAGS_FILES := $(BASE_CGO_FLAGS_FILES) vendor/github.com/knz/go-libedit/unix/zcgo_flags_extra.go
 
 $(CGO_UNSUFFIXED_FLAGS_FILES): build/defs.mk.sig
 
-$(CGO_FLAGS_FILES): Makefile
+$(BASE_CGO_FLAGS_FILES): Makefile | bin/.submodules-initialized
 	@echo '// GENERATED FILE DO NOT EDIT' > $@
 	@echo >> $@
 	@echo '// +build $(if $(findstring $(native-tag),$@),$(native-tag),!make)' >> $@
 	@echo >> $@
-	@echo 'package $(notdir $(@D))' >> $@
+	@echo 'package $(if $($(@D)-package),$($(@D)-package),$(notdir $(@D)))' >> $@
 	@echo >> $@
 	@echo '// #cgo CPPFLAGS: $(addprefix -I,$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS))' >> $@
-	@echo '// #cgo LDFLAGS: $(addprefix -L,$(CRYPTOPP_DIR) $(PROTOBUF_DIR) $(JEMALLOC_DIR)/lib $(SNAPPY_DIR) $(ROCKSDB_DIR) $(LIBROACH_DIR) $(KRB_DIR))' >> $@
+	@echo '// #cgo LDFLAGS: $(addprefix -L,$(CRYPTOPP_DIR) $(PROTOBUF_DIR) $(JEMALLOC_DIR)/lib $(SNAPPY_DIR) $(LIBEDIT_DIR)/src/.libs $(ROCKSDB_DIR) $(LIBROACH_DIR) $(KRB_DIR))' >> $@
+	@echo 'import "C"' >> $@
+
+vendor/github.com/knz/go-libedit/unix/zcgo_flags_extra.go: Makefile | bin/.submodules-initialized
+	@echo '// GENERATED FILE DO NOT EDIT' > $@
+	@echo >> $@
+	@echo 'package $($(@D)-package)' >> $@
+	@echo >> $@
+	@echo '// #cgo CPPFLAGS: -DGO_LIBEDIT_NO_BUILD' >> $@
+	@echo '// #cgo !windows LDFLAGS: -ledit -lncurses' >> $@
 	@echo 'import "C"' >> $@
 
 # BUILD ARTIFACT CACHING
@@ -602,6 +634,18 @@ $(SNAPPY_DIR)/Makefile: $(C_DEPS_DIR)/snappy-rebuild | bin/.submodules-initializ
 	cd $(SNAPPY_DIR) && cmake $(xcmake-flags) $(SNAPPY_SRC_DIR) \
 	  -DCMAKE_BUILD_TYPE=Release
 
+$(LIBEDIT_SRC_DIR)/configure.ac: | bin/.submodules-initialized
+
+$(LIBEDIT_SRC_DIR)/configure: $(LIBEDIT_SRC_DIR)/configure.ac
+	cd $(LIBEDIT_SRC_DIR) && autoconf
+
+$(LIBEDIT_DIR)/Makefile: $(C_DEPS_DIR)/libedit-rebuild $(LIBEDIT_SRC_DIR)/configure
+	rm -rf $(LIBEDIT_DIR)
+	mkdir -p $(LIBEDIT_DIR)
+	@# NOTE: If you change the configure flags below, bump the version in
+	@# $(C_DEPS_DIR)/libedit-rebuild. See above for rationale.
+	cd $(LIBEDIT_DIR) && $(LIBEDIT_SRC_DIR)/configure $(xconfigure-flags) --disable-examples --disable-shared
+
 # TODO(benesch): make it possible to build libroach without CCL code. Because
 # libroach and libroachccl are defined in the same CMake project, CMake requires
 # that the CCL code be present even if only the OSS target will be built.
@@ -660,6 +704,9 @@ $(LIBPROTOBUF): $(PROTOBUF_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 $(LIBSNAPPY): $(SNAPPY_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 	@uptodate $@ $(SNAPPY_SRC_DIR) || $(MAKE) --no-print-directory -C $(SNAPPY_DIR) snappy
 
+$(LIBEDIT): $(LIBEDIT_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
+	@uptodate $@ $(LIBEDIT_SRC_DIR) || $(MAKE) --no-print-directory -C $(LIBEDIT_DIR)/src
+
 $(LIBROCKSDB): $(ROCKSDB_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 	@uptodate $@ $(ROCKSDB_SRC_DIR) || $(MAKE) --no-print-directory -C $(ROCKSDB_DIR) rocksdb
 
@@ -678,6 +725,7 @@ $(LIBKRB5): $(KRB5_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 .PHONY: protoc libcryptopp libjemalloc libprotobuf libsnappy librocksdb libroach libroachccl libkrb5
 protoc:      $(PROTOC)
 libcryptopp: $(LIBCRYPTOPP)
+libedit:     $(LIBEDIT)
 libjemalloc: $(LIBJEMALLOC)
 libprotobuf: $(LIBPROTOBUF)
 libsnappy:   $(LIBSNAPPY)
@@ -741,24 +789,45 @@ PROTOBUF_TARGETS := bin/.go_protobuf_sources bin/.gw_protobuf_sources bin/.cpp_p
 DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions
 
 EXECGEN_TARGETS = \
-  pkg/sql/exec/any_not_null_agg.eg.go \
-  pkg/sql/exec/avg_agg.eg.go \
-  pkg/sql/exec/coldata/vec.eg.go \
-  pkg/sql/exec/const.eg.go \
-  pkg/sql/exec/distinct.eg.go \
-  pkg/sql/exec/hashjoiner.eg.go \
-  pkg/sql/exec/like_ops.eg.go \
-  pkg/sql/exec/mergejoiner.eg.go \
-  pkg/sql/exec/min_max_agg.eg.go \
-  pkg/sql/exec/projection_ops.eg.go \
-  pkg/sql/exec/quicksort.eg.go \
-  pkg/sql/exec/rowstovec.eg.go \
-  pkg/sql/exec/selection_ops.eg.go \
-  pkg/sql/exec/sort.eg.go \
-  pkg/sql/exec/sum_agg.eg.go \
-  pkg/sql/exec/tuples_differ.eg.go \
-  pkg/sql/exec/vec_comparators.eg.go \
-  pkg/sql/exec/zerocolumns.eg.go
+  pkg/col/coldata/vec.eg.go \
+  pkg/sql/colexec/and_or_projection.eg.go \
+  pkg/sql/colexec/any_not_null_agg.eg.go \
+  pkg/sql/colexec/avg_agg.eg.go \
+  pkg/sql/colexec/cast.eg.go \
+  pkg/sql/colexec/const.eg.go \
+  pkg/sql/colexec/distinct.eg.go \
+  pkg/sql/colexec/hashjoiner.eg.go \
+  pkg/sql/colexec/joiner_util.eg.go \
+  pkg/sql/colexec/like_ops.eg.go \
+  pkg/sql/colexec/mergejoinbase.eg.go \
+  pkg/sql/colexec/mergejoiner_fullouter.eg.go \
+  pkg/sql/colexec/mergejoiner_inner.eg.go \
+  pkg/sql/colexec/mergejoiner_leftanti.eg.go \
+  pkg/sql/colexec/mergejoiner_leftouter.eg.go \
+  pkg/sql/colexec/mergejoiner_leftsemi.eg.go \
+  pkg/sql/colexec/mergejoiner_rightouter.eg.go \
+  pkg/sql/colexec/min_max_agg.eg.go \
+  pkg/sql/colexec/overloads_test_utils.eg.go \
+  pkg/sql/colexec/proj_const_left_ops.eg.go \
+  pkg/sql/colexec/proj_const_right_ops.eg.go \
+  pkg/sql/colexec/proj_non_const_ops.eg.go \
+  pkg/sql/colexec/rank.eg.go \
+  pkg/sql/colexec/row_number.eg.go \
+  pkg/sql/colexec/quicksort.eg.go \
+  pkg/sql/colexec/rowstovec.eg.go \
+  pkg/sql/colexec/selection_ops.eg.go \
+  pkg/sql/colexec/select_in.eg.go \
+  pkg/sql/colexec/sort.eg.go \
+  pkg/sql/colexec/sum_agg.eg.go \
+  pkg/sql/colexec/tuples_differ.eg.go \
+  pkg/sql/colexec/vec_comparators.eg.go \
+  pkg/sql/colexec/zerocolumns.eg.go
+
+execgen-exclusions = $(addprefix -not -path ,$(EXECGEN_TARGETS))
+
+$(info Cleaning old generated files.)
+$(shell find pkg/sql/colexec -type f -name '*.eg.go' $(execgen-exclusions) -delete)
+$(shell find pkg/sql/exec -type f -name '*.eg.go' $(execgen-exclusions) -delete 2>/dev/null)
 
 OPTGEN_TARGETS = \
 	pkg/sql/opt/memo/expr.og.go \
@@ -897,7 +966,7 @@ bench benchshort: TESTTIMEOUT := $(BENCHTIMEOUT)
 # that longer running benchmarks can skip themselves.
 benchshort: override TESTFLAGS += -benchtime=1ns -short
 
-.PHONY: check test testshort testrace testlogic testbaselogic testplannerlogic testccllogic testoptlogic bench benchshort
+.PHONY: check test testshort testrace testlogic testbaselogic testccllogic testoptlogic bench benchshort
 test: ## Run tests.
 check test testshort testrace bench benchshort:
 	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
@@ -912,21 +981,18 @@ stress stressrace:
 roachprod-stress roachprod-stressrace: bin/roachprod-stress
 	# The bootstrap target creates, among other things, ./bin/stress.
 	build/builder.sh make bin/.bootstrap
-	build/builder.sh make test GOFLAGS="$(GOFLAGS) -v -c -o $(notdir $(patsubst %/,%,$(PKG))).test" PKG=$(PKG)
+	build/builder.sh mkrelease amd64-linux-gnu test GOFLAGS="$(GOFLAGS)" TESTFLAGS="-v -c -o $(notdir $(patsubst %/,%,$(PKG))).test" PKG=$(PKG)
 	@if [ -z "$(CLUSTER)" ]; then \
 	  echo "ERROR: missing or empty CLUSTER"; \
 	else \
-	  bin/roachprod-stress $(CLUSTER) $(STRESSFLAGS) ./$(notdir $(patsubst %/,%,$(PKG))).test \
+	  bin/roachprod-stress $(CLUSTER) $(STRESSFLAGS) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) \
 	    -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
 	fi
 
-testlogic: testbaselogic testplannerlogic testoptlogic testccllogic
+testlogic: testbaselogic testoptlogic testccllogic
 
 testbaselogic: ## Run SQL Logic Tests.
 testbaselogic: bin/logictest
-
-testplannerlogic: ## Run SQL Logic Tests for the heuristic planner.
-testplannerlogic: bin/logictest
 
 testccllogic: ## Run SQL CCL Logic Tests.
 testccllogic: bin/logictestccl
@@ -937,7 +1003,6 @@ testoptlogic: bin/logictestopt
 logic-test-selector := $(if $(TESTCONFIG),^$(TESTCONFIG)$$)/$(if $(FILES),^$(subst $(space),$$|^,$(FILES))$$)/$(SUBTESTS)
 testbaselogic: TESTS := TestLogic/$(logic-test-selector)
 testccllogic: TESTS := TestCCLLogic/$(logic-test-selector)
-testplannerlogic: TESTS := TestPlannerLogic/$(logic-test-selector)
 testoptlogic: TESTS := TestExecBuild/$(logic-test-selector)
 
 # Note: we specify -config here in addition to the filter on TESTS
@@ -946,8 +1011,8 @@ testoptlogic: TESTS := TestExecBuild/$(logic-test-selector)
 # does not prevent loading and initializing every default config in
 # turn (including setting up the test clusters, etc.). By specifying
 # -config, the extra initialization overhead is averted.
-testbaselogic testccllogic testplannerlogic testoptlogic: TESTFLAGS := -test.v $(if $(FILES),-show-sql) $(if $(TESTCONFIG),-config $(TESTCONFIG))
-testbaselogic testccllogic testplannerlogic testoptlogic:
+testbaselogic testccllogic testoptlogic: TESTFLAGS := -test.v $(if $(FILES),-show-sql) $(if $(TESTCONFIG),-config $(TESTCONFIG))
+testbaselogic testccllogic testoptlogic:
 	cd $($(<F)-package) && $(<F) -test.run "$(TESTS)" -test.timeout $(TESTTIMEOUT) $(TESTFLAGS)
 
 testraceslow: override GOFLAGS += -race
@@ -993,7 +1058,7 @@ lint lintshort: TESTTIMEOUT := $(LINTTIMEOUT)
 .PHONY: lint
 lint: override TAGS += lint
 lint: ## Run all style checkers and linters.
-lint: bin/returncheck
+lint: bin/returncheck bin/roachlint
 	@if [ -t 1 ]; then echo '$(yellow)NOTE: `make lint` is very slow! Perhaps `make lintshort`?$(term-reset)'; fi
 	@# Run 'go build -i' to ensure we have compiled object files available for all
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
@@ -1004,6 +1069,7 @@ lint: bin/returncheck
 .PHONY: lintshort
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
+lintshort: bin/roachlint
 	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
@@ -1080,6 +1146,9 @@ PROTOBUF_PATH  := $(GOGO_PROTOBUF_PATH)/protobuf
 
 GOGOPROTO_PROTO := $(GOGO_PROTOBUF_PATH)/gogoproto/gogo.proto
 
+ERRORS_PATH := ./vendor/github.com/cockroachdb/errors
+ERRORS_PROTO := $(ERRORS_PATH)/errorspb/errors.proto
+
 COREOS_PATH := ./vendor/go.etcd.io
 
 GRPC_GATEWAY_GOOGLEAPIS_PACKAGE := github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis
@@ -1115,7 +1184,7 @@ UI_JS_OSS := pkg/ui/src/js/protos.js
 UI_TS_OSS := pkg/ui/src/js/protos.d.ts
 UI_PROTOS_OSS := $(UI_JS_OSS) $(UI_TS_OSS)
 
-CPP_PROTOS := $(filter %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/engine/enginepb/mvcc.proto %/engine/enginepb/mvcc3.proto %/engine/enginepb/file_registry.proto %/engine/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/log/log.proto %/unresolved_addr.proto,$(GO_PROTOS))
+CPP_PROTOS := $(filter %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/roachpb/errors.proto %/roachpb/api.proto %util/tracing/recorded_span.proto %/engine/enginepb/mvcc.proto %/engine/enginepb/mvcc3.proto %/engine/enginepb/file_registry.proto %/engine/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/log/log.proto %/unresolved_addr.proto,$(GO_PROTOS))
 CPP_HEADERS := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.h))
 CPP_SOURCES := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.cc))
 
@@ -1124,27 +1193,29 @@ CPP_HEADERS_CCL := $(subst ./pkg,$(CPP_PROTO_CCL_ROOT),$(CPP_PROTOS_CCL:%.proto=
 CPP_SOURCES_CCL := $(subst ./pkg,$(CPP_PROTO_CCL_ROOT),$(CPP_PROTOS_CCL:%.proto=%.pb.cc))
 
 $(GOGOPROTO_PROTO): bin/.submodules-initialized
+$(ERRORS_PROTO): bin/.submodules-initialized
 
-bin/.go_protobuf_sources: $(PROTOC) $(GO_PROTOS) $(GOGOPROTO_PROTO) bin/.bootstrap bin/protoc-gen-gogoroach
+bin/.go_protobuf_sources: $(PROTOC) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap bin/protoc-gen-gogoroach
 	$(FIND_RELEVANT) -type f -name '*.pb.go' -exec rm {} +
 	set -e; for dir in $(sort $(dir $(GO_PROTOS))); do \
-	  build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --gogoroach_out=$(PROTO_MAPPINGS),plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/:./pkg $$dir/*.proto; \
+	  build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH):$(ERRORS_PATH) --gogoroach_out=$(PROTO_MAPPINGS),plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/:./pkg $$dir/*.proto; \
 	done
 	$(SED_INPLACE) -E \
 		-e '/import _ /d' \
 		-e 's!import (fmt|math) "github.com/cockroachdb/cockroach/pkg/(fmt|math)"! !g' \
 		-e 's!github\.com/cockroachdb/cockroach/pkg/(etcd)!go.etcd.io/\1!g' \
-		-e 's!github.com/cockroachdb/cockroach/pkg/(bytes|encoding/binary|errors|fmt|io|math|github\.com|(google\.)?golang\.org)!\1!g' \
+		-e 's!github.com/cockroachdb/cockroach/pkg/((bytes|encoding/binary|errors|fmt|io|math|github\.com|(google\.)?golang\.org)([^a-z]|$$))!\1!g' \
+        -e 's!github.com/cockroachdb/cockroach/pkg/errorspb!github.com/cockroachdb/errors/errorspb!g' \
 		-e 's!golang.org/x/net/context!context!g' \
 		$(GO_SOURCES)
 	@# TODO(benesch): Remove the last sed command after https://github.com/grpc/grpc-go/issues/711.
 	gofmt -s -w $(GO_SOURCES)
 	touch $@
 
-bin/.gw_protobuf_sources: $(PROTOC) $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOGOPROTO_PROTO) bin/.bootstrap
+bin/.gw_protobuf_sources: $(PROTOC) $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap
 	$(FIND_RELEVANT) -type f -name '*.pb.gw.go' -exec rm {} +
-	build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_SERVER_PROTOS)
-	build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_TS_PROTOS)
+	build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(ERRORS_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_SERVER_PROTOS)
+	build/werror.sh $(PROTOC) -Ipkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(ERRORS_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_TS_PROTOS)
 	@# TODO(benesch): Remove after https://github.com/grpc/grpc-go/issues/711.
 	$(SED_INPLACE) -E 's!golang.org/x/net/context!context!g' $(GW_SOURCES)
 	gofmt -s -w $(GW_SOURCES)
@@ -1175,13 +1246,13 @@ bin/.cpp_ccl_protobuf_sources: $(PROTOC) $(CPP_PROTOS_CCL)
 $(UI_JS_CCL): $(GW_PROTOS) $(GO_PROTOS) $(JS_PROTOS_CCL) pkg/ui/yarn.installed | bin/.submodules-initialized
 	# Add comment recognized by reviewable.
 	echo '// GENERATED FILE DO NOT EDIT' > $@
-	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(COREOS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS) $(JS_PROTOS_CCL)) >> $@
+	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(ERRORS_PATH) --path $(COREOS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS) $(JS_PROTOS_CCL)) >> $@
 
 .SECONDARY: $(UI_JS_OSS)
 $(UI_JS_OSS): $(GW_PROTOS) $(GO_PROTOS) pkg/ui/yarn.installed | bin/.submodules-initialized
 	# Add comment recognized by reviewable.
 	echo '// GENERATED FILE DO NOT EDIT' > $@
-	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(COREOS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS)) >> $@
+	$(PBJS) -t static-module -w es6 --strict-long --keep-case --path pkg --path ./vendor/github.com --path $(GOGO_PROTOBUF_PATH) --path $(ERRORS_PATH) --path $(COREOS_PATH) --path $(GRPC_GATEWAY_GOOGLEAPIS_PATH) $(filter %.proto,$(GW_PROTOS)) >> $@
 
 # End of PBJS-generated files.
 
@@ -1322,7 +1393,7 @@ pkg/sql/lex/tokens.go: pkg/sql/parser/gen/sql.go.tmp
 # The lex package is now the primary source for the token constant
 # definitions. Modify the code generated by goyacc here to refer to
 # the definitions in the lex package.
-pkg/sql/parser/sql.go: pkg/sql/parser/gen/sql.go.tmp
+pkg/sql/parser/sql.go: pkg/sql/parser/gen/sql.go.tmp | bin/.bootstrap
 	(echo "// Code generated by goyacc. DO NOT EDIT."; \
 	 echo "// GENERATED FILE DO NOT EDIT"; \
 	 cat $^ | \
@@ -1359,12 +1430,12 @@ pkg/sql/parser/gen/sql-gen.y: pkg/sql/parser/sql.y pkg/sql/parser/replace_help_r
 	mv -f $@.tmp $@
 	rm pkg/sql/parser/gen/types_regex.tmp
 
-pkg/sql/lex/reserved_keywords.go: pkg/sql/parser/sql.y pkg/sql/parser/reserved_keywords.awk
+pkg/sql/lex/reserved_keywords.go: pkg/sql/parser/sql.y pkg/sql/parser/reserved_keywords.awk | bin/.bootstrap
 	awk -f pkg/sql/parser/reserved_keywords.awk < $< > $@.tmp || rm $@.tmp
 	mv -f $@.tmp $@
 	gofmt -s -w $@
 
-pkg/sql/lex/keywords.go: pkg/sql/parser/sql.y pkg/sql/lex/all_keywords.go
+pkg/sql/lex/keywords.go: pkg/sql/parser/sql.y pkg/sql/lex/all_keywords.go | bin/.bootstrap
 	go run -tags all-keywords pkg/sql/lex/all_keywords.go < $< > $@.tmp || rm $@.tmp
 	mv -f $@.tmp $@
 	gofmt -s -w $@
@@ -1379,12 +1450,12 @@ sqlparser-unused-unreserved-keywords: pkg/sql/parser/sql.y pkg/sql/parser/unrese
 	  fi \
 	done
 
-pkg/sql/parser/helpmap_test.go: pkg/sql/parser/gen/sql-gen.y pkg/sql/parser/help_gen_test.sh
+pkg/sql/parser/helpmap_test.go: pkg/sql/parser/gen/sql-gen.y pkg/sql/parser/help_gen_test.sh | bin/.bootstrap
 	@pkg/sql/parser/help_gen_test.sh < $< >$@.tmp || rm $@.tmp
 	mv -f $@.tmp $@
 	gofmt -s -w $@
 
-pkg/sql/parser/help_messages.go: pkg/sql/parser/sql.y pkg/sql/parser/help.awk
+pkg/sql/parser/help_messages.go: pkg/sql/parser/sql.y pkg/sql/parser/help.awk | bin/.bootstrap
 	awk -f pkg/sql/parser/help.awk < $< > $@.tmp || rm $@.tmp
 	mv -f $@.tmp $@
 	gofmt -s -w $@
@@ -1402,26 +1473,39 @@ settings-doc-gen := $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),
 $(SETTINGS_DOC_PAGE): $(settings-doc-gen)
 	@$(settings-doc-gen) gen settings-list --format=html > $@
 
-pkg/sql/exec/any_not_null_agg.eg.go: pkg/sql/exec/any_not_null_agg_tmpl.go
-pkg/sql/exec/avg_agg.eg.go: pkg/sql/exec/avg_agg_tmpl.go
-pkg/sql/exec/coldata/vec.eg.go: pkg/sql/exec/coldata/vec_tmpl.go
-pkg/sql/exec/const.eg.go: pkg/sql/exec/const_tmpl.go
-pkg/sql/exec/distinct.eg.go: pkg/sql/exec/distinct_tmpl.go
-pkg/sql/exec/hashjoiner.eg.go: pkg/sql/exec/hashjoiner_tmpl.go
-pkg/sql/exec/mergejoiner.eg.go: pkg/sql/exec/mergejoiner_tmpl.go
-pkg/sql/exec/min_max_agg.eg.go: pkg/sql/exec/min_max_agg_tmpl.go
-pkg/sql/exec/quicksort.eg.go: pkg/sql/exec/quicksort_tmpl.go
-pkg/sql/exec/rowstovec.eg.go: pkg/sql/exec/rowstovec_tmpl.go
-pkg/sql/exec/sort.eg.go: pkg/sql/exec/sort_tmpl.go
-pkg/sql/exec/sum_agg.eg.go: pkg/sql/exec/sum_agg_tmpl.go
-pkg/sql/exec/tuples_differ.eg.go: pkg/sql/exec/tuples_differ_tmpl.go
-pkg/sql/exec/vec_comparators.eg.go: pkg/sql/exec/vec_comparators_tmpl.go
-pkg/sql/exec/zerocolumns.eg.go: pkg/sql/exec/zerocolumns_tmpl.go
+pkg/col/coldata/vec.eg.go: pkg/col/coldata/vec_tmpl.go
+pkg/sql/colexec/and_or_projection.eg.go: pkg/sql/colexec/and_or_projection_tmpl.go
+pkg/sql/colexec/any_not_null_agg.eg.go: pkg/sql/colexec/any_not_null_agg_tmpl.go
+pkg/sql/colexec/avg_agg.eg.go: pkg/sql/colexec/avg_agg_tmpl.go
+pkg/sql/colexec/cast.eg.go: pkg/sql/colexec/cast_tmpl.go
+pkg/sql/colexec/const.eg.go: pkg/sql/colexec/const_tmpl.go
+pkg/sql/colexec/distinct.eg.go: pkg/sql/colexec/distinct_tmpl.go
+pkg/sql/colexec/hashjoiner.eg.go: pkg/sql/colexec/hashjoiner_tmpl.go
+pkg/sql/colexec/joiner_util.eg.go: pkg/sql/colexec/joiner_util_tmpl.go
+pkg/sql/colexec/mergejoinbase.eg.go: pkg/sql/colexec/mergejoinbase_tmpl.go
+pkg/sql/colexec/mergejoiner_fullouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
+pkg/sql/colexec/mergejoiner_inner.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
+pkg/sql/colexec/mergejoiner_leftanti.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
+pkg/sql/colexec/mergejoiner_leftouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
+pkg/sql/colexec/mergejoiner_leftsemi.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
+pkg/sql/colexec/mergejoiner_rightouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
+pkg/sql/colexec/min_max_agg.eg.go: pkg/sql/colexec/min_max_agg_tmpl.go
+pkg/sql/colexec/proj_const_left_ops.eg.go: pkg/sql/colexec/proj_const_ops_tmpl.go
+pkg/sql/colexec/proj_const_right_ops.eg.go: pkg/sql/colexec/proj_const_ops_tmpl.go
+pkg/sql/colexec/proj_non_const_ops.eg.go: pkg/sql/colexec/proj_non_const_ops_tmpl.go
+pkg/sql/colexec/quicksort.eg.go: pkg/sql/colexec/quicksort_tmpl.go
+pkg/sql/colexec/rank.eg.go: pkg/sql/colexec/rank_tmpl.go
+pkg/sql/colexec/row_number.eg.go: pkg/sql/colexec/row_number_tmpl.go
+pkg/sql/colexec/rowstovec.eg.go: pkg/sql/colexec/rowstovec_tmpl.go
+pkg/sql/colexec/select_in.eg.go: pkg/sql/colexec/select_in_tmpl.go
+pkg/sql/colexec/selection_ops.eg.go: pkg/sql/colexec/selection_ops_tmpl.go
+pkg/sql/colexec/sort.eg.go: pkg/sql/colexec/sort_tmpl.go
+pkg/sql/colexec/sum_agg.eg.go: pkg/sql/colexec/sum_agg_tmpl.go
+pkg/sql/colexec/tuples_differ.eg.go: pkg/sql/colexec/tuples_differ_tmpl.go
+pkg/sql/colexec/vec_comparators.eg.go: pkg/sql/colexec/vec_comparators_tmpl.go
+pkg/sql/colexec/zerocolumns.eg.go: pkg/sql/colexec/zerocolumns_tmpl.go
 
 $(EXECGEN_TARGETS): bin/execgen
-	@# Remove generated files with the old suffix to avoid conflicts.
-	@# See https://github.com/cockroachdb/cockroach/pull/32265.
-	@rm -f pkg/sql/exec/*.og.go
 	execgen $@
 
 optgen-defs := pkg/sql/opt/ops/*.opt
@@ -1471,9 +1555,14 @@ unsafe-clean-c-deps:
 	git -C $(LIBROACH_SRC_DIR) clean -dxf
 	git -C $(KRB5_SRC_DIR)     clean -dxf
 
+.PHONY: clean-execgen-files
+clean-execgen-files:
+	find ./pkg/sql/colexec -type f -name '*.eg.go' -exec rm {} +
+	test -d ./pkg/sql/exec && find ./pkg/sql/exec -type f -name '*.eg.go' -exec rm {} + || true
+
 .PHONY: clean
 clean: ## Remove build artifacts.
-clean: clean-c-deps
+clean: clean-c-deps clean-execgen-files
 	rm -rf bin/.go_protobuf_sources bin/.gw_protobuf_sources bin/.cpp_protobuf_sources build/defs.mk*
 	$(GO) clean $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -i -cache github.com/cockroachdb/cockroach...
 	$(FIND_RELEVANT) -type f \( -name 'zcgo_flags*.go' -o -name '*.test' \) -exec rm {} +
@@ -1502,6 +1591,7 @@ bins = \
   bin/cockroach-short \
   bin/docgen \
   bin/execgen \
+  bin/fuzz \
   bin/generate-binary \
   bin/terraformgen \
   bin/github-post \
@@ -1513,6 +1603,7 @@ bins = \
   bin/publish-provisional-artifacts \
   bin/optgen \
   bin/returncheck \
+  bin/roachlint \
   bin/roachprod \
   bin/roachprod-stress \
   bin/roachtest \
@@ -1528,7 +1619,7 @@ testbins = \
   bin/logictestccl
 
 # Mappings for binaries that don't live in pkg/cmd.
-execgen-package = ./pkg/sql/exec/execgen/cmd/execgen
+execgen-package = ./pkg/sql/colexec/execgen/cmd/execgen
 langgen-package = ./pkg/sql/opt/optgen/cmd/langgen
 optgen-package = ./pkg/sql/opt/optgen/cmd/optgen
 logictest-package = ./pkg/sql/logictest
@@ -1560,6 +1651,11 @@ $(testbins): bin/%: bin/%.d | bin/prereqs $(SUBMODULES_TARGET)
 bin/prereqs: ./pkg/cmd/prereqs/*.go
 	@echo go install -v ./pkg/cmd/prereqs
 	@$(GO_INSTALL) -v ./pkg/cmd/prereqs
+
+.PHONY: fuzz
+fuzz: ## Run fuzz tests.
+fuzz: bin/fuzz
+	bin/fuzz $(TESTFLAGS) -tests $(TESTS) -timeout $(TESTTIMEOUT) $(PKG)
 
 .PRECIOUS: bin/%.d
 bin/%.d: ;

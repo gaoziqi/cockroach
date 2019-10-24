@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server_test
 
@@ -261,7 +257,7 @@ func TestSettingsSetAndShow(t *testing.T) {
 	db.ExpectErr(t, `invalid integer value '7' for enum setting`, fmt.Sprintf(setQ, enumKey, "7"))
 
 	db.Exec(t, `CREATE USER testuser`)
-	pgURL, cleanupFunc := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User("testuser"))
+	pgURL, cleanupFunc := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User("testuser"))
 	defer cleanupFunc()
 	testuser, err := gosql.Open("postgres", pgURL.String())
 	if err != nil {
@@ -270,22 +266,22 @@ func TestSettingsSetAndShow(t *testing.T) {
 	defer testuser.Close()
 
 	if _, err := testuser.Exec(`SET CLUSTER SETTING foo = 'bar'`); !testutils.IsError(err,
-		`only superusers are allowed to SET CLUSTER SETTING`,
+		`only users with the admin role are allowed to SET CLUSTER SETTING`,
 	) {
 		t.Fatal(err)
 	}
 	if _, err := testuser.Exec(`SHOW CLUSTER SETTING foo`); !testutils.IsError(err,
-		`only superusers are allowed to SHOW CLUSTER SETTING`,
+		`only users with the admin role are allowed to SHOW CLUSTER SETTING`,
 	) {
 		t.Fatal(err)
 	}
 	if _, err := testuser.Exec(`SHOW ALL CLUSTER SETTINGS`); !testutils.IsError(err,
-		`only superusers are allowed to SHOW ALL CLUSTER SETTINGS`,
+		`only users with the admin role are allowed to SHOW ALL CLUSTER SETTINGS`,
 	) {
 		t.Fatal(err)
 	}
 	if _, err := testuser.Exec(`SELECT * FROM crdb_internal.cluster_settings`); !testutils.IsError(err,
-		`only superusers are allowed to read crdb_internal.cluster_settings`,
+		`only users with the admin role are allowed to read crdb_internal.cluster_settings`,
 	) {
 		t.Fatal(err)
 	}

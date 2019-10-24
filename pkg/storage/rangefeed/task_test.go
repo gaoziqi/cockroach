@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package rangefeed
 
@@ -65,9 +61,10 @@ func makeInline(key, val string) engine.MVCCKeyValue {
 func makeIntent(key string, txnID uuid.UUID, txnKey string, txnTS int64) engine.MVCCKeyValue {
 	return makeMetaKV(key, enginepb.MVCCMetadata{
 		Txn: &enginepb.TxnMeta{
-			ID:        txnID,
-			Key:       []byte(txnKey),
-			Timestamp: hlc.Timestamp{WallTime: txnTS},
+			ID:           txnID,
+			Key:          []byte(txnKey),
+			Timestamp:    hlc.Timestamp{WallTime: txnTS},
+			MinTimestamp: hlc.Timestamp{WallTime: txnTS},
 		},
 		Timestamp: hlc.LegacyTimestamp{WallTime: txnTS},
 	})
@@ -283,9 +280,10 @@ func TestTxnPushAttempt(t *testing.T) {
 
 	// Create a set of transactions.
 	txn1, txn2, txn3 := uuid.MakeV4(), uuid.MakeV4(), uuid.MakeV4()
-	txn1Meta := enginepb.TxnMeta{ID: txn1, Key: keyA, Timestamp: hlc.Timestamp{WallTime: 1}}
-	txn2Meta := enginepb.TxnMeta{ID: txn2, Key: keyB, Timestamp: hlc.Timestamp{WallTime: 2}}
-	txn3Meta := enginepb.TxnMeta{ID: txn3, Key: keyC, Timestamp: hlc.Timestamp{WallTime: 3}}
+	ts1, ts2, ts3 := hlc.Timestamp{WallTime: 1}, hlc.Timestamp{WallTime: 2}, hlc.Timestamp{WallTime: 3}
+	txn1Meta := enginepb.TxnMeta{ID: txn1, Key: keyA, Timestamp: ts1, MinTimestamp: ts1}
+	txn2Meta := enginepb.TxnMeta{ID: txn2, Key: keyB, Timestamp: ts2, MinTimestamp: ts2}
+	txn3Meta := enginepb.TxnMeta{ID: txn3, Key: keyC, Timestamp: ts3, MinTimestamp: ts3}
 	txn1Proto := roachpb.Transaction{TxnMeta: txn1Meta, Status: roachpb.PENDING}
 	txn2Proto := roachpb.Transaction{TxnMeta: txn2Meta, Status: roachpb.COMMITTED}
 	txn3Proto := roachpb.Transaction{TxnMeta: txn3Meta, Status: roachpb.ABORTED}

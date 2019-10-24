@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -26,7 +22,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -43,6 +38,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
+
+func strToValue(s string) *roachpb.Value {
+	v := roachpb.MakeValueFromBytes([]byte(s))
+	return &v
+}
 
 // createTestDB creates a local test server and starts it. The caller
 // is responsible for stopping the test server.
@@ -66,31 +66,6 @@ func makeTS(walltime int64, logical int32) hlc.Timestamp {
 	return hlc.Timestamp{
 		WallTime: walltime,
 		Logical:  logical,
-	}
-}
-
-// isTracking returns true if the heartbeat loop is running.
-func (tc *TxnCoordSender) isTracking() bool {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	return tc.interceptorAlloc.txnHeartbeater.mu.txnEnd != nil
-}
-
-// Test that the Transaction.DeprecatedWriting flag is set after performing any
-// writes.
-// TODO(nvanbenschoten): Remove this in 19.2.
-func TestTxnCoordSenderSetWritingFlag(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s := createTestDB(t)
-	defer s.Stop()
-	ctx := context.Background()
-
-	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-	if err := txn.Put(ctx, roachpb.Key("a"), []byte("value")); err != nil {
-		t.Fatal(err)
-	}
-	if !txn.Serialize().DeprecatedWriting {
-		t.Fatal("txn is not marked as writing")
 	}
 }
 
@@ -319,7 +294,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 	keyA := roachpb.Key("a")
 	keyC := roachpb.Key("c")
 	splitKey := roachpb.Key("b")
-	if err := s.DB.AdminSplit(ctx, splitKey /* spanKey */, splitKey /* splitKey */, true /* manual */); err != nil {
+	if err := s.DB.AdminSplit(ctx, splitKey /* spanKey */, splitKey /* splitKey */, hlc.MaxTimestamp /* expirationTimestamp */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -397,7 +372,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 			// This relies on the heartbeat loop stopping once it figures out that the txn
 			// has been aborted.
 			testutils.SucceedsSoon(t, func() error {
-				if tc.isTracking() {
+				if tc.IsTracking() {
 					return fmt.Errorf("transaction is not aborted")
 				}
 				return nil
@@ -437,7 +412,7 @@ func getTxn(ctx context.Context, txn *client.Txn) (*roachpb.Transaction, *roachp
 func verifyCleanup(key roachpb.Key, eng engine.Engine, t *testing.T, coords ...*TxnCoordSender) {
 	testutils.SucceedsSoon(t, func() error {
 		for _, coord := range coords {
-			if coord.isTracking() {
+			if coord.IsTracking() {
 				return fmt.Errorf("expected no heartbeat")
 			}
 		}
@@ -560,7 +535,7 @@ func TestTxnCoordSenderAddIntentOnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	{
-		err, ok := txn.CPut(ctx, key, []byte("x"), []byte("born to fail")).(*roachpb.ConditionFailedError)
+		err, ok := txn.CPut(ctx, key, []byte("x"), strToValue("born to fail")).(*roachpb.ConditionFailedError)
 		if !ok {
 			t.Fatal(err)
 		}
@@ -633,6 +608,34 @@ func TestTxnCoordSenderCleanupOnAborted(t *testing.T) {
 	verifyCleanup(key, s.Eng, t, txn1.Sender().(*TxnCoordSender), txn2.Sender().(*TxnCoordSender))
 }
 
+// TestTxnCoordSenderCleanupOnCommitAfterRestart verifies that if a txn restarts
+// at a higher epoch and then commits before it has written anything in the new
+// epoch, the coordinator still cleans up the transaction. In #40466, we saw that
+// this case could be detected as a 1PC transaction and the cleanup during the
+// commit could be omitted.
+func TestTxnCoordSenderCleanupOnCommitAfterRestart(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := createTestDB(t)
+	defer s.Stop()
+	ctx := context.Background()
+
+	// Create a transaction with intent at "a".
+	key := roachpb.Key("a")
+	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	if err := txn.Put(ctx, key, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart the transaction with a new epoch.
+	txn.ManualRestart(ctx, s.Clock.Now())
+
+	// Now immediately commit.
+	if err := txn.CommitOrCleanup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	verifyCleanup(key, s.Eng, t, txn.Sender().(*TxnCoordSender))
+}
+
 // TestTxnCoordSenderGCWithAmbiguousResultErr verifies that the coordinator
 // cleans up extant transactions and intents after an ambiguous result error is
 // observed, even if the error is on the first request.
@@ -675,7 +678,7 @@ func TestTxnCoordSenderGCWithAmbiguousResultErr(t *testing.T) {
 
 		testutils.SucceedsSoon(t, func() error {
 			// Locking the TxnCoordSender to prevent a data race.
-			if tc.isTracking() {
+			if tc.IsTracking() {
 				return errors.Errorf("expected garbage collection")
 			}
 			return nil
@@ -1183,7 +1186,7 @@ func TestTxnRestartCount(t *testing.T) {
 	// Wait for heartbeat to start.
 	tc := txn.Sender().(*TxnCoordSender)
 	testutils.SucceedsSoon(t, func() error {
-		if !tc.isTracking() {
+		if !tc.IsTracking() {
 			return errors.New("expected heartbeat to start")
 		}
 		return nil
@@ -1412,7 +1415,7 @@ func TestRollbackErrorStopsHeartbeat(t *testing.T) {
 	); pErr != nil {
 		t.Fatal(pErr)
 	}
-	if !txn.Sender().(*TxnCoordSender).isTracking() {
+	if !txn.Sender().(*TxnCoordSender).IsTracking() {
 		t.Fatalf("expected TxnCoordSender to be tracking after the write")
 	}
 
@@ -1424,20 +1427,20 @@ func TestRollbackErrorStopsHeartbeat(t *testing.T) {
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		if txn.Sender().(*TxnCoordSender).isTracking() {
+		if txn.Sender().(*TxnCoordSender).IsTracking() {
 			return fmt.Errorf("still tracking")
 		}
 		return nil
 	})
 }
 
-// Test that intent tracking behaves correctly for
-// transactions that attempt to run a batch containing both a BeginTransaction
-// and an EndTransaction. Since in case of an error it's not easy to determine
-// whether any intents have been laid down (i.e. in case the batch was split by
-// the DistSender and then there was mixed success for the sub-batches, or in
-// case a retriable error is returned), the test verifies that all possible
-// intents are properly tracked and attached to a subsequent EndTransaction.
+// Test that intent tracking behaves correctly for transactions that attempt to
+// run a batch containing both a BeginTransaction and an EndTransaction. Since
+// in case of an error it's not easy to determine whether any intents have been
+// laid down (i.e. in case the batch was split by the DistSender and then there
+// was mixed success for the sub-batches, or in case a retriable error is
+// returned), the test verifies that all possible intents are properly tracked
+// and attached to a subsequent EndTransaction.
 func TestOnePCErrorTracking(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
@@ -1510,7 +1513,7 @@ func TestOnePCErrorTracking(t *testing.T) {
 
 	// As always, check that the rollback we just sent stops the heartbeat loop.
 	testutils.SucceedsSoon(t, func() error {
-		if txn.Sender().(*TxnCoordSender).isTracking() {
+		if txn.Sender().(*TxnCoordSender).IsTracking() {
 			return fmt.Errorf("still tracking")
 		}
 		return nil
@@ -1663,127 +1666,6 @@ func TestCommitMutatingTransaction(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestTxnInsertBeginTransaction verifies that a begin transaction
-// request is inserted just before the first mutating command.
-// TODO(nvanbenschoten): Remove in 2.3.
-func TestTxnInsertBeginTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-	sender := &mockSender{}
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-
-	var calls []roachpb.Method
-	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		br := ba.CreateReply()
-		br.Txn = ba.Txn.Clone()
-
-		calls = append(calls, ba.Methods()...)
-		if bt, ok := ba.GetArg(roachpb.BeginTransaction); ok && !bt.Header().Key.Equal(roachpb.Key("a")) {
-			t.Errorf("expected begin transaction key to be \"a\"; got %s", bt.Header().Key)
-		}
-		if et, ok := ba.GetArg(roachpb.EndTransaction); ok {
-			if !et.(*roachpb.EndTransactionRequest).Commit {
-				t.Errorf("expected commit to be true")
-			}
-			br.Txn.Status = roachpb.COMMITTED
-		}
-		return br, nil
-	})
-
-	v := cluster.VersionByKey(cluster.Version2_1)
-	st := cluster.MakeTestingClusterSettingsWithVersion(v, v)
-	factory := NewTxnCoordSenderFactory(
-		TxnCoordSenderFactoryConfig{
-			AmbientCtx: ambient,
-			Settings:   st,
-			Clock:      clock,
-			Stopper:    stopper,
-		},
-		sender,
-	)
-
-	db := client.NewDB(testutils.MakeAmbientCtx(), factory, clock)
-	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
-		if _, err := txn.Get(ctx, "foo"); err != nil {
-			return err
-		}
-		return txn.Put(ctx, "a", "b")
-	}); err != nil {
-		t.Fatalf("unexpected error on commit: %s", err)
-	}
-	expectedCalls := []roachpb.Method{
-		roachpb.Get,
-		roachpb.BeginTransaction,
-		roachpb.Put,
-		roachpb.QueryIntent,
-		roachpb.EndTransaction}
-	if !reflect.DeepEqual(expectedCalls, calls) {
-		t.Fatalf("expected %s, got %s", expectedCalls, calls)
-	}
-}
-
-// TestBeginTransactionErrorIndex verifies that the error index is cleared
-// when a BeginTransaction command causes an error.
-// TODO(nvanbenschoten): Remove in 2.3.
-func TestBeginTransactionErrorIndex(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-	sender := &mockSender{}
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-
-	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		pErr := roachpb.NewError(&roachpb.WriteIntentError{})
-		pErr.SetErrorIndex(0)
-		return nil, pErr
-	})
-
-	v := cluster.VersionByKey(cluster.Version2_1)
-	st := cluster.MakeTestingClusterSettingsWithVersion(v, v)
-	factory := NewTxnCoordSenderFactory(
-		TxnCoordSenderFactoryConfig{
-			AmbientCtx: ambient,
-			Settings:   st,
-			Clock:      clock,
-			Stopper:    stopper,
-		},
-		sender,
-	)
-
-	db := client.NewDB(testutils.MakeAmbientCtx(), factory, clock)
-	_ = db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		b := txn.NewBatch()
-		b.Put("a", "b")
-		err := getOneErr(txn.Run(ctx, b), b)
-		if err == nil {
-			t.Fatal("missing err")
-		}
-		pErr := b.MustPErr()
-		// Verify that the original error type is preserved, but the error index is unset.
-		if _, ok := pErr.GetDetail().(*roachpb.WriteIntentError); !ok {
-			t.Fatalf("unexpected error %s", pErr)
-		}
-		if pErr.Index != nil {
-			t.Errorf("error index must not be set, but got %d", pErr.Index)
-		}
-		return err
-	})
-}
-
-// getOneErr returns the error for a single-request Batch that was run.
-// runErr is the error returned by Run, b is the Batch that was passed to Run.
-func getOneErr(runErr error, b *client.Batch) error {
-	if runErr != nil && len(b.Results) > 0 {
-		return b.Results[0].Err
-	}
-	return runErr
 }
 
 // TestAbortReadOnlyTransaction verifies that aborting a read-only

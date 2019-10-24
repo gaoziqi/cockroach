@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package client
 
@@ -18,6 +14,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/pkg/errors"
 )
 
@@ -415,18 +413,55 @@ func (b *Batch) PutInline(key, value interface{}) {
 //
 // key can be either a byte slice or a string. value can be any key type, a
 // protoutil.Message or any Go primitive type (bool, int, etc).
-func (b *Batch) CPut(key, value, expValue interface{}) {
+func (b *Batch) CPut(key, value interface{}, expValue *roachpb.Value) {
 	b.cputInternal(key, value, expValue, false)
+}
+
+// CPutDeprecated conditionally sets the value for a key if the existing value is equal
+// to expValue. To conditionally set a value only if there is no existing entry
+// pass nil for expValue. Note that this must be an interface{}(nil), not a
+// typed nil value (e.g. []byte(nil)).
+//
+// A new result will be appended to the batch which will contain a single row
+// and Result.Err will indicate success or failure.
+//
+// key can be either a byte slice or a string. value can be any key type, a
+// protoutil.Message or any Go primitive type (bool, int, etc).
+func (b *Batch) CPutDeprecated(key, value, expValue interface{}) {
+	b.cputInternalDeprecated(key, value, expValue, false)
 }
 
 // CPutAllowingIfNotExists is like CPut except it also allows the Put when the
 // existing entry does not exist -- i.e. it succeeds if there is no existing
 // entry or the existing entry has the expected value.
-func (b *Batch) CPutAllowingIfNotExists(key, value, expValue interface{}) {
+func (b *Batch) CPutAllowingIfNotExists(key, value interface{}, expValue *roachpb.Value) {
 	b.cputInternal(key, value, expValue, true)
 }
 
-func (b *Batch) cputInternal(key, value, expValue interface{}, allowNotExist bool) {
+func (b *Batch) cputInternal(key, value interface{}, expValue *roachpb.Value, allowNotExist bool) {
+	k, err := marshalKey(key)
+	if err != nil {
+		b.initResult(0, 1, notRaw, err)
+		return
+	}
+	v, err := marshalValue(value)
+	if err != nil {
+		b.initResult(0, 1, notRaw, err)
+		return
+	}
+	var ev roachpb.Value
+	if expValue != nil {
+		ev = *expValue
+		// This expected value is assumed to come from a kv read or from writing a
+		// roachpb.Value. In both cases it will have a checksum set. Instead of
+		// requiring callers to clear it, do it for them.
+		ev.ClearChecksum()
+	}
+	b.appendReqs(roachpb.NewConditionalPut(k, v, ev, allowNotExist))
+	b.initResult(1, 1, notRaw, nil)
+}
+
+func (b *Batch) cputInternalDeprecated(key, value, expValue interface{}, allowNotExist bool) {
 	k, err := marshalKey(key)
 	if err != nil {
 		b.initResult(0, 1, notRaw, err)
@@ -588,7 +623,7 @@ func (b *Batch) adminMerge(key interface{}) {
 
 // adminSplit is only exported on DB. It is here for symmetry with the
 // other operations.
-func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}, manual bool) {
+func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}, expirationTime hlc.Timestamp) {
 	spanKey, err := marshalKey(spanKeyIn)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
@@ -603,8 +638,8 @@ func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}, manual bool) {
 		RequestHeader: roachpb.RequestHeader{
 			Key: spanKey,
 		},
-		SplitKey: splitKey,
-		Manual:   manual,
+		SplitKey:       splitKey,
+		ExpirationTime: expirationTime,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
@@ -645,10 +680,7 @@ func (b *Batch) adminTransferLease(key interface{}, target roachpb.StoreID) {
 // adminChangeReplicas is only exported on DB. It is here for symmetry with the
 // other operations.
 func (b *Batch) adminChangeReplicas(
-	key interface{},
-	changeType roachpb.ReplicaChangeType,
-	targets []roachpb.ReplicationTarget,
-	expDesc roachpb.RangeDescriptor,
+	key interface{}, expDesc roachpb.RangeDescriptor, chgs []roachpb.ReplicationChange,
 ) {
 	k, err := marshalKey(key)
 	if err != nil {
@@ -659,10 +691,10 @@ func (b *Batch) adminChangeReplicas(
 		RequestHeader: roachpb.RequestHeader{
 			Key: k,
 		},
-		ChangeType: changeType,
-		Targets:    targets,
-		ExpDesc:    &expDesc,
+		ExpDesc: expDesc,
 	}
+	req.AddChanges(chgs...)
+
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
 }
@@ -708,7 +740,9 @@ func (b *Batch) writeBatch(s, e interface{}, data []byte) {
 }
 
 // addSSTable is only exported on DB.
-func (b *Batch) addSSTable(s, e interface{}, data []byte) {
+func (b *Batch) addSSTable(
+	s, e interface{}, data []byte, disallowShadowing bool, stats *enginepb.MVCCStats,
+) {
 	begin, err := marshalKey(s)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
@@ -724,7 +758,9 @@ func (b *Batch) addSSTable(s, e interface{}, data []byte) {
 			Key:    begin,
 			EndKey: end,
 		},
-		Data: data,
+		Data:              data,
+		DisallowShadowing: disallowShadowing,
+		MVCCStats:         stats,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)

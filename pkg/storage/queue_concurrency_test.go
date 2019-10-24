@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -23,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -69,7 +66,7 @@ func TestBaseQueueConcurrent(t *testing.T) {
 		cfg: StoreConfig{
 			Clock:             hlc.NewClock(hlc.UnixNano, time.Second),
 			AmbientCtx:        log.AmbientContext{Tracer: tracing.NewTracer()},
-			DefaultZoneConfig: config.DefaultZoneConfigRef(),
+			DefaultZoneConfig: zonepb.DefaultZoneConfigRef(),
 		},
 	}
 
@@ -89,13 +86,13 @@ func TestBaseQueueConcurrent(t *testing.T) {
 	}
 	bq := newBaseQueue("test", impl, store, nil /* Gossip */, cfg)
 	bq.getReplica = func(id roachpb.RangeID) (replicaInQueue, error) {
-		return &fakeReplica{id: id}, nil
+		return &fakeReplica{rangeID: id}, nil
 	}
 	bq.Start(stopper)
 
 	var g errgroup.Group
 	for i := 1; i <= num; i++ {
-		r := &fakeReplica{id: roachpb.RangeID(i)}
+		r := &fakeReplica{rangeID: roachpb.RangeID(i)}
 		for j := 0; j < 5; j++ {
 			g.Go(func() error {
 				_, err := bq.testingAdd(ctx, r, 1.0)
@@ -104,7 +101,7 @@ func TestBaseQueueConcurrent(t *testing.T) {
 		}
 		if rand.Intn(5) == 0 {
 			g.Go(func() error {
-				bq.MaybeRemove(r.id)
+				bq.MaybeRemove(r.rangeID)
 				return nil
 			})
 		}
@@ -149,18 +146,20 @@ func (fakeQueueImpl) purgatoryChan() <-chan time.Time {
 }
 
 type fakeReplica struct {
-	id roachpb.RangeID
+	rangeID   roachpb.RangeID
+	replicaID roachpb.ReplicaID
 }
 
 func (fr *fakeReplica) AnnotateCtx(ctx context.Context) context.Context { return ctx }
 func (fr *fakeReplica) StoreID() roachpb.StoreID {
 	return 1
 }
-func (fr *fakeReplica) GetRangeID() roachpb.RangeID         { return fr.id }
+func (fr *fakeReplica) GetRangeID() roachpb.RangeID         { return fr.rangeID }
+func (fr *fakeReplica) ReplicaID() roachpb.ReplicaID        { return fr.replicaID }
 func (fr *fakeReplica) IsInitialized() bool                 { return true }
 func (fr *fakeReplica) IsDestroyed() (DestroyReason, error) { return destroyReasonAlive, nil }
 func (fr *fakeReplica) Desc() *roachpb.RangeDescriptor {
-	return &roachpb.RangeDescriptor{RangeID: fr.id, EndKey: roachpb.RKey("z")}
+	return &roachpb.RangeDescriptor{RangeID: fr.rangeID, EndKey: roachpb.RKey("z")}
 }
 func (fr *fakeReplica) maybeInitializeRaftGroup(context.Context) {}
 func (fr *fakeReplica) redirectOnOrAcquireLease(

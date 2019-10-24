@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stateloader
 
@@ -18,7 +14,6 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
@@ -53,7 +48,6 @@ func WriteInitialReplicaState(
 	desc roachpb.RangeDescriptor,
 	lease roachpb.Lease,
 	gcThreshold hlc.Timestamp,
-	txnSpanGCThreshold hlc.Timestamp,
 	activeVersion roachpb.Version,
 	truncStateType TruncatedStateType,
 ) (enginepb.MVCCStats, error) {
@@ -76,18 +70,7 @@ func WriteInitialReplicaState(
 	s.Stats = &ms
 	s.Lease = &lease
 	s.GCThreshold = &gcThreshold
-	s.TxnSpanGCThreshold = &txnSpanGCThreshold
-
-	// If the version is high enough to guarantee that all nodes will understand
-	// the AppliedStateKey then we can just straight to using it without ever
-	// writing the legacy stats and index keys.
-	if !activeVersion.Less(cluster.VersionByKey(cluster.VersionRangeAppliedStateKey)) {
-		s.UsingAppliedStateKey = true
-	} else {
-		if err := engine.AccountForLegacyMVCCStats(s.Stats, desc.RangeID); err != nil {
-			return enginepb.MVCCStats{}, err
-		}
-	}
+	s.UsingAppliedStateKey = true
 
 	if existingLease, err := rsl.LoadLease(ctx, eng); err != nil {
 		return enginepb.MVCCStats{}, errors.Wrap(err, "error reading lease")
@@ -99,12 +82,6 @@ func WriteInitialReplicaState(
 		return enginepb.MVCCStats{}, errors.Wrap(err, "error reading GCThreshold")
 	} else if (*existingGCThreshold != hlc.Timestamp{}) {
 		log.Fatalf(ctx, "expected trivial GChreshold, but found %+v", existingGCThreshold)
-	}
-
-	if existingTxnSpanGCThreshold, err := rsl.LoadTxnSpanGCThreshold(ctx, eng); err != nil {
-		return enginepb.MVCCStats{}, errors.Wrap(err, "error reading TxnSpanGCThreshold")
-	} else if (*existingTxnSpanGCThreshold != hlc.Timestamp{}) {
-		log.Fatalf(ctx, "expected trivial TxnSpanGCThreshold, but found %+v", existingTxnSpanGCThreshold)
 	}
 
 	newMS, err := rsl.Save(ctx, eng, s, truncStateType)
@@ -129,12 +106,11 @@ func WriteInitialState(
 	desc roachpb.RangeDescriptor,
 	lease roachpb.Lease,
 	gcThreshold hlc.Timestamp,
-	txnSpanGCThreshold hlc.Timestamp,
 	bootstrapVersion roachpb.Version,
 	truncStateType TruncatedStateType,
 ) (enginepb.MVCCStats, error) {
 	newMS, err := WriteInitialReplicaState(
-		ctx, eng, ms, desc, lease, gcThreshold, txnSpanGCThreshold, bootstrapVersion, truncStateType)
+		ctx, eng, ms, desc, lease, gcThreshold, bootstrapVersion, truncStateType)
 	if err != nil {
 		return enginepb.MVCCStats{}, err
 	}

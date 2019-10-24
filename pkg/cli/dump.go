@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -31,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -56,7 +52,7 @@ var verDump = version.MustParse("v2.1.0-alpha.20180416-0")
 // The approach here and its current flaws are summarized
 // in https://github.com/cockroachdb/cockroach/issues/28948.
 func runDump(cmd *cobra.Command, args []string) error {
-	conn, err := getPasswordAndMakeSQLClient("cockroach dump")
+	conn, err := makeSQLClient("cockroach dump", useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -537,6 +533,20 @@ func dumpSequenceData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMet
 func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetadata) error {
 	md, err := getMetadataForTable(conn, bmd, clusterTS)
 	if err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(md.columnNames) == "" {
+		// A table with no columns may still have one or more rows. In
+		// fact, it can have arbitrary many rows, each with a different
+		// (hidden) PK value. Unfortunately, the dump command today simply
+		// omits the hidden PKs from the dump, so it is not possible to
+		// restore the invisible values.
+		// Instead of failing with an incomprehensible error below, inform
+		// the user more clearly.
+		err := errors.Newf("table %q has no visible columns", tree.ErrString(bmd.name))
+		err = errors.WithHint(err, "To proceed with the dump, either omit this table from the list of tables to dump, drop the table, or add some visible columns.")
+		err = errors.WithIssueLink(err, errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/37768"})
 		return err
 	}
 

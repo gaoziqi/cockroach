@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package norm
 
@@ -20,17 +16,19 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/arith"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // CustomFuncs contains all the custom match and replace functions used by
@@ -49,6 +47,16 @@ func (c *CustomFuncs) Init(f *Factory) {
 // Succeeded returns true if a result expression is not nil.
 func (c *CustomFuncs) Succeeded(result opt.Expr) bool {
 	return result != nil
+}
+
+// OrderingSucceeded returns true if an OrderingChoice is not nil.
+func (c *CustomFuncs) OrderingSucceeded(result *physical.OrderingChoice) bool {
+	return result != nil
+}
+
+// DerefOrderingChoice returns an OrderingChoice from a pointer.
+func (c *CustomFuncs) DerefOrderingChoice(result *physical.OrderingChoice) physical.OrderingChoice {
+	return *result
 }
 
 // ----------------------------------------------------------------------
@@ -148,11 +156,10 @@ func (c *CustomFuncs) CanConstructBinary(op opt.Operator, left, right opt.Scalar
 	return memo.BinaryOverloadExists(op, left.DataType(), right.DataType())
 }
 
-// ArrayType returns the type of the first output column wrapped
+// ArrayType returns the type of the given column wrapped
 // in an array.
-func (c *CustomFuncs) ArrayType(in memo.RelExpr) *types.T {
-	inCol, _ := c.OutputCols(in).Next(0)
-	inTyp := c.mem.Metadata().ColumnMeta(opt.ColumnID(inCol)).Type
+func (c *CustomFuncs) ArrayType(inCol opt.ColumnID) *types.T {
+	inTyp := c.mem.Metadata().ColumnMeta(inCol).Type
 	return types.MakeArray(inTyp)
 }
 
@@ -190,14 +197,14 @@ func (c *CustomFuncs) CandidateKey(input memo.RelExpr) (key opt.ColSet, ok bool)
 
 // IsColNotNull returns true if the given input column is never null.
 func (c *CustomFuncs) IsColNotNull(col opt.ColumnID, input memo.RelExpr) bool {
-	return input.Relational().NotNullCols.Contains(int(col))
+	return input.Relational().NotNullCols.Contains(col)
 }
 
 // IsColNotNull2 returns true if the given column is part of the left or right
 // expressions' set of not-null columns.
 func (c *CustomFuncs) IsColNotNull2(col opt.ColumnID, left, right memo.RelExpr) bool {
-	return left.Relational().NotNullCols.Contains(int(col)) ||
-		right.Relational().NotNullCols.Contains(int(col))
+	return left.Relational().NotNullCols.Contains(col) ||
+		right.Relational().NotNullCols.Contains(col)
 }
 
 // OuterCols returns the set of outer columns associated with the given
@@ -233,6 +240,13 @@ func (c *CustomFuncs) HasOuterCols(input opt.Expr) bool {
 // produced by the Scan.
 func (c *CustomFuncs) IsBoundBy(src opt.Expr, cols opt.ColSet) bool {
 	return c.OuterCols(src).SubsetOf(cols)
+}
+
+// IsDeterminedBy returns true if all outer references in the source expression
+// are bound by the closure of the given columns according to the functional
+// dependencies of the input expression.
+func (c *CustomFuncs) IsDeterminedBy(src opt.Expr, cols opt.ColSet, input memo.RelExpr) bool {
+	return input.Relational().FuncDeps.InClosureOf(c.OuterCols(src), cols)
 }
 
 // IsCorrelated returns true if any variable in the source expression references
@@ -298,6 +312,11 @@ func (c *CustomFuncs) ColsIntersect(left, right opt.ColSet) bool {
 	return left.Intersects(right)
 }
 
+// IntersectionCols returns the intersection of the left and right column sets.
+func (c *CustomFuncs) IntersectionCols(left, right opt.ColSet) opt.ColSet {
+	return left.Intersection(right)
+}
+
 // UnionCols returns the union of the left and right column sets.
 func (c *CustomFuncs) UnionCols(left, right opt.ColSet) opt.ColSet {
 	return left.Union(right)
@@ -333,7 +352,18 @@ func (c *CustomFuncs) sharedProps(e opt.Expr) *props.Shared {
 	case memo.ScalarPropsExpr:
 		return &t.ScalarProps(c.mem).Shared
 	}
-	panic(pgerror.AssertionFailedf("no logical properties available for node: %v", e))
+	panic(errors.AssertionFailedf("no logical properties available for node: %v", e))
+}
+
+// MutationTable returns the table upon which the mutation is applied.
+func (c *CustomFuncs) MutationTable(private *memo.MutationPrivate) opt.TableID {
+	return private.Table
+}
+
+// PrimaryKeyCols returns the key columns of the primary key of the table.
+func (c *CustomFuncs) PrimaryKeyCols(table opt.TableID) opt.ColSet {
+	tabMeta := c.mem.Metadata().TableMeta(table)
+	return tabMeta.IndexKeyColumns(cat.PrimaryIndex)
 }
 
 // ----------------------------------------------------------------------
@@ -373,6 +403,79 @@ func (c *CustomFuncs) PruneOrdering(
 // ordering.
 func (c *CustomFuncs) EmptyOrdering() physical.OrderingChoice {
 	return physical.OrderingChoice{}
+}
+
+// MakeSegmentedOrdering returns an ordering choice which satisfies both
+// limitOrdering and the ordering required by a window function. Returns nil if
+// no such ordering exists. See OrderingChoice.PrefixIntersection for more
+// details.
+func (c *CustomFuncs) MakeSegmentedOrdering(
+	input memo.RelExpr,
+	prefix opt.ColSet,
+	ordering physical.OrderingChoice,
+	limitOrdering physical.OrderingChoice,
+) *physical.OrderingChoice {
+
+	// The columns in the closure of the prefix may be included in it. It's
+	// beneficial to do so for a given column iff that column appears in the
+	// limit's ordering.
+	cl := input.Relational().FuncDeps.ComputeClosure(prefix)
+	cl.IntersectionWith(limitOrdering.ColSet())
+	cl.UnionWith(prefix)
+	prefix = cl
+
+	oc, ok := limitOrdering.PrefixIntersection(prefix, ordering.Columns)
+	if !ok {
+		return nil
+	}
+	return &oc
+}
+
+// AllArePrefixSafe returns whether every window function in the list satisfies
+// the "prefix-safe" property.
+//
+// Being prefix-safe means that the computation of a window function on a given
+// row does not depend on any of the rows that come after it. It's also
+// precisely the property that lets us push limit operators below window
+// functions:
+//
+//		(Limit (Window $input) n) = (Window (Limit $input n))
+//
+// Note that the frame affects whether a given window function is prefix-safe or not.
+// rank() is prefix-safe under any frame, but avg():
+//  * is not prefix-safe under RANGE BETWEEN UNBOUNDED PRECEDING TO CURRENT ROW
+//    (the default), because we might cut off mid-peer group. If we can
+//    guarantee that the ordering is over a key, then this becomes safe.
+//  * is not prefix-safe under ROWS BETWEEN UNBOUNDED PRECEDING TO UNBOUNDED
+//    FOLLOWING, because it needs to look at the entire partition.
+//  * is prefix-safe under ROWS BETWEEN UNBOUNDED PRECEDING TO CURRENT ROW,
+//    because it only needs to look at the rows up to any given row.
+// (We don't currently handle this case).
+//
+// This function is best-effort. It's OK to report a function not as
+// prefix-safe, even if it is.
+func (c *CustomFuncs) AllArePrefixSafe(fns memo.WindowsExpr) bool {
+	for i := range fns {
+		if !c.isPrefixSafe(&fns[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// isPrefixSafe returns whether or not the given window function satisfies the
+// "prefix-safe" property. See the comment above AllArePrefixSafe for more
+// details.
+func (c *CustomFuncs) isPrefixSafe(fn *memo.WindowsItem) bool {
+	switch fn.Function.Op() {
+	case opt.RankOp, opt.RowNumberOp, opt.DenseRankOp:
+		return true
+	}
+	// TODO(justin): Add other cases. I think aggregates are valid here if the
+	// upper bound is CURRENT ROW, and either:
+	// * the mode is ROWS, or
+	// * the mode is RANGE and the ordering is over a key.
+	return false
 }
 
 // -----------------------------------------------------------------------
@@ -443,7 +546,7 @@ func (c *CustomFuncs) RemoveFiltersItem(
 			return newFilters
 		}
 	}
-	panic(pgerror.AssertionFailedf("item to remove is not in the list: %v", search))
+	panic(errors.AssertionFailedf("item to remove is not in the list: %v", search))
 }
 
 // ReplaceFiltersItem returns a new list that is a copy of the given list,
@@ -463,7 +566,7 @@ func (c *CustomFuncs) ReplaceFiltersItem(
 			return newFilters
 		}
 	}
-	panic(pgerror.AssertionFailedf("item to replace is not in the list: %v", search))
+	panic(errors.AssertionFailedf("item to replace is not in the list: %v", search))
 }
 
 // FiltersBoundBy returns true if all outer references in any of the filter
@@ -531,6 +634,35 @@ func (c *CustomFuncs) ExtractUnboundConditions(
 	return newFilters
 }
 
+// ExtractDeterminedConditions returns a new list of filters containing only
+// those expressions from the given list which are bound by columns which
+// are functionally determined by the given columns.
+func (c *CustomFuncs) ExtractDeterminedConditions(
+	filters memo.FiltersExpr, cols opt.ColSet, input memo.RelExpr,
+) memo.FiltersExpr {
+	newFilters := make(memo.FiltersExpr, 0, len(filters))
+	for i := range filters {
+		if c.IsDeterminedBy(&filters[i], cols, input) {
+			newFilters = append(newFilters, filters[i])
+		}
+	}
+	return newFilters
+}
+
+// ExtractUndeterminedConditions is the opposite of
+// ExtractDeterminedConditions.
+func (c *CustomFuncs) ExtractUndeterminedConditions(
+	filters memo.FiltersExpr, cols opt.ColSet, input memo.RelExpr,
+) memo.FiltersExpr {
+	newFilters := make(memo.FiltersExpr, 0, len(filters))
+	for i := range filters {
+		if !c.IsDeterminedBy(&filters[i], cols, input) {
+			newFilters = append(newFilters, filters[i])
+		}
+	}
+	return newFilters
+}
+
 // CanConsolidateFilters returns true if there are at least two different
 // filter conditions that contain the same variable, where the conditions
 // have tight constraints and contain a single variable. For example,
@@ -555,7 +687,7 @@ func (c *CustomFuncs) CanConsolidateFilters(filters memo.FiltersExpr) bool {
 // x IS NULL. If the filter can be consolidated, canConsolidateFilter returns
 // the column ID of the variable and ok=true. Otherwise, canConsolidateFilter
 // returns ok=false.
-func (c *CustomFuncs) canConsolidateFilter(filter *memo.FiltersItem) (col int, ok bool) {
+func (c *CustomFuncs) canConsolidateFilter(filter *memo.FiltersItem) (col opt.ColumnID, ok bool) {
 	if !filter.ScalarProps(c.mem).TightConstraints {
 		return 0, false
 	}
@@ -598,7 +730,7 @@ func (c *CustomFuncs) ConsolidateFilters(filters memo.FiltersExpr) memo.FiltersE
 	var rangeMap util.FastIntMap
 	i := 0
 	for col, ok := seenTwice.Next(0); ok; col, ok = seenTwice.Next(col + 1) {
-		rangeMap.Set(col, i)
+		rangeMap.Set(int(col), i)
 		i++
 	}
 
@@ -615,7 +747,7 @@ func (c *CustomFuncs) ConsolidateFilters(filters memo.FiltersExpr) memo.FiltersE
 				// If it is already a range expression, unwrap it.
 				cond = t.And
 			}
-			rangeIdx, _ := rangeMap.Get(col)
+			rangeIdx, _ := rangeMap.Get(int(col))
 			rangeItem := &newFilters[rangeIdx]
 			if rangeItem.Condition == nil {
 				// This is the first condition.
@@ -658,9 +790,7 @@ func (c *CustomFuncs) SortFilters(f memo.FiltersExpr) memo.FiltersExpr {
 		fi := f.Child(i).(*memo.FiltersItem)
 		result[i] = *fi
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Child(0).(opt.ScalarExpr).ID() < result[j].Child(0).(opt.ScalarExpr).ID()
-	})
+	result.Sort()
 	return result
 }
 
@@ -699,7 +829,7 @@ func (c *CustomFuncs) MergeProjections(
 	copy(newProjections, outer)
 	for i := range inner {
 		item := &inner[i]
-		if passthrough.Contains(int(item.Col)) {
+		if passthrough.Contains(item.Col) {
 			newProjections = append(newProjections, *item)
 		}
 	}
@@ -728,7 +858,7 @@ func (c *CustomFuncs) MergeProjectWithValues(
 	values := input.(*memo.ValuesExpr)
 	tuple := values.Rows[0].(*memo.TupleExpr)
 	for i, colID := range values.Cols {
-		if passthrough.Contains(int(colID)) {
+		if passthrough.Contains(colID) {
 			newExprs = append(newExprs, tuple.Elems[i])
 			newTypes = append(newTypes, *tuple.Elems[i].DataType())
 			newCols = append(newCols, colID)
@@ -755,7 +885,7 @@ func (c *CustomFuncs) MergeProjectWithValues(
 func (c *CustomFuncs) ProjectionCols(projections memo.ProjectionsExpr) opt.ColSet {
 	var colSet opt.ColSet
 	for i := range projections {
-		colSet.Add(int(projections[i].Col))
+		colSet.Add(projections[i].Col)
 	}
 	return colSet
 }
@@ -878,7 +1008,7 @@ func (c *CustomFuncs) addConjuncts(
 func (c *CustomFuncs) ConstructEmptyValues(cols opt.ColSet) memo.RelExpr {
 	colList := make(opt.ColList, 0, cols.Len())
 	for i, ok := cols.Next(0); ok; i, ok = cols.Next(i + 1) {
-		colList = append(colList, opt.ColumnID(i))
+		colList = append(colList, i)
 	}
 	return c.f.ConstructValues(memo.EmptyScalarListExpr, &memo.ValuesPrivate{
 		Cols: colList,
@@ -917,9 +1047,21 @@ func (c *CustomFuncs) GroupingAndConstCols(
 		if constAgg, ok := item.Agg.(*memo.ConstAggExpr); ok {
 			// Verify that the input and output column IDs match.
 			if item.Col == constAgg.Input.(*memo.VariableExpr).Col {
-				result.Add(int(item.Col))
+				result.Add(item.Col)
 			}
 		}
+	}
+	return result
+}
+
+// GroupingOutputCols returns the output columns of a GroupBy, ScalarGroupBy, or
+// DistinctOn expression.
+func (c *CustomFuncs) GroupingOutputCols(
+	grouping *memo.GroupingPrivate, aggs memo.AggregationsExpr,
+) opt.ColSet {
+	result := grouping.GroupingCols.Copy()
+	for i := range aggs {
+		result.Add(aggs[i].Col)
 	}
 	return result
 }
@@ -948,12 +1090,25 @@ func (c *CustomFuncs) IsUnorderedGrouping(grouping *memo.GroupingPrivate) bool {
 //
 // ----------------------------------------------------------------------
 
+// IsPositiveLimit is true if the given limit value is greater than zero.
+func (c *CustomFuncs) IsPositiveLimit(limit tree.Datum) bool {
+	limitVal := int64(*limit.(*tree.DInt))
+	return limitVal > 0
+}
+
 // LimitGeMaxRows returns true if the given constant limit value is greater than
 // or equal to the max number of rows returned by the input expression.
 func (c *CustomFuncs) LimitGeMaxRows(limit tree.Datum, input memo.RelExpr) bool {
 	limitVal := int64(*limit.(*tree.DInt))
 	maxRows := input.Relational().Cardinality.Max
 	return limitVal >= 0 && maxRows < math.MaxUint32 && limitVal >= int64(maxRows)
+}
+
+// IsSameOrdering evaluates whether the two orderings are equal.
+func (c *CustomFuncs) IsSameOrdering(
+	first physical.OrderingChoice, other physical.OrderingChoice,
+) bool {
+	return first.Equals(&other)
 }
 
 // ----------------------------------------------------------------------
@@ -1017,12 +1172,43 @@ func (c *CustomFuncs) projectColMapSide(toList, fromList opt.ColList) memo.Proje
 	return items
 }
 
+// PruneSetPrivate returns a SetPrivate based on the given SetPrivate, but with
+// unneeded input and output columns discarded.
+func (c *CustomFuncs) PruneSetPrivate(needed opt.ColSet, set *memo.SetPrivate) *memo.SetPrivate {
+	length := needed.Len()
+	prunedSet := memo.SetPrivate{
+		LeftCols:  make(opt.ColList, 0, length),
+		RightCols: make(opt.ColList, 0, length),
+		OutCols:   make(opt.ColList, 0, length),
+	}
+	for idx, outCol := range set.OutCols {
+		if needed.Contains(outCol) {
+			prunedSet.LeftCols = append(prunedSet.LeftCols, set.LeftCols[idx])
+			prunedSet.RightCols = append(prunedSet.RightCols, set.RightCols[idx])
+			prunedSet.OutCols = append(prunedSet.OutCols, outCol)
+		}
+	}
+	return &prunedSet
+}
+
+// NeededColMapLeft returns the subset of a SetPrivate's LeftCols that corresponds to the
+// needed subset of OutCols. This is useful for pruning columns in set operations.
+func (c *CustomFuncs) NeededColMapLeft(needed opt.ColSet, set *memo.SetPrivate) opt.ColSet {
+	return opt.TranslateColSet(needed, set.OutCols, set.LeftCols)
+}
+
+// NeededColMapRight returns the subset of a SetPrivate's RightCols that corresponds to the
+// needed subset of OutCols. This is useful for pruning columns in set operations.
+func (c *CustomFuncs) NeededColMapRight(needed opt.ColSet, set *memo.SetPrivate) opt.ColSet {
+	return opt.TranslateColSet(needed, set.OutCols, set.RightCols)
+}
+
 // CanMapOnSetOp determines whether the filter can be mapped to either
 // side of a set operator.
 func (c *CustomFuncs) CanMapOnSetOp(src *memo.FiltersItem) bool {
 	filterProps := src.ScalarProps(c.mem)
 	for i, ok := filterProps.OuterCols.Next(0); ok; i, ok = filterProps.OuterCols.Next(i + 1) {
-		colType := c.f.Metadata().ColumnMeta(opt.ColumnID(i)).Type
+		colType := c.f.Metadata().ColumnMeta(i).Type
 		if sqlbase.DatumTypeHasCompositeKeyEncoding(colType) {
 			return false
 		}
@@ -1122,6 +1308,17 @@ func (c *CustomFuncs) ReduceWindowPartitionCols(
 	return &p
 }
 
+// WindowPartition returns the set of columns that the window function uses to
+// partition.
+func (c *CustomFuncs) WindowPartition(priv *memo.WindowPrivate) opt.ColSet {
+	return priv.Partition
+}
+
+// WindowOrdering returns the ordering used by the window function.
+func (c *CustomFuncs) WindowOrdering(private *memo.WindowPrivate) physical.OrderingChoice {
+	return private.Ordering
+}
+
 // ----------------------------------------------------------------------
 //
 // Boolean Rules
@@ -1169,7 +1366,7 @@ func (c *CustomFuncs) CommuteInequality(
 	case opt.LtOp:
 		return c.f.ConstructGt(right, left)
 	}
-	panic(pgerror.AssertionFailedf("called commuteInequality with operator %s", log.Safe(op)))
+	panic(errors.AssertionFailedf("called commuteInequality with operator %s", log.Safe(op)))
 }
 
 // FindRedundantConjunct takes the left and right operands of an Or operator as
@@ -1280,7 +1477,7 @@ func (c *CustomFuncs) extractConjunct(conjunct opt.ScalarExpr, and *memo.AndExpr
 //   (a = x) AND (b = y) AND (c = z)
 func (c *CustomFuncs) NormalizeTupleEquality(left, right memo.ScalarListExpr) opt.ScalarExpr {
 	if len(left) != len(right) {
-		panic(pgerror.AssertionFailedf("tuple length mismatch"))
+		panic(errors.AssertionFailedf("tuple length mismatch"))
 	}
 	if len(left) == 0 {
 		// () = (), which is always true.
@@ -1368,7 +1565,7 @@ func (c *CustomFuncs) IsConstValueEqual(const1, const2 opt.ScalarExpr) bool {
 		datum2 := const2.(*memo.ConstExpr).Value
 		return datum1.Compare(c.f.evalCtx, datum2) == 0
 	default:
-		panic(pgerror.AssertionFailedf("unexpected Op type: %v", log.Safe(op1)))
+		panic(errors.AssertionFailedf("unexpected Op type: %v", log.Safe(op1)))
 	}
 }
 
@@ -1451,14 +1648,19 @@ func (c *CustomFuncs) ConvertConstArrayToTuple(scalar opt.ScalarExpr) opt.Scalar
 // CastToCollatedString returns the given string or collated string as a
 // collated string constant with the given locale.
 func (c *CustomFuncs) CastToCollatedString(str opt.ScalarExpr, locale string) opt.ScalarExpr {
+	datum := str.(*memo.ConstExpr).Value
+	if wrap, ok := datum.(*tree.DOidWrapper); ok {
+		datum = wrap.Wrapped
+	}
+
 	var value string
-	switch t := str.(*memo.ConstExpr).Value.(type) {
+	switch t := datum.(type) {
 	case *tree.DString:
 		value = string(*t)
 	case *tree.DCollatedString:
 		value = t.Contents
 	default:
-		panic(pgerror.AssertionFailedf("unexpected type for COLLATE: %T", log.Safe(str.(*memo.ConstExpr).Value)))
+		panic(errors.AssertionFailedf("unexpected type for COLLATE: %T", t))
 	}
 
 	return c.f.ConstructConst(tree.NewDCollatedString(value, locale, &c.f.evalCtx.CollationEnv))
@@ -1476,10 +1678,10 @@ func (c *CustomFuncs) SubqueryOrdering(sub *memo.SubqueryPrivate) physical.Order
 	return oc
 }
 
-// FirstCol returns the first column in the input expression.
-func (c *CustomFuncs) FirstCol(in memo.RelExpr) opt.ColumnID {
-	inCol, _ := c.OutputCols(in).Next(0)
-	return opt.ColumnID(inCol)
+// SubqueryRequestedCol returns the requested column from a SubqueryPrivate.
+// This function should only be used with ArrayFlatten expressions.
+func (c *CustomFuncs) SubqueryRequestedCol(sub *memo.SubqueryPrivate) opt.ColumnID {
+	return sub.RequestedCol
 }
 
 // MakeArrayAggCol returns a ColPrivate with the given type and an "array_agg" label.
@@ -1547,4 +1749,122 @@ func (c *CustomFuncs) EqualsNumber(datum tree.Datum, value int64) bool {
 		return *t == tree.DInt(value)
 	}
 	return false
+}
+
+// AddConstInts adds the numeric constants together. AddConstInts assumes the sum
+// will not overflow. Call CanAddConstInts on the constants to guarantee this.
+func (c *CustomFuncs) AddConstInts(first tree.Datum, second tree.Datum) tree.Datum {
+	firstVal := int64(*first.(*tree.DInt))
+	secondVal := int64(*second.(*tree.DInt))
+	sum, ok := arith.AddWithOverflow(firstVal, secondVal)
+	if !ok {
+		panic(errors.AssertionFailedf("addition of %d and %d overflowed", firstVal, secondVal))
+	}
+	return tree.NewDInt(tree.DInt(sum))
+}
+
+// CanAddConstInts returns true if the addition of the two integers overflows.
+func (c *CustomFuncs) CanAddConstInts(first tree.Datum, second tree.Datum) bool {
+	firstVal := int64(*first.(*tree.DInt))
+	secondVal := int64(*second.(*tree.DInt))
+	_, ok := arith.AddWithOverflow(firstVal, secondVal)
+	return ok
+}
+
+// ----------------------------------------------------------------------
+//
+// With Rules
+//   Custom match and replace functions used with with.opt rules.
+//
+// ----------------------------------------------------------------------
+
+// CanInlineWith returns whether or not it's valid to inline binding in expr.
+// This is the case when:
+// 1. binding has no side-effects (because once it's inlined, there's no
+//    guarantee it will be executed fully), and
+// 2. binding is referenced at most once in expr.
+func (c *CustomFuncs) CanInlineWith(binding, expr memo.RelExpr, private *memo.WithPrivate) bool {
+	if binding.Relational().CanHaveSideEffects {
+		return false
+	}
+	return c.WithUses(expr)[private.ID] <= 1
+}
+
+// InlineWith replaces all references to the With expression in input (via
+// WithScans) with its definition.
+func (c *CustomFuncs) InlineWith(binding, input memo.RelExpr, priv *memo.WithPrivate) memo.RelExpr {
+	var replace ReplaceFunc
+	replace = func(nd opt.Expr) opt.Expr {
+		switch t := nd.(type) {
+		case *memo.WithScanExpr:
+			if t.ID == priv.ID {
+				// TODO(justin): it might be worth carefully walking the tree and
+				// renaming variables as we do this replacement so that this projection
+				// is unnecessary (assuming there's at most one reference to the
+				// WithScan, which might be false if we heuristically inline multiple
+				// times in the future).
+				projections := make(memo.ProjectionsExpr, len(t.InCols))
+				for i := range t.InCols {
+					projections[i] = memo.ProjectionsItem{
+						Element:    c.f.ConstructVariable(t.InCols[i]),
+						ColPrivate: memo.ColPrivate{Col: t.OutCols[i]},
+					}
+				}
+				return c.f.ConstructProject(binding, projections, opt.ColSet{})
+			}
+			// TODO(justin): should apply joins block inlining because they can lead
+			// to expressions being executed multiple times?
+		}
+		return c.f.Replace(nd, replace)
+	}
+
+	return replace(input).(memo.RelExpr)
+}
+
+// WithUses returns a map mapping WithIDs to the number of times a given With
+// expression is referenced in the given expression.
+func (c *CustomFuncs) WithUses(r opt.Expr) map[opt.WithID]int {
+	switch e := r.(type) {
+	case memo.RelExpr:
+		relProps := e.Relational()
+		if !relProps.IsAvailable(props.WithUses) {
+			relProps.SetAvailable(props.WithUses)
+			relProps.Shared.Rule.WithUses = c.deriveWithUses(r)
+		}
+		return relProps.Shared.Rule.WithUses
+
+	case memo.ScalarPropsExpr:
+		scalarProps := e.ScalarProps(c.mem)
+
+		// Lazily calculate and store the WithUses value.
+		if !scalarProps.IsAvailable(props.WithUses) {
+			scalarProps.Shared.Rule.WithUses = c.deriveWithUses(r)
+			scalarProps.SetAvailable(props.WithUses)
+		}
+		return scalarProps.Shared.Rule.WithUses
+
+	default:
+		return c.deriveWithUses(r)
+	}
+}
+
+// deriveWithUses computes the number of times each WithScan is referenced. It's
+// used to decide if we can inline a With or not.
+func (c *CustomFuncs) deriveWithUses(r opt.Expr) map[opt.WithID]int {
+	var result map[opt.WithID]int
+	switch e := r.(type) {
+	case *memo.WithScanExpr:
+		result = map[opt.WithID]int{e.ID: 1}
+	default:
+		for i, n := 0, r.ChildCount(); i < n; i++ {
+			for id, useCount := range c.WithUses(r.Child(i)) {
+				if result == nil {
+					result = make(map[opt.WithID]int)
+				}
+				result[id] = result[id] + useCount
+			}
+		}
+	}
+
+	return result
 }

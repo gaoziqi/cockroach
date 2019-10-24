@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -20,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/storage/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanlatch"
 	"github.com/cockroachdb/cockroach/pkg/storage/split"
@@ -108,6 +105,7 @@ func (r *Replica) initRaftMuLockedReplicaMuLocked(
 	// reloading the raft state below, it isn't safe to use the existing raft
 	// group.
 	r.mu.internalRaftGroup = nil
+	r.mu.proposalBuf.Init((*replicaProposer)(r))
 
 	var err error
 	if r.mu.state, err = r.mu.stateLoader.Load(ctx, r.store.Engine(), desc); err != nil {
@@ -151,49 +149,38 @@ func (r *Replica) initRaftMuLockedReplicaMuLocked(
 		replicaID = repDesc.ReplicaID
 	}
 	r.rangeStr.store(replicaID, r.mu.state.Desc)
-	if err := r.setReplicaIDRaftMuLockedMuLocked(replicaID); err != nil {
-		return err
+	r.connectionClass.set(rpc.ConnectionClassForKey(desc.StartKey))
+	if r.mu.replicaID == 0 {
+		if err := r.setReplicaIDRaftMuLockedMuLocked(ctx, replicaID); err != nil {
+			return err
+		}
+	} else if r.mu.replicaID != replicaID {
+		log.Fatalf(ctx, "attempting to initialize a replica which has ID %d with ID %d",
+			r.mu.replicaID, replicaID)
 	}
-
 	r.assertStateLocked(ctx, r.store.Engine())
 	return nil
 }
 
-func (r *Replica) setReplicaID(replicaID roachpb.ReplicaID) error {
-	r.raftMu.Lock()
-	defer r.raftMu.Unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.setReplicaIDRaftMuLockedMuLocked(replicaID)
-}
-
-func (r *Replica) setReplicaIDRaftMuLockedMuLocked(replicaID roachpb.ReplicaID) error {
-	if r.mu.replicaID == replicaID {
-		// The common case: the replica ID is unchanged.
-		return nil
+func (r *Replica) setReplicaIDRaftMuLockedMuLocked(
+	ctx context.Context, replicaID roachpb.ReplicaID,
+) error {
+	if r.mu.replicaID != 0 {
+		log.Fatalf(ctx, "cannot set replica ID from anything other than 0, currently %d",
+			r.mu.replicaID)
+	} else if replicaID == 0 {
+		log.Fatalf(ctx, "cannot set replica ID from anything to 0: %v", r)
 	}
-	if replicaID == 0 {
-		// If the incoming message does not have a new replica ID it is a
-		// preemptive snapshot. We'll update minReplicaID if the snapshot is
-		// accepted.
-		return nil
-	}
-	if replicaID < r.mu.minReplicaID {
+	if replicaID < r.mu.tombstoneMinReplicaID {
 		return &roachpb.RaftGroupDeletedError{}
 	}
 	if r.mu.replicaID > replicaID {
 		return errors.Errorf("replicaID cannot move backwards from %d to %d", r.mu.replicaID, replicaID)
 	}
-
-	if r.mu.destroyStatus.reason == destroyReasonRemovalPending {
-		// An earlier incarnation of this replica was removed, but apparently it has been re-added
-		// now, so reset the status.
-		r.mu.destroyStatus.Reset()
+	if r.mu.destroyStatus.Removed() {
+		// This replica has been marked for removal and we're trying to resurrect it.
+		log.Fatalf(ctx, "cannot resurect replica %d", r.mu.replicaID)
 	}
-
-	// if r.mu.replicaID != 0 {
-	// 	// TODO(bdarnell): clean up previous raftGroup (update peers)
-	// }
 
 	// Initialize or update the sideloaded storage. If the sideloaded storage
 	// already exists (which is iff the previous replicaID was non-zero), then
@@ -221,24 +208,12 @@ func (r *Replica) setReplicaIDRaftMuLockedMuLocked(replicaID roachpb.ReplicaID) 
 		return errors.Wrap(err, "while initializing sideloaded storage")
 	}
 
-	previousReplicaID := r.mu.replicaID
 	r.mu.replicaID = replicaID
 
-	if replicaID >= r.mu.minReplicaID {
-		r.mu.minReplicaID = replicaID + 1
-	}
-	// Reset the raft group to force its recreation on next usage.
-	r.mu.internalRaftGroup = nil
-
-	// If there was a previous replica, repropose its pending commands under
-	// this new incarnation.
-	if previousReplicaID != 0 {
-		if log.V(1) {
-			log.Infof(r.AnnotateCtx(context.TODO()), "changed replica ID from %d to %d",
-				previousReplicaID, replicaID)
-		}
-		// repropose all pending commands under new replicaID.
-		r.refreshProposalsLocked(0, reasonReplicaIDChanged)
+	// Sanity check that we do not already have a raft group as we did not
+	// know our replica ID before this call.
+	if r.mu.internalRaftGroup != nil {
+		log.Fatalf(ctx, "somehow had an initialized raft group on a zero valued replica")
 	}
 
 	return nil
@@ -271,8 +246,12 @@ func (r *Replica) maybeInitializeRaftGroup(ctx context.Context) {
 	// If this replica hasn't initialized the Raft group, create it and
 	// unquiesce and wake the leader to ensure the replica comes up to date.
 	initialized := r.mu.internalRaftGroup != nil
+	// If this replica has been removed or is in the process of being removed
+	// then it'll never handle any raft events so there's no reason to initialize
+	// it now.
+	removed := !r.mu.destroyStatus.IsAlive()
 	r.mu.RUnlock()
-	if initialized {
+	if initialized || removed {
 		return
 	}
 
@@ -282,9 +261,11 @@ func (r *Replica) maybeInitializeRaftGroup(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// If we raced on checking the destroyStatus above that's fine as
+	// the below withRaftGroupLocked will no-op.
 	if err := r.withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
 		return true, nil
-	}); err != nil {
+	}); err != nil && err != errRemoved {
 		log.VErrEventf(ctx, 1, "unable to initialize raft group: %s", err)
 	}
 }
@@ -312,8 +293,8 @@ func (r *Replica) setDesc(ctx context.Context, desc *roachpb.RangeDescriptor) {
 
 	// Determine if a new replica was added. This is true if the new max replica
 	// ID is greater than the old max replica ID.
-	oldMaxID := maxReplicaID(r.mu.state.Desc)
-	newMaxID := maxReplicaID(desc)
+	oldMaxID := maxReplicaIDOfAny(r.mu.state.Desc)
+	newMaxID := maxReplicaIDOfAny(desc)
 	if newMaxID > oldMaxID {
 		r.mu.lastReplicaAdded = newMaxID
 		r.mu.lastReplicaAddedTime = timeutil.Now()
@@ -324,5 +305,6 @@ func (r *Replica) setDesc(ctx context.Context, desc *roachpb.RangeDescriptor) {
 	}
 
 	r.rangeStr.store(r.mu.replicaID, desc)
+	r.connectionClass.set(rpc.ConnectionClassForKey(desc.StartKey))
 	r.mu.state.Desc = desc
 }

@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 /* Package storage_test provides a means of testing store
 functionality which depends on a fully-functional KV client. This
@@ -37,6 +33,7 @@ import (
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -65,6 +62,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft"
 	"google.golang.org/grpc"
 )
@@ -216,12 +214,18 @@ func createTestStoreWithOpts(
 	}
 	// Wait for the store's single range to have quorum before proceeding.
 	repl := store.LookupReplica(roachpb.RKeyMin)
-	testutils.SucceedsSoon(t, func() error {
-		if !repl.HasQuorum() {
-			return errors.New("first range has not reached quorum")
-		}
-		return nil
-	})
+
+	// Send a request through the range to make sure everything is warmed up
+	// and works.
+	// NB: it's unclear if this code is necessary.
+	var ba roachpb.BatchRequest
+	get := roachpb.GetRequest{}
+	get.Key = keys.LocalMax
+	ba.Header.Replica = repl.Desc().Replicas().Voters()[0]
+	ba.Header.RangeID = repl.RangeID
+	ba.Add(&get)
+	_, pErr := store.Send(ctx, ba)
+	require.NoError(t, pErr.GoError())
 
 	// Wait for the system config to be available in gossip. All sorts of things
 	// might not work properly while the system config is not available.
@@ -248,6 +252,9 @@ type multiTestContext struct {
 	manualClock *hlc.ManualClock
 	clock       *hlc.Clock
 	rpcContext  *rpc.Context
+	// rpcTestingKnobs are optional configuration for the rpcContext.
+	rpcTestingKnobs rpc.ContextTestingKnobs
+
 	// By default, a multiTestContext starts with a bunch of system ranges, just
 	// like a regular Server after bootstrap. If startWithSingleRange is set,
 	// we'll start with a single range spanning all the key space. The split
@@ -310,6 +317,7 @@ func (m *multiTestContext) Start(t testing.TB, numStores int) {
 		mCopy.engines = nil
 		mCopy.engineStoppers = nil
 		mCopy.startWithSingleRange = false
+		mCopy.rpcTestingKnobs = rpc.ContextTestingKnobs{}
 		var empty multiTestContext
 		if !reflect.DeepEqual(empty, mCopy) {
 			t.Fatalf("illegal fields set in multiTestContext:\n%s", pretty.Diff(empty, mCopy))
@@ -342,8 +350,8 @@ func (m *multiTestContext) Start(t testing.TB, numStores int) {
 	}
 	st := cluster.MakeTestingClusterSettings()
 	if m.rpcContext == nil {
-		m.rpcContext = rpc.NewContext(log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, m.clock,
-			m.transportStopper, &st.Version)
+		m.rpcContext = rpc.NewContextWithTestingKnobs(log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, m.clock,
+			m.transportStopper, &st.Version, m.rpcTestingKnobs)
 		// Ensure that tests using this test context and restart/shut down
 		// their servers do not inadvertently start talking to servers from
 		// unrelated concurrent tests.
@@ -826,7 +834,7 @@ func (m *multiTestContext) addStore(idx int) {
 		grpcServer,
 		m.transportStopper,
 		metric.NewRegistry(),
-		config.DefaultZoneConfigRef(),
+		zonepb.DefaultZoneConfigRef(),
 	)
 
 	nodeID := roachpb.NodeID(idx + 1)
@@ -917,7 +925,8 @@ func (m *multiTestContext) addStore(idx int) {
 	// having to worry about such conditions we pre-warm the connection
 	// cache. See #8440 for an example of the headaches the long dial times
 	// cause.
-	if _, err := m.rpcContext.GRPCDialNode(ln.Addr().String(), nodeID).Connect(ctx); err != nil {
+	if _, err := m.rpcContext.GRPCDialNode(ln.Addr().String(), nodeID,
+		rpc.DefaultClass).Connect(ctx); err != nil {
 		m.t.Fatal(err)
 	}
 
@@ -988,11 +997,12 @@ func (m *multiTestContext) stopStore(i int) {
 
 	m.mu.Lock()
 	m.stoppers[i] = nil
-	// Break the transport breaker for this node so that messages sent between a
-	// store stopping and that store restarting will never remain in-flight in
+	// Break the transport breakers for this node so that messages sent between
+	// a store stopping and that store restarting will never remain in-flight in
 	// the transport and end up reaching the store. This has been the cause of
 	// flakiness in the past.
-	m.transport.GetCircuitBreaker(m.idents[i].NodeID).Break()
+	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.DefaultClass).Break()
+	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.SystemClass).Break()
 	m.senders[i].RemoveStore(m.stores[i])
 	m.stores[i] = nil
 	m.mu.Unlock()
@@ -1026,7 +1036,8 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 		m.t.Fatal(err)
 	}
 	m.senders[i].AddStore(store)
-	m.transport.GetCircuitBreaker(m.idents[i].NodeID).Reset()
+	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.DefaultClass).Reset()
+	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.SystemClass).Reset()
 	m.mu.Unlock()
 	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, func(ctx context.Context) {
 		now := m.clocks[i].Now()
@@ -1051,8 +1062,8 @@ func (m *multiTestContext) restartStore(i int) {
 }
 
 func (m *multiTestContext) Store(i int) *storage.Store {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.stores[i]
 }
 
@@ -1084,7 +1095,7 @@ func (m *multiTestContext) findMemberStoreLocked(desc roachpb.RangeDescriptor) *
 			}
 		}
 	}
-	m.t.Fatalf("couldn't find a live member of %s", desc)
+	m.t.Fatalf("couldn't find a live member of %s", &desc)
 	return nil // unreached, but the compiler can't tell.
 }
 
@@ -1132,12 +1143,14 @@ func (m *multiTestContext) changeReplicas(
 		}
 
 		_, err := m.dbs[0].AdminChangeReplicas(
-			ctx, startKey.AsRawKey(), changeType,
-			[]roachpb.ReplicationTarget{{
-				NodeID:  m.idents[dest].NodeID,
-				StoreID: m.idents[dest].StoreID,
-			}},
+			ctx, startKey.AsRawKey(),
 			desc,
+			roachpb.MakeReplicationChanges(
+				changeType,
+				roachpb.ReplicationTarget{
+					NodeID:  m.idents[dest].NodeID,
+					StoreID: m.idents[dest].StoreID,
+				}),
 		)
 
 		if err == nil || testutils.IsError(err, alreadyDoneErr) {
@@ -1154,7 +1167,7 @@ func (m *multiTestContext) changeReplicas(
 		// We can't use storage.IsSnapshotError() because the original error object
 		// is lost. We could make a this into a roachpb.Error but it seems overkill
 		// for this one usage.
-		if testutils.IsError(err, "snapshot failed: .*") {
+		if testutils.IsError(err, "snapshot failed: .*|descriptor changed") {
 			log.Info(ctx, err)
 			continue
 		}
@@ -1201,6 +1214,9 @@ func (m *multiTestContext) replicateRangeNonFatal(rangeID roachpb.RangeID, dests
 			if e := expectedReplicaIDs[i]; repDesc.ReplicaID != e {
 				return errors.Errorf("expected replica %s to have ID %d", repl, e)
 			}
+			if t := repDesc.GetType(); t != roachpb.VOTER_FULL {
+				return errors.Errorf("expected replica %s to be a voter was %s", repl, t)
+			}
 			if !repl.Desc().ContainsKey(startKey) {
 				return errors.Errorf("expected replica %s to contain %s", repl, startKey)
 			}
@@ -1228,6 +1244,23 @@ func (m *multiTestContext) unreplicateRangeNonFatal(rangeID roachpb.RangeID, des
 	return err
 }
 
+// waitForUnreplicated waits until no replica exists for the specified range
+// on the dest store.
+func (m *multiTestContext) waitForUnreplicated(rangeID roachpb.RangeID, dest int) error {
+	// Wait for the unreplications to complete on destination node.
+	return retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
+		_, err := m.stores[dest].GetReplica(rangeID)
+		switch err.(type) {
+		case nil:
+			return fmt.Errorf("replica still exists on dest %d", dest)
+		case *roachpb.RangeNotFoundError:
+			return nil
+		default:
+			return err
+		}
+	})
+}
+
 // readIntFromEngines reads the current integer value at the given key
 // from all configured engines, filling in zeros when the value is not
 // found. Returns a slice of the same length as mtc.engines.
@@ -1243,11 +1276,24 @@ func (m *multiTestContext) readIntFromEngines(key roachpb.Key) []int64 {
 		} else {
 			results[i], err = val.GetInt()
 			if err != nil {
-				log.Errorf(context.TODO(), "engine %d: error decoding %s from key %s: %s", i, val, key, err)
+				log.Errorf(context.TODO(), "engine %d: error decoding %s from key %s: %+v", i, val, key, err)
 			}
 		}
 	}
 	return results
+}
+
+// waitForValuesT is like waitForValues but allows the caller to provide a
+// testing.T which may differ from m.t.
+func (m *multiTestContext) waitForValuesT(t testing.TB, key roachpb.Key, expected []int64) {
+	t.Helper()
+	testutils.SucceedsSoon(t, func() error {
+		actual := m.readIntFromEngines(key)
+		if !reflect.DeepEqual(expected, actual) {
+			return errors.Errorf("expected %v, got %v", expected, actual)
+		}
+		return nil
+	})
 }
 
 // waitForValues waits up to the given duration for the integer values
@@ -1255,13 +1301,7 @@ func (m *multiTestContext) readIntFromEngines(key roachpb.Key) []int64 {
 // Fails the test if they do not match.
 func (m *multiTestContext) waitForValues(key roachpb.Key, expected []int64) {
 	m.t.Helper()
-	testutils.SucceedsSoon(m.t, func() error {
-		actual := m.readIntFromEngines(key)
-		if !reflect.DeepEqual(expected, actual) {
-			return errors.Errorf("expected %v, got %v", expected, actual)
-		}
-		return nil
-	})
+	m.waitForValuesT(m.t, key, expected)
 }
 
 // transferLease transfers the lease for the given range from the source
@@ -1528,4 +1568,23 @@ func verifyRecomputedStats(
 		return fmt.Errorf("expected range's stats to agree with recomputation: got\n%+v\nrecomputed\n%+v", expMS, ms)
 	}
 	return nil
+}
+
+func waitForTombstone(
+	t *testing.T, eng engine.Reader, rangeID roachpb.RangeID,
+) (tombstone roachpb.RaftTombstone) {
+	testutils.SucceedsSoon(t, func() error {
+		tombstoneKey := keys.RaftTombstoneKey(rangeID)
+		ok, err := engine.MVCCGetProto(
+			context.TODO(), eng, tombstoneKey, hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
+		)
+		if err != nil {
+			t.Fatalf("failed to read tombstone: %v", err)
+		}
+		if !ok {
+			return fmt.Errorf("tombstone not found for range %d", rangeID)
+		}
+		return nil
+	})
+	return tombstone
 }

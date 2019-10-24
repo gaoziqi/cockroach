@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -159,7 +154,7 @@ func repeatRunWithBuffer(
 // repeatGitCloneE is the same function as c.GitCloneE but with an automatic
 // retry loop.
 func repeatGitCloneE(
-	ctx context.Context, c *cluster, src, dest, branch string, node nodeListOption,
+	ctx context.Context, l *logger, c *cluster, src, dest, branch string, node nodeListOption,
 ) error {
 	var lastError error
 	for attempt, r := 0, retry.StartWithCtx(ctx, canaryRetryOptions); r.Next(); {
@@ -170,8 +165,8 @@ func repeatGitCloneE(
 			return fmt.Errorf("test has failed")
 		}
 		attempt++
-		c.l.Printf("attempt %d - clone %s", attempt, src)
-		lastError = c.GitCloneE(ctx, src, dest, branch, node)
+		l.Printf("attempt %d - clone %s", attempt, src)
+		lastError = c.GitClone(ctx, l, src, dest, branch, node)
 		if lastError != nil {
 			c.l.Printf("error - retrying: %s", lastError)
 			continue

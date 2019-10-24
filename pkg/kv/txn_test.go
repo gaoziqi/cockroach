@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -29,8 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/tscache"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 // TestTxnDBBasics verifies that a simple transaction can be run and
@@ -159,14 +157,17 @@ func TestLostUpdate(t *testing.T) {
 			t.Fatal("should experience just one restart")
 		}
 
+		var newVal string
 		if gr.Exists() && bytes.Equal(gr.ValueBytes(), []byte("hi")) {
-			if err := txn.Put(ctx, key, "correct"); err != nil {
-				t.Fatal(err)
-			}
+			newVal = "correct"
 		} else {
-			if err := txn.Put(ctx, key, "oops!"); err != nil {
-				t.Fatal(err)
-			}
+			newVal = "oops!"
+		}
+		b := txn.NewBatch()
+		b.Header.DeferWriteTooOldError = true
+		b.Put(key, newVal)
+		if err := txn.Run(ctx, b); err != nil {
+			t.Fatal(err)
 		}
 		// Verify that the WriteTooOld boolean is set on the txn.
 		proto := txn.Serialize()
@@ -408,7 +409,7 @@ func TestTxnRepeatGetWithRangeSplit(t *testing.T) {
 		}
 		s.Manual.Increment(time.Second.Nanoseconds())
 		// Split range by keyB.
-		if err := s.DB.AdminSplit(context.TODO(), splitKey, splitKey, true /* manual */); err != nil {
+		if err := s.DB.AdminSplit(context.TODO(), splitKey, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
 			t.Fatal(err)
 		}
 		// Wait till split complete.
@@ -588,4 +589,53 @@ func TestTxnResolveIntentsFromMultipleEpochs(t *testing.T) {
 			}
 		}
 	}
+}
+
+// Test that txn.CommitTimestamp() reflects refreshes.
+func TestTxnCommitTimestampAdvancedByRefresh(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	// We're going to inject an uncertainty error, expect the refresh to succeed,
+	// and then check that the txn.CommitTimestamp() value reflects the refresh.
+	injected := false
+	var refreshTS hlc.Timestamp
+	errKey := roachpb.Key("inject_err")
+	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), &storage.StoreTestingKnobs{
+		TestingRequestFilter: func(ba roachpb.BatchRequest) *roachpb.Error {
+			if g, ok := ba.GetArg(roachpb.Get); ok && g.(*roachpb.GetRequest).Key.Equal(errKey) {
+				if injected {
+					return nil
+				}
+				injected = true
+				txn := ba.Txn.Clone()
+				refreshTS = txn.Timestamp.Add(0, 1)
+				pErr := roachpb.NewReadWithinUncertaintyIntervalError(
+					txn.OrigTimestamp,
+					refreshTS,
+					txn)
+				return roachpb.NewErrorWithTxn(pErr, txn)
+			}
+			return nil
+		},
+	})
+	defer s.Stop()
+
+	err := s.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		_, err := txn.Get(ctx, errKey)
+		if err != nil {
+			return err
+		}
+		if !injected {
+			return errors.Errorf("didn't inject err")
+		}
+		commitTS := txn.CommitTimestamp()
+		// We expect to have refreshed just after the timestamp injected by the error.
+		expTS := refreshTS.Add(0, 1)
+		if !commitTS.Equal(expTS) {
+			return errors.Errorf("expected refreshTS: %s, got: %s", refreshTS, commitTS)
+		}
+		return nil
+	})
+	require.NoError(t, err)
 }

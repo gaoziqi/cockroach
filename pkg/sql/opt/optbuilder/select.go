@@ -1,33 +1,30 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package optbuilder
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -74,30 +71,44 @@ func (b *Builder) buildDataSource(
 
 		// CTEs take precedence over other data sources.
 		if cte := inScope.resolveCTE(tn); cte != nil {
-			if cte.used {
-				panic(unimplementedWithIssueDetailf(21084, "", "unsupported multiple use of CTE clause %q", tn))
-			}
-			cte.used = true
-
 			outScope = inScope.push()
 
-			// TODO(justin): once we support mutations here, we will want to include a
-			// spool operation.
-			outScope.expr = cte.expr
-			outScope.cols = cte.cols
+			inCols := make(opt.ColList, len(cte.cols))
+			outCols := make(opt.ColList, len(cte.cols))
+			outScope.cols = nil
+			i := 0
+			for _, col := range cte.cols {
+				c := b.factory.Metadata().ColumnMeta(col.ID)
+				newCol := b.synthesizeColumn(outScope, col.Alias, c.Type, nil, nil)
+				newCol.table = *tn
+				inCols[i] = col.ID
+				outCols[i] = newCol.id
+				i++
+			}
+
+			outScope.expr = b.factory.ConstructWithScan(&memo.WithScanPrivate{
+				ID:           cte.id,
+				Name:         string(cte.name.Alias),
+				InCols:       inCols,
+				OutCols:      outCols,
+				BindingProps: cte.bindingProps,
+			})
 			return outScope
 		}
 
 		ds, resName := b.resolveDataSource(tn, privilege.SELECT)
 		switch t := ds.(type) {
 		case cat.Table:
-			return b.buildScan(t, &resName, nil /* ordinals */, indexFlags, excludeMutations, inScope)
-		case cat.View:
-			return b.buildView(t, inScope)
+			tabMeta := b.addTable(t, &resName)
+			return b.buildScan(tabMeta, nil /* ordinals */, indexFlags, excludeMutations, inScope)
+
 		case cat.Sequence:
-			return b.buildSequenceSelect(t, inScope)
+			return b.buildSequenceSelect(t, &resName, inScope)
+
+		case cat.View:
+			return b.buildView(t, &resName, inScope)
 		default:
-			panic(pgerror.AssertionFailedf("unknown DataSource type %T", ds))
+			panic(errors.AssertionFailedf("unknown DataSource type %T", ds))
 		}
 
 	case *tree.ParenTableExpr:
@@ -118,11 +129,18 @@ func (b *Builder) buildDataSource(
 		return outScope
 
 	case *tree.StatementSource:
-		outScope = b.buildStmt(source.Statement, nil /* desiredTypes */, inScope)
-		if len(outScope.cols) == 0 {
-			panic(pgerror.Newf(pgerror.CodeUndefinedColumnError,
+		// This is the special '[ ... ]' syntax. We treat this as syntactic sugar
+		// for a top-level CTE, so it cannot refer to anything in the input scope.
+		// See #41078.
+		emptyScope := &scope{builder: b}
+		innerScope := b.buildStmt(source.Statement, nil /* desiredTypes */, emptyScope)
+		if len(innerScope.cols) == 0 {
+			panic(pgerror.Newf(pgcode.UndefinedColumn,
 				"statement source \"%v\" does not return any columns", source.Statement))
 		}
+		outScope = inScope.push()
+		outScope.appendColumnsFromScope(innerScope)
+		outScope.expr = innerScope.expr
 		return outScope
 
 	case *tree.TableRef:
@@ -130,19 +148,33 @@ func (b *Builder) buildDataSource(
 		switch t := ds.(type) {
 		case cat.Table:
 			outScope = b.buildScanFromTableRef(t, source, indexFlags, inScope)
+		case cat.View:
+			if source.Columns != nil {
+				panic(pgerror.Newf(pgcode.FeatureNotSupported,
+					"cannot specify an explicit column list when accessing a view by reference"))
+			}
+			tn := tree.MakeUnqualifiedTableName(t.Name())
+
+			outScope = b.buildView(t, &tn, inScope)
+		case cat.Sequence:
+			tn := tree.MakeUnqualifiedTableName(t.Name())
+			// Any explicitly listed columns are ignored.
+			outScope = b.buildSequenceSelect(t, &tn, inScope)
 		default:
-			panic(unimplementedWithIssueDetailf(35708, fmt.Sprintf("%T", t), "view and sequence numeric refs are not supported"))
+			panic(errors.AssertionFailedf("unsupported catalog object"))
 		}
 		b.renameSource(source.As, outScope)
 		return outScope
 
 	default:
-		panic(pgerror.AssertionFailedf("unknown table expr: %T", texpr))
+		panic(errors.AssertionFailedf("unknown table expr: %T", texpr))
 	}
 }
 
 // buildView parses the view query text and builds it as a Select expression.
-func (b *Builder) buildView(view cat.View, inScope *scope) (outScope *scope) {
+func (b *Builder) buildView(
+	view cat.View, viewName *tree.TableName, inScope *scope,
+) (outScope *scope) {
 	// Cache the AST so that multiple references won't need to reparse.
 	if b.views == nil {
 		b.views = make(map[cat.View]*tree.Select)
@@ -153,14 +185,14 @@ func (b *Builder) buildView(view cat.View, inScope *scope) (outScope *scope) {
 	if !ok {
 		stmt, err := parser.ParseOne(view.Query())
 		if err != nil {
-			wrapped := pgerror.Wrapf(err, pgerror.CodeSyntaxError,
+			wrapped := pgerror.Wrapf(err, pgcode.Syntax,
 				"failed to parse underlying query from view %q", view.Name())
-			panic(builderError{wrapped})
+			panic(wrapped)
 		}
 
 		sel, ok = stmt.AST.(*tree.Select)
 		if !ok {
-			panic(pgerror.AssertionFailedf("expected SELECT statement"))
+			panic(errors.AssertionFailedf("expected SELECT statement"))
 		}
 
 		b.views[view] = sel
@@ -178,6 +210,13 @@ func (b *Builder) buildView(view cat.View, inScope *scope) (outScope *scope) {
 		b.skipSelectPrivilegeChecks = true
 		defer func() { b.skipSelectPrivilegeChecks = false }()
 	}
+	trackDeps := b.trackViewDeps
+	if trackDeps {
+		// We are only interested in the direct dependency on this view descriptor.
+		// Any further dependency by the view's query should not be tracked.
+		b.trackViewDeps = false
+		defer func() { b.trackViewDeps = true }()
+	}
 
 	outScope = b.buildSelect(sel, nil /* desiredTypes */, &scope{builder: b})
 
@@ -185,10 +224,18 @@ func (b *Builder) buildView(view cat.View, inScope *scope) (outScope *scope) {
 	// are specified, then update names of output columns.
 	hasCols := view.ColumnNameCount() > 0
 	for i := range outScope.cols {
-		outScope.cols[i].table = *view.Name()
+		outScope.cols[i].table = *viewName
 		if hasCols {
 			outScope.cols[i].name = view.ColumnName(i)
 		}
+	}
+
+	if trackDeps && !view.IsSystemView() {
+		dep := opt.ViewDep{DataSource: view}
+		for i := range outScope.cols {
+			dep.ColumnOrdinals.Add(i)
+		}
+		b.viewDeps = append(b.viewDeps, dep)
 	}
 
 	return outScope
@@ -227,7 +274,7 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 				if colIdx >= len(scope.cols) {
 					srcName := tree.ErrString(&tableAlias)
 					panic(pgerror.Newf(
-						pgerror.CodeInvalidColumnReferenceError,
+						pgcode.InvalidColumnReference,
 						"source %q has %d columns available but %d columns specified",
 						srcName, aliasIdx, len(colAlias),
 					))
@@ -259,7 +306,7 @@ func (b *Builder) buildScanFromTableRef(
 	tab cat.Table, ref *tree.TableRef, indexFlags *tree.IndexFlags, inScope *scope,
 ) (outScope *scope) {
 	if ref.Columns != nil && len(ref.Columns) == 0 {
-		panic(pgerror.Newf(pgerror.CodeSyntaxError,
+		panic(pgerror.Newf(pgcode.Syntax,
 			"an explicit list of column IDs must include at least one column"))
 	}
 
@@ -281,20 +328,29 @@ func (b *Builder) buildScanFromTableRef(
 				ord++
 			}
 			if ord >= cnt {
-				panic(pgerror.Newf(pgerror.CodeUndefinedColumnError,
+				panic(pgerror.Newf(pgcode.UndefinedColumn,
 					"column [%d] does not exist", c))
 			}
 			ordinals[i] = ord
 		}
 	}
 
-	return b.buildScan(tab, tab.Name(), ordinals, indexFlags, excludeMutations, inScope)
+	tn := tree.MakeUnqualifiedTableName(tab.Name())
+	tabMeta := b.addTable(tab, &tn)
+	return b.buildScan(tabMeta, ordinals, indexFlags, excludeMutations, inScope)
+}
+
+// addTable adds a table to the metadata and returns the TableMeta. The table
+// name is passed separately in order to preserve knowledge of whether the
+// catalog and schema names were explicitly specified.
+func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta {
+	md := b.factory.Metadata()
+	tabID := md.AddTable(tab, alias)
+	return md.TableMeta(tabID)
 }
 
 // buildScan builds a memo group for a ScanOp or VirtualScanOp expression on the
-// given table with the given table name. Note that the table name is passed
-// separately in order to preserve knowledge of whether the catalog and schema
-// names were explicitly specified.
+// given table.
 //
 // If the ordinals slice is not nil, then only columns with ordinals in that
 // list are projected by the scan. Otherwise, all columns from the table are
@@ -303,16 +359,15 @@ func (b *Builder) buildScanFromTableRef(
 // See Builder.buildStmt for a description of the remaining input and return
 // values.
 func (b *Builder) buildScan(
-	tab cat.Table,
-	alias *tree.TableName,
+	tabMeta *opt.TableMeta,
 	ordinals []int,
 	indexFlags *tree.IndexFlags,
 	scanMutationCols bool,
 	inScope *scope,
 ) (outScope *scope) {
-	md := b.factory.Metadata()
-	tabID := md.AddTableWithAlias(tab, alias)
-	tabMeta := md.TableMeta(tabID)
+	tab := tabMeta.Table
+	tabID := tabMeta.MetaID
+
 	if indexFlags != nil && indexFlags.IgnoreForeignKeys {
 		tabMeta.IgnoreForeignKeys = true
 	}
@@ -328,18 +383,21 @@ func (b *Builder) buildScan(
 		}
 	}
 
+	getOrdinal := func(i int) int {
+		if ordinals == nil {
+			return i
+		}
+		return ordinals[i]
+	}
+
 	var tabColIDs opt.ColSet
 	outScope = inScope.push()
 	outScope.cols = make([]scopeColumn, 0, colCount)
 	for i := 0; i < colCount; i++ {
-		ord := i
-		if ordinals != nil {
-			ord = ordinals[i]
-		}
-
+		ord := getOrdinal(i)
 		col := tab.Column(ord)
 		colID := tabID.ColumnID(ord)
-		tabColIDs.Add(int(colID))
+		tabColIDs.Add(colID)
 		name := col.ColName()
 		isMutation := cat.IsMutationColumn(tab, ord)
 		outScope.cols = append(outScope.cols, scopeColumn{
@@ -354,11 +412,13 @@ func (b *Builder) buildScan(
 
 	if tab.IsVirtualTable() {
 		if indexFlags != nil {
-			panic(pgerror.Newf(pgerror.CodeSyntaxError,
+			panic(pgerror.Newf(pgcode.Syntax,
 				"index flags not allowed with virtual tables"))
 		}
 		private := memo.VirtualScanPrivate{Table: tabID, Cols: tabColIDs}
 		outScope.expr = b.factory.ConstructVirtualScan(&private)
+
+		// Virtual tables should not be collected as view dependencies.
 	} else {
 		private := memo.ScanPrivate{Table: tabID, Cols: tabColIDs}
 
@@ -380,28 +440,91 @@ func (b *Builder) buildScan(
 					} else {
 						err = errors.Errorf("index [%d] not found", indexFlags.IndexID)
 					}
-					panic(builderError{err})
+					panic(err)
 				}
 				private.Flags.ForceIndex = true
 				private.Flags.Index = idx
 				private.Flags.Direction = indexFlags.Direction
 			}
 		}
-
 		outScope.expr = b.factory.ConstructScan(&private)
+
+		b.addCheckConstraintsForTable(outScope, tabMeta, ordinals != nil /* allowMissingColumns */)
+
+		if b.trackViewDeps {
+			dep := opt.ViewDep{DataSource: tab}
+			for i := 0; i < colCount; i++ {
+				dep.ColumnOrdinals.Add(getOrdinal(i))
+			}
+			if private.Flags.ForceIndex {
+				dep.SpecificIndex = true
+				dep.Index = private.Flags.Index
+			}
+			b.viewDeps = append(b.viewDeps, dep)
+		}
 	}
 	return outScope
 }
 
-func (b *Builder) buildSequenceSelect(seq cat.Sequence, inScope *scope) (outScope *scope) {
-	tn := seq.SequenceName()
+// addCheckConstraintsForTable finds all the check constraints that apply to the
+// table and adds them to the table metadata. To do this, the scalar expression
+// of the check constraints are built here.
+//
+// If allowMissingColumns is true, we ignore check constraints that involve
+// columns not in the current scope (useful when we build a scan that doesn't
+// contain all table columns).
+func (b *Builder) addCheckConstraintsForTable(
+	scope *scope, tabMeta *opt.TableMeta, allowMissingColumns bool,
+) {
+	tab := tabMeta.Table
+	// Find all the check constraints that apply to the table and add them
+	// to the table meta data. To do this, we must build them into scalar
+	// expressions.
+	for i, n := 0, tab.CheckCount(); i < n; i++ {
+		checkConstraint := tab.Check(i)
+
+		// Only add validated check constraints to the table's metadata.
+		if !checkConstraint.Validated {
+			continue
+		}
+		expr, err := parser.ParseExpr(checkConstraint.Constraint)
+		if err != nil {
+			panic(err)
+		}
+
+		var texpr tree.TypedExpr
+		func() {
+			if allowMissingColumns {
+				// Swallow any undefined column errors.
+				defer func() {
+					if r := recover(); r != nil {
+						if err, ok := r.(error); ok {
+							if code := pgerror.GetPGCode(err); code == pgcode.UndefinedColumn {
+								return
+							}
+						}
+						panic(r)
+					}
+				}()
+			}
+			texpr = scope.resolveAndRequireType(expr, types.Bool)
+		}()
+		if texpr != nil {
+			tabMeta.AddConstraint(b.buildScalar(texpr, scope, nil, nil, nil))
+		}
+	}
+}
+
+func (b *Builder) buildSequenceSelect(
+	seq cat.Sequence, seqName *tree.TableName, inScope *scope,
+) (outScope *scope) {
 	md := b.factory.Metadata()
 	outScope = inScope.push()
 
-	cols := opt.ColList{
-		md.AddColumn("last_value", types.Int),
-		md.AddColumn("log_cnt", types.Int),
-		md.AddColumn("is_called", types.Bool),
+	cols := make(opt.ColList, len(sqlbase.SequenceSelectColumns))
+
+	for i, c := range sqlbase.SequenceSelectColumns {
+		cols[i] = md.AddColumn(c.Name, c.Typ)
 	}
 
 	outScope.cols = make([]scopeColumn, 3)
@@ -410,7 +533,7 @@ func (b *Builder) buildSequenceSelect(seq cat.Sequence, inScope *scope) (outScop
 		outScope.cols[i] = scopeColumn{
 			id:    c,
 			name:  tree.Name(col.Alias),
-			table: *tn,
+			table: *seqName,
 			typ:   col.Type,
 		}
 	}
@@ -420,6 +543,10 @@ func (b *Builder) buildSequenceSelect(seq cat.Sequence, inScope *scope) (outScop
 		Cols:     cols,
 	}
 	outScope.expr = b.factory.ConstructSequenceSelect(&private)
+
+	if b.trackViewDeps {
+		b.viewDeps = append(b.viewDeps, opt.ViewDep{DataSource: seq})
+	}
 	return outScope
 }
 
@@ -444,67 +571,62 @@ func (b *Builder) buildWithOrdinality(colName string, inScope *scope) (outScope 
 	return inScope
 }
 
-func (b *Builder) buildCTE(ctes []*tree.CTE, inScope *scope) (outScope *scope) {
+func (b *Builder) buildCTEs(
+	with *tree.With, inScope *scope,
+) (outScope *scope, addedCTEs []cteSource) {
 	outScope = inScope.push()
 
+	addedCTEs = make([]cteSource, len(with.CTEList))
 	outScope.ctes = make(map[string]*cteSource)
-	for i := range ctes {
-		cteScope := b.buildStmt(ctes[i].Stmt, nil /* desiredTypes */, outScope)
-		cols := cteScope.cols
-		name := ctes[i].Name.Alias
+	for i, cte := range with.CTEList {
+		cteExpr, cteCols := b.buildCTE(cte, outScope, with.Recursive)
 
-		if _, ok := outScope.ctes[name.String()]; ok {
+		// TODO(justin): lift this restriction when possible. WITH should be hoistable.
+		if b.subquery != nil && !b.subquery.outerCols.Empty() {
+			panic(pgerror.Newf(pgcode.FeatureNotSupported, "CTEs may not be correlated"))
+		}
+
+		aliasStr := cte.Name.Alias.String()
+		if _, ok := outScope.ctes[aliasStr]; ok {
 			panic(pgerror.Newf(
-				pgerror.CodeDuplicateAliasError,
-				"WITH query name %s specified more than once", ctes[i].Name.Alias),
-			)
+				pgcode.DuplicateAlias, "WITH query name %s specified more than once", aliasStr,
+			))
 		}
 
-		// Names for the output columns can optionally be specified.
-		if ctes[i].Name.Cols != nil {
-			if len(cteScope.cols) != len(ctes[i].Name.Cols) {
-				panic(pgerror.Newf(
-					pgerror.CodeInvalidColumnReferenceError,
-					"source %q has %d columns available but %d columns specified",
-					name, len(cteScope.cols), len(ctes[i].Name.Cols),
-				))
-			}
+		id := b.factory.Memo().NextWithID()
 
-			cols = make([]scopeColumn, len(cteScope.cols))
-			tableName := tree.MakeUnqualifiedTableName(ctes[i].Name.Alias)
-			copy(cols, cteScope.cols)
-			for j := range cols {
-				cols[j].name = ctes[i].Name.Cols[j]
-				cols[j].table = tableName
-			}
+		addedCTEs[i] = cteSource{
+			name:         cte.Name,
+			cols:         cteCols,
+			originalExpr: cte.Stmt,
+			expr:         cteExpr,
+			bindingProps: cteExpr.Relational(),
+			id:           id,
 		}
-
-		if len(cols) == 0 {
-			panic(pgerror.Newf(pgerror.CodeFeatureNotSupportedError,
-				"WITH clause %q does not have a RETURNING clause", tree.ErrString(&name)))
-		}
-
-		outScope.ctes[ctes[i].Name.Alias.String()] = &cteSource{
-			name: ctes[i].Name,
-			cols: cols,
-			expr: cteScope.expr,
-		}
+		outScope.ctes[aliasStr] = &addedCTEs[i]
 	}
 
 	telemetry.Inc(sqltelemetry.CteUseCounter)
 
-	return outScope
+	return outScope, addedCTEs
 }
 
-// checkCTEUsage ensures that a CTE that contains a mutation (like INSERT) is
-// used at least once by the query. Otherwise, it might not be executed.
-func (b *Builder) checkCTEUsage(inScope *scope) {
-	for alias, source := range inScope.ctes {
-		if !source.used && source.expr.Relational().CanMutate {
-			panic(pgerror.UnimplementedWithIssuef(24307,
-				"common table expression %q with side effects was not used in query", alias))
-		}
+// wrapWithCTEs adds With expressions on top of an expression.
+func (b *Builder) wrapWithCTEs(expr memo.RelExpr, ctes []cteSource) memo.RelExpr {
+	// Since later CTEs can refer to earlier ones, we want to add these in
+	// reverse order.
+	for i := len(ctes) - 1; i >= 0; i-- {
+		expr = b.factory.ConstructWith(
+			ctes[i].expr,
+			expr,
+			&memo.WithPrivate{
+				ID:           ctes[i].id,
+				Name:         string(ctes[i].name.Alias),
+				OriginalExpr: ctes[i].originalExpr,
+			},
+		)
 	}
+	return expr
 }
 
 // buildSelectStmt builds a set of memo groups that represent the given select
@@ -524,13 +646,13 @@ func (b *Builder) buildSelectStmt(
 		return b.buildSelectClause(stmt, nil /* orderBy */, desiredTypes, inScope)
 
 	case *tree.UnionClause:
-		return b.buildUnion(stmt, desiredTypes, inScope)
+		return b.buildUnionClause(stmt, desiredTypes, inScope)
 
 	case *tree.ValuesClause:
 		return b.buildValuesClause(stmt, desiredTypes, inScope)
 
 	default:
-		panic(pgerror.AssertionFailedf("unknown select statement type: %T", stmt))
+		panic(errors.AssertionFailedf("unknown select statement type: %T", stmt))
 	}
 }
 
@@ -546,6 +668,20 @@ func (b *Builder) buildSelect(
 	orderBy := stmt.OrderBy
 	limit := stmt.Limit
 	with := stmt.With
+	forLocked := stmt.ForLocked.Strength
+
+	switch forLocked {
+	case tree.ForNone:
+	case tree.ForUpdate:
+	case tree.ForNoKeyUpdate:
+	case tree.ForShare:
+	case tree.ForKeyShare:
+		// CockroachDB treats all of the FOR LOCKED modes as no-ops. Since all
+		// transactions are serializable in CockroachDB, clients can't observe
+		// whether or not FOR UPDATE (or any of the other weaker modes) actually
+		// created a lock. This behavior may improve as the transaction model gains
+		// more capabilities.
+	}
 
 	for s, ok := wrapped.(*tree.ParenSelect); ok; s, ok = wrapped.(*tree.ParenSelect) {
 		stmt = s.Select
@@ -554,7 +690,7 @@ func (b *Builder) buildSelect(
 				// (WITH ... (WITH ...))
 				// Currently we are unable to nest the scopes inside ParenSelect so we
 				// must refuse the syntax so that the query does not get invalid results.
-				panic(pgerror.UnimplementedWithIssue(24303, "multiple WITH clauses in parentheses"))
+				panic(unimplemented.NewWithIssue(24303, "multiple WITH clauses in parentheses"))
 			}
 			with = s.Select.With
 		}
@@ -562,7 +698,7 @@ func (b *Builder) buildSelect(
 		if stmt.OrderBy != nil {
 			if orderBy != nil {
 				panic(pgerror.Newf(
-					pgerror.CodeSyntaxError, "multiple ORDER BY clauses not allowed",
+					pgcode.Syntax, "multiple ORDER BY clauses not allowed",
 				))
 			}
 			orderBy = stmt.OrderBy
@@ -570,16 +706,16 @@ func (b *Builder) buildSelect(
 		if stmt.Limit != nil {
 			if limit != nil {
 				panic(pgerror.Newf(
-					pgerror.CodeSyntaxError, "multiple LIMIT clauses not allowed",
+					pgcode.Syntax, "multiple LIMIT clauses not allowed",
 				))
 			}
 			limit = stmt.Limit
 		}
 	}
 
+	var ctes []cteSource
 	if with != nil {
-		inScope = b.buildCTE(with.CTEList, inScope)
-		defer b.checkCTEUsage(inScope)
+		inScope, ctes = b.buildCTEs(with, inScope)
 	}
 
 	// NB: The case statements are sorted lexicographically.
@@ -588,13 +724,13 @@ func (b *Builder) buildSelect(
 		outScope = b.buildSelectClause(t, orderBy, desiredTypes, inScope)
 
 	case *tree.UnionClause:
-		outScope = b.buildUnion(t, desiredTypes, inScope)
+		outScope = b.buildUnionClause(t, desiredTypes, inScope)
 
 	case *tree.ValuesClause:
 		outScope = b.buildValuesClause(t, desiredTypes, inScope)
 
 	default:
-		panic(pgerror.Newf(pgerror.CodeFeatureNotSupportedError,
+		panic(pgerror.Newf(pgcode.FeatureNotSupported,
 			"unknown select statement: %T", stmt.Select))
 	}
 
@@ -616,6 +752,8 @@ func (b *Builder) buildSelect(
 		b.buildLimit(limit, inScope, outScope)
 	}
 
+	outScope.expr = b.wrapWithCTEs(outScope.expr, ctes)
+
 	// TODO(rytaft): Support FILTER expression.
 	return outScope
 }
@@ -631,10 +769,8 @@ func (b *Builder) buildSelect(
 func (b *Builder) buildSelectClause(
 	sel *tree.SelectClause, orderBy tree.OrderBy, desiredTypes []*types.T, inScope *scope,
 ) (outScope *scope) {
-	if len(sel.Window) > 0 {
-		panic(unimplementedWithIssueDetailf(34251, "", "unsupported window function"))
-	}
 	fromScope := b.buildFrom(sel.From, inScope)
+	b.processWindowDefs(sel, fromScope)
 	b.buildWhere(sel.Where, fromScope)
 
 	projectionsScope := fromScope.replace()
@@ -651,14 +787,13 @@ func (b *Builder) buildSelectClause(
 	orderByScope := b.analyzeOrderBy(orderBy, fromScope, projectionsScope)
 	distinctOnScope := b.analyzeDistinctOnArgs(sel.DistinctOn, fromScope, projectionsScope)
 
-	var groupingCols []scopeColumn
 	var having opt.ScalarExpr
 	needsAgg := b.needsAggregation(sel, fromScope)
 	if needsAgg {
 		// Grouping columns must be built before building the projection list so
 		// we can check that any column references that appear in the SELECT list
 		// outside of aggregate functions are present in the grouping list.
-		groupingCols = b.buildGroupingColumns(sel, fromScope)
+		b.buildGroupingColumns(sel, fromScope)
 		having = b.buildHaving(havingExpr, fromScope)
 	}
 
@@ -671,7 +806,7 @@ func (b *Builder) buildSelectClause(
 		// We must wait to build the aggregation until after the above block since
 		// any SRFs found in the SELECT list will change the FROM scope (they
 		// create an implicit lateral join).
-		outScope = b.buildAggregation(groupingCols, having, fromScope)
+		outScope = b.buildAggregation(having, fromScope)
 	} else {
 		outScope = fromScope
 	}
@@ -696,7 +831,7 @@ func (b *Builder) buildSelectClause(
 //
 // See Builder.buildStmt for a description of the remaining input and return
 // values.
-func (b *Builder) buildFrom(from *tree.From, inScope *scope) (outScope *scope) {
+func (b *Builder) buildFrom(from tree.From, inScope *scope) (outScope *scope) {
 	// The root AS OF clause is recognized and handled by the executor. The only
 	// thing that must be done at this point is to ensure that if any timestamps
 	// are specified, the root SELECT was an AS OF SYSTEM TIME and that the time
@@ -718,6 +853,27 @@ func (b *Builder) buildFrom(from *tree.From, inScope *scope) (outScope *scope) {
 	return outScope
 }
 
+// processWindowDefs validates that any window defs have unique names and adds
+// them to the given scope.
+func (b *Builder) processWindowDefs(sel *tree.SelectClause, fromScope *scope) {
+	// Just do an O(n^2) loop since the number of window defs is likely small.
+	for i := range sel.Window {
+		for j := i + 1; j < len(sel.Window); j++ {
+			if sel.Window[i].Name == sel.Window[j].Name {
+				panic(pgerror.Newf(
+					pgcode.Windowing,
+					"window %q is already defined",
+					sel.Window[i].Name,
+				))
+			}
+		}
+	}
+
+	// Pass down the set of window definitions so that they can be referenced
+	// elsewhere in the SELECT.
+	fromScope.windowDefs = sel.Window
+}
+
 // buildWhere builds a set of memo groups that represent the given WHERE clause.
 //
 // See Builder.buildStmt for a description of the remaining input and return
@@ -727,17 +883,7 @@ func (b *Builder) buildWhere(where *tree.Where, inScope *scope) {
 		return
 	}
 
-	// We need to save and restore the previous value of the field in
-	// semaCtx in case we are recursively called within a subquery
-	// context.
-	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-	b.semaCtx.Properties.Require("WHERE", tree.RejectSpecial)
-	inScope.context = "WHERE"
-
-	// All "from" columns are visible to the filter expression.
-	texpr := inScope.resolveAndRequireType(where.Expr, types.Bool)
-
-	filter := b.buildScalar(texpr, inScope, nil, nil, nil)
+	filter := b.resolveAndBuildScalar(where.Expr, types.Bool, "WHERE", tree.RejectSpecial, inScope)
 
 	// Wrap the filter in a FiltersOp.
 	inScope.expr = b.factory.ConstructSelect(
@@ -857,11 +1003,11 @@ func (b *Builder) buildFromWithLateral(tables tree.TableExprs, inScope *scope) (
 func (b *Builder) validateAsOf(asOf tree.AsOfClause) {
 	ts, err := tree.EvalAsOfTimestamp(asOf, b.semaCtx, b.evalCtx)
 	if err != nil {
-		panic(builderError{err})
+		panic(err)
 	}
 
 	if b.semaCtx.AsOfTimestamp == nil {
-		panic(pgerror.Newf(pgerror.CodeSyntaxError,
+		panic(pgerror.Newf(pgcode.Syntax,
 			"AS OF SYSTEM TIME must be provided on a top-level statement"))
 	}
 

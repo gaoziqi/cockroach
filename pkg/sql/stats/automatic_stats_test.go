@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stats
 
@@ -22,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -57,7 +54,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	descA := sqlbase.GetTableDescriptor(s.DB(), "t", "a")
-	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
+	cache := NewTableStatisticsCache(10 /* cacheSize */, s.GossipI().(*gossip.Gossip), kvDB, executor)
 	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// There should not be any stats yet.
@@ -127,7 +124,7 @@ func TestAverageRefreshTime(t *testing.T) {
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	tableID := sqlbase.GetTableDescriptor(s.DB(), "t", "a").ID
-	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
+	cache := NewTableStatisticsCache(10 /* cacheSize */, s.GossipI().(*gossip.Gossip), kvDB, executor)
 	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	checkAverageRefreshTime := func(expected time.Duration) error {
@@ -343,7 +340,7 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 		CREATE TABLE t.a (k INT PRIMARY KEY);`)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
-	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
+	cache := NewTableStatisticsCache(10 /* cacheSize */, s.GossipI().(*gossip.Gossip), kvDB, executor)
 	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	AutomaticStatisticsClusterMode.Override(&st.SV, true)
@@ -374,7 +371,7 @@ func TestNoRetryOnFailure(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
-	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
+	cache := NewTableStatisticsCache(10 /* cacheSize */, s.GossipI().(*gossip.Gossip), kvDB, executor)
 	r := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// Try to refresh stats on a table that doesn't exist.
@@ -431,6 +428,17 @@ func TestDefaultColumns(t *testing.T) {
 	}
 
 	sqlRun.Exec(t, `CREATE STATISTICS s FROM t.a`)
+
+	// TODO(rytaft): this extra logging was added to help debug issue #38572.
+	// Remove it once that issue is resolved.
+	// === BEGINNING OF EXTRA LOGGING ===
+	res := sqlRun.QueryStr(t, `SHOW CREATE TABLE t.a`)
+	t.Log(sqlutils.MatrixToStr(res))
+	res = sqlRun.QueryStr(t, `EXPLAIN (DISTSQL) CREATE STATISTICS s FROM t.a`)
+	t.Log(sqlutils.MatrixToStr(res))
+	res = sqlRun.QueryStr(t, `SHOW STATISTICS FOR TABLE t.a`)
+	t.Log(sqlutils.MatrixToStr(res))
+	// === END OF EXTRA LOGGING ===
 
 	// There should be 101 stats. One for the primary index, plus 100 other
 	// columns.

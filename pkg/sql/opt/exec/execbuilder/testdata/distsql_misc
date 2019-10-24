@@ -1,4 +1,4 @@
-# LogicTest: 5node-dist-opt
+# LogicTest: 5node-dist
 
 subtest scrub
 
@@ -6,10 +6,10 @@ subtest scrub
 # the optimizer).
 #
 # # Verify the index check execution plan uses a merge join.
-# 
+#
 # statement ok
 # CREATE TABLE test (k INT PRIMARY KEY, v INT, data INT, INDEX secondary (v) STORING (data))
-# 
+#
 # query T
 # SELECT url FROM [EXPLAIN (DISTSQL)
 #     SELECT leftside.v, leftside.k, leftside.data, rightside.v, rightside.k, rightside.data
@@ -23,16 +23,16 @@ subtest scrub
 # ]
 # ----
 # https://cockroachdb.github.io/distsqlplan/decode.html#eJyckc2K2zAQgO99CjGnLBlIJDs9CAq6dCFLGpdscio-uNY0a3AkM5Khy5J3L45hNw5x2vQ4I33zzc8bOG9pXRwogP4BEnKEhn1JIXjuUv2Hpf0Neo5QuaaNXTpHKD0T6DeIVawJNGyLnzVtqLDEszkgWIpFVZ_KNlwdCn41kUIEhKyNWhiFRqJJID8i-DZ-FA6x2BNoecR_lz97jsQzOfQaOUWjpmiS6ahG3aM5n1ENXYFK7-zdUyb_MWUyPiXCoYjli6jJaaFGremo9UPWOs-WmOzAlnfk375caf0b8Z6efOWIZ-mw_-1rQ1o87lYrke22XzfiKVuuAaGmX3FyNtzDF672L8MUIDxWdSTWYmKUWD6L9W61ehDZRkzM4j1-P4fE7iIJmhTNAs3n0Q0t7rnLhkLjXaDLTV2tPO_WQ3ZP_bqDb7mk7-zLk6YPsxN3SlgKsX-VfbB0_VPX4Dksb8LpAJaXsLoJJ7fNyR1mdQmnN-HFhTk_fvoTAAD__3P7gDg=
-# 
+#
 # # Verify the foreign key check execution plan uses a merge join.
-# 
+#
 # statement ok
 # CREATE TABLE parent (
 #   id INT PRIMARY KEY,
 #   id2 INT,
 #   UNIQUE INDEX (id, id2)
 # )
-# 
+#
 # statement ok
 # CREATE TABLE child (
 #   child_id INT PRIMARY KEY,
@@ -40,7 +40,7 @@ subtest scrub
 #   id2 INT,
 #   FOREIGN KEY (id, id2) REFERENCES parent (id, id2)
 # )
-# 
+#
 # query T
 # SELECT url FROM [EXPLAIN (DISTSQL)
 #     SELECT p.child_id, p.id, p.id2
@@ -70,8 +70,8 @@ ALTER TABLE data EXPERIMENTAL_RELOCATE
   SELECT ARRAY[i%5+1], i FROM generate_series(0, 9) AS g(i)
 
 # Verify data placement.
-query TTTI colnames
-SELECT start_key, end_key, replicas, lease_holder FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE data]
+query TTTI colnames,rowsort
+SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM TABLE data]
 ----
 start_key  end_key  replicas  lease_holder
 NULL       /1       {1}       1
@@ -88,7 +88,7 @@ NULL       /1       {1}       1
 query T
 SELECT url FROM [EXPLAIN (DISTSQL) CREATE STATISTICS s1 ON a FROM data]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html#eJy0lMGOmzAQhu99CjRnI2NDslmftse9dKtNbxUHF48oEsHINlLbFe9eAUJboo2x5PSInT_fr2-seYNOK_wiL2hBfAcGBDgQyIFAAQQOUBLoja7QWm2mnyyBZ_ULREag6frBTcclgUobBPEGrnEtgoBv8keLrygVGpoBAYVONu2M6U1zkeb3k5JOAoFzLzsrkpSyRHYqYYl2P9EAgZfBieSJQTkS0IN7Z1knawTBRhLe5ywvfYuGHrZdluNz8wdFMtU8O-mH8pvQd9bQaaPQoNqwyvFmrc91bbCWThvKssiC-aYgC58SC5kSZSnlUXPaabTO6XjXOfFwDTxIA09pHqVhp9Gq4eGuGvJwDXmQhjylRZSGnUarhtNdNRThGoogDUVKD1EadhqtGh7_2_L6APqKttedxasl9vE_Z9NyQ1XjsgmtHkyFX42uZszy-TLn5gOF1i23bPl47parqeC_YeYN802YXYe5n7yDzr3pwh8uYnofvOGjn3yMIT94wyc_-RRDfvTPKtt5Jv5Hds0ux09_AwAA___WSOum
+https://cockroachdb.github.io/distsqlplan/decode.html#eJy0lEGL2kAUx-_9FMM77cJIMkl03ZxWrIWA1a3JobDkMOs8rDRm0pkJtBW_e4lBtso6GYh7zIx_f39-b3h70L8KiCGdzWfTjNSqIF9Wy6_kZfb9eT5JFuTuc5Jm6bf5PZmuZpNsRtJskiVplkxTohlZLghvE4IbngOFUgpc8B1qiF-AAYUAKIRAIQIKQ8gpVEquUWupmp_sj4FE_IbYp7Atq9o0xzmFtVQI8R7M1hQIMWT8tcAVcoHK84GCQMO3xRFTqe2Oqz9PTQegkFa81DEZeIzwUhBGpPmBCigsaxOTJwb5gYKszRtLG75BiNmBuvdJ-a4qUHnD8y7tcbr9izFhvu83VVPD7eDgKviNV5dSCVQoznj54Wq1yWajcMONVB7z3UuSu8D3yWu9_olG31-tHJ5VZu6zYy6z89jAC3pNr6PRaXqjm08vcFcROKkIBl7YS0VHo5OKh5urCN1VhE4qwoEX9VLR0eikYnxzFZG7ishJRTTwhr1UdDQ6qXj80PX2DniFupKlxos19_4_-836Q7HBdldqWas1Piu5PmLaz-UxdzwQqE17y9qPpGyvmoL_h5k1HJyF2WU4sJM70KE1HdnDUZ_eQ2t4ZCeP-pAfrOGxnTzuQ360z8rveCb2R3bJzg-f_gUAAP__KeEKoQ==
 
 statement ok
 INSERT INTO data SELECT a, b, c::FLOAT, 1
@@ -97,4 +97,4 @@ FROM generate_series(1,10) AS a, generate_series(1,10) AS b, generate_series(1,1
 query T
 SELECT url FROM [EXPLAIN ANALYZE (DISTSQL) CREATE STATISTICS s1 ON a FROM data]
 ----
-https://cockroachdb.github.io/distsqlplan/decode.html#eJzElDFv2zAQhff-CuJmKhIpObY5pd2CAk0Rdys0MOZBFSCLAkmhTQP_94JShdRGTNGojYyiePfefY-4F2i1wi9yhxbEd2BAgQOFHCgUQGEBJYXO6C1aq42_Mhbcq18gMgp12_XOH5cUttogiBdwtWsQBHyTTw0-olRo0gwoKHSybgaZztQ7aZ7vlHQSKGw62VpBkpQR2SrCiHY_0ACFh94JcudNGf3TEoNSCcIy38062TTE1TsUJLNA4enZ4XQlv1mTz_UnKPcUdO9ePVonKwTB9jR-jo3cdQ2adHE4w3i8qX97A34IJ0ezp0T5SdFXrb7VRqFBdaBV7k_a-lhVBivptElZ9p8G8wODLD5dFpNuypKUx-TL5_Nd3qzOyHdmkinf24vmy-Px8Sh8PEnzd8E3M8mEb3lRfHk8vjwKX56kxbvgm5lkwre6KL4iHl8Rha9I0kUMvnweH-Nn0JsZZKK3vtpufkP0EW2nW4tHO_rtzpnf3agqHBe91b3Z4lejt4PM-Pkw1A0HCq0b_7Lx474df3mD_xazYDE_KGbHxTysPCOdB6uLcHFxju-B4gD07wuy2DofaXncdhFsexv2dHsdT8tg21XY0-o6ntbh5LOZRxd-svGuyv2HPwEAAP__DypgEw==
+https://cockroachdb.github.io/distsqlplan/decode.html#eJzElUFvm04Qxe__TzGaUyKtAws4cTjF_9SVrLp2aji0jThszMhFxSzdXdSmkb97BdRKHcWwlhLlyMKb9-Y3o-UB9Y8cQ4wms8l1DJXK4f1y8RFuJ59vZuPpHMbz8ezL1wmcvJtGcfRpdgrXy8k4nkAUj-NpFE-vI9AcFnMQrTIVRiTIsJApzcWGNIa3yJGhhwx9ZBggwyEmDEslV6S1VPUnD41gmv7C0GWYFWVl6uOE4UoqwvABTWZywhBjcZfTkkRKynGRYUpGZHljU6psI9T9VZ0BGUalKHQIA4eDKFLgIM03UshwUZkQrupQSv7UoEikIXC3rqaNyHMw2YZCcDUyvLs3tPvEP7uED9n_mGwZyso8ZtRGrAlDvmX2fURiU-aknOF-D-1xlP2mJlITKjKiDXzI2Dto_OhXFVKlpCjd80u2B6ON12tFa2GkcrhrHxJOPNeFu2r1nYw-PRjZ34vM7WfObWbu8IHj2Uzd65_6xdnoiKn3dLKb-vmLT92zR-hZIfQGjv8mCHs62SG8eHGEvj1C3wqhP3CCN0HY08kO4ejFEQb2CAMrhMHAGdog9PsRcu8Igj2N7Ahevurt_YzxknQpC01PbvHnK7v17U7pmtpfgZaVWtGNkqvGpn1cNLrmICVt2re8fZgW7as64L9i3in29sT8qdjrdu6x9jvVQbc4OCZ3Q7EB-neLNBUmBBeaFdovPOwsfN6d6vy1Ul10Fh51pxq9VqrL7vm7PavXvbjH5Eq2__0JAAD__2JIgrs=

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -46,7 +43,7 @@ func (p *planner) DropUser(ctx context.Context, n *tree.DropUser) (planNode, err
 func (p *planner) DropUserNode(
 	ctx context.Context, namesE tree.Exprs, ifExists bool, isRole bool, opName string,
 ) (*DropUserNode, error) {
-	tDesc, err := ResolveExistingObject(ctx, p, userTableName, true /*required*/, ResolveRequireTableDesc)
+	tDesc, err := ResolveExistingObject(ctx, p, userTableName, tree.ObjectLookupFlagsWithRequired(), ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +153,7 @@ func (n *DropUserNode) startExec(params runParams) error {
 			}
 			fnl.FormatName(name)
 		}
-		return pgerror.Newf(pgerror.CodeGroupingError,
+		return pgerror.Newf(pgcode.Grouping,
 			"cannot drop user%s or role%s %s: grants still exist on %s",
 			util.Pluralize(int64(len(names))), util.Pluralize(int64(len(names))),
 			fnl.String(), f.String(),
@@ -170,11 +167,11 @@ func (n *DropUserNode) startExec(params runParams) error {
 		// "privileges still exist" first.
 		if normalizedUsername == sqlbase.AdminRole || normalizedUsername == sqlbase.PublicRole {
 			return pgerror.Newf(
-				pgerror.CodeInvalidParameterValueError, "cannot drop special role %s", normalizedUsername)
+				pgcode.InvalidParameterValue, "cannot drop special role %s", normalizedUsername)
 		}
 		if normalizedUsername == security.RootUser {
 			return pgerror.Newf(
-				pgerror.CodeInvalidParameterValueError, "cannot drop special user %s", normalizedUsername)
+				pgcode.InvalidParameterValue, "cannot drop special user %s", normalizedUsername)
 		}
 
 		rowsAffected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(

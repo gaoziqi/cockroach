@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package xform
 
@@ -22,10 +18,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // MatchedRuleFunc defines the callback function for the NotifyOnMatchedRule
@@ -188,16 +185,18 @@ func (o *Optimizer) Optimize() (_ opt.Expr, err error) {
 			// error checks everywhere throughout the code. This is only possible
 			// because the code does not update shared state and does not manipulate
 			// locks.
-			if pgErr, ok := r.(*pgerror.Error); ok {
-				err = pgErr
+			if ok, e := errorutil.ShouldCatch(r); ok {
+				err = e
 			} else {
+				// Other panic objects can't be considered "safe" and thus are
+				// propagated as crashes that terminate the session.
 				panic(r)
 			}
 		}
 	}()
 
 	if o.mem.IsOptimized() {
-		return nil, pgerror.AssertionFailedf("cannot optimize a memo multiple times")
+		return nil, errors.AssertionFailedf("cannot optimize a memo multiple times")
 	}
 
 	// Optimize the root expression according to the properties required of it.
@@ -216,9 +215,9 @@ func (o *Optimizer) Optimize() (_ opt.Expr, err error) {
 
 	// Validate there are no dangling references.
 	if !root.Relational().OuterCols.Empty() {
-		return nil, pgerror.AssertionFailedf(
+		return nil, errors.AssertionFailedf(
 			"top-level relational expression cannot have outer columns: %s",
-			log.Safe(root.Relational().OuterCols),
+			errors.Safe(root.Relational().OuterCols),
 		)
 	}
 
@@ -247,7 +246,7 @@ func (o *Optimizer) optimizeExpr(
 		return o.optimizeScalarExpr(t)
 
 	default:
-		panic(pgerror.AssertionFailedf("unhandled child: %+v", e))
+		panic(errors.AssertionFailedf("unhandled child: %+v", e))
 	}
 }
 
@@ -562,24 +561,77 @@ func (o *Optimizer) enforceProps(
 	// least likely to be expensive to enforce to most likely.
 	var enforcer memo.RelExpr
 	if !inner.Ordering.Any() {
+		// Try Sort enforcer that requires no ordering from its input.
 		inner.Ordering = physical.OrderingChoice{}
+		interned := o.mem.InternPhysicalProps(&inner)
 		enforcer = &memo.SortExpr{Input: member}
-	} else {
-		// No remaining properties, so no more enforcers.
-		if inner.Defined() {
-			panic(pgerror.AssertionFailedf("unhandled physical property: %v", inner))
+		fullyOptimized = o.optimizeEnforcer(state, enforcer, required, member, interned)
+
+		// Try Sort enforcer that requires a partial ordering from its input.
+		longestCommonPrefix := deriveInterestingOrderingPrefix(member, required.Ordering)
+		if len(longestCommonPrefix) > 0 && len(longestCommonPrefix) < len(required.Ordering.Columns) {
+			inner.Ordering.FromOrdering(longestCommonPrefix)
+			interned = o.mem.InternPhysicalProps(&inner)
+			enforcer := &memo.SortExpr{Input: state.best, InputOrdering: inner.Ordering}
+			if o.optimizeEnforcer(state, enforcer, required, member, interned) {
+				fullyOptimized = true
+			}
 		}
-		return true
+
+		return fullyOptimized
 	}
 
-	// Recursively optimize the same group, but now with respect to the "inner"
-	// properties (which are a subset of the required properties).
-	innerState := o.optimizeGroup(member, o.mem.InternPhysicalProps(&inner))
+	// No remaining properties, so no more enforcers.
+	if inner.Defined() {
+		panic(errors.AssertionFailedf("unhandled physical property: %v", inner))
+	}
+	return true
+}
+
+// deriveInterestingOrderingPrefix finds the longest prefix of the required ordering
+// that is "interesting" as defined in Relational.Rule.InterestingOrderings.
+func deriveInterestingOrderingPrefix(
+	member memo.RelExpr, requiredOrdering physical.OrderingChoice,
+) opt.Ordering {
+	// Find the interesting orderings of the member expression.
+	interestingOrderings := DeriveInterestingOrderings(member)
+
+	// Find the longest interesting ordering that is a prefix of the required ordering.
+	var longestCommonPrefix opt.Ordering
+	for _, ordering := range interestingOrderings {
+		var commonPrefix opt.Ordering
+		for i, orderingCol := range ordering {
+			if i < len(requiredOrdering.Columns) &&
+				requiredOrdering.Columns[i].Group.Contains(orderingCol.ID()) &&
+				requiredOrdering.Columns[i].Descending == orderingCol.Descending() {
+				commonPrefix = append(commonPrefix, orderingCol)
+			} else {
+				break
+			}
+		}
+		if len(commonPrefix) > len(longestCommonPrefix) {
+			longestCommonPrefix = commonPrefix
+		}
+	}
+	return longestCommonPrefix
+}
+
+// optimizeEnforcer optimizes and costs the enforcer.
+func (o *Optimizer) optimizeEnforcer(
+	state *groupState,
+	enforcer memo.RelExpr,
+	enforcerProps *physical.Required,
+	member memo.RelExpr,
+	memberProps *physical.Required,
+) (fullyOptimized bool) {
+	// Recursively optimize the member group with respect to a subset of the
+	// enforcer properties.
+	innerState := o.optimizeGroup(member, memberProps)
 	fullyOptimized = innerState.fullyOptimized
 
 	// Check whether this is the new lowest cost expression with the enforcer
 	// added.
-	cost := innerState.cost + o.coster.ComputeCost(enforcer, required)
+	cost := innerState.cost + o.coster.ComputeCost(enforcer, enforcerProps)
 	o.ratchetCost(state, enforcer, cost)
 
 	// Enforcer expression is fully optimized if its input expression is fully
@@ -710,7 +762,7 @@ func (o *Optimizer) ensureOptState(grp memo.RelExpr, required *physical.Required
 func (o *Optimizer) optimizeRootWithProps() {
 	root, ok := o.mem.RootExpr().(memo.RelExpr)
 	if !ok {
-		panic(pgerror.AssertionFailedf("Optimize can only be called on relational root expressions"))
+		panic(errors.AssertionFailedf("Optimize can only be called on relational root expressions"))
 	}
 	rootProps := o.mem.RootProps()
 
@@ -735,7 +787,7 @@ func (o *Optimizer) optimizeRootWithProps() {
 	// or presentation properties.
 	neededCols := rootProps.ColSet()
 	if !neededCols.SubsetOf(root.Relational().OutputCols) {
-		panic(pgerror.AssertionFailedf(
+		panic(errors.AssertionFailedf(
 			"columns required of root %s must be subset of output columns %s",
 			neededCols,
 			root.Relational().OutputCols,
@@ -821,10 +873,10 @@ func (os *groupState) isMemberFullyOptimized(ord int) bool {
 // made.
 func (os *groupState) markMemberAsFullyOptimized(ord int) {
 	if os.fullyOptimized {
-		panic(pgerror.AssertionFailedf("best expression is already fully optimized"))
+		panic(errors.AssertionFailedf("best expression is already fully optimized"))
 	}
 	if os.isMemberFullyOptimized(ord) {
-		panic(pgerror.AssertionFailedf("memo expression is already fully optimized for required physical properties"))
+		panic(errors.AssertionFailedf("memo expression is already fully optimized for required physical properties"))
 	}
 	os.fullyOptimizedExprs.Add(ord)
 }

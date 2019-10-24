@@ -1,29 +1,24 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/cockroachdb/errors"
+	"github.com/opentracing/opentracing-go"
 )
 
 // explainDistSQLNode is a planNode that wraps a plan and returns
@@ -40,10 +35,6 @@ type explainDistSQLNode struct {
 	// pointing to a visual query plan with statistics will be in the row
 	// returned by the node.
 	analyze bool
-
-	// optimizeSubqueries indicates whether to invoke optimizeSubquery and
-	// setUnlimited on the subqueries.
-	optimizeSubqueries bool
 
 	run explainDistSQLRun
 }
@@ -72,27 +63,10 @@ type distSQLExplainable interface {
 }
 
 func (n *explainDistSQLNode) startExec(params runParams) error {
-	if n.analyze && params.SessionData().DistSQLMode == sessiondata.DistSQLOff {
-		return pgerror.Newf(
-			pgerror.CodeObjectNotInPrerequisiteStateError,
-			"cannot run EXPLAIN ANALYZE while distsql is disabled",
-		)
-	}
-
-	// Trigger limit propagation.
-	params.p.prepareForDistSQLSupportCheck()
-
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
-
-	var recommendation distRecommendation
-	if _, ok := n.plan.(distSQLExplainable); ok {
-		recommendation = shouldDistribute
-	} else {
-		recommendation, _ = distSQLPlanner.checkSupportForNode(n.plan)
-	}
-
+	shouldPlanDistribute, recommendation := willDistributePlan(distSQLPlanner, n.plan, params)
 	planCtx := distSQLPlanner.NewPlanningCtx(params.ctx, params.extendedEvalCtx, params.p.txn)
-	planCtx.isLocal = !shouldDistributeGivenRecAndMode(recommendation, params.SessionData().DistSQLMode)
+	planCtx.isLocal = !shouldPlanDistribute
 	planCtx.ignoreClose = true
 	planCtx.planner = params.p
 	planCtx.stmtType = n.stmtType
@@ -108,23 +82,6 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 			planCtx.planner.curPlan.subqueryPlans = outerSubqueries
 		}()
 		planCtx.planner.curPlan.subqueryPlans = n.subqueryPlans
-
-		if n.optimizeSubqueries {
-			// The sub-plan's subqueries have been captured local to the
-			// explainDistSQLNode node so that they would not be automatically
-			// started for execution by planTop.start(). But this also means
-			// they were not yet processed by makePlan()/optimizePlan(). Do it
-			// here.
-			for i := range n.subqueryPlans {
-				if err := params.p.optimizeSubquery(params.ctx, &n.subqueryPlans[i]); err != nil {
-					return err
-				}
-
-				// Trigger limit propagation. This would be done otherwise when
-				// starting the plan. However we do not want to start the plan.
-				params.p.setUnlimited(n.subqueryPlans[i].plan)
-			}
-		}
 
 		// Discard rows that are returned.
 		rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
@@ -158,21 +115,18 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 		}
 	}
 
-	var plan PhysicalPlan
-	var err error
-	if planNode, ok := n.plan.(distSQLExplainable); ok {
-		plan, err = planNode.makePlanForExplainDistSQL(planCtx, distSQLPlanner)
-	} else {
-		plan, err = distSQLPlanner.createPlanForNode(planCtx, n.plan)
-	}
+	plan, err := makePhysicalPlan(planCtx, distSQLPlanner, n.plan)
 	if err != nil {
+		if len(n.subqueryPlans) > 0 {
+			return errors.New("running EXPLAIN (DISTSQL) on this query is " +
+				"unsupported because of the presence of subqueries")
+		}
 		return err
 	}
 
 	distSQLPlanner.FinalizePlan(planCtx, &plan)
-
 	flows := plan.GenerateFlowSpecs(params.extendedEvalCtx.NodeID)
-	diagram, err := distsqlpb.GeneratePlanDiagram(flows)
+	diagram, err := execinfrapb.GeneratePlanDiagram(params.p.stmt.String(), flows)
 	if err != nil {
 		return err
 	}
@@ -226,7 +180,8 @@ func (n *explainDistSQLNode) startExec(params runParams) error {
 		)
 		defer recv.Release()
 		distSQLPlanner.Run(
-			planCtx, newParams.p.txn, &plan, recv, newParams.extendedEvalCtx, nil /* finishedSetupFn */)
+			planCtx, newParams.p.txn, &plan, recv, newParams.extendedEvalCtx, nil, /* finishedSetupFn */
+		)()
 
 		n.run.executedStatement = true
 
@@ -271,4 +226,38 @@ func (n *explainDistSQLNode) Close(ctx context.Context) {
 			n.subqueryPlans[i].plan = nil
 		}
 	}
+}
+
+// willDistributePlan checks if the given plan will run with distributed
+// execution. It takes into account whether a distSQL plan can be made at all
+// and the session setting for distSQL.
+func willDistributePlan(
+	distSQLPlanner *DistSQLPlanner, plan planNode, params runParams,
+) (bool, distRecommendation) {
+	// Trigger limit propagation.
+	params.p.prepareForDistSQLSupportCheck()
+	var recommendation distRecommendation
+	if _, ok := plan.(distSQLExplainable); ok {
+		recommendation = shouldDistribute
+	} else {
+		recommendation, _ = distSQLPlanner.checkSupportForNode(plan)
+	}
+	shouldDistribute := shouldDistributeGivenRecAndMode(recommendation, params.SessionData().DistSQLMode)
+	return shouldDistribute, recommendation
+}
+
+func makePhysicalPlan(
+	planCtx *PlanningCtx, distSQLPlanner *DistSQLPlanner, plan planNode,
+) (PhysicalPlan, error) {
+	var physPlan PhysicalPlan
+	var err error
+	if planNode, ok := plan.(distSQLExplainable); ok {
+		physPlan, err = planNode.makePlanForExplainDistSQL(planCtx, distSQLPlanner)
+	} else {
+		physPlan, err = distSQLPlanner.createPlanForNode(planCtx, plan)
+	}
+	if err != nil {
+		return PhysicalPlan{}, err
+	}
+	return physPlan, nil
 }

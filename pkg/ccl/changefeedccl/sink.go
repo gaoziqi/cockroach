@@ -27,17 +27,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/logtags"
 	"github.com/pkg/errors"
 )
 
@@ -70,6 +72,8 @@ func getSink(
 	opts map[string]string,
 	targets jobspb.ChangefeedTargets,
 	settings *cluster.Settings,
+	timestampOracle timestampLowerBoundOracle,
+	makeExternalStorageFromURI cloud.ExternalStorageFromURIFactory,
 ) (Sink, error) {
 	u, err := url.Parse(sinkURI)
 	if err != nil {
@@ -109,6 +113,18 @@ func getSink(
 			}
 		}
 		q.Del(sinkParamCACert)
+		if clientCertHex := q.Get(sinkParamClientCert); clientCertHex != `` {
+			if cfg.clientCert, err = base64.StdEncoding.DecodeString(clientCertHex); err != nil {
+				return nil, errors.Errorf(`param %s must be base 64 encoded: %s`, sinkParamClientCert, err)
+			}
+		}
+		q.Del(sinkParamClientCert)
+		if clientKeyHex := q.Get(sinkParamClientKey); clientKeyHex != `` {
+			if cfg.clientKey, err = base64.StdEncoding.DecodeString(clientKeyHex); err != nil {
+				return nil, errors.Errorf(`param %s must be base 64 encoded: %s`, sinkParamClientKey, err)
+			}
+		}
+		q.Del(sinkParamClientKey)
 
 		saslParam := q.Get(sinkParamSASLEnabled)
 		q.Del(sinkParamSASLEnabled)
@@ -162,16 +178,19 @@ func getSink(
 		var fileSize int64 = 16 << 20 // 16MB
 		if fileSizeParam != `` {
 			if fileSize, err = humanizeutil.ParseBytes(fileSizeParam); err != nil {
-				return nil, pgerror.Wrapf(err, pgerror.CodeSyntaxError, `parsing %s`, fileSizeParam)
+				return nil, pgerror.Wrapf(err, pgcode.Syntax, `parsing %s`, fileSizeParam)
 			}
 		}
 		u.Scheme = strings.TrimPrefix(u.Scheme, `experimental-`)
 		// Transfer "ownership" of validating all remaining query parameters to
-		// ExportStorage.
+		// ExternalStorage.
 		u.RawQuery = q.Encode()
 		q = url.Values{}
 		makeSink = func() (Sink, error) {
-			return makeCloudStorageSink(u.String(), nodeID, fileSize, settings, opts)
+			return makeCloudStorageSink(
+				u.String(), nodeID, fileSize, settings,
+				opts, timestampOracle, makeExternalStorageFromURI,
+			)
 		}
 	case u.Scheme == sinkSchemeExperimentalSQL:
 		// Swap the changefeed prefix for the sql connection one that sqlSink
@@ -271,6 +290,8 @@ type kafkaSinkConfig struct {
 	kafkaTopicPrefix string
 	tlsEnabled       bool
 	caCert           []byte
+	clientCert       []byte
+	clientKey        []byte
 	saslEnabled      bool
 	saslHandshake    bool
 	saslUser         string
@@ -328,6 +349,25 @@ func makeKafkaSink(
 		config.Net.TLS.Enable = true
 	}
 
+	if cfg.clientCert != nil {
+		if !cfg.tlsEnabled {
+			return nil, errors.Errorf(`%s requires %s=true`, sinkParamClientCert, sinkParamTLSEnabled)
+		}
+		if cfg.clientKey == nil {
+			return nil, errors.Errorf(`%s requires %s to be set`, sinkParamClientCert, sinkParamClientKey)
+		}
+		cert, err := tls.X509KeyPair(cfg.clientCert, cfg.clientKey)
+		if err != nil {
+			return nil, errors.Errorf(`invalid client certificate data provided: %s`, err)
+		}
+		if config.Net.TLS.Config == nil {
+			config.Net.TLS.Config = &tls.Config{}
+		}
+		config.Net.TLS.Config.Certificates = []tls.Certificate{cert}
+	} else if cfg.clientKey != nil {
+		return nil, errors.Errorf(`%s requires %s to be set`, sinkParamClientKey, sinkParamClientCert)
+	}
+
 	if cfg.saslEnabled {
 		config.Net.SASL.Enable = true
 		config.Net.SASL.Handshake = cfg.saslHandshake
@@ -373,13 +413,13 @@ func makeKafkaSink(
 	var err error
 	sink.client, err = sarama.NewClient(strings.Split(bootstrapServers, `,`), config)
 	if err != nil {
-		err = pgerror.Wrapf(err, pgerror.CodeCannotConnectNowError,
+		err = pgerror.Wrapf(err, pgcode.CannotConnectNow,
 			`connecting to kafka: %s`, bootstrapServers)
 		return nil, err
 	}
 	sink.producer, err = sarama.NewAsyncProducerFromClient(sink.client)
 	if err != nil {
-		err = pgerror.Wrapf(err, pgerror.CodeCannotConnectNowError,
+		err = pgerror.Wrapf(err, pgcode.CannotConnectNow,
 			`connecting to kafka: %s`, bootstrapServers)
 		return nil, err
 	}

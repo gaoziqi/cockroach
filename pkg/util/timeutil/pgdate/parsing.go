@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgdate
 
@@ -18,8 +14,10 @@ import (
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 // Various keywords that appear in timestamps.
@@ -145,29 +143,27 @@ func ParseTimestamp(now time.Time, mode ParseMode, s string) (time.Time, error) 
 	return fe.MakeTimestamp(), nil
 }
 
-// badFieldPrefixError constructs a CodeInvalidDatetimeFormatError pgerror.
+// badFieldPrefixError constructs an error with pg code InvalidDatetimeFormat.
 func badFieldPrefixError(field field, prefix rune) error {
-	return inputErrorf("unexpected separator '%s' for field %s", string(prefix), field.Pretty())
+	return inputErrorf("unexpected separator '%s' for field %s", string(prefix), errors.Safe(field.Pretty()))
 }
 
-// inputErrorf returns a CodeInvalidDatetimeFormatError pgerror.
+// inputErrorf returns an error with pg code InvalidDatetimeFormat.
 func inputErrorf(format string, args ...interface{}) error {
-	return pgerror.Newf(pgerror.CodeInvalidDatetimeFormatError, format, args...)
+	return pgerror.WithCandidateCode(errors.Newf(format, args...), pgcode.InvalidDatetimeFormat)
 }
 
-// outOfRangeError returns a CodeDatetimeFieldOverflowError pgerror.
+// outOfRangeError returns an error with pg code DatetimeFieldOverflow.
 func outOfRangeError(field string, val int) error {
-	return pgerror.Newf(pgerror.CodeDatetimeFieldOverflowError,
-		"field %s value %d is out of range", field, val)
+	return pgerror.WithCandidateCode(
+		errors.Newf("field %s value %d is out of range", errors.Safe(field), errors.Safe(val)),
+		pgcode.DatetimeFieldOverflow)
 }
 
 // parseError ensures that any error we return to the client will
-// be some kind of pgerror.
+// be some kind of error with a pg code.
 func parseError(err error, kind string, s string) error {
-	if err, ok := err.(*pgerror.Error); ok {
-		err.Message += " as type " + kind
-		return err
-	}
-	return pgerror.Newf(pgerror.CodeInvalidDatetimeFormatError,
-		`could not parse "%s" as type %s`, s, kind)
+	return pgerror.WithCandidateCode(
+		errors.Wrapf(err, "parsing as type %s", errors.Safe(kind)),
+		pgcode.InvalidDatetimeFormat)
 }

@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -95,10 +91,6 @@ const (
 	// permitted in responses.
 	omittedKeyStr = "omitted (due to the 'server.remote_debugging.mode' setting)"
 
-	// heapDir is the directory name where the heap profiler stores profiles
-	// when there is a potential OOM situation.
-	heapDir = "heap_profiler"
-
 	// goroutineDir is the directory name where the goroutinedumper stores
 	// goroutine dumps.
 	goroutinesDir = "goroutine_dump"
@@ -112,6 +104,12 @@ var (
 	// endpoint to be usable.
 	remoteDebuggingErr = grpcstatus.Error(
 		codes.PermissionDenied, "not allowed (due to the 'server.remote_debugging.mode' setting)")
+
+	// Counter to count accesses to the prometheus vars endpoint /_status/vars .
+	telemetryPrometheusVars = telemetry.GetCounterOnce("monitoring.prometheus.vars")
+
+	// Counter to count accesses to the health check endpoint /health .
+	telemetryHealthCheck = telemetry.GetCounterOnce("monitoring.health.details")
 )
 
 type metricMarshaler interface {
@@ -216,7 +214,8 @@ func (s *statusServer) dialNode(
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.rpcCtx.GRPCDialNode(addr.String(), nodeID).Connect(ctx)
+	conn, err := s.rpcCtx.GRPCDialNode(addr.String(), nodeID,
+		rpc.DefaultClass).Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -615,6 +614,7 @@ func (s *statusServer) Details(
 	if err != nil {
 		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
 	}
+	telemetry.Inc(telemetryHealthCheck)
 	if !local {
 		status, err := s.dialNode(ctx, nodeID)
 		if err != nil {
@@ -623,13 +623,17 @@ func (s *statusServer) Details(
 		return status.Details(ctx, req)
 	}
 
+	remoteNodeID := s.gossip.NodeID.Get()
 	resp := &serverpb.DetailsResponse{
-		NodeID:     s.gossip.NodeID.Get(),
+		NodeID:     remoteNodeID,
 		BuildInfo:  build.GetInfo(),
 		SystemInfo: s.si.systemInfo(ctx),
 	}
-	if addr, err := s.gossip.GetNodeIDAddress(s.gossip.NodeID.Get()); err == nil {
+	if addr, err := s.gossip.GetNodeIDAddress(remoteNodeID); err == nil {
 		resp.Address = *addr
+	}
+	if addr, err := s.gossip.GetNodeIDSQLAddress(remoteNodeID); err == nil {
+		resp.SQLAddress = *addr
 	}
 
 	// If Ready is not set, the client doesn't want to know whether this node is
@@ -681,7 +685,7 @@ func (s *statusServer) GetFiles(
 	//TODO(ridwanmsharif): Serve logfiles so debug-zip can fetch them
 	// intead of reading indididual entries.
 	case serverpb.FileType_HEAP: // Requesting for saved Heap Profiles.
-		dir = filepath.Join(s.admin.server.cfg.HeapProfileDirName, heapDir)
+		dir = filepath.Join(s.admin.server.cfg.HeapProfileDirName, base.HeapProfileDir)
 	case serverpb.FileType_GOROUTINES: // Requesting for saved Goroutine dumps.
 		dir = filepath.Join(s.admin.server.cfg.GoroutineDumpDirName, goroutinesDir)
 	default:
@@ -1133,7 +1137,7 @@ func (s *statusServer) RaftDebug(
 			desc := node.Range.State.Desc
 			// Check for whether replica should be GCed.
 			containsNode := false
-			for _, replica := range desc.Replicas().Unwrap() {
+			for _, replica := range desc.Replicas().All() {
 				if replica.NodeID == node.NodeID {
 					containsNode = true
 				}
@@ -1167,6 +1171,7 @@ func (s *statusServer) handleVars(w http.ResponseWriter, r *http.Request) {
 		log.Error(r.Context(), err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+	telemetry.Inc(telemetryPrometheusVars)
 }
 
 // Ranges returns range info for the specified node.
@@ -1213,7 +1218,7 @@ func (s *statusServer) Ranges(
 			state.Progress[id] = serverpb.RaftState_Progress{
 				Match:           progress.Match,
 				Next:            progress.Next,
-				Paused:          progress.Paused,
+				Paused:          progress.IsPaused(),
 				PendingSnapshot: progress.PendingSnapshot,
 				State:           progress.State.String(),
 			}
@@ -1438,8 +1443,14 @@ func (s *statusServer) Range(
 		status := client.(serverpb.StatusClient)
 		return status.Ranges(ctx, rangesRequest)
 	}
+	nowNanos := timeutil.Now().UnixNano()
 	responseFn := func(nodeID roachpb.NodeID, resp interface{}) {
 		rangesResp := resp.(*serverpb.RangesResponse)
+		// Age the MVCCStats to a consistent current timestamp. An age that is
+		// not up to date is less useful.
+		for i := range rangesResp.Ranges {
+			rangesResp.Ranges[i].State.Stats.AgeTo(nowNanos)
+		}
 		response.ResponsesByNodeID[nodeID] = serverpb.RangeResponse_NodeResponse{
 			Response: true,
 			Infos:    rangesResp.Ranges,
@@ -1473,8 +1484,8 @@ func (s *statusServer) ListLocalSessions(
 		return nil, err
 	}
 
-	superuser := s.isSuperUser(ctx, sessionUser)
-	if !superuser {
+	ok := s.hasAdminRole(ctx, sessionUser)
+	if !ok {
 		// For non-superusers, requests with an empty username is
 		// implicitly a request for the client's own sessions.
 		if req.Username == "" {
@@ -1858,10 +1869,10 @@ func userFromContext(ctx context.Context) (string, error) {
 }
 
 type superUserChecker interface {
-	RequireSuperUser(ctx context.Context, action string) error
+	RequireAdminRole(ctx context.Context, action string) error
 }
 
-func (s *statusServer) isSuperUser(ctx context.Context, username string) bool {
+func (s *statusServer) hasAdminRole(ctx context.Context, username string) bool {
 	if username == security.RootUser {
 		return true
 	}
@@ -1872,7 +1883,7 @@ func (s *statusServer) isSuperUser(ctx context.Context, username string) bool {
 		&sql.MemoryMetrics{},
 		s.admin.server.execCfg)
 	defer cleanup()
-	if err := planner.(superUserChecker).RequireSuperUser(ctx, "access status server endpoint"); err != nil {
+	if err := planner.(superUserChecker).RequireAdminRole(ctx, "access status server endpoint"); err != nil {
 		return false
 	}
 	return true

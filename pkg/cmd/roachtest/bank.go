@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -37,8 +32,9 @@ import (
 )
 
 const (
-	bankMaxTransfer = 999
-	bankNumAccounts = 999
+	bankStartingAmount = 999
+	bankMaxTransfer    = 999
+	bankNumAccounts    = 999
 )
 
 type bankClient struct {
@@ -61,7 +57,7 @@ func (client *bankClient) transferMoney(ctx context.Context, numAccounts, maxTra
 	// statement timeout, which unfortunately precludes the use of prepared
 	// statements.
 	q := fmt.Sprintf(`
-SET statement_timeout = '31s';
+SET statement_timeout = '30s';
 UPDATE bank.accounts
    SET balance = CASE id WHEN %[1]d THEN balance-%[3]d WHEN %[2]d THEN balance+%[3]d END
  WHERE id IN (%[1]d, %[2]d) AND (SELECT balance >= %[3]d FROM bank.accounts WHERE id = %[1]d);
@@ -143,7 +139,7 @@ CREATE TABLE bank.accounts (
 		if i > 0 {
 			placeholders.WriteString(", ")
 		}
-		fmt.Fprintf(&placeholders, "($%d, 0)", i+1)
+		fmt.Fprintf(&placeholders, "($%d, %d)", i+1, bankStartingAmount)
 		values = append(values, i)
 	}
 	stmt := `INSERT INTO bank.accounts (id, balance) VALUES ` + placeholders.String()
@@ -182,13 +178,13 @@ func (s *bankState) verifyAccounts(ctx context.Context, t *test) {
 	client := &s.clients[0]
 
 	var sum int
-	var accounts uint64
+	var numAccounts uint64
 	err := retry.ForDuration(30*time.Second, func() error {
 		// Hold the read lock on the client to prevent it being restarted by
 		// chaos monkey.
 		client.RLock()
 		defer client.RUnlock()
-		err := client.db.QueryRowContext(ctx, "SELECT count(*), sum(balance) FROM bank.accounts").Scan(&accounts, &sum)
+		err := client.db.QueryRowContext(ctx, "SELECT count(*), sum(balance) FROM bank.accounts").Scan(&numAccounts, &sum)
 		if err != nil && !pgerror.IsSQLRetryableError(err) {
 			t.Fatal(err)
 		}
@@ -197,24 +193,18 @@ func (s *bankState) verifyAccounts(ctx context.Context, t *test) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sum != 0 {
-		t.Fatalf("the bank is not in good order, total value: %d", sum)
+	if expected := bankStartingAmount * bankNumAccounts; sum != expected {
+		t.Fatalf("the bank is not in good order, total value: %d, expected: %d", sum, expected)
 	}
 
-	if accounts < bankNumAccounts {
-		t.Fatalf("the bank is not in good order, total value: %d", sum)
+	if numAccounts != bankNumAccounts {
+		t.Fatalf("the bank is not in good order, total num accounts: %d, expected: %d", numAccounts, bankNumAccounts)
 	}
 }
 
-// startChaosMonkey picks a set of nodes and restarts them. If stopClients is set
-// all the clients are locked before the nodes are restarted.
+// startChaosMonkey picks a set of nodes and restarts them.
 func (s *bankState) startChaosMonkey(
-	ctx context.Context,
-	t *test,
-	c *cluster,
-	stopClients bool,
-	pickNodes func() []int,
-	consistentIdx int,
+	ctx context.Context, t *test, c *cluster, pickNodes func() []int, consistentIdx int,
 ) {
 	s.waitGroup.Add(1)
 	go func() {
@@ -222,7 +212,7 @@ func (s *bankState) startChaosMonkey(
 
 		// Don't begin the chaos monkey until all nodes are serving SQL connections.
 		// This ensures that we don't test cluster initialization under chaos.
-		for i := 1; i <= c.nodes; i++ {
+		for i := 1; i <= c.spec.NodeCount; i++ {
 			db := c.Conn(ctx, i)
 			var res int
 			err := db.QueryRowContext(ctx, `SELECT 1`).Scan(&res)
@@ -241,29 +231,13 @@ func (s *bankState) startChaosMonkey(
 			// Pick nodes to be restarted.
 			nodes := pickNodes()
 
-			if stopClients {
-				// Prevent all clients from writing while nodes are being restarted.
-				for i := 0; i < len(s.clients); i++ {
-					s.clients[i].Lock()
-				}
-			}
 			t.l.Printf("round %d: restarting nodes %v\n", curRound, nodes)
 			for _, i := range nodes {
 				if s.done(ctx) {
 					break
 				}
 				t.l.Printf("round %d: restarting %d\n", curRound, i)
-				c.Stop(ctx, c.Node(i))
-				c.Start(ctx, t, c.Node(i))
-				if stopClients {
-					// Reinitialize the client talking to the restarted node.
-					s.initClient(ctx, c, i)
-				}
-			}
-			if stopClients {
-				for i := 0; i < len(s.clients); i++ {
-					s.clients[i].Unlock()
-				}
+				c.Restart(ctx, t, c.Node(i))
 			}
 
 			preCount := s.counts()
@@ -301,9 +275,9 @@ func (s *bankState) startSplitMonkey(ctx context.Context, d time.Duration, c *cl
 		defer s.waitGroup.Done()
 
 		r := newRand()
-		nodes := make([]string, c.nodes)
+		nodes := make([]string, c.spec.NodeCount)
 
-		for i := 0; i < c.nodes; i++ {
+		for i := 0; i < c.spec.NodeCount; i++ {
 			nodes[i] = strconv.Itoa(i + 1)
 		}
 
@@ -362,7 +336,15 @@ func isExpectedRelocateError(err error) bool {
 	// for more failure modes not caught here. We decided to avoid adding
 	// to this catchall and to fix the root causes instead.
 	// We've also seen "breaker open" errors here.
-	return testutils.IsError(err, "(descriptor changed|unable to remove replica .* which is not present|unable to add replica .* which is already present|received invalid ChangeReplicasTrigger .* to remove self)")
+	whitelist := []string{
+		"descriptor changed",
+		"unable to remove replica .* which is not present",
+		"unable to add replica .* which is already present",
+		"received invalid ChangeReplicasTrigger .* to remove self",
+		"failed to apply snapshot: raft group deleted",
+	}
+	pattern := "(" + strings.Join(whitelist, "|") + ")"
+	return testutils.IsError(err, pattern)
 }
 
 func accountDistribution(r *rand.Rand) *rand.Zipf {
@@ -418,7 +400,7 @@ func (s *bankState) waitClientsStop(
 					curRound, strings.Join(strCounts, ", "))
 			} else {
 				newOutput = fmt.Sprintf("test finished, waiting for shutdown of %d clients",
-					c.nodes-doneClients)
+					c.spec.NodeCount-doneClients)
 			}
 			// This just stops the logs from being a bit too spammy.
 			if newOutput != prevOutput {
@@ -436,14 +418,14 @@ func runBankClusterRecovery(ctx context.Context, t *test, c *cluster) {
 	// TODO(peter): Run for longer when !local.
 	start := timeutil.Now()
 	s := &bankState{
-		errChan:  make(chan error, c.nodes),
+		errChan:  make(chan error, c.spec.NodeCount),
 		deadline: start.Add(time.Minute),
-		clients:  make([]bankClient, c.nodes),
+		clients:  make([]bankClient, c.spec.NodeCount),
 	}
 	s.initBank(ctx, t, c)
 	defer s.waitGroup.Wait()
 
-	for i := 0; i < c.nodes; i++ {
+	for i := 0; i < c.spec.NodeCount; i++ {
 		s.clients[i].Lock()
 		s.initClient(ctx, c, i+1)
 		s.clients[i].Unlock()
@@ -454,15 +436,15 @@ func runBankClusterRecovery(ctx context.Context, t *test, c *cluster) {
 	rnd, seed := randutil.NewPseudoRand()
 	t.l.Printf("monkey starts (seed %d)\n", seed)
 	pickNodes := func() []int {
-		nodes := rnd.Perm(c.nodes)[:rnd.Intn(c.nodes)+1]
+		nodes := rnd.Perm(c.spec.NodeCount)[:rnd.Intn(c.spec.NodeCount)+1]
 		for i := range nodes {
 			nodes[i]++
 		}
 		return nodes
 	}
-	s.startChaosMonkey(ctx, t, c, true, pickNodes, -1)
+	s.startChaosMonkey(ctx, t, c, pickNodes, -1)
 
-	s.waitClientsStop(ctx, t, c, 30*time.Second)
+	s.waitClientsStop(ctx, t, c, 45*time.Second)
 
 	// Verify accounts.
 	s.verifyAccounts(ctx, t)
@@ -490,7 +472,7 @@ func runBankNodeRestart(ctx context.Context, t *test, c *cluster) {
 	s.initBank(ctx, t, c)
 	defer s.waitGroup.Wait()
 
-	clientIdx := c.nodes
+	clientIdx := c.spec.NodeCount
 	client := &s.clients[0]
 	client.db = c.Conn(ctx, clientIdx)
 
@@ -502,9 +484,9 @@ func runBankNodeRestart(ctx context.Context, t *test, c *cluster) {
 	pickNodes := func() []int {
 		return []int{1 + rnd.Intn(clientIdx)}
 	}
-	s.startChaosMonkey(ctx, t, c, false, pickNodes, clientIdx)
+	s.startChaosMonkey(ctx, t, c, pickNodes, clientIdx)
 
-	s.waitClientsStop(ctx, t, c, 30*time.Second)
+	s.waitClientsStop(ctx, t, c, 45*time.Second)
 
 	// Verify accounts.
 	s.verifyAccounts(ctx, t)
@@ -520,14 +502,14 @@ func runBankNodeZeroSum(ctx context.Context, t *test, c *cluster) {
 
 	start := timeutil.Now()
 	s := &bankState{
-		errChan:  make(chan error, c.nodes),
+		errChan:  make(chan error, c.spec.NodeCount),
 		deadline: start.Add(time.Minute),
-		clients:  make([]bankClient, c.nodes),
+		clients:  make([]bankClient, c.spec.NodeCount),
 	}
 	s.initBank(ctx, t, c)
 	defer s.waitGroup.Wait()
 
-	for i := 0; i < c.nodes; i++ {
+	for i := 0; i < c.spec.NodeCount; i++ {
 		s.clients[i].Lock()
 		s.initClient(ctx, c, i+1)
 		s.clients[i].Unlock()
@@ -535,7 +517,7 @@ func runBankNodeZeroSum(ctx context.Context, t *test, c *cluster) {
 	}
 
 	s.startSplitMonkey(ctx, 2*time.Second, c)
-	s.waitClientsStop(ctx, t, c, 30*time.Second)
+	s.waitClientsStop(ctx, t, c, 45*time.Second)
 
 	s.verifyAccounts(ctx, t)
 
@@ -556,14 +538,14 @@ func runBankZeroSumRestart(ctx context.Context, t *test, c *cluster) {
 
 	start := timeutil.Now()
 	s := &bankState{
-		errChan:  make(chan error, c.nodes),
+		errChan:  make(chan error, c.spec.NodeCount),
 		deadline: start.Add(time.Minute),
-		clients:  make([]bankClient, c.nodes),
+		clients:  make([]bankClient, c.spec.NodeCount),
 	}
 	s.initBank(ctx, t, c)
 	defer s.waitGroup.Wait()
 
-	for i := 0; i < c.nodes; i++ {
+	for i := 0; i < c.spec.NodeCount; i++ {
 		s.clients[i].Lock()
 		s.initClient(ctx, c, i+1)
 		s.clients[i].Unlock()
@@ -573,7 +555,7 @@ func runBankZeroSumRestart(ctx context.Context, t *test, c *cluster) {
 	rnd, seed := randutil.NewPseudoRand()
 	c.l.Printf("monkey starts (seed %d)\n", seed)
 	pickNodes := func() []int {
-		nodes := rnd.Perm(c.nodes)[:rnd.Intn(c.nodes)+1]
+		nodes := rnd.Perm(c.spec.NodeCount)[:rnd.Intn(c.spec.NodeCount)+1]
 		for i := range nodes {
 			nodes[i]++
 		}
@@ -581,9 +563,9 @@ func runBankZeroSumRestart(ctx context.Context, t *test, c *cluster) {
 	}
 
 	// Starting up the goroutines that restart and do splits and lease moves.
-	s.startChaosMonkey(ctx, t, c, false, pickNodes, -1)
+	s.startChaosMonkey(ctx, t, c, pickNodes, -1)
 	s.startSplitMonkey(ctx, 2*time.Second, c)
-	s.waitClientsStop(ctx, t, c, 30*time.Second)
+	s.waitClientsStop(ctx, t, c, 45*time.Second)
 
 	// Verify accounts.
 	s.verifyAccounts(ctx, t)

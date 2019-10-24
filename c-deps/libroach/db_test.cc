@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 #include "db.h"
 #include "file_registry.h"
@@ -85,6 +81,7 @@ TEST(Libroach, DBOpen) {
                  "Invalid argument: encryption was used on this store before, but no encryption "
                  "flags specified. You need a CCL build and must fully specify the "
                  "--enterprise-encryption flag");
+    free(ret.data);
     ASSERT_OK(rocksdb::Env::Default()->DeleteFile(dir.Path(kFileRegistryFilename)));
   }
   {
@@ -102,6 +99,7 @@ TEST(Libroach, DBOpen) {
     auto ret = DBOpen(&db, ToDBSlice(dir.Path("")), db_opts);
     EXPECT_STREQ(std::string(ret.data, ret.len).c_str(),
                  "Invalid argument: encryption options are not supported in OSS builds");
+    free(ret.data);
     ASSERT_OK(rocksdb::Env::Default()->DeleteFile(dir.Path(kFileRegistryFilename)));
   }
 }

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -31,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	_ "github.com/lib/pq"
 )
@@ -57,7 +54,7 @@ func TestLogSplits(t *testing.T) {
 	initialSplits := countSplits()
 
 	// Generate an explicit split event.
-	if err := kvDB.AdminSplit(ctx, "splitkey", "splitkey", true /* manual */); err != nil {
+	if err := kvDB.AdminSplit(ctx, "splitkey", "splitkey", hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,7 +94,7 @@ func TestLogSplits(t *testing.T) {
 		}
 		var info storagepb.RangeLogEvent_Info
 		if err := json.Unmarshal([]byte(infoStr.String), &info); err != nil {
-			t.Errorf("error unmarshalling info string for split of range %d: %s", rangeID, err)
+			t.Errorf("error unmarshalling info string for split of range %d: %+v", rangeID, err)
 			continue
 		}
 		if int64(info.UpdatedDesc.RangeID) != rangeID {
@@ -178,10 +175,10 @@ func TestLogMerges(t *testing.T) {
 	}
 
 	// Create two ranges, then merge them.
-	if err := kvDB.AdminSplit(ctx, "a", "a", true /* manual */); err != nil {
+	if err := kvDB.AdminSplit(ctx, "a", "a", hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
-	if err := kvDB.AdminSplit(ctx, "b", "b", true /* manual */); err != nil {
+	if err := kvDB.AdminSplit(ctx, "b", "b", hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
 	if err := kvDB.AdminMerge(ctx, "a"); err != nil {
@@ -221,7 +218,7 @@ func TestLogMerges(t *testing.T) {
 		}
 		var info storagepb.RangeLogEvent_Info
 		if err := json.Unmarshal([]byte(infoStr.String), &info); err != nil {
-			t.Errorf("error unmarshalling info string for merge of range %d: %s", rangeID, err)
+			t.Errorf("error unmarshalling info string for merge of range %d: %+v", rangeID, err)
 			continue
 		}
 		if int64(info.UpdatedDesc.RangeID) != rangeID {
@@ -283,7 +280,7 @@ func TestLogRebalances(t *testing.T) {
 	checkMetrics(2 /*adds*/, 1 /*remove*/)
 
 	// Open a SQL connection to verify that the events have been logged.
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), "TestLogRebalances", url.User(security.RootUser))
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestLogRebalances", url.User(security.RootUser))
 	defer cleanupFn()
 
 	sqlDB, err := gosql.Open("postgres", pgURL.String())
@@ -318,7 +315,7 @@ func TestLogRebalances(t *testing.T) {
 		}
 		var info storagepb.RangeLogEvent_Info
 		if err := json.Unmarshal([]byte(infoStr.String), &info); err != nil {
-			t.Errorf("error unmarshalling info string for add replica %d: %s", rangeID, err)
+			t.Errorf("error unmarshalling info string for add replica %d: %+v", rangeID, err)
 			continue
 		}
 		if int64(info.UpdatedDesc.RangeID) != rangeID {
@@ -370,7 +367,7 @@ func TestLogRebalances(t *testing.T) {
 		}
 		var info storagepb.RangeLogEvent_Info
 		if err := json.Unmarshal([]byte(infoStr.String), &info); err != nil {
-			t.Errorf("error unmarshalling info string for remove replica %d: %s", rangeID, err)
+			t.Errorf("error unmarshalling info string for remove replica %d: %+v", rangeID, err)
 			continue
 		}
 		if int64(info.UpdatedDesc.RangeID) != rangeID {

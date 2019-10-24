@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -19,12 +14,13 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 var typeORMReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
 
 // This test runs TypeORM's full test suite against a single cockroach node.
-func registerTypeORM(r *registry) {
+func registerTypeORM(r *testRegistry) {
 	runTypeORM := func(
 		ctx context.Context,
 		t *test,
@@ -92,6 +88,7 @@ func registerTypeORM(r *registry) {
 
 		if err := repeatGitCloneE(
 			ctx,
+			t.l,
 			c,
 			"https://github.com/typeorm/typeorm.git",
 			"/mnt/data1/typeorm",
@@ -117,6 +114,16 @@ func registerTypeORM(r *registry) {
 			ctx,
 			c,
 			node,
+			"patch TypeORM test script to run all tests even on failure",
+			`sed -i 's/--bail //' /mnt/data1/typeorm/package.json`,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := repeatRunE(
+			ctx,
+			c,
+			node,
 			"building TypeORM",
 			`cd /mnt/data1/typeorm/ && sudo npm install --unsafe-perm=true --allow-root`,
 		); err != nil {
@@ -127,9 +134,20 @@ func registerTypeORM(r *registry) {
 		rawResults, err := c.RunWithBuffer(ctx, t.l, node,
 			`cd /mnt/data1/typeorm/ && sudo npm test --unsafe-perm=true --allow-root`,
 		)
-		c.l.Printf("Test Results: %s", rawResults)
+		rawResultsStr := string(rawResults)
+		c.l.Printf("Test Results: %s", rawResultsStr)
 		if err != nil {
-			t.Fatal(err)
+			// Ignore the failure discussed in #38180 and in
+			// https://github.com/typeorm/typeorm/pull/4298.
+			// TODO(jordanlewis): remove this once the failure is resolved.
+			if t.IsBuildVersion("v19.2.0") &&
+				strings.Contains(rawResultsStr, "1 failing") &&
+				strings.Contains(rawResultsStr, "AssertionError: expected 2147483647 to equal '2147483647'") {
+				err = nil
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 

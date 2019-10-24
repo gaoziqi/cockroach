@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package builtins
 
@@ -23,9 +19,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
-const maxCount = 1000
 const maxInt = 1000000
 const maxOffset = 100
 
@@ -165,7 +161,7 @@ func testSumAndAvg(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFram
 		wfr.StartBoundOffset = tree.NewDInt(tree.DInt(offset))
 		wfr.EndBoundOffset = tree.NewDInt(tree.DInt(offset))
 		sum := &slidingWindowSumFunc{agg: &intSumAggregate{}}
-		avg := &avgWindowFunc{sum: slidingWindowSumFunc{agg: &intSumAggregate{}}}
+		avg := &avgWindowFunc{sum: newSlidingWindowSumFunc(&intSumAggregate{})}
 		for wfr.RowIdx = 0; wfr.RowIdx < wfr.PartitionSize(); wfr.RowIdx++ {
 			res, err := sum.Compute(evalCtx.Ctx(), evalCtx, wfr)
 			if err != nil {
@@ -221,6 +217,8 @@ func testSumAndAvg(t *testing.T, evalCtx *tree.EvalContext, wfr *tree.WindowFram
 	}
 }
 
+const noFilterIdx = -1
+
 func makeTestWindowFrameRun(count int) *tree.WindowFrameRun {
 	return &tree.WindowFrameRun{
 		Rows:         makeTestPartition(count),
@@ -253,7 +251,8 @@ func partitionToString(ctx context.Context, partition tree.IndexedRows) string {
 }
 
 func TestSlidingWindow(t *testing.T) {
-	for count := 1; count <= maxCount; count += int(rand.Int31n(maxCount / 10)) {
+	defer leaktest.AfterTest(t)()
+	for _, count := range []int{1, 17, 253} {
 		testSlidingWindow(t, count)
 	}
 }

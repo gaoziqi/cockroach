@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -101,6 +97,12 @@ var (
 		Measurement: "Errors",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaDistSenderRangeLookups = metric.Metadata{
+		Name:        "distsender.rangelookups",
+		Help:        "Number of range lookups.",
+		Measurement: "Range Lookups",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // CanSendToFollower is used by the DistSender to determine if it needs to look
@@ -130,6 +132,7 @@ type DistSenderMetrics struct {
 	NextReplicaErrCount     *metric.Counter
 	NotLeaseHolderErrCount  *metric.Counter
 	InLeaseTransferBackoffs *metric.Counter
+	RangeLookups            *metric.Counter
 }
 
 func makeDistSenderMetrics() DistSenderMetrics {
@@ -143,6 +146,7 @@ func makeDistSenderMetrics() DistSenderMetrics {
 		NextReplicaErrCount:     metric.NewCounter(metaTransportSenderNextReplicaErrCount),
 		NotLeaseHolderErrCount:  metric.NewCounter(metaDistSenderNotLeaseHolderErrCount),
 		InLeaseTransferBackoffs: metric.NewCounter(metaDistSenderInLeaseTransferBackoffsCount),
+		RangeLookups:            metric.NewCounter(metaDistSenderRangeLookups),
 	}
 }
 
@@ -191,6 +195,9 @@ type DistSender struct {
 	// It is copied out of the rpcContext at construction time and used in
 	// testing.
 	clusterID *base.ClusterIDContainer
+	// rangeIteratorGen returns a range iterator bound to the DistSender.
+	// Used to avoid allocations.
+	rangeIteratorGen RangeIteratorGen
 
 	// disableFirstRangeUpdates disables updates of the first range via
 	// gossip. Used by tests which want finer control of the contents of the
@@ -276,6 +283,7 @@ func NewDistSender(cfg DistSenderConfig, g *gossip.Gossip) *DistSender {
 	ds.clusterID = &cfg.RPCContext.ClusterID
 	ds.nodeDialer = cfg.NodeDialer
 	ds.asyncSenderSem = make(chan struct{}, defaultSenderConcurrency)
+	ds.rangeIteratorGen = func() *RangeIterator { return NewRangeIterator(ds) }
 
 	if g != nil {
 		ctx := ds.AnnotateCtx(context.Background())
@@ -338,6 +346,7 @@ func (ds *DistSender) LeaseHolderCache() *LeaseHolderCache {
 func (ds *DistSender) RangeLookup(
 	ctx context.Context, key roachpb.RKey, useReverseScan bool,
 ) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error) {
+	ds.metrics.RangeLookups.Inc(1)
 	// We perform the range lookup scan with a READ_UNCOMMITTED consistency
 	// level because we want the scan to return intents as well as committed
 	// values. The reason for this is because it's not clear whether the intent
@@ -412,6 +421,7 @@ func (ds *DistSender) getNodeDescriptor() *roachpb.NodeDescriptor {
 func (ds *DistSender) sendRPC(
 	ctx context.Context,
 	ba roachpb.BatchRequest,
+	class rpc.ConnectionClass,
 	rangeID roachpb.RangeID,
 	replicas ReplicaSlice,
 	cachedLeaseHolder roachpb.ReplicaDescriptor,
@@ -430,7 +440,10 @@ func (ds *DistSender) sendRPC(
 	return ds.sendToReplicas(
 		ctx,
 		ba,
-		SendOptions{metrics: &ds.metrics},
+		SendOptions{
+			class:   class,
+			metrics: &ds.metrics,
+		},
 		rangeID,
 		replicas,
 		ds.nodeDialer,
@@ -482,8 +495,10 @@ func (ds *DistSender) getDescriptor(
 func (ds *DistSender) sendSingleRange(
 	ctx context.Context, ba roachpb.BatchRequest, desc *roachpb.RangeDescriptor, withCommit bool,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
-	// Try to send the call.
-	replicas := NewReplicaSlice(ds.gossip, desc)
+	// Try to send the call. Learner replicas won't serve reads/writes, so send
+	// only to the `Voters` replicas. This is just an optimization to save a
+	// network hop, everything would still work if we had `All` here.
+	replicas := NewReplicaSlice(ds.gossip, desc.Replicas().Voters())
 
 	// If this request needs to go to a lease holder and we know who that is, move
 	// it to the front.
@@ -503,8 +518,8 @@ func (ds *DistSender) sendSingleRange(
 		// request latency.
 		replicas.OptimizeReplicaOrder(ds.getNodeDescriptor(), ds.rpcContext.RemoteClocks.Latency)
 	}
-
-	br, err := ds.sendRPC(ctx, ba, desc.RangeID, replicas, cachedLeaseHolder, withCommit)
+	class := rpc.ConnectionClassForKey(desc.RSpan().Key)
+	br, err := ds.sendRPC(ctx, ba, class, desc.RangeID, replicas, cachedLeaseHolder, withCommit)
 	if err != nil {
 		log.VErrEvent(ctx, 2, err.Error())
 		return nil, roachpb.NewError(err)
@@ -565,6 +580,8 @@ func (ds *DistSender) initAndVerifyBatch(
 			case *roachpb.BeginTransactionRequest, *roachpb.EndTransactionRequest, *roachpb.ReverseScanRequest:
 				continue
 
+			case *roachpb.RevertRangeRequest:
+				continue
 			default:
 				return roachpb.NewErrorf("batch with limit contains %T request", inner)
 			}
@@ -589,20 +606,6 @@ func (ds *DistSender) initAndVerifyBatch(
 			ba.Header.MaxSpanRequestKeys < ba.Header.ScanOptions.MinResults {
 			return roachpb.NewErrorf("MaxSpanRequestKeys (%d) < MinResults (%d): %s",
 				ba.Header.MaxSpanRequestKeys, ba.Header.ScanOptions.MinResults, ba)
-		}
-	}
-
-	// Make sure that MVCCScan requests aren't in batch form if our cluster
-	// version is too old.
-	// TODO(jordan): delete this stanza after 2.1 is released.
-	if !ds.st.Version.IsActive(cluster.VersionBatchResponse) {
-		for i := range ba.Requests {
-			switch req := ba.Requests[i].GetInner().(type) {
-			case *roachpb.ScanRequest:
-				req.ScanFormat = roachpb.KEY_VALUES
-			case *roachpb.ReverseScanRequest:
-				req.ScanFormat = roachpb.KEY_VALUES
-			}
 		}
 	}
 	return nil
@@ -712,7 +715,7 @@ func (ds *DistSender) Send(
 		// Local addressing has already been resolved.
 		// TODO(tschottdorf): consider rudimentary validation of the batch here
 		// (for example, non-range requests with EndKey, or empty key ranges).
-		rs, err := keys.Range(ba)
+		rs, err := keys.Range(ba.Requests)
 		if err != nil {
 			return nil, roachpb.NewError(err)
 		}
@@ -849,7 +852,7 @@ func (ds *DistSender) divideAndSendParallelCommit(
 	// over multiple ranges, so call into divideAndSendBatchToRanges.
 	qiBa := ba
 	qiBa.Requests = swappedReqs[swapIdx+1:]
-	qiRS, err := keys.Range(qiBa)
+	qiRS, err := keys.Range(qiBa.Requests)
 	if err != nil {
 		return br, roachpb.NewError(err)
 	}
@@ -891,7 +894,7 @@ func (ds *DistSender) divideAndSendParallelCommit(
 	// QueryIntent requests. Make sure to determine the request's
 	// new key span.
 	ba.Requests = swappedReqs[:swapIdx+1]
-	rs, err = keys.Range(ba)
+	rs, err = keys.Range(ba.Requests)
 	if err != nil {
 		return nil, roachpb.NewError(err)
 	}
@@ -914,14 +917,30 @@ func (ds *DistSender) divideAndSendParallelCommit(
 	}
 	if qiPErr := qiReply.pErr; qiPErr != nil {
 		// The batch with the pre-commit QueryIntent requests returned an error.
-		// Wrap this in a MixedSuccessError, as we know that the EndTransaction
-		// batch succeeded. It is not possible for qiPErr to be a MixedSuccessError
-		// itself, so we don't need to handle that case like we do down below.
-		qiPErr.UpdateTxn(ba.Txn)
-		maybeSwapErrorIndex(qiPErr, swapIdx, lastIdx)
-		pErr := roachpb.NewError(&roachpb.MixedSuccessError{Wrapped: qiPErr})
-		pErr.Index = qiPErr.Index
-		return nil, pErr
+		ignoreMissing := false
+		if _, ok := qiPErr.GetDetail().(*roachpb.IntentMissingError); ok {
+			// If the error is an IntentMissingError, detect whether this is due
+			// to intent resolution and can be safely ignored.
+			ignoreMissing, err = ds.detectIntentMissingDueToIntentResolution(ctx, br.Txn)
+			if err != nil {
+				return nil, roachpb.NewError(err)
+			}
+		}
+		if !ignoreMissing {
+			// Wrap this in a MixedSuccessError, as we know that the EndTransaction
+			// batch succeeded. It is not possible for qiPErr to be a MixedSuccessError
+			// itself.
+			qiPErr.UpdateTxn(br.Txn)
+			qiPErr.SetDetail(roachpb.WrapWithMixedSuccessError(qiPErr.GetDetail()))
+			maybeSwapErrorIndex(qiPErr, swapIdx, lastIdx)
+			return nil, qiPErr
+		}
+		// Populate the pre-commit QueryIntent batch response. If we made it
+		// here then we know we can ignore intent missing errors.
+		qiReply.reply = qiBa.CreateReply()
+		for _, ru := range qiReply.reply.Responses {
+			ru.GetQueryIntent().FoundIntent = true
+		}
 	}
 
 	// Both halves of the split batch succeeded. Piece them back together.
@@ -935,6 +954,80 @@ func (ds *DistSender) divideAndSendParallelCommit(
 	return br, nil
 }
 
+// detectIntentMissingDueToIntentResolution attempts to detect whether a missing
+// intent error thrown by a pre-commit QueryIntent request was due to intent
+// resolution after the transaction was already finalized instead of due to a
+// failure of the corresponding pipelined write. It is possible for these two
+// situations to be confused because the pre-commit QueryIntent requests are
+// issued in parallel with the staging EndTransaction request and may evaluate
+// after the transaction becomes implicitly committed. If this happens and a
+// concurrent transaction observes the implicit commit and makes the commit
+// explicit, it is allowed to begin resolving the transactions intents.
+//
+// MVCC values don't remember their transaction once they have been resolved.
+// This loss of information means that QueryIntent returns an intent missing
+// error if it finds the resolved value that correspond to its desired intent.
+// Because of this, the race discussed above can result in intent missing errors
+// during a parallel commit even when the transaction successfully committed.
+//
+// This method queries the transaction record to determine whether an intent
+// missing error was caused by this race or whether the intent missing error
+// is real and guarantees that the transaction is not implicitly committed.
+//
+// See #37866 (issue) and #37900 (corresponding tla+ update).
+func (ds *DistSender) detectIntentMissingDueToIntentResolution(
+	ctx context.Context, txn *roachpb.Transaction,
+) (bool, error) {
+	ba := roachpb.BatchRequest{}
+	ba.Timestamp = ds.clock.Now()
+	ba.Add(&roachpb.QueryTxnRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: txn.TxnMeta.Key,
+		},
+		Txn: txn.TxnMeta,
+	})
+	log.VEvent(ctx, 1, "detecting whether missing intent is due to intent resolution")
+	br, pErr := ds.Send(ctx, ba)
+	if pErr != nil {
+		// We weren't able to determine whether the intent missing error is
+		// due to intent resolution or not, so it is still ambiguous whether
+		// the commit succeeded.
+		return false, roachpb.NewAmbiguousResultError(fmt.Sprintf("error=%s [intent missing]", pErr))
+	}
+	respTxn := &br.Responses[0].GetQueryTxn().QueriedTxn
+	switch respTxn.Status {
+	case roachpb.COMMITTED:
+		// The transaction has already been finalized as committed. The missing
+		// intent error must have been a result of a concurrent transaction
+		// recovery finding the transaction in the implicit commit state and
+		// resolving one of its intents before the pre-commit QueryIntent
+		// queried that intent. We know that the transaction was committed
+		// successfully, so ignore the error.
+		return true, nil
+	case roachpb.ABORTED:
+		// The transaction has either already been finalized as aborted or has
+		// been finalized as committed and already had its transaction record
+		// GCed. We can't distinguish between these two conditions with full
+		// certainty, so we're forced to return an ambiguous commit error.
+		// TODO(nvanbenschoten): QueryTxn will materialize an ABORTED transaction
+		// record if one does not already exist. If we are certain that no actor
+		// will ever persist an ABORTED transaction record after a COMMIT record is
+		// GCed and we returned whether the record was synthesized in the QueryTxn
+		// response then we could use the existence of an ABORTED transaction record
+		// to further isolates the ambiguity caused by the loss of information
+		// during intent resolution. If this error becomes a problem, we can explore
+		// this option.
+		return false, roachpb.NewAmbiguousResultError("intent missing and record aborted")
+	default:
+		// The transaction has not been finalized yet, so the missing intent
+		// error must have been caused by a real missing intent. Propagate the
+		// missing intent error.
+		// NB: we don't expect the record to be PENDING at this point, but it's
+		// not worth making any hard assertions about what we get back here.
+		return false, nil
+	}
+}
+
 // maybeSwapErrorIndex swaps the error index from a to b or b to a if the
 // error's index is set and is equal to one of these to values.
 func maybeSwapErrorIndex(pErr *roachpb.Error, a, b int) {
@@ -946,6 +1039,17 @@ func maybeSwapErrorIndex(pErr *roachpb.Error, a, b int) {
 	} else if pErr.Index.Index == int32(b) {
 		pErr.Index.Index = int32(a)
 	}
+}
+
+// mergeErrors merges the two errors, combining their transaction state and
+// returning the error with the highest priority.
+func mergeErrors(pErr1, pErr2 *roachpb.Error) *roachpb.Error {
+	ret, drop := pErr1, pErr2
+	if roachpb.ErrPriority(drop.GoError()) > roachpb.ErrPriority(ret.GoError()) {
+		ret, drop = drop, ret
+	}
+	ret.UpdateTxn(drop.GetTxn())
+	return ret
 }
 
 // divideAndSendBatchToRanges sends the supplied batch to all of the
@@ -1053,6 +1157,15 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 			if resp.pErr != nil {
 				if pErr == nil {
 					pErr = resp.pErr
+					// Update the error's transaction with any new information from
+					// the batch response. This may contain interesting updates if
+					// the batch was parallelized and part of it succeeded.
+					pErr.UpdateTxn(br.Txn)
+				} else {
+					// The batch was split and saw (at least) two different errors.
+					// Merge their transaction state and determine which to return
+					// based on their priorities.
+					pErr = mergeErrors(pErr, resp.pErr)
 				}
 				continue
 			}
@@ -1067,21 +1180,22 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 			}
 
 			// Combine the new response with the existing one (including updating
-			// the headers).
+			// the headers) if we haven't yet seen an error.
 			if pErr == nil {
 				if err := br.Combine(resp.reply, resp.positions); err != nil {
 					pErr = roachpb.NewError(err)
 				}
+			} else {
+				// Update the error's transaction with any new information from
+				// the batch response. This may contain interesting updates if
+				// the batch was parallelized and part of it succeeded.
+				pErr.UpdateTxn(resp.reply.Txn)
 			}
 		}
 
 		// If we experienced an error, don't neglect to update the error's
 		// attached transaction with any responses which were received.
 		if pErr != nil {
-			// Update the error's transaction with any new information from
-			// the batch response. This may contain interesting updates if
-			// the batch was parallelized and part of it succeeded.
-			pErr.UpdateTxn(br.Txn)
 			// If this is a write batch with any successful responses, but
 			// we're ultimately returning an error, wrap the error with a
 			// MixedSuccessError.
@@ -1089,16 +1203,8 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 				// divideAndSendBatchToRanges can call sendPartialBatch, which in
 				// turn can call divideAndSendBatchToRanges recursively. Therefore,
 				// pErr can already be a MixedSuccessError returned from the
-				// recursive call; do not wrap it in another MixedSuccessError.
-				if _, ok := pErr.GetDetail().(*roachpb.MixedSuccessError); !ok {
-					index := pErr.Index
-					pErr = roachpb.NewError(&roachpb.MixedSuccessError{Wrapped: pErr})
-					// Propagate the index to the MixedSuccessError. Note that the index
-					// is shared by pointer, and when the index is modified as part of
-					// the MixedSuccessError and the MixedSuccessError gets
-					// unwrapped, the original error will contain the modified index.
-					pErr.Index = index
-				}
+				// recursive call. WrapWithMixedSuccessError handles this case.
+				pErr.SetDetail(roachpb.WrapWithMixedSuccessError(pErr.GetDetail()))
 			}
 		} else if couldHaveSkippedResponses {
 			fillSkippedResponses(ba, br, seekKey, resumeReason)
@@ -1110,6 +1216,12 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	var numResults int64
 	stopAtRangeBoundary := ba.Header.ScanOptions != nil && ba.Header.ScanOptions.StopAtRangeBoundary
 	canParallelize := (ba.Header.MaxSpanRequestKeys == 0) && !stopAtRangeBoundary
+	if ba.IsSingleCheckConsistencyRequest() {
+		// Don't parallelize full checksum requests as they have to touch the
+		// entirety of each replica of each range they touch.
+		isExpensive := ba.Requests[0].GetCheckConsistency().Mode == roachpb.ChecksumMode_CHECK_FULL
+		canParallelize = canParallelize && !isExpensive
+	}
 
 	for ; ri.Valid(); ri.Seek(ctx, seekKey, scanDir) {
 		responseCh := make(chan response, 1)
@@ -1326,11 +1438,12 @@ func (ds *DistSender) sendPartialBatch(
 			} else {
 				descKey = rs.Key
 			}
-			// TODO(nvanbenschoten): shouldn't we be passing an eviction token
-			// here from the previous iteration? See #28967.
-			desc, evictToken, err = ds.getDescriptor(ctx, descKey, nil, isReverse)
+			desc, evictToken, err = ds.getDescriptor(ctx, descKey, evictToken, isReverse)
 			if err != nil {
 				log.VErrEventf(ctx, 1, "range descriptor re-lookup failed: %s", err)
+				// We set pErr if we encountered an error getting the descriptor in
+				// order to return the most recent error when we are out of retries.
+				pErr = roachpb.NewError(err)
 				continue
 			}
 		}

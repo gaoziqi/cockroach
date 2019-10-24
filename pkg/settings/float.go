@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package settings
 
@@ -55,12 +51,15 @@ func (*FloatSetting) Typ() string {
 	return "f"
 }
 
-// Override changes the setting, panicking when validation fails.
+// Override changes the setting panicking if validation fails and also overrides
+// the default value.
+//
 // For testing usage only.
 func (f *FloatSetting) Override(sv *Values, v float64) {
 	if err := f.set(sv, v); err != nil {
 		panic(err)
 	}
+	sv.setDefaultOverrideInt64(f.slotIdx, int64(math.Float64bits(v)))
 }
 
 // Validate that a value conforms with the validation function.
@@ -82,6 +81,14 @@ func (f *FloatSetting) set(sv *Values, v float64) error {
 }
 
 func (f *FloatSetting) setToDefault(sv *Values) {
+	// See if the default value was overridden.
+	ok, val, _ := sv.getDefaultOverride(f.slotIdx)
+	if ok {
+		// As per the semantics of override, these values don't go through
+		// validation.
+		_ = f.set(sv, math.Float64frombits(uint64((val))))
+		return
+	}
 	if err := f.set(sv, f.defaultValue); err != nil {
 		panic(err)
 	}

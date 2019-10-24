@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tpcc
 
@@ -20,6 +15,7 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadimpl"
 	"github.com/jackc/pgx"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
@@ -47,11 +44,16 @@ type tpcc struct {
 	nowString        []byte
 	numConns         int
 
-	mix        string
-	doWaits    bool
-	workers    int
-	fks        bool
-	dbOverride string
+	// Used in non-uniform random data generation. cLoad is the value of C at load
+	// time. cCustomerID is the value of C for the customer id generator. cItemID
+	// is the value of C for the item id generator. See 2.1.6.
+	cLoad, cCustomerID, cItemID int
+
+	mix          string
+	waitFraction float64
+	workers      int
+	fks          bool
+	dbOverride   string
 
 	txInfos []txInfo
 	// deck contains indexes into the txInfos slice.
@@ -65,6 +67,7 @@ type tpcc struct {
 	scatter bool
 
 	partitions        int
+	clientPartitions  int
 	affinityPartition int
 	wPart             *partitioner
 	zoneCfg           zoneConfig
@@ -80,6 +83,45 @@ type tpcc struct {
 		values [][]int
 	}
 	localsPool *sync.Pool
+}
+
+type waitSetter struct {
+	val *float64
+}
+
+// Set implements the pflag.Value interface.
+func (w *waitSetter) Set(val string) error {
+	switch strings.ToLower(val) {
+	case "true", "on":
+		*w.val = 1.0
+	case "false", "off":
+		*w.val = 0.0
+	default:
+		f, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return err
+		}
+		if f < 0 {
+			return errors.New("cannot set --wait to a negative value")
+		}
+		*w.val = f
+	}
+	return nil
+}
+
+// Type implements the pflag.Value interface
+func (*waitSetter) Type() string { return "0.0/false - 1.0/true" }
+
+// String implements the pflag.Value interface.
+func (w *waitSetter) String() string {
+	switch *w.val {
+	case 0:
+		return "false"
+	case 1:
+		return "true"
+	default:
+		return fmt.Sprintf("%f", *w.val)
+	}
 }
 
 func init() {
@@ -105,6 +147,7 @@ var tpccMeta = workload.Meta{
 			`db`:                 {RuntimeOnly: true},
 			`mix`:                {RuntimeOnly: true},
 			`partitions`:         {RuntimeOnly: true},
+			`client-partitions`:  {RuntimeOnly: true},
 			`partition-affinity`: {RuntimeOnly: true},
 			`partition-strategy`: {RuntimeOnly: true},
 			`zones`:              {RuntimeOnly: true},
@@ -126,7 +169,8 @@ var tpccMeta = workload.Meta{
 		g.flags.StringVar(&g.mix, `mix`,
 			`newOrder=10,payment=10,orderStatus=1,delivery=1,stockLevel=1`,
 			`Weights for the transaction mix. The default matches the TPCC spec.`)
-		g.flags.BoolVar(&g.doWaits, `wait`, true, `Run in wait mode (include think/keying sleeps)`)
+		g.waitFraction = 1.0
+		g.flags.Var(&waitSetter{&g.waitFraction}, `wait`, `Wait mode (include think/keying sleeps): 1/true for tpcc-standard wait, 0/false for no waits, other factors also allowed`)
 		g.flags.StringVar(&g.dbOverride, `db`, ``,
 			`Override for the SQL database to use. If empty, defaults to the generator name`)
 		g.flags.IntVar(&g.workers, `workers`, 0, fmt.Sprintf(
@@ -137,6 +181,7 @@ var tpccMeta = workload.Meta{
 			numConnsPerWarehouse,
 		))
 		g.flags.IntVar(&g.partitions, `partitions`, 1, `Partition tables`)
+		g.flags.IntVar(&g.clientPartitions, `client-partitions`, 0, `Make client behave as if the tables are partitioned, but does not actually partition underlying data. Requires --partition-affinity.`)
 		g.flags.IntVar(&g.affinityPartition, `partition-affinity`, -1, `Run load generator against specific partition (requires partitions)`)
 		g.flags.Var(&g.zoneCfg.strategy, `partition-strategy`, `Partition tables according to which strategy [replication, leases]`)
 		g.flags.StringSliceVar(&g.zoneCfg.zones, "zones", []string{}, "Zones for partitioning, the number of zones should match the number of partitions and the zones used to start cockroach.")
@@ -178,15 +223,36 @@ func (w *tpcc) Hooks() workload.Hooks {
 				return errors.Errorf(`--partitions must be positive`)
 			}
 
-			if w.affinityPartition < -1 {
-				return errors.Errorf(`if specified, --partition-affinity should be greater than or equal to 0`)
-			} else if w.affinityPartition >= w.partitions {
-				return errors.Errorf(`--partition-affinity out of bounds of --partitions`)
+			if w.clientPartitions > 0 {
+
+				if w.partitions > 1 {
+					return errors.Errorf(`cannot specify both --partitions and --client-partitions;
+					--partitions actually partitions underlying data.
+					--client-partitions only modifies client behavior to access a subset of warehouses. Must be used with --partition-affinity`)
+				}
+
+				if w.affinityPartition == -1 {
+					return errors.Errorf(`--client-partitions must be used with --partition-affinity.`)
+				}
+
+				if w.affinityPartition >= w.clientPartitions {
+					return errors.Errorf(`--partition-affinity out of bounds of --client-partitions`)
+				}
+
+			} else {
+
+				if w.affinityPartition < -1 {
+					return errors.Errorf(`if specified, --partition-affinity should be greater than or equal to 0`)
+				} else if w.affinityPartition >= w.partitions {
+					return errors.Errorf(`--partition-affinity out of bounds of --partitions`)
+				}
+
+				if len(w.zoneCfg.zones) > 0 && (len(w.zoneCfg.zones) != w.partitions) {
+					return errors.Errorf(`--zones should have the sames length as --partitions.`)
+				}
 			}
 
-			if len(w.zoneCfg.zones) > 0 && (len(w.zoneCfg.zones) != w.partitions) {
-				return errors.Errorf(`--zones should have the sames length as --partitions.`)
-			}
+			w.initNonUniformRandomConstants()
 
 			if w.workers == 0 {
 				w.workers = w.activeWarehouses * numWorkersPerWarehouse
@@ -197,15 +263,15 @@ func (w *tpcc) Hooks() workload.Hooks {
 				// waiting, we only use up to a set number of connections per warehouse.
 				// This isn't mandated by the spec, but opening a connection per worker
 				// when they each spend most of their time waiting is wasteful.
-				if !w.doWaits {
+				if w.waitFraction == 0 {
 					w.numConns = w.workers
 				} else {
 					w.numConns = w.activeWarehouses * numConnsPerWarehouse
 				}
 			}
 
-			if w.doWaits && w.workers != w.activeWarehouses*numWorkersPerWarehouse {
-				return errors.Errorf(`--wait=true and --warehouses=%d requires --workers=%d`,
+			if w.waitFraction > 0 && w.workers != w.activeWarehouses*numWorkersPerWarehouse {
+				return errors.Errorf(`--wait > 0 and --warehouses=%d requires --workers=%d`,
 					w.activeWarehouses, w.warehouses*numWorkersPerWarehouse)
 			}
 
@@ -218,7 +284,13 @@ func (w *tpcc) Hooks() workload.Hooks {
 			// Create a partitioner to help us partition the warehouses. The base-case is
 			// where w.warehouses == w.activeWarehouses and w.partitions == 1.
 			var err error
-			w.wPart, err = makePartitioner(w.warehouses, w.activeWarehouses, w.partitions)
+			if w.clientPartitions > 0 {
+				// This partitioner will not actually be used to partiton the data, but instead
+				// is only used to limit the warehouses the client attempts to manipulate.
+				w.wPart, err = makePartitioner(w.warehouses, w.activeWarehouses, w.clientPartitions)
+			} else {
+				w.wPart, err = makePartitioner(w.warehouses, w.activeWarehouses, w.partitions)
+			}
 			if err != nil {
 				return errors.Wrap(err, "error creating partitioner")
 			}
@@ -227,17 +299,24 @@ func (w *tpcc) Hooks() workload.Hooks {
 		},
 		PostLoad: func(db *gosql.DB) error {
 			if w.fks {
+				// We avoid validating foreign keys because we just generated
+				// the data set and don't want to scan over the entire thing
+				// again. Unfortunately, this means that we leave the foreign
+				// keys unvalidated for the duration of the test, so the SQL
+				// optimizer can't use them.
+				// TODO(lucy-zhang): expose an internal knob to validate fk
+				// relations without performing full validation. See #38833.
 				fkStmts := []string{
-					`alter table district add foreign key (d_w_id) references warehouse (w_id)`,
-					`alter table customer add foreign key (c_w_id, c_d_id) references district (d_w_id, d_id)`,
-					`alter table history add foreign key (h_c_w_id, h_c_d_id, h_c_id) references customer (c_w_id, c_d_id, c_id)`,
-					`alter table history add foreign key (h_w_id, h_d_id) references district (d_w_id, d_id)`,
-					`alter table "order" add foreign key (o_w_id, o_d_id, o_c_id) references customer (c_w_id, c_d_id, c_id)`,
-					`alter table new_order add foreign key (no_w_id, no_d_id, no_o_id) references "order" (o_w_id, o_d_id, o_id)`,
-					`alter table stock add foreign key (s_w_id) references warehouse (w_id)`,
-					`alter table stock add foreign key (s_i_id) references item (i_id)`,
-					`alter table order_line add foreign key (ol_w_id, ol_d_id, ol_o_id) references "order" (o_w_id, o_d_id, o_id)`,
-					`alter table order_line add foreign key (ol_supply_w_id, ol_i_id) references stock (s_w_id, s_i_id)`,
+					`alter table district add foreign key (d_w_id) references warehouse (w_id) not valid`,
+					`alter table customer add foreign key (c_w_id, c_d_id) references district (d_w_id, d_id) not valid`,
+					`alter table history add foreign key (h_c_w_id, h_c_d_id, h_c_id) references customer (c_w_id, c_d_id, c_id) not valid`,
+					`alter table history add foreign key (h_w_id, h_d_id) references district (d_w_id, d_id) not valid`,
+					`alter table "order" add foreign key (o_w_id, o_d_id, o_c_id) references customer (c_w_id, c_d_id, c_id) not valid`,
+					`alter table new_order add foreign key (no_w_id, no_d_id, no_o_id) references "order" (o_w_id, o_d_id, o_id) not valid`,
+					`alter table stock add foreign key (s_w_id) references warehouse (w_id) not valid`,
+					`alter table stock add foreign key (s_i_id) references item (i_id) not valid`,
+					`alter table order_line add foreign key (ol_w_id, ol_d_id, ol_o_id) references "order" (o_w_id, o_d_id, o_id) not valid`,
+					`alter table order_line add foreign key (ol_supply_w_id, ol_i_id) references stock (s_w_id, s_i_id) not valid`,
 				}
 
 				for _, fkStmt := range fkStmts {
@@ -279,17 +358,15 @@ func (w *tpcc) Hooks() workload.Hooks {
 			return nil
 		},
 		CheckConsistency: func(ctx context.Context, db *gosql.DB) error {
-			// TODO(arjun): We should run each test in a single transaction as
-			// currently we have to shut down load before running the checks.
-			for _, check := range allChecks() {
-				if !w.expensiveChecks && check.expensive {
+			for _, check := range AllChecks() {
+				if !w.expensiveChecks && check.Expensive {
 					continue
 				}
 				start := timeutil.Now()
-				err := check.f(db)
-				log.Infof(ctx, `check %s took %s`, check.name, timeutil.Since(start))
+				err := check.Fn(db, "" /* asOfSystemTime */)
+				log.Infof(ctx, `check %s took %s`, check.Name, timeutil.Since(start))
 				if err != nil {
-					return errors.Wrapf(err, `check failed: %s`, check.name)
+					return errors.Wrapf(err, `check failed: %s`, check.Name)
 				}
 			}
 			return nil
@@ -299,11 +376,22 @@ func (w *tpcc) Hooks() workload.Hooks {
 
 // Tables implements the Generator interface.
 func (w *tpcc) Tables() []workload.Table {
+	aCharsInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(w.seed)), precomputedLength, aCharsAlphabet)
+	lettersInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(w.seed)), precomputedLength, lettersAlphabet)
+	numbersInit := workloadimpl.PrecomputedRandInit(rand.New(rand.NewSource(w.seed)), precomputedLength, numbersAlphabet)
 	if w.localsPool == nil {
 		w.localsPool = &sync.Pool{
 			New: func() interface{} {
 				return &generateLocals{
-					rng: rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano()))),
+					rng: tpccRand{
+						Rand: rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano()))),
+						// Intentionally wait until here to initialize the precomputed rands
+						// so a caller of Tables that only wants schema doesn't compute
+						// them.
+						aChars:  aCharsInit(),
+						letters: lettersInit(),
+						numbers: numbersInit(),
+					},
 				}
 			},
 		}
@@ -509,11 +597,19 @@ func (w *tpcc) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, 
 	if err := g.Wait(); err != nil {
 		return workload.QueryLoad{}, err
 	}
+	var partitionDBs [][]*workload.MultiConnPool
+	if w.clientPartitions > 0 {
+		// Client partitons simply emulates the behavior of data partitions
+		// w/r/t database connections, though all of the connections will
+		// be for the same partition.
+		partitionDBs = make([][]*workload.MultiConnPool, w.clientPartitions)
+	} else {
+		// Assign each DB connection pool to a local partition. This assumes that
+		// dbs[i] is a machine that holds partition "i % *partitions". If we have an
+		// affinity partition, all connections will be for the same partition.
+		partitionDBs = make([][]*workload.MultiConnPool, w.partitions)
+	}
 
-	// Assign each DB connection pool to a local partition. This assumes that
-	// dbs[i] is a machine that holds partition "i % *partitions". If we have an
-	// affinity partition, all connections will be for the same partition.
-	partitionDBs := make([][]*workload.MultiConnPool, w.partitions)
 	if w.affinityPartition >= 0 {
 		// All connections are for our local partition.
 		partitionDBs[w.affinityPartition] = dbs
@@ -532,12 +628,12 @@ func (w *tpcc) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, 
 
 	fmt.Printf("Initializing %d workers and preparing statements...\n", w.workers)
 	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
-	ql.WorkerFns = make([]func(context.Context) error, w.workers)
+	ql.WorkerFns = make([]func(context.Context) error, 0, w.workers)
 	var group errgroup.Group
 	// Limit the amount of workers we initialize in parallel, to avoid running out
 	// of memory (#36897).
 	sem := make(chan struct{}, 100)
-	for workerIdx := range ql.WorkerFns {
+	for workerIdx := 0; workerIdx < w.workers; workerIdx++ {
 		workerIdx := workerIdx
 		warehouse := w.wPart.totalElems[workerIdx%len(w.wPart.totalElems)]
 
@@ -549,11 +645,14 @@ func (w *tpcc) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, 
 		dbs := partitionDBs[p]
 		db := dbs[warehouse%len(dbs)]
 
+		// NB: ql.WorkerFns is sized so this never re-allocs.
+		ql.WorkerFns = append(ql.WorkerFns, nil)
+		idx := len(ql.WorkerFns) - 1
 		sem <- struct{}{}
 		group.Go(func() error {
 			worker, err := newWorker(context.TODO(), w, db, reg.GetHandle(), warehouse)
 			if err == nil {
-				ql.WorkerFns[workerIdx] = worker.run
+				ql.WorkerFns[idx] = worker.run
 			}
 			<-sem
 			return err

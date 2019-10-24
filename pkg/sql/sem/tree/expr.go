@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -21,9 +17,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // Expr represents an expression.
@@ -145,7 +143,7 @@ func (ta typeAnnotation) ResolvedType() *types.T {
 
 func (ta typeAnnotation) assertTyped() {
 	if ta.typ == nil {
-		panic(pgerror.AssertionFailedf(
+		panic(errors.AssertionFailedf(
 			"ReturnType called on TypedExpr with empty typeAnnotation. " +
 				"Was the underlying Expr type-checked before asserting a type of TypedExpr?"))
 	}
@@ -327,6 +325,7 @@ const (
 	JSONExists
 	JSONSomeExists
 	JSONAllExists
+	Overlaps
 
 	// The following operators will always be used with an associated SubOperator.
 	// If Go had algebraic data types they would be defined in a self-contained
@@ -376,6 +375,7 @@ var comparisonOpName = [...]string{
 	JSONExists:        "?",
 	JSONSomeExists:    "?|",
 	JSONAllExists:     "?&",
+	Overlaps:          "&&",
 	Any:               "ANY",
 	Some:              "SOME",
 	All:               "ALL",
@@ -453,12 +453,12 @@ func NewTypedComparisonExprWithSubOp(
 }
 
 // NewTypedIndirectionExpr returns a new IndirectionExpr that is verified to be well-typed.
-func NewTypedIndirectionExpr(expr, index TypedExpr) *IndirectionExpr {
+func NewTypedIndirectionExpr(expr, index TypedExpr, typ *types.T) *IndirectionExpr {
 	node := &IndirectionExpr{
 		Expr:        expr,
 		Indirection: ArraySubscripts{&ArraySubscript{Begin: index}},
 	}
-	node.typ = expr.(TypedExpr).ResolvedType().ArrayContents()
+	node.typ = typ
 	return node
 }
 
@@ -524,7 +524,7 @@ func (node *ComparisonExpr) memoizeFn() {
 
 	fn, ok := CmpOps[fOp].lookupImpl(leftRet, rightRet)
 	if !ok {
-		panic(pgerror.AssertionFailedf("lookup for ComparisonExpr %s's CmpOp failed",
+		panic(errors.AssertionFailedf("lookup for ComparisonExpr %s's CmpOp failed",
 			AsStringWithFlags(node, FmtShowTypes)))
 	}
 	node.fn = fn
@@ -780,7 +780,7 @@ func NewPlaceholder(name string) (*Placeholder, error) {
 	// etc), while PlaceholderIdx is 0-based.
 	if uval == 0 || uval > MaxPlaceholderIdx+1 {
 		return nil, pgerror.Newf(
-			pgerror.CodeNumericValueOutOfRangeError,
+			pgcode.NumericValueOutOfRange,
 			"placeholder index must be between 1 and %d", MaxPlaceholderIdx+1,
 		)
 	}
@@ -900,6 +900,14 @@ func (node *Array) Format(ctx *FmtCtx) {
 	ctx.WriteString("ARRAY[")
 	ctx.FormatNode(&node.Exprs)
 	ctx.WriteByte(']')
+	// If the array has a type, add an annotation. Don't add it if the type is
+	// UNKNOWN[], since that's not a valid annotation.
+	if ctx.HasFlags(FmtParsable) && node.typ != nil {
+		if node.typ.ArrayContents().Family() != types.UnknownFamily {
+			ctx.WriteString(":::")
+			ctx.Buffer.WriteString(node.typ.SQLString())
+		}
+	}
 }
 
 // ArrayFlatten represents a subquery array constructor.
@@ -1122,7 +1130,7 @@ func (node *BinaryExpr) memoizeFn() {
 	leftRet, rightRet := node.Left.(TypedExpr).ResolvedType(), node.Right.(TypedExpr).ResolvedType()
 	fn, ok := BinOps[node.Operator].lookupImpl(leftRet, rightRet)
 	if !ok {
-		panic(pgerror.AssertionFailedf("lookup for BinaryExpr %s's BinOp failed",
+		panic(errors.AssertionFailedf("lookup for BinaryExpr %s's BinOp failed",
 			AsStringWithFlags(node, FmtShowTypes)))
 	}
 	node.fn = fn
@@ -1223,7 +1231,7 @@ func NewTypedUnaryExpr(op UnaryOperator, expr TypedExpr, typ *types.T) *UnaryExp
 			return node
 		}
 	}
-	panic(pgerror.AssertionFailedf("invalid TypedExpr with unary op %d: %s", op, expr))
+	panic(errors.AssertionFailedf("invalid TypedExpr with unary op %d: %s", op, expr))
 }
 
 // FuncExpr represents a function call.
@@ -1235,6 +1243,9 @@ type FuncExpr struct {
 	Filter    Expr
 	WindowDef *WindowDef
 
+	// OrderBy is used for aggregations that specify an order:
+	// array_agg(col1 ORDER BY col2)
+	OrderBy OrderBy
 	typeAnnotation
 	fnProps *FunctionProperties
 	fn      *Overload
@@ -1315,6 +1326,12 @@ func (node *FuncExpr) IsDistSQLBlacklist() bool {
 	return node.fnProps != nil && node.fnProps.DistsqlBlacklist
 }
 
+// CanHandleNulls returns whether or not the function can handle null
+// arguments.
+func (node *FuncExpr) CanHandleNulls() bool {
+	return node.fnProps != nil && node.fnProps.NullableArgs
+}
+
 type funcType int
 
 // FuncExpr.Type
@@ -1345,6 +1362,10 @@ func (node *FuncExpr) Format(ctx *FmtCtx) {
 	ctx.WriteByte('(')
 	ctx.WriteString(typ)
 	ctx.FormatNode(&node.Exprs)
+	if len(node.OrderBy) > 0 {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(&node.OrderBy)
+	}
 	ctx.WriteByte(')')
 	if ctx.HasFlags(FmtParsable) && node.typ != nil {
 		if node.fnProps.AmbiguousReturnType {
@@ -1605,6 +1626,16 @@ type AnnotateTypeExpr struct {
 
 // Format implements the NodeFormatter interface.
 func (node *AnnotateTypeExpr) Format(ctx *FmtCtx) {
+	if ctx.HasFlags(FmtPGAttrdefAdbin) {
+		ctx.FormatNode(node.Expr)
+		switch node.Type.Family() {
+		case types.StringFamily, types.CollatedStringFamily:
+			// Postgres formats strings using a cast afterward. Let's do the same.
+			ctx.WriteString("::")
+			ctx.WriteString(node.Type.SQLString())
+		}
+		return
+	}
 	switch node.SyntaxMode {
 	case AnnotateShort:
 		exprFmtWithParen(ctx, node.Expr)

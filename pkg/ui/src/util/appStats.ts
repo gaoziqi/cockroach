@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This file significantly duplicates the algorithms available in
 // pkg/roachpb/app_stats.go, in particular the functions on NumericStats
@@ -96,6 +92,7 @@ export interface ExecutionStatistics {
   app: string;
   distSQL: boolean;
   opt: boolean;
+  implicit_txn: boolean;
   failed: boolean;
   node_id: number;
   stats: StatementStatistics;
@@ -103,13 +100,14 @@ export interface ExecutionStatistics {
 
 export function flattenStatementStats(statementStats: CollectedStatementStatistics[]): ExecutionStatistics[] {
   return statementStats.map(stmt => ({
-    statement: stmt.key.key_data.query,
-    app:       stmt.key.key_data.app,
-    distSQL:   stmt.key.key_data.distSQL,
-    opt:       stmt.key.key_data.opt,
-    failed:    stmt.key.key_data.failed,
-    node_id:   stmt.key.node_id,
-    stats:     stmt.stats,
+    statement:    stmt.key.key_data.query,
+    app:          stmt.key.key_data.app,
+    distSQL:      stmt.key.key_data.distSQL,
+    opt:          stmt.key.key_data.opt,
+    implicit_txn: stmt.key.key_data.implicit_txn,
+    failed:       stmt.key.key_data.failed,
+    node_id:      stmt.key.node_id,
+    stats:        stmt.stats,
   }));
 }
 

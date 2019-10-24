@@ -1,22 +1,20 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
 	"math/rand"
 	"path/filepath"
 	"reflect"
@@ -32,6 +30,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 )
@@ -65,6 +65,15 @@ func runWithAllEngines(test func(e Engine, t *testing.T), t *testing.T) {
 	inMem := NewInMem(inMemAttrs, testCacheSize)
 	stopper.AddCloser(inMem)
 	test(inMem, t)
+	inMem.Close()
+	pebbleInMem, err := NewPebble("", &pebble.Options{
+		FS: vfs.NewMem(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	test(pebbleInMem, t)
+	pebbleInMem.Close()
 }
 
 // TestEngineBatchCommit writes a batch containing 10K rows (all the
@@ -159,11 +168,13 @@ func TestEngineBatchStaleCachedIterator(t *testing.T) {
 				t.Fatalf("iterator unexpectedly valid: %v -> %v",
 					iter.UnsafeKey(), iter.UnsafeValue())
 			}
+
+			iter.Close()
 		}
 
 		// Higher-level failure mode. Mostly for documentation.
 		{
-			batch := eng.NewBatch().(*rocksDBBatch)
+			batch := eng.NewBatch()
 			defer batch.Close()
 
 			key := roachpb.Key("z")
@@ -278,7 +289,7 @@ func TestEngineBatch(t *testing.T) {
 			// Run it once with individual operations and remember the result.
 			for i, op := range currentBatch {
 				if err := apply(engine, op); err != nil {
-					t.Errorf("%d: op %v: %v", i, op, err)
+					t.Errorf("%d: op %v: %+v", i, op, err)
 					continue
 				}
 			}
@@ -324,7 +335,7 @@ func TestEngineBatch(t *testing.T) {
 			iter.Close()
 			// Commit the batch and try getting the value from the engine.
 			if err := b.Commit(false /* sync */); err != nil {
-				t.Errorf("%d: %v", i, err)
+				t.Errorf("%d: %+v", i, err)
 				continue
 			}
 			actualValue = get(engine, key)
@@ -452,7 +463,7 @@ func TestEngineMerge(t *testing.T) {
 		for _, tc := range testcases {
 			for i, update := range tc.merges {
 				if err := engine.Merge(tc.testKey, update); err != nil {
-					t.Fatalf("%d: %v", i, err)
+					t.Fatalf("%d: %+v", i, err)
 				}
 			}
 			result, _ := engine.Get(tc.testKey)
@@ -466,6 +477,199 @@ func TestEngineMerge(t *testing.T) {
 			if !reflect.DeepEqual(resultV, expectedV) {
 				t.Errorf("unexpected append-merge result: %v != %v", resultV, expectedV)
 			}
+		}
+	}, t)
+}
+
+func TestEngineTimeBound(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	for _, engineImpl := range mvccEngineImpls {
+		t.Run(engineImpl.name, func(t *testing.T) {
+			engine := engineImpl.create()
+			defer engine.Close()
+
+			var minTimestamp = hlc.Timestamp{WallTime: 1, Logical: 0}
+			var maxTimestamp = hlc.Timestamp{WallTime: 3, Logical: 0}
+			times := []hlc.Timestamp{
+				{WallTime: 2, Logical: 0},
+				minTimestamp,
+				maxTimestamp,
+				{WallTime: 2, Logical: 0},
+			}
+
+			for i, time := range times {
+				s := fmt.Sprintf("%02d", i)
+				key := MVCCKey{Key: roachpb.Key(s), Timestamp: time}
+				if err := engine.Put(key, []byte(s)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := engine.Flush(); err != nil {
+				t.Fatal(err)
+			}
+
+			batch := engine.NewBatch()
+			defer batch.Close()
+
+			check := func(t *testing.T, tbi Iterator, keys, ssts int) {
+				defer tbi.Close()
+				tbi.Seek(NilKey)
+
+				var count int
+				for ; ; tbi.Next() {
+					ok, err := tbi.Valid()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !ok {
+						break
+					}
+					count++
+				}
+
+				// Make sure the iterator sees no writes.
+				if keys != count {
+					t.Fatalf("saw %d values in time bounded iterator, but expected %d", count, keys)
+				}
+				stats := tbi.Stats()
+				if a := stats.TimeBoundNumSSTs; a != ssts {
+					t.Fatalf("touched %d SSTs, expected %d", a, ssts)
+				}
+			}
+
+			testCases := []struct {
+				iter       Iterator
+				keys, ssts int
+			}{
+				// Completely to the right, not touching.
+				{
+					iter: batch.NewIterator(IterOptions{
+						MinTimestampHint: maxTimestamp.Next(),
+						MaxTimestampHint: maxTimestamp.Next().Next(),
+						UpperBound:       roachpb.KeyMax,
+						WithStats:        true,
+					}),
+					keys: 0,
+					ssts: 0,
+				},
+				// Completely to the left, not touching.
+				{
+					iter: batch.NewIterator(IterOptions{
+						MinTimestampHint: minTimestamp.Prev().Prev(),
+						MaxTimestampHint: minTimestamp.Prev(),
+						UpperBound:       roachpb.KeyMax,
+						WithStats:        true,
+					}),
+					keys: 0,
+					ssts: 0,
+				},
+				// Touching on the right.
+				{
+					iter: batch.NewIterator(IterOptions{
+						MinTimestampHint: maxTimestamp,
+						MaxTimestampHint: maxTimestamp,
+						UpperBound:       roachpb.KeyMax,
+						WithStats:        true,
+					}),
+					keys: len(times),
+					ssts: 1,
+				},
+				// Touching on the left.
+				{
+					iter: batch.NewIterator(IterOptions{
+						MinTimestampHint: minTimestamp,
+						MaxTimestampHint: minTimestamp,
+						UpperBound:       roachpb.KeyMax,
+						WithStats:        true,
+					}),
+					keys: len(times),
+					ssts: 1,
+				},
+				// Copy of last case, but confirm that we don't get SST stats if we don't
+				// ask for them.
+				{
+					iter: batch.NewIterator(IterOptions{
+						MinTimestampHint: minTimestamp,
+						MaxTimestampHint: minTimestamp,
+						UpperBound:       roachpb.KeyMax,
+						WithStats:        false,
+					}),
+					keys: len(times),
+					ssts: 0,
+				},
+				// Copy of last case, but confirm that upper bound is respected.
+				{
+					iter: batch.NewIterator(IterOptions{
+						MinTimestampHint: minTimestamp,
+						MaxTimestampHint: minTimestamp,
+						UpperBound:       []byte("02"),
+						WithStats:        false,
+					}),
+					keys: 2,
+					ssts: 0,
+				},
+			}
+
+			for _, test := range testCases {
+				t.Run("", func(t *testing.T) {
+					check(t, test.iter, test.keys, test.ssts)
+				})
+			}
+
+			// Make a regular iterator. Before #21721, this would accidentally pick up the
+			// time bounded iterator instead.
+			iter := batch.NewIterator(IterOptions{UpperBound: roachpb.KeyMax})
+			defer iter.Close()
+			iter.Seek(NilKey)
+
+			var count int
+			for ; ; iter.Next() {
+				ok, err := iter.Valid()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !ok {
+					break
+				}
+				count++
+			}
+
+			// Make sure the iterator sees the writes (i.e. it's not the time bounded iterator).
+			if expCount := len(times); expCount != count {
+				t.Fatalf("saw %d values in regular iterator, but expected %d", count, expCount)
+			}
+		})
+	}
+}
+
+func TestFlushWithSSTables(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	runWithAllEngines(func(engine Engine, t *testing.T) {
+		batch := engine.NewBatch()
+		for i := 0; i < 10000; i++ {
+			key := make([]byte, 4)
+			binary.BigEndian.PutUint32(key, uint32(i))
+			err := batch.Put(MVCCKey{Key: key}, []byte("foobar"))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		err := batch.Commit(true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		batch.Close()
+
+		err = engine.Flush()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ssts := engine.(WithSSTables).GetSSTables()
+		if len(ssts) == 0 {
+			t.Fatal("expected non-zero sstables, got 0")
 		}
 	}, t)
 }
@@ -487,7 +691,7 @@ func TestEngineScan1(t *testing.T) {
 		keyMap := map[string][]byte{}
 		for _, c := range testCases {
 			if err := engine.Put(c.key, c.value); err != nil {
-				t.Errorf("could not put key %q: %v", c.key, err)
+				t.Errorf("could not put key %q: %+v", c.key, err)
 			}
 			keyMap[string(c.key.Key)] = c.value
 		}
@@ -499,20 +703,20 @@ func TestEngineScan1(t *testing.T) {
 
 		keyvals, err := Scan(engine, mvccKey("chinese"), mvccKey("german"), 0)
 		if err != nil {
-			t.Fatalf("could not run scan: %v", err)
+			t.Fatalf("could not run scan: %+v", err)
 		}
 		ensureRangeEqual(t, sortedKeys[1:4], keyMap, keyvals)
 
 		// Check an end of range which does not equal an existing key.
 		keyvals, err = Scan(engine, mvccKey("chinese"), mvccKey("german1"), 0)
 		if err != nil {
-			t.Fatalf("could not run scan: %v", err)
+			t.Fatalf("could not run scan: %+v", err)
 		}
 		ensureRangeEqual(t, sortedKeys[1:5], keyMap, keyvals)
 
 		keyvals, err = Scan(engine, mvccKey("chinese"), mvccKey("german"), 2)
 		if err != nil {
-			t.Fatalf("could not run scan: %v", err)
+			t.Fatalf("could not run scan: %+v", err)
 		}
 		ensureRangeEqual(t, sortedKeys[1:3], keyMap, keyvals)
 
@@ -523,7 +727,7 @@ func TestEngineScan1(t *testing.T) {
 		for _, startKey := range startKeys {
 			keyvals, err = Scan(engine, startKey, mvccKey(roachpb.RKeyMax), 0)
 			if err != nil {
-				t.Fatalf("could not run scan: %v", err)
+				t.Fatalf("could not run scan: %+v", err)
 			}
 			ensureRangeEqual(t, sortedKeys, keyMap, keyvals)
 		}

@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -26,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type tableHistoryWaiter struct {
@@ -244,8 +243,7 @@ func fetchTableDescriptorVersions(
 	}
 	if pErr != nil {
 		err := pErr.GoError()
-		return nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
-			`fetching changes for %s`, span)
+		return nil, errors.Wrapf(err, `fetching changes for %s`, span)
 	}
 
 	var tableDescs []*sqlbase.TableDescriptor
@@ -262,7 +260,8 @@ func fetchTableDescriptorVersions(
 				} else if !ok {
 					return nil
 				}
-				remaining, _, _, err := sqlbase.DecodeTableIDIndexID(it.UnsafeKey().Key)
+				k := it.UnsafeKey()
+				remaining, _, _, err := sqlbase.DecodeTableIDIndexID(k.Key)
 				if err != nil {
 					return err
 				}
@@ -284,7 +283,7 @@ func fetchTableDescriptorVersions(
 				if err := value.GetProto(&desc); err != nil {
 					return err
 				}
-				if tableDesc := desc.GetTable(); tableDesc != nil {
+				if tableDesc := desc.Table(k.Timestamp); tableDesc != nil {
 					tableDescs = append(tableDescs, tableDesc)
 				}
 			}

@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,9 +14,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 type controlJobsNode struct {
@@ -33,29 +28,6 @@ var jobCommandToDesiredStatus = map[tree.JobCommand]jobs.Status{
 	tree.CancelJob: jobs.StatusCanceled,
 	tree.ResumeJob: jobs.StatusRunning,
 	tree.PauseJob:  jobs.StatusPaused,
-}
-
-func (p *planner) ControlJobs(ctx context.Context, n *tree.ControlJobs) (planNode, error) {
-	rows, err := p.newPlan(ctx, n.Jobs, []*types.T{types.Int})
-	if err != nil {
-		return nil, err
-	}
-	cols := planColumns(rows)
-	if len(cols) != 1 {
-		return nil, pgerror.Newf(pgerror.CodeSyntaxError,
-			"%s JOBS expects a single column source, got %d columns",
-			tree.JobCommandToStatement[n.Command], len(cols))
-	}
-	if cols[0].Typ.Family() != types.IntFamily {
-		return nil, pgerror.Newf(pgerror.CodeDatatypeMismatchError,
-			"%s JOBS requires int values, not type %s",
-			tree.JobCommandToStatement[n.Command], cols[0].Typ)
-	}
-
-	return &controlJobsNode{
-		rows:          rows,
-		desiredStatus: jobCommandToDesiredStatus[n.Command],
-	}, nil
 }
 
 // FastPathResults implements the planNodeFastPath inteface.
@@ -81,7 +53,7 @@ func (n *controlJobsNode) startExec(params runParams) error {
 
 		jobID, ok := tree.AsDInt(jobIDDatum)
 		if !ok {
-			return pgerror.AssertionFailedf("%q: expected *DInt, found %T", jobIDDatum, jobIDDatum)
+			return errors.AssertionFailedf("%q: expected *DInt, found %T", jobIDDatum, jobIDDatum)
 		}
 
 		switch n.desiredStatus {
@@ -92,7 +64,7 @@ func (n *controlJobsNode) startExec(params runParams) error {
 		case jobs.StatusCanceled:
 			err = reg.Cancel(params.ctx, params.p.txn, int64(jobID))
 		default:
-			err = pgerror.AssertionFailedf("unhandled status %v", n.desiredStatus)
+			err = errors.AssertionFailedf("unhandled status %v", n.desiredStatus)
 		}
 		if err != nil {
 			return err

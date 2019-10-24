@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -120,6 +116,12 @@ var ExplainOptColumns = ResultColumns{
 	{Name: "text", Typ: types.String},
 }
 
+// ExplainVecColumns are the result columns of an
+// EXPLAIN (VEC) statement.
+var ExplainVecColumns = ResultColumns{
+	{Name: "text", Typ: types.String},
+}
+
 // ShowTraceColumns are the result columns of a SHOW [KV] TRACE statement.
 var ShowTraceColumns = ResultColumns{
 	{Name: "timestamp", Typ: types.TimestampTZ},
@@ -162,4 +164,66 @@ var ShowReplicaTraceColumns = ResultColumns{
 var ShowSyntaxColumns = ResultColumns{
 	{Name: "field", Typ: types.String},
 	{Name: "message", Typ: types.String},
+}
+
+// ShowFingerprintsColumns are the result columns of a
+// SHOW EXPERIMENTAL_FINGERPRINTS statement.
+var ShowFingerprintsColumns = ResultColumns{
+	{Name: "index_name", Typ: types.String},
+	{Name: "fingerprint", Typ: types.String},
+}
+
+// AlterTableSplitColumns are the result columns of an
+// ALTER TABLE/INDEX .. SPLIT AT statement.
+var AlterTableSplitColumns = ResultColumns{
+	{Name: "key", Typ: types.Bytes},
+	{Name: "pretty", Typ: types.String},
+	{Name: "split_enforced_until", Typ: types.Timestamp},
+}
+
+// AlterTableUnsplitColumns are the result columns of an
+// ALTER TABLE/INDEX .. UNSPLIT statement.
+var AlterTableUnsplitColumns = ResultColumns{
+	{Name: "key", Typ: types.Bytes},
+	{Name: "pretty", Typ: types.String},
+}
+
+// AlterTableRelocateColumns are the result columns of an
+// ALTER TABLE/INDEX .. EXPERIMENTAL_RELOCATE statement.
+var AlterTableRelocateColumns = ResultColumns{
+	{Name: "key", Typ: types.Bytes},
+	{Name: "pretty", Typ: types.String},
+}
+
+// AlterTableScatterColumns are the result columns of an
+// ALTER TABLE/INDEX .. SCATTER statement.
+var AlterTableScatterColumns = ResultColumns{
+	{Name: "key", Typ: types.Bytes},
+	{Name: "pretty", Typ: types.String},
+}
+
+// ScrubColumns are the result columns of a SCRUB statement.
+var ScrubColumns = ResultColumns{
+	{Name: "job_uuid", Typ: types.Uuid},
+	{Name: "error_type", Typ: types.String},
+	{Name: "database", Typ: types.String},
+	{Name: "table", Typ: types.String},
+	{Name: "primary_key", Typ: types.String},
+	{Name: "timestamp", Typ: types.Timestamp},
+	{Name: "repaired", Typ: types.Bool},
+	{Name: "details", Typ: types.Jsonb},
+}
+
+// SequenceSelectColumns are the result columns of a sequence data source.
+var SequenceSelectColumns = ResultColumns{
+	{Name: `last_value`, Typ: types.Int},
+	{Name: `log_cnt`, Typ: types.Int},
+	{Name: `is_called`, Typ: types.Bool},
+}
+
+// ExportColumns are the result columns of an EXPORT statement.
+var ExportColumns = ResultColumns{
+	{Name: "filename", Typ: types.String},
+	{Name: "rows", Typ: types.Int},
+	{Name: "bytes", Typ: types.Int},
 }

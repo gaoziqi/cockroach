@@ -10,12 +10,13 @@ package changefeedccl
 
 import (
 	"context"
+	"encoding/hex"
+	"math/rand"
 	"net/url"
 	"sort"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -27,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -65,6 +67,8 @@ const (
 	optFormatAvro formatType = `experimental_avro`
 
 	sinkParamCACert           = `ca_cert`
+	sinkParamClientCert       = `client_cert`
+	sinkParamClientKey        = `client_key`
 	sinkParamFileSize         = `file_size`
 	sinkParamSchemaTopic      = `schema_topic`
 	sinkParamTLSEnabled       = `tls_enabled`
@@ -136,13 +140,7 @@ func changefeedPlanHook(
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer tracing.FinishSpan(span)
 
-		if !p.ExecCfg().Settings.Version.IsActive(cluster.VersionCreateChangefeed) {
-			return errors.Errorf(`CREATE CHANGEFEED requires all nodes to be upgraded to %s`,
-				cluster.VersionByKey(cluster.VersionCreateChangefeed),
-			)
-		}
-
-		if err := p.RequireSuperUser(ctx, "CREATE CHANGEFEED"); err != nil {
+		if err := p.RequireAdminRole(ctx, "CREATE CHANGEFEED"); err != nil {
 			return err
 		}
 
@@ -204,7 +202,7 @@ func changefeedPlanHook(
 		}
 		targets := make(jobspb.ChangefeedTargets, len(targetDescs))
 		for _, desc := range targetDescs {
-			if tableDesc := desc.GetTable(); tableDesc != nil {
+			if tableDesc := desc.Table(hlc.Timestamp{}); tableDesc != nil {
 				targets[tableDesc.ID] = jobspb.ChangefeedTarget{
 					StatementTimeName: tableDesc.Name,
 				}
@@ -295,7 +293,11 @@ func changefeedPlanHook(
 		// which will be immediately closed, only to check for errors.
 		{
 			nodeID := p.ExtendedEvalContext().NodeID
-			canarySink, err := getSink(details.SinkURI, nodeID, details.Opts, details.Targets, settings)
+			var nilOracle timestampLowerBoundOracle
+			canarySink, err := getSink(
+				details.SinkURI, nodeID, details.Opts, details.Targets,
+				settings, nilOracle, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI,
+			)
 			if err != nil {
 				return MaybeStripRetryableErrorMarker(err)
 			}
@@ -343,7 +345,7 @@ func changefeedPlanHook(
 func changefeedJobDescription(
 	p sql.PlanHookState, changefeed *tree.CreateChangefeed, sinkURI string, opts map[string]string,
 ) (string, error) {
-	cleanedSinkURI, err := storageccl.SanitizeExportStorageURI(sinkURI)
+	cleanedSinkURI, err := cloud.SanitizeExternalStorageURI(sinkURI)
 	if err != nil {
 		return "", err
 	}
@@ -454,6 +456,34 @@ func validateChangefeedTable(
 
 type changefeedResumer struct {
 	job *jobs.Job
+}
+
+// generateChangefeedSessionID generates a unique string that is used to
+// prevent overwriting of output files by the cloudStorageSink.
+func generateChangefeedSessionID() string {
+	// We read exactly 8 random bytes. 8 bytes should be enough because:
+	// Consider that each new session for a changefeed job can occur at the
+	// same highWater timestamp for its catch up scan. This session ID is
+	// used to ensure that a session emitting files with the same timestamp
+	// as the session before doesn't clobber existing files. Let's assume that
+	// each of these runs for 0 seconds. Our node liveness duration is currently
+	// 9 seconds, but let's go with a conservative duration of 1 second.
+	// With 8 bytes using the rough approximation for the birthday problem
+	// https://en.wikipedia.org/wiki/Birthday_problem#Square_approximation, we
+	// will have a 50% chance of a single collision after sqrt(2^64) = 2^32
+	// sessions. So if we start a new job every second, we get a coin flip chance of
+	// single collision after 136 years. With this same approximation, we get
+	// something like 220 days to have a 0.001% chance of a collision. In practice,
+	// jobs are likely to run for longer and it's likely to take longer for
+	// job adoption, so we should be good with 8 bytes. Similarly, it's clear that
+	// 16 would be way overkill. 4 bytes gives us a 50% chance of collision after
+	// 65K sessions at the same timestamp.
+	const size = 8
+	p := make([]byte, size)
+	buf := make([]byte, hex.EncodedLen(size))
+	rand.Read(p)
+	hex.Encode(buf, p)
+	return string(buf)
 }
 
 // Resume is part of the jobs.Resumer interface.

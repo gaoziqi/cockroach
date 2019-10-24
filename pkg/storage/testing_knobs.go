@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -54,12 +50,12 @@ type StoreTestingKnobs struct {
 	// TestingApplyFilter is called before applying the results of a
 	// command on each replica. If it returns an error, the command will
 	// not be applied. If it returns an error on some replicas but not
-	// others, the behavior is poorly defined unless that error is a
-	// ReplicaCorruptionError.
+	// others, the behavior is poorly defined.
 	TestingApplyFilter storagebase.ReplicaApplyFilter
 
 	// TestingPostApplyFilter is called after a command is applied to
 	// rocksdb but before in-memory side effects have been processed.
+	// It is only called on the replica the proposed the command.
 	TestingPostApplyFilter storagebase.ReplicaApplyFilter
 
 	// TestingResponseFilter is called after the replica processes a
@@ -67,11 +63,6 @@ type StoreTestingKnobs struct {
 	// error returned to the client, or to simulate network failures.
 	TestingResponseFilter storagebase.ReplicaResponseFilter
 
-	// Disables the use of optional one phase commits. Even when enabled, requests
-	// that set the Require1PC flag are permitted to use one phase commits. This
-	// prevents wedging node liveness, which requires one phase commits during
-	// liveness updates.
-	DisableOptional1PC bool
 	// A hack to manipulate the clock before sending a batch request to a replica.
 	// TODO(kaneda): This hook is not encouraged to use. Get rid of it once
 	// we make TestServer take a ManualClock.
@@ -107,6 +98,8 @@ type StoreTestingKnobs struct {
 	DisableGCQueue bool
 	// DisableMergeQueue disables the merge queue.
 	DisableMergeQueue bool
+	// DisableReplicateQueue disables the raft log queue.
+	DisableRaftLogQueue bool
 	// DisableReplicaGCQueue disables the replica GC queue.
 	DisableReplicaGCQueue bool
 	// DisableReplicateQueue disables the replication queue.
@@ -145,6 +138,13 @@ type StoreTestingKnobs struct {
 	// DisableRefreshReasonTicks disables refreshing pending commands
 	// periodically.
 	DisableRefreshReasonTicks bool
+	// DisableEagerReplicaRemoval prevents the Replica from destroying itself
+	// when it encounters a ChangeReplicasTrigger which would remove it or when
+	// a ReplicaTooOldError in a RaftMessageResponse would lead to removal.
+	// This option can lead to nasty cases during shutdown where a replica will
+	// spin attempting to acquire a split or merge lock on a RHS which will
+	// always fail and is generally not safe but is useful for testing.
+	DisableEagerReplicaRemoval bool
 	// RefreshReasonTicksPeriod overrides the default period over which
 	// pending commands are refreshed. The period is specified as a multiple
 	// of Raft group ticks.
@@ -185,6 +185,50 @@ type StoreTestingKnobs struct {
 	// TraceAllRaftEvents enables raft event tracing even when the current
 	// vmodule would not have enabled it.
 	TraceAllRaftEvents bool
+	// EnableUnconditionalRefreshesInRaftReady will always set the refresh reason
+	// in handleRaftReady to refreshReasonNewLeaderOrConfigChange.
+	EnableUnconditionalRefreshesInRaftReady bool
+
+	// ReceiveSnapshot is run after receiving a snapshot header but before
+	// acquiring snapshot quota or doing shouldAcceptSnapshotData checks. If an
+	// error is returned from the hook, it's sent as an ERROR SnapshotResponse.
+	ReceiveSnapshot func(*SnapshotRequest_Header) error
+	// ReplicaAddSkipRollback causes replica addition to skip the learner rollback
+	// that happens when promotion to a voter fails.
+	ReplicaAddSkipLearnerRollback func() bool
+	// ReplicaAddStopAfterLearnerSnapshot causes replica addition to return early
+	// if the func returns true. Specifically, after the learner txn is successful
+	// and after the LEARNER type snapshot, but before promoting it to a voter.
+	// This ensures the `*Replica` will be materialized on the Store when it
+	// returns.
+	ReplicaAddStopAfterLearnerSnapshot func([]roachpb.ReplicationTarget) bool
+	// ReplicaSkipLearnerSnapshot causes snapshots to never be sent to learners
+	// if the func returns true. Adding replicas proceeds as usual, though if
+	// the added replica has no prior state which can be caught up from the raft
+	// log, the result will be an voter that is unable to participate in quorum.
+	ReplicaSkipLearnerSnapshot func() bool
+	// ReplicaAddStopAfterJointConfig causes replica addition to return early if
+	// the func returns true. This happens before transitioning out of a joint
+	// configuration, after the joint configuration has been entered by means
+	// of a first ChangeReplicas transaction. If the replication change does
+	// not use joint consensus, this early return is identical to the regular
+	// return path.
+	ReplicaAddStopAfterJointConfig func() bool
+	// ReplicationAlwaysUseJointConfig causes replica addition to always go
+	// through a joint configuration, even when this isn't necessary (because
+	// the replication change affects only one replica).
+	ReplicationAlwaysUseJointConfig func() bool
+	// BeforeSnapshotSSTIngestion is run just before the SSTs are ingested when
+	// applying a snapshot.
+	BeforeSnapshotSSTIngestion func(IncomingSnapshot, SnapshotRequest_Type, []string) error
+	// BeforeRelocateOne intercepts the return values of s.relocateOne before
+	// they're being put into effect.
+	BeforeRelocateOne func(_ []roachpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget, _ error)
+
+	// MaxApplicationBatchSize enforces a maximum size on application batches.
+	// This can be useful for testing conditions which require commands to be
+	// applied in separate batches.
+	MaxApplicationBatchSize int
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sessiondata
 
@@ -42,9 +38,9 @@ type SessionData struct {
 	// ForceSplitAt indicates whether checks to prevent incorrect usage of ALTER
 	// TABLE ... SPLIT AT should be skipped.
 	ForceSplitAt bool
-	// OptimizerMode indicates whether to use the experimental optimizer for
-	// query planning.
-	OptimizerMode OptimizerMode
+	// OptimizerFKs indicates whether we should use the new paths to plan foreign
+	// key checks in the optimizer.
+	OptimizerFKs bool
 	// SerialNormalizationMode indicates how to handle the SERIAL pseudo-type.
 	SerialNormalizationMode SerialNormalizationMode
 	// SearchPath is a list of namespaces to search builtins in.
@@ -73,8 +69,12 @@ type SessionData struct {
 	// DurationAdditionMode enables math compatibility options to be enabled.
 	// TODO(bob): Remove this once the 2.2 release branch is cut.
 	DurationAdditionMode duration.AdditionMode
-	// Vectorize enables automatic planning of vectorized operators.
-	Vectorize VectorizeExecMode
+	// VectorizeMode indicates which kinds of queries to use vectorized execution
+	// engine for.
+	VectorizeMode VectorizeExecMode
+	// VectorizeRowCountThreshold indicates the row count above which the
+	// vectorized execution engine will be used if possible.
+	VectorizeRowCountThreshold uint64
 	// ForceSavepointRestart overrides the default SAVEPOINT behavior
 	// for compatibility with certain ORMs. When this flag is set,
 	// the savepoint name will no longer be compared against the magic
@@ -94,6 +94,8 @@ type SessionData struct {
 	// given prefix for the output of each subexpression in a query. If
 	// SaveTablesPrefix is empty, no tables are created.
 	SaveTablesPrefix string
+	// TempTablesEnabled indicates whether temporary tables can be created or not.
+	TempTablesEnabled bool
 }
 
 // DataConversionConfig contains the parameters that influence
@@ -255,22 +257,28 @@ type VectorizeExecMode int64
 const (
 	// VectorizeOff means that columnar execution is disabled.
 	VectorizeOff VectorizeExecMode = iota
-	// VectorizeOn means that any supported queries will be run using the columnar
-	// execution on.
-	VectorizeOn
-	// VectorizeAlways means that we attempt to vectorize all queries; unsupported
-	// queries will fail. Mostly used for testing.
-	VectorizeAlways
+	// VectorizeAuto means that that any supported queries that use only
+	// streaming operators (i.e. those that do not require any buffering) will be
+	// run using the columnar execution.
+	VectorizeAuto
+	// VectorizeExperimentalOn means that any supported queries will be run using
+	// the columnar execution on.
+	VectorizeExperimentalOn
+	// VectorizeExperimentalAlways means that we attempt to vectorize all
+	// queries; unsupported queries will fail. Mostly used for testing.
+	VectorizeExperimentalAlways
 )
 
 func (m VectorizeExecMode) String() string {
 	switch m {
 	case VectorizeOff:
 		return "off"
-	case VectorizeOn:
-		return "on"
-	case VectorizeAlways:
-		return "always"
+	case VectorizeAuto:
+		return "auto"
+	case VectorizeExperimentalOn:
+		return "experimental_on"
+	case VectorizeExperimentalAlways:
+		return "experimental_always"
 	default:
 		return fmt.Sprintf("invalid (%d)", m)
 	}
@@ -283,62 +291,16 @@ func VectorizeExecModeFromString(val string) (VectorizeExecMode, bool) {
 	switch strings.ToUpper(val) {
 	case "OFF":
 		m = VectorizeOff
-	case "ON":
-		m = VectorizeOn
-	case "ALWAYS":
-		m = VectorizeAlways
+	case "AUTO":
+		m = VectorizeAuto
+	case "EXPERIMENTAL_ON":
+		m = VectorizeExperimentalOn
+	case "EXPERIMENTAL_ALWAYS":
+		m = VectorizeExperimentalAlways
 	default:
 		return 0, false
 	}
 	return m, true
-}
-
-// OptimizerMode controls if and when the Executor uses the optimizer.
-type OptimizerMode int64
-
-const (
-	// OptimizerOff means that we don't use the optimizer.
-	OptimizerOff = iota
-	// OptimizerOn means that we use the optimizer for all supported statements.
-	OptimizerOn
-	// OptimizerLocal means that we use the optimizer for all supported
-	// statements, but we don't try to distribute the resulting plan.
-	OptimizerLocal
-	// OptimizerAlways means that we attempt to use the optimizer always, even
-	// for unsupported statements which result in errors. This mode is useful
-	// for testing.
-	OptimizerAlways
-)
-
-func (m OptimizerMode) String() string {
-	switch m {
-	case OptimizerOff:
-		return "off"
-	case OptimizerOn:
-		return "on"
-	case OptimizerLocal:
-		return "local"
-	case OptimizerAlways:
-		return "always"
-	default:
-		return fmt.Sprintf("invalid (%d)", m)
-	}
-}
-
-// OptimizerModeFromString converts a string into a OptimizerMode
-func OptimizerModeFromString(val string) (_ OptimizerMode, ok bool) {
-	switch strings.ToUpper(val) {
-	case "OFF":
-		return OptimizerOff, true
-	case "ON":
-		return OptimizerOn, true
-	case "LOCAL":
-		return OptimizerLocal, true
-	case "ALWAYS":
-		return OptimizerAlways, true
-	default:
-		return 0, false
-	}
 }
 
 // SerialNormalizationMode controls if and when the Executor uses DistSQL.

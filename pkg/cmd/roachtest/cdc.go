@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -60,9 +55,15 @@ type cdcTestArgs struct {
 }
 
 func cdcBasicTest(ctx context.Context, t *test, c *cluster, args cdcTestArgs) {
-	crdbNodes := c.Range(1, c.nodes-1)
-	workloadNode := c.Node(c.nodes)
-	kafkaNode := c.Node(c.nodes)
+	// Skip the poller test on v19.2. After 19.2 is out, we should likely delete
+	// the test entirely.
+	if !args.rangefeed && t.buildVersion.Compare(version.MustParse(`v19.1.0-0`)) > 0 {
+		t.Skip("no poller in >= v19.2.0", "")
+	}
+
+	crdbNodes := c.Range(1, c.spec.NodeCount-1)
+	workloadNode := c.Node(c.spec.NodeCount)
+	kafkaNode := c.Node(c.spec.NodeCount)
 	c.Put(ctx, cockroach, "./cockroach")
 	c.Put(ctx, workload, "./workload", workloadNode)
 	c.Start(ctx, t, crdbNodes)
@@ -236,7 +237,7 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 	// spam.
 	c.Run(ctx, c.All(), `mkdir -p logs`)
 
-	crdbNodes, workloadNode, kafkaNode := c.Range(1, c.nodes-1), c.Node(c.nodes), c.Node(c.nodes)
+	crdbNodes, workloadNode, kafkaNode := c.Range(1, c.spec.NodeCount-1), c.Node(c.spec.NodeCount), c.Node(c.spec.NodeCount)
 	c.Put(ctx, cockroach, "./cockroach", crdbNodes)
 	c.Put(ctx, workload, "./workload", workloadNode)
 	c.Start(ctx, t, crdbNodes)
@@ -459,9 +460,9 @@ func runCDCSchemaRegistry(ctx context.Context, t *test, c *cluster) {
 	}
 }
 
-func registerCDC(r *registry) {
+func registerCDC(r *testRegistry) {
 	useRangeFeed := true
-	if r.buildVersion.Compare(version.MustParse(`v2.2.0-0`)) < 0 {
+	if r.buildVersion.Compare(version.MustParse(`v19.1.0-0`)) < 0 {
 		// RangeFeed is not production ready in 2.1, so run the tests with the
 		// poller.
 		useRangeFeed = false
@@ -503,7 +504,7 @@ func registerCDC(r *registry) {
 		// When testing a 2.1 binary, we use the poller for all the other tests
 		// and this is close enough to cdc/tpcc-1000 test to be redundant, so
 		// skip it.
-		MinVersion: "v2.2.0",
+		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			cdcBasicTest(ctx, t, c, cdcTestArgs{
@@ -535,6 +536,7 @@ func registerCDC(r *registry) {
 	})
 	r.Add(testSpec{
 		Name: fmt.Sprintf("cdc/crdb-chaos/rangefeed=%t", useRangeFeed),
+		Skip: "#37716",
 		// TODO(dan): Re-enable this test on 2.1 if we decide to backport #36852.
 		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
@@ -575,7 +577,7 @@ func registerCDC(r *registry) {
 	})
 	r.Add(testSpec{
 		Name:       "cdc/cloud-sink-gcs/rangefeed=true",
-		MinVersion: "v2.2.0",
+		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			cdcBasicTest(ctx, t, c, cdcTestArgs{
@@ -608,7 +610,7 @@ func registerCDC(r *registry) {
 	})
 	r.Add(testSpec{
 		Name:       "cdc/schemareg",
-		MinVersion: "v2.2.0",
+		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(1),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runCDCSchemaRegistry(ctx, t, c)

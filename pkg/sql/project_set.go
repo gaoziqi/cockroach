@@ -1,23 +1,18 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -41,9 +36,6 @@ import (
 type projectSetNode struct {
 	source     planNode
 	sourceInfo *sqlbase.DataSourceInfo
-
-	// ivarHelper is used to resolve names in correlated SRFs.
-	ivarHelper tree.IndexedVarHelper
 
 	// columns contains all the columns from the source, and then
 	// the columns from the generators.
@@ -69,145 +61,9 @@ type projectSetNode struct {
 	// each entry in `exprs`.
 	numColsPerGen []int
 
-	// props are the ordering, key props etc.
-	props physicalProps
+	reqOrdering ReqOrdering
 
 	run projectSetRun
-}
-
-// ProjectSet wraps a plan in a projectSetNode.
-func (p *planner) ProjectSet(
-	ctx context.Context,
-	source planNode,
-	sourceInfo *sqlbase.DataSourceInfo,
-	errCtx string,
-	sourceNames tree.TableNames,
-	exprs ...tree.Expr,
-) (planDataSource, error) {
-	if len(exprs) == 0 {
-		return planDataSource{}, pgerror.AssertionFailedf("ProjectSet invoked with no projected expression")
-	}
-
-	srcCols := sourceInfo.SourceColumns
-	n := &projectSetNode{
-		source:          source,
-		sourceInfo:      sourceInfo,
-		columns:         make(sqlbase.ResultColumns, 0, len(srcCols)+len(exprs)),
-		numColsInSource: len(srcCols),
-		exprs:           make(tree.TypedExprs, len(exprs)),
-		funcs:           make([]*tree.FuncExpr, len(exprs)),
-		numColsPerGen:   make([]int, len(exprs)),
-		run: projectSetRun{
-			gens: make([]tree.ValueGenerator, len(exprs)),
-			done: make([]bool, len(exprs)),
-		},
-	}
-
-	// The resulting plans produces at least every column of the
-	// input. They appear first in the input so that any indexed vars
-	// that referred to the original source stay valid.
-	n.columns = append(n.columns, srcCols...)
-
-	// We need to save and restore the previous value of the field in
-	// semaCtx in case we are recursively called within a subquery
-	// context.
-	defer p.semaCtx.Properties.Restore(p.semaCtx.Properties)
-
-	// Ensure there are no aggregate or window functions in the clause.
-	p.semaCtx.Properties.Require("FROM",
-		tree.RejectAggregates|tree.RejectWindowApplications|tree.RejectNestedGenerators)
-
-	// Analyze the provided expressions.
-	n.ivarHelper = tree.MakeIndexedVarHelper(n, len(srcCols))
-	for i, expr := range exprs {
-		normalized, err := p.analyzeExpr(
-			ctx, expr, sqlbase.MultiSourceInfo{sourceInfo}, n.ivarHelper, types.Any, false, errCtx)
-		if err != nil {
-			return planDataSource{}, err
-		}
-
-		// Store it for later.
-		n.exprs[i] = normalized
-
-		// Now we need to set up the execution and the result columns
-		// separately for SRF invocations and "simple" scalar expressions.
-
-		if tFunc, ok := normalized.(*tree.FuncExpr); ok && tFunc.IsGeneratorApplication() {
-			// Set-generating functions: generate_series() etc.
-			fd, err := tFunc.Func.Resolve(p.semaCtx.SearchPath)
-			if err != nil {
-				return planDataSource{}, err
-			}
-
-			n.funcs[i] = tFunc
-			n.numColsPerGen[i] = len(fd.ReturnLabels)
-
-			typ := normalized.ResolvedType()
-			if n.numColsPerGen[i] == 1 {
-				// Single-column return type.
-				n.columns = append(n.columns, sqlbase.ResultColumn{
-					Name: fd.ReturnLabels[0],
-					Typ:  typ,
-				})
-			} else {
-				// Prepare the result columns. Use the tuple labels in the SRF's
-				// return type as column labels.
-				for j := range typ.TupleContents() {
-					n.columns = append(n.columns, sqlbase.ResultColumn{
-						Name: typ.TupleLabels()[j],
-						Typ:  &typ.TupleContents()[j],
-					})
-				}
-			}
-		} else {
-			// A simple non-generator expression.
-			n.numColsPerGen[i] = 1
-
-			// There is just one result column.
-			// TODO(knz): until #26236 is resolved, make a best effort at guessing
-			// suitable column names.
-			var colName string
-			if origFunc, ok := expr.(*tree.FuncExpr); ok {
-				colName = origFunc.Func.String()
-			} else {
-				colName = expr.String()
-			}
-			n.columns = append(n.columns, sqlbase.ResultColumn{
-				Name: colName,
-				Typ:  normalized.ResolvedType(),
-			})
-		}
-	}
-
-	// Pre-allocate the result buffer to conserve memory.
-	n.run.rowBuffer = make(tree.Datums, len(n.columns))
-
-	var info *sqlbase.DataSourceInfo
-	if sourceNames == nil {
-		// No source names specified: we have the ROWS FROM syntax. There is no
-		// source operand, so we can ignore the sourceInfo really.
-		info = sqlbase.NewSourceInfoForSingleTable(sqlbase.AnonymousTable, n.columns)
-	} else {
-		// Some sources specified. We must keep the source info and also
-		// add new source aliases for each column group.
-		numAliasesInSource := len(sourceInfo.SourceAliases)
-		info = &sqlbase.DataSourceInfo{
-			SourceColumns: n.columns,
-			SourceAliases: make(sqlbase.SourceAliases, numAliasesInSource+len(n.exprs)),
-		}
-		copy(info.SourceAliases, sourceInfo.SourceAliases)
-		colIdx := n.numColsInSource
-		for i := range n.exprs {
-			nextFirstCol := colIdx + n.numColsPerGen[i]
-			info.SourceAliases[numAliasesInSource+i] = sqlbase.SourceAlias{
-				Name:      sourceNames[i],
-				ColumnSet: sqlbase.FillColumnRange(colIdx, nextFirstCol-1),
-			}
-			colIdx = nextFirstCol
-		}
-	}
-
-	return planDataSource{info: info, plan: n}, nil
 }
 
 func (n *projectSetNode) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
@@ -276,7 +132,7 @@ func (n *projectSetNode) Next(params runParams) (bool, error) {
 					if gen == nil {
 						gen = builtins.EmptyGenerator()
 					}
-					if err := gen.Start(); err != nil {
+					if err := gen.Start(params.ctx, params.extendedEvalCtx.Txn); err != nil {
 						return false, err
 					}
 					n.run.gens[i] = gen
@@ -300,7 +156,7 @@ func (n *projectSetNode) Next(params runParams) (bool, error) {
 				// Yes. Is there still work to do for the current row?
 				if !n.run.done[i] {
 					// Yes; heck whether this source still has some values available.
-					hasVals, err := gen.Next()
+					hasVals, err := gen.Next(params.ctx)
 					if err != nil {
 						return false, err
 					}
@@ -358,13 +214,4 @@ func (n *projectSetNode) Close(ctx context.Context) {
 			gen.Close()
 		}
 	}
-}
-
-func (n *projectSetNode) computePhysicalProps() {
-	// We can pass through properties because projectSetNode preserves
-	// all input columns, and they come first.
-	n.props = planPhysicalProps(n.source)
-	// However any key in the source is destroyed because rows may repeat
-	// multiple times.
-	n.props.weakKeys = nil
 }

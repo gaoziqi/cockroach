@@ -21,65 +21,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/kr/pretty"
 	mysql "vitess.io/vitess/go/vt/sqlparser"
 )
-
-var testEvalCtx = &tree.EvalContext{
-	SessionData: &sessiondata.SessionData{
-		DataConversion: sessiondata.DataConversionConfig{Location: time.UTC},
-	},
-	StmtTimestamp: timeutil.Unix(100000000, 0),
-}
-
-func descForTable(
-	t *testing.T, create string, parent, id sqlbase.ID, fks fkHandler,
-) *sqlbase.TableDescriptor {
-	t.Helper()
-	parsed, err := parser.Parse(create)
-	if err != nil {
-		t.Fatalf("could not parse %q: %v", create, err)
-	}
-	nanos := testEvalCtx.StmtTimestamp.UnixNano()
-
-	var stmt *tree.CreateTable
-
-	if len(parsed) == 2 {
-		stmt = parsed[1].AST.(*tree.CreateTable)
-		name := parsed[0].AST.(*tree.CreateSequence).Name.String()
-
-		ts := hlc.Timestamp{WallTime: nanos}
-		priv := sqlbase.NewDefaultPrivilegeDescriptor()
-		desc, err := sql.MakeSequenceTableDesc(
-			name, tree.SequenceOptions{}, parent, id-1, ts, priv, nil, /* settings */
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fks.resolver[name] = &desc
-	} else {
-		stmt = parsed[0].AST.(*tree.CreateTable)
-	}
-	table, err := MakeSimpleTableDescriptor(context.TODO(), nil, stmt, parent, id, fks, nanos)
-	if err != nil {
-		t.Fatalf("could not interpret %q: %v", create, err)
-	}
-	if err := fixDescriptorFKState(table.TableDesc()); err != nil {
-		t.Fatal(err)
-	}
-	return table.TableDesc()
-}
 
 func TestMysqldumpDataReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -88,9 +39,9 @@ func TestMysqldumpDataReader(t *testing.T) {
 
 	ctx := context.TODO()
 	table := descForTable(t, `CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea)`, 10, 20, NoFKs)
-	tables := map[string]*sqlbase.TableDescriptor{"simple": table}
+	tables := map[string]*execinfrapb.ReadImportDataSpec_ImportTable{"simple": {Desc: table}}
 
-	converter, err := newMysqldumpReader(make(chan []roachpb.KeyValue, 10), tables, testEvalCtx)
+	converter, err := newMysqldumpReader(make(chan row.KVBatch, 10), tables, testEvalCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,10 +56,9 @@ func TestMysqldumpDataReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer in.Close()
+	wrapped := &fileReader{Reader: in, counter: byteCounter{r: in}}
 
-	noop := func(_ bool) error { return nil }
-
-	if err := converter.readFile(ctx, in, 1, "", noop); err != nil {
+	if err := converter.readFile(ctx, wrapped, 1, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	converter.inputFinished(ctx)

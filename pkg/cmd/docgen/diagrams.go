@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -419,6 +415,12 @@ var specs = []stmtSpec{
 		name:    "alter_zone_table_stmt",
 		inline:  []string{"set_zone_config", "var_set_list"},
 		replace: map[string]string{"var_name": "variable", "var_value": "value"},
+		unlink:  []string{"variable", "value"},
+	},
+	{
+		name:    "alter_zone_partition_stmt",
+		inline:  []string{"table_index_name", "set_zone_config", "var_set_list"},
+		replace: map[string]string{"var_name": "variable", "var_value": "value", "standalone_index_name": "index_name"},
 		unlink:  []string{"variable", "value"},
 	},
 	{
@@ -1116,6 +1118,12 @@ var specs = []stmtSpec{
 		unlink:  []string{"location"},
 	},
 	{
+		name:    "show_jobs",
+		stmt:    "show_jobs_stmt",
+		replace: map[string]string{"a_expr": "job_id"},
+		unlink:  []string{"job_id"},
+	},
+	{
 		name:   "show_grants_stmt",
 		inline: []string{"name_list", "opt_on_targets_roles", "for_grantee_clause", "name_list"},
 		replace: map[string]string{
@@ -1132,11 +1140,6 @@ var specs = []stmtSpec{
 		unlink:  []string{"table_name"},
 	},
 	{
-		name:   "show_jobs",
-		stmt:   "show_jobs_stmt",
-		inline: []string{"opt_automatic"},
-	},
-	{
 		name:  "show_keys",
 		stmt:  "show_stmt",
 		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'KEYS'")},
@@ -1150,9 +1153,8 @@ var specs = []stmtSpec{
 		name: "show_roles_stmt",
 	},
 	{
-		name:    "show_ranges_stmt",
-		inline:  []string{"ranges_kw"},
-		exclude: []*regexp.Regexp{regexp.MustCompile("'TESTING_RANGES'")},
+		name: "show_ranges_stmt",
+		stmt: "show_ranges_stmt",
 	},
 	{
 		name: "show_schemas",
@@ -1200,7 +1202,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "sort_clause",
-		inline: []string{"sortby_list", "sortby", "opt_asc_desc"},
+		inline: []string{"sortby_list", "sortby", "opt_asc_desc", "opt_nulls_order"},
 	},
 	{
 		name:    "split_index_at",

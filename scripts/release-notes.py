@@ -48,6 +48,7 @@ author_aliases = {
     'dianasaur323': "Diana Hsieh",
     'kena': "Raphael 'kena' Poss",
     'vivekmenezes': "Vivek Menezes",
+    'Darin':"Darin Peshev",
     'RaduBerinde': "Radu Berinde",
     'Andy Kimball': "Andrew Kimball",
     'marc': "Marc Berhault",
@@ -62,6 +63,7 @@ author_aliases = {
     'songhao': "Song Hao",
     'solongordon': "Solon Gordon",
     'tim-o': "Tim O'Brien",
+    'Tyler314': "Tyler Roberts",
     'Amruta': "Amruta Ranade",
     'yuzefovich': "Yahor Yuzefovich",
     'madhavsuresh': "Madhav Suresh",
@@ -80,6 +82,7 @@ crdb_folk = set([
     "Andrew Werner",
     "Andrew Kryczka",
     "Andy Woods",
+    "Aditya Maru",
     "Angela Chang",
     "Arjun Narayan",
     "Ben Darnell",
@@ -89,6 +92,7 @@ crdb_folk = set([
     "Celia La",
     "Daniel Harrison",
     "David Taylor",
+    "Darin Peshev",
     "Diana Hsieh",
     "Emmanuel Sales",
     "Erik Trinh",
@@ -99,6 +103,9 @@ crdb_folk = set([
     "Joey Pereira",
     "Jordan Lewis",
     "Justin Jaffray",
+    "Jeffrey Xiao",
+    "Ken Liu",
+    "Kendra Curtis",
     "Kuan Luo",
     "Lauren Hirata",
     "Lucy Zhang",
@@ -114,11 +121,13 @@ crdb_folk = set([
     "Pete Vilter",
     "Peter Mattis",
     "Radu Berinde",
+    "Rafi Shamim",
     "Raphael 'kena' Poss",
     "Rebecca Taft",
     "Rich Loveland",
     "Richard Wu",
     "Ridwan Sharif",
+    "Rohan Yadav",
     "Roland Crosby",
     "Sean Loiselle",
     "Solon Gordon",
@@ -126,6 +135,8 @@ crdb_folk = set([
     "Tamir Duberstein",
     "Tim O'Brien",
     "Tobias Schottdorf",
+    "Tyler Roberts",
+    "Will Cross",
     "Victor Chen",
     "Vivek Menezes",
     "Yahor Yuzefovich",
@@ -278,6 +289,13 @@ def find_commits(from_commit_ref, until_commit_ref):
         exit(1)
 
     return firstCommit, commit
+
+if not options.until_commit:
+    print("no value specified with --until, try --until=xxxxx (without space after =)", file=sys.stderr)
+    exit(1)
+if not options.from_commit:
+    print("no value specified with --from, try --from=xxxx (without space after =)", file=sys.stderr)
+    exit(1)
 
 firstCommit, commit = find_commits(options.from_commit, options.until_commit)
 if commit == firstCommit:
@@ -757,7 +775,6 @@ if not hidedownloads:
 <div id="os-tabs" class="clearfix">
     <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.darwin-10.9-amd64.tgz"><button id="mac" data-eventcategory="mac-binary-release-notes">Mac</button></a>
     <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.linux-amd64.tgz"><button id="linux" data-eventcategory="linux-binary-release-notes">Linux</button></a>
-    <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.windows-6.2-amd64.zip"><button id="windows" data-eventcategory="windows-binary-release-notes">Windows</button></a>
     <a href="https://binaries.cockroachdb.com/cockroach-""" + current_version + """.src.tgz"><button id="source" data-eventcategory="source-release-notes">Source</button></a>
 </div>
 """)

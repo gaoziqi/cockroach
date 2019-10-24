@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tests_test
 
@@ -35,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -142,7 +138,7 @@ func (db *verifyFormatDB) exec(ctx context.Context, sql string) error {
 		if err != nil {
 			if pqerr, ok := err.(*pq.Error); ok {
 				// Output Postgres error code if it's available.
-				if pqerr.Code == pgerror.CodeCrashShutdownError {
+				if pqerr.Code == pgcode.CrashShutdown {
 					return crasher{
 						sql:    sql,
 						err:    err,
@@ -483,7 +479,7 @@ var ignoredErrorPatterns = []string{
 	"invalid destination encoding name",
 	"invalid IP format",
 	"invalid format code",
-	`.*val\(\): syntax error at or near`,
+	`.*val\(\): syntax error`,
 	"invalid source encoding name",
 	"strconv.Atoi: parsing .*: invalid syntax",
 	"field position .* must be greater than zero",
@@ -503,7 +499,7 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 
 	var smither *sqlsmith.Smither
 
-	tableStmts := make([]string, 10)
+	tableStmts := make([]string, 2)
 	testRandomSyntax(t, true, "defaultdb", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		// Create some random tables for the smither's column references and INSERT.
 		for i := 0; i < len(tableStmts); i++ {
@@ -512,10 +508,15 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 			if err := db.exec(ctx, stmt); err != nil {
 				return err
 			}
+			fmt.Printf("%s;\n", stmt)
 			tableStmts[i] = stmt
 		}
+		if err := db.exec(ctx, sqlsmith.SeedTable); err != nil {
+			return err
+		}
+		fmt.Printf("%s;\n", sqlsmith.SeedTable)
 		var err error
-		smither, err = sqlsmith.NewSmither(db.db, r.Rnd)
+		smither, err = sqlsmith.NewSmither(db.db, r.Rnd, sqlsmith.DisableMutations())
 		return err
 	}, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		s := smither.Generate()
@@ -535,7 +536,7 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 		if ignoredRegex.MatchString(msg) {
 			shouldLogErr = false
 		}
-		if shouldLogErr {
+		if testing.Verbose() && shouldLogErr {
 			fmt.Printf("ERROR: %s\ncaused by:\n%s;\n\n", err, s)
 		}
 		return err
@@ -546,6 +547,88 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 		fmt.Printf("%s;", stmt)
 	}
 	fmt.Printf("\n")
+}
+
+func TestRandomDatumRoundtrip(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	sema := tree.MakeSemaContext()
+	eval := tree.MakeTestingEvalContext(nil)
+
+	var smither *sqlsmith.Smither
+	testRandomSyntax(t, true, "", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+		var err error
+		smither, err = sqlsmith.NewSmither(nil, r.Rnd)
+		return err
+	}, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+		defer func() {
+			if err := recover(); err != nil {
+				s := fmt.Sprint(err)
+				// JSONB NaN and Infinity can't round
+				// trip because JSON doesn't support
+				// those as Numbers, only strings. (Try
+				// `JSON.stringify(Infinity)` in a JS console.)
+				if strings.Contains(s, "JSONB") && (strings.Contains(s, "Infinity") || strings.Contains(s, "NaN")) {
+					return
+				}
+				for _, cmp := range []string{
+					"ReturnType called on TypedExpr with empty typeAnnotation",
+					"runtime error: invalid memory address or nil pointer dereference",
+				} {
+					if strings.Contains(s, cmp) {
+						return
+					}
+				}
+				panic(err)
+			}
+		}()
+		generated := smither.GenerateExpr()
+		typ := generated.ResolvedType()
+		switch typ {
+		case types.Date, types.Decimal:
+			return nil
+		}
+		serializedGen := tree.Serialize(generated)
+
+		// We don't care about errors below because they are often
+		// caused by sqlsmith generating bogus queries. We're just
+		// looking for datums that don't match.
+		parsed1, err := parser.ParseExpr(serializedGen)
+		if err != nil {
+			return nil
+		}
+		typed1, err := parsed1.TypeCheck(&sema, typ)
+		if err != nil {
+			return nil
+		}
+		datum1, err := typed1.Eval(&eval)
+		if err != nil {
+			return nil
+		}
+		serialized1 := tree.Serialize(datum1)
+
+		parsed2, err := parser.ParseExpr(serialized1)
+		if err != nil {
+			return nil
+		}
+		typed2, err := parsed2.TypeCheck(&sema, typ)
+		if err != nil {
+			return nil
+		}
+		datum2, err := typed2.Eval(&eval)
+		if err != nil {
+			return nil
+		}
+		serialized2 := tree.Serialize(datum2)
+
+		if serialized1 != serialized2 {
+			panic(errors.Errorf("serialized didn't match:\nexpr: %s\nfirst: %s\nsecond: %s", generated, serialized1, serialized2))
+		}
+		if datum1.Compare(&eval, datum2) != 0 {
+			panic(errors.Errorf("%s [%[1]T] != %s [%[2]T] (original expr: %s)", serialized1, serialized2, serializedGen))
+		}
+		return nil
+	})
 }
 
 // testRandomSyntax performs all of the RSG setup and teardown for common
@@ -568,8 +651,6 @@ func testRandomSyntax(
 
 	params, _ := tests.CreateTestServerParams()
 	params.UseDatabase = databaseName
-	// Use a low memory limit to quickly halt runaway functions.
-	params.SQLMemoryPoolSize = 3 * 1024 * 1024 // 3MB
 	// Catch panics and return them as errors.
 	params.Knobs.PGWireTestingKnobs = &sql.PGWireTestingKnobs{
 		CatchPanics: true,

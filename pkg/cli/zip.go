@@ -1,17 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -22,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -61,6 +57,9 @@ var debugZipTablesPerCluster = []string{
 	"crdb_internal.cluster_settings",
 
 	"crdb_internal.jobs",
+	"system.jobs",       // get the raw, restorable jobs records too.
+	"system.descriptor", // descriptors also contain job-like mutation state.
+	"system.namespace",
 
 	"crdb_internal.kv_node_status",
 	"crdb_internal.kv_store_status",
@@ -81,12 +80,13 @@ var debugZipTablesPerNode = []string{
 
 	"crdb_internal.leases",
 
-	"crdb_internal.node_statement_statistics",
 	"crdb_internal.node_build_info",
 	"crdb_internal.node_metrics",
 	"crdb_internal.node_queries",
 	"crdb_internal.node_runtime_info",
 	"crdb_internal.node_sessions",
+	"crdb_internal.node_statement_statistics",
+	"crdb_internal.node_txn_stats",
 }
 
 type zipper struct {
@@ -203,7 +203,23 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 	status := serverpb.NewStatusClient(conn)
 	admin := serverpb.NewAdminClient(conn)
 
-	sqlConn, err := getPasswordAndMakeSQLClient("cockroach sql")
+	// Retrieve the node status to get the SQL address.
+	nodeS, err := status.Node(baseCtx, &serverpb.NodeRequest{NodeId: "local"})
+	if err != nil {
+		return err
+	}
+	sqlAddr := nodeS.Desc.SQLAddress
+	if sqlAddr.IsEmpty() {
+		// No SQL address: either a pre-19.2 node, or same address for both
+		// SQL and RPC.
+		sqlAddr = nodeS.Desc.Address
+	}
+	cliCtx.clientConnHost, cliCtx.clientConnPort, err = net.SplitHostPort(sqlAddr.AddressField)
+	if err != nil {
+		return err
+	}
+
+	sqlConn, err := makeSQLClient("cockroach zip", useSystemDb)
 	if err != nil {
 		log.Warningf(baseCtx, "unable to open a SQL session. Debug information will be incomplete: %s", err)
 	}
@@ -297,7 +313,13 @@ func runDebugZip(cmd *cobra.Command, args []string) error {
 				// not work and if it doesn't, we let the invalid curSQLConn get
 				// used anyway so that anything that does *not* need it will
 				// still happen.
-				curSQLConn := guessNodeURL(sqlConn.url, node.Desc.Address.AddressField)
+				sqlAddr := node.Desc.SQLAddress
+				if sqlAddr.IsEmpty() {
+					// No SQL address: either a pre-19.2 node, or same address for both
+					// SQL and RPC.
+					sqlAddr = node.Desc.Address
+				}
+				curSQLConn := guessNodeURL(sqlConn.url, sqlAddr.AddressField)
 				if err := z.createJSON(prefix+"/status.json", node); err != nil {
 					return err
 				}

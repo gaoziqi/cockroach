@@ -1,23 +1,18 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
 import (
-	"context"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -78,40 +73,8 @@ func (*descContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
 
 // CannotWriteToComputedColError constructs a write error for a computed column.
 func CannotWriteToComputedColError(colName string) error {
-	return pgerror.Newf(pgerror.CodeObjectNotInPrerequisiteStateError,
+	return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 		"cannot write directly to computed column %q", tree.ErrNameString(colName))
-}
-
-// ProcessComputedColumns adds columns which are computed to the set of columns
-// being updated and returns the computation exprs for those columns.
-//
-// The original column descriptors are listed at the beginning of
-// the first return slice, and the computed column descriptors come after that.
-// The 2nd return slice is an alias for the part of the 1st return slice
-// that corresponds to computed columns.
-// The 3rd slice has one expression per computed column; that is, its
-// length is equal to that of the 2nd return slice.
-//
-// TODO(justin/knz): This can be made less work intensive by only selecting
-// computed columns that depend on one of the updated columns. See issue
-// https://github.com/cockroachdb/cockroach/issues/23523.
-func ProcessComputedColumns(
-	ctx context.Context,
-	cols []ColumnDescriptor,
-	tn *tree.TableName,
-	tableDesc *ImmutableTableDescriptor,
-	txCtx *transform.ExprTransformContext,
-	evalCtx *tree.EvalContext,
-) ([]ColumnDescriptor, []ColumnDescriptor, []tree.TypedExpr, error) {
-	computedCols := processColumnSet(nil, tableDesc, func(col *ColumnDescriptor) bool {
-		return col.IsComputed()
-	})
-	cols = append(cols, computedCols...)
-
-	// TODO(justin): it's unfortunate that this parses and typechecks the
-	// ComputeExprs on every query.
-	computedExprs, err := MakeComputedExprs(computedCols, tableDesc, tn, txCtx, evalCtx, false /* addingCols */)
-	return cols, computedCols, computedExprs, err
 }
 
 // MakeComputedExprs returns a slice of the computed expressions for the

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree_test
 
@@ -30,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"golang.org/x/sync/errgroup"
 )
@@ -44,6 +41,7 @@ var (
 // doc interface for a node, and should be used to compare and verify
 // the changed output.
 func TestPrettyDataShort(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	matches, err := filepath.Glob(filepath.Join("testdata", "pretty", "*.sql"))
 	if err != nil {
 		t.Fatal(err)
@@ -158,6 +156,7 @@ func runTestPrettyData(
 }
 
 func TestPrettyVerify(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	tests := map[string]string{
 		// Verify that INTERVAL is maintained.
 		`SELECT interval '-2µs'`: `SELECT '-00:00:00.000002':::INTERVAL`,
@@ -208,6 +207,7 @@ func BenchmarkPrettyData(b *testing.B) {
 }
 
 func TestPrettyExprs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	tests := map[tree.Expr]string{
 		&tree.CastExpr{
 			Expr: tree.NewDString("foo"),

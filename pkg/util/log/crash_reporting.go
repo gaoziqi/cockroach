@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package log
 
@@ -36,6 +32,13 @@ import (
 	raven "github.com/getsentry/raven-go"
 	"github.com/pkg/errors"
 )
+
+// The call stack here is usually:
+// - ReportPanic
+// - RecoverAndReport
+// - panic()
+// so ReportPanic should pop three frames.
+const depthForRecoverAndReportPanic = 3
 
 var (
 	// crashReportEnv controls the version reported in crash reports
@@ -203,7 +206,7 @@ func (st SafeType) WithCause(cause interface{}) SafeType {
 func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth int) {
 	Shout(ctx, Severity_ERROR, "a panic has occurred!")
 
-	if stderrRedirected {
+	if mainLog.stderrRedirected() {
 		// We do not use Shout() to print the panic details here, because
 		// if stderr is not redirected (e.g. when logging to file is
 		// disabled) Shout() would copy its argument to stderr
@@ -216,7 +219,7 @@ func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth 
 		// If stderr is not redirected, then Go's runtime will only print
 		// out the panic details to the original stderr, and we'll miss a copy
 		// in the log file. Produce it here.
-		logging.printPanicToFile(r)
+		mainLog.printPanicToFile(r)
 	}
 
 	SendCrashReport(ctx, sv, depth+1, "", []interface{}{r}, ReportTypePanic)

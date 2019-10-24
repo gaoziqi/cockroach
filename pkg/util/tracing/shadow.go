@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 //
 // A "shadow" tracer can be any opentracing.Tracer implementation that is used
 // in addition to the normal functionality of our tracer. It works by attaching
@@ -91,6 +87,15 @@ func linkShadowSpan(
 	var opts []opentracing.StartSpanOption
 	// Replicate the options, using the lightstep context in the reference.
 	opts = append(opts, opentracing.StartTime(s.startTime))
+	if s.startTags != nil {
+		startTags := make(opentracing.Tags)
+		tags := s.startTags.Get()
+		for i := range tags {
+			tag := &tags[i]
+			startTags[tag.Key()] = tag.Value()
+		}
+		opts = append(opts, startTags)
+	}
 	if s.mu.tags != nil {
 		opts = append(opts, s.mu.tags)
 	}

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -63,7 +59,7 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 			return m
 		},
 		emptySum:     7551962144604783939,
-		populatedSum: 1088818516378651945,
+		populatedSum: 12720006657210437557,
 	},
 	reflect.TypeOf(&enginepb.RangeAppliedState{}): {
 		populatedConstructor: func(r *rand.Rand) protoutil.Message {
@@ -71,15 +67,6 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 		},
 		emptySum:     615555020845646359,
 		populatedSum: 94706924697857278,
-	},
-	// MVCCStats is still serialized beneath Raft in tests that use old cluster
-	// versions before the RangeAppliedState key.
-	reflect.TypeOf(&enginepb.MVCCStats{}): {
-		populatedConstructor: func(r *rand.Rand) protoutil.Message {
-			return enginepb.NewPopulatedMVCCStats(r, false)
-		},
-		emptySum:     18064891702890239528,
-		populatedSum: 4287370248246326846,
 	},
 	reflect.TypeOf(&raftpb.HardState{}): {
 		populatedConstructor: func(r *rand.Rand) protoutil.Message {
@@ -109,7 +96,7 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 			return roachpb.NewPopulatedRangeDescriptor(r, false)
 		},
 		emptySum:     5524024218313206949,
-		populatedSum: 7797688559592618706,
+		populatedSum: 3507997910320018655,
 	},
 	reflect.TypeOf(&storagepb.Liveness{}): {
 		populatedConstructor: func(r *rand.Rand) protoutil.Message {

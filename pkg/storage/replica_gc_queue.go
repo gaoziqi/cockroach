@@ -1,22 +1,17 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
 import (
 	"context"
-	"math"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
@@ -37,10 +32,18 @@ const (
 	// ReplicaGCQueueInactivityThreshold is the inactivity duration after which
 	// a range will be considered for garbage collection. Exported for testing.
 	ReplicaGCQueueInactivityThreshold = 10 * 24 * time.Hour // 10 days
-	// ReplicaGCQueueCandidateTimeout is the duration after which a range in
+	// ReplicaGCQueueSuspectTimeout is the duration after which a Replica which
+	// is suspected to be removed should be processed by the queue.
+	// A Replica is suspected to have been removed if either it is in the
 	// candidate Raft state (which is a typical sign of having been removed
-	// from the group) will be considered for garbage collection.
-	ReplicaGCQueueCandidateTimeout = 1 * time.Second
+	// from the group) or it is not in the VOTER_FULL state. Replicas which are
+	// in the LEARNER state will never become candidates. It seems possible that
+	// a range will quiesce and never tell a VOTER_OUTGOING that is was removed.
+	// Cases where a replica gets stuck in VOTER_INCOMING seem farfetched and
+	// would require the replica to be removed from the range before it ever
+	// learned about its promotion but that state shouldn't last long so we
+	// also treat idle replicas in that state as suspect.
+	ReplicaGCQueueSuspectTimeout = 1 * time.Second
 )
 
 // Priorities for the replica GC queue.
@@ -49,7 +52,10 @@ const (
 
 	// Replicas that have been removed from the range spend a lot of
 	// time in the candidate state, so treat them as higher priority.
-	replicaGCPriorityCandidate = 1.0
+	// Learner replicas which have been removed never enter the candidate state
+	// but in the common case a replica should not be a learner for long so
+	// treat it the same as a candidate.
+	replicaGCPrioritySuspect = 1.0
 
 	// The highest priority is used when we have definite evidence
 	// (external to replicaGCQueue) that the replica has been removed.
@@ -118,14 +124,15 @@ func newReplicaGCQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *repl
 // in the past.
 func (rgcq *replicaGCQueue) shouldQueue(
 	ctx context.Context, now hlc.Timestamp, repl *Replica, _ *config.SystemConfig,
-) (bool, float64) {
+) (shouldQ bool, prio float64) {
+
 	lastCheck, err := repl.GetLastReplicaGCTimestamp(ctx)
 	if err != nil {
-		log.Errorf(ctx, "could not read last replica GC timestamp: %s", err)
+		log.Errorf(ctx, "could not read last replica GC timestamp: %+v", err)
 		return false, 0
 	}
-
-	if _, currentMember := repl.Desc().GetReplicaDescriptor(repl.store.StoreID()); !currentMember {
+	replDesc, currentMember := repl.Desc().GetReplicaDescriptor(repl.store.StoreID())
+	if !currentMember {
 		return true, replicaGCPriorityRemoved
 	}
 
@@ -137,10 +144,19 @@ func (rgcq *replicaGCQueue) shouldQueue(
 		lastActivity.Forward(*lease.ProposedTS)
 	}
 
-	var isCandidate bool
+	// It is critical to think of the replica as suspect if it is a learner as
+	// it both shouldn't be a learner for long but will never become a candidate.
+	// It is less critical to consider joint configuration members as suspect
+	// but in cases where a replica is removed but only ever hears about the
+	// command which sets it to VOTER_OUTGOING we would conservatively wait
+	// 10 days before removing the node. Finally we consider replicas which are
+	// VOTER_INCOMING as suspect because no replica should stay in that state for
+	// too long and being conservative here doesn't seem worthwhile.
+	isSuspect := replDesc.GetType() != roachpb.VOTER_FULL
 	if raftStatus := repl.RaftStatus(); raftStatus != nil {
-		isCandidate = (raftStatus.SoftState.RaftState == raft.StateCandidate ||
-			raftStatus.SoftState.RaftState == raft.StatePreCandidate)
+		isSuspect = isSuspect ||
+			(raftStatus.SoftState.RaftState == raft.StateCandidate ||
+				raftStatus.SoftState.RaftState == raft.StatePreCandidate)
 	} else {
 		// If a replica doesn't have an active raft group, we should check whether
 		// we're decommissioning. If so, we should process the replica because it
@@ -148,25 +164,25 @@ func (rgcq *replicaGCQueue) shouldQueue(
 		// Without this, node decommissioning can stall on such dormant ranges.
 		// Make sure NodeLiveness isn't nil because it can be in tests/benchmarks.
 		if repl.store.cfg.NodeLiveness != nil {
-			if liveness, _ := repl.store.cfg.NodeLiveness.Self(); liveness != nil && liveness.Decommissioning {
+			if liveness, err := repl.store.cfg.NodeLiveness.Self(); err == nil && liveness.Decommissioning {
 				return true, replicaGCPriorityDefault
 			}
 		}
 	}
-	return replicaGCShouldQueueImpl(now, lastCheck, lastActivity, isCandidate)
+	return replicaGCShouldQueueImpl(now, lastCheck, lastActivity, isSuspect)
 }
 
 func replicaGCShouldQueueImpl(
-	now, lastCheck, lastActivity hlc.Timestamp, isCandidate bool,
+	now, lastCheck, lastActivity hlc.Timestamp, isSuspect bool,
 ) (bool, float64) {
 	timeout := ReplicaGCQueueInactivityThreshold
 	priority := replicaGCPriorityDefault
 
-	if isCandidate {
-		// If the range is a candidate (which happens if its former replica set
+	if isSuspect {
+		// If the range is suspect (which happens if its former replica set
 		// ignores it), let it expire much earlier.
-		timeout = ReplicaGCQueueCandidateTimeout
-		priority = replicaGCPriorityCandidate
+		timeout = ReplicaGCQueueSuspectTimeout
+		priority = replicaGCPrioritySuspect
 	} else if now.Less(lastCheck.Add(ReplicaGCQueueInactivityThreshold.Nanoseconds(), 0)) {
 		// Return false immediately if the previous check was less than the
 		// check interval in the past. Note that we don't do this if the
@@ -214,15 +230,21 @@ func (rgcq *replicaGCQueue) process(
 		//
 		// TODO(knz): we should really have a separate type for assertion
 		// errors that trigger telemetry, like
-		// pgerror.AssertionFailedf() does.
+		// errors.AssertionFailedf() does.
 		return errors.Errorf("expected 1 range descriptor, got %d", len(rs))
 	}
 	replyDesc := rs[0]
 
+	repl.mu.RLock()
+	replicaID := repl.mu.replicaID
+	ticks := repl.mu.ticks
+	repl.mu.RUnlock()
+
 	// Now check whether the replica is meant to still exist.
 	// Maybe it was deleted "under us" by being moved.
 	currentDesc, currentMember := replyDesc.GetReplicaDescriptor(repl.store.StoreID())
-	if desc.RangeID == replyDesc.RangeID && currentMember {
+	sameRange := desc.RangeID == replyDesc.RangeID
+	if sameRange && currentMember {
 		// This replica is a current member of the raft group. Set the last replica
 		// GC check time to avoid re-processing for another check interval.
 		//
@@ -234,14 +256,17 @@ func (rgcq *replicaGCQueue) process(
 		if err := repl.setLastReplicaGCTimestamp(ctx, repl.store.Clock().Now()); err != nil {
 			return err
 		}
-	} else if desc.RangeID == replyDesc.RangeID {
+
+		// Note that we do not check the replicaID at this point. If our
+		// local replica ID is behind the one in the meta descriptor, we
+		// could safely delete our local copy, but this would just force
+		// the use of a snapshot when catching up to the new replica ID.
+		// We don't normally expect to have a *higher* local replica ID
+		// than the one in the meta descriptor, but it's possible after
+		// recovering with unsafe-remove-dead-replicas.
+	} else if sameRange {
 		// We are no longer a member of this range, but the range still exists.
 		// Clean up our local data.
-
-		repl.mu.RLock()
-		replicaID := repl.mu.replicaID
-		ticks := repl.mu.ticks
-		repl.mu.RUnlock()
 
 		if replicaID == 0 {
 			// This is a preemptive replica. GC'ing a preemptive replica is a
@@ -288,13 +313,18 @@ func (rgcq *replicaGCQueue) process(
 
 		rgcq.metrics.RemoveReplicaCount.Inc(1)
 		log.VEventf(ctx, 1, "destroying local data")
+
+		nextReplicaID := replyDesc.NextReplicaID
 		// Note that this seems racy - we didn't hold any locks between reading
 		// the range descriptor above and deciding to remove the replica - but
 		// we pass in the NextReplicaID to detect situations in which the
 		// replica became "non-gc'able" in the meantime by checking (with raftMu
 		// held throughout) whether the replicaID is still smaller than the
-		// NextReplicaID.
-		if err := repl.store.RemoveReplica(ctx, repl, replyDesc.NextReplicaID, RemoveOptions{
+		// NextReplicaID. Given non-zero replica IDs don't change, this is only
+		// possible if we currently think we're processing a pre-emptive snapshot
+		// but discover in RemoveReplica that this range has since been added and
+		// knows that.
+		if err := repl.store.RemoveReplica(ctx, repl, nextReplicaID, RemoveOptions{
 			DestroyData: true,
 		}); err != nil {
 			return err
@@ -322,7 +352,7 @@ func (rgcq *replicaGCQueue) process(
 			if len(rs) != 1 {
 				return errors.Errorf("expected 1 range descriptor, got %d", len(rs))
 			}
-			if leftReplyDesc := rs[0]; !leftDesc.Equal(leftReplyDesc) {
+			if leftReplyDesc := &rs[0]; !leftDesc.Equal(*leftReplyDesc) {
 				log.VEventf(ctx, 1, "left neighbor %s not up-to-date with meta descriptor %s; cannot safely GC range yet",
 					leftDesc, leftReplyDesc)
 				// Chances are that the left replica needs to be GC'd. Since we don't
@@ -332,15 +362,10 @@ func (rgcq *replicaGCQueue) process(
 			}
 		}
 
-		// We don't have the last NextReplicaID for the subsumed range, nor can we
-		// obtain it, but that's OK: we can just be conservative and use the maximum
-		// possible replica ID. store.RemoveReplica will write a tombstone using
-		// this maximum possible replica ID, which would normally be problematic, as
-		// it would prevent this store from ever having a new replica of the removed
-		// range. In this case, however, it's copacetic, as subsumed ranges _can't_
-		// have new replicas.
-		const nextReplicaID = math.MaxInt32
-		if err := repl.store.RemoveReplica(ctx, repl, nextReplicaID, RemoveOptions{
+		// A tombstone is written with a value of mergedTombstoneReplicaID because
+		// we know the range to have been merged. See the Merge case of
+		// runPreApplyTriggers() for details.
+		if err := repl.store.RemoveReplica(ctx, repl, mergedTombstoneReplicaID, RemoveOptions{
 			DestroyData: true,
 		}); err != nil {
 			return err

@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
@@ -134,11 +130,10 @@ func timeSeriesColumnAsValue(
 	return v
 }
 
-// TestGoMerge tests the function goMerge but not the integration with
-// the storage engines. For that, see the engine tests.
-func TestGoMerge(t *testing.T) {
+// TestGoMergeCorruption tests the function goMerge with error inputs but does not test the
+// integration with the storage engines. For that, see the engine tests.
+func TestGoMergeCorruption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	// Let's start with stuff that should go wrong.
 	badCombinations := []struct {
 		existing, update []byte
 	}{
@@ -183,8 +178,18 @@ func TestGoMerge(t *testing.T) {
 		if err == nil {
 			t.Errorf("goMerge: %d: expected error", i)
 		}
+		_, err = merge(nil /* key */, c.existing, c.update, nil /* buf */)
+		if err == nil {
+			t.Fatalf("pebble merge: %d: expected error", i)
+		}
 	}
+}
 
+// TestGoMergeAppend tests the function goMerge with the default append operator
+// but does not test the integration with the storage engines. For that, see the
+// engine tests.
+func TestGoMergeAppend(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	gibber1, gibber2 := gibberishString(100), gibberishString(200)
 
 	testCasesAppender := []struct {
@@ -201,7 +206,7 @@ func TestGoMerge(t *testing.T) {
 	for i, c := range testCasesAppender {
 		result, err := goMerge(c.existing, c.update)
 		if err != nil {
-			t.Errorf("goMerge error: %d: %v", i, err)
+			t.Errorf("goMerge error: %d: %+v", i, err)
 			continue
 		}
 		var resultV, expectedV enginepb.MVCCMetadata
@@ -215,7 +220,28 @@ func TestGoMerge(t *testing.T) {
 			t.Errorf("goMerge error: %d: want %+v, got %+v", i, expectedV, resultV)
 		}
 	}
+}
 
+func MergeInternalTimeSeriesDataPebble(
+	sources ...roachpb.InternalTimeSeriesData,
+) (roachpb.InternalTimeSeriesData, error) {
+	srcBytes, err := serializeMergeInputs(sources...)
+	if err != nil {
+		return roachpb.InternalTimeSeriesData{}, nil
+	}
+	merger := MVCCMerger
+	var mergedBytes = srcBytes[0]
+	for _, bytes := range srcBytes[1:] {
+		mergedBytes = merger.Merge(nil /* key */, mergedBytes, bytes, nil /* buf */)
+	}
+	return deserializeMergeOutput(mergedBytes)
+}
+
+// TestGoMergeTimeSeries tests the function goMerge with the timeseries operator
+// but does not test the integration with the storage engines. For that, see
+// the engine tests.
+func TestGoMergeTimeSeries(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	// Each time series test case is a list of byte slice. The last byte slice
 	// is the expected result; all preceding slices will be merged together
 	// to generate the actual result.
@@ -512,6 +538,18 @@ func TestGoMerge(t *testing.T) {
 						)
 					}
 				}
+			}
+			if len(operands) < 2 {
+				// TODO(ajkr): Pebble merge operator isn't currently called with one operand,
+				// though maybe it should be to match RocksDB behavior.
+				return
+			}
+			resultTS, err := MergeInternalTimeSeriesDataPebble(operands...)
+			if err != nil {
+				t.Errorf("MergeInternalTimeSeriesDataPebble error: %s", err.Error())
+			}
+			if a, e := resultTS, expectedTS; !reflect.DeepEqual(a, e) {
+				t.Errorf("MergeInternalTimeSeriesDataPebble returned wrong result got %v, wanted %v", a, e)
 			}
 		})
 	}

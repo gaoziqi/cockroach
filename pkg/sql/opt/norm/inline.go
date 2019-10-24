@@ -1,23 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package norm
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/errors"
 )
 
 // FindInlinableConstants returns the set of input columns that are synthesized
@@ -30,14 +26,14 @@ func (c *CustomFuncs) FindInlinableConstants(input memo.RelExpr) opt.ColSet {
 		for i := range project.Projections {
 			item := &project.Projections[i]
 			if opt.IsConstValueOp(item.Element) {
-				cols.Add(int(item.Col))
+				cols.Add(item.Col)
 			}
 		}
 	} else if values, ok := input.(*memo.ValuesExpr); ok && len(values.Rows) == 1 {
 		tup := values.Rows[0].(*memo.TupleExpr)
 		for i, scalar := range tup.Elems {
 			if opt.IsConstValueOp(scalar) {
-				cols.Add(int(values.Cols[i]))
+				cols.Add(values.Cols[i])
 			}
 		}
 	}
@@ -83,7 +79,7 @@ func (c *CustomFuncs) inlineConstants(
 	replace = func(e opt.Expr) opt.Expr {
 		switch t := e.(type) {
 		case *memo.VariableExpr:
-			if constCols.Contains(int(t.Col)) {
+			if constCols.Contains(t.Col) {
 				return c.extractColumn(input, t.Col)
 			}
 			return t
@@ -111,7 +107,7 @@ func (c *CustomFuncs) extractColumn(input memo.RelExpr, col opt.ColumnID) opt.Sc
 			}
 		}
 	}
-	panic(pgerror.AssertionFailedf("could not find column to extract"))
+	panic(errors.AssertionFailedf("could not find column to extract"))
 }
 
 // HasDuplicateRefs returns true if the target projection expressions or
@@ -147,15 +143,15 @@ func (c *CustomFuncs) HasDuplicateRefs(
 			switch t := e.(type) {
 			case *memo.VariableExpr:
 				// Ignore references to non-target columns.
-				if !targetCols.Contains(int(t.Col)) {
+				if !targetCols.Contains(t.Col) {
 					return false
 				}
 
 				// Count Variable references.
-				if refs.Contains(int(t.Col)) {
+				if refs.Contains(t.Col) {
 					return true
 				}
-				refs.Add(int(t.Col))
+				refs.Add(t.Col)
 				return false
 
 			case memo.RelExpr:
@@ -251,9 +247,9 @@ func (c *CustomFuncs) InlineProjectProject(
 	if !newPassthrough.Empty() {
 		for i := range innerProjections {
 			item := &innerProjections[i]
-			if newPassthrough.Contains(int(item.Col)) {
+			if newPassthrough.Contains(item.Col) {
 				newProjections = append(newProjections, *item)
-				newPassthrough.Remove(int(item.Col))
+				newPassthrough.Remove(item.Col)
 			}
 		}
 	}
@@ -278,7 +274,7 @@ func (c *CustomFuncs) inlineProjections(e opt.Expr, projections memo.Projections
 		case memo.RelExpr:
 			if !c.OuterCols(t).Empty() {
 				// Should have prevented this in HasDuplicateRefs/HasCorrelatedSubquery.
-				panic(pgerror.AssertionFailedf("cannot inline references within correlated subqueries"))
+				panic(errors.AssertionFailedf("cannot inline references within correlated subqueries"))
 			}
 
 			// No projections references possible, since there are no outer cols.

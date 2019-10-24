@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package memo
 
@@ -20,11 +16,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 var fdAnnID = opt.NewTableAnnID()
@@ -96,7 +91,7 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 		// Initialize key FD's from the table schema, including constant columns from
 		// the constraint, minus any columns that are not projected by the Scan
 		// operator.
-		rel.FuncDeps.CopyFrom(makeTableFuncDep(md, scan.Table))
+		rel.FuncDeps.CopyFrom(MakeTableFuncDep(md, scan.Table))
 		if scan.Constraint != nil {
 			rel.FuncDeps.AddConstants(scan.Constraint.ExtractConstCols(b.evalCtx))
 		}
@@ -112,8 +107,13 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 		rel.Cardinality = props.ZeroCardinality
 	} else if rel.FuncDeps.HasMax1Row() {
 		rel.Cardinality = rel.Cardinality.Limit(1)
-	} else if hardLimit > 0 && hardLimit < math.MaxUint32 {
-		rel.Cardinality = rel.Cardinality.Limit(uint32(hardLimit))
+	} else {
+		if hardLimit > 0 && hardLimit < math.MaxUint32 {
+			rel.Cardinality = rel.Cardinality.Limit(uint32(hardLimit))
+		}
+		if scan.Constraint != nil {
+			b.updateCardinalityFromConstraint(scan.Constraint, rel)
+		}
 	}
 
 	// Statistics
@@ -229,6 +229,8 @@ func (b *logicalPropsBuilder) buildSelectProps(sel *SelectExpr, rel *props.Relat
 		rel.Cardinality = props.ZeroCardinality
 	} else if rel.FuncDeps.HasMax1Row() {
 		rel.Cardinality = rel.Cardinality.Limit(1)
+	} else {
+		b.updateCardinalityFromFilters(sel.Filters, rel)
 	}
 
 	// Statistics
@@ -247,7 +249,7 @@ func (b *logicalPropsBuilder) buildProjectProps(prj *ProjectExpr, rel *props.Rel
 	// --------------
 	// Output columns are the union of synthesized columns and passthrough columns.
 	for i := range prj.Projections {
-		rel.OutputCols.Add(int(prj.Projections[i].Col))
+		rel.OutputCols.Add(prj.Projections[i].Col)
 	}
 	rel.OutputCols.UnionWith(prj.Passthrough)
 
@@ -264,7 +266,7 @@ func (b *logicalPropsBuilder) buildProjectProps(prj *ProjectExpr, rel *props.Rel
 		item := &prj.Projections[i]
 		if opt.IsConstValueOp(item.Element) {
 			if ExtractConstDatum(item.Element) != tree.DNull {
-				rel.NotNullCols.Add(int(item.Col))
+				rel.NotNullCols.Add(item.Col)
 			}
 		}
 	}
@@ -296,7 +298,7 @@ func (b *logicalPropsBuilder) buildProjectProps(prj *ProjectExpr, rel *props.Rel
 			// arithmetic.
 			composite := false
 			for i, ok := from.Next(0); ok; i, ok = from.Next(i + 1) {
-				typ := b.mem.Metadata().ColumnMeta(opt.ColumnID(i)).Type
+				typ := b.mem.Metadata().ColumnMeta(i).Type
 				if sqlbase.DatumTypeHasCompositeKeyEncoding(typ) {
 					composite = true
 					break
@@ -354,18 +356,6 @@ func (b *logicalPropsBuilder) buildInnerJoinApplyProps(
 
 func (b *logicalPropsBuilder) buildLeftJoinApplyProps(
 	join *LeftJoinApplyExpr, rel *props.Relational,
-) {
-	b.buildJoinProps(join, rel)
-}
-
-func (b *logicalPropsBuilder) buildRightJoinApplyProps(
-	join *RightJoinApplyExpr, rel *props.Relational,
-) {
-	b.buildJoinProps(join, rel)
-}
-
-func (b *logicalPropsBuilder) buildFullJoinApplyProps(
-	join *FullJoinApplyExpr, rel *props.Relational,
 ) {
 	b.buildJoinProps(join, rel)
 }
@@ -448,7 +438,7 @@ func (b *logicalPropsBuilder) buildIndexJoinProps(indexJoin *IndexJoinExpr, rel 
 	// -----------------------
 	// Start with the input FD set, and join that with the table's FD.
 	rel.FuncDeps.CopyFrom(&inputProps.FuncDeps)
-	rel.FuncDeps.AddFrom(makeTableFuncDep(md, indexJoin.Table))
+	rel.FuncDeps.AddFrom(MakeTableFuncDep(md, indexJoin.Table))
 	rel.FuncDeps.MakeNotNull(rel.NotNullCols)
 	rel.FuncDeps.ProjectCols(rel.OutputCols)
 
@@ -505,7 +495,7 @@ func (b *logicalPropsBuilder) buildGroupingExprProps(groupExpr RelExpr, rel *pro
 	// aggregate projection list.
 	rel.OutputCols = groupPrivate.GroupingCols.Copy()
 	for i := range aggs {
-		rel.OutputCols.Add(int(aggs[i].Col))
+		rel.OutputCols.Add(aggs[i].Col)
 	}
 
 	// Not Null Columns
@@ -588,7 +578,7 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 	setPrivate := setNode.Private().(*SetPrivate)
 	if len(setPrivate.OutCols) != len(setPrivate.LeftCols) ||
 		len(setPrivate.OutCols) != len(setPrivate.RightCols) {
-		panic(pgerror.AssertionFailedf(
+		panic(errors.AssertionFailedf(
 			"lists in SetPrivate are not all the same length. new:%d, left:%d, right:%d",
 			log.Safe(len(setPrivate.OutCols)), log.Safe(len(setPrivate.LeftCols)), log.Safe(len(setPrivate.RightCols)),
 		))
@@ -606,9 +596,9 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 	// with the output columns, since OutputCols are not ordered and may
 	// not correspond to each other.
 	for i := range setPrivate.OutCols {
-		if leftProps.NotNullCols.Contains(int((setPrivate.LeftCols)[i])) &&
-			rightProps.NotNullCols.Contains(int((setPrivate.RightCols)[i])) {
-			rel.NotNullCols.Add(int((setPrivate.OutCols)[i]))
+		if leftProps.NotNullCols.Contains((setPrivate.LeftCols)[i]) &&
+			rightProps.NotNullCols.Contains((setPrivate.RightCols)[i]) {
+			rel.NotNullCols.Add((setPrivate.OutCols)[i])
 		}
 	}
 
@@ -649,7 +639,23 @@ func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Re
 
 	// Not Null Columns
 	// ----------------
-	// All columns are assumed to be nullable.
+	// All columns are assumed to be nullable, unless they contain only constant
+	// non-null values.
+
+	for colIdx, col := range values.Cols {
+		notNull := true
+		for rowIdx := range values.Rows {
+			val := values.Rows[rowIdx].(*TupleExpr).Elems[colIdx]
+			if !opt.IsConstValueOp(val) || val.Op() == opt.NullOp {
+				// Null or not a constant.
+				notNull = false
+				break
+			}
+		}
+		if notNull {
+			rel.NotNullCols.Add(col)
+		}
+	}
 
 	// Outer Columns
 	// -------------
@@ -673,13 +679,12 @@ func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Re
 	}
 }
 
-func (b *logicalPropsBuilder) buildExplainProps(explain *ExplainExpr, rel *props.Relational) {
-	BuildSharedProps(b.mem, explain, &rel.Shared)
+func (b *logicalPropsBuilder) buildBasicProps(e opt.Expr, cols opt.ColList, rel *props.Relational) {
+	BuildSharedProps(b.mem, e, &rel.Shared)
 
 	// Output Columns
 	// --------------
-	// Output columns are stored in the definition.
-	rel.OutputCols = explain.ColList.ToSet()
+	rel.OutputCols = cols.ToSet()
 
 	// Not Null Columns
 	// ----------------
@@ -687,11 +692,11 @@ func (b *logicalPropsBuilder) buildExplainProps(explain *ExplainExpr, rel *props
 
 	// Outer Columns
 	// -------------
-	// EXPLAIN doesn't allow outer columns.
+	// No outer columns.
 
 	// Functional Dependencies
 	// -----------------------
-	// Explain operator has an empty FD set.
+	// Empty FD set.
 
 	// Cardinality
 	// -----------
@@ -701,43 +706,189 @@ func (b *logicalPropsBuilder) buildExplainProps(explain *ExplainExpr, rel *props
 	// Statistics
 	// ----------
 	if !b.disableStats {
-		b.sb.buildExplain(rel)
+		b.sb.buildUnknown(rel)
 	}
+}
+
+func (b *logicalPropsBuilder) buildWithProps(with *WithExpr, rel *props.Relational) {
+	// Copy over the props from the input.
+	inputProps := with.Main.Relational()
+
+	BuildSharedProps(b.mem, with, &rel.Shared)
+
+	// Side Effects
+	// ------------
+	// This expression has side effects if either Binding or Input has side
+	// effects, which is what is computed by the call to BuildSharedProps.
+
+	// Output Columns
+	// --------------
+	// Inherited from the input expression.
+	rel.OutputCols = inputProps.OutputCols
+
+	// Not Null Columns
+	// ----------------
+	// Inherited from the input expression.
+	rel.NotNullCols = inputProps.NotNullCols
+
+	// Outer Columns
+	// -------------
+	// The outer columns are the union of the outer columns from Binding or Input,
+	// which is what is computed by the call to BuildSharedProps.
+
+	// Functional Dependencies
+	// -----------------------
+	rel.FuncDeps = inputProps.FuncDeps
+
+	// Cardinality
+	// -----------
+	rel.Cardinality = inputProps.Cardinality
+
+	// Statistics
+	// ----------
+	// Inherited from the input expression.
+	rel.Stats = inputProps.Stats
+}
+
+func (b *logicalPropsBuilder) buildWithScanProps(withScan *WithScanExpr, rel *props.Relational) {
+	BuildSharedProps(b.mem, withScan, &rel.Shared)
+	bindingProps := withScan.BindingProps
+
+	// Side Effects
+	// ------------
+	// WithScan has no side effects (even if the original expression had them).
+
+	// Output Columns
+	// --------------
+	rel.OutputCols = withScan.OutCols.ToSet()
+
+	// Not Null Columns
+	// ----------------
+	rel.NotNullCols = opt.TranslateColSet(bindingProps.NotNullCols, withScan.InCols, withScan.OutCols)
+
+	// Outer Columns
+	// -------------
+	// No outer columns.
+
+	// Functional Dependencies
+	// -----------------------
+	// Inherit dependencies from the referenced expression (remapping the
+	// columns).
+	rel.FuncDeps.CopyFrom(&bindingProps.FuncDeps)
+	for i := range withScan.InCols {
+		rel.FuncDeps.AddEquivalency(withScan.InCols[i], withScan.OutCols[i])
+	}
+	rel.FuncDeps.ProjectCols(withScan.OutCols.ToSet())
+
+	// Cardinality
+	// -----------
+	// Inherit from the referenced expression.
+	rel.Cardinality = bindingProps.Cardinality
+
+	// Statistics
+	// ----------
+	if !b.disableStats {
+		b.sb.buildWithScan(withScan, rel)
+	}
+}
+
+func (b *logicalPropsBuilder) buildRecursiveCTEProps(rec *RecursiveCTEExpr, rel *props.Relational) {
+	BuildSharedProps(b.mem, rec, &rel.Shared)
+
+	// Output Columns
+	// --------------
+	rel.OutputCols = rec.OutCols.ToSet()
+
+	// Not Null Columns
+	// ----------------
+	// All columns are assumed to be nullable.
+
+	// Outer Columns
+	// -------------
+	// No outer columns.
+
+	// Functional Dependencies
+	// -----------------------
+	// No known FDs.
+
+	// Cardinality
+	// -----------
+	// At least the cardinality of the initial buffer.
+	rel.Cardinality = props.AnyCardinality.AtLeast(rec.Initial.Relational().Cardinality)
+
+	// Statistics
+	// ----------
+	if !b.disableStats {
+		b.sb.buildUnknown(rel)
+	}
+}
+
+func (b *logicalPropsBuilder) buildExplainProps(explain *ExplainExpr, rel *props.Relational) {
+	b.buildBasicProps(explain, explain.ColList, rel)
 }
 
 func (b *logicalPropsBuilder) buildShowTraceForSessionProps(
 	showTrace *ShowTraceForSessionExpr, rel *props.Relational,
 ) {
-	BuildSharedProps(b.mem, showTrace, &rel.Shared)
+	b.buildBasicProps(showTrace, showTrace.ColList, rel)
+}
 
-	// Output Columns
-	// --------------
-	// Output columns are stored in the definition.
-	rel.OutputCols = showTrace.ColList.ToSet()
+func (b *logicalPropsBuilder) buildOpaqueRelProps(op *OpaqueRelExpr, rel *props.Relational) {
+	b.buildBasicProps(op, op.Columns, rel)
+}
 
-	// Not Null Columns
-	// ----------------
-	// All columns are assumed to be nullable.
+func (b *logicalPropsBuilder) buildOpaqueMutationProps(
+	op *OpaqueMutationExpr, rel *props.Relational,
+) {
+	b.buildBasicProps(op, op.Columns, rel)
+}
 
-	// Outer Columns
-	// -------------
-	// SHOW TRACE doesn't allow outer columns.
+func (b *logicalPropsBuilder) buildOpaqueDDLProps(op *OpaqueDDLExpr, rel *props.Relational) {
+	b.buildBasicProps(op, op.Columns, rel)
+}
 
-	// Functional Dependencies
-	// -----------------------
-	// ShowTrace operator has an empty FD set.
+func (b *logicalPropsBuilder) buildAlterTableSplitProps(
+	split *AlterTableSplitExpr, rel *props.Relational,
+) {
+	b.buildBasicProps(split, split.Columns, rel)
+}
 
-	// Cardinality
-	// -----------
-	// Don't make any assumptions about cardinality of output.
-	rel.Cardinality = props.AnyCardinality
+func (b *logicalPropsBuilder) buildAlterTableUnsplitProps(
+	unsplit *AlterTableUnsplitExpr, rel *props.Relational,
+) {
+	b.buildBasicProps(unsplit, unsplit.Columns, rel)
+}
 
-	// Statistics
-	// ----------
-	if !b.disableStats {
-		b.sb.buildShowTrace(rel)
-	}
+func (b *logicalPropsBuilder) buildAlterTableUnsplitAllProps(
+	unsplitAll *AlterTableUnsplitAllExpr, rel *props.Relational,
+) {
+	b.buildBasicProps(unsplitAll, unsplitAll.Columns, rel)
+}
 
+func (b *logicalPropsBuilder) buildAlterTableRelocateProps(
+	relocate *AlterTableRelocateExpr, rel *props.Relational,
+) {
+	b.buildBasicProps(relocate, relocate.Columns, rel)
+}
+
+func (b *logicalPropsBuilder) buildControlJobsProps(ctl *ControlJobsExpr, rel *props.Relational) {
+	b.buildBasicProps(ctl, opt.ColList{}, rel)
+}
+
+func (b *logicalPropsBuilder) buildCancelQueriesProps(
+	cancel *CancelQueriesExpr, rel *props.Relational,
+) {
+	b.buildBasicProps(cancel, opt.ColList{}, rel)
+}
+
+func (b *logicalPropsBuilder) buildCancelSessionsProps(
+	cancel *CancelSessionsExpr, rel *props.Relational,
+) {
+	b.buildBasicProps(cancel, opt.ColList{}, rel)
+}
+
+func (b *logicalPropsBuilder) buildExportProps(export *ExportExpr, rel *props.Relational) {
+	b.buildBasicProps(export, export.Columns, rel)
 }
 
 func (b *logicalPropsBuilder) buildLimitProps(limit *LimitExpr, rel *props.Relational) {
@@ -890,14 +1041,14 @@ func (b *logicalPropsBuilder) buildOrdinalityProps(ord *OrdinalityExpr, rel *pro
 	// --------------
 	// An extra output column is added to those projected by input operator.
 	rel.OutputCols = inputProps.OutputCols.Copy()
-	rel.OutputCols.Add(int(ord.ColID))
+	rel.OutputCols.Add(ord.ColID)
 
 	// Not Null Columns
 	// ----------------
 	// The new output column is not null, and other columns inherit not null
 	// property from input.
 	rel.NotNullCols = inputProps.NotNullCols.Copy()
-	rel.NotNullCols.Add(int(ord.ColID))
+	rel.NotNullCols.Add(ord.ColID)
 
 	// Outer Columns
 	// -------------
@@ -912,7 +1063,7 @@ func (b *logicalPropsBuilder) buildOrdinalityProps(ord *OrdinalityExpr, rel *pro
 		// Any existing keys are still keys.
 		rel.FuncDeps.AddStrictKey(key, rel.OutputCols)
 	}
-	rel.FuncDeps.AddStrictKey(util.MakeFastIntSet(int(ord.ColID)), rel.OutputCols)
+	rel.FuncDeps.AddStrictKey(opt.MakeColSet(ord.ColID), rel.OutputCols)
 
 	// Cardinality
 	// -----------
@@ -937,7 +1088,7 @@ func (b *logicalPropsBuilder) buildWindowProps(window *WindowExpr, rel *props.Re
 	// window function column.
 	rel.OutputCols = inputProps.OutputCols.Copy()
 	for _, w := range window.Windows {
-		rel.OutputCols.Add(int(w.Col))
+		rel.OutputCols.Add(w.Col)
 	}
 
 	// Not Null Columns
@@ -1065,8 +1216,18 @@ func (b *logicalPropsBuilder) buildMutationProps(mutation RelExpr, rel *props.Re
 	// --------------
 	// Only non-mutation columns are output columns.
 	for i, n := 0, tab.ColumnCount(); i < n; i++ {
-		colID := int(private.Table.ColumnID(i))
-		rel.OutputCols.Add(colID)
+		if private.IsColumnOutput(i) {
+			colID := private.Table.ColumnID(i)
+			rel.OutputCols.Add(colID)
+		}
+	}
+
+	// The output columns of the mutation will also include all
+	// columns it allowed to pass through.
+	for _, col := range private.PassthroughCols {
+		if col != 0 {
+			rel.OutputCols.Add(col)
+		}
 	}
 
 	// Not Null Columns
@@ -1077,19 +1238,19 @@ func (b *logicalPropsBuilder) buildMutationProps(mutation RelExpr, rel *props.Re
 	// the column must be not null.
 	for i, n := 0, tab.ColumnCount(); i < n; i++ {
 		tabColID := private.Table.ColumnID(i)
-		if !rel.OutputCols.Contains(int(tabColID)) {
+		if !rel.OutputCols.Contains(tabColID) {
 			continue
 		}
 
 		// If the target table column is not null, then mark the column as not null.
 		if !tab.Column(i).IsNullable() {
-			rel.NotNullCols.Add(int(tabColID))
+			rel.NotNullCols.Add(tabColID)
 			continue
 		}
 
 		// If the input column is not null, then the result will be not null.
-		if inputProps.NotNullCols.Contains(int(private.ReturnCols[i])) {
-			rel.NotNullCols.Add(int(private.Table.ColumnID(i)))
+		if inputProps.NotNullCols.Contains(private.ReturnCols[i]) {
+			rel.NotNullCols.Add(private.Table.ColumnID(i))
 		}
 	}
 
@@ -1122,15 +1283,23 @@ func (b *logicalPropsBuilder) buildCreateTableProps(ct *CreateTableExpr, rel *pr
 	BuildSharedProps(b.mem, ct, &rel.Shared)
 }
 
+func (b *logicalPropsBuilder) buildCreateViewProps(cv *CreateViewExpr, rel *props.Relational) {
+	BuildSharedProps(b.mem, cv, &rel.Shared)
+}
+
 func (b *logicalPropsBuilder) buildFiltersItemProps(item *FiltersItem, scalar *props.Scalar) {
 	BuildSharedProps(b.mem, item.Condition, &scalar.Shared)
 
 	// Constraints
 	// -----------
 	cb := constraintsBuilder{md: b.mem.Metadata(), evalCtx: b.evalCtx}
-	scalar.Constraints, scalar.TightConstraints = cb.buildConstraints(item.Condition)
-	if scalar.Constraints.IsUnconstrained() {
+	// TODO(rytaft): Using local variables here to avoid a data race. It would be
+	// better to avoid lazy building of props altogether.
+	constraints, tightConstraints := cb.buildConstraints(item.Condition)
+	if constraints.IsUnconstrained() {
 		scalar.Constraints, scalar.TightConstraints = nil, false
+	} else {
+		scalar.Constraints, scalar.TightConstraints = constraints, tightConstraints
 	}
 
 	// Functional Dependencies
@@ -1184,7 +1353,7 @@ func BuildSharedProps(mem *Memo, e opt.Expr, shared *props.Shared) {
 	switch t := e.(type) {
 	case *VariableExpr:
 		// Variable introduces outer column.
-		shared.OuterCols.Add(int(t.Col))
+		shared.OuterCols.Add(t.Col)
 		return
 
 	case *PlaceholderExpr:
@@ -1273,11 +1442,11 @@ func hasOuterCols(mem *Memo, e opt.Expr) bool {
 	return false
 }
 
-// makeTableFuncDep returns the set of functional dependencies derived from the
+// MakeTableFuncDep returns the set of functional dependencies derived from the
 // given base table. The set is derived lazily and is cached in the metadata,
 // since it may be accessed multiple times during query optimization. For more
 // details, see Relational.FuncDepSet.
-func makeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
+func MakeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 	fd, ok := md.TableAnnotation(tabID, fdAnnID).(*props.FuncDepSet)
 	if ok {
 		// Already made.
@@ -1288,7 +1457,7 @@ func makeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 	var allCols opt.ColSet
 	tab := md.Table(tabID)
 	for i := 0; i < tab.DeletableColumnCount(); i++ {
-		allCols.Add(int(tabID.ColumnID(i)))
+		allCols.Add(tabID.ColumnID(i))
 	}
 
 	fd = &props.FuncDepSet{}
@@ -1305,7 +1474,7 @@ func makeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 		// strict key. See the comment for cat.Index.LaxKeyColumnCount.
 		for col := 0; col < index.LaxKeyColumnCount(); col++ {
 			ord := index.Column(col).Ordinal
-			keyCols.Add(int(tabID.ColumnID(ord)))
+			keyCols.Add(tabID.ColumnID(ord))
 		}
 		if index.LaxKeyColumnCount() < index.KeyColumnCount() {
 			// This case only occurs for a UNIQUE index having a NULL-able column.
@@ -1403,6 +1572,44 @@ func (b *logicalPropsBuilder) addFiltersToFuncDep(filters FiltersExpr, fdset *pr
 	}
 }
 
+// updateCardinalityFromFilters determines whether a tight cardinality bound
+// can be determined from the filters, and updates the cardinality accordingly.
+// Specifically, it may be possible to determine a tight bound if the key
+// column(s) are constrained to a finite number of values.
+func (b *logicalPropsBuilder) updateCardinalityFromFilters(
+	filters FiltersExpr, rel *props.Relational,
+) {
+	for i := range filters {
+		filterProps := filters[i].ScalarProps(b.mem)
+		if filterProps.Constraints == nil {
+			continue
+		}
+
+		for j, n := 0, filterProps.Constraints.Length(); j < n; j++ {
+			c := filterProps.Constraints.Constraint(j)
+			b.updateCardinalityFromConstraint(c, rel)
+		}
+	}
+}
+
+// updateCardinalityFromConstraint determines whether a tight cardinality
+// bound can be determined from the constraint, and updates the cardinality
+// accordingly. Specifically, it may be possible to determine a tight bound
+// if the key column(s) are constrained to a finite number of values.
+func (b *logicalPropsBuilder) updateCardinalityFromConstraint(
+	c *constraint.Constraint, rel *props.Relational,
+) {
+	cols := c.Columns.ColSet()
+	if !rel.FuncDeps.ColsAreLaxKey(cols) {
+		return
+	}
+
+	count := c.CalculateMaxResults(b.evalCtx, cols, rel.NotNullCols)
+	if count != 0 && count < math.MaxUint32 {
+		rel.Cardinality = rel.Cardinality.Limit(uint32(count))
+	}
+}
+
 // ensureLookupJoinInputProps lazily populates the relational properties that
 // apply to the lookup side of the join, as if it were a Scan operator.
 func ensureLookupJoinInputProps(join *LookupJoinExpr, sb *statisticsBuilder) *props.Relational {
@@ -1410,10 +1617,18 @@ func ensureLookupJoinInputProps(join *LookupJoinExpr, sb *statisticsBuilder) *pr
 	if relational.OutputCols.Empty() {
 		md := join.Memo().Metadata()
 		relational.OutputCols = join.Cols.Difference(join.Input.Relational().OutputCols)
+
+		// Include the key columns in the output columns.
+		index := md.Table(join.Table).Index(join.Index)
+		for i := range join.KeyCols {
+			indexColID := join.Table.ColumnID(index.Column(i).Ordinal)
+			relational.OutputCols.Add(indexColID)
+		}
+
 		relational.NotNullCols = tableNotNullCols(md, join.Table)
 		relational.NotNullCols.IntersectionWith(relational.OutputCols)
 		relational.Cardinality = props.AnyCardinality
-		relational.FuncDeps.CopyFrom(makeTableFuncDep(md, join.Table))
+		relational.FuncDeps.CopyFrom(MakeTableFuncDep(md, join.Table))
 		relational.FuncDeps.ProjectCols(relational.OutputCols)
 		relational.Stats = *sb.makeTableStatistics(join.Table)
 	}
@@ -1458,7 +1673,7 @@ func ensureInputPropsForIndex(
 		relProps.NotNullCols = tableNotNullCols(md, tabID)
 		relProps.NotNullCols.IntersectionWith(relProps.OutputCols)
 		relProps.Cardinality = props.AnyCardinality
-		relProps.FuncDeps.CopyFrom(makeTableFuncDep(md, tabID))
+		relProps.FuncDeps.CopyFrom(MakeTableFuncDep(md, tabID))
 		relProps.FuncDeps.ProjectCols(relProps.OutputCols)
 		relProps.Stats = *sb.makeTableStatistics(tabID)
 	}
@@ -1474,7 +1689,7 @@ func tableNotNullCols(md *opt.Metadata, tabID opt.TableID) opt.ColSet {
 	for i := 0; i < tab.ColumnCount(); i++ {
 		// Non-null mutation columns can be null during backfill.
 		if !tab.Column(i).IsNullable() {
-			cs.Add(int(tabID.ColumnID(i)))
+			cs.Add(tabID.ColumnID(i))
 		}
 	}
 	return cs
@@ -1503,6 +1718,8 @@ type joinPropsHelper struct {
 	filterNotNullCols opt.ColSet
 	filterIsTrue      bool
 	filterIsFalse     bool
+
+	selfJoinCols opt.ColSet
 }
 
 func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
@@ -1523,9 +1740,13 @@ func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 		index := md.Table(join.Table).Index(join.Index)
 		for i, colID := range join.KeyCols {
 			indexColID := join.Table.ColumnID(index.Column(i).Ordinal)
-			h.filterNotNullCols.Add(int(colID))
-			h.filterNotNullCols.Add(int(indexColID))
+			h.filterNotNullCols.Add(colID)
+			h.filterNotNullCols.Add(indexColID)
 			h.filtersFD.AddEquivalency(colID, indexColID)
+			if colID == indexColID {
+				// This can happen if an index join was converted into a lookup join.
+				h.selfJoinCols.Add(colID)
+			}
 		}
 
 		// Lookup join has implicit equality conditions on KeyCols.
@@ -1544,8 +1765,8 @@ func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 		for i := range join.LeftEq {
 			l := join.LeftEq[i].ID()
 			r := join.RightEq[i].ID()
-			h.filterNotNullCols.Add(int(l))
-			h.filterNotNullCols.Add(int(r))
+			h.filterNotNullCols.Add(l)
+			h.filterNotNullCols.Add(r)
 			h.filtersFD.AddEquivalency(l, r)
 		}
 
@@ -1567,8 +1788,8 @@ func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 			leftColID := join.LeftEqCols[i]
 			rightColID := join.RightEqCols[i]
 
-			h.filterNotNullCols.Add(int(leftColID))
-			h.filterNotNullCols.Add(int(rightColID))
+			h.filterNotNullCols.Add(leftColID)
+			h.filterNotNullCols.Add(rightColID)
 			h.filtersFD.AddEquivalency(leftColID, rightColID)
 		}
 
@@ -1615,7 +1836,7 @@ func (h *joinPropsHelper) notNullCols() opt.ColSet {
 	// Left/full outer joins can result in right columns becoming null.
 	// Otherwise, propagate not null setting from right child.
 	switch h.joinType {
-	case opt.LeftJoinOp, opt.FullJoinOp, opt.LeftJoinApplyOp, opt.FullJoinApplyOp,
+	case opt.LeftJoinOp, opt.FullJoinOp, opt.LeftJoinApplyOp,
 		opt.SemiJoinOp, opt.SemiJoinApplyOp, opt.AntiJoinOp, opt.AntiJoinApplyOp:
 
 	default:
@@ -1625,7 +1846,7 @@ func (h *joinPropsHelper) notNullCols() opt.ColSet {
 	// Right/full outer joins can result in left columns becoming null.
 	// Otherwise, propagate not null setting from left child.
 	switch h.joinType {
-	case opt.RightJoinOp, opt.FullJoinOp, opt.RightJoinApplyOp, opt.FullJoinApplyOp:
+	case opt.RightJoinOp, opt.FullJoinOp:
 
 	default:
 		notNullCols.UnionWith(h.leftProps.NotNullCols)
@@ -1683,13 +1904,13 @@ func (h *joinPropsHelper) setFuncDeps(rel *props.Relational) {
 			rel.FuncDeps.AddFrom(&h.filtersFD)
 			addOuterColsToFuncDep(rel.OuterCols, &rel.FuncDeps)
 
-		case opt.RightJoinOp, opt.RightJoinApplyOp:
+		case opt.RightJoinOp:
 			rel.FuncDeps.MakeOuter(h.leftProps.OutputCols, notNullInputCols)
 
 		case opt.LeftJoinOp, opt.LeftJoinApplyOp:
 			rel.FuncDeps.MakeOuter(h.rightProps.OutputCols, notNullInputCols)
 
-		case opt.FullJoinOp, opt.FullJoinApplyOp:
+		case opt.FullJoinOp:
 			// Clear the relation's key if all columns are nullable, because
 			// duplicate all-null rows are possible:
 			//
@@ -1745,10 +1966,10 @@ func (h *joinPropsHelper) cardinality() props.Cardinality {
 	case opt.LeftJoinOp, opt.LeftJoinApplyOp:
 		return innerJoinCard.AtLeast(left)
 
-	case opt.RightJoinOp, opt.RightJoinApplyOp:
+	case opt.RightJoinOp:
 		return innerJoinCard.AtLeast(right)
 
-	case opt.FullJoinOp, opt.FullJoinApplyOp:
+	case opt.FullJoinOp:
 		if innerJoinCard.IsZero() {
 			// In this case, we know that each left or right row will generate an
 			// output row.

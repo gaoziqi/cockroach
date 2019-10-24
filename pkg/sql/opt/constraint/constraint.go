@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package constraint
 
@@ -18,10 +14,9 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // Constraint specifies the possible set of values that one or more columns
@@ -54,7 +49,7 @@ type Constraint struct {
 func (c *Constraint) Init(keyCtx *KeyContext, spans *Spans) {
 	for i := 1; i < spans.Count(); i++ {
 		if !spans.Get(i).StartsStrictlyAfter(keyCtx, spans.Get(i-1)) {
-			panic(pgerror.AssertionFailedf("spans must be ordered and non-overlapping"))
+			panic(errors.AssertionFailedf("spans must be ordered and non-overlapping"))
 		}
 	}
 	c.Columns = keyCtx.Columns
@@ -86,7 +81,7 @@ func (c *Constraint) IsUnconstrained() bool {
 // constraints.
 func (c *Constraint) UnionWith(evalCtx *tree.EvalContext, other *Constraint) {
 	if !c.Columns.Equals(&other.Columns) {
-		panic(pgerror.AssertionFailedf("column mismatch"))
+		panic(errors.AssertionFailedf("column mismatch"))
 	}
 	if c.IsUnconstrained() || other.IsContradiction() {
 		return
@@ -174,7 +169,7 @@ func (c *Constraint) UnionWith(evalCtx *tree.EvalContext, other *Constraint) {
 // should be marked as empty and all constraints removed.
 func (c *Constraint) IntersectWith(evalCtx *tree.EvalContext, other *Constraint) {
 	if !c.Columns.Equals(&other.Columns) {
-		panic(pgerror.AssertionFailedf("column mismatch"))
+		panic(errors.AssertionFailedf("column mismatch"))
 	}
 	if c.IsContradiction() || other.IsUnconstrained() {
 		return
@@ -263,7 +258,7 @@ func (c *Constraint) Combine(evalCtx *tree.EvalContext, other *Constraint) {
 	if !other.Columns.IsStrictSuffixOf(&c.Columns) {
 		// Note: we don't want to let the c and other pointers escape by passing
 		// them directly to Sprintf.
-		panic(pgerror.AssertionFailedf("%s not a suffix of %s", other.String(), c.String()))
+		panic(errors.AssertionFailedf("%s not a suffix of %s", other.String(), c.String()))
 	}
 	if c.IsUnconstrained() || c.IsContradiction() || other.IsUnconstrained() {
 		return
@@ -404,7 +399,9 @@ func (c *Constraint) ConsolidateSpans(evalCtx *tree.EvalContext) {
 					result.Append(c.Spans.Get(j))
 				}
 			}
-			result.Get(result.Count() - 1).end = sp.end
+			r := result.Get(result.Count() - 1)
+			r.end = sp.end
+			r.endBoundary = sp.endBoundary
 		} else {
 			if result.Count() != 0 {
 				result.Append(sp)
@@ -504,7 +501,7 @@ func (c *Constraint) ExtractConstCols(evalCtx *tree.EvalContext) opt.ColSet {
 	var res opt.ColSet
 	pre := c.ExactPrefix(evalCtx)
 	for i := 0; i < pre; i++ {
-		res.Add(int(c.Columns.Get(i).ID()))
+		res.Add(c.Columns.Get(i).ID())
 	}
 	return res
 }
@@ -538,7 +535,7 @@ func (c *Constraint) ExtractNotNullCols(evalCtx *tree.EvalContext) opt.ColSet {
 			hasNull = hasNull || start.Value(i) == tree.DNull
 		}
 		if !hasNull {
-			res.Add(int(c.Columns.Get(i).ID()))
+			res.Add(c.Columns.Get(i).ID())
 		}
 	}
 	if prefix == c.Columns.Count() {
@@ -563,7 +560,7 @@ func (c *Constraint) ExtractNotNullCols(evalCtx *tree.EvalContext) opt.ColSet {
 		}
 	}
 	// All spans constrain col to be not-null.
-	res.Add(int(col.ID()))
+	res.Add(col.ID())
 	return res
 }
 
@@ -581,7 +578,7 @@ func (c *Constraint) ExtractNotNullCols(evalCtx *tree.EvalContext) opt.ColSet {
 // planner and optimizer need this logic, due to the heuristic planner planning
 // mutations. Once the optimizer plans mutations, this method can go away.
 func (c *Constraint) CalculateMaxResults(
-	evalCtx *tree.EvalContext, indexCols util.FastIntSet, notNullCols util.FastIntSet,
+	evalCtx *tree.EvalContext, indexCols opt.ColSet, notNullCols opt.ColSet,
 ) uint64 {
 	// Ensure that if we have nullable columns, we are only reading non-null
 	// values, given that a unique index allows an arbitrary number of duplicate
@@ -595,13 +592,13 @@ func (c *Constraint) CalculateMaxResults(
 	// Check if the longest prefix of columns for which all the spans have the
 	// same start and end values covers all columns.
 	prefix := c.Prefix(evalCtx)
-	distinctVals := uint64(1)
+	var distinctVals uint64
 	if prefix < numCols-1 {
 		return 0
 	} else if prefix == numCols-1 {
 		// If the prefix does not include the last column, calculate the number of
 		// distinct values possible in the span. This is only supported for int
-		// types.
+		// and date types.
 		for i := 0; i < c.Spans.Count(); i++ {
 			sp := c.Spans.Get(i)
 			start := sp.StartKey()
@@ -616,17 +613,37 @@ func (c *Constraint) CalculateMaxResults(
 			// updateDistinctCountsFromConstraint. It would be nice to extract this
 			// logic somewhere.
 			colIdx := numCols - 1
-			if start.Value(colIdx).ResolvedType().Family() != types.IntFamily ||
-				end.Value(colIdx).ResolvedType().Family() != types.IntFamily {
+			startVal := start.Value(colIdx)
+			endVal := end.Value(colIdx)
+			var startIntVal, endIntVal int64
+			if startVal.ResolvedType().Family() == types.IntFamily &&
+				endVal.ResolvedType().Family() == types.IntFamily {
+				startIntVal = int64(*startVal.(*tree.DInt))
+				endIntVal = int64(*endVal.(*tree.DInt))
+			} else if startVal.ResolvedType().Family() == types.DateFamily &&
+				endVal.ResolvedType().Family() == types.DateFamily {
+				startDate := startVal.(*tree.DDate)
+				endDate := endVal.(*tree.DDate)
+				if !startDate.IsFinite() || !endDate.IsFinite() {
+					// One of the boundaries is not finite, so we can't determine the
+					// distinct count for this column.
+					return 0
+				}
+				startIntVal = int64(startDate.PGEpochDays())
+				endIntVal = int64(endDate.PGEpochDays())
+			} else {
 				return 0
 			}
-			startVal := int(*start.Value(colIdx).(*tree.DInt))
-			endVal := int(*end.Value(colIdx).(*tree.DInt))
+
 			if c.Columns.Get(colIdx).Ascending() {
-				distinctVals += uint64(endVal - startVal)
+				distinctVals += uint64(endIntVal - startIntVal)
 			} else {
-				distinctVals += uint64(startVal - endVal)
+				distinctVals += uint64(startIntVal - endIntVal)
 			}
+
+			// Add one since both start and end boundaries should be inclusive
+			// (due to Span.PreferInclusive).
+			distinctVals++
 		}
 	} else {
 		distinctVals = uint64(c.Spans.Count())

@@ -1,21 +1,17 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package types
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
 
@@ -49,7 +45,7 @@ var (
 
 	// OidVector is a type-alias for an array of Oid values, but with a different
 	// OID (T_oidvector instead of T__oid). It is a special VECTOR type used by
-	// Postgres in system tables.
+	// Postgres in system tables. OidVectors are 0-indexed, unlike normal arrays.
 	OidVector = &T{InternalType: InternalType{
 		Family: ArrayFamily, Oid: oid.T_oidvector, ArrayContents: Oid, Locale: &emptyLocale}}
 )
@@ -197,7 +193,7 @@ func calcArrayOid(elemTyp *T) oid.Oid {
 	// init method).
 	o = oidToArrayOid[o]
 	if o == 0 {
-		panic(pgerror.AssertionFailedf("oid %d couldn't be mapped to array oid", o))
+		panic(errors.AssertionFailedf("oid %d couldn't be mapped to array oid", o))
 	}
 	return o
 }

@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package issues
 
@@ -80,6 +76,7 @@ func TestPost(t *testing.T) {
 		packageName string
 		testName    string
 		message     string
+		artifacts   string
 		author      string
 	}{
 		{
@@ -96,6 +93,14 @@ func TestPost(t *testing.T) {
 			message:     "F170517 07:33:43.763059 69575 storage/replica.go:1360  [n3,s3,r1/3:/M{in-ax}] on-disk and in-memory state diverged:",
 			author:      "bran",
 		},
+		{
+			name:        "with artifacts",
+			packageName: "github.com/cockroachdb/cockroach/pkg/storage",
+			testName:    "kv/splits/nodes=3/quiesce=true",
+			message:     "The test failed on branch=master, cloud=gce:",
+			artifacts:   "/kv/splits/nodes=3/quiesce=true",
+			author:      "bran",
+		},
 	}
 
 	for _, c := range testCases {
@@ -105,6 +110,11 @@ func TestPost(t *testing.T) {
 				name = name + "-existing-issue"
 			}
 			t.Run(name, func(t *testing.T) {
+				expURL := fmt.Sprintf("%s/viewLog.html?buildId=%d&tab=buildLog", serverURL, buildID)
+				if c.artifacts != "" {
+					expURL = fmt.Sprintf("%s/viewLog.html?buildId=%d&tab=artifacts#%s", serverURL, buildID, c.artifacts)
+				}
+
 				reString := fmt.Sprintf(`(?s)\ASHA: https://github.com/cockroachdb/cockroach/commits/%s
 
 Parameters:
@@ -128,7 +138,7 @@ Failed test: %s`,
 					regexp.QuoteMeta(parameters),
 					c.testName,
 					c.packageName,
-					regexp.QuoteMeta(fmt.Sprintf("%s/viewLog.html?buildId=%d&tab=buildLog", serverURL, buildID)),
+					regexp.QuoteMeta(expURL),
 				)
 
 				issueBodyRe, err := regexp.Compile(
@@ -253,7 +263,7 @@ Failed test: %s`,
 				ctx := context.Background()
 				if err := p.post(
 					ctx, DefaultStressFailureTitle(c.packageName, c.testName),
-					c.packageName, c.testName, c.message, c.author, nil,
+					c.packageName, c.testName, c.message, c.artifacts, c.author, nil,
 				); err != nil {
 					t.Fatal(err)
 				}

@@ -12,10 +12,6 @@ create table Person (
   primary key (id)
 )
 ----
-TABLE person
- ├── id int not null
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table Phone (
@@ -26,13 +22,6 @@ create table Phone (
   primary key (id)
 )
 ----
-TABLE phone
- ├── id int not null
- ├── number varchar
- ├── since timestamp
- ├── type int4
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table phone_register (
@@ -44,17 +33,6 @@ create table phone_register (
   unique (person_id)
 )
 ----
-TABLE phone_register
- ├── phone_id int not null
- ├── person_id int not null
- ├── INDEX primary
- │    ├── phone_id int not null
- │    └── person_id int not null
- ├── INDEX secondary
- │    ├── person_id int not null
- │    └── phone_id int not null (storing)
- ├── CONSTRAINT fk_person_id_ref_phone FOREIGN KEY (person_id) REFERENCES t.public.phone (id)
- └── CONSTRAINT fk_phone_id_ref_person FOREIGN KEY (phone_id) REFERENCES t.public.person (id)
 
 opt
 select
@@ -122,15 +100,6 @@ create table Person (
     primary key (id)
 )
 ----
-TABLE person
- ├── id int not null
- ├── address varchar
- ├── createdon timestamp
- ├── name varchar
- ├── nickname varchar
- ├── version int4 not null
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table Person_addresses (
@@ -140,13 +109,6 @@ create table Person_addresses (
     primary key (Person_id, addresses_KEY)
 )
 ----
-TABLE person_addresses
- ├── person_id int not null
- ├── addresses varchar
- ├── addresses_key varchar not null
- └── INDEX primary
-      ├── person_id int not null
-      └── addresses_key varchar not null
 
 exec-ddl
 create table Phone (
@@ -158,14 +120,6 @@ create table Phone (
     primary key (id)
 )
 ----
-TABLE phone
- ├── id int not null
- ├── phone_number varchar
- ├── phone_type varchar
- ├── person_id int
- ├── order_id int4
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table phone_call (
@@ -176,13 +130,6 @@ create table phone_call (
     primary key (id)
 )
 ----
-TABLE phone_call
- ├── id int not null
- ├── duration int4 not null
- ├── call_timestamp timestamp
- ├── phone_id int
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table Partner (
@@ -192,12 +139,6 @@ create table Partner (
     primary key (id)
 )
 ----
-TABLE partner
- ├── id int not null
- ├── name varchar
- ├── version int4 not null
- └── INDEX primary
-      └── id int not null
 
 opt
 select
@@ -235,43 +176,38 @@ where
             phone0_.id=calls3_.phone_id
     )
 ----
-inner-join
+inner-join (hash)
  ├── columns: id1_6_0_:1(int!null) id1_4_1_:6(int!null) phone_nu2_6_0_:2(varchar) person_i4_6_0_:4(int!null) phone_ty3_6_0_:3(varchar) person_i1_5_0__:12(int!null) addresse2_5_0__:13(varchar) addresse3_0__:14(varchar!null) address2_4_1_:7(varchar) createdo3_4_1_:8(timestamp) name4_4_1_:9(varchar) nickname5_4_1_:10(varchar) version6_4_1_:11(int4!null) person_i1_5_0__:12(int!null) addresse2_5_0__:13(varchar) addresse3_0__:14(varchar!null)
  ├── key: (1,14)
  ├── fd: (1)-->(2-4), (6)-->(7-11), (4)==(6,12), (6)==(4,12), (12,14)-->(13), (12)==(4,6)
- ├── semi-join
- │    ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) phone0_.person_id:4(int)
+ ├── scan addresses2_
+ │    ├── columns: addresses2_.person_id:12(int!null) addresses:13(varchar) addresses_key:14(varchar!null)
+ │    ├── key: (12,14)
+ │    └── fd: (12,14)-->(13)
+ ├── inner-join (lookup person)
+ │    ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) phone0_.person_id:4(int!null) person1_.id:6(int!null) address:7(varchar) createdon:8(timestamp) name:9(varchar) nickname:10(varchar) version:11(int4!null)
+ │    ├── key columns: [4] = [6]
  │    ├── key: (1)
- │    ├── fd: (1)-->(2-4)
- │    ├── scan phone0_
+ │    ├── fd: (1)-->(2-4), (6)-->(7-11), (4)==(6), (6)==(4)
+ │    ├── project
  │    │    ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) phone0_.person_id:4(int)
  │    │    ├── key: (1)
- │    │    └── fd: (1)-->(2-4)
- │    ├── scan calls3_
- │    │    ├── columns: calls3_.id:15(int!null) phone_id:18(int)
- │    │    ├── key: (15)
- │    │    └── fd: (15)-->(18)
- │    └── filters
- │         └── phone0_.id = phone_id [type=bool, outer=(1,18), constraints=(/1: (/NULL - ]; /18: (/NULL - ]), fd=(1)==(18), (18)==(1)]
- ├── inner-join (merge)
- │    ├── columns: person1_.id:6(int!null) address:7(varchar) createdon:8(timestamp) name:9(varchar) nickname:10(varchar) version:11(int4!null) addresses2_.person_id:12(int!null) addresses:13(varchar) addresses_key:14(varchar!null)
- │    ├── left ordering: +6
- │    ├── right ordering: +12
- │    ├── key: (12,14)
- │    ├── fd: (6)-->(7-11), (12,14)-->(13), (6)==(12), (12)==(6)
- │    ├── scan person1_
- │    │    ├── columns: person1_.id:6(int!null) address:7(varchar) createdon:8(timestamp) name:9(varchar) nickname:10(varchar) version:11(int4!null)
- │    │    ├── key: (6)
- │    │    ├── fd: (6)-->(7-11)
- │    │    └── ordering: +6
- │    ├── scan addresses2_
- │    │    ├── columns: addresses2_.person_id:12(int!null) addresses:13(varchar) addresses_key:14(varchar!null)
- │    │    ├── key: (12,14)
- │    │    ├── fd: (12,14)-->(13)
- │    │    └── ordering: +12
+ │    │    ├── fd: (1)-->(2-4)
+ │    │    └── inner-join (lookup phone)
+ │    │         ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) phone0_.person_id:4(int) phone_id:18(int!null)
+ │    │         ├── key columns: [18] = [1]
+ │    │         ├── key: (18)
+ │    │         ├── fd: (1)-->(2-4), (1)==(18), (18)==(1)
+ │    │         ├── distinct-on
+ │    │         │    ├── columns: phone_id:18(int)
+ │    │         │    ├── grouping columns: phone_id:18(int)
+ │    │         │    ├── key: (18)
+ │    │         │    └── scan calls3_
+ │    │         │         └── columns: phone_id:18(int)
+ │    │         └── filters (true)
  │    └── filters (true)
  └── filters
-      └── phone0_.person_id = person1_.id [type=bool, outer=(4,6), constraints=(/4: (/NULL - ]; /6: (/NULL - ]), fd=(4)==(6), (6)==(4)]
+      └── person1_.id = addresses2_.person_id [type=bool, outer=(6,12), constraints=(/6: (/NULL - ]; /12: (/NULL - ]), fd=(6)==(12), (12)==(6)]
 
 opt
 select
@@ -300,38 +236,35 @@ where
 project
  ├── columns: id1_6_:1(int!null) phone_nu2_6_:2(varchar) person_i4_6_:4(int!null) phone_ty3_6_:3(varchar)
  ├── fd: (1)-->(2-4)
- └── inner-join
+ └── inner-join (hash)
       ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) phone0_.person_id:4(int!null) person1_.id:6(int!null) addresses2_.person_id:12(int!null)
       ├── fd: (1)-->(2-4), (4)==(6,12), (6)==(4,12), (12)==(4,6)
-      ├── semi-join
-      │    ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) phone0_.person_id:4(int)
+      ├── scan addresses2_
+      │    └── columns: addresses2_.person_id:12(int!null)
+      ├── inner-join (lookup person)
+      │    ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) phone0_.person_id:4(int!null) person1_.id:6(int!null)
+      │    ├── key columns: [4] = [6]
       │    ├── key: (1)
-      │    ├── fd: (1)-->(2-4)
-      │    ├── scan phone0_
+      │    ├── fd: (1)-->(2-4), (4)==(6), (6)==(4)
+      │    ├── project
       │    │    ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) phone0_.person_id:4(int)
       │    │    ├── key: (1)
-      │    │    └── fd: (1)-->(2-4)
-      │    ├── scan calls3_
-      │    │    ├── columns: calls3_.id:15(int!null) phone_id:18(int)
-      │    │    ├── key: (15)
-      │    │    └── fd: (15)-->(18)
-      │    └── filters
-      │         └── phone0_.id = phone_id [type=bool, outer=(1,18), constraints=(/1: (/NULL - ]; /18: (/NULL - ]), fd=(1)==(18), (18)==(1)]
-      ├── inner-join (merge)
-      │    ├── columns: person1_.id:6(int!null) addresses2_.person_id:12(int!null)
-      │    ├── left ordering: +6
-      │    ├── right ordering: +12
-      │    ├── fd: (6)==(12), (12)==(6)
-      │    ├── scan person1_
-      │    │    ├── columns: person1_.id:6(int!null)
-      │    │    ├── key: (6)
-      │    │    └── ordering: +6
-      │    ├── scan addresses2_
-      │    │    ├── columns: addresses2_.person_id:12(int!null)
-      │    │    └── ordering: +12
+      │    │    ├── fd: (1)-->(2-4)
+      │    │    └── inner-join (lookup phone)
+      │    │         ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) phone0_.person_id:4(int) phone_id:18(int!null)
+      │    │         ├── key columns: [18] = [1]
+      │    │         ├── key: (18)
+      │    │         ├── fd: (1)-->(2-4), (1)==(18), (18)==(1)
+      │    │         ├── distinct-on
+      │    │         │    ├── columns: phone_id:18(int)
+      │    │         │    ├── grouping columns: phone_id:18(int)
+      │    │         │    ├── key: (18)
+      │    │         │    └── scan calls3_
+      │    │         │         └── columns: phone_id:18(int)
+      │    │         └── filters (true)
       │    └── filters (true)
       └── filters
-           └── phone0_.person_id = person1_.id [type=bool, outer=(4,6), constraints=(/4: (/NULL - ]; /6: (/NULL - ]), fd=(4)==(6), (6)==(4)]
+           └── person1_.id = addresses2_.person_id [type=bool, outer=(6,12), constraints=(/6: (/NULL - ]; /12: (/NULL - ]), fd=(6)==(12), (12)==(6)]
 
 opt
 select
@@ -365,33 +298,30 @@ where
     )
     and partner1_.version=0
 ----
-inner-join
+inner-join (hash)
  ├── columns: id1_4_0_:1(int!null) id1_2_1_:7(int!null) address2_4_0_:2(varchar!null) createdo3_4_0_:3(timestamp) name4_4_0_:4(varchar) nickname5_4_0_:5(varchar) version6_4_0_:6(int4!null) name2_2_1_:8(varchar!null) version3_2_1_:9(int4!null)
  ├── has-placeholder
  ├── key: (1,7)
  ├── fd: ()-->(9), (1)-->(2-6), (7)-->(8)
- ├── semi-join
+ ├── project
  │    ├── columns: person0_.id:1(int!null) address:2(varchar!null) createdon:3(timestamp) person0_.name:4(varchar) nickname:5(varchar) person0_.version:6(int4!null)
  │    ├── has-placeholder
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-6)
- │    ├── select
- │    │    ├── columns: person0_.id:1(int!null) address:2(varchar!null) createdon:3(timestamp) person0_.name:4(varchar) nickname:5(varchar) person0_.version:6(int4!null)
- │    │    ├── has-placeholder
- │    │    ├── key: (1)
- │    │    ├── fd: (1)-->(2-6)
- │    │    ├── scan person0_
- │    │    │    ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) person0_.name:4(varchar) nickname:5(varchar) person0_.version:6(int4!null)
- │    │    │    ├── key: (1)
- │    │    │    └── fd: (1)-->(2-6)
- │    │    └── filters
- │    │         └── address = $1 [type=bool, outer=(2), constraints=(/2: (/NULL - ])]
- │    ├── scan phones2_
- │    │    ├── columns: phones2_.id:10(int!null) person_id:13(int)
- │    │    ├── key: (10)
- │    │    └── fd: (10)-->(13)
- │    └── filters
- │         └── person0_.id = person_id [type=bool, outer=(1,13), constraints=(/1: (/NULL - ]; /13: (/NULL - ]), fd=(1)==(13), (13)==(1)]
+ │    └── inner-join (lookup person)
+ │         ├── columns: person0_.id:1(int!null) address:2(varchar!null) createdon:3(timestamp) person0_.name:4(varchar) nickname:5(varchar) person0_.version:6(int4!null) person_id:13(int!null)
+ │         ├── key columns: [13] = [1]
+ │         ├── has-placeholder
+ │         ├── key: (13)
+ │         ├── fd: (1)-->(2-6), (1)==(13), (13)==(1)
+ │         ├── distinct-on
+ │         │    ├── columns: person_id:13(int)
+ │         │    ├── grouping columns: person_id:13(int)
+ │         │    ├── key: (13)
+ │         │    └── scan phones2_
+ │         │         └── columns: person_id:13(int)
+ │         └── filters
+ │              └── address = $1 [type=bool, outer=(2), constraints=(/2: (/NULL - ])]
  ├── select
  │    ├── columns: partner1_.id:7(int!null) partner1_.name:8(varchar!null) partner1_.version:9(int4!null)
  │    ├── has-placeholder
@@ -425,16 +355,6 @@ create table Customer_AUD (
     primary key (id, REV)
 )
 ----
-TABLE customer_aud
- ├── id int not null
- ├── rev int4 not null
- ├── revtype int2
- ├── created_on timestamp
- ├── firstname varchar
- ├── lastname varchar
- └── INDEX primary
-      ├── id int not null
-      └── rev int4 not null
 
 opt
 select
@@ -541,18 +461,6 @@ create table Customer_AUD (
     primary key (id, REV)
 )
 ----
-TABLE customer_aud
- ├── id int not null
- ├── rev int4 not null
- ├── revtype int2
- ├── revend int4
- ├── created_on timestamp
- ├── firstname varchar
- ├── lastname varchar
- ├── address_id int
- └── INDEX primary
-      ├── id int not null
-      └── rev int4 not null
 
 opt
 select
@@ -680,14 +588,6 @@ create table Phone (
     primary key (id)
 )
 ----
-TABLE phone
- ├── id int not null
- ├── phone_number varchar
- ├── phone_type varchar
- ├── person_id int
- ├── order_id int4
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table phone_call (
@@ -698,13 +598,6 @@ create table phone_call (
     primary key (id)
 )
 ----
-TABLE phone_call
- ├── id int not null
- ├── duration int4 not null
- ├── call_timestamp timestamp
- ├── phone_id int
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table Person (
@@ -717,15 +610,6 @@ create table Person (
     primary key (id)
 )
 ----
-TABLE person
- ├── id int not null
- ├── address varchar
- ├── createdon timestamp
- ├── name varchar
- ├── nickname varchar
- ├── version int4 not null
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table Phone_repairTimestamps (
@@ -733,12 +617,6 @@ create table Phone_repairTimestamps (
    repairTimestamps timestamp
 )
 ----
-TABLE phone_repairtimestamps
- ├── phone_id int not null
- ├── repairtimestamps timestamp
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 exec-ddl
 create table Person_addresses (
@@ -748,13 +626,6 @@ create table Person_addresses (
     primary key (Person_id, addresses_KEY)
 )
 ----
-TABLE person_addresses
- ├── person_id int not null
- ├── addresses varchar
- ├── addresses_key varchar not null
- └── INDEX primary
-      ├── person_id int not null
-      └── addresses_key varchar not null
 
 opt
 select
@@ -787,13 +658,20 @@ distinct-on
  ├── grouping columns: person2_.id:10(int!null)
  ├── key: (10)
  ├── fd: (10)-->(11-15)
- ├── inner-join
+ ├── inner-join (hash)
  │    ├── columns: phone0_.id:1(int!null) person_id:4(int!null) calls1_.phone_id:9(int!null) person2_.id:10(int!null) address:11(varchar) createdon:12(timestamp) name:13(varchar) nickname:14(varchar) version:15(int4!null)
  │    ├── fd: (1)-->(4), (1)==(9), (9)==(1), (10)-->(11-15), (4)==(10), (10)==(4)
- │    ├── inner-join
- │    │    ├── columns: phone0_.id:1(int!null) person_id:4(int) calls1_.phone_id:9(int!null)
- │    │    ├── fd: (1)-->(4), (1)==(9), (9)==(1)
- │    │    ├── anti-join
+ │    ├── scan calls1_
+ │    │    └── columns: calls1_.phone_id:9(int)
+ │    ├── inner-join (hash)
+ │    │    ├── columns: phone0_.id:1(int!null) person_id:4(int!null) person2_.id:10(int!null) address:11(varchar) createdon:12(timestamp) name:13(varchar) nickname:14(varchar) version:15(int4!null)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (1)-->(4), (10)-->(11-15), (4)==(10), (10)==(4)
+ │    │    ├── scan person2_
+ │    │    │    ├── columns: person2_.id:10(int!null) address:11(varchar) createdon:12(timestamp) name:13(varchar) nickname:14(varchar) version:15(int4!null)
+ │    │    │    ├── key: (10)
+ │    │    │    └── fd: (10)-->(11-15)
+ │    │    ├── anti-join (hash)
  │    │    │    ├── columns: phone0_.id:1(int!null) person_id:4(int)
  │    │    │    ├── key: (1)
  │    │    │    ├── fd: (1)-->(4)
@@ -809,16 +687,10 @@ distinct-on
  │    │    │    │         └── (call3_.duration >= 50) IS NOT false [type=bool, outer=(17)]
  │    │    │    └── filters
  │    │    │         └── call3_.phone_id = phone0_.id [type=bool, outer=(1,19), constraints=(/1: (/NULL - ]; /19: (/NULL - ]), fd=(1)==(19), (19)==(1)]
- │    │    ├── scan calls1_
- │    │    │    └── columns: calls1_.phone_id:9(int)
  │    │    └── filters
- │    │         └── phone0_.id = calls1_.phone_id [type=bool, outer=(1,9), constraints=(/1: (/NULL - ]; /9: (/NULL - ]), fd=(1)==(9), (9)==(1)]
- │    ├── scan person2_
- │    │    ├── columns: person2_.id:10(int!null) address:11(varchar) createdon:12(timestamp) name:13(varchar) nickname:14(varchar) version:15(int4!null)
- │    │    ├── key: (10)
- │    │    └── fd: (10)-->(11-15)
+ │    │         └── person_id = person2_.id [type=bool, outer=(4,10), constraints=(/4: (/NULL - ]; /10: (/NULL - ]), fd=(4)==(10), (10)==(4)]
  │    └── filters
- │         └── person_id = person2_.id [type=bool, outer=(4,10), constraints=(/4: (/NULL - ]; /10: (/NULL - ]), fd=(4)==(10), (10)==(4)]
+ │         └── phone0_.id = calls1_.phone_id [type=bool, outer=(1,9), constraints=(/1: (/NULL - ]; /9: (/NULL - ]), fd=(1)==(9), (9)==(1)]
  └── aggregations
       ├── const-agg [type=varchar, outer=(11)]
       │    └── variable: address [type=varchar]
@@ -864,7 +736,7 @@ project
       │    ├── grouping columns: phone0_.id:1(int!null)
       │    ├── key: (1)
       │    ├── fd: (1)-->(2-4,10)
-      │    ├── inner-join
+      │    ├── inner-join (hash)
       │    │    ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) person_id:4(int) calls1_.id:6(int!null) phone_id:9(int!null)
       │    │    ├── key: (6)
       │    │    ├── fd: (1)-->(2-4), (6)-->(9), (1)==(9), (9)==(1)
@@ -923,7 +795,7 @@ project
       │    ├── grouping columns: person0_.id:1(int!null)
       │    ├── key: (1)
       │    ├── fd: (1)-->(2-6,12)
-      │    ├── left-join
+      │    ├── left-join (hash)
       │    │    ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null) person_id:10(int)
       │    │    ├── fd: (1)-->(2-6)
       │    │    ├── scan person0_
@@ -983,7 +855,7 @@ project
       │    ├── grouping columns: phone0_.id:1(int!null)
       │    ├── key: (1)
       │    ├── fd: (1)-->(2-4,10)
-      │    ├── inner-join
+      │    ├── inner-join (hash)
       │    │    ├── columns: phone0_.id:1(int!null) phone_number:2(varchar) phone_type:3(varchar) person_id:4(int) calls1_.id:6(int!null) phone_id:9(int!null)
       │    │    ├── key: (6)
       │    │    ├── fd: (1)-->(2-4), (6)-->(9), (1)==(9), (9)==(1)
@@ -1042,7 +914,7 @@ project
       │    ├── grouping columns: person0_.id:1(int!null)
       │    ├── key: (1)
       │    ├── fd: (1)-->(2-6,12)
-      │    ├── inner-join
+      │    ├── inner-join (hash)
       │    │    ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null) person_id:10(int!null) order_id:11(int4!null)
       │    │    ├── fd: (1)-->(2-6), (1)==(10), (10)==(1)
       │    │    ├── scan person0_
@@ -1093,28 +965,34 @@ where
             person0_.id=phones1_.person_id
     )
 ----
-semi-join
+project
  ├── columns: id1_2_:1(int!null) address2_2_:2(varchar) createdo3_2_:3(timestamp) name4_2_:4(varchar) nickname5_2_:5(varchar) version6_2_:6(int4!null)
  ├── has-placeholder
  ├── key: (1)
  ├── fd: (1)-->(2-6)
- ├── scan person0_
- │    ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null)
- │    ├── key: (1)
- │    └── fd: (1)-->(2-6)
- ├── select
- │    ├── columns: phones1_.id:7(int!null) person_id:10(int)
- │    ├── has-placeholder
- │    ├── key: (7)
- │    ├── fd: (7)-->(10)
- │    ├── scan phones1_
- │    │    ├── columns: phones1_.id:7(int!null) person_id:10(int)
- │    │    ├── key: (7)
- │    │    └── fd: (7)-->(10)
- │    └── filters
- │         └── phones1_.id = $1::INT8 [type=bool, outer=(7), constraints=(/7: (/NULL - ])]
- └── filters
-      └── person0_.id = person_id [type=bool, outer=(1,10), constraints=(/1: (/NULL - ]; /10: (/NULL - ]), fd=(1)==(10), (10)==(1)]
+ └── inner-join (lookup person)
+      ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null) person_id:10(int!null)
+      ├── key columns: [10] = [1]
+      ├── has-placeholder
+      ├── key: (10)
+      ├── fd: (1)-->(2-6), (1)==(10), (10)==(1)
+      ├── distinct-on
+      │    ├── columns: person_id:10(int)
+      │    ├── grouping columns: person_id:10(int)
+      │    ├── has-placeholder
+      │    ├── key: (10)
+      │    └── select
+      │         ├── columns: phones1_.id:7(int!null) person_id:10(int)
+      │         ├── has-placeholder
+      │         ├── key: (7)
+      │         ├── fd: (7)-->(10)
+      │         ├── scan phones1_
+      │         │    ├── columns: phones1_.id:7(int!null) person_id:10(int)
+      │         │    ├── key: (7)
+      │         │    └── fd: (7)-->(10)
+      │         └── filters
+      │              └── phones1_.id = $1::INT8 [type=bool, outer=(7), constraints=(/7: (/NULL - ])]
+      └── filters (true)
 
 opt
 select
@@ -1136,28 +1014,34 @@ where
             person0_.id=phones1_.person_id
     )
 ----
-semi-join
+project
  ├── columns: id1_2_:1(int!null) address2_2_:2(varchar) createdo3_2_:3(timestamp) name4_2_:4(varchar) nickname5_2_:5(varchar) version6_2_:6(int4!null)
  ├── has-placeholder
  ├── key: (1)
  ├── fd: (1)-->(2-6)
- ├── scan person0_
- │    ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null)
- │    ├── key: (1)
- │    └── fd: (1)-->(2-6)
- ├── select
- │    ├── columns: phones1_.id:7(int!null) person_id:10(int)
- │    ├── has-placeholder
- │    ├── key: (7)
- │    ├── fd: (7)-->(10)
- │    ├── scan phones1_
- │    │    ├── columns: phones1_.id:7(int!null) person_id:10(int)
- │    │    ├── key: (7)
- │    │    └── fd: (7)-->(10)
- │    └── filters
- │         └── phones1_.id = $1::INT8 [type=bool, outer=(7), constraints=(/7: (/NULL - ])]
- └── filters
-      └── person0_.id = person_id [type=bool, outer=(1,10), constraints=(/1: (/NULL - ]; /10: (/NULL - ]), fd=(1)==(10), (10)==(1)]
+ └── inner-join (lookup person)
+      ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null) person_id:10(int!null)
+      ├── key columns: [10] = [1]
+      ├── has-placeholder
+      ├── key: (10)
+      ├── fd: (1)-->(2-6), (1)==(10), (10)==(1)
+      ├── distinct-on
+      │    ├── columns: person_id:10(int)
+      │    ├── grouping columns: person_id:10(int)
+      │    ├── has-placeholder
+      │    ├── key: (10)
+      │    └── select
+      │         ├── columns: phones1_.id:7(int!null) person_id:10(int)
+      │         ├── has-placeholder
+      │         ├── key: (7)
+      │         ├── fd: (7)-->(10)
+      │         ├── scan phones1_
+      │         │    ├── columns: phones1_.id:7(int!null) person_id:10(int)
+      │         │    ├── key: (7)
+      │         │    └── fd: (7)-->(10)
+      │         └── filters
+      │              └── phones1_.id = $1::INT8 [type=bool, outer=(7), constraints=(/7: (/NULL - ])]
+      └── filters (true)
 
 opt
 select
@@ -1179,20 +1063,22 @@ where
             person0_.id=phones1_.person_id
     )
 ----
-semi-join
+project
  ├── columns: id1_2_:1(int!null) address2_2_:2(varchar) createdo3_2_:3(timestamp) name4_2_:4(varchar) nickname5_2_:5(varchar) version6_2_:6(int4!null)
  ├── key: (1)
  ├── fd: (1)-->(2-6)
- ├── scan person0_
- │    ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null)
- │    ├── key: (1)
- │    └── fd: (1)-->(2-6)
- ├── scan phones1_
- │    ├── columns: phones1_.id:7(int!null) person_id:10(int)
- │    ├── key: (7)
- │    └── fd: (7)-->(10)
- └── filters
-      └── person0_.id = person_id [type=bool, outer=(1,10), constraints=(/1: (/NULL - ]; /10: (/NULL - ]), fd=(1)==(10), (10)==(1)]
+ └── inner-join (lookup person)
+      ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null) person_id:10(int!null)
+      ├── key columns: [10] = [1]
+      ├── key: (10)
+      ├── fd: (1)-->(2-6), (1)==(10), (10)==(1)
+      ├── distinct-on
+      │    ├── columns: person_id:10(int)
+      │    ├── grouping columns: person_id:10(int)
+      │    ├── key: (10)
+      │    └── scan phones1_
+      │         └── columns: person_id:10(int)
+      └── filters (true)
 
 opt
 select
@@ -1212,7 +1098,7 @@ where
             phone0_.id=repairtime1_.Phone_id
     )
 ----
-anti-join
+anti-join (hash)
  ├── columns: id1_4_:1(int!null) phone_nu2_4_:2(varchar) person_i4_4_:4(int) phone_ty3_4_:3(varchar)
  ├── has-placeholder
  ├── key: (1)
@@ -1251,29 +1137,27 @@ where
             person0_.id=phones1_.person_id
     )
 ----
-semi-join (merge)
+project
  ├── columns: id1_2_:1(int!null) address2_2_:2(varchar) createdo3_2_:3(timestamp) name4_2_:4(varchar) nickname5_2_:5(varchar) version6_2_:6(int4!null)
- ├── left ordering: +1
- ├── right ordering: +10
  ├── key: (1)
  ├── fd: (1)-->(2-6)
- ├── scan person0_
- │    ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null)
- │    ├── key: (1)
- │    ├── fd: (1)-->(2-6)
- │    └── ordering: +1
- ├── sort
- │    ├── columns: person_id:10(int) order_id:11(int4!null)
- │    ├── fd: ()-->(11)
- │    ├── ordering: +10 opt(11) [actual: +10]
- │    └── select
- │         ├── columns: person_id:10(int) order_id:11(int4!null)
- │         ├── fd: ()-->(11)
- │         ├── scan phones1_
- │         │    └── columns: person_id:10(int) order_id:11(int4)
- │         └── filters
- │              └── order_id = 1 [type=bool, outer=(11), constraints=(/11: [/1 - /1]; tight), fd=()-->(11)]
- └── filters (true)
+ └── inner-join (lookup person)
+      ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null) person_id:10(int!null)
+      ├── key columns: [10] = [1]
+      ├── key: (10)
+      ├── fd: (1)-->(2-6), (1)==(10), (10)==(1)
+      ├── distinct-on
+      │    ├── columns: person_id:10(int)
+      │    ├── grouping columns: person_id:10(int)
+      │    ├── key: (10)
+      │    └── select
+      │         ├── columns: person_id:10(int) order_id:11(int4!null)
+      │         ├── fd: ()-->(11)
+      │         ├── scan phones1_
+      │         │    └── columns: person_id:10(int) order_id:11(int4)
+      │         └── filters
+      │              └── order_id = 1 [type=bool, outer=(11), constraints=(/11: [/1 - /1]; tight), fd=()-->(11)]
+      └── filters (true)
 
 opt
 select
@@ -1311,7 +1195,7 @@ project
       │    ├── grouping columns: phones2_.id:7(int!null)
       │    ├── key: (7)
       │    ├── fd: (1)-->(2-6), (7)-->(1-6,11,17)
-      │    ├── inner-join
+      │    ├── inner-join (hash)
       │    │    ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null) phones2_.id:7(int!null) phones2_.phone_type:9(varchar!null) phones2_.person_id:10(int!null) phones2_.order_id:11(int4) phones1_.person_id:15(int!null) phones1_.order_id:16(int4!null)
       │    │    ├── fd: ()-->(9), (1)-->(2-6), (7)-->(10,11), (1)==(10,15), (10)==(1,15), (15)==(1,10)
       │    │    ├── select
@@ -1376,7 +1260,7 @@ where
     where
         person0_.id=phones1_.person_id))
 ----
-anti-join
+anti-join (hash)
  ├── columns: id1_2_:1(int!null) address2_2_:2(varchar) createdo3_2_:3(timestamp) name4_2_:4(varchar) nickname5_2_:5(varchar) version6_2_:6(int4!null)
  ├── key: (1)
  ├── fd: (1)-->(2-6)
@@ -1385,9 +1269,7 @@ anti-join
  │    ├── key: (1)
  │    └── fd: (1)-->(2-6)
  ├── scan phones1_
- │    ├── columns: phones1_.id:7(int!null) person_id:10(int)
- │    ├── key: (7)
- │    └── fd: (7)-->(10)
+ │    └── columns: person_id:10(int)
  └── filters
       └── person0_.id = person_id [type=bool, outer=(1,10), constraints=(/1: (/NULL - ]; /10: (/NULL - ]), fd=(1)==(10), (10)==(1)]
 
@@ -1411,20 +1293,22 @@ where
             person0_.id=phones1_.person_id
     )
 ----
-semi-join
+project
  ├── columns: id1_2_:1(int!null) address2_2_:2(varchar) createdo3_2_:3(timestamp) name4_2_:4(varchar) nickname5_2_:5(varchar) version6_2_:6(int4!null)
  ├── key: (1)
  ├── fd: (1)-->(2-6)
- ├── scan person0_
- │    ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null)
- │    ├── key: (1)
- │    └── fd: (1)-->(2-6)
- ├── scan phones1_
- │    ├── columns: phones1_.id:7(int!null) person_id:10(int)
- │    ├── key: (7)
- │    └── fd: (7)-->(10)
- └── filters
-      └── person0_.id = person_id [type=bool, outer=(1,10), constraints=(/1: (/NULL - ]; /10: (/NULL - ]), fd=(1)==(10), (10)==(1)]
+ └── inner-join (lookup person)
+      ├── columns: person0_.id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null) person_id:10(int!null)
+      ├── key columns: [10] = [1]
+      ├── key: (10)
+      ├── fd: (1)-->(2-6), (1)==(10), (10)==(1)
+      ├── distinct-on
+      │    ├── columns: person_id:10(int)
+      │    ├── grouping columns: person_id:10(int)
+      │    ├── key: (10)
+      │    └── scan phones1_
+      │         └── columns: person_id:10(int)
+      └── filters (true)
 
 opt
 select
@@ -1442,7 +1326,7 @@ where
     where
         phone0_.id=calls1_.phone_id))
 ----
-anti-join
+anti-join (hash)
  ├── columns: id1_4_:1(int!null) phone_nu2_4_:2(varchar) person_i4_4_:4(int) phone_ty3_4_:3(varchar)
  ├── key: (1)
  ├── fd: (1)-->(2-4)
@@ -1451,9 +1335,7 @@ anti-join
  │    ├── key: (1)
  │    └── fd: (1)-->(2-4)
  ├── scan calls1_
- │    ├── columns: calls1_.id:6(int!null) phone_id:9(int)
- │    ├── key: (6)
- │    └── fd: (6)-->(9)
+ │    └── columns: phone_id:9(int)
  └── filters
       └── phone0_.id = phone_id [type=bool, outer=(1,9), constraints=(/1: (/NULL - ]; /9: (/NULL - ]), fd=(1)==(9), (9)==(1)]
 
@@ -1477,27 +1359,30 @@ where
             person0_.id=addresses1_.Person_id
     )
 ----
-semi-join (merge)
+project
  ├── columns: id1_2_:1(int!null) address2_2_:2(varchar) createdo3_2_:3(timestamp) name4_2_:4(varchar) nickname5_2_:5(varchar) version6_2_:6(int4!null)
- ├── left ordering: +1
- ├── right ordering: +7
  ├── key: (1)
  ├── fd: (1)-->(2-6)
- ├── scan person0_
- │    ├── columns: id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null)
- │    ├── key: (1)
- │    ├── fd: (1)-->(2-6)
- │    └── ordering: +1
- ├── select
- │    ├── columns: person_id:7(int!null) addresses:8(varchar!null)
- │    ├── fd: ()-->(8)
- │    ├── ordering: +7 opt(8) [actual: +7]
- │    ├── scan addresses1_
- │    │    ├── columns: person_id:7(int!null) addresses:8(varchar)
- │    │    └── ordering: +7 opt(8) [actual: +7]
- │    └── filters
- │         └── addresses = 'Home address' [type=bool, outer=(8), constraints=(/8: [/'Home address' - /'Home address']; tight), fd=()-->(8)]
- └── filters (true)
+ └── inner-join (lookup person)
+      ├── columns: id:1(int!null) address:2(varchar) createdon:3(timestamp) name:4(varchar) nickname:5(varchar) version:6(int4!null) person_id:7(int!null)
+      ├── key columns: [7] = [1]
+      ├── key: (7)
+      ├── fd: (1)-->(2-6), (1)==(7), (7)==(1)
+      ├── distinct-on
+      │    ├── columns: person_id:7(int!null)
+      │    ├── grouping columns: person_id:7(int!null)
+      │    ├── internal-ordering: +7 opt(8)
+      │    ├── key: (7)
+      │    └── select
+      │         ├── columns: person_id:7(int!null) addresses:8(varchar!null)
+      │         ├── fd: ()-->(8)
+      │         ├── ordering: +7 opt(8) [actual: +7]
+      │         ├── scan addresses1_
+      │         │    ├── columns: person_id:7(int!null) addresses:8(varchar)
+      │         │    └── ordering: +7 opt(8) [actual: +7]
+      │         └── filters
+      │              └── addresses = 'Home address' [type=bool, outer=(8), constraints=(/8: [/'Home address' - /'Home address']; tight), fd=()-->(8)]
+      └── filters (true)
 
 opt
 select
@@ -1555,12 +1440,6 @@ create table EMPLOYEE (
     primary key (id)
 )
 ----
-TABLE employee
- ├── id int not null
- ├── email varchar
- ├── currentproject_id int
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table Employee_phones (
@@ -1568,12 +1447,6 @@ create table Employee_phones (
     phone_number varchar(255)
 )
 ----
-TABLE employee_phones
- ├── employee_id int not null
- ├── phone_number varchar
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 opt
 select
@@ -1605,7 +1478,7 @@ project
       │    ├── grouping columns: id:1(int!null)
       │    ├── key: (1)
       │    ├── fd: (1)-->(2,3,7)
-      │    ├── left-join
+      │    ├── left-join (hash)
       │    │    ├── columns: id:1(int!null) email:2(varchar) currentproject_id:3(int) employee_id:4(int)
       │    │    ├── fd: (1)-->(2,3)
       │    │    ├── scan componenti0_
@@ -1640,11 +1513,6 @@ create table Company (
     primary key (id)
 )
 ----
-TABLE company
- ├── id int not null
- ├── location_id int
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table Company_Employee (
@@ -1653,12 +1521,6 @@ create table Company_Employee (
     primary key (Company_id, employees_id)
 )
 ----
-TABLE company_employee
- ├── company_id int not null
- ├── employees_id int not null
- └── INDEX primary
-      ├── company_id int not null
-      └── employees_id int not null
 
 exec-ddl
 create table Employee (
@@ -1666,10 +1528,6 @@ create table Employee (
     primary key (id)
 )
 ----
-TABLE employee
- ├── id int not null
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table Manager (
@@ -1677,10 +1535,6 @@ create table Manager (
     primary key (id)
 )
 ----
-TABLE manager
- ├── id int not null
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table Location (
@@ -1690,12 +1544,6 @@ create table Location (
     primary key (id)
 )
 ----
-TABLE location
- ├── id int not null
- ├── address varchar
- ├── zip int4 not null
- └── INDEX primary
-      └── id int not null
 
 opt
 select
@@ -1729,11 +1577,15 @@ where
         company0_.id=employees1_.Company_id
         and employees1_.employees_id=employee2_.id))
 ----
-left-join
+right-join (hash)
  ├── columns: id1_0_0_:1(int!null) id1_8_1_:3(int) location2_0_0_:2(int) address2_8_1_:4(varchar) zip3_8_1_:5(int4)
  ├── key: (1,3)
  ├── fd: (1)-->(2), (3)-->(4,5)
- ├── anti-join
+ ├── scan location3_
+ │    ├── columns: location3_.id:3(int!null) address:4(varchar) zip:5(int4!null)
+ │    ├── key: (3)
+ │    └── fd: (3)-->(4,5)
+ ├── anti-join (hash)
  │    ├── columns: company0_.id:1(int!null) location_id:2(int)
  │    ├── key: (1)
  │    ├── fd: (1)-->(2)
@@ -1741,31 +1593,19 @@ left-join
  │    │    ├── columns: company0_.id:1(int!null) location_id:2(int)
  │    │    ├── key: (1)
  │    │    └── fd: (1)-->(2)
- │    ├── inner-join
- │    │    ├── columns: company_id:6(int!null) employees_id:7(int!null) id:12(int!null) clazz_:13(int!null)
+ │    ├── inner-join (hash)
+ │    │    ├── columns: company_id:6(int!null) employees_id:7(int!null) id:12(int!null)
  │    │    ├── fd: (7)==(12), (12)==(7)
  │    │    ├── union-all
- │    │    │    ├── columns: id:12(int!null) clazz_:13(int!null)
- │    │    │    ├── left columns: employee.id:8(int) clazz_:9(int)
- │    │    │    ├── right columns: manager.id:10(int) clazz_:11(int)
- │    │    │    ├── project
- │    │    │    │    ├── columns: clazz_:9(int!null) employee.id:8(int!null)
- │    │    │    │    ├── key: (8)
- │    │    │    │    ├── fd: ()-->(9)
- │    │    │    │    ├── scan employee
- │    │    │    │    │    ├── columns: employee.id:8(int!null)
- │    │    │    │    │    └── key: (8)
- │    │    │    │    └── projections
- │    │    │    │         └── const: 0 [type=int]
- │    │    │    └── project
- │    │    │         ├── columns: clazz_:11(int!null) manager.id:10(int!null)
- │    │    │         ├── key: (10)
- │    │    │         ├── fd: ()-->(11)
- │    │    │         ├── scan manager
- │    │    │         │    ├── columns: manager.id:10(int!null)
- │    │    │         │    └── key: (10)
- │    │    │         └── projections
- │    │    │              └── const: 1 [type=int]
+ │    │    │    ├── columns: id:12(int!null)
+ │    │    │    ├── left columns: employee.id:8(int)
+ │    │    │    ├── right columns: manager.id:10(int)
+ │    │    │    ├── scan employee
+ │    │    │    │    ├── columns: employee.id:8(int!null)
+ │    │    │    │    └── key: (8)
+ │    │    │    └── scan manager
+ │    │    │         ├── columns: manager.id:10(int!null)
+ │    │    │         └── key: (10)
  │    │    ├── scan employees1_
  │    │    │    ├── columns: company_id:6(int!null) employees_id:7(int!null)
  │    │    │    └── key: (6,7)
@@ -1773,10 +1613,6 @@ left-join
  │    │         └── employees_id = id [type=bool, outer=(7,12), constraints=(/7: (/NULL - ]; /12: (/NULL - ]), fd=(7)==(12), (12)==(7)]
  │    └── filters
  │         └── company0_.id = company_id [type=bool, outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
- ├── scan location3_
- │    ├── columns: location3_.id:3(int!null) address:4(varchar) zip:5(int4!null)
- │    ├── key: (3)
- │    └── fd: (3)-->(4,5)
  └── filters
       └── location_id = location3_.id [type=bool, outer=(2,3), constraints=(/2: (/NULL - ]; /3: (/NULL - ]), fd=(2)==(3), (3)==(2)]
 
@@ -1797,12 +1633,6 @@ create table News (
     primary key (news_id)
 )
 ----
-TABLE news
- ├── news_id int4 not null
- ├── detail varchar
- ├── title varchar
- └── INDEX primary
-      └── news_id int4 not null
 
 exec-ddl
 create table Newspaper (
@@ -1811,11 +1641,6 @@ create table Newspaper (
     primary key (id)
 )
 ----
-TABLE newspaper
- ├── id int4 not null
- ├── name varchar
- └── INDEX primary
-      └── id int4 not null
 
 exec-ddl
 create table Newspaper_News (
@@ -1824,12 +1649,6 @@ create table Newspaper_News (
     primary key (Newspaper_id, news_news_id)
 )
 ----
-TABLE newspaper_news
- ├── newspaper_id int4 not null
- ├── news_news_id int4 not null
- └── INDEX primary
-      ├── newspaper_id int4 not null
-      └── news_news_id int4 not null
 
 opt
 select
@@ -1892,13 +1711,6 @@ create table GenerationGroup (
     primary key (id)
 )
 ----
-TABLE generationgroup
- ├── id int4 not null
- ├── age varchar
- ├── culture varchar
- ├── description varchar
- └── INDEX primary
-      └── id int4 not null
 
 exec-ddl
 create table GenerationUser (
@@ -1906,10 +1718,6 @@ create table GenerationUser (
     primary key (id)
 )
 ----
-TABLE generationuser
- ├── id int4 not null
- └── INDEX primary
-      └── id int4 not null
 
 exec-ddl
 create table GenerationUser_GenerationGroup (
@@ -1918,12 +1726,6 @@ create table GenerationUser_GenerationGroup (
     primary key (GenerationUser_id, ref_id)
 )
 ----
-TABLE generationuser_generationgroup
- ├── generationuser_id int4 not null
- ├── ref_id int4 not null
- └── INDEX primary
-      ├── generationuser_id int4 not null
-      └── ref_id int4 not null
 
 opt
 SELECT ref0_.generationuser_id AS generati1_2_0_
@@ -2000,13 +1802,6 @@ create table TAuction2 (
     primary key (id)
 )
 ----
-TABLE tauction2
- ├── id int not null
- ├── description varchar
- ├── enddatetime timestamp
- ├── successfulbid int
- └── INDEX primary
-      └── id int not null
 
 exec-ddl
 create table TBid2 (
@@ -2017,13 +1812,6 @@ create table TBid2 (
     primary key (id)
 )
 ----
-TABLE tbid2
- ├── id int not null
- ├── amount decimal
- ├── createddatetime timestamp
- ├── auctionid int
- └── INDEX primary
-      └── id int not null
 
 opt
 select
@@ -2055,7 +1843,7 @@ project
  │    ├── has-placeholder
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4,11)
- │    ├── right-join
+ │    ├── right-join (hash)
  │    │    ├── columns: bids0_.id:1(int!null) amount:2(decimal) createddatetime:3(timestamp) auctionid:4(int!null) successfulbid:8(int) true:10(bool)
  │    │    ├── has-placeholder
  │    │    ├── fd: (1)-->(2-4), ()~~>(10)
@@ -2107,12 +1895,6 @@ CREATE TABLE customer (
   PRIMARY KEY (customerid)
 );
 ----
-TABLE customer
- ├── customerid varchar not null
- ├── name varchar not null
- ├── address varchar not null
- └── INDEX primary
-      └── customerid varchar not null
 
 exec-ddl
 CREATE TABLE customerorder (
@@ -2122,13 +1904,6 @@ CREATE TABLE customerorder (
   PRIMARY KEY (customerid, ordernumber)
 );
 ----
-TABLE customerorder
- ├── customerid varchar not null
- ├── ordernumber int4 not null
- ├── orderdate date not null
- └── INDEX primary
-      ├── customerid varchar not null
-      └── ordernumber int4 not null
 
 exec-ddl
 CREATE TABLE lineitem (
@@ -2139,15 +1914,6 @@ CREATE TABLE lineitem (
   PRIMARY KEY (customerid, ordernumber, productid)
 );
 ----
-TABLE lineitem
- ├── customerid varchar not null
- ├── ordernumber int4 not null
- ├── productid varchar not null
- ├── quantity int4
- └── INDEX primary
-      ├── customerid varchar not null
-      ├── ordernumber int4 not null
-      └── productid varchar not null
 
 exec-ddl
 CREATE TABLE product (
@@ -2158,13 +1924,6 @@ CREATE TABLE product (
   PRIMARY KEY (productid)
 );
 ----
-TABLE product
- ├── productid varchar not null
- ├── description varchar not null
- ├── cost decimal
- ├── numberavailable int4
- └── INDEX primary
-      └── productid varchar not null
 
 opt
 SELECT
@@ -2207,12 +1966,12 @@ project
  │    ├── grouping columns: lineitems1_.productid:6(varchar)
  │    ├── key: (6)
  │    ├── fd: ()-->(1-3), (6)-->(1-5,7,17), ()~~>(4,5)
- │    ├── right-join
+ │    ├── right-join (hash)
  │    │    ├── columns: order0_.customerid:1(varchar!null) order0_.ordernumber:2(int4!null) orderdate:3(date!null) lineitems1_.customerid:4(varchar) lineitems1_.ordernumber:5(int4) lineitems1_.productid:6(varchar) lineitems1_.quantity:7(int4) li.customerid:8(varchar) li.ordernumber:9(int4) column16:16(decimal)
  │    │    ├── fd: ()-->(1-3), (6)-->(4,5,7), ()~~>(4,5)
  │    │    ├── project
  │    │    │    ├── columns: column16:16(decimal) li.customerid:8(varchar!null) li.ordernumber:9(int4!null)
- │    │    │    ├── inner-join
+ │    │    │    ├── inner-join (hash)
  │    │    │    │    ├── columns: li.customerid:8(varchar!null) li.ordernumber:9(int4!null) li.productid:10(varchar!null) li.quantity:11(int4) p.productid:12(varchar!null) cost:14(decimal)
  │    │    │    │    ├── key: (8,9,12)
  │    │    │    │    ├── fd: (8-10)-->(11), (12)-->(14), (10)==(12), (12)==(10)
@@ -2328,7 +2087,7 @@ project
  │    ├── grouping columns: customer0_.customerid:1(varchar!null) orders1_.customerid:4(varchar) orders1_.ordernumber:5(int4) lineitems2_.customerid:7(varchar) lineitems2_.ordernumber:8(int4) lineitems2_.productid:9(varchar) product3_.productid:11(varchar)
  │    ├── key: (1,4,5,7-9,11)
  │    ├── fd: (1)-->(2,3), (4,5)-->(6), (7-9)-->(10), (11)-->(12-14), (1,4,5,7-9,11)-->(2,3,6,10,12-14,24,29)
- │    ├── left-join
+ │    ├── left-join (hash)
  │    │    ├── columns: customer0_.customerid:1(varchar!null) name:2(varchar) address:3(varchar) orders1_.customerid:4(varchar) orders1_.ordernumber:5(int4) orderdate:6(date) lineitems2_.customerid:7(varchar) lineitems2_.ordernumber:8(int4) lineitems2_.productid:9(varchar) lineitems2_.quantity:10(int4) product3_.productid:11(varchar) product3_.description:12(varchar) product3_.cost:13(decimal) product3_.numberavailable:14(int4) sum:24(decimal) li.productid:27(varchar) li.quantity:28(int4)
  │    │    ├── fd: (1)-->(2,3), (4,5)-->(6), (7-9)-->(10), (11)-->(12-14), (1,4,5,7-9,11)-->(2,3,6,10,12-14,24)
  │    │    ├── group-by
@@ -2336,14 +2095,14 @@ project
  │    │    │    ├── grouping columns: customer0_.customerid:1(varchar!null) orders1_.customerid:4(varchar) orders1_.ordernumber:5(int4) lineitems2_.customerid:7(varchar) lineitems2_.ordernumber:8(int4) lineitems2_.productid:9(varchar) product3_.productid:11(varchar)
  │    │    │    ├── key: (1,4,5,7-9,11)
  │    │    │    ├── fd: (1)-->(2,3), (4,5)-->(6), (7-9)-->(10), (11)-->(12-14), (1,4,5,7-9,11)-->(2,3,6,10,12-14,24)
- │    │    │    ├── left-join
+ │    │    │    ├── left-join (hash)
  │    │    │    │    ├── columns: customer0_.customerid:1(varchar!null) name:2(varchar!null) address:3(varchar!null) orders1_.customerid:4(varchar) orders1_.ordernumber:5(int4) orderdate:6(date) lineitems2_.customerid:7(varchar) lineitems2_.ordernumber:8(int4) lineitems2_.productid:9(varchar) lineitems2_.quantity:10(int4) product3_.productid:11(varchar) product3_.description:12(varchar) product3_.cost:13(decimal) product3_.numberavailable:14(int4) li.customerid:15(varchar) li.ordernumber:16(int4) column23:23(decimal)
  │    │    │    │    ├── fd: (1)-->(2,3), (4,5)-->(6), (7-9)-->(10), (11)-->(12-14)
- │    │    │    │    ├── left-join
+ │    │    │    │    ├── left-join (hash)
  │    │    │    │    │    ├── columns: customer0_.customerid:1(varchar!null) name:2(varchar!null) address:3(varchar!null) orders1_.customerid:4(varchar) orders1_.ordernumber:5(int4) orderdate:6(date) lineitems2_.customerid:7(varchar) lineitems2_.ordernumber:8(int4) lineitems2_.productid:9(varchar) lineitems2_.quantity:10(int4) product3_.productid:11(varchar) product3_.description:12(varchar) product3_.cost:13(decimal) product3_.numberavailable:14(int4)
  │    │    │    │    │    ├── key: (1,4,5,7-9,11)
  │    │    │    │    │    ├── fd: (1)-->(2,3), (4,5)-->(6), (7-9)-->(10), (11)-->(12-14)
- │    │    │    │    │    ├── left-join
+ │    │    │    │    │    ├── left-join (hash)
  │    │    │    │    │    │    ├── columns: customer0_.customerid:1(varchar!null) name:2(varchar!null) address:3(varchar!null) orders1_.customerid:4(varchar) orders1_.ordernumber:5(int4) orderdate:6(date) lineitems2_.customerid:7(varchar) lineitems2_.ordernumber:8(int4) lineitems2_.productid:9(varchar) lineitems2_.quantity:10(int4)
  │    │    │    │    │    │    ├── key: (1,4,5,7-9)
  │    │    │    │    │    │    ├── fd: (1)-->(2,3), (4,5)-->(6), (7-9)-->(10)
@@ -2379,7 +2138,7 @@ project
  │    │    │    │    │         └── lineitems2_.productid = product3_.productid [type=bool, outer=(9,11), constraints=(/9: (/NULL - ]; /11: (/NULL - ]), fd=(9)==(11), (11)==(9)]
  │    │    │    │    ├── project
  │    │    │    │    │    ├── columns: column23:23(decimal) li.customerid:15(varchar!null) li.ordernumber:16(int4!null)
- │    │    │    │    │    ├── inner-join
+ │    │    │    │    │    ├── inner-join (hash)
  │    │    │    │    │    │    ├── columns: li.customerid:15(varchar!null) li.ordernumber:16(int4!null) li.productid:17(varchar!null) li.quantity:18(int4) p.productid:19(varchar!null) p.cost:21(decimal)
  │    │    │    │    │    │    ├── key: (15,16,19)
  │    │    │    │    │    │    ├── fd: (15-17)-->(18), (19)-->(21), (17)==(19), (19)==(17)
@@ -2483,12 +2242,12 @@ project
  │    ├── grouping columns: lineitems1_.productid:6(varchar)
  │    ├── key: (6)
  │    ├── fd: ()-->(1-3), (6)-->(1-5,7,17), ()~~>(4,5)
- │    ├── right-join
+ │    ├── right-join (hash)
  │    │    ├── columns: order0_.customerid:1(varchar!null) order0_.ordernumber:2(int4!null) orderdate:3(date!null) lineitems1_.customerid:4(varchar) lineitems1_.ordernumber:5(int4) lineitems1_.productid:6(varchar) lineitems1_.quantity:7(int4) li.customerid:8(varchar) li.ordernumber:9(int4) column16:16(decimal)
  │    │    ├── fd: ()-->(1-3), (6)-->(4,5,7), ()~~>(4,5)
  │    │    ├── project
  │    │    │    ├── columns: column16:16(decimal) li.customerid:8(varchar!null) li.ordernumber:9(int4!null)
- │    │    │    ├── inner-join
+ │    │    │    ├── inner-join (hash)
  │    │    │    │    ├── columns: li.customerid:8(varchar!null) li.ordernumber:9(int4!null) li.productid:10(varchar!null) li.quantity:11(int4) p.productid:12(varchar!null) cost:14(decimal)
  │    │    │    │    ├── key: (8,9,12)
  │    │    │    │    ├── fd: (8-10)-->(11), (12)-->(14), (10)==(12), (12)==(10)
@@ -2571,7 +2330,7 @@ project
  │    ├── grouping columns: order0_.customerid:1(varchar!null) order0_.ordernumber:2(int4!null)
  │    ├── key: (1,2)
  │    ├── fd: (1,2)-->(3,13)
- │    ├── left-join
+ │    ├── left-join (hash)
  │    │    ├── columns: order0_.customerid:1(varchar!null) order0_.ordernumber:2(int4!null) orderdate:3(date!null) li.customerid:4(varchar) li.ordernumber:5(int4) column12:12(decimal)
  │    │    ├── fd: (1,2)-->(3)
  │    │    ├── scan order0_
@@ -2580,7 +2339,7 @@ project
  │    │    │    └── fd: (1,2)-->(3)
  │    │    ├── project
  │    │    │    ├── columns: column12:12(decimal) li.customerid:4(varchar!null) li.ordernumber:5(int4!null)
- │    │    │    ├── inner-join
+ │    │    │    ├── inner-join (hash)
  │    │    │    │    ├── columns: li.customerid:4(varchar!null) li.ordernumber:5(int4!null) li.productid:6(varchar!null) quantity:7(int4) p.productid:8(varchar!null) cost:10(decimal)
  │    │    │    │    ├── key: (4,5,8)
  │    │    │    │    ├── fd: (4-6)-->(7), (8)-->(10), (6)==(8), (8)==(6)
@@ -2625,14 +2384,6 @@ CREATE TABLE student (
   PRIMARY KEY (studentid)
 );
 ----
-TABLE student
- ├── studentid int not null
- ├── name varchar not null
- ├── address_city varchar
- ├── address_state varchar
- ├── preferredcoursecode varchar
- └── INDEX primary
-      └── studentid int not null
 
 exec-ddl
 CREATE TABLE enrolment (
@@ -2643,14 +2394,6 @@ CREATE TABLE enrolment (
   PRIMARY KEY (studentid, coursecode)
 );
 ----
-TABLE enrolment
- ├── studentid int not null
- ├── coursecode varchar not null
- ├── semester int2 not null
- ├── year int2 not null
- └── INDEX primary
-      ├── studentid int not null
-      └── coursecode varchar not null
 
 opt
 SELECT
@@ -2693,10 +2436,10 @@ group-by
  │    │    ├── grouping columns: this_.studentid:1(int!null) enrolment_.studentid:6(int!null) enrolment_.coursecode:7(varchar!null)
  │    │    ├── key: (1,6,7)
  │    │    ├── fd: (1)-->(2-5), (6,7)-->(9), (1,6,7)-->(2-5,9,14)
- │    │    ├── inner-join
+ │    │    ├── inner-join (hash)
  │    │    │    ├── columns: this_.studentid:1(int!null) name:2(varchar!null) address_city:3(varchar) address_state:4(varchar) preferredcoursecode:5(varchar!null) enrolment_.studentid:6(int!null) enrolment_.coursecode:7(varchar!null) enrolment_.year:9(int2!null) maxstudentenrolment_.coursecode:11(varchar!null) maxstudentenrolment_.year:13(int2!null)
  │    │    │    ├── fd: (1)-->(2-5), (6,7)-->(9), (5)==(11), (11)==(5)
- │    │    │    ├── inner-join
+ │    │    │    ├── inner-join (hash)
  │    │    │    │    ├── columns: this_.studentid:1(int!null) name:2(varchar!null) address_city:3(varchar) address_state:4(varchar) preferredcoursecode:5(varchar!null) maxstudentenrolment_.coursecode:11(varchar!null) maxstudentenrolment_.year:13(int2!null)
  │    │    │    │    ├── fd: (1)-->(2-5), (5)==(11), (11)==(5)
  │    │    │    │    ├── scan maxstudentenrolment_
@@ -2749,11 +2492,6 @@ drop table student, enrolment
 exec-ddl
 CREATE TABLE t_name (id INT4 NOT NULL, c_name VARCHAR(255), PRIMARY KEY (id));
 ----
-TABLE t_name
- ├── id int4 not null
- ├── c_name varchar
- └── INDEX primary
-      └── id int4 not null
 
 opt
 SELECT

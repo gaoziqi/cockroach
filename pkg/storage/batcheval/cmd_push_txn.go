@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package batcheval
 
@@ -159,14 +155,6 @@ func PushTxn(
 		// written. If a transaction record for the transaction could be written in
 		// the future then we must be in the first case. If one could not be written
 		// then we know we're in either the second or the third case.
-		//
-		// Performing this detection could have false positives where we determine
-		// that a record could still be written and conclude that we're in the first
-		// case. However, it cannot have false negatives where we determine that a
-		// record can not be written and conclude that we're in the second or third
-		// case. This is important, because it means that we may end up failing to
-		// push a finalized transaction but will never determine that a transaction
-		// is finalized when it still could end up committing.
 		reply.PusheeTxn = SynthesizeTxnFromMeta(cArgs.EvalCtx, args.PusheeTxn)
 		if reply.PusheeTxn.Status == roachpb.ABORTED {
 			// If the transaction is uncommittable, we don't even need to
@@ -202,11 +190,27 @@ func PushTxn(
 	}
 
 	// The pusher might be aware of a newer version of the pushee.
-	reply.PusheeTxn.Timestamp.Forward(args.PusheeTxn.Timestamp)
+	increasedEpochOrTimestamp := false
+	if reply.PusheeTxn.Timestamp.Less(args.PusheeTxn.Timestamp) {
+		reply.PusheeTxn.Timestamp = args.PusheeTxn.Timestamp
+		increasedEpochOrTimestamp = true
+	}
 	if reply.PusheeTxn.Epoch < args.PusheeTxn.Epoch {
 		reply.PusheeTxn.Epoch = args.PusheeTxn.Epoch
+		increasedEpochOrTimestamp = true
 	}
 	reply.PusheeTxn.UpgradePriority(args.PusheeTxn.Priority)
+
+	// If the pusher is aware that the pushee's currently recorded attempt at a
+	// parallel commit failed, either because it found intents at a higher
+	// timestamp than the parallel commit attempt or because it found intents at
+	// a higher epoch than the parallel commit attempt, it should not consider
+	// the pushee to be performing a parallel commit. Its commit status is not
+	// indeterminate.
+	if increasedEpochOrTimestamp && reply.PusheeTxn.Status == roachpb.STAGING {
+		reply.PusheeTxn.Status = roachpb.PENDING
+		reply.PusheeTxn.InFlightWrites = nil
+	}
 
 	pushType := args.PushType
 	var pusherWins bool

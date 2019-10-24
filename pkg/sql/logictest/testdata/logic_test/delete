@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-opt
-
 statement ok
 CREATE TABLE kv (
   k INT PRIMARY KEY,
@@ -279,3 +277,6 @@ SELECT x, y, z FROM family
 ----
 1  1  NULL
 3  3  NULL
+
+statement error at or near "where": syntax error: unimplemented: this syntax
+DELETE FROM family USING family, other_table WHERE x=2

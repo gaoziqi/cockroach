@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -64,7 +60,7 @@ import (
 // as this method makes the assumption that it operates on a shallow copy (see
 // call to applyTimestampCache).
 func (r *Replica) executeWriteBatch(
-	ctx context.Context, ba roachpb.BatchRequest,
+	ctx context.Context, ba *roachpb.BatchRequest,
 ) (br *roachpb.BatchResponse, pErr *roachpb.Error) {
 	startTime := timeutil.Now()
 
@@ -78,12 +74,12 @@ func (r *Replica) executeWriteBatch(
 		return nil, roachpb.NewError(err)
 	}
 
-	spans, err := r.collectSpans(&ba)
+	spans, err := r.collectSpans(ba)
 	if err != nil {
 		return nil, roachpb.NewError(err)
 	}
 
-	var endCmds *endCmds
+	var ec endCmds
 	if !ba.IsLeaseRequest() {
 		// Acquire latches to prevent overlapping commands from executing until
 		// this command completes. Note that this must be done before getting
@@ -91,18 +87,18 @@ func (r *Replica) executeWriteBatch(
 		// after preceding commands have been run to successful completion.
 		log.Event(ctx, "acquire latches")
 		var err error
-		endCmds, err = r.beginCmds(ctx, &ba, spans)
+		ec, err = r.beginCmds(ctx, ba, spans)
 		if err != nil {
 			return nil, roachpb.NewError(err)
 		}
 	}
 
-	// Guarantee we release the latches that we just acquired. This is
-	// wrapped to delay pErr evaluation to its value when returning.
+	// Guarantee we release the latches that we just acquired if we never make
+	// it to passing responsibility to evalAndPropose. This is wrapped to delay
+	// pErr evaluation to its value when returning.
 	defer func() {
-		if endCmds != nil {
-			endCmds.done(br, pErr)
-		}
+		// No-op if we move ec into evalAndPropose.
+		ec.done(ba, br, pErr)
 	}()
 
 	var lease roachpb.Lease
@@ -118,7 +114,7 @@ func (r *Replica) executeWriteBatch(
 		}
 		lease = status.Lease
 	}
-	r.limitTxnMaxTimestamp(ctx, &ba, status)
+	r.limitTxnMaxTimestamp(ctx, ba, status)
 
 	minTS, untrack := r.store.cfg.ClosedTimestamp.Tracker.Track(ctx)
 	defer untrack(ctx, 0, 0, 0) // covers all error returns below
@@ -127,9 +123,7 @@ func (r *Replica) executeWriteBatch(
 	// commands which require this command to move its timestamp
 	// forward. Or, in the case of a transactional write, the txn
 	// timestamp and possible write-too-old bool.
-	if bumped, pErr := r.applyTimestampCache(ctx, &ba, minTS); pErr != nil {
-		return nil, pErr
-	} else if bumped {
+	if bumped := r.applyTimestampCache(ctx, ba, minTS); bumped {
 		// If we bump the transaction's timestamp, we must absolutely
 		// tell the client in a response transaction (for otherwise it
 		// doesn't know about the incremented timestamp). Response
@@ -150,7 +144,9 @@ func (r *Replica) executeWriteBatch(
 
 	log.Event(ctx, "applied timestamp cache")
 
-	ch, tryAbandon, maxLeaseIndex, pErr := r.evalAndPropose(ctx, lease, ba, endCmds, spans)
+	// After the command is proposed to Raft, invoking endCmds.done is the
+	// responsibility of Raft, so move the endCmds into evalAndPropose.
+	ch, abandon, maxLeaseIndex, pErr := r.evalAndPropose(ctx, lease, ba, spans, ec.move())
 	if pErr != nil {
 		if maxLeaseIndex != 0 {
 			log.Fatalf(
@@ -167,10 +163,6 @@ func (r *Replica) executeWriteBatch(
 	if maxLeaseIndex != 0 {
 		untrack(ctx, ctpb.Epoch(lease.Epoch), r.RangeID, ctpb.LAI(maxLeaseIndex))
 	}
-
-	// After the command is proposed to Raft, invoking endCmds.done is now the
-	// responsibility of processRaftCommand.
-	endCmds = nil
 
 	// If the command was accepted by raft, wait for the range to apply it.
 	ctxDone := ctx.Done()
@@ -234,30 +226,19 @@ and the following Raft status: %+v`,
 			}()
 
 		case <-ctxDone:
-			// If our context was canceled, return an AmbiguousResultError
-			// if the command isn't already being executed and using our
-			// context, in which case we expect it to finish soon. The
-			// AmbiguousResultError indicates to caller that the command may
-			// have executed.
-			if tryAbandon() {
-				log.VEventf(ctx, 2, "context cancellation after %0.1fs of attempting command %s",
-					timeutil.Since(startTime).Seconds(), ba)
-				return nil, roachpb.NewError(roachpb.NewAmbiguousResultError(ctx.Err().Error()))
-			}
-			ctxDone = nil
+			// If our context was canceled, return an AmbiguousResultError,
+			// which indicates to the caller that the command may have executed.
+			abandon()
+			log.VEventf(ctx, 2, "context cancellation after %0.1fs of attempting command %s",
+				timeutil.Since(startTime).Seconds(), ba)
+			return nil, roachpb.NewError(roachpb.NewAmbiguousResultError(ctx.Err().Error()))
 		case <-shouldQuiesce:
-			// If shutting down, return an AmbiguousResultError if the
-			// command isn't already being executed and using our context,
-			// in which case we expect it to finish soon. AmbiguousResultError
-			// indicates to caller that the command may have executed. If
-			// tryAbandon fails, we iterate through the loop again to wait
-			// for the command to finish.
-			if tryAbandon() {
-				log.VEventf(ctx, 2, "shutdown cancellation after %0.1fs of attempting command %s",
-					timeutil.Since(startTime).Seconds(), ba)
-				return nil, roachpb.NewError(roachpb.NewAmbiguousResultError("server shutdown"))
-			}
-			shouldQuiesce = nil
+			// If shutting down, return an AmbiguousResultError, which indicates
+			// to the caller that the command may have executed.
+			abandon()
+			log.VEventf(ctx, 2, "shutdown cancellation after %0.1fs of attempting command %s",
+				timeutil.Since(startTime).Seconds(), ba)
+			return nil, roachpb.NewError(roachpb.NewAmbiguousResultError("server shutdown"))
 		}
 	}
 }
@@ -273,19 +254,19 @@ and the following Raft status: %+v`,
 // re-executed in full. This allows it to lay down intents and return
 // an appropriate retryable error.
 func (r *Replica) evaluateWriteBatch(
-	ctx context.Context, idKey storagebase.CmdIDKey, ba roachpb.BatchRequest, spans *spanset.SpanSet,
+	ctx context.Context, idKey storagebase.CmdIDKey, ba *roachpb.BatchRequest, spans *spanset.SpanSet,
 ) (engine.Batch, enginepb.MVCCStats, *roachpb.BatchResponse, result.Result, *roachpb.Error) {
 	ms := enginepb.MVCCStats{}
 	// If not transactional or there are indications that the batch's txn will
 	// require restart or retry, execute as normal.
-	if isOnePhaseCommit(ba, r.store.TestingKnobs()) {
+	if isOnePhaseCommit(ba) {
 		_, hasBegin := ba.GetArg(roachpb.BeginTransaction)
 		arg, _ := ba.GetArg(roachpb.EndTransaction)
 		etArg := arg.(*roachpb.EndTransactionRequest)
 
 		// Try executing with transaction stripped. We use the transaction timestamp
 		// to write any values as it may have been advanced by the timestamp cache.
-		strippedBa := ba
+		strippedBa := *ba
 		strippedBa.Timestamp = strippedBa.Txn.Timestamp
 		strippedBa.Txn = nil
 		if hasBegin {
@@ -294,18 +275,18 @@ func (r *Replica) evaluateWriteBatch(
 			strippedBa.Requests = ba.Requests[:len(ba.Requests)-1] // strip end txn req
 		}
 
-		// If there were no refreshable spans earlier in the txn
-		// (e.g. earlier gets or scans), then the batch can be retried
-		// locally in the event of write too old errors.
-		retryLocally := etArg.NoRefreshSpans && !ba.Txn.OrigTimestampWasObserved
+		// Is the transaction allowed to retry locally in the event of
+		// write too old errors? This is only allowed if it is able to
+		// forward its commit timestamp without a read refresh.
+		canForwardTimestamp := batcheval.CanForwardCommitTimestampWithoutRefresh(ba.Txn, etArg)
 
 		// If all writes occurred at the intended timestamp, we've succeeded on the fast path.
 		rec := NewReplicaEvalContext(r, spans)
 		batch, br, res, pErr := r.evaluateWriteBatchWithLocalRetries(
-			ctx, idKey, rec, &ms, strippedBa, spans, retryLocally,
+			ctx, idKey, rec, &ms, &strippedBa, spans, canForwardTimestamp,
 		)
 		if pErr == nil && (ba.Timestamp == br.Timestamp ||
-			(retryLocally && !batcheval.IsEndTransactionExceedingDeadline(br.Timestamp, etArg))) {
+			(canForwardTimestamp && !batcheval.IsEndTransactionExceedingDeadline(br.Timestamp, etArg))) {
 			clonedTxn := ba.Txn.Clone()
 			clonedTxn.Status = roachpb.COMMITTED
 			// Make sure the returned txn has the actual commit
@@ -377,7 +358,7 @@ func (r *Replica) evaluateWriteBatchWithLocalRetries(
 	idKey storagebase.CmdIDKey,
 	rec batcheval.EvalContext,
 	ms *enginepb.MVCCStats,
-	ba roachpb.BatchRequest,
+	ba *roachpb.BatchRequest,
 	spans *spanset.SpanSet,
 	canRetry bool,
 ) (batch engine.Batch, br *roachpb.BatchResponse, res result.Result, pErr *roachpb.Error) {
@@ -448,14 +429,15 @@ func (r *Replica) evaluateWriteBatchWithLocalRetries(
 	return
 }
 
-// isOnePhaseCommit returns true iff the BatchRequest contains all commands in
-// the transaction, starting with BeginTransaction and ending with
-// EndTransaction. One phase commits are disallowed if (1) the transaction has
-// already been flagged with a write too old error, or (2) if isolation is
-// serializable and the commit timestamp has been forwarded, or (3) the
-// transaction exceeded its deadline, or (4) the testing knobs disallow optional
-// one phase commits and the BatchRequest does not require one phase commit.
-func isOnePhaseCommit(ba roachpb.BatchRequest, knobs *StoreTestingKnobs) bool {
+// isOnePhaseCommit returns true iff the BatchRequest contains all writes in the
+// transaction and ends with an EndTransaction. One phase commits are disallowed
+// if any of the following conditions are true:
+// (1) the transaction has already been flagged with a write too old error
+// (2) the transaction's commit timestamp has been forwarded
+// (3) the transaction exceeded its deadline
+// (4) the transaction is not in its first epoch and the EndTransaction request
+//     does not require one phase commit.
+func isOnePhaseCommit(ba *roachpb.BatchRequest) bool {
 	if ba.Txn == nil {
 		return false
 	}
@@ -464,13 +446,21 @@ func isOnePhaseCommit(ba roachpb.BatchRequest, knobs *StoreTestingKnobs) bool {
 	}
 	arg, _ := ba.GetArg(roachpb.EndTransaction)
 	etArg := arg.(*roachpb.EndTransactionRequest)
-	if batcheval.IsEndTransactionExceedingDeadline(ba.Txn.Timestamp, etArg) {
-		return false
-	}
 	if retry, _, _ := batcheval.IsEndTransactionTriggeringRetryError(ba.Txn, etArg); retry {
 		return false
 	}
-	return !knobs.DisableOptional1PC || etArg.Require1PC
+	// If the transaction has already restarted at least once then it may have
+	// left intents at prior epochs that need to be cleaned up during the
+	// process of committing the transaction. Even if the current epoch could
+	// perform a one phase commit, we don't allow it to because that could
+	// prevent it from properly resolving intents from prior epochs and cause
+	// it to abandon them instead.
+	//
+	// The exception to this rule is transactions that require a one phase
+	// commit. We know that if they also required a one phase commit in past
+	// epochs then they couldn't have left any intents that they now need to
+	// clean up.
+	return ba.Txn.Epoch == 0 || etArg.Require1PC
 }
 
 // maybeStripInFlightWrites attempts to remove all point writes and query
@@ -483,7 +473,7 @@ func isOnePhaseCommit(ba roachpb.BatchRequest, knobs *StoreTestingKnobs) bool {
 // entirely. This is possible if the function removes all of the in-flight
 // writes from an EndTransaction request that was committing in parallel with
 // writes which all happened to be on the same range as the transaction record.
-func maybeStripInFlightWrites(ba roachpb.BatchRequest) (roachpb.BatchRequest, error) {
+func maybeStripInFlightWrites(ba *roachpb.BatchRequest) (*roachpb.BatchRequest, error) {
 	args, hasET := ba.GetArg(roachpb.EndTransaction)
 	if !hasET {
 		return ba, nil

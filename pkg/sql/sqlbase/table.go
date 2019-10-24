@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -18,12 +14,16 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/text/language"
 )
 
@@ -38,7 +38,7 @@ func SanitizeVarFreeExpr(
 	allowImpure bool,
 ) (tree.TypedExpr, error) {
 	if tree.ContainsVars(expr) {
-		return nil, pgerror.Newf(pgerror.CodeSyntaxError,
+		return nil, pgerror.Newf(pgcode.Syntax,
 			"variable sub-expressions are not allowed in %s", context)
 	}
 
@@ -76,7 +76,7 @@ func ValidateColumnDefType(t *types.T) error {
 	case types.StringFamily, types.CollatedStringFamily:
 		if t.Family() == types.CollatedStringFamily {
 			if _, err := language.Parse(t.Locale()); err != nil {
-				return pgerror.Newf(pgerror.CodeSyntaxError, `invalid locale %s`, t.Locale())
+				return pgerror.Newf(pgcode.Syntax, `invalid locale %s`, t.Locale())
 			}
 		}
 
@@ -106,7 +106,7 @@ func ValidateColumnDefType(t *types.T) error {
 		// These types are OK.
 
 	default:
-		return pgerror.Newf(pgerror.CodeInvalidTableDefinitionError,
+		return pgerror.Newf(pgcode.InvalidTableDefinition,
 			"value type %s cannot be used for table columns", t.String())
 	}
 
@@ -136,7 +136,7 @@ func MakeColumnDefDescs(
 		// prior to calling MakeColumnDefDescs. The dependent sequences
 		// must be created, and the SERIAL type eliminated, prior to this
 		// point.
-		return nil, nil, nil, pgerror.New(pgerror.CodeFeatureNotSupportedError,
+		return nil, nil, nil, pgerror.New(pgcode.FeatureNotSupported,
 			"SERIAL cannot be used in this context")
 	}
 
@@ -171,12 +171,15 @@ func MakeColumnDefDescs(
 		); err != nil {
 			return nil, nil, nil, err
 		}
-		// We keep the type checked expression so that the type annotation
-		// gets properly stored.
-		d.DefaultExpr.Expr = typedExpr
 
-		s := tree.Serialize(d.DefaultExpr.Expr)
-		col.DefaultExpr = &s
+		// Keep the type checked expression so that the type annotation gets
+		// properly stored, only if the default expression is not NULL.
+		// Otherwise we want to keep the default expression nil.
+		if typedExpr != tree.DNull {
+			d.DefaultExpr.Expr = typedExpr
+			s := tree.Serialize(d.DefaultExpr.Expr)
+			col.DefaultExpr = &s
+		}
 	}
 
 	if d.IsComputed() {
@@ -262,13 +265,12 @@ type ConstraintDetail struct {
 	Details     string
 	Unvalidated bool
 
-	// Only populated for FK, PK, and Unique Constraints.
+	// Only populated for PK and Unique Constraints.
 	Index *IndexDescriptor
 
 	// Only populated for FK Constraints.
-	FK              *ForeignKeyReference
+	FK              *ForeignKeyConstraint
 	ReferencedTable *TableDescriptor
-	ReferencedIndex *IndexDescriptor
 
 	// Only populated for Check Constraints.
 	CheckConstraint *TableDescriptor_CheckConstraint
@@ -316,7 +318,7 @@ func (desc *TableDescriptor) collectConstraintInfo(
 	for _, index := range indexes {
 		if index.ID == desc.PrimaryIndex.ID {
 			if _, ok := info[index.Name]; ok {
-				return nil, pgerror.Newf(pgerror.CodeDuplicateObjectError,
+				return nil, pgerror.Newf(pgcode.DuplicateObject,
 					"duplicate constraint name: %q", index.Name)
 			}
 			colHiddenMap := make(map[ColumnID]bool, len(desc.Columns))
@@ -343,7 +345,7 @@ func (desc *TableDescriptor) collectConstraintInfo(
 			info[index.Name] = detail
 		} else if index.Unique {
 			if _, ok := info[index.Name]; ok {
-				return nil, pgerror.Newf(pgerror.CodeDuplicateObjectError,
+				return nil, pgerror.Newf(pgcode.DuplicateObject,
 					"duplicate constraint name: %q", index.Name)
 			}
 			detail := ConstraintDetail{Kind: ConstraintTypeUnique}
@@ -353,46 +355,35 @@ func (desc *TableDescriptor) collectConstraintInfo(
 		}
 	}
 
-	fks, err := desc.AllActiveAndInactiveForeignKeys()
-	if err != nil {
-		return nil, err
-	}
-	for id, fk := range fks {
-		idx, err := desc.FindIndexByID(id)
-		if err != nil {
-			return nil, err
-		}
+	fks := desc.AllActiveAndInactiveForeignKeys()
+	for _, fk := range fks {
 		if _, ok := info[fk.Name]; ok {
-			return nil, pgerror.Newf(pgerror.CodeDuplicateObjectError,
+			return nil, pgerror.Newf(pgcode.DuplicateObject,
 				"duplicate constraint name: %q", fk.Name)
 		}
 		detail := ConstraintDetail{Kind: ConstraintTypeFK}
 		// Constraints in the Validating state are considered Unvalidated for this purpose
 		detail.Unvalidated = fk.Validity != ConstraintValidity_Validated
-		numCols := len(idx.ColumnIDs)
-		if fk.SharedPrefixLen > 0 {
-			numCols = int(fk.SharedPrefixLen)
+		var err error
+		detail.Columns, err = desc.NamesForColumnIDs(fk.OriginColumnIDs)
+		if err != nil {
+			return nil, err
 		}
-		detail.Columns = idx.ColumnNames[:numCols]
-		detail.Index = idx
 		detail.FK = fk
 
 		if tableLookup != nil {
-			other, err := tableLookup(fk.Table)
+			other, err := tableLookup(fk.ReferencedTableID)
 			if err != nil {
-				return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 					"error resolving table %d referenced in foreign key",
-					log.Safe(fk.Table))
+					log.Safe(fk.ReferencedTableID))
 			}
-			otherIdx, err := other.FindIndexByID(fk.Index)
+			referencedColumnNames, err := other.NamesForColumnIDs(fk.ReferencedColumnIDs)
 			if err != nil {
-				return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
-					"error resolving index %d in table %s referenced in foreign key",
-					log.Safe(fk.Index), other.Name)
+				return nil, err
 			}
-			detail.Details = fmt.Sprintf("%s.%v", other.Name, otherIdx.ColumnNames)
+			detail.Details = fmt.Sprintf("%s.%v", other.Name, referencedColumnNames)
 			detail.ReferencedTable = other
-			detail.ReferencedIndex = otherIdx
 		}
 		info[fk.Name] = detail
 	}
@@ -409,13 +400,13 @@ func (desc *TableDescriptor) collectConstraintInfo(
 		if tableLookup != nil {
 			colsUsed, err := c.ColumnsUsed(desc)
 			if err != nil {
-				return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 					"error computing columns used in check constraint %q", c.Name)
 			}
 			for _, colID := range colsUsed {
 				col, err := desc.FindColumnByID(colID)
 				if err != nil {
-					return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+					return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 						"error finding column %d in table %s", log.Safe(colID), desc.Name)
 				}
 				detail.Columns = append(detail.Columns, col.Name)
@@ -424,4 +415,120 @@ func (desc *TableDescriptor) collectConstraintInfo(
 		info[c.Name] = detail
 	}
 	return info, nil
+}
+
+// FindFKReferencedIndex finds the first index in the supplied referencedTable
+// that can satisfy a foreign key of the supplied column ids.
+func FindFKReferencedIndex(
+	referencedTable *TableDescriptor, referencedColIDs ColumnIDs,
+) (*IndexDescriptor, error) {
+	// Search for a unique index on the referenced table that matches our foreign
+	// key columns.
+	if ColumnIDs(referencedTable.PrimaryIndex.ColumnIDs).HasPrefix(referencedColIDs) {
+		return &referencedTable.PrimaryIndex, nil
+	}
+	// If the PK doesn't match, find the index corresponding to the referenced column.
+	for _, idx := range referencedTable.Indexes {
+		if idx.Unique && ColumnIDs(idx.ColumnIDs).HasPrefix(referencedColIDs) {
+			return &idx, nil
+		}
+	}
+	return nil, pgerror.Newf(
+		pgcode.ForeignKeyViolation,
+		"there is no unique constraint matching given keys for referenced table %s",
+		referencedTable.Name,
+	)
+}
+
+// FindFKOriginIndex finds the first index in the supplied originTable
+// that can satisfy an outgoing foreign key of the supplied column ids.
+func FindFKOriginIndex(
+	originTable *TableDescriptor, originColIDs ColumnIDs,
+) (*IndexDescriptor, error) {
+	// Search for an index on the origin table that matches our foreign
+	// key columns.
+	if ColumnIDs(originTable.PrimaryIndex.ColumnIDs).HasPrefix(originColIDs) {
+		return &originTable.PrimaryIndex, nil
+	}
+	// If the PK doesn't match, find the index corresponding to the origin column.
+	for _, idx := range originTable.Indexes {
+		if ColumnIDs(idx.ColumnIDs).HasPrefix(originColIDs) {
+			return &idx, nil
+		}
+	}
+	return nil, pgerror.Newf(
+		pgcode.ForeignKeyViolation,
+		"there is no index matching given keys for referenced table %s",
+		originTable.Name,
+	)
+}
+
+// ConditionalGetTableDescFromTxn validates that the supplied TableDescriptor
+// matches the one currently stored in kv. This simulates a CPut and returns a
+// ConditionFailedError on mismatch. We don't directly use CPut with protos
+// because the marshaling is not guaranteed to be stable and also because it's
+// sensitive to things like missing vs default values of fields.
+func ConditionalGetTableDescFromTxn(
+	ctx context.Context, txn *client.Txn, expectation *TableDescriptor,
+) (*roachpb.Value, error) {
+	key := MakeDescMetadataKey(expectation.ID)
+	existingKV, err := txn.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	var existing *Descriptor
+	if existingKV.Value != nil {
+		existing = &Descriptor{}
+		if err := existingKV.Value.GetProto(existing); err != nil {
+			return nil, errors.Wrapf(err,
+				"decoding current table descriptor value for id: %d", expectation.ID)
+		}
+		existing.Table(existingKV.Value.Timestamp)
+	}
+	wrapped := WrapDescriptor(expectation)
+	if !existing.Equal(wrapped) {
+		return nil, &roachpb.ConditionFailedError{ActualValue: existingKV.Value}
+	}
+	return existingKV.Value, nil
+}
+
+// SplitKeysForTable computes the split keys for a given table descriptor,
+// taking into account all its partitions and their zone configs.
+// The descriptor is taken as a raw Value, as the config package needs to invoke
+// this. If the descriptor represents indeed a table, at least one split point
+// is returned (the start of the table). If the descriptor that's passed in is
+// not a table (i.e. it's a database or a view), then nil is returned.
+//
+// zone is the zone config for the table. Can be nil if no zone config has been
+// configured.
+//
+// The split keys are returned sorted.
+// An error is returned iff a descVal is not a descriptor.
+func SplitKeysForTable(descVal *roachpb.Value, zone *zonepb.ZoneConfig) ([]roachpb.RKey, error) {
+	var desc Descriptor
+	if err := descVal.GetProto(&desc); err != nil {
+		return nil, errors.AssertionFailedf("failed to decode descriptor")
+	}
+
+	table := desc.Table(descVal.Timestamp)
+	if table == nil {
+		// Databases don't require splits.
+		return nil, nil
+	}
+	if viewStr := table.GetViewQuery(); viewStr != "" {
+		// Views don't require splits.
+		return nil, nil
+	}
+	tableKey := roachpb.RKey(keys.MakeTablePrefix(uint32(table.ID)))
+	if zone == nil {
+		return []roachpb.RKey{tableKey}, nil
+	}
+	subzoneSplits := zone.SubzoneSplits()
+	splits := make([]roachpb.RKey, len(subzoneSplits)+1)
+	splits[0] = tableKey
+	for i, s := range subzoneSplits {
+		// Prepend the table prefix to the subzone splits.
+		splits[i+1] = append(append([]byte(nil), tableKey...), s...)
+	}
+	return splits, nil
 }

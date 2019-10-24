@@ -6,7 +6,12 @@ extract(year from '2010-09-28'::date)
 2010
 
 eval
-extract(year from '2010-09-28'::date)
+extract('year' from '2010-09-28'::date)
+----
+2010
+
+eval
+extract('YEAR' from '2010-09-28'::date)
 ----
 2010
 
@@ -36,9 +41,69 @@ extract(dayofweek from '2010-09-28'::date)
 2
 
 eval
+extract(isodow from '2010-09-28'::date)
+----
+2
+
+eval
+extract(isodow from '2010-09-26'::date)
+----
+7
+
+eval
 extract(quarter from '2010-09-28'::date)
 ----
 3
+
+eval
+extract(century from '2010-09-28'::date)
+----
+21
+
+eval
+extract(century from '2010-09-28 BC'::date)
+----
+-21
+
+eval
+extract(decade from '2010-09-28'::date)
+----
+201
+
+eval
+extract(decade from '2010-09-28 BC'::date)
+----
+-201
+
+eval
+extract(isoyear from '2006-01-01'::date)
+----
+2005
+
+eval
+extract(isoyear from '2006-01-02'::date)
+----
+2006
+
+eval
+extract(millennium from '2010-09-28'::date)
+----
+3
+
+eval
+extract(millennium from '2010-09-28 BC'::date)
+----
+-3
+
+eval
+extract(julian from '2010-09-28'::date)
+----
+2455468
+
+eval
+extract(julian from '4714-11-24 BC'::date)
+----
+0
 
 # Extract from times.
 
@@ -127,22 +192,82 @@ extract(second from '2010-01-10 12:13:14.1+00:00'::timestamp)
 eval
 extract(millisecond from '2010-01-10 12:13:14.123456+00:00'::timestamp)
 ----
-123
+14123
 
 eval
 extract(microsecond from '2010-01-10 12:13:14.123456+00:00'::timestamp)
 ----
-123456
+14123456
 
 eval
 extract(epoch from '2010-01-10 12:13:14.1+00:00'::timestamp)
 ----
 1263125594
 
+eval
+extract(century from '2010-01-10 12:13:14.1+00:00'::timestamp)
+----
+21
+
+eval
+extract(century from '0001-01-10 12:13:14.1+00:00 BC'::timestamp)
+----
+-1
+
+eval
+extract(decade from '2010-01-10 12:13:14.1+00:00'::timestamp)
+----
+201
+
+eval
+extract(decade from '2010-01-10 12:13:14.1+00:00 BC'::timestamp)
+----
+-201
+
+eval
+extract(isoyear from '2006-01-01 12:13:14.1+00:00'::timestamp)
+----
+2005
+
+eval
+extract(isoyear from '2006-01-02 12:13:14.1+00:00'::timestamp)
+----
+2006
+
+eval
+extract(millennium from '2010-01-10 12:13:14.1+00:00'::timestamp)
+----
+3
+
+eval
+extract(millennium from '0010-01-10 12:13:14.1+00:00 BC'::timestamp)
+----
+-1
+
+eval
+extract(julian from '2010-01-10 12:13:14.1+00:00'::timestamp)
+----
+2455207
+
+eval
+extract(julian from '4714-11-24 12:13:14.1+00:00 BC'::timestamp)
+----
+0
+
 # Extract from intervals.
 
 eval
 extract_duration(hour from '123m')
+----
+2
+
+eval
+extract_duration('hour' from '123m')
+----
+2
+
+eval
+extract_duration('HOUR' from '123m')
 ----
 2
 

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -25,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -87,7 +82,7 @@ func (mt mutationTest) makeMutationsActive() {
 	}
 	mt.tableDesc.Mutations = nil
 	mt.tableDesc.Version++
-	if err := mt.tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); err != nil {
+	if err := mt.tableDesc.ValidateTable(); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -145,7 +140,7 @@ func (mt mutationTest) writeMutation(m sqlbase.DescriptorMutation) {
 	}
 	mt.tableDesc.Mutations = append(mt.tableDesc.Mutations, m)
 	mt.tableDesc.Version++
-	if err := mt.tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); err != nil {
+	if err := mt.tableDesc.ValidateTable(); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -443,21 +438,21 @@ CREATE INDEX allidx ON t.test (k, v);
 	// Check that a mutation can only be inserted with an explicit mutation state, and direction.
 	tableDesc = mTest.tableDesc
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{}}
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{Descriptor_: &sqlbase.DescriptorMutation_Column{Column: &tableDesc.Columns[len(tableDesc.Columns)-1]}}}
 	tableDesc.Columns = tableDesc.Columns[:len(tableDesc.Columns)-1]
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, `mutation in state UNKNOWN, direction NONE, col "i", id 3`) {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, `mutation in state UNKNOWN, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = sqlbase.DescriptorMutation_DELETE_ONLY
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, `mutation in state DELETE_ONLY, direction NONE, col "i", id 3`) {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, `mutation in state DELETE_ONLY, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = sqlbase.DescriptorMutation_UNKNOWN
 	tableDesc.Mutations[0].Direction = sqlbase.DescriptorMutation_DROP
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, `mutation in state UNKNOWN, direction DROP, col "i", id 3`) {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, `mutation in state UNKNOWN, direction DROP, col "i", id 3`) {
 		t.Fatal(err)
 	}
 }
@@ -623,7 +618,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 	tableDesc = mTest.tableDesc
 	tableDesc.Mutations = []sqlbase.DescriptorMutation{{Descriptor_: &sqlbase.DescriptorMutation_Index{Index: &tableDesc.Indexes[len(tableDesc.Indexes)-1]}}}
 	tableDesc.Indexes = tableDesc.Indexes[:len(tableDesc.Indexes)-1]
-	if err := tableDesc.ValidateTable(cluster.MakeTestingClusterSettings()); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
+	if err := tableDesc.ValidateTable(); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
 		t.Fatal(err)
 	}
 }
@@ -998,8 +993,8 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 		"SHOW COLUMNS FROM t.test",
 		[][]string{
 			{"a", "STRING", "false", "NULL", "", "{primary,ufo}", "false"},
-			{"d", "STRING", "true", "NULL", "", "{ufo}", "false"},
 			{"e", "STRING", "true", "NULL", "", "{}", "false"},
+			{"d", "STRING", "true", "NULL", "", "{ufo}", "false"},
 		},
 	)
 

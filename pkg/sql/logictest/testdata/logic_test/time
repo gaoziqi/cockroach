@@ -1,5 +1,3 @@
-# LogicTest: local local-opt fakedist fakedist-opt fakedist-metadata
-
 # Note that the odd '0000-01-01 hh:mi:ss +0000 UTC' result format is an
 # artifact of how pq displays TIMEs.
 
@@ -315,12 +313,12 @@ SELECT extract(second from time '12:01:02.345678')
 query I
 SELECT extract(millisecond from time '12:01:02.345678')
 ----
-345
+2345
 
 query I
 SELECT extract(microsecond from time '12:01:02.345678')
 ----
-345678
+2345678
 
 query I
 SELECT extract(epoch from time '12:00:00')
@@ -329,3 +327,19 @@ SELECT extract(epoch from time '12:00:00')
 
 query error pgcode 22023 extract\(\): unsupported timespan: day
 SELECT extract(day from time '12:00:00')
+
+query I
+SELECT extract('microsecond' from time '12:01:02.345678')
+----
+2345678
+
+query I
+SELECT extract('EPOCH' from time '12:00:00')
+----
+43200
+
+query error pgcode 22023 extract\(\): unsupported timespan: day
+SELECT extract('day' from time '12:00:00')
+
+query error pgcode 22023 extract\(\): unsupported timespan: day
+SELECT extract('DAY' from time '12:00:00')

@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package testcat
 
@@ -18,7 +14,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -137,12 +133,21 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	} else if !tab.IsVirtual {
 		tab.addPrimaryColumnIndex("rowid")
 	}
+	if stmt.PartitionBy != nil {
+		if len(tab.Indexes) == 0 {
+			panic("cannot partition virtual table")
+		}
+		tab.Indexes[0].partitionBy = stmt.PartitionBy
+	}
 
 	// Add check constraints.
 	for _, def := range stmt.Defs {
 		switch def := def.(type) {
 		case *tree.CheckConstraintTableDef:
-			tab.Checks = append(tab.Checks, cat.CheckConstraint(tree.Serialize(def.Expr)))
+			tab.Checks = append(tab.Checks, cat.CheckConstraint{
+				Constraint: serializeTableDefExpr(def.Expr),
+				Validated:  validatedCheckConstraint(def),
+			})
 		}
 	}
 
@@ -159,6 +164,17 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 
 		case *tree.FamilyTableDef:
 			tab.addFamily(def)
+
+		case *tree.ColumnTableDef:
+			if def.Unique {
+				tab.addIndex(
+					&tree.IndexTableDef{
+						Name:    tree.Name(fmt.Sprintf("%s_%s_key", stmt.Table.TableName, def.Name)),
+						Columns: tree.IndexElemList{{Column: def.Name}},
+					},
+					uniqueIndex,
+				)
+			}
 		}
 	}
 
@@ -230,7 +246,12 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 		fromCols[i] = tab.FindOrdinal(string(c))
 	}
 
-	targetTable := tc.Table(&d.Table)
+	var targetTable *Table
+	if d.Table.TableName == tab.Name() {
+		targetTable = tab
+	} else {
+		targetTable = tc.Table(&d.Table)
+	}
 
 	toCols := make([]int, len(d.ToCols))
 	for i, c := range d.ToCols {
@@ -261,10 +282,10 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 	// columns. If strict is false, it is acceptable if the given columns are a
 	// prefix of the index key columns.
 	matches := func(idx *Index, cols []int, strict bool) bool {
-		if idx.KeyColumnCount() < len(cols) {
+		if idx.LaxKeyColumnCount() < len(cols) {
 			return false
 		}
-		if strict && idx.KeyColumnCount() > len(cols) {
+		if strict && idx.LaxKeyColumnCount() > len(cols) {
 			return false
 		}
 		for i := range cols {
@@ -318,7 +339,9 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 		originColumnOrdinals:     fromCols,
 		referencedColumnOrdinals: toCols,
 		validated:                true,
-		matchMethod:              tree.MatchSimple,
+		matchMethod:              d.Match,
+		deleteAction:             d.Actions.Delete,
+		updateAction:             d.Actions.Update,
 	}
 	tab.outboundFKs = append(tab.outboundFKs, fk)
 	targetTable.inboundFKs = append(targetTable.inboundFKs, fk)
@@ -344,12 +367,12 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 	}
 
 	if def.DefaultExpr.Expr != nil {
-		s := tree.Serialize(def.DefaultExpr.Expr)
+		s := serializeTableDefExpr(def.DefaultExpr.Expr)
 		col.DefaultExpr = &s
 	}
 
 	if def.Computed.Expr != nil {
-		s := tree.Serialize(def.Computed.Expr)
+		s := serializeTableDefExpr(def.Computed.Expr)
 		col.ComputedExpr = &s
 	}
 
@@ -358,11 +381,12 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 
 func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 	idx := &Index{
-		IdxName:  tt.makeIndexName(def.Name, typ),
-		Unique:   typ != nonUniqueIndex,
-		Inverted: def.Inverted,
-		IdxZone:  &config.ZoneConfig{},
-		table:    tt,
+		IdxName:     tt.makeIndexName(def.Name, typ),
+		Unique:      typ != nonUniqueIndex,
+		Inverted:    def.Inverted,
+		IdxZone:     &zonepb.ZoneConfig{},
+		table:       tt,
+		partitionBy: def.PartitionBy,
 	}
 
 	// Look for name suffixes indicating this is a mutation index.
@@ -402,7 +426,7 @@ func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 		if len(tt.Indexes) != 0 {
 			panic("primary index should always be 0th index")
 		}
-		idx.Ordinal = len(tt.Indexes)
+		idx.ordinal = len(tt.Indexes)
 		tt.Indexes = append(tt.Indexes, idx)
 		return idx
 	}
@@ -455,7 +479,7 @@ func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 		}
 	}
 
-	idx.Ordinal = len(tt.Indexes)
+	idx.ordinal = len(tt.Indexes)
 	tt.Indexes = append(tt.Indexes, idx)
 
 	return idx
@@ -571,4 +595,33 @@ func extractDeleteOnlyIndex(def *tree.IndexTableDef) (name string, ok bool) {
 		return "", false
 	}
 	return strings.TrimSuffix(string(def.Name), ":delete-only"), true
+}
+
+func validatedCheckConstraint(def *tree.CheckConstraintTableDef) bool {
+	return !strings.HasSuffix(string(def.Name), ":unvalidated")
+}
+
+func serializeTableDefExpr(expr tree.Expr) string {
+	// Disallow any column references that are qualified with the table. The
+	// production table creation code verifies them and strips them away, so the
+	// stored expressions contain only unqualified column references.
+	preFn := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		if vBase, ok := expr.(tree.VarName); ok {
+			v, err := vBase.NormalizeVarName()
+			if err != nil {
+				return false, nil, err
+			}
+			if c, ok := v.(*tree.ColumnItem); ok && c.TableName != nil {
+				return false, nil, fmt.Errorf(
+					"expressions in table definitions must not contain qualified column references: %s", c,
+				)
+			}
+		}
+		return true, expr, nil
+	}
+	_, err := tree.SimpleVisit(expr, preFn)
+	if err != nil {
+		panic(err)
+	}
+	return tree.Serialize(expr)
 }

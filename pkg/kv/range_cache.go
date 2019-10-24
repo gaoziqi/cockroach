@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -29,10 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/logtags"
 	"github.com/pkg/errors"
 )
 
@@ -130,6 +126,17 @@ type lookupResult struct {
 // Note that the above description assumes that useReverseScan is false for simplicity.
 // If useReverseScan is true, we need to use the end key of the stale descriptor instead.
 func makeLookupRequestKey(key roachpb.RKey, evictToken *EvictionToken, useReverseScan bool) string {
+	var ret strings.Builder
+	// We only want meta1, meta2, user range lookups to be coalesced with other
+	// meta1, meta2, user range lookups, respectively. Otherwise, deadlocks could
+	// happen due to singleflight. If the range lookup is in a meta range, we
+	// prefix the request key with the corresponding meta prefix to disambiguate
+	// the different lookups.
+	if key.AsRawKey().Compare(keys.Meta1KeyMax) < 0 {
+		ret.Write(keys.Meta1Prefix)
+	} else if key.AsRawKey().Compare(keys.Meta2KeyMax) < 0 {
+		ret.Write(keys.Meta2Prefix)
+	}
 	if evictToken != nil {
 		if useReverseScan {
 			key = evictToken.prevDesc.EndKey
@@ -137,7 +144,21 @@ func makeLookupRequestKey(key roachpb.RKey, evictToken *EvictionToken, useRevers
 			key = evictToken.prevDesc.StartKey
 		}
 	}
-	return string(key) + ":" + strconv.FormatBool(useReverseScan)
+	ret.Write(key)
+	ret.WriteString(":")
+	ret.WriteString(strconv.FormatBool(useReverseScan))
+	// Add the generation of the previous descriptor to the lookup request key to
+	// decrease the number of lookups in the rare double split case. Suppose we
+	// have a range [a, e) that gets split into [a, c) and [c, e). The requests
+	// on [c, e) will fail and will have to retry the lookup. If [a, c) gets
+	// split again into [a, b) and [b, c), we don't want to the requests on [a,
+	// b) to be coalesced with the retried requests on [c, e). To distinguish the
+	// two cases, we can use the generation of the previous descriptor.
+	if evictToken != nil && evictToken.prevDesc.GetGenerationComparable() {
+		ret.WriteString(":")
+		ret.WriteString(strconv.FormatInt(evictToken.prevDesc.GetGeneration(), 10))
+	}
+	return ret.String()
 }
 
 // NewRangeDescriptorCache returns a new RangeDescriptorCache which
@@ -465,56 +486,33 @@ func (rdc *RangeDescriptorCache) evictCachedRangeDescriptorLocked(
 		return err
 	}
 
-	// Note that we're doing a "compare-and-erase": If seenDesc is not nil,
-	// we want to clean the cache only if it equals the cached range
-	// descriptor as a pointer. If not, then likely some other caller
-	// already evicted previously, and we can save work by not doing it
-	// again (which would prompt another expensive lookup).
-	if seenDesc != nil && seenDesc != cachedDesc {
-		return nil
-	}
-
-	for {
-		if log.V(2) {
-			log.Infof(ctx, "evict cached descriptor: key=%s desc=%s", descKey, cachedDesc)
-		}
-		rdc.rangeCache.cache.DelEntry(entry)
-
-		// Retrieve the metadata range key for the next level of metadata, and
-		// evict that key as well. This loop ends after the meta1 range, which
-		// returns KeyMin as its metadata key.
-		//
-		// Evicting 'meta(descKey)' instead of 'meta(cachedDesc.EndKey)' could be
-		// incorrect here because it could result in us evicting the wrong meta2
-		// descriptor. Imagine that descriptors are in the configuration:
-		//
-		// meta2 descs:  [/meta2/a,/meta2/m),  [/meta2/m,/meta2/z)
-		// user  descs:  [a,f),   [f,k),   [k,p),   [p,u),   [u,z)
-		//
-		// A lookup for the key 'l' would return the third user-space descriptor
-		// [k,p), after a continuation lookup. This descriptor is stored on the
-		// second meta2 range because its end key is p, which maps to /meta2/p.
-		// If we later want to evict this user-space descriptor, we also want to
-		// evict the meta2 descriptor for the range that contains it. However,
-		// if we naively evicted meta('l'), we'd end up evicting the first meta2
-		// descriptor. Instead, we want to evict meta('p'), since 'p' is the end
-		// key of the user-space descriptor.
-		//
-		// This is also why we pass inverted=false down below.
-		descKey = keys.RangeMetaKey(cachedDesc.EndKey)
-		// TODO(tschottdorf): write a test that verifies that the first descriptor
-		// can also be evicted. This is necessary since the initial range
-		// [KeyMin,KeyMax) may turn into [KeyMin, "something"), after which
-		// larger ranges don't fit into it any more.
-		if bytes.Equal(descKey, roachpb.RKeyMin) {
-			break
-		}
-
-		cachedDesc, entry, err = rdc.getCachedRangeDescriptorLocked(descKey, false /* inverted */)
-		if err != nil || cachedDesc == nil {
-			return err
+	// Note that we're doing a "compare-and-erase": If seenDesc is not nil, we
+	// want to clean the cache only if it equals the cached range descriptor. We
+	// try to use Generation and GenerationComparable to determine if the range
+	// descriptors are equal, but if we cannot, we fallback to
+	// pointer-comparison. If the range descriptors are not equal, then likely
+	// some other caller already evicted previously, and we can save work by not
+	// doing it again (which would prompt another expensive lookup).
+	if seenDesc != nil {
+		if seenDesc.GetGenerationComparable() && cachedDesc.GetGenerationComparable() {
+			if seenDesc.GetGeneration() != cachedDesc.GetGeneration() {
+				return nil
+			}
+		} else if !seenDesc.GetGenerationComparable() && !cachedDesc.GetGenerationComparable() {
+			if seenDesc != cachedDesc {
+				return nil
+			}
+		} else {
+			// One descriptor's generation is comparable, while the other is
+			// incomparable, so the descriptors are guaranteed to be different.
+			return nil
 		}
 	}
+
+	if log.V(2) {
+		log.Infof(ctx, "evict cached descriptor: key=%s desc=%s", descKey, cachedDesc)
+	}
+	rdc.rangeCache.cache.DelEntry(entry)
 	return nil
 }
 
@@ -610,52 +608,82 @@ func (rdc *RangeDescriptorCache) insertRangeDescriptorsLocked(
 //
 // This method is expected to be used in preparation of inserting a descriptor
 // in the cache; the bool return value specifies if the insertion should go on:
-// if the specified descriptor is already in the cache, then nothing is deleted
-// and false is returned. Otherwise, true is returned.
+// if any overlapping descriptor is known to be newer than the one passed in,
+// false is returned, and true otherwise. Note that even if false is returned,
+// stale range descriptors can still be deleted from the cache.
 func (rdc *RangeDescriptorCache) clearOverlappingCachedRangeDescriptors(
 	ctx context.Context, desc *roachpb.RangeDescriptor,
 ) (bool, error) {
-	key := desc.EndKey
-	metaKey := keys.RangeMetaKey(key)
+	startMeta := keys.RangeMetaKey(desc.StartKey)
+	endMeta := keys.RangeMetaKey(desc.EndKey)
+	var entriesToEvict []*cache.Entry
+	continueWithInsert := true
 
-	// Clear out any descriptors which subsume the key which we're going
-	// to cache. For example, if an existing KeyMin->KeyMax descriptor
-	// should be cleared out in favor of a KeyMin->"m" descriptor.
-	entry, ok := rdc.rangeCache.cache.CeilEntry(rangeCacheKey(metaKey))
+	// Try to clear the descriptor that covers the end key of desc, if any. For
+	// example, if we are inserting a [/Min, "m") descriptor, we should check if
+	// we should evict an existing [/Min, /Max) descriptor.
+	entry, ok := rdc.rangeCache.cache.CeilEntry(rangeCacheKey(endMeta))
 	if ok {
-		descriptor := entry.Value.(*roachpb.RangeDescriptor)
-		if descriptor.StartKey.Less(key) && !descriptor.EndKey.Less(key) {
-			if descriptor.Equal(*desc) {
-				// The descriptor is already in the cache. Nothing to do.
-				return false, nil
+		cached := entry.Value.(*roachpb.RangeDescriptor)
+		// It might be possible that the range descriptor immediately following
+		// desc.EndKey does not contain desc.EndKey, so we explicitly check that it
+		// overlaps. For example, if we are inserting ["a", "c"), we don't want to
+		// check ["c", "d"). We do, however, want to check ["b", "c"), which is why
+		// the end key is inclusive.
+		if cached.StartKey.Less(desc.EndKey) && !cached.EndKey.Less(desc.EndKey) {
+			if desc.GetGenerationComparable() && cached.GetGenerationComparable() {
+				if desc.GetGeneration() <= cached.GetGeneration() {
+					// Generations are comparable and a newer descriptor already exists in
+					// cache.
+					continueWithInsert = false
+				}
+			} else if desc.Equal(*cached) {
+				// Generations are incomparable so we don't continue with insertion
+				// only if the descriptor already exists.
+				continueWithInsert = false
 			}
-			if log.V(2) {
-				log.Infof(ctx, "clearing overlapping descriptor: key=%s desc=%s",
-					entry.Key, descriptor)
+			if continueWithInsert {
+				entriesToEvict = append(entriesToEvict, entry)
 			}
-			rdc.rangeCache.cache.DelEntry(entry)
 		}
 	}
 
-	startMeta := keys.RangeMetaKey(desc.StartKey)
-	endMeta := keys.RangeMetaKey(desc.EndKey)
-
-	// Also clear any descriptors which are subsumed by the one we're
-	// going to cache. This could happen on a merge (and also happens
-	// when there's a lot of concurrency). Iterate from the range meta key
-	// after RangeMetaKey(desc.StartKey) to the range meta key for desc.EndKey.
-	var entries []*cache.Entry
+	// Try to clear any descriptors whose end key is contained by the descriptor
+	// we are inserting. We iterate from the range meta key after
+	// RangeMetaKey(desc.StartKey) to RangeMetaKey(desc.EndKey) to avoid clearing
+	// the descriptor that ends when desc starts. For example, if we are
+	// inserting ["b", "c"), we should not evict ["a", "b").
+	//
+	// Descriptors could be cleared from the cache in the event of a merge or a
+	// lot of concurrency. For example, if ranges ["a", "b") and ["b", "c") are
+	// merged, we should clear both of these if we are inserting ["a", "c").
+	//
+	// We can usually tell which descriptor is older based on the Generation, but
+	// in the legacy case in which we can't, we clear the descriptors in the
+	// cache unconditionally.
 	rdc.rangeCache.cache.DoRangeEntry(func(e *cache.Entry) bool {
-		if log.V(2) {
-			log.Infof(ctx, "clearing subsumed descriptor: key=%s desc=%s",
-				e.Key, e.Value.(*roachpb.RangeDescriptor))
+		descriptor := e.Value.(*roachpb.RangeDescriptor)
+		if desc.GetGenerationComparable() && descriptor.GetGenerationComparable() {
+			// If generations are comparable, then check generations to see if we
+			// evict.
+			if desc.GetGeneration() <= descriptor.GetGeneration() {
+				continueWithInsert = false
+			} else {
+				entriesToEvict = append(entriesToEvict, e)
+			}
+		} else {
+			// If generations are not comparable, evict.
+			entriesToEvict = append(entriesToEvict, e)
 		}
-		entries = append(entries, e)
 		return false
 	}, rangeCacheKey(startMeta.Next()), rangeCacheKey(endMeta))
 
-	for _, e := range entries {
+	for _, e := range entriesToEvict {
+		if log.V(2) {
+			log.Infof(ctx, "clearing overlapping descriptor: key=%s desc=%s",
+				e.Key, e.Value.(*roachpb.RangeDescriptor))
+		}
 		rdc.rangeCache.cache.DelEntry(e)
 	}
-	return true, nil
+	return continueWithInsert, nil
 }

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -55,7 +51,7 @@ func TestParseInitNodeAttributes(t *testing.T) {
 func TestParseJoinUsingAddrs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	cfg := MakeConfig(context.TODO(), cluster.MakeTestingClusterSettings())
-	cfg.JoinList = []string{"localhost:12345,,localhost:23456", "localhost:34567"}
+	cfg.JoinList = []string{"localhost:12345", "localhost:23456", "localhost:34567", "localhost"}
 	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, Size: base.SizeSpec{InBytes: base.MinimumStoreSize * 100}}}}
 	engines, err := cfg.CreateEngines(context.TODO())
 	if err != nil {
@@ -77,7 +73,11 @@ func TestParseJoinUsingAddrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := []resolver.Resolver{r1, r2, r3}
+	r4, err := resolver.NewResolver("localhost:26257")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []resolver.Resolver{r1, r2, r3, r4}
 	if !reflect.DeepEqual(cfg.GossipBootstrapResolvers, expected) {
 		t.Fatalf("Unexpected bootstrap addresses: %v, expected: %v", cfg.GossipBootstrapResolvers, expected)
 	}

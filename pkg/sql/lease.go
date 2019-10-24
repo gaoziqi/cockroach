@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -33,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
@@ -45,7 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
 
 var errRenewLease = errors.New("renew lease on id")
@@ -176,7 +172,7 @@ func (s LeaseStore) jitteredLeaseDuration() time.Duration {
 
 // acquire a lease on the most recent version of a table descriptor.
 // If the lease cannot be obtained because the descriptor is in the process of
-// being dropped, the error will be errTableDropped.
+// being dropped or offline, the error will be of type inactiveTableError.
 // The expiration time set for the lease > minExpiration.
 func (s LeaseStore) acquire(
 	ctx context.Context, minExpiration hlc.Timestamp, tableID sqlbase.ID,
@@ -199,7 +195,9 @@ func (s LeaseStore) acquire(
 		if err := filterTableState(tableDesc); err != nil {
 			return err
 		}
-		tableDesc.MaybeFillInDescriptor()
+		if err := tableDesc.MaybeFillInDescriptor(ctx, txn); err != nil {
+			return err
+		}
 		// Once the descriptor is set it is immutable and care must be taken
 		// to not modify it.
 		storedLease := &storedTableLease{
@@ -215,7 +213,7 @@ func (s LeaseStore) acquire(
 
 		// ValidateTable instead of Validate, even though we have a txn available,
 		// so we don't block reads waiting for this table version.
-		if err := table.ValidateTable(s.settings); err != nil {
+		if err := table.ValidateTable(); err != nil {
 			return err
 		}
 
@@ -302,19 +300,15 @@ func (s LeaseStore) release(ctx context.Context, stopper *stop.Stopper, lease *s
 func (s LeaseStore) WaitForOneVersion(
 	ctx context.Context, tableID sqlbase.ID, retryOpts retry.Options,
 ) (sqlbase.DescriptorVersion, error) {
-	desc := &sqlbase.Descriptor{}
-	descKey := sqlbase.MakeDescMetadataKey(tableID)
 	var tableDesc *sqlbase.TableDescriptor
+	var err error
 	for lastCount, r := 0, retry.Start(retryOpts); r.Next(); {
 		// Get the current version of the table descriptor non-transactionally.
 		//
 		// TODO(pmattis): Do an inconsistent read here?
-		if err := s.db.GetProto(ctx, descKey, desc); err != nil {
+		tableDesc, err = sqlbase.GetTableDescFromID(ctx, s.db, tableID)
+		if err != nil {
 			return 0, err
-		}
-		tableDesc = desc.GetTable()
-		if tableDesc == nil {
-			return 0, errors.Errorf("ID %d is not a table", tableID)
 		}
 		// Check to see if there are any leases that still exist on the previous
 		// version of the descriptor.
@@ -337,76 +331,96 @@ func (s LeaseStore) WaitForOneVersion(
 
 var errDidntUpdateDescriptor = errors.New("didn't update the table descriptor")
 
-// Publish updates a table descriptor. It also maintains the invariant that
-// there are at most two versions of the descriptor out in the wild at any time
-// by first waiting for all nodes to be on the current (pre-update) version of
-// the table desc.
-// The update closure is called after the wait, and it provides the new version
-// of the descriptor to be written. In a multi-step schema operation, this
-// update should perform a single step.
+// PublishMultiple updates multiple table descriptors, maintaining the invariant
+// that there are at most two versions of each descriptor out in the wild at any
+// time by first waiting for all nodes to be on the current (pre-update) version
+// of the table desc.
+//
+// The update closure for all tables is called after the wait. The argument to
+// the closure is a map of the table descriptors with the IDs given in tableIDs,
+// and the closure mutates those descriptors.
+//
 // The closure may be called multiple times if retries occur; make sure it does
 // not have side effects.
-// Returns the updated version of the descriptor.
-func (s LeaseStore) Publish(
+//
+// Returns the updated versions of the descriptors.
+func (s LeaseStore) PublishMultiple(
 	ctx context.Context,
-	tableID sqlbase.ID,
-	update func(*sqlbase.MutableTableDescriptor) error,
+	tableIDs []sqlbase.ID,
+	update func(map[sqlbase.ID]*sqlbase.MutableTableDescriptor) error,
 	logEvent func(*client.Txn) error,
-) (*sqlbase.ImmutableTableDescriptor, error) {
+) (map[sqlbase.ID]*sqlbase.ImmutableTableDescriptor, error) {
 	errLeaseVersionChanged := errors.New("lease version changed")
 	// Retry while getting errLeaseVersionChanged.
 	for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
-		// Wait until there are no unexpired leases on the previous version
-		// of the table.
-		expectedVersion, err := s.WaitForOneVersion(ctx, tableID, base.DefaultRetryOptions())
-		if err != nil {
-			return nil, err
+		// Wait until there are no unexpired leases on the previous versions
+		// of the tables.
+		expectedVersions := make(map[sqlbase.ID]sqlbase.DescriptorVersion)
+		for _, id := range tableIDs {
+			expected, err := s.WaitForOneVersion(ctx, id, base.DefaultRetryOptions())
+			if err != nil {
+				return nil, err
+			}
+			expectedVersions[id] = expected
 		}
 
-		var tableDesc *sqlbase.MutableTableDescriptor
+		tableDescs := make(map[sqlbase.ID]*sqlbase.MutableTableDescriptor)
 		// There should be only one version of the descriptor, but it's
 		// a race now to update to the next version.
-		err = s.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-			// Re-read the current version of the table descriptor, this time
-			// transactionally.
-			var err error
-			tableDesc, err = sqlbase.GetMutableTableDescFromID(ctx, txn, tableID)
-			if err != nil {
-				return err
-			}
-
-			if expectedVersion != tableDesc.Version {
-				// The version changed out from under us. Someone else must be
-				// performing a schema change operation.
-				if log.V(3) {
-					log.Infof(ctx, "publish (version changed): %d != %d", expectedVersion, tableDesc.Version)
+		err := s.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+			versions := make(map[sqlbase.ID]sqlbase.DescriptorVersion)
+			descsToUpdate := make(map[sqlbase.ID]*sqlbase.MutableTableDescriptor)
+			for _, id := range tableIDs {
+				// Re-read the current versions of the table descriptor, this time
+				// transactionally.
+				var err error
+				descsToUpdate[id], err = sqlbase.GetMutableTableDescFromID(ctx, txn, id)
+				if err != nil {
+					return err
 				}
-				return errLeaseVersionChanged
+
+				if expectedVersions[id] != descsToUpdate[id].Version {
+					// The version changed out from under us. Someone else must be
+					// performing a schema change operation.
+					if log.V(3) {
+						log.Infof(ctx, "publish (version changed): %d != %d", expectedVersions[id], descsToUpdate[id].Version)
+					}
+					return errLeaseVersionChanged
+				}
+
+				versions[id] = descsToUpdate[id].Version
 			}
 
 			// Run the update closure.
-			version := tableDesc.Version
-			if err := update(tableDesc); err != nil {
+			if err := update(descsToUpdate); err != nil {
 				return err
 			}
-			if version != tableDesc.Version {
-				return errors.Errorf("updated version to: %d, expected: %d",
-					tableDesc.Version, version)
+			for _, id := range tableIDs {
+				if versions[id] != descsToUpdate[id].Version {
+					return errors.Errorf("updated version to: %d, expected: %d",
+						descsToUpdate[id].Version, versions[id])
+				}
+
+				if err := descsToUpdate[id].MaybeIncrementVersion(ctx, txn, s.settings); err != nil {
+					return err
+				}
+				if err := descsToUpdate[id].ValidateTable(); err != nil {
+					return err
+				}
+
+				tableDescs[id] = descsToUpdate[id]
 			}
 
-			if err := tableDesc.MaybeIncrementVersion(ctx, txn); err != nil {
-				return err
-			}
-			if err := tableDesc.ValidateTable(s.settings); err != nil {
-				return err
-			}
-
-			// Write the updated descriptor.
+			// Write the updated descriptors.
 			if err := txn.SetSystemConfigTrigger(); err != nil {
 				return err
 			}
 			b := txn.NewBatch()
-			b.Put(sqlbase.MakeDescMetadataKey(tableID), sqlbase.WrapDescriptor(tableDesc))
+			for tableID, tableDesc := range tableDescs {
+				if err := writeDescToBatch(ctx, false /* kvTrace */, s.settings, b, tableID, tableDesc.TableDesc()); err != nil {
+					return err
+				}
+			}
 			if logEvent != nil {
 				// If an event log is required for this update, ensure that the
 				// descriptor change occurs first in the transaction. This is
@@ -428,7 +442,11 @@ func (s LeaseStore) Publish(
 
 		switch err {
 		case nil, errDidntUpdateDescriptor:
-			return sqlbase.NewImmutableTableDescriptor(tableDesc.TableDescriptor), nil
+			immutTableDescs := make(map[sqlbase.ID]*ImmutableTableDescriptor)
+			for id, tableDesc := range tableDescs {
+				immutTableDescs[id] = sqlbase.NewImmutableTableDescriptor(tableDesc.TableDescriptor)
+			}
+			return immutTableDescs, nil
 		case errLeaseVersionChanged:
 			// will loop around to retry
 		default:
@@ -437,6 +455,41 @@ func (s LeaseStore) Publish(
 	}
 
 	panic("not reached")
+}
+
+// Publish updates a table descriptor. It also maintains the invariant that
+// there are at most two versions of the descriptor out in the wild at any time
+// by first waiting for all nodes to be on the current (pre-update) version of
+// the table desc.
+//
+// The update closure is called after the wait, and it provides the new version
+// of the descriptor to be written. In a multi-step schema operation, this
+// update should perform a single step.
+//
+// The closure may be called multiple times if retries occur; make sure it does
+// not have side effects.
+//
+// Returns the updated version of the descriptor.
+func (s LeaseStore) Publish(
+	ctx context.Context,
+	tableID sqlbase.ID,
+	update func(*sqlbase.MutableTableDescriptor) error,
+	logEvent func(*client.Txn) error,
+) (*sqlbase.ImmutableTableDescriptor, error) {
+	tableIDs := []sqlbase.ID{tableID}
+	updates := func(descs map[sqlbase.ID]*sqlbase.MutableTableDescriptor) error {
+		desc, ok := descs[tableID]
+		if !ok {
+			return errors.AssertionFailedf("required table with ID %d not provided to update closure", tableID)
+		}
+		return update(desc)
+	}
+
+	results, err := s.PublishMultiple(ctx, tableIDs, updates, logEvent)
+	if err != nil {
+		return nil, err
+	}
+	return results[tableID], nil
 }
 
 // IDVersion represents a descriptor ID, version pair that are
@@ -497,15 +550,19 @@ func (s LeaseStore) getForExpiration(
 		prevTimestamp := expiration.Prev()
 		txn.SetFixedTimestamp(ctx, prevTimestamp)
 		var desc sqlbase.Descriptor
-		if err := txn.GetProto(ctx, descKey, &desc); err != nil {
+		ts, err := txn.GetProtoTs(ctx, descKey, &desc)
+		if err != nil {
 			return err
 		}
-		tableDesc := desc.GetTable()
+		tableDesc := desc.Table(ts)
 		if tableDesc == nil {
 			return sqlbase.ErrDescriptorNotFound
 		}
 		if !tableDesc.ModificationTime.Less(prevTimestamp) {
-			return pgerror.AssertionFailedf("unable to read table= (%d, %s)", id, expiration)
+			return errors.AssertionFailedf("unable to read table= (%d, %s)", id, expiration)
+		}
+		if err := tableDesc.MaybeFillInDescriptor(ctx, txn); err != nil {
+			return err
 		}
 		// Create a tableVersionState with the table and without a lease.
 		table = &tableVersionState{
@@ -919,12 +976,18 @@ func (t *tableState) removeInactiveVersions() []*storedTableLease {
 }
 
 // If the lease cannot be obtained because the descriptor is in the process of
-// being dropped, the error will be errTableDropped.
+// being dropped or offline, the error will be of type inactiveTableError.
 // The boolean returned is true if this call was actually responsible for the
 // lease acquisition.
 func acquireNodeLease(ctx context.Context, m *LeaseManager, id sqlbase.ID) (bool, error) {
 	var toRelease *storedTableLease
 	resultChan, didAcquire := m.group.DoChan(fmt.Sprintf("acquire%d", id), func() (interface{}, error) {
+		// Note that we use a new `context` here to avoid a situation where a cancellation
+		// of the first context cancels other callers to the `acquireNodeLease()` method,
+		// because of its use of `singleflight.Group`. See issue #41780 for how this has
+		// happened.
+		newCtx, cancel := m.stopper.WithCancelOnQuiesce(logtags.WithTags(context.Background(), logtags.FromContext(ctx)))
+		defer cancel()
 		if m.isDraining() {
 			return nil, errors.New("cannot acquire lease when draining")
 		}
@@ -933,26 +996,30 @@ func acquireNodeLease(ctx context.Context, m *LeaseManager, id sqlbase.ID) (bool
 		if newest != nil {
 			minExpiration = newest.expiration
 		}
-		table, err := m.LeaseStore.acquire(ctx, minExpiration, id)
+		table, err := m.LeaseStore.acquire(newCtx, minExpiration, id)
 		if err != nil {
 			return nil, err
 		}
 		t := m.findTableState(id, false /* create */)
 		t.mu.Lock()
 		defer t.mu.Unlock()
-		toRelease, err = t.upsertLocked(ctx, table)
+		toRelease, err = t.upsertLocked(newCtx, table)
 		if err != nil {
 			return nil, err
 		}
 		m.tableNames.insert(table)
+		if toRelease != nil {
+			releaseLease(toRelease, m)
+		}
 		return leaseToken(table), nil
 	})
-	result := <-resultChan
-	if result.Err != nil {
-		return false, result.Err
-	}
-	if toRelease != nil {
-		releaseLease(toRelease, m)
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case result := <-resultChan:
+		if result.Err != nil {
+			return false, result.Err
+		}
 	}
 	return didAcquire, nil
 }
@@ -1028,7 +1095,7 @@ func releaseLease(lease *storedTableLease, m *LeaseManager) {
 
 // purgeOldVersions removes old unused table descriptor versions older than
 // minVersion and releases any associated leases.
-// If dropped is set, minVersion is ignored; no lease is acquired and all
+// If takenOffline is set, minVersion is ignored; no lease is acquired and all
 // existing unused versions are removed. The table is further marked dropped,
 // which will cause existing in-use leases to be eagerly released once
 // they're not in use any more.
@@ -1037,7 +1104,7 @@ func purgeOldVersions(
 	ctx context.Context,
 	db *client.DB,
 	id sqlbase.ID,
-	dropped bool,
+	takenOffline bool,
 	minVersion sqlbase.DescriptorVersion,
 	m *LeaseManager,
 ) error {
@@ -1064,8 +1131,8 @@ func purgeOldVersions(
 		}
 	}
 
-	if dropped {
-		removeInactives(dropped)
+	if takenOffline {
+		removeInactives(takenOffline)
 		return nil
 	}
 
@@ -1077,8 +1144,9 @@ func purgeOldVersions(
 	// active lease, so that it doesn't get released when removeInactives()
 	// is called below. Release this lease after calling removeInactives().
 	table, _, err := t.findForTimestamp(ctx, m.clock.Now())
-	if dropped := err == errTableDropped; dropped || err == nil {
-		removeInactives(dropped)
+	if _, ok := err.(*inactiveTableError); ok || err == nil {
+		isInactive := ok
+		removeInactives(isInactive)
 		if table != nil {
 			s, err := t.release(&table.ImmutableTableDescriptor, m.removeOnceDereferenced())
 			if err != nil {
@@ -1677,8 +1745,14 @@ func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *client.DB, g *gossip.G
 					switch union := descriptor.Union.(type) {
 					case *sqlbase.Descriptor_Table:
 						table := union.Table
-						table.MaybeFillInDescriptor()
-						if err := table.ValidateTable(m.settings); err != nil {
+						// Note that we don't need to "fill in" the descriptor here. Nobody
+						// actually reads the table, but it's necessary for the call to
+						// ValidateTable().
+						if err := table.MaybeFillInDescriptor(ctx, nil); err != nil {
+							log.Warningf(ctx, "%s: unable to fill in table descriptor %v", kv.Key, table)
+							return
+						}
+						if err := table.ValidateTable(); err != nil {
 							log.Errorf(ctx, "%s: received invalid table descriptor: %s. Desc: %v",
 								kv.Key, err, table,
 							)
@@ -1690,7 +1764,7 @@ func (m *LeaseManager) RefreshLeases(s *stop.Stopper, db *client.DB, g *gossip.G
 						}
 						// Try to refresh the table lease to one >= this version.
 						if err := purgeOldVersions(
-							ctx, db, table.ID, table.Dropped(), table.Version, m); err != nil {
+							ctx, db, table.ID, table.GoingOffline(), table.Version, m); err != nil {
 							log.Warningf(ctx, "error purging leases for table %d(%s): %s",
 								table.ID, table.Name, err)
 						}

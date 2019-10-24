@@ -1,24 +1,20 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
 import (
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // ParseStringAs reads s as type t. If t is Bytes or String, s is returned
@@ -39,7 +35,7 @@ func ParseStringAs(t *types.T, s string, evalCtx *EvalContext) (Datum, error) {
 	default:
 		d, err = parseStringAs(t, s, evalCtx)
 		if d == nil && err == nil {
-			return nil, pgerror.AssertionFailedf("unknown type %s (%T)", t, t)
+			return nil, errors.AssertionFailedf("unknown type %s (%T)", t, t)
 		}
 	}
 	return d, err
@@ -56,14 +52,18 @@ func ParseDatumStringAs(t *types.T, s string, evalCtx *EvalContext) (Datum, erro
 	}
 }
 
-// parseStringAs parses s as type t for simple types. Bytes, arrays, collated
+// parseStringAs parses s as type t for simple types. Arrays and collated
 // strings are not handled. nil, nil is returned if t is not a supported type.
 func parseStringAs(t *types.T, s string, ctx ParseTimeContext) (Datum, error) {
 	switch t.Family() {
+	case types.ArrayFamily:
+		return ParseDArrayFromString(ctx, s, t.ArrayContents())
 	case types.BitFamily:
 		return ParseDBitArray(s)
 	case types.BoolFamily:
 		return ParseDBool(s)
+	case types.BytesFamily:
+		return ParseDByte(s)
 	case types.DateFamily:
 		return ParseDDate(ctx, s)
 	case types.DecimalFamily:
@@ -83,8 +83,14 @@ func parseStringAs(t *types.T, s string, ctx ParseTimeContext) (Datum, error) {
 	case types.TimeFamily:
 		return ParseDTime(ctx, s)
 	case types.TimestampFamily:
+		if t.Precision() == 0 {
+			return ParseDTimestamp(ctx, s, time.Second)
+		}
 		return ParseDTimestamp(ctx, s, time.Microsecond)
 	case types.TimestampTZFamily:
+		if t.Precision() == 0 {
+			return ParseDTimestampTZ(ctx, s, time.Second)
+		}
 		return ParseDTimestampTZ(ctx, s, time.Microsecond)
 	case types.UuidFamily:
 		return ParseDUuidFromString(s)

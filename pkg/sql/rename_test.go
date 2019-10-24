@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -53,10 +49,11 @@ func TestRenameTable(t *testing.T) {
 	// Check the table descriptor.
 	desc := &sqlbase.Descriptor{}
 	tableDescKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(counter))
-	if err := kvDB.GetProto(context.TODO(), tableDescKey, desc); err != nil {
+	ts, err := kvDB.GetProtoTs(context.TODO(), tableDescKey, desc)
+	if err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := desc.GetTable()
+	tableDesc := desc.Table(ts)
 	if tableDesc.Name != oldName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", oldName, tableDesc)
 	}
@@ -78,10 +75,11 @@ func TestRenameTable(t *testing.T) {
 	}
 
 	// Check the table descriptor again.
-	if err := kvDB.GetProto(context.TODO(), tableDescKey, desc); err != nil {
+	ts, err = kvDB.GetProtoTs(context.TODO(), tableDescKey, desc)
+	if err != nil {
 		t.Fatal(err)
 	}
-	tableDesc = desc.GetTable()
+	tableDesc = desc.Table(ts)
 	if tableDesc.Name != newName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", newName, tableDesc)
 	}
@@ -107,7 +105,7 @@ func isRenamed(
 	if err := val.GetProto(&descriptor); err != nil {
 		panic("unable to unmarshal table descriptor")
 	}
-	table := descriptor.GetTable()
+	table := descriptor.Table(val.Timestamp)
 	return table.Name == expectedName && table.Version == expectedVersion
 }
 

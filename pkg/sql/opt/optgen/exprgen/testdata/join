@@ -1,28 +1,10 @@
 exec-ddl
 CREATE TABLE abc (a INT, b INT, c INT, INDEX ab(a, b))
 ----
-TABLE abc
- ├── a int
- ├── b int
- ├── c int
- ├── rowid int not null (hidden)
- ├── INDEX primary
- │    └── rowid int not null (hidden)
- └── INDEX ab
-      ├── a int
-      ├── b int
-      └── rowid int not null (hidden)
 
 exec-ddl
 CREATE TABLE def (d INT, e INT, f INT)
 ----
-TABLE def
- ├── d int
- ├── e int
- ├── f int
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 expr
 (InnerJoin
@@ -32,10 +14,10 @@ expr
   [ ]
 )
 ----
-inner-join
+inner-join (hash)
  ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int) t.public.abc.c:3(int) t.public.def.d:5(int!null) t.public.def.e:6(int) t.public.def.f:7(int)
- ├── stats: [rows=10000, distinct(1)=100, null(1)=0, distinct(5)=100, null(5)=0]
- ├── cost: 2270.05
+ ├── stats: [rows=9801, distinct(1)=99, null(1)=0, distinct(5)=99, null(5)=0]
+ ├── cost: 2268.06
  ├── fd: (1)==(5), (5)==(1)
  ├── prune: (2,3,6,7)
  ├── interesting orderings: (+1,+2)
@@ -65,11 +47,11 @@ expr
 left-join (lookup abc@ab)
  ├── columns: t.public.abc.a:5(int) t.public.abc.b:6(int)
  ├── key columns: [5] = [5]
- ├── stats: [rows=333333.333]
- ├── cost: 691726.697
+ ├── stats: [rows=3333.33333, distinct(5)=100, null(5)=33.3333333]
+ ├── cost: 25560.04
  ├── scan t.public.def
  │    ├── columns: t.public.def.d:1(int) t.public.def.e:2(int)
- │    ├── stats: [rows=1000]
+ │    ├── stats: [rows=1000, distinct(2)=100, null(2)=10]
  │    ├── cost: 1060.02
  │    └── prune: (1,2)
  └── filters
@@ -95,8 +77,8 @@ inner-join (merge)
  ├── columns: t.public.abc.a:1(int!null) t.public.abc.b:2(int) t.public.abc.c:3(int) t.public.def.d:5(int!null) t.public.def.e:6(int) t.public.def.f:7(int)
  ├── left ordering: +1
  ├── right ordering: +5
- ├── stats: [rows=10000, distinct(1)=100, null(1)=0, distinct(5)=100, null(5)=0]
- ├── cost: 2698.70137
+ ├── stats: [rows=9801, distinct(1)=99, null(1)=0, distinct(5)=99, null(5)=0]
+ ├── cost: 2696.71137
  ├── fd: (1)==(5), (5)==(1)
  ├── sort
  │    ├── columns: t.public.abc.a:1(int) t.public.abc.b:2(int) t.public.abc.c:3(int)
@@ -145,7 +127,7 @@ inner-join-apply
  ├── select
  │    ├── columns: t.public.def.d:5(int) t.public.def.e:6(int) t.public.def.f:7(int)
  │    ├── outer: (1)
- │    ├── stats: [rows=333.333333]
+ │    ├── stats: [rows=333.333333, distinct(1)=1, null(1)=0]
  │    ├── cost: 1080.03
  │    ├── prune: (7)
  │    ├── scan t.public.def

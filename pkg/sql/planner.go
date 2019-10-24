@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -20,8 +16,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -32,8 +28,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/logtags"
 	"github.com/pkg/errors"
 )
 
@@ -43,6 +39,9 @@ type extendedEvalContext struct {
 	tree.EvalContext
 
 	SessionMutator *sessionDataMutator
+
+	// SessionID for this connection.
+	SessionID ClusterWideID
 
 	// VirtualSchemas can be used to access virtual tables.
 	VirtualSchemas VirtualTabler
@@ -70,6 +69,8 @@ type extendedEvalContext struct {
 	SchemaChangers *schemaChangerCollection
 
 	schemaAccessors *schemaInterface
+
+	sqlStatsCollector *sqlStatsCollector
 }
 
 // copy returns a deep copy of ctx.
@@ -113,9 +114,6 @@ type planner struct {
 
 	preparedStatements preparedStatementsAccessor
 
-	// statsCollector is used to collect statistics about SQL statement execution.
-	statsCollector sqlStatsCollector
-
 	// avoidCachedDescriptors, when true, instructs all code that
 	// accesses table/view descriptors to force reading the descriptors
 	// within the transaction. This is necessary to read descriptors
@@ -134,8 +132,8 @@ type planner struct {
 	// transaction along with other KV operations. Committing the txn might be
 	// beneficial because it may enable the 1PC optimization.
 	//
-	// NOTE: This member is for internal use of the planner only. PlanNodes that
-	// want to do 1PC transactions have to implement the autoCommitNode interface.
+	// NOTE: plan node must be configured appropriately to actually perform an
+	// auto-commit. This is dependent on information from the optimizer.
 	autoCommit bool
 
 	// discardRows is set if we want to discard any results rather than sending
@@ -158,9 +156,7 @@ type planner struct {
 
 	// Avoid allocations by embedding commonly used objects and visitors.
 	txCtx                 transform.ExprTransformContext
-	subqueryVisitor       subqueryVisitor
 	nameResolutionVisitor sqlbase.NameResolutionVisitor
-	srfExtractionVisitor  srfExtractionVisitor
 	tableName             tree.TableName
 
 	// Use a common datum allocator across all the plan nodes. This separates the
@@ -173,6 +169,10 @@ type planner struct {
 	optPlanningCtx optPlanningCtx
 
 	queryCacheSession querycache.Session
+}
+
+func (ctx *extendedEvalContext) setSessionID(sessionID ClusterWideID) {
+	ctx.SessionID = sessionID
 }
 
 // noteworthyInternalMemoryUsageBytes is the minimum size tracked by each
@@ -265,6 +265,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.SessionAccessor = p
 	p.extendedEvalCtx.Sequence = p
 	p.extendedEvalCtx.ClusterID = execCfg.ClusterID()
+	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	p.extendedEvalCtx.NodeID = execCfg.NodeID.Get()
 	p.extendedEvalCtx.Locality = execCfg.Locality
 
@@ -278,6 +279,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.Tables = tables
 
 	p.queryCacheSession.Init()
+	p.optPlanningCtx.init(p)
 
 	return p, func() {
 		// Note that we capture ctx here. This is only valid as long as we create
@@ -405,16 +407,19 @@ func (p *planner) ParseQualifiedTableName(
 }
 
 // ResolveTableName implements the tree.EvalDatabase interface.
-func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) error {
-	_, err := ResolveExistingObject(ctx, p, tn, true /*required*/, ResolveAnyDescType)
-	return err
+func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tree.ID, error) {
+	desc, err := ResolveExistingObject(ctx, p, tn, tree.ObjectLookupFlagsWithRequired(), ResolveAnyDescType)
+	if err != nil {
+		return 0, err
+	}
+	return tree.ID(desc.ID), nil
 }
 
 // LookupTableByID looks up a table, by the given descriptor ID. Based on the
 // CommonLookupFlags, it could use or skip the TableCollection cache. See
 // TableCollection.getTableVersionByID for how it's used.
 func (p *planner) LookupTableByID(ctx context.Context, tableID sqlbase.ID) (row.TableEntry, error) {
-	flags := ObjectLookupFlags{CommonLookupFlags: CommonLookupFlags{avoidCached: p.avoidCachedDescriptors}}
+	flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{AvoidCached: p.avoidCachedDescriptors}}
 	table, err := p.Tables().getTableVersionByID(ctx, p.txn, tableID, flags)
 	if err != nil {
 		if err == errTableAdding {
@@ -457,6 +462,41 @@ const (
 	KVStringOptRequireNoValue KVStringOptValidate = `no-value`
 	KVStringOptRequireValue   KVStringOptValidate = `value`
 )
+
+// evalStringOptions evaluates the KVOption values as strings and returns them
+// in a map. Options with no value have an empty string.
+func evalStringOptions(
+	evalCtx *tree.EvalContext, opts []exec.KVOption, optValidate map[string]KVStringOptValidate,
+) (map[string]string, error) {
+	res := make(map[string]string, len(opts))
+	for _, opt := range opts {
+		k := opt.Key
+		validate, ok := optValidate[k]
+		if !ok {
+			return nil, errors.Errorf("invalid option %q", k)
+		}
+		val, err := opt.Value.Eval(evalCtx)
+		if err != nil {
+			return nil, err
+		}
+		if val == tree.DNull {
+			if validate == KVStringOptRequireValue {
+				return nil, errors.Errorf("option %q requires a value", k)
+			}
+			res[k] = ""
+		} else {
+			if validate == KVStringOptRequireNoValue {
+				return nil, errors.Errorf("option %q does not take a value", k)
+			}
+			str, ok := val.(*tree.DString)
+			if !ok {
+				return nil, errors.Errorf("expected string value, got %T", val)
+			}
+			res[k] = string(*str)
+		}
+	}
+	return res, nil
+}
 
 // TypeAsStringOpts enforces (not hints) that the given expressions
 // typecheck as strings, and returns a function that can be called to
@@ -559,33 +599,4 @@ type txnModesSetter interface {
 	// transaction.
 	// asOfTs, if not empty, is the evaluation of modes.AsOf.
 	setTransactionModes(modes tree.TransactionModes, asOfTs hlc.Timestamp) error
-}
-
-// sqlStatsCollector is the interface used by SQL execution, through the
-// planner, for recording statistics about SQL statements.
-type sqlStatsCollector interface {
-	// PhaseTimes returns that phaseTimes struct that measures the time spent in
-	// each phase of SQL execution.
-	// See executor_statement_metrics.go for details.
-	PhaseTimes() *phaseTimes
-
-	// RecordStatement record stats for one statement.
-	//
-	// samplePlanDescription can be nil, as these are only sampled periodically per unique fingerprint.
-	RecordStatement(
-		stmt *Statement,
-		samplePlanDescription *roachpb.ExplainTreePlanNode,
-		distSQLUsed bool,
-		optUsed bool,
-		automaticRetryCount int,
-		numRows int,
-		err error,
-		parseLat, planLat, runLat, svcLat, ovhLat float64,
-	)
-
-	// SQLStats provides access to the global sqlStats object.
-	SQLStats() *sqlStats
-
-	// Reset resets this stats collector with the given phaseTimes array.
-	Reset(sqlStats *sqlStats, appStats *appStats, times *phaseTimes)
 }

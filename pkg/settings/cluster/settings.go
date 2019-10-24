@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cluster
 
@@ -20,7 +16,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -63,6 +61,9 @@ type Settings struct {
 	// Manual defaults to false. If set, lets this ClusterSetting's MakeUpdater
 	// method return a dummy updater that simply throws away all values. This is
 	// for use in tests for which manual control is desired.
+	//
+	// Also see the Override() method that different types of settings provide for
+	// overwriting the default of a single setting.
 	Manual atomic.Value // bool
 
 	Version ExposedClusterVersion
@@ -75,6 +76,11 @@ type Settings struct {
 	// Set to 1 if a profile is active (if the profile is being grabbed through
 	// the `pprofui` server as opposed to the raw endpoint).
 	cpuProfiling int32 // atomic
+}
+
+// TelemetryOptOut is a place for controlling whether to opt out of telemetry or not.
+func TelemetryOptOut() bool {
+	return envutil.EnvOrDefaultBool("COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING", false)
 }
 
 // IsCPUProfiling returns true if a pprofui CPU profile is being recorded. This can
@@ -193,7 +199,11 @@ func (ecv *ExposedClusterVersion) BootstrapVersion() ClusterVersion {
 }
 
 // IsActive returns true if the features of the supplied version key are active
-// at the running version.
+// at the running version. In other words, if a particular version returns true
+// from this method, it means that you're guaranteed that all of the nodes in
+// the cluster have running binaries that are at least as new as that version,
+// and that you're guaranteed that those nodes will never be downgraded to an
+// older version.
 //
 // If this returns true then all nodes in the cluster will eventually see this
 // version. However, this is not atomic because versions are gossiped. Because
@@ -215,7 +225,7 @@ func (ecv *ExposedClusterVersion) IsActive(versionKey VersionKey) bool {
 func (ecv *ExposedClusterVersion) CheckVersion(versionKey VersionKey, feature string) error {
 	if !ecv.Version().IsActive(versionKey) {
 		return pgerror.Newf(
-			pgerror.CodeFeatureNotSupportedError,
+			pgcode.FeatureNotSupported,
 			"cluster version does not support %s (>= %s required)",
 			feature,
 			VersionByKey(versionKey).String(),
@@ -223,6 +233,9 @@ func (ecv *ExposedClusterVersion) CheckVersion(versionKey VersionKey, feature st
 	}
 	return nil
 }
+
+// Silence unused warning.
+var _ = (*ExposedClusterVersion)(nil).CheckVersion
 
 // MakeTestingClusterSettings returns a Settings object that has had its version
 // initialized to BinaryServerVersion.
@@ -245,6 +258,7 @@ func MakeTestingClusterSettingsWithVersion(minVersion, serverVersion roachpb.Ver
 // MakeClusterSettings makes a new ClusterSettings object for the given minimum
 // supported and server version, respectively.
 func MakeClusterSettings(minVersion, serverVersion roachpb.Version) *Settings {
+
 	s := &Settings{}
 
 	// Initialize the setting. Note that baseVersion starts out with the zero

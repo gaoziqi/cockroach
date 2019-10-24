@@ -1,49 +1,59 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package row
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 )
 
-// kvFetcher wraps kvBatchFetcher, providing a nextKV interface that returns the
+// KVFetcher wraps kvBatchFetcher, providing a NextKV interface that returns the
 // next kv from its input.
-type kvFetcher struct {
+type KVFetcher struct {
 	kvBatchFetcher
 
 	kvs []roachpb.KeyValue
 
 	batchResponse []byte
 	bytesRead     int64
-	span          roachpb.Span
+	Span          roachpb.Span
 	newSpan       bool
 }
 
-func newKVFetcher(batchFetcher kvBatchFetcher) kvFetcher {
-	return kvFetcher{
+// NewKVFetcher creates a new KVFetcher.
+func NewKVFetcher(
+	txn *client.Txn,
+	spans roachpb.Spans,
+	reverse bool,
+	useBatchLimit bool,
+	firstBatchLimit int64,
+	returnRangeInfo bool,
+) (*KVFetcher, error) {
+	kvBatchFetcher, err := makeKVBatchFetcher(txn, spans, reverse, useBatchLimit, firstBatchLimit, returnRangeInfo)
+	return newKVFetcher(&kvBatchFetcher), err
+}
+
+func newKVFetcher(batchFetcher kvBatchFetcher) *KVFetcher {
+	return &KVFetcher{
 		kvBatchFetcher: batchFetcher,
 	}
 }
 
-// nextKV returns the next kv from this fetcher. Returns false if there are no
+// NextKV returns the next kv from this fetcher. Returns false if there are no
 // more kvs to fetch, the kv that was fetched, and any errors that may have
 // occurred.
-func (f *kvFetcher) nextKV(
+func (f *KVFetcher) NextKV(
 	ctx context.Context,
 ) (ok bool, kv roachpb.KeyValue, newSpan bool, err error) {
 	for {
@@ -70,7 +80,7 @@ func (f *kvFetcher) nextKV(
 			}, newSpan, nil
 		}
 
-		ok, f.kvs, f.batchResponse, f.span, err = f.nextBatch(ctx)
+		ok, f.kvs, f.batchResponse, f.Span, err = f.nextBatch(ctx)
 		if err != nil {
 			return ok, kv, false, err
 		}

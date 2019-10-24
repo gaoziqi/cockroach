@@ -1,4 +1,4 @@
-# LogicTest: local local-opt
+# LogicTest: local
 
 query T colnames
 SELECT * FROM [SHOW client_encoding]
@@ -37,16 +37,19 @@ default_tablespace                   ·
 default_transaction_isolation        serializable
 default_transaction_read_only        off
 distsql                              off
-experimental_enable_zigzag_join      on
+enable_zigzag_join                   on
+experimental_enable_temp_tables      off
 experimental_force_split_at          off
+experimental_optimizer_foreign_keys  off
 experimental_serial_normalization    rowid
-experimental_vectorize               off
 extra_float_digits                   0
 force_savepoint_restart              off
 idle_in_transaction_session_timeout  0
 integer_datetimes                    on
 intervalstyle                        postgres
+locality                             region=test,dc=dc1
 lock_timeout                         0
+max_identifier_length                128
 max_index_keys                       32
 node_id                              1
 reorder_joins_limit                  4
@@ -67,6 +70,8 @@ transaction_isolation                serializable
 transaction_priority                 normal
 transaction_read_only                off
 transaction_status                   NoTxn
+vectorize                            auto
+vectorize_row_count_threshold        0
 
 query T colnames
 SELECT * FROM [SHOW CLUSTER SETTING sql.defaults.distsql]
@@ -95,12 +100,12 @@ test
 query TT colnames
 SELECT * FROM [SHOW ZONE CONFIGURATIONS] LIMIT 0
 ----
-zone_name  config_sql
+target  raw_config_sql
 
 query TT colnames
 SELECT * FROM [SHOW ZONE CONFIGURATION FOR TABLE system.users] LIMIT 0
 ----
-zone_name  config_sql
+target  raw_config_sql
 
 query T colnames,rowsort
 SELECT * FROM [SHOW DATABASES]
@@ -156,41 +161,49 @@ query T colnames,rowsort
 SELECT * FROM [SHOW TABLES FROM system]
 ----
 table_name
-comments
-descriptor
-eventlog
-jobs
-lease
-locations
 namespace
-rangelog
-role_members
-settings
-table_statistics
-ui
+descriptor
 users
-web_sessions
 zones
+settings
+lease
+eventlog
+rangelog
+ui
+jobs
+web_sessions
+table_statistics
+locations
+role_members
+comments
+replication_constraint_stats
+replication_critical_localities
+replication_stats
+reports_meta
 
 query TT colnames,rowsort
 SELECT * FROM [SHOW TABLES FROM system WITH COMMENT]
 ----
-table_name        comment
-namespace         ·
-descriptor        ·
-users             ·
-zones             ·
-settings          ·
-lease             ·
-eventlog          ·
-rangelog          ·
-ui                ·
-jobs              ·
-web_sessions      ·
-table_statistics  ·
-locations         ·
-role_members      ·
-comments          ·
+table_name                       comment
+namespace                        ·
+descriptor                       ·
+users                            ·
+zones                            ·
+settings                         ·
+lease                            ·
+eventlog                         ·
+rangelog                         ·
+ui                               ·
+jobs                             ·
+web_sessions                     ·
+table_statistics                 ·
+locations                        ·
+role_members                     ·
+comments                         ·
+replication_constraint_stats     ·
+replication_critical_localities  ·
+replication_stats                ·
+reports_meta                     ·
 
 query ITTT colnames
 SELECT node_id, user_name, application_name, active_queries
@@ -286,13 +299,13 @@ testuser
 
 
 query TTTI colnames
-SELECT start_key, end_key, replicas, lease_holder FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE system.descriptor]
+SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM TABLE system.descriptor]
 ----
 start_key  end_key  replicas  lease_holder
 NULL       NULL     {1}       1
 
 query TTTI colnames
-CREATE INDEX ix ON foo(x); SELECT start_key, end_key, replicas, lease_holder FROM [SHOW EXPERIMENTAL_RANGES FROM INDEX foo@ix]
+CREATE INDEX ix ON foo(x); SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM INDEX foo@ix]
 ----
 start_key  end_key  replicas  lease_holder
 NULL       NULL     {1}       1
@@ -326,8 +339,51 @@ SELECT field, replace(message, e'\n', ' ') AS message FROM [SHOW SYNTAX 'foo']
  WHERE field != 'line'
 ----
 field     message
-error     syntax error at or near "foo"
+error     at or near "foo": syntax error
 code      42601
-file      sql/parser/show_syntax.go
-function  RunShowSyntax
+file      lexer.go
+function  Error
 detail    source SQL: foo ^
+
+
+# Test the SHOW INDEXES FROM DATABASE COMMAND
+statement ok
+CREATE DATABASE showdbindexestest;
+
+statement ok
+CREATE TABLE showdbindexestest.table1 (key1 INT PRIMARY KEY);
+
+statement ok
+CREATE TABLE showdbindexestest.table2 (key2 INT PRIMARY KEY);
+
+query TTBITTBB
+SHOW INDEXES FROM DATABASE showdbindexestest;
+----
+table1 primary false 1 key1 ASC false false
+table2 primary false 1 key2 ASC false false
+
+statement ok
+CREATE DATABASE "$peci@l";
+
+statement ok
+CREATE TABLE "$peci@l".table1 (key1 INT PRIMARY KEY);
+
+statement ok
+CREATE TABLE "$peci@l".table2 (key2 INT PRIMARY KEY);
+
+query TTBITTBB
+SHOW INDEXES FROM DATABASE "$peci@l";
+----
+table1 primary false 1 key1 ASC false false
+table2 primary false 1 key2 ASC false false
+
+# Test SHOW LOCALITY telemetry.
+query T
+SHOW LOCALITY
+----
+region=test,dc=dc1
+
+query T
+SELECT feature_name FROM crdb_internal.feature_usage WHERE feature_name='sql.show.locality' AND usage_count > 0
+----
+sql.show.locality

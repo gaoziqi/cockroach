@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package xform
 
@@ -50,9 +46,25 @@ func BuildChildPhysicalProps(
 ) *physical.Required {
 	var childProps physical.Required
 
-	// The only operation that requires a presentation of its input is Explain.
-	if parent.Op() == opt.ExplainOp {
+	// Most operations don't require a presentation of their input; these are the
+	// exceptions.
+	switch parent.Op() {
+	case opt.ExplainOp:
 		childProps.Presentation = parent.(*memo.ExplainExpr).Props.Presentation
+	case opt.AlterTableSplitOp:
+		childProps.Presentation = parent.(*memo.AlterTableSplitExpr).Props.Presentation
+	case opt.AlterTableUnsplitOp:
+		childProps.Presentation = parent.(*memo.AlterTableUnsplitExpr).Props.Presentation
+	case opt.AlterTableRelocateOp:
+		childProps.Presentation = parent.(*memo.AlterTableRelocateExpr).Props.Presentation
+	case opt.ControlJobsOp:
+		childProps.Presentation = parent.(*memo.ControlJobsExpr).Props.Presentation
+	case opt.CancelQueriesOp:
+		childProps.Presentation = parent.(*memo.CancelQueriesExpr).Props.Presentation
+	case opt.CancelSessionsOp:
+		childProps.Presentation = parent.(*memo.CancelSessionsExpr).Props.Presentation
+	case opt.ExportOp:
+		childProps.Presentation = parent.(*memo.ExportExpr).Props.Presentation
 	}
 
 	childProps.Ordering = ordering.BuildChildRequired(parent, &parentProps.Ordering, nth)

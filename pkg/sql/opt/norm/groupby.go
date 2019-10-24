@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package norm
 
@@ -19,8 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // CanReduceGroupingCols is true if the given GroupBy operator has one or more
@@ -113,7 +109,7 @@ func (c *CustomFuncs) makeAggCols(
 	// Append aggregate functions wrapping a Variable reference to each column.
 	i := 0
 	for id, ok := cols.Next(0); ok; id, ok = cols.Next(id + 1) {
-		varExpr := c.f.ConstructVariable(opt.ColumnID(id))
+		varExpr := c.f.ConstructVariable(id)
 
 		var outAgg opt.ScalarExpr
 		switch aggOp {
@@ -127,11 +123,11 @@ func (c *CustomFuncs) makeAggCols(
 			outAgg = c.f.ConstructFirstAgg(varExpr)
 
 		default:
-			panic(pgerror.AssertionFailedf("unrecognized aggregate operator type: %v", log.Safe(aggOp)))
+			panic(errors.AssertionFailedf("unrecognized aggregate operator type: %v", log.Safe(aggOp)))
 		}
 
 		outAggs[i].Agg = outAgg
-		outAggs[i].Col = opt.ColumnID(id)
+		outAggs[i].Col = id
 		i++
 	}
 }
@@ -192,7 +188,7 @@ func (c *CustomFuncs) replaceAggInputVar(agg opt.ScalarExpr, v opt.ScalarExpr) o
 	case 2:
 		return c.f.DynamicConstruct(agg.Op(), v, agg.Child(1)).(opt.ScalarExpr)
 	default:
-		panic(pgerror.AssertionFailedf("unhandled number of aggregate children"))
+		panic(errors.AssertionFailedf("unhandled number of aggregate children"))
 	}
 }
 
@@ -219,7 +215,7 @@ func (c *CustomFuncs) hasRemovableAggDistinct(
 	}
 
 	cols := groupingCols.Copy()
-	cols.Add(int(v.Col))
+	cols.Add(v.Col)
 	if !inputFDs.ColsAreStrictKey(cols) {
 		return false, nil
 	}
@@ -250,7 +246,7 @@ func (c *CustomFuncs) ConstructProjectionFromDistinctOn(
 		inputCol := varExpr.Col
 		outputCol := aggs[i].Col
 		if inputCol == outputCol {
-			passthrough.Add(int(inputCol))
+			passthrough.Add(inputCol)
 		} else {
 			projections = append(projections, memo.ProjectionsItem{
 				Element:    varExpr,

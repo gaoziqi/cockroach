@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package client
 
@@ -57,11 +53,8 @@ type Txn struct {
 	// mu holds fields that need to be synchronized for concurrent request execution.
 	mu struct {
 		syncutil.Mutex
-		ID        uuid.UUID
-		debugName string
-
-		// userPriority is the transaction's priority. If not set,
-		// NormalUserPriority will be used.
+		ID           uuid.UUID
+		debugName    string
 		userPriority roachpb.UserPriority
 
 		// previousIDs holds the set of all previous IDs that the Txn's Proto has
@@ -98,6 +91,8 @@ type Txn struct {
 //   in the batch with the current node's ID.
 //   If the gatewayNodeID is set and this is a root transaction, we optimize
 //   away any clock uncertainty for our own node, as our clock is accessible.
+//
+// See also db.NewTxn().
 func NewTxn(ctx context.Context, db *DB, gatewayNodeID roachpb.NodeID, typ TxnType) *Txn {
 	now := db.clock.Now()
 	txn := roachpb.MakeTransaction(
@@ -141,7 +136,8 @@ func NewTxnWithCoordMeta(
 	meta.Txn.AssertInitialized(ctx)
 	txn := &Txn{db: db, typ: typ, gatewayNodeID: gatewayNodeID}
 	txn.mu.ID = meta.Txn.ID
-	txn.mu.sender = db.factory.TransactionalSender(typ, meta)
+	txn.mu.userPriority = roachpb.NormalUserPriority
+	txn.mu.sender = db.factory.TransactionalSender(typ, meta, txn.mu.userPriority)
 	return txn
 }
 
@@ -265,21 +261,16 @@ func (txn *Txn) CommitTimestamp() hlc.Timestamp {
 	return txn.mu.sender.CommitTimestamp()
 }
 
-// CommitTimestampFixed returns true if the commit timestamp has
-// been fixed to the start timestamp and cannot be pushed forward.
-func (txn *Txn) CommitTimestampFixed() bool {
-	txn.mu.Lock()
-	defer txn.mu.Unlock()
-	return txn.mu.sender.CommitTimestampFixed()
-}
-
 // SetSystemConfigTrigger sets the system db trigger to true on this transaction.
 // This will impact the EndTransactionRequest.
 func (txn *Txn) SetSystemConfigTrigger() error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
+	if err := txn.mu.sender.AnchorOnSystemConfigRange(); err != nil {
+		return err
+	}
 	txn.systemConfigTrigger = true
-	return txn.mu.sender.SetSystemConfigTrigger()
+	return nil
 }
 
 // DisablePipelining instructs the transaction not to pipeline requests. It
@@ -318,11 +309,28 @@ func (txn *Txn) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 //
 // key can be either a byte slice or a string.
 func (txn *Txn) GetProto(ctx context.Context, key interface{}, msg protoutil.Message) error {
+	_, err := txn.GetProtoTs(ctx, key, msg)
+	return err
+}
+
+// GetProtoTs retrieves the value for a key and decodes the result as a proto
+// message. It additionally returns the timestamp at which the key was read.
+// If the key doesn't exist, the proto will simply be reset and a zero timestamp
+// will be returned. A zero timestamp will also be returned if unmarshaling
+// fails.
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) GetProtoTs(
+	ctx context.Context, key interface{}, msg protoutil.Message,
+) (hlc.Timestamp, error) {
 	r, err := txn.Get(ctx, key)
 	if err != nil {
-		return err
+		return hlc.Timestamp{}, err
 	}
-	return r.ValueProto(msg)
+	if err := r.ValueProto(msg); err != nil || r.Value == nil {
+		return hlc.Timestamp{}, err
+	}
+	return r.Value.Timestamp, nil
 }
 
 // Put sets the value for a key
@@ -344,7 +352,7 @@ func (txn *Txn) Put(ctx context.Context, key, value interface{}) error {
 //
 // key can be either a byte slice or a string. value can be any key type, a
 // protoutil.Message or any Go primitive type (bool, int, etc).
-func (txn *Txn) CPut(ctx context.Context, key, value, expValue interface{}) error {
+func (txn *Txn) CPut(ctx context.Context, key, value interface{}, expValue *roachpb.Value) error {
 	b := txn.NewBatch()
 	b.CPut(key, value, expValue)
 	return getOneErr(txn.Run(ctx, b), b)
@@ -917,7 +925,7 @@ func (txn *Txn) replaceSenderIfTxnAbortedLocked(
 	txn.mu.ID = newTxn.ID
 	// Create a new txn sender.
 	meta := roachpb.MakeTxnCoordMeta(*newTxn)
-	txn.mu.sender = txn.db.factory.TransactionalSender(txn.typ, meta)
+	txn.mu.sender = txn.db.factory.TransactionalSender(txn.typ, meta, txn.mu.userPriority)
 }
 
 func (txn *Txn) recordPreviousTxnIDLocked(prevTxnID uuid.UUID) {

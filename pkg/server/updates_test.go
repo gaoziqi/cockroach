@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -30,14 +26,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -227,6 +223,7 @@ func TestCBOReportUsage(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, params)
 	// Stopper will wait for the update/report loop to finish too.
 	defer s.Stopper().Stop(context.TODO())
+	defer db.Close()
 	ts := s.(*TestServer)
 
 	// make sure the test's generated activity is the only activity we measure.
@@ -398,11 +395,15 @@ func TestReportUsage(t *testing.T) {
 		{"DATABASE system", fmt.Sprintf(`constraints: {"+zone=%[1]s,+%[1]s": 2, +%[1]s: 1}`, elemName)},
 		{"DATABASE system", fmt.Sprintf(`experimental_lease_preferences: [[+zone=%[1]s,+%[1]s], [+%[1]s]]`, elemName)},
 	} {
-		if _, err := db.Exec(
-			fmt.Sprintf(`ALTER %s CONFIGURE ZONE = '%s'`, cmd.resource, cmd.config),
-		); err != nil {
-			t.Fatalf("error applying zone config %q to %q: %v", cmd.config, cmd.resource, err)
-		}
+		testutils.SucceedsSoon(t, func() error {
+			if _, err := db.Exec(
+				fmt.Sprintf(`ALTER %s CONFIGURE ZONE = '%s'`, cmd.resource, cmd.config),
+			); err != nil {
+				// Work around gossip asynchronicity.
+				return errors.Errorf("error applying zone config %q to %q: %v", cmd.config, cmd.resource, err)
+			}
+			return nil
+		})
 	}
 	if _, err := db.Exec(`INSERT INTO system.zones (id, config) VALUES (10000, null)`); err != nil {
 		t.Fatal(err)
@@ -475,11 +476,6 @@ func TestReportUsage(t *testing.T) {
 		) {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`ALTER TABLE foo ALTER COLUMN x SET NOT NULL`); !testutils.IsError(
-			err, "unimplemented",
-		) {
-			t.Fatal(err)
-		}
 		if _, err := db.Exec(`SELECT crdb_internal.force_assertion_error('woo')`); !testutils.IsError(
 			err, "internal error",
 		) {
@@ -532,7 +528,7 @@ func TestReportUsage(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Try a correlated subquery to check that feature reporting.
-		if _, err := db.Exec(`SELECT x	FROM (VALUES (1)) AS b(x) WHERE EXISTS(SELECT * FROM (VALUES (1)) AS a(x) WHERE a.x = b.x)`); err != nil {
+		if _, err := db.Exec(`SELECT x FROM (VALUES (1)) AS b(x) WHERE EXISTS(SELECT * FROM (VALUES (1)) AS a(x) WHERE a.x = b.x)`); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -694,40 +690,39 @@ func TestReportUsage(t *testing.T) {
 
 		// Although the query is executed 10 times, due to plan caching
 		// keyed by the SQL text, the planning only occurs once.
+		// TODO(radu): fix this (#39361).
 		"sql.plan.ops.cast.string::inet":                                            1,
 		"sql.plan.ops.bin.jsonb - string":                                           1,
 		"sql.plan.builtins.crdb_internal.force_assertion_error(msg: string) -> int": 1,
 		"sql.plan.ops.array.ind":                                                    1,
 		"sql.plan.ops.array.cons":                                                   1,
 		"sql.plan.ops.array.flatten":                                                1,
+		// The CTE counter is exercised by `WITH a AS (SELECT 1) ...`.
+		"sql.plan.cte": 1,
 
 		// The subquery counter is exercised by `(1, 20, 30, 40) = (SELECT ...)`.
 		"sql.plan.subquery": 1,
 		// The correlated sq counter is exercised by `WHERE EXISTS ( ... )` above.
 		"sql.plan.subquery.correlated": 1,
-		// The CTE counter is exercised by `WITH a AS (SELECT 1) ...`.
-		"sql.plan.cte": 10,
 
 		"unimplemented.#33285.json_object_agg":          10,
 		"unimplemented.pg_catalog.pg_stat_wal_receiver": 10,
-		"unimplemented.syntax.#28751":                   10,
 		"unimplemented.syntax.#32564":                   10,
 		"unimplemented.#9148":                           10,
-		"othererror.builtins.go":                        10,
 		"othererror." +
-			pgerror.CodeDataExceptionError +
+			pgcode.Uncategorized +
 			".crdb_internal.set_vmodule()": 10,
-		"errorcodes.blah": 10,
-		"errorcodes." + pgerror.CodeDataExceptionError:       10,
-		"errorcodes." + pgerror.CodeInternalError:            10,
-		"errorcodes." + pgerror.CodeSyntaxError:              10,
-		"errorcodes." + pgerror.CodeFeatureNotSupportedError: 10,
-		"errorcodes." + pgerror.CodeDivisionByZeroError:      10,
+		"errorcodes.blah":                          10,
+		"errorcodes." + pgcode.Internal:            10,
+		"errorcodes." + pgcode.Syntax:              10,
+		"errorcodes." + pgcode.FeatureNotSupported: 10,
+		"errorcodes." + pgcode.DivisionByZero:      10,
 	}
 
 	if expected, actual := len(expectedFeatureUsage), len(r.last.FeatureUsage); actual < expected {
 		t.Fatalf("expected at least %d feature usage counts, got %d: %v", expected, actual, r.last.FeatureUsage)
 	}
+	t.Logf("%# v", pretty.Formatter(r.last.FeatureUsage))
 	for key, expected := range expectedFeatureUsage {
 		if got, ok := r.last.FeatureUsage[key]; !ok {
 			t.Fatalf("expected report of feature %q", key)
@@ -736,10 +731,10 @@ func TestReportUsage(t *testing.T) {
 		}
 	}
 
-	// 3 + 4 = 7: set 3 initially and org is set mid-test for 3 altered settings,
-	// plus version, reporting, trace and secret settings are set in startup
+	// 3 + 3 = 6: set 3 initially and org is set mid-test for 3 altered settings,
+	// plus version, reporting and secret settings are set in startup
 	// migrations.
-	if expected, actual := 7, len(r.last.AlteredSettings); expected != actual {
+	if expected, actual := 6, len(r.last.AlteredSettings); expected != actual {
 		t.Fatalf("expected %d changed settings, got %d: %v", expected, actual, r.last.AlteredSettings)
 	}
 	for key, expected := range map[string]string{
@@ -747,7 +742,6 @@ func TestReportUsage(t *testing.T) {
 		"diagnostics.reporting.enabled":            "true",
 		"diagnostics.reporting.send_crash_reports": "false",
 		"server.time_until_store_dead":             "1m30s",
-		"trace.debug.enable":                       "false",
 		"version":                                  cluster.BinaryServerVersion.String(),
 		"cluster.secret":                           "<redacted>",
 	} {
@@ -785,11 +779,11 @@ func TestReportUsage(t *testing.T) {
 			if a, e := zone.GC.TTLSeconds, int32(1); a != e {
 				t.Errorf("expected zone %d GC.TTLSeconds = %d; got %d", id, e, a)
 			}
-			if a, e := zone.Constraints, []config.Constraints{
+			if a, e := zone.Constraints, []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Key: hashedZone, Value: hashedElemName, Type: config.Constraint_REQUIRED},
-						{Value: hashedElemName, Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Key: hashedZone, Value: hashedElemName, Type: zonepb.Constraint_REQUIRED},
+						{Value: hashedElemName, Type: zonepb.Constraint_REQUIRED},
 					},
 				},
 			}; !reflect.DeepEqual(a, e) {
@@ -797,30 +791,30 @@ func TestReportUsage(t *testing.T) {
 			}
 		}
 		if id == keys.SystemDatabaseID {
-			if a, e := zone.Constraints, []config.Constraints{
+			if a, e := zone.Constraints, []zonepb.Constraints{
 				{
 					NumReplicas: 1,
-					Constraints: []config.Constraint{{Value: hashedElemName, Type: config.Constraint_REQUIRED}},
+					Constraints: []zonepb.Constraint{{Value: hashedElemName, Type: zonepb.Constraint_REQUIRED}},
 				},
 				{
 					NumReplicas: 2,
-					Constraints: []config.Constraint{
-						{Key: hashedZone, Value: hashedElemName, Type: config.Constraint_REQUIRED},
-						{Value: hashedElemName, Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Key: hashedZone, Value: hashedElemName, Type: zonepb.Constraint_REQUIRED},
+						{Value: hashedElemName, Type: zonepb.Constraint_REQUIRED},
 					},
 				},
 			}; !reflect.DeepEqual(a, e) {
 				t.Errorf("expected zone %d Constraints = %+v; got %+v", id, e, a)
 			}
-			if a, e := zone.LeasePreferences, []config.LeasePreference{
+			if a, e := zone.LeasePreferences, []zonepb.LeasePreference{
 				{
-					Constraints: []config.Constraint{
-						{Key: hashedZone, Value: hashedElemName, Type: config.Constraint_REQUIRED},
-						{Value: hashedElemName, Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Key: hashedZone, Value: hashedElemName, Type: zonepb.Constraint_REQUIRED},
+						{Value: hashedElemName, Type: zonepb.Constraint_REQUIRED},
 					},
 				},
 				{
-					Constraints: []config.Constraint{{Value: hashedElemName, Type: config.Constraint_REQUIRED}},
+					Constraints: []zonepb.Constraint{{Value: hashedElemName, Type: zonepb.Constraint_REQUIRED}},
 				},
 			}; !reflect.DeepEqual(a, e) {
 				t.Errorf("expected zone %d LeasePreferences = %+v; got %+v", id, e, a)
@@ -834,41 +828,58 @@ func TestReportUsage(t *testing.T) {
 			// Let's ignore all internal queries for this test.
 			continue
 		}
-		foundKeys = append(foundKeys,
-			fmt.Sprintf("[%v,%v,%v] %s", s.Key.Opt, s.Key.DistSQL, s.Key.Failed, s.Key.Query))
+		var tags []string
+		if s.Key.Opt {
+			tags = append(tags, "opt")
+		}
+
+		if s.Key.DistSQL {
+			tags = append(tags, "dist")
+		} else {
+			tags = append(tags, "nodist")
+		}
+
+		if s.Key.Failed {
+			tags = append(tags, "failed")
+		} else {
+			tags = append(tags, "ok")
+		}
+
+		foundKeys = append(foundKeys, fmt.Sprintf("[%s] %s", strings.Join(tags, ","), s.Key.Query))
 	}
 	sort.Strings(foundKeys)
 	expectedKeys := []string{
-		`[false,false,false] ALTER DATABASE _ CONFIGURE ZONE = _`,
-		`[false,false,false] ALTER TABLE _ CONFIGURE ZONE = _`,
-		`[false,false,false] CREATE DATABASE _`,
-		`[false,false,false] SET CLUSTER SETTING "cluster.organization" = _`,
-		`[false,false,false] SET CLUSTER SETTING "diagnostics.reporting.send_crash_reports" = _`,
-		`[false,false,false] SET CLUSTER SETTING "server.time_until_store_dead" = _`,
-		`[false,false,false] SET application_name = $1`,
-		`[false,false,false] SET application_name = DEFAULT`,
-		`[false,false,false] SET application_name = _`,
-		`[true,false,false] CREATE TABLE _ (_ INT8 NOT NULL DEFAULT unique_rowid())`,
-		`[true,false,false] CREATE TABLE _ (_ INT8, CONSTRAINT _ CHECK (_ > _))`,
-		`[true,false,false] INSERT INTO _ SELECT unnest(ARRAY[_, _, __more2__])`,
-		`[true,false,false] INSERT INTO _ VALUES (_), (__more2__)`,
-		`[true,false,false] INSERT INTO _ VALUES (length($1::STRING)), (__more1__)`,
-		`[true,false,false] INSERT INTO _(_, _) VALUES (_, _)`,
-		`[true,false,false] SELECT (_, _, __more2__) = (SELECT _, _, _, _ FROM _ LIMIT _)`,
-		`[true,false,false] SELECT _ FROM (VALUES (_)) AS _ (_) WHERE EXISTS (SELECT * FROM (VALUES (_)) AS _ (_) WHERE _._ = _._)`,
-		"[true,false,false] SELECT _::STRING::INET, _::JSONB - _, ARRAY (SELECT _)[_]",
-		`[true,false,false] UPDATE _ SET _ = _ + _`,
-		"[true,false,false] WITH _ AS (SELECT _) SELECT * FROM _",
-		`[true,false,true] CREATE TABLE _ (_ INT8 PRIMARY KEY, _ INT8, INDEX (_) INTERLEAVE IN PARENT _ (_))`,
-		`[true,false,true] SELECT _ / $1`,
-		`[true,false,true] SELECT _ / _`,
-		`[true,false,true] SELECT crdb_internal.force_assertion_error(_)`,
-		`[true,false,true] SELECT crdb_internal.force_error(_, $1)`,
-		`[true,false,true] SELECT crdb_internal.set_vmodule(_)`,
-		`[true,true,false] SELECT * FROM _ WHERE (_ = _) AND (_ = _)`,
-		`[true,true,false] SELECT * FROM _ WHERE (_ = length($1::STRING)) OR (_ = $2)`,
-		`[true,true,false] SELECT _ FROM _ WHERE (_ = _) AND (lower(_) = lower(_))`,
+		`[opt,nodist,ok] ALTER DATABASE _ CONFIGURE ZONE = _`,
+		`[opt,nodist,ok] ALTER TABLE _ CONFIGURE ZONE = _`,
+		`[opt,nodist,ok] CREATE DATABASE _`,
+		`[opt,nodist,ok] SET CLUSTER SETTING "cluster.organization" = _`,
+		`[opt,nodist,ok] SET CLUSTER SETTING "diagnostics.reporting.send_crash_reports" = _`,
+		`[opt,nodist,ok] SET CLUSTER SETTING "server.time_until_store_dead" = _`,
+		`[opt,nodist,ok] SET application_name = $1`,
+		`[opt,nodist,ok] SET application_name = DEFAULT`,
+		`[opt,nodist,ok] SET application_name = _`,
+		`[opt,nodist,ok] CREATE TABLE _ (_ INT8 NOT NULL DEFAULT unique_rowid())`,
+		`[opt,nodist,ok] CREATE TABLE _ (_ INT8, CONSTRAINT _ CHECK (_ > _))`,
+		`[opt,nodist,ok] INSERT INTO _ SELECT unnest(ARRAY[_, _, __more2__])`,
+		`[opt,nodist,ok] INSERT INTO _ VALUES (_), (__more2__)`,
+		`[opt,nodist,ok] INSERT INTO _ VALUES (length($1::STRING)), (__more1__)`,
+		`[opt,nodist,ok] INSERT INTO _(_, _) VALUES (_, _)`,
+		`[opt,nodist,ok] SELECT (_, _, __more2__) = (SELECT _, _, _, _ FROM _ LIMIT _)`,
+		`[opt,nodist,ok] SELECT _ FROM (VALUES (_)) AS _ (_) WHERE EXISTS (SELECT * FROM (VALUES (_)) AS _ (_) WHERE _._ = _._)`,
+		"[opt,nodist,ok] SELECT _::STRING::INET, _::JSONB - _, ARRAY (SELECT _)[_]",
+		`[opt,nodist,ok] UPDATE _ SET _ = _ + _`,
+		"[opt,nodist,ok] WITH _ AS (SELECT _) SELECT * FROM _",
+		`[opt,nodist,failed] CREATE TABLE _ (_ INT8 PRIMARY KEY, _ INT8, INDEX (_) INTERLEAVE IN PARENT _ (_))`,
+		`[opt,nodist,failed] SELECT _ / $1`,
+		`[opt,nodist,failed] SELECT _ / _`,
+		`[opt,nodist,failed] SELECT crdb_internal.force_assertion_error(_)`,
+		`[opt,nodist,failed] SELECT crdb_internal.force_error(_, $1)`,
+		`[opt,nodist,failed] SELECT crdb_internal.set_vmodule(_)`,
+		`[opt,dist,ok] SELECT * FROM _ WHERE (_ = _) AND (_ = _)`,
+		`[opt,dist,ok] SELECT * FROM _ WHERE (_ = length($1::STRING)) OR (_ = $2)`,
+		`[opt,dist,ok] SELECT _ FROM _ WHERE (_ = _) AND (lower(_) = lower(_))`,
 	}
+	sort.Strings(expectedKeys)
 	t.Logf("expected:\n%s\ngot:\n%s", pretty.Sprint(expectedKeys), pretty.Sprint(foundKeys))
 	for i, found := range foundKeys {
 		if i >= len(expectedKeys) {

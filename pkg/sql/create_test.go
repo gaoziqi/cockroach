@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -56,7 +52,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	}
 
 	// Database name.
-	nameKey := sqlbase.MakeNameMetadataKey(keys.RootNamespaceID, "test")
+	nameKey := sqlbase.NewDatabaseKey("test").Key()
 	if gr, err := kvDB.Get(ctx, nameKey); err != nil {
 		t.Fatal(err)
 	} else if gr.Exists() {
@@ -444,7 +440,7 @@ func TestCreateStatementType(t *testing.T) {
 	ctx := context.TODO()
 	defer s.Stopper().Stop(ctx)
 
-	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingAddr(), t.Name(), url.User(security.RootUser))
+	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 	pgxConfig, err := pgx.ParseConnectionString(pgURL.String())
 	if err != nil {
@@ -475,8 +471,8 @@ func TestCreateStatementType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cmdTag != "SELECT 10" {
-		t.Fatal("expected SELECT 10, got", cmdTag)
+	if cmdTag != "CREATE TABLE AS" {
+		t.Fatal("expected CREATE TABLE AS, got", cmdTag)
 	}
 }
 

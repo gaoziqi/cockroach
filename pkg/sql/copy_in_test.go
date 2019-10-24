@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -21,6 +17,7 @@ import (
 	"math/rand"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/lib/pq"
@@ -128,7 +127,7 @@ func TestCopyNullInfNaN(t *testing.T) {
 	}
 }
 
-// TestCopyRandom inserts 100 random rows using COPY and ensures the SELECT'd
+// TestCopyRandom inserts random rows using COPY and ensures the SELECT'd
 // data is the same.
 func TestCopyRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -188,7 +187,7 @@ func TestCopyRandom(t *testing.T) {
 
 	var inputs [][]interface{}
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 1000; i++ {
 		row := make([]interface{}, len(typs))
 		for j, t := range typs {
 			var ds string
@@ -198,6 +197,10 @@ func TestCopyRandom(t *testing.T) {
 			} else {
 				d := sqlbase.RandDatum(rng, t, false)
 				ds = tree.AsStringWithFlags(d, tree.FmtBareStrings)
+				switch t {
+				case types.Float:
+					ds = strings.TrimSuffix(ds, ".0")
+				}
 			}
 			row[j] = ds
 		}
@@ -428,5 +431,48 @@ func TestCopyTransaction(t *testing.T) {
 	}
 	if err := txn.Commit(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCopyFKCheck verifies that foreign keys are checked during COPY.
+func TestCopyFKCheck(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	params, _ := tests.CreateTestServerParams()
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	db.SetMaxOpenConns(1)
+	r := sqlutils.MakeSQLRunner(db)
+	r.Exec(t, `
+		CREATE DATABASE d;
+		SET DATABASE = d;
+		CREATE TABLE p (p INT PRIMARY KEY);
+		CREATE TABLE t (
+		  a INT PRIMARY KEY,
+		  p INT REFERENCES p(p)
+		);
+		SET experimental_optimizer_foreign_keys = true;
+	`)
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = txn.Rollback() }()
+
+	stmt, err := txn.Prepare(pq.CopyIn("t", "a", "p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = stmt.Exec(1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = stmt.Close()
+	if !testutils.IsError(err, "foreign key violation|violates foreign key constraint") {
+		t.Fatalf("expected FK error, got: %v", err)
 	}
 }

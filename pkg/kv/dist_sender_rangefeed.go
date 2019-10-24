@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package kv
 
@@ -21,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -226,10 +223,15 @@ func (ds *DistSender) singleRangeFeed(
 	if ds.rpcContext != nil {
 		latencyFn = ds.rpcContext.RemoteClocks.Latency
 	}
-	replicas := NewReplicaSlice(ds.gossip, desc)
+	// Learner replicas won't serve reads/writes, so send only to the `Voters`
+	// replicas. This is just an optimization to save a network hop, everything
+	// would still work if we had `All` here.
+	replicas := NewReplicaSlice(ds.gossip, desc.Replicas().Voters())
 	replicas.OptimizeReplicaOrder(ds.getNodeDescriptor(), latencyFn)
-
-	transport, err := ds.transportFactory(SendOptions{}, ds.nodeDialer, replicas)
+	// The RangeFeed is not used for system critical traffic so use a DefaultClass
+	// connection regardless of the range.
+	opts := SendOptions{class: rpc.DefaultClass}
+	transport, err := ds.transportFactory(opts, ds.nodeDialer, replicas)
 	if err != nil {
 		return args.Timestamp, roachpb.NewError(err)
 	}

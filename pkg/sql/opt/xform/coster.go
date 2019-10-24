@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package xform
 
@@ -24,9 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/tools/container/intsets"
 )
 
@@ -167,7 +163,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 
 	case opt.InnerJoinOp, opt.LeftJoinOp, opt.RightJoinOp, opt.FullJoinOp,
 		opt.SemiJoinOp, opt.AntiJoinOp, opt.InnerJoinApplyOp, opt.LeftJoinApplyOp,
-		opt.RightJoinApplyOp, opt.FullJoinApplyOp, opt.SemiJoinApplyOp, opt.AntiJoinApplyOp:
+		opt.SemiJoinApplyOp, opt.AntiJoinApplyOp:
 		// All join ops use hash join by default.
 		cost = c.computeHashJoinCost(candidate)
 
@@ -218,7 +214,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		// Optsteps uses MaxCost to suppress nodes in the memo. When a node with
 		// MaxCost is added to the memo, it can lead to an obscure crash with an
 		// unknown node. We'd rather detect this early.
-		panic(pgerror.AssertionFailedf("node %s with MaxCost added to the memo", log.Safe(candidate.Op())))
+		panic(errors.AssertionFailedf("node %s with MaxCost added to the memo", log.Safe(candidate.Op())))
 	}
 
 	if c.perturbation != 0 {
@@ -242,19 +238,34 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 }
 
 func (c *coster) computeSortCost(sort *memo.SortExpr, required *physical.Required) memo.Cost {
-	// We calculate a per-row cost and multiply by (1 + log2(rowCount)).
+	// We calculate the cost of a segmented sort. We assume each segment
+	// is of the same size of (rowCount / numSegments). We also calculate the
+	// per-row cost. The cost of the sort is:
+	//
+	// perRowCost * (rowCount + (segmentSize * log2(segmentSize) * numOrderedSegments))
+	//
 	// The constant term is necessary for cases where the estimated row count is
 	// very small.
 	// TODO(rytaft): This is the cost of a local, in-memory sort. When a
 	// certain amount of memory is used, distsql switches to a disk-based sort
 	// with a temp RocksDB store.
-	rowCount := sort.Relational().Stats.RowCount
-	perRowCost := c.rowSortCost(len(required.Ordering.Columns))
-	cost := memo.Cost(rowCount) * perRowCost
-	if rowCount > 1 {
-		cost *= (1 + memo.Cost(math.Log2(rowCount)))
+
+	numSegments := c.countSegments(sort)
+	cost := memo.Cost(0)
+	stats := sort.Relational().Stats
+	rowCount := stats.RowCount
+	perRowCost := c.rowSortCost(len(required.Ordering.Columns) - len(sort.InputOrdering.Columns))
+
+	if !sort.InputOrdering.Any() {
+		// Add the cost for finding the segments.
+		cost += memo.Cost(float64(len(sort.InputOrdering.Columns))*rowCount) * cpuCostFactor
 	}
 
+	segmentSize := rowCount / numSegments
+	if segmentSize > 1 {
+		cost += memo.Cost(segmentSize) * (memo.Cost(math.Log2(segmentSize)) * memo.Cost(numSegments))
+	}
+	cost = perRowCost * (memo.Cost(rowCount) + cost)
 	return cost
 }
 
@@ -336,9 +347,16 @@ func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
 	cost := memo.Cost(1.25*leftRowCount+1.75*rightRowCount) * cpuCostFactor
 
 	// Add the CPU cost of emitting the rows.
-	// TODO(radu): ideally we would have an estimate of how many rows we actually
-	// have to run the ON condition on.
-	cost += memo.Cost(join.Relational().Stats.RowCount) * cpuCostFactor
+	rowsProcessed, ok := c.mem.RowsProcessed(join)
+	if !ok {
+		// This can happen as part of testing. In this case just return the number
+		// of rows.
+		rowsProcessed = join.Relational().Stats.RowCount
+	}
+	cost += memo.Cost(rowsProcessed) * cpuCostFactor
+
+	// TODO(rytaft): Add a constant "setup" cost per extra ON condition similar
+	// to merge join and lookup join.
 	return cost
 }
 
@@ -349,9 +367,19 @@ func (c *coster) computeMergeJoinCost(join *memo.MergeJoinExpr) memo.Cost {
 	cost := memo.Cost(leftRowCount+rightRowCount) * cpuCostFactor
 
 	// Add the CPU cost of emitting the rows.
-	// TODO(radu): ideally we would have an estimate of how many rows we actually
-	// have to run the ON condition on.
-	cost += memo.Cost(join.Relational().Stats.RowCount) * cpuCostFactor
+	rowsProcessed, ok := c.mem.RowsProcessed(join)
+	if !ok {
+		// We shouldn't ever get here. Since we don't allow the memo
+		// to be optimized twice, the coster should never be used after
+		// logPropsBuilder.clear() is called.
+		panic(errors.AssertionFailedf("could not get rows processed for merge join"))
+	}
+	cost += memo.Cost(rowsProcessed) * cpuCostFactor
+
+	// Add a constant "setup" cost per ON condition to account for the fact that
+	// the rowsProcessed estimate alone cannot effectively discriminate between
+	// plans when RowCount is too small.
+	cost += cpuCostFactor * memo.Cost(len(join.On))
 	return cost
 }
 
@@ -382,33 +410,28 @@ func (c *coster) computeLookupJoinCost(join *memo.LookupJoinExpr) memo.Cost {
 	perRowCost := lookupJoinRetrieveRowCost +
 		c.rowScanCost(join.Table, join.Index, numLookupCols)
 
-	// Add a cost if we have to evaluate an ON condition on every row. The more
-	// leftover conditions, the more expensive it should be. We want to
-	// differentiate between two lookup joins where one uses only a subset of the
-	// columns. For example:
-	//   abc JOIN xyz ON a=x AND b=y
-	// We could have a lookup join using an index on y (and left-over condition
-	// a=x), and another lookup join on an index on x,y. The latter is definitely
-	// preferable (the former could generate a lot of internal results that are
-	// then discarded).
-	//
-	// TODO(radu): we should take into account that the "internal" row count is
-	// higher, according to the selectivities of the conditions. Unfortunately
-	// this is very tricky, in particular because of left-over conditions that are
-	// not selective.
+	// Take into account that the "internal" row count is higher, according to
+	// the selectivities of the conditions. In particular, we need to ignore
+	// left-over conditions that are not selective.
 	// For example:
 	//   ab JOIN xy ON a=x AND x=10
 	// becomes (during normalization):
 	//   ab JOIN xy ON a=x AND a=10 AND x=10
 	// which can become a lookup join with left-over condition x=10 which doesn't
 	// actually filter anything.
-	//
-	// TODO(radu): this should be extended to all join types. It's tricky for hash
-	// joins where we don't have the equality and leftover filters readily
-	// available.
-	perRowCost += cpuCostFactor * memo.Cost(len(join.On))
+	rowsProcessed, ok := c.mem.RowsProcessed(join)
+	if !ok {
+		// We shouldn't ever get here. Since we don't allow the memo
+		// to be optimized twice, the coster should never be used after
+		// logPropsBuilder.clear() is called.
+		panic(errors.AssertionFailedf("could not get rows processed for lookup join"))
+	}
+	cost += memo.Cost(rowsProcessed) * perRowCost
 
-	cost += memo.Cost(join.Relational().Stats.RowCount) * perRowCost
+	// Add a constant "setup" cost per ON condition to account for the fact that
+	// the rowsProcessed estimate alone cannot effectively discriminate between
+	// plans when RowCount is too small.
+	cost += cpuCostFactor * memo.Cost(len(join.On))
 	return cost
 }
 
@@ -503,6 +526,28 @@ func (c *coster) computeProjectSetCost(projectSet *memo.ProjectSetExpr) memo.Cos
 	// Add the CPU cost of emitting the rows.
 	cost := memo.Cost(projectSet.Relational().Stats.RowCount) * cpuCostFactor
 	return cost
+}
+
+// countSegments calculates the number of segments that will be used to execute
+// the sort. If no input ordering is provided, there's only one segment.
+func (c *coster) countSegments(sort *memo.SortExpr) float64 {
+	if sort.InputOrdering.Any() {
+		return 1
+	}
+	stats := sort.Relational().Stats
+	orderedCols := sort.InputOrdering.ColSet()
+	orderedStats, ok := stats.ColStats.Lookup(orderedCols)
+	if !ok {
+		orderedStats, ok = c.mem.RequestColStat(sort, orderedCols)
+		if !ok {
+			// I don't think we can ever get here. Since we don't allow the memo
+			// to be optimized twice, the coster should never be used after
+			// logPropsBuilder.clear() is called.
+			panic(errors.AssertionFailedf("could not request the stats for ColSet %v", orderedCols))
+		}
+	}
+
+	return orderedStats.DistinctCount
 }
 
 // rowSortCost is the CPU cost to sort one row, which depends on the number of

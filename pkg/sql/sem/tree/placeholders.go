@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tree
 
@@ -18,12 +14,11 @@ import (
 	"bytes"
 	"fmt"
 	"math"
-	"sort"
-	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // PlaceholderIdx is the 0-based index of a placeholder. Placeholder "$1"
@@ -67,7 +62,7 @@ func (pt PlaceholderTypes) Equals(other PlaceholderTypes) bool {
 func (pt PlaceholderTypes) AssertAllSet() error {
 	for i := range pt {
 		if pt[i] == nil {
-			return placeholderTypeAmbiguityError{PlaceholderIdx(i)}
+			return placeholderTypeAmbiguityError(PlaceholderIdx(i))
 		}
 	}
 	return nil
@@ -134,7 +129,7 @@ func (p *PlaceholderTypesInfo) SetType(idx PlaceholderIdx, typ *types.T) error {
 	if t := p.Types[idx]; t != nil {
 		if !typ.Equivalent(t) {
 			return pgerror.Newf(
-				pgerror.CodeDatatypeMismatchError,
+				pgcode.DatatypeMismatch,
 				"placeholder %s already has type %s, cannot assign %s", idx, t, typ)
 		}
 		return nil
@@ -148,10 +143,6 @@ type PlaceholderInfo struct {
 	PlaceholderTypesInfo
 
 	Values QueryArguments
-
-	// permitUnassigned controls whether AssertAllAssigned returns an error when
-	// there are unassigned placeholders. See PermitUnassigned().
-	permitUnassigned bool
 }
 
 // Init initializes a PlaceholderInfo structure appropriate for the given number
@@ -167,7 +158,6 @@ func (p *PlaceholderInfo) Init(numPlaceholders int, typeHints PlaceholderTypes) 
 		p.TypeHints = typeHints
 	}
 	p.Values = nil
-	p.permitUnassigned = false
 	return nil
 }
 
@@ -186,43 +176,13 @@ func (p *PlaceholderInfo) Assign(src *PlaceholderInfo, numPlaceholders int) erro
 
 func checkPlaceholderArity(numTypes, numPlaceholders int) error {
 	if numTypes > numPlaceholders {
-		return pgerror.AssertionFailedf(
+		return errors.AssertionFailedf(
 			"unexpected placeholder types: got %d, expected %d",
 			numTypes, numPlaceholders)
 	} else if numTypes < numPlaceholders {
-		return pgerror.Newf(pgerror.CodeUndefinedParameterError,
+		return pgerror.Newf(pgcode.UndefinedParameter,
 			"could not find types for all placeholders: got %d, expected %d",
 			numTypes, numPlaceholders)
-	}
-	return nil
-}
-
-// PermitUnassigned permits unassigned placeholders during plan construction,
-// so that EXPLAIN can work on statements with placeholders.
-func (p *PlaceholderInfo) PermitUnassigned() {
-	p.permitUnassigned = true
-}
-
-// AssertAllAssigned ensures that all placeholders that are used also have a
-// value assigned, or that PermitUnassigned was called.
-func (p *PlaceholderInfo) AssertAllAssigned() error {
-	if p.permitUnassigned {
-		return nil
-	}
-	var missing []string
-	for i := range p.Types {
-		idx := PlaceholderIdx(i)
-		if _, ok := p.Value(idx); !ok {
-			missing = append(missing, idx.String())
-		}
-	}
-	if len(missing) > 0 {
-		sort.Strings(missing)
-		return pgerror.Newf(pgerror.CodeUndefinedParameterError,
-			"no value provided for placeholder%s: %s",
-			util.Pluralize(int64(len(missing))),
-			strings.Join(missing, ", "),
-		)
 	}
 	return nil
 }

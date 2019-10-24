@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package engine
 
@@ -248,7 +244,7 @@ func runMVCCScan(ctx context.Context, b *testing.B, emk engineMaker, opts benchS
 			Reverse: opts.reverse,
 		})
 		if err != nil {
-			b.Fatalf("failed scan: %s", err)
+			b.Fatalf("failed scan: %+v", err)
 		}
 		if len(kvs) != opts.numRows {
 			b.Fatalf("failed to scan: %d != %d", len(kvs), opts.numRows)
@@ -284,7 +280,7 @@ func runMVCCGet(ctx context.Context, b *testing.B, emk engineMaker, opts benchDa
 		walltime := int64(5 * (rand.Int31n(int32(opts.numVersions)) + 1))
 		ts := hlc.Timestamp{WallTime: walltime}
 		if v, _, err := MVCCGet(ctx, eng, key, ts, MVCCGetOptions{}); err != nil {
-			b.Fatalf("failed get: %s", err)
+			b.Fatalf("failed get: %+v", err)
 		} else if v == nil {
 			b.Fatalf("failed get (key not found): %d@%d", keyIdx, walltime)
 		} else if valueBytes, err := v.GetBytes(); err != nil {
@@ -312,7 +308,7 @@ func runMVCCPut(ctx context.Context, b *testing.B, emk engineMaker, valueSize in
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		if err := MVCCPut(ctx, eng, nil, key, ts, value, nil); err != nil {
-			b.Fatalf("failed put: %s", err)
+			b.Fatalf("failed put: %+v", err)
 		}
 	}
 
@@ -334,7 +330,7 @@ func runMVCCBlindPut(ctx context.Context, b *testing.B, emk engineMaker, valueSi
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		if err := MVCCBlindPut(ctx, eng, nil, key, ts, value, nil); err != nil {
-			b.Fatalf("failed put: %s", err)
+			b.Fatalf("failed put: %+v", err)
 		}
 	}
 
@@ -358,7 +354,7 @@ func runMVCCConditionalPut(
 			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 			ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 			if err := MVCCPut(ctx, eng, nil, key, ts, value, nil); err != nil {
-				b.Fatalf("failed put: %s", err)
+				b.Fatalf("failed put: %+v", err)
 			}
 		}
 		expected = &value
@@ -370,7 +366,7 @@ func runMVCCConditionalPut(
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		if err := MVCCConditionalPut(ctx, eng, nil, key, ts, value, expected, CPutFailIfMissing, nil); err != nil {
-			b.Fatalf("failed put: %s", err)
+			b.Fatalf("failed put: %+v", err)
 		}
 	}
 
@@ -392,7 +388,7 @@ func runMVCCBlindConditionalPut(ctx context.Context, b *testing.B, emk engineMak
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		if err := MVCCBlindConditionalPut(ctx, eng, nil, key, ts, value, nil, CPutFailIfMissing, nil); err != nil {
-			b.Fatalf("failed put: %s", err)
+			b.Fatalf("failed put: %+v", err)
 		}
 	}
 
@@ -414,7 +410,7 @@ func runMVCCInitPut(ctx context.Context, b *testing.B, emk engineMaker, valueSiz
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		if err := MVCCInitPut(ctx, eng, nil, key, ts, value, false, nil); err != nil {
-			b.Fatalf("failed put: %s", err)
+			b.Fatalf("failed put: %+v", err)
 		}
 	}
 
@@ -436,7 +432,7 @@ func runMVCCBlindInitPut(ctx context.Context, b *testing.B, emk engineMaker, val
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		if err := MVCCBlindInitPut(ctx, eng, nil, key, ts, value, false, nil); err != nil {
-			b.Fatalf("failed put: %s", err)
+			b.Fatalf("failed put: %+v", err)
 		}
 	}
 
@@ -466,7 +462,7 @@ func runMVCCBatchPut(ctx context.Context, b *testing.B, emk engineMaker, valueSi
 			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(j)))
 			ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 			if err := MVCCPut(ctx, batch, nil, key, ts, value, nil); err != nil {
-				b.Fatalf("failed put: %s", err)
+				b.Fatalf("failed put: %+v", err)
 			}
 		}
 
@@ -517,7 +513,7 @@ func runMVCCBatchTimeSeries(ctx context.Context, b *testing.B, emk engineMaker, 
 		for j := 0; j < batchSize; j++ {
 			ts.Logical++
 			if err := MVCCMerge(ctx, batch, nil, keys[j], ts, value); err != nil {
-				b.Fatalf("failed put: %s", err)
+				b.Fatalf("failed put: %+v", err)
 			}
 		}
 
@@ -557,6 +553,7 @@ func runMVCCMerge(
 			}
 		}
 	})
+	b.StopTimer()
 
 	// Read values out to force merge.
 	for _, key := range keys {
@@ -567,7 +564,52 @@ func runMVCCMerge(
 			continue
 		}
 	}
+}
 
+// runMVCCGetMergedValue reads merged values for numKeys separate keys and mergesPerKey
+// operands per key.
+func runMVCCGetMergedValue(
+	ctx context.Context, b *testing.B, emk engineMaker, numKeys, mergesPerKey int,
+) {
+	eng := emk(b, fmt.Sprintf("get_merged_%d_%d", numKeys, mergesPerKey))
+	defer eng.Close()
+
+	// Precompute keys so we don't waste time formatting them at each iteration.
+	keys := make([]roachpb.Key, numKeys)
+	for i := 0; i < numKeys; i++ {
+		keys[i] = roachpb.Key(fmt.Sprintf("key-%d", i))
+	}
+
+	timestamp := hlc.Timestamp{}
+	for i := 0; i < numKeys; i++ {
+		for j := 0; j < mergesPerKey; j++ {
+			timeseries := &roachpb.InternalTimeSeriesData{
+				StartTimestampNanos: 0,
+				SampleDurationNanos: 1000,
+				Samples: []roachpb.InternalTimeSeriesSample{
+					{Offset: int32(j), Count: 1, Sum: 5.0},
+				},
+			}
+			var value roachpb.Value
+			if err := value.SetProto(timeseries); err != nil {
+				b.Fatal(err)
+			}
+			ms := enginepb.MVCCStats{}
+			timestamp.Logical++
+			err := MVCCMerge(ctx, eng, &ms, keys[i], timestamp, value)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, err := MVCCGet(ctx, eng, keys[rand.Intn(numKeys)], timestamp, MVCCGetOptions{})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
 	b.StopTimer()
 }
 
@@ -751,6 +793,7 @@ func runMVCCGarbageCollect(
 	// NB: a real invocation of MVCCGarbageCollect typically has most of the keys
 	// in sorted order. Here they will be ordered randomly.
 	setup := func() (gcKeys []roachpb.GCRequest_GCKey) {
+		batch := eng.NewBatch()
 		for i := 0; i < opts.numKeys; i++ {
 			key := randutil.RandBytes(rng, opts.keyBytes)
 			if opts.deleteVersions > 0 {
@@ -760,22 +803,29 @@ func runMVCCGarbageCollect(
 				})
 			}
 			for j := 0; j < opts.numVersions; j++ {
-				if err := MVCCPut(ctx, eng, nil /* ms */, key, ts.Add(0, int32(j)), val, nil); err != nil {
+				if err := MVCCPut(ctx, batch, nil /* ms */, key, ts.Add(0, int32(j)), val, nil); err != nil {
 					b.Fatal(err)
 				}
 			}
 		}
+		if err := batch.Commit(false); err != nil {
+			b.Fatal(err)
+		}
+		batch.Close()
 		return gcKeys
 	}
 
+	gcKeys := setup()
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		gcKeys := setup()
-		b.StartTimer()
-		if err := MVCCGarbageCollect(ctx, eng, nil /* ms */, gcKeys, now); err != nil {
+		batch := eng.NewWriteOnlyBatch()
+		distinct := batch.Distinct()
+		if err := MVCCGarbageCollect(ctx, distinct, nil /* ms */, gcKeys, now); err != nil {
 			b.Fatal(err)
 		}
+		distinct.Close()
+		batch.Close()
 	}
 }
 

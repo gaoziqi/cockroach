@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage_test
 
@@ -22,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -40,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
@@ -131,7 +128,7 @@ func newRaftTransportTestContext(t testing.TB) *raftTransportTestContext {
 
 	server := rpc.NewServer(rttc.nodeRPCContext) // never started
 	rttc.gossip = gossip.NewTest(
-		1, rttc.nodeRPCContext, server, rttc.stopper, metric.NewRegistry(), config.DefaultZoneConfigRef(),
+		1, rttc.nodeRPCContext, server, rttc.stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef(),
 	)
 
 	return rttc
@@ -209,7 +206,7 @@ func (rttc *raftTransportTestContext) Send(
 		ToReplica:   to,
 		FromReplica: from,
 	}
-	return rttc.transports[from.NodeID].SendAsync(req)
+	return rttc.transports[from.NodeID].SendAsync(req, rpc.DefaultClass)
 }
 
 func TestSendAndReceive(t *testing.T) {
@@ -291,10 +288,10 @@ func TestSendAndReceive(t *testing.T) {
 				req := baseReq
 				req.Message.Type = messageType
 
-				if !transports[fromNodeID].SendAsync(&req) {
-					t.Errorf("unable to send %s from %d to %d", req.Message.Type, fromNodeID, toNodeID)
+				if !transports[fromNodeID].SendAsync(&req, rpc.DefaultClass) {
+					t.Errorf("unable to send %s from %d to %d", messageType, fromNodeID, toNodeID)
 				}
-				messageTypeCounts[toStoreID][req.Message.Type]++
+				messageTypeCounts[toStoreID][messageType]++
 			}
 		}
 	}
@@ -359,7 +356,9 @@ func TestSendAndReceive(t *testing.T) {
 			ReplicaID: replicaIDs[toStoreID],
 		},
 	}
-	if !transports[storeNodes[fromStoreID]].SendAsync(expReq) {
+	// NB: argument passed to SendAsync is not safe to use after; make a copy.
+	expReqCopy := *expReq
+	if !transports[storeNodes[fromStoreID]].SendAsync(&expReqCopy, rpc.DefaultClass) {
 		t.Errorf("unable to send message from %d to %d", fromStoreID, toStoreID)
 	}
 	// NB: proto.Equal will panic here since it doesn't know about `gogoproto.casttype`.
@@ -450,7 +449,7 @@ func TestRaftTransportCircuitBreaker(t *testing.T) {
 	// snuck in.
 	testutils.SucceedsSoon(t, func() error {
 		if !rttc.Send(clientReplica, serverReplica, 1, raftpb.Message{Commit: 2}) {
-			clientTransport.GetCircuitBreaker(serverReplica.NodeID).Reset()
+			clientTransport.GetCircuitBreaker(serverReplica.NodeID, rpc.DefaultClass).Reset()
 		}
 		select {
 		case req := <-serverChannel.ch:
@@ -606,4 +605,41 @@ func TestReopenConnection(t *testing.T) {
 		}
 		return errors.New("still waiting")
 	})
+}
+
+// This test ensures that blocking by a node dialer attempting to dial a
+// remote node does not block calls to SendAsync.
+func TestSendFailureToConnectDoesNotHangRaft(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	rttc := newRaftTransportTestContext(t)
+	defer rttc.Stop()
+
+	// Create a single server from which we're going to call send.
+	// We'll then set up a bogus target server which will not be serving gRPC
+	// and will block during connection setup (leading to blocking in the Dial
+	// call). The test ensures that the Send call does not block.
+	const rangeID, from, to = 1, 1, 2
+	transport := rttc.AddNode(from)
+	// Set up a plain old TCP listener that's not going to accept any connecitons
+	// which will lead to blocking during dial.
+	ln, err := net.Listen("tcp", util.TestAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+	rttc.GossipNode(to, ln.Addr())
+	// Try to send a message, make sure we don't block waiting to set up the
+	// connection.
+	transport.SendAsync(&storage.RaftMessageRequest{
+		RangeID: rangeID,
+		ToReplica: roachpb.ReplicaDescriptor{
+			StoreID:   to,
+			NodeID:    to,
+			ReplicaID: to,
+		},
+		FromReplica: roachpb.ReplicaDescriptor{
+			StoreID:   from,
+			NodeID:    from,
+			ReplicaID: from,
+		},
+		Message: raftpb.Message{To: to, From: from},
+	}, rpc.DefaultClass)
 }

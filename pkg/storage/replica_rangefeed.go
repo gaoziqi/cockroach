@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package storage
 
@@ -409,9 +405,13 @@ func (r *Replica) numRangefeedRegistrations() int {
 }
 
 // handleLogicalOpLogRaftMuLocked passes the logical op log to the active
-// rangefeed, if one is running. No-op if a rangefeed is not active. Requires
+// rangefeed, if one is running. The method accepts a reader, which is used to
+// look up the values associated with key-value writes in the log before handing
+// them to the rangefeed processor. No-op if a rangefeed is not active. Requires
 // raftMu to be locked.
-func (r *Replica) handleLogicalOpLogRaftMuLocked(ctx context.Context, ops *storagepb.LogicalOpLog) {
+func (r *Replica) handleLogicalOpLogRaftMuLocked(
+	ctx context.Context, ops *storagepb.LogicalOpLog, reader engine.Reader,
+) {
 	p := r.getRangefeedProcessor()
 	if p == nil {
 		return
@@ -433,8 +433,7 @@ func (r *Replica) handleLogicalOpLogRaftMuLocked(ctx context.Context, ops *stora
 	}
 
 	// When reading straight from the Raft log, some logical ops will not be
-	// fully populated. Read from the engine (under raftMu) to populate all
-	// fields.
+	// fully populated. Read from the Reader to populate all fields.
 	for _, op := range ops.Ops {
 		var key []byte
 		var ts hlc.Timestamp
@@ -454,12 +453,12 @@ func (r *Replica) handleLogicalOpLogRaftMuLocked(ctx context.Context, ops *stora
 			panic(fmt.Sprintf("unknown logical op %T", t))
 		}
 
-		// Read the value directly from the Engine. This is performed in the
+		// Read the value directly from the Reader. This is performed in the
 		// same raftMu critical section that the logical op's corresponding
 		// WriteBatch is applied, so the value should exist.
-		val, _, err := engine.MVCCGet(ctx, r.Engine(), key, ts, engine.MVCCGetOptions{Tombstones: true})
+		val, _, err := engine.MVCCGet(ctx, reader, key, ts, engine.MVCCGetOptions{Tombstones: true})
 		if val == nil && err == nil {
-			err = errors.New("value missing in engine")
+			err = errors.New("value missing in reader")
 		}
 		if err != nil {
 			r.disconnectRangefeedWithErr(p, roachpb.NewErrorf(

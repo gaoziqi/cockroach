@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
@@ -25,7 +20,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-func registerBackup(r *registry) {
+func registerBackup(r *testRegistry) {
 	backup2TBSpec := makeClusterSpec(10)
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("backup2TB/%s", backup2TBSpec),
@@ -52,22 +47,6 @@ func registerBackup(r *registry) {
 			c.Run(ctx, c.Node(1), "./workload", "fixtures", "import", "bank",
 				"--db=bank", "--payload-bytes=10240", "--ranges=0", "--csv-server", "http://localhost:8081",
 				fmt.Sprintf("--rows=%d", rows), "--seed=1", "{pgurl:1}")
-
-			// NB: without this delay, the BACKUP operation sometimes claims that
-			// bank.bank doesn't exist, probably due to some gossip propagation
-			// delay.
-			//
-			// See https://github.com/cockroachdb/cockroach/issues/36841.
-			for i := 0; i < 5; i++ {
-				_, err := c.Conn(ctx, 1).ExecContext(ctx, "SELECT * FROM bank.bank LIMIT 1")
-				if err != nil {
-					c.l.Printf("%s", err)
-					time.Sleep(time.Second)
-					continue
-				}
-				c.l.Printf("found the table")
-				break
-			}
 
 			m := newMonitor(ctx, c)
 			m.Go(func(ctx context.Context) error {
@@ -105,7 +84,7 @@ func registerBackup(r *registry) {
 			t.Status(`workload initialization`)
 			cmd := fmt.Sprintf(
 				"./workload init tpcc --warehouses=%d {pgurl:1-%d}",
-				warehouses, c.nodes,
+				warehouses, c.spec.NodeCount,
 			)
 			c.Run(ctx, c.Node(1), cmd)
 
@@ -127,7 +106,7 @@ func registerBackup(r *registry) {
 			go func() {
 				cmd := fmt.Sprintf(
 					"./workload run tpcc --warehouses=%d {pgurl:1-%d}",
-					warehouses, c.nodes,
+					warehouses, c.spec.NodeCount,
 				)
 
 				cmdDone <- c.RunE(ctx, c.Node(1), cmd)

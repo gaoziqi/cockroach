@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 /*
 Package bulkingest defines a workload that is intended to stress some edge cases
@@ -56,8 +52,8 @@ import (
 	"math/rand"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -133,11 +129,11 @@ func (w *bulkingest) Tables() []workload.Table {
 	}
 	schema += ")"
 
-	var bulkingestColTypes = []types.T{
-		types.Int64,
-		types.Int64,
-		types.Int64,
-		types.Bytes,
+	var bulkingestColTypes = []coltypes.T{
+		coltypes.Int64,
+		coltypes.Int64,
+		coltypes.Int64,
+		coltypes.Bytes,
 	}
 
 	table := workload.Table{
@@ -145,7 +141,6 @@ func (w *bulkingest) Tables() []workload.Table {
 		Schema: schema,
 		InitialRows: workload.BatchedTuples{
 			NumBatches: w.aCount * w.bCount,
-			NumTotal:   w.aCount * w.bCount * w.cCount,
 			FillBatch: func(ab int, cb coldata.Batch, alloc *bufalloc.ByteAllocator) {
 				a := ab / w.bCount
 				b := ab % w.bCount
@@ -164,13 +159,14 @@ func (w *bulkingest) Tables() []workload.Table {
 				var payload []byte
 				payload, *alloc = alloc.Alloc(w.cCount*w.payloadBytes, 0 /* extraCap */)
 				randutil.ReadTestdataBytes(rng, payload)
+				payloadCol.Reset()
 				for rowIdx := 0; rowIdx < w.cCount; rowIdx++ {
 					c := rowIdx
 					off := c * w.payloadBytes
 					aCol[rowIdx] = int64(a)
 					bCol[rowIdx] = int64(b)
 					cCol[rowIdx] = int64(c)
-					payloadCol[rowIdx] = payload[off : off+w.payloadBytes]
+					payloadCol.Set(rowIdx, payload[off:off+w.payloadBytes])
 				}
 			},
 		},

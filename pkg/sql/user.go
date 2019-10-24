@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,9 +14,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/errors"
 )
 
 // GetUserHashedPassword returns the hashedPassword for the given username if
@@ -39,8 +35,7 @@ func GetUserHashedPassword(
 	values, err := ie.QueryRow(
 		ctx, "get-hashed-pwd", nil /* txn */, getHashedPassword, normalizedUsername)
 	if err != nil {
-		return false, nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
-			"error looking up user %s", normalizedUsername)
+		return false, nil, errors.Wrapf(err, "error looking up user %s", normalizedUsername)
 	}
 	if values == nil {
 		return false, nil, nil

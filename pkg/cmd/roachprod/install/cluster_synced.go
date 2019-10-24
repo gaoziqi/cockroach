@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package install
 
@@ -48,6 +43,7 @@ import (
 // ClusterImpl TODO(peter): document
 type ClusterImpl interface {
 	Start(c *SyncedCluster, extraArgs []string)
+	CertsDir(c *SyncedCluster, index int) string
 	NodeDir(c *SyncedCluster, index int) string
 	LogDir(c *SyncedCluster, index int) string
 	NodeURL(c *SyncedCluster, host string, port int) string
@@ -69,7 +65,6 @@ type SyncedCluster struct {
 	VPCs       []string
 	// all other fields are populated in newCluster.
 	Nodes       []int
-	LoadGen     int
 	Secure      bool
 	Env         string
 	Args        []string
@@ -106,16 +101,7 @@ func (c *SyncedCluster) IsLocal() bool {
 
 // ServerNodes TODO(peter): document
 func (c *SyncedCluster) ServerNodes() []int {
-	if c.LoadGen == -1 {
-		return c.Nodes
-	}
-	newNodes := make([]int, 0, len(c.Nodes))
-	for _, i := range c.Nodes {
-		if i != c.LoadGen {
-			newNodes = append(newNodes, i)
-		}
-	}
-	return newNodes
+	return append([]int{}, c.Nodes...)
 }
 
 // GetInternalIP returns the internal IP address of the specified node.
@@ -126,16 +112,20 @@ func (c *SyncedCluster) GetInternalIP(index int) (string, error) {
 
 	session, err := c.newSession(index)
 	if err != nil {
-		return "", nil
+		return "", errors.Wrapf(err, "GetInternalIP: failed dial %s:%d", c.Name, index)
 	}
 	defer session.Close()
 
+	var stdout, stderr strings.Builder
+	session.SetStdout(&stdout)
+	session.SetStderr(&stderr)
 	cmd := `hostname --all-ip-addresses`
-	out, err := session.CombinedOutput(cmd)
-	if err != nil {
-		return "", nil
+	if err := session.Run(cmd); err != nil {
+		return "", errors.Wrapf(err,
+			"GetInternalIP: failed to execute hostname on %s:%d:\n(stdout) %s\n(stderr) %s",
+			c.Name, index, stdout.String(), stderr.String())
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(stdout.String()), nil
 }
 
 // Start TODO(peter): document
@@ -198,7 +188,7 @@ fi
 }
 
 // Wipe TODO(peter): document
-func (c *SyncedCluster) Wipe() {
+func (c *SyncedCluster) Wipe(preserveCerts bool) {
 	display := fmt.Sprintf("%s: wiping", c.Name)
 	c.Stop(9, true /* wait */)
 	c.Parallel(display, len(c.Nodes), 0, func(i int) ([]byte, error) {
@@ -211,14 +201,21 @@ func (c *SyncedCluster) Wipe() {
 		var cmd string
 		if c.IsLocal() {
 			// Not all shells like brace expansion, so we'll do it here
-			for _, dir := range []string{"certs*", "data", "logs"} {
+			dirs := []string{"data", "logs"}
+			if !preserveCerts {
+				dirs = append(dirs, "certs*")
+			}
+			for _, dir := range dirs {
 				cmd += fmt.Sprintf(`rm -fr ${HOME}/local/%d/%s ;`, c.Nodes[i], dir)
 			}
 		} else {
-			cmd = `find /mnt/data* -maxdepth 1 -type f -exec rm -f {} \; ;
-rm -fr /mnt/data*/{auxiliary,local,tmp,cassandra,cockroach,cockroach-temp*,mongo-data} \; ;
-rm -fr {certs*,logs} ;
+			cmd = `sudo find /mnt/data* -maxdepth 1 -type f -exec rm -f {} \; &&
+sudo rm -fr /mnt/data*/{auxiliary,local,tmp,cassandra,cockroach,cockroach-temp*,mongo-data} &&
+sudo rm -fr logs &&
 `
+			if !preserveCerts {
+				cmd += "sudo rm -fr certs* ;\n"
+			}
 		}
 		return sess.CombinedOutput(cmd)
 	})
@@ -677,7 +674,6 @@ exit 1
 		knownHostsData = stdout.Bytes()
 		return nil, nil
 	})
-	const sharedUser = "ubuntu"
 	c.Parallel("distributing known_hosts", len(c.Nodes), 0, func(i int) ([]byte, error) {
 		sess, err := c.newSession(c.Nodes[i])
 		if err != nil {
@@ -693,11 +689,24 @@ tmp="$(tempfile -p 'roachprod' -m 0644 )"
 on_exit() {
     rm -f "${tmp}"
 }
-echo "${known_hosts_data}" > "${tmp}"
 trap on_exit EXIT
+echo "${known_hosts_data}" > "${tmp}"
 cat "${tmp}" >> ~/.ssh/known_hosts
-if [[ "$(whoami)" != "` + sharedUser + `" ]]; then
-    sudo -u ` + sharedUser + ` bash -c "cat ${tmp} >> ~` + sharedUser + `/.ssh/known_hosts"
+# If our bootstrapping user is not the shared user install all of the
+# relevant ssh files from the bootstrapping user into the shared user's
+# .ssh directory.
+if [[ "$(whoami)" != "` + config.SharedUser + `" ]]; then
+    # Ensure that the shared user has a .ssh directory
+    sudo -u ` + config.SharedUser +
+			` bash -c "mkdir -p ~` + config.SharedUser + `/.ssh"
+    # This somewhat absurd incantation ensures that we properly shell quote
+    # filenames so that they both aren't expanded and work even if the filenames
+    # include spaces.
+    sudo find ~/.ssh -type f -execdir bash -c 'install \
+        --owner ` + config.SharedUser + ` \
+        --group ` + config.SharedUser + ` \
+        --mode $(stat -c "%a" '"'"'{}'"'"') \
+        '"'"'{}'"'"' ~` + config.SharedUser + `/.ssh' \;
 fi
 `
 		if out, err := sess.CombinedOutput(cmd); err != nil {
@@ -706,6 +715,11 @@ fi
 		return nil, nil
 	})
 	if len(c.AuthorizedKeys) > 0 {
+		// When clusters are created using cloud APIs they only have a subset of
+		// desired keys installed on a subset of users. This code distributes
+		// additional authorized_keys to both the current user (your username on
+		// gce and the shared user on aws) as well as to the shared user on both
+		// platforms.
 		c.Parallel("adding additional authorized keys", len(c.Nodes), 0, func(i int) ([]byte, error) {
 			sess, err := c.newSession(c.Nodes[i])
 			if err != nil {
@@ -714,7 +728,6 @@ fi
 			defer sess.Close()
 
 			sess.SetStdin(bytes.NewReader(c.AuthorizedKeys))
-
 			const cmd = `
 keys_data="$(cat)"
 set -e
@@ -724,12 +737,19 @@ on_exit() {
     rm -f "${tmp1}" "${tmp2}"
 }
 trap on_exit EXIT
-[[ -f ~/.ssh/authorized_keys ]] && cat ~/.ssh/authorized_keys > "${tmp1}"
+if [[ -f ~/.ssh/authorized_keys ]]; then
+    cat ~/.ssh/authorized_keys > "${tmp1}"
+fi
 echo "${keys_data}" >> "${tmp1}"
 sort -u < "${tmp1}" > "${tmp2}"
-sudo install --mode 0600 --owner ` + sharedUser +
-				` --group ` + sharedUser +
-				` "${tmp2}" ~` + sharedUser + `/.ssh/authorized_keys`
+install --mode 0600 "${tmp2}" ~/.ssh/authorized_keys
+if [[ "$(whoami)" != "` + config.SharedUser + `" ]]; then
+    sudo install --mode 0600 \
+        --owner ` + config.SharedUser + `\
+        --group ` + config.SharedUser + `\
+        "${tmp2}" ~` + config.SharedUser + `/.ssh/authorized_keys
+fi
+`
 			if out, err := sess.CombinedOutput(cmd); err != nil {
 				return nil, errors.Wrapf(err, "~ %s\n%s", cmd, out)
 			}
@@ -740,81 +760,152 @@ sudo install --mode 0600 --owner ` + sharedUser +
 	return nil
 }
 
-// CockroachVersions TODO(peter): document
-func (c *SyncedCluster) CockroachVersions() map[string]int {
-	sha := make(map[string]int)
-	var mu syncutil.Mutex
+// DistributeCerts will generate and distribute certificates to all of the
+// nodes.
+func (c *SyncedCluster) DistributeCerts() {
+	dir := ""
+	if c.IsLocal() {
+		dir = `${HOME}/local/1`
+	}
 
-	display := fmt.Sprintf("%s: cockroach version", c.Name)
-	nodes := c.ServerNodes()
-	c.Parallel(display, len(nodes), 0, func(i int) ([]byte, error) {
-		sess, err := c.newSession(c.Nodes[i])
+	// Check to see if the certs have already been initialized.
+	var existsErr error
+	display := fmt.Sprintf("%s: checking certs", c.Name)
+	c.Parallel(display, 1, 0, func(i int) ([]byte, error) {
+		sess, err := c.newSession(1)
+		if err != nil {
+			return nil, err
+		}
+		defer sess.Close()
+		_, existsErr = sess.CombinedOutput(`test -e ` + filepath.Join(dir, `certs.tar`))
+		return nil, nil
+	})
+
+	if existsErr == nil {
+		return
+	}
+
+	// Gather the internal IP addresses for every node in the cluster, even
+	// if it won't be added to the cluster itself we still add the IP address
+	// to the node cert.
+	var msg string
+	display = fmt.Sprintf("%s: initializing certs", c.Name)
+	nodes := allNodes(len(c.VMs))
+	var ips []string
+	if !c.IsLocal() {
+		ips = make([]string, len(nodes))
+		c.Parallel("", len(nodes), 0, func(i int) ([]byte, error) {
+			var err error
+			ips[i], err = c.GetInternalIP(nodes[i])
+			return nil, errors.Wrapf(err, "IPs")
+		})
+	}
+
+	// Generate the ca, client and node certificates on the first node.
+	c.Parallel(display, 1, 0, func(i int) ([]byte, error) {
+		sess, err := c.newSession(1)
 		if err != nil {
 			return nil, err
 		}
 		defer sess.Close()
 
-		cmd := config.Binary + " version | awk '/Build Tag:/ {print $NF}'"
-		out, err := sess.CombinedOutput(cmd)
-		var s string
-		if err != nil {
-			s = fmt.Sprintf("%s: %v", out, err)
+		var nodeNames []string
+		if c.IsLocal() {
+			// For local clusters, we only need to add one of the VM IP addresses.
+			nodeNames = append(nodeNames, "$(hostname)", c.VMs[0])
 		} else {
-			s = strings.TrimSpace(string(out))
+			// Add both the local and external IP addresses, as well as the
+			// hostnames to the node certificate.
+			nodeNames = append(nodeNames, ips...)
+			nodeNames = append(nodeNames, c.VMs...)
+			for i := range c.VMs {
+				nodeNames = append(nodeNames, fmt.Sprintf("%s-%04d", c.Name, i+1))
+				// On AWS nodes internally have a DNS name in the form ip-<ip address>
+				// where dots have been replaces with dashes.
+				// See https://docs.aws.amazon.com/vpc/latest/userguide/vpc-dns.html#vpc-dns-hostnames
+				if strings.Contains(c.Localities[i], "cloud=aws") {
+					nodeNames = append(nodeNames, "ip-"+strings.ReplaceAll(ips[i], ".", "-"))
+				}
+			}
 		}
-		mu.Lock()
-		sha[s]++
-		mu.Unlock()
-		return nil, err
+
+		var cmd string
+		if c.IsLocal() {
+			cmd = `cd ${HOME}/local/1 ; `
+		}
+		cmd += fmt.Sprintf(`
+rm -fr certs
+mkdir -p certs
+%[1]s cert create-ca --certs-dir=certs --ca-key=certs/ca.key
+%[1]s cert create-client root --certs-dir=certs --ca-key=certs/ca.key
+%[1]s cert create-node localhost %[2]s --certs-dir=certs --ca-key=certs/ca.key
+tar cvf certs.tar certs
+`, cockroachNodeBinary(c, 1), strings.Join(nodeNames, " "))
+		if out, err := sess.CombinedOutput(cmd); err != nil {
+			msg = fmt.Sprintf("%s: %v", out, err)
+		}
+		return nil, nil
 	})
 
-	return sha
-}
-
-// RunLoad TODO(peter): document
-func (c *SyncedCluster) RunLoad(cmd string, stdout, stderr io.Writer) error {
-	if c.LoadGen == 0 {
-		log.Fatalf("%s: no load generator node specified", c.Name)
+	if msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
+		os.Exit(1)
 	}
 
-	display := fmt.Sprintf("%s: retrieving IP addresses", c.Name)
-	nodes := c.ServerNodes()
-	ips := make([]string, len(nodes))
-	c.Parallel(display, len(nodes), 0, func(i int) ([]byte, error) {
-		var err error
-		ips[i], err = c.GetInternalIP(nodes[i])
-		return nil, err
-	})
+	var tmpfileName string
+	if c.IsLocal() {
+		tmpfileName = os.ExpandEnv(filepath.Join(dir, "certs.tar"))
+	} else {
+		// Retrieve the certs.tar that was created on the first node.
+		tmpfile, err := ioutil.TempFile("", "certs")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		_ = tmpfile.Close()
+		defer func() {
+			_ = os.Remove(tmpfile.Name()) // clean up
+		}()
 
-	session, err := ssh.NewSSHSession(c.user(c.LoadGen), c.host(c.LoadGen))
+		if err := func() error {
+			return c.scp(fmt.Sprintf("%s@%s:certs.tar", c.user(1), c.host(1)), tmpfile.Name())
+		}(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+		tmpfileName = tmpfile.Name()
+	}
+
+	// Read the certs.tar file we just downloaded. We'll be piping it to the
+	// other nodes in the cluster.
+	certsTar, err := ioutil.ReadFile(tmpfileName)
 	if err != nil {
-		return err
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-	defer session.Close()
 
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	defer func() {
-		signal.Stop(ch)
-		close(ch)
-	}()
-	go func() {
-		_, ok := <-ch
-		if ok {
-			c.stopLoad()
+	// Skip the the first node which is where we generated the certs.
+	display = c.Name + ": distributing certs"
+	nodes = nodes[1:]
+	c.Parallel(display, len(nodes), 0, func(i int) ([]byte, error) {
+		sess, err := c.newSession(nodes[i])
+		if err != nil {
+			return nil, err
 		}
-	}()
+		defer sess.Close()
 
-	session.Stdout = stdout
-	session.Stderr = stderr
-	fmt.Fprintln(stdout, cmd)
-
-	var urls []string
-	for i, ip := range ips {
-		urls = append(urls, c.Impl.NodeURL(c, ip, c.Impl.NodePort(c, nodes[i])))
-	}
-	prefix := fmt.Sprintf("ulimit -n 16384; export ROACHPROD=%d%s && ", c.LoadGen, c.Tag)
-	return session.Run(prefix + cmd + " " + strings.Join(urls, " "))
+		sess.SetStdin(bytes.NewReader(certsTar))
+		var cmd string
+		if c.IsLocal() {
+			cmd = fmt.Sprintf(`cd ${HOME}/local/%d ; `, nodes[i])
+		}
+		cmd += `tar xf -`
+		if out, err := sess.CombinedOutput(cmd); err != nil {
+			return nil, errors.Wrapf(err, "~ %s\n%s", cmd, out)
+		}
+		return nil, nil
+	})
 }
 
 const progressDone = "=======================================>"
@@ -1030,7 +1121,10 @@ func (c *SyncedCluster) Put(src, dest string) {
 // user and assumes that the current user used to create c has the ability to
 // sudo into <user>.
 func (c *SyncedCluster) Logs(
-	src, dest, user, filter string, interval time.Duration, from, to time.Time, out io.Writer,
+	src, dest, user, filter, programFilter string,
+	interval time.Duration,
+	from, to time.Time,
+	out io.Writer,
 ) error {
 	rsyncNodeLogs := func(ctx context.Context, idx int) error {
 		base := fmt.Sprintf("%d.logs", c.Nodes[idx-1])
@@ -1094,6 +1188,9 @@ func (c *SyncedCluster) Logs(
 			"--to", t.Format(time.RFC3339))
 		if filter != "" {
 			cmd.Args = append(cmd.Args, "--filter", filter)
+		}
+		if programFilter != "" {
+			cmd.Args = append(cmd.Args, "--program-filter", programFilter)
 		}
 		// For local clusters capture the cluster ID from the sync path because the
 		// host information is useless.
@@ -1333,16 +1430,25 @@ func (c *SyncedCluster) Get(src, dest string) {
 }
 
 func (c *SyncedCluster) pgurls(nodes []int) map[int]string {
+	hosts := c.pghosts(nodes)
+	m := make(map[int]string, len(hosts))
+	for node, host := range hosts {
+		m[node] = c.Impl.NodeURL(c, host, c.Impl.NodePort(c, node))
+	}
+	return m
+}
+
+func (c *SyncedCluster) pghosts(nodes []int) map[int]string {
 	ips := make([]string, len(nodes))
 	c.Parallel("", len(nodes), 0, func(i int) ([]byte, error) {
 		var err error
 		ips[i], err = c.GetInternalIP(nodes[i])
-		return nil, errors.Wrapf(err, "pgurls")
+		return nil, errors.Wrapf(err, "pghosts")
 	})
 
 	m := make(map[int]string, len(ips))
 	for i, ip := range ips {
-		m[nodes[i]] = c.Impl.NodeURL(c, ip, c.Impl.NodePort(c, nodes[i]))
+		m[nodes[i]] = ip
 	}
 	return m
 }
@@ -1409,7 +1515,7 @@ func (c *SyncedCluster) SSH(sshArgs, args []string) error {
 
 func (c *SyncedCluster) scp(src, dest string) error {
 	args := []string{
-		"scp", "-v", "-r", "-C",
+		"scp", "-r", "-C",
 		"-o", "StrictHostKeyChecking=no",
 	}
 	args = append(args, sshAuthArgs()...)
@@ -1420,26 +1526,6 @@ func (c *SyncedCluster) scp(src, dest string) error {
 		return errors.Wrapf(err, "~ %s\n%s", strings.Join(args, " "), out)
 	}
 	return nil
-}
-
-func (c *SyncedCluster) stopLoad() {
-	if c.LoadGen == 0 {
-		log.Fatalf("no load generator node specified for cluster: %s", c.Name)
-	}
-
-	display := fmt.Sprintf("%s: stopping load", c.Name)
-	c.Parallel(display, 1, 0, func(i int) ([]byte, error) {
-		sess, err := c.newSession(c.LoadGen)
-		if err != nil {
-			return nil, err
-		}
-		defer sess.Close()
-
-		cmd := fmt.Sprintf("kill -9 $(lsof -t -i :%d -i :%d) 2>/dev/null || true",
-			Cockroach{}.NodePort(c, c.Nodes[i]),
-			Cassandra{}.NodePort(c, c.Nodes[i]))
-		return sess.CombinedOutput(cmd)
-	})
 }
 
 // Parallel TODO(peter): document

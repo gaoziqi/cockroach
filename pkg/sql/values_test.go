@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -70,11 +66,17 @@ func TestValues(t *testing.T) {
 	unsupp := &tree.RangeCond{}
 
 	intVal := func(v int64) *tree.NumVal {
-		return &tree.NumVal{Value: constant.MakeInt64(v)}
+		return tree.NewNumVal(
+			constant.MakeInt64(v),
+			"", /* origString */
+			false /* negative */)
 	}
 	floatVal := func(f float64) *tree.CastExpr {
 		return &tree.CastExpr{
-			Expr: &tree.NumVal{Value: constant.MakeFloat64(f)},
+			Expr: tree.NewNumVal(
+				constant.MakeFloat64(f),
+				"", /* origString */
+				false /* negative */),
 			Type: types.Float,
 		}
 	}
@@ -150,10 +152,6 @@ func TestValues(t *testing.T) {
 			}
 			if plan == nil {
 				return
-			}
-			plan, err = p.optimizePlan(ctx, plan, allColumns(plan))
-			if err != nil {
-				t.Fatalf("%d: unexpected error in optimizePlan: %v", i, err)
 			}
 			params := runParams{ctx: ctx, p: p, extendedEvalCtx: &p.extendedEvalCtx}
 			if err := startExec(params, plan); err != nil {

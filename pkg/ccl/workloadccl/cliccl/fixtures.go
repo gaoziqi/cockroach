@@ -1,17 +1,10 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed as a CockroachDB Enterprise file under the Cockroach Community
+// License (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 package cliccl
 
@@ -28,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	workloadcli "github.com/cockroachdb/cockroach/pkg/workload/cli"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -97,10 +91,6 @@ var fixturesMakeFilesPerNode = fixturesMakeCmd.PersistentFlags().Int(
 	`files-per-node`, 1,
 	`number of file URLs to generate per node when using csv-server`)
 
-var fixturesImportDirectIngestionTable = fixturesImportCmd.PersistentFlags().Bool(
-	`experimental-direct-ingestion`, false,
-	`Use the faster, but limited and still quite experimental, IMPORT without a distributed sort`)
-
 var fixturesImportFilesPerNode = fixturesImportCmd.PersistentFlags().Int(
 	`files-per-node`, 1,
 	`number of file URLs to generate per node`)
@@ -133,7 +123,7 @@ const storageError = `failed to create google cloud client ` +
 // caller is responsible for closing it.
 func getStorage(ctx context.Context) (*storage.Client, error) {
 	// TODO(dan): Right now, we don't need all the complexity of
-	// storageccl.ExportStorage, but if we start supporting more than just GCS,
+	// cloud.ExternalStorage, but if we start supporting more than just GCS,
 	// this should probably be switched to it.
 	g, err := storage.NewClient(ctx, option.WithScopes(storage.ScopeReadWrite))
 	return g, errors.Wrap(err, storageError)
@@ -275,6 +265,29 @@ func fixturesMake(gen workload.Generator, urls []string, _ string) error {
 	return nil
 }
 
+// restoreDataLoader is an InitialDataLoader implementation that loads data with
+// RESTORE.
+type restoreDataLoader struct {
+	fixture  workloadccl.Fixture
+	database string
+}
+
+// InitialDataLoad implements the InitialDataLoader interface.
+func (l restoreDataLoader) InitialDataLoad(
+	ctx context.Context, db *gosql.DB, gen workload.Generator,
+) (int64, error) {
+	log.Infof(ctx, "starting restore of %d tables", len(gen.Tables()))
+	start := timeutil.Now()
+	bytes, err := workloadccl.RestoreFixture(ctx, db, l.fixture, l.database, true /* injectStats */)
+	if err != nil {
+		return 0, errors.Wrap(err, `restoring fixture`)
+	}
+	elapsed := timeutil.Since(start)
+	log.Infof(ctx, "restored %s bytes in %d tables (took %s, %s)",
+		humanizeutil.IBytes(bytes), len(gen.Tables()), elapsed, humanizeutil.DataRate(bytes, elapsed))
+	return bytes, nil
+}
+
 func fixturesLoad(gen workload.Generator, urls []string, dbName string) error {
 	ctx := context.Background()
 	gcs, err := getStorage(ctx)
@@ -296,19 +309,14 @@ func fixturesLoad(gen workload.Generator, urls []string, dbName string) error {
 		return errors.Wrap(err, `finding fixture`)
 	}
 
-	start := timeutil.Now()
-	log.Infof(ctx, "starting load of %d tables", len(gen.Tables()))
-	bytes, err := workloadccl.RestoreFixture(ctx, sqlDB, fixture, dbName)
-	if err != nil {
-		return errors.Wrap(err, `restoring fixture`)
+	l := restoreDataLoader{fixture: fixture, database: dbName}
+	if _, err := workloadsql.Setup(ctx, sqlDB, gen, l); err != nil {
+		return err
 	}
-	elapsed := timeutil.Since(start)
-	log.Infof(ctx, "loaded %s in %d tables (took %s, %s)",
-		humanizeutil.IBytes(bytes), len(gen.Tables()), elapsed, humanizeutil.DataRate(bytes, elapsed))
 
 	if hooks, ok := gen.(workload.Hookser); *fixturesRunChecks && ok {
 		if consistencyCheckFn := hooks.Hooks().CheckConsistency; consistencyCheckFn != nil {
-			log.Info(ctx, "fixture is restored; now running consistency checks (ctrl-c to abort)")
+			log.Info(ctx, "fixture is imported; now running consistency checks (ctrl-c to abort)")
 			if err := consistencyCheckFn(ctx, sqlDB); err != nil {
 				return err
 			}
@@ -328,26 +336,18 @@ func fixturesImport(gen workload.Generator, urls []string, dbName string) error 
 		return err
 	}
 
-	log.Infof(ctx, "starting import of %d tables", len(gen.Tables()))
-	start := timeutil.Now()
-	directIngestion := *fixturesImportDirectIngestionTable
-	filesPerNode := *fixturesImportFilesPerNode
-	injectStats := *fixturesImportInjectStats
-	noSkipPostLoad := false
-	csvServer := *fixturesMakeImportCSVServerURL
-	bytes, err := workloadccl.ImportFixture(
-		ctx, sqlDB, gen, dbName, directIngestion, filesPerNode, injectStats, noSkipPostLoad, csvServer,
-	)
-	if err != nil {
-		return errors.Wrap(err, `importing fixture`)
+	l := workloadccl.ImportDataLoader{
+		FilesPerNode: *fixturesImportFilesPerNode,
+		InjectStats:  *fixturesImportInjectStats,
+		CSVServer:    *fixturesMakeImportCSVServerURL,
 	}
-	elapsed := timeutil.Since(start)
-	log.Infof(ctx, "imported %s in %d tables (took %s, %s)",
-		humanizeutil.IBytes(bytes), len(gen.Tables()), elapsed, humanizeutil.DataRate(bytes, elapsed))
+	if _, err := workloadsql.Setup(ctx, sqlDB, gen, l); err != nil {
+		return err
+	}
 
 	if hooks, ok := gen.(workload.Hookser); *fixturesRunChecks && ok {
 		if consistencyCheckFn := hooks.Hooks().CheckConsistency; consistencyCheckFn != nil {
-			log.Info(ctx, "fixture is imported; now running consistency checks (ctrl-c to abort)")
+			log.Info(ctx, "fixture is restored; now running consistency checks (ctrl-c to abort)")
 			if err := consistencyCheckFn(ctx, sqlDB); err != nil {
 				return err
 			}

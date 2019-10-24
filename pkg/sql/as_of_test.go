@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -229,11 +225,23 @@ func TestAsOfTime(t *testing.T) {
 		t.Fatalf("expected %v, got %v", val1, i)
 	}
 
-	// Can't use in a transaction.
+	// Can use in a transaction by using the SET TRANSACTION syntax
+	if err := db.QueryRow(fmt.Sprintf(`
+			BEGIN;
+			SET TRANSACTION AS OF SYSTEM TIME %s;
+			SELECT a FROM d.t;
+			COMMIT;
+	`, tsVal1)).Scan(&i); err != nil {
+		t.Fatal(err)
+	} else if i != val1 {
+		t.Fatalf("expected %v, got %v", val1, i)
+	}
+
+	// Can't use in a transaction without SET TRANSACTION AS OF SYSTEM TIME syntax
 	_, err = db.Query(
 		fmt.Sprintf("BEGIN; SELECT a FROM d.t AS OF SYSTEM TIME %s; COMMIT;", tsVal1))
-	if !testutils.IsError(err, "cannot be used inside a transaction") {
-		t.Fatalf("expected not supported, got: %v", err)
+	if !testutils.IsError(err, "try SET TRANSACTION AS OF SYSTEM TIME") {
+		t.Fatalf("expected try SET TRANSACTION AS OF SYSTEM TIME, got: %v", err)
 	}
 }
 

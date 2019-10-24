@@ -1,16 +1,12 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package execbuilder
 
@@ -53,7 +49,7 @@ func fmtInterceptor(f *memo.ExprFmtCtx, tp treeprinter.Node, nd opt.Expr) bool {
 	}
 
 	// Build the scalar expression and format it as a single tree node.
-	bld := New(nil /* factory */, f.Memo, nd, nil /* evalCtx */)
+	bld := New(nil /* factory */, f.Memo, nil /* catalog */, nd, nil /* evalCtx */)
 	md := f.Memo.Metadata()
 	ivh := tree.MakeIndexedVarHelper(nil /* container */, md.NumColumns())
 	expr, err := bld.BuildScalar(&ivh)
@@ -64,7 +60,7 @@ func fmtInterceptor(f *memo.ExprFmtCtx, tp treeprinter.Node, nd opt.Expr) bool {
 	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
 	fmtCtx.SetIndexedVarFormat(func(ctx *tree.FmtCtx, idx int) {
 		fullyQualify := !f.HasFlags(memo.ExprFmtHideQualifications)
-		alias := md.QualifiedAlias(opt.ColumnID(idx+1), fullyQualify)
+		alias := md.QualifiedAlias(opt.ColumnID(idx+1), fullyQualify, f.Catalog)
 		ctx.WriteString(alias)
 	})
 	expr.Format(fmtCtx)

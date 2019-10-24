@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package keys
 
@@ -478,7 +474,7 @@ func TestBatchRange(t *testing.T) {
 				Key: roachpb.Key(pair[0]), EndKey: roachpb.Key(pair[1]),
 			}})
 		}
-		if rs, err := Range(ba); err != nil {
+		if rs, err := Range(ba.Requests); err != nil {
 			t.Errorf("%d: %v", i, err)
 		} else if actPair := [2]string{string(rs.Key), string(rs.EndKey)}; !reflect.DeepEqual(actPair, c.exp) {
 			t.Errorf("%d: expected [%q,%q), got [%q,%q)", i, c.exp[0], c.exp[1], actPair[0], actPair[1])
@@ -507,7 +503,7 @@ func TestBatchError(t *testing.T) {
 		ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
 			Key: roachpb.Key(c.req[0]), EndKey: roachpb.Key(c.req[1]),
 		}})
-		if _, err := Range(ba); !testutils.IsError(err, c.errMsg) {
+		if _, err := Range(ba.Requests); !testutils.IsError(err, c.errMsg) {
 			t.Errorf("%d: unexpected error %v", i, err)
 		}
 	}
@@ -517,7 +513,7 @@ func TestBatchError(t *testing.T) {
 	ba.Add(&roachpb.GetRequest{RequestHeader: roachpb.RequestHeader{
 		Key: roachpb.Key("a"), EndKey: roachpb.Key("b"),
 	}})
-	if _, err := Range(ba); !testutils.IsError(err, "end key specified for non-range operation") {
+	if _, err := Range(ba.Requests); !testutils.IsError(err, "end key specified for non-range operation") {
 		t.Errorf("unexpected error %v", err)
 	}
 }

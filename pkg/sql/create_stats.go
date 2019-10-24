@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -24,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
@@ -33,9 +30,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -127,8 +125,7 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 	}
 
 	if err = <-errCh; err != nil {
-		pgerr, ok := errors.Cause(err).(*pgerror.Error)
-		if ok && pgerr.Code == pgerror.CodeLockNotAvailableError {
+		if errors.Is(err, stats.ConcurrentCreateStatsError) {
 			// Delete the job so users don't see it and get confused by the error.
 			const stmt = `DELETE FROM system.jobs WHERE id = $1`
 			if _ /* cols */, delErr := n.p.ExecCfg().InternalExecutor.Exec(
@@ -144,13 +141,6 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 // makeJobRecord creates a CreateStats job record which can be used to plan and
 // execute statistics creation.
 func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, error) {
-	if !n.p.ExecCfg().Settings.Version.IsActive(cluster.VersionCreateStats) {
-		return nil, pgerror.Newf(pgerror.CodeObjectNotInPrerequisiteStateError,
-			`CREATE STATISTICS requires all nodes to be upgraded to %s`,
-			cluster.VersionByKey(cluster.VersionCreateStats),
-		)
-	}
-
 	var tableDesc *ImmutableTableDescriptor
 	var fqTableName string
 	var err error
@@ -163,8 +153,8 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		fqTableName = n.p.ResolvedName(t).FQString()
 
 	case *tree.TableRef:
-		flags := ObjectLookupFlags{CommonLookupFlags: CommonLookupFlags{
-			avoidCached: n.p.avoidCachedDescriptors,
+		flags := tree.ObjectLookupFlags{CommonLookupFlags: tree.CommonLookupFlags{
+			AvoidCached: n.p.avoidCachedDescriptors,
 		}}
 		tableDesc, err = n.p.Tables().getTableVersionByID(ctx, n.p.txn, sqlbase.ID(t.TableID), flags)
 		if err != nil {
@@ -178,13 +168,13 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 
 	if tableDesc.IsVirtualTable() {
 		return nil, pgerror.New(
-			pgerror.CodeWrongObjectTypeError, "cannot create statistics on virtual tables",
+			pgcode.WrongObjectType, "cannot create statistics on virtual tables",
 		)
 	}
 
 	if tableDesc.IsView() {
 		return nil, pgerror.New(
-			pgerror.CodeWrongObjectTypeError, "cannot create statistics on views",
+			pgcode.WrongObjectType, "cannot create statistics on views",
 		)
 	}
 
@@ -193,9 +183,9 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 	}
 
 	// Identify which columns we should create statistics for.
-	var createStatsColLists []jobspb.CreateStatsDetails_ColList
+	var colStats []jobspb.CreateStatsDetails_ColStat
 	if len(n.ColumnNames) == 0 {
-		if createStatsColLists, err = createStatsDefaultColumns(tableDesc); err != nil {
+		if colStats, err = createStatsDefaultColumns(tableDesc); err != nil {
 			return nil, err
 		}
 	} else {
@@ -207,12 +197,17 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		columnIDs := make([]sqlbase.ColumnID, len(columns))
 		for i := range columns {
 			if columns[i].Type.Family() == types.JsonFamily {
-				return nil, pgerror.UnimplementedWithIssuef(35844,
+				return nil, unimplemented.NewWithIssuef(35844,
 					"CREATE STATISTICS is not supported for JSON columns")
 			}
 			columnIDs[i] = columns[i].ID
 		}
-		createStatsColLists = []jobspb.CreateStatsDetails_ColList{{IDs: columnIDs}}
+		colStats = []jobspb.CreateStatsDetails_ColStat{{ColumnIDs: columnIDs, HasHistogram: false}}
+		if len(columnIDs) == 1 {
+			// By default, create histograms on all explicitly requested column stats
+			// with a single column.
+			colStats[0].HasHistogram = true
+		}
 	}
 
 	// Evaluate the AS OF time, if any.
@@ -245,7 +240,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 			Name:            string(n.Name),
 			FQTableName:     fqTableName,
 			Table:           tableDesc.TableDescriptor,
-			ColumnLists:     createStatsColLists,
+			ColumnStats:     colStats,
 			Statement:       n.String(),
 			AsOf:            asOf,
 			MaxFractionIdle: n.Options.Throttling,
@@ -270,20 +265,23 @@ const maxNonIndexCols = 100
 // collect statistics on a, {a, b}, b, and {b, c}.
 //
 // In addition to the index columns, we collect stats on up to maxNonIndexCols
-// other columns from the table.
+// other columns from the table. We only collect histograms for index columns.
 //
 // TODO(rytaft): This currently only generates one single-column stat per
 // index. Add code to collect multi-column stats once they are supported.
 func createStatsDefaultColumns(
 	desc *ImmutableTableDescriptor,
-) ([]jobspb.CreateStatsDetails_ColList, error) {
-	columns := make([]jobspb.CreateStatsDetails_ColList, 0, len(desc.Indexes)+1)
+) ([]jobspb.CreateStatsDetails_ColStat, error) {
+	colStats := make([]jobspb.CreateStatsDetails_ColStat, 0, len(desc.Indexes)+1)
 
 	var requestedCols util.FastIntSet
 
 	// Add a column for the primary key.
 	pkCol := desc.PrimaryIndex.ColumnIDs[0]
-	columns = append(columns, jobspb.CreateStatsDetails_ColList{IDs: []sqlbase.ColumnID{pkCol}})
+	colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
+		ColumnIDs:    []sqlbase.ColumnID{pkCol},
+		HasHistogram: true,
+	})
 	requestedCols.Add(int(pkCol))
 
 	// Add columns for each secondary index.
@@ -294,9 +292,10 @@ func createStatsDefaultColumns(
 		}
 		idxCol := desc.Indexes[i].ColumnIDs[0]
 		if !requestedCols.Contains(int(idxCol)) {
-			columns = append(
-				columns, jobspb.CreateStatsDetails_ColList{IDs: []sqlbase.ColumnID{idxCol}},
-			)
+			colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
+				ColumnIDs:    []sqlbase.ColumnID{idxCol},
+				HasHistogram: true,
+			})
 			requestedCols.Add(int(idxCol))
 		}
 	}
@@ -306,14 +305,15 @@ func createStatsDefaultColumns(
 	for i := 0; i < len(desc.Columns) && nonIdxCols < maxNonIndexCols; i++ {
 		col := &desc.Columns[i]
 		if col.Type.Family() != types.JsonFamily && !requestedCols.Contains(int(col.ID)) {
-			columns = append(
-				columns, jobspb.CreateStatsDetails_ColList{IDs: []sqlbase.ColumnID{col.ID}},
-			)
+			colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
+				ColumnIDs:    []sqlbase.ColumnID{col.ID},
+				HasHistogram: false,
+			})
 			nonIdxCols++
 		}
 	}
 
-	return columns, nil
+	return colStats, nil
 }
 
 // makePlanForExplainDistSQL is part of the distSQLExplainable interface.
@@ -381,7 +381,7 @@ func (r *createStatsResumer) Resume(
 			ctx, r.evalCtx, planCtx, txn, r.job, NewRowResultWriter(rows),
 		); err != nil {
 			// Check if this was a context canceled error and restart if it was.
-			if s, ok := status.FromError(errors.Cause(err)); ok {
+			if s, ok := status.FromError(errors.UnwrapAll(err)); ok {
 				if s.Code() == codes.Canceled && s.Message() == context.Canceled.Error() {
 					return jobs.NewRetryJobError("node failure")
 				}
@@ -448,9 +448,7 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p *planner) error {
 
 			// This is not the first CreateStats job running. This job should fail
 			// so that the earlier job can succeed.
-			return pgerror.New(
-				pgerror.CodeLockNotAvailableError, "another CREATE STATISTICS job is already running",
-			)
+			return stats.ConcurrentCreateStatsError
 		}
 	}
 	return nil
