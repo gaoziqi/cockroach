@@ -30,14 +30,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/ui"
@@ -51,6 +51,7 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var nodeTestBaseContext = testutils.NewNodeTestBaseContext()
@@ -120,6 +121,31 @@ func TestHealthCheck(t *testing.T) {
 	}
 }
 
+// TestEngineTelemetry tests that the server increments a telemetry counter on
+// start that denotes engine type.
+func TestEngineTelemetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	rows, err := db.Query("SELECT * FROM crdb_internal.feature_usage WHERE feature_name LIKE 'storage.engine.%' AND usage_count > 0;")
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if count < 1 {
+		t.Fatal("expected engine type telemetry counter to be emiitted")
+	}
+}
+
 // TestServerStartClock tests that a server's clock is not pushed out of thin
 // air. This used to happen - the simple act of starting was causing a server's
 // clock to be pushed because we were introducing bogus future timestamps into
@@ -132,7 +158,7 @@ func TestServerStartClock(t *testing.T) {
 	// which would allow the physical clock to catch up to the pushed one.
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
-			Store: &storage.StoreTestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
 				MaxOffset: time.Second,
 			},
 		},
@@ -146,7 +172,7 @@ func TestServerStartClock(t *testing.T) {
 	get := &roachpb.GetRequest{
 		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key("a")},
 	}
-	if _, err := client.SendWrapped(
+	if _, err := kv.SendWrapped(
 		context.Background(), s.DB().NonTransactionalSender(), get,
 	); err != nil {
 		t.Fatal(err)
@@ -185,7 +211,7 @@ func TestPlainHTTPServer(t *testing.T) {
 	if !strings.HasPrefix(url, "http://") {
 		t.Fatalf("expected insecure admin url to start with http://, but got %s", url)
 	}
-	if resp, err := http.Get(url); err != nil {
+	if resp, err := httputil.Get(context.TODO(), url); err != nil {
 		t.Error(err)
 	} else {
 		if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
@@ -198,7 +224,7 @@ func TestPlainHTTPServer(t *testing.T) {
 
 	// Attempting to connect to the insecure server with HTTPS doesn't work.
 	secureURL := strings.Replace(url, "http://", "https://", 1)
-	if _, err := http.Get(secureURL); !testutils.IsError(err, "http: server gave HTTP response to HTTPS client") {
+	if _, err := httputil.Get(context.TODO(), secureURL); !testutils.IsError(err, "http: server gave HTTP response to HTTPS client") {
 		t.Error(err)
 	}
 }
@@ -257,7 +283,7 @@ func TestAcceptEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
-	client, err := s.GetAuthenticatedHTTPClient()
+	client, err := s.GetAdminAuthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,17 +350,17 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 		RequestHeader: roachpb.RequestHeader{Key: writes[0]},
 	}
 	get.EndKey = writes[len(writes)-1]
-	if _, err := client.SendWrapped(ctx, tds, get); err == nil {
+	if _, err := kv.SendWrapped(ctx, tds, get); err == nil {
 		t.Errorf("able to call Get with a key range: %v", get)
 	}
 	var delTS hlc.Timestamp
 	for i, k := range writes {
 		put := roachpb.NewPut(k, roachpb.MakeValueFromBytes(k))
-		if _, err := client.SendWrapped(ctx, tds, put); err != nil {
+		if _, err := kv.SendWrapped(ctx, tds, put); err != nil {
 			t.Fatal(err)
 		}
-		scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next())
-		reply, err := client.SendWrapped(ctx, tds, scan)
+		scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next(), false)
+		reply, err := kv.SendWrapped(ctx, tds, scan)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -356,7 +382,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 		},
 		ReturnKeys: true,
 	}
-	reply, err := client.SendWrappedWith(ctx, tds, roachpb.Header{Timestamp: delTS}, del)
+	reply, err := kv.SendWrappedWith(ctx, tds, roachpb.Header{Timestamp: delTS}, del)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,10 +394,11 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 		t.Errorf("expected %d keys to be deleted, but got %d instead", writes, dr.Keys)
 	}
 
-	txnProto := roachpb.MakeTransaction("MyTxn", nil, 0, s.Clock().Now(), 0)
-	txn := client.NewTxnWithProto(ctx, db, s.NodeID(), client.RootTxn, txnProto)
+	now := s.Clock().Now()
+	txnProto := roachpb.MakeTransaction("MyTxn", nil, 0, now, 0)
+	txn := kv.NewTxnFromProto(ctx, db, s.NodeID(), now, kv.RootTxn, &txnProto)
 
-	scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next())
+	scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next(), false)
 	ba := roachpb.BatchRequest{}
 	ba.Header = roachpb.Header{Txn: &txnProto}
 	ba.Add(scan)
@@ -389,9 +416,10 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	}
 }
 
-// TestMultiRangeScanWithMaxResults tests that commands which access multiple
-// ranges with MaxResults parameter are carried out properly.
-func TestMultiRangeScanWithMaxResults(t *testing.T) {
+// TestMultiRangeScanWithPagination tests that specifying MaxSpanResultKeys
+// and/or TargetBytes to break up result sets works properly, even across
+// ranges.
+func TestMultiRangeScanWithPagination(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		splitKeys []roachpb.Key
@@ -404,7 +432,7 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 				roachpb.Key("r"), roachpb.Key("w"), roachpb.Key("y")}},
 	}
 
-	for i, tc := range testCases {
+	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
 			ctx := context.Background()
 			s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
@@ -420,31 +448,93 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 
 			for _, k := range tc.keys {
 				put := roachpb.NewPut(k, roachpb.MakeValueFromBytes(k))
-				if _, err := client.SendWrapped(ctx, tds, put); err != nil {
+				if _, err := kv.SendWrapped(ctx, tds, put); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			// Try every possible ScanRequest startKey.
-			for start := 0; start < len(tc.keys); start++ {
-				// Try every possible maxResults, from 1 to beyond the size of key array.
-				for maxResults := 1; maxResults <= len(tc.keys)-start+1; maxResults++ {
-					scan := roachpb.NewScan(tc.keys[start], tc.keys[len(tc.keys)-1].Next())
-					reply, err := client.SendWrappedWith(
-						ctx, tds, roachpb.Header{MaxSpanRequestKeys: int64(maxResults)}, scan,
-					)
-					if err != nil {
-						t.Fatal(err)
-					}
-					rows := reply.(*roachpb.ScanResponse).Rows
-					if start+maxResults <= len(tc.keys) && len(rows) != maxResults {
-						t.Errorf("%d: start=%s: expected %d rows, but got %d", i, tc.keys[start], maxResults, len(rows))
-					} else if start+maxResults == len(tc.keys)+1 && len(rows) != maxResults-1 {
-						t.Errorf("%d: expected %d rows, but got %d", i, maxResults-1, len(rows))
-					}
-				}
+			// The maximum TargetBytes to use in this test. We use the bytes in
+			// all kvs in this test case as a ceiling. Nothing interesting
+			// happens above this.
+			var maxTargetBytes int64
+			{
+				scan := roachpb.NewScan(tc.keys[0], tc.keys[len(tc.keys)-1].Next(), false)
+				resp, pErr := kv.SendWrapped(ctx, tds, scan)
+				require.Nil(t, pErr)
+				maxTargetBytes = resp.Header().NumBytes
 			}
 
+			testutils.RunTrueAndFalse(t, "reverse", func(t *testing.T, reverse bool) {
+				// Iterate through MaxSpanRequestKeys=1..n and TargetBytes=1..m
+				// and (where n and m are chosen to reveal the full result set
+				// in one page). At each(*) combination, paginate both the
+				// forward and reverse scan and make sure we get the right
+				// result.
+				//
+				// (*) we don't increase the limits when there's only one page,
+				// but short circuit to something more interesting instead.
+				msrq := int64(1)
+				for targetBytes := int64(1); ; targetBytes++ {
+					var numPages int
+					t.Run(fmt.Sprintf("targetBytes=%d,maxSpanRequestKeys=%d", targetBytes, msrq), func(t *testing.T) {
+						req := func(span roachpb.Span) roachpb.Request {
+							if reverse {
+								return roachpb.NewReverseScan(span.Key, span.EndKey, false)
+							}
+							return roachpb.NewScan(span.Key, span.EndKey, false)
+						}
+						// Paginate.
+						resumeSpan := &roachpb.Span{Key: tc.keys[0], EndKey: tc.keys[len(tc.keys)-1].Next()}
+						var keys []roachpb.Key
+						for {
+							numPages++
+							scan := req(*resumeSpan)
+							var ba roachpb.BatchRequest
+							ba.Add(scan)
+							ba.Header.TargetBytes = targetBytes
+							ba.Header.MaxSpanRequestKeys = msrq
+							br, pErr := tds.Send(ctx, ba)
+							require.Nil(t, pErr)
+							var rows []roachpb.KeyValue
+							if reverse {
+								rows = br.Responses[0].GetReverseScan().Rows
+							} else {
+								rows = br.Responses[0].GetScan().Rows
+							}
+							for _, kv := range rows {
+								keys = append(keys, kv.Key)
+							}
+							resumeSpan = br.Responses[0].GetInner().Header().ResumeSpan
+							t.Logf("page #%d: scan %v -> keys (after) %v resume %v", scan.Header().Span(), numPages, keys, resumeSpan)
+							if resumeSpan == nil {
+								// Done with this pagination.
+								break
+							}
+						}
+						if reverse {
+							for i, n := 0, len(keys); i < n-i-1; i++ {
+								keys[i], keys[n-i-1] = keys[n-i-1], keys[i]
+							}
+						}
+						require.Equal(t, tc.keys, keys)
+						if targetBytes == 1 || msrq < int64(len(tc.keys)) {
+							// Definitely more than one page in this case.
+							require.Less(t, 1, numPages)
+						}
+						if targetBytes >= maxTargetBytes && msrq >= int64(len(tc.keys)) {
+							// Definitely one page if limits are larger than result set.
+							require.Equal(t, 1, numPages)
+						}
+					})
+					if targetBytes >= maxTargetBytes || numPages == 1 {
+						if msrq >= int64(len(tc.keys)) {
+							return
+						}
+						targetBytes = 0
+						msrq++
+					}
+				}
+			})
 		})
 	}
 }
@@ -474,7 +564,7 @@ func TestSystemConfigGossip(t *testing.T) {
 	}
 
 	// Write a system key with the transaction marked as having a Gossip trigger.
-	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		if err := txn.SetSystemConfigTrigger(); err != nil {
 			return err
 		}
@@ -578,9 +668,9 @@ func TestListenerFileCreation(t *testing.T) {
 func TestClusterIDMismatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	engines := make([]engine.Engine, 2)
+	engines := make([]storage.Engine, 2)
 	for i := range engines {
-		e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
+		e := storage.NewDefaultInMem()
 		defer e.Close()
 
 		sIdent := roachpb.StoreIdent{
@@ -588,7 +678,7 @@ func TestClusterIDMismatch(t *testing.T) {
 			NodeID:    roachpb.NodeID(i),
 			StoreID:   roachpb.StoreID(i),
 		}
-		if err := engine.MVCCPutProto(
+		if err := storage.MVCCPutProto(
 			context.Background(), e, nil, keys.StoreIdentKey(), hlc.Timestamp{}, nil, &sIdent); err != nil {
 
 			t.Fatal(err)
@@ -941,7 +1031,7 @@ Binary built without web UI.
 		defer s.Stopper().Stop(context.TODO())
 		tsrv := s.(*TestServer)
 
-		loggedInClient, err := tsrv.GetAuthenticatedHTTPClient()
+		loggedInClient, err := tsrv.GetAdminAuthenticatedHTTPClient()
 		if err != nil {
 			t.Fatal(err)
 		}

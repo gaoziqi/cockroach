@@ -224,7 +224,12 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 	// that the node doesn't have a lease on it anymore (committing the txn
 	// should have released the lease on the version of the descriptor with the
 	// old name), even though the name mapping still exists.
-	lease := s.LeaseManager().(*LeaseManager).tableNames.get(tableDesc.ID, "t", s.Clock().Now())
+	lease := s.LeaseManager().(*LeaseManager).tableNames.get(
+		tableDesc.ID,
+		tableDesc.GetParentSchemaID(),
+		"t",
+		s.Clock().Now(),
+	)
 	if lease != nil {
 		t.Fatalf(`still have lease on "t"`)
 	}
@@ -368,13 +373,15 @@ func TestRenameDuringDrainingName(t *testing.T) {
 						<-finishRename
 					}
 				},
-				SyncFilter: func(tscc TestingSchemaChangerCollection) {
-					// Clear the schema changer for the second RENAME so
-					// that we can be sure that the first schema changer
-					// runs both schema changes.
-					if startRename == nil {
-						tscc.ClearSchemaChangers()
-					}
+				// Don't run the schema changer for the second RENAME so that we can be
+				// sure that the first schema changer runs both schema changes. This
+				// behavior is due to the fact that the schema changer for the first job
+				// will process all the draining names on the table descriptor,
+				// including the ones queued up by the second job. It's not ideal since
+				// we would like jobs to manage their own state without interference
+				// from other jobs, but that's how schema change jobs work right now.
+				SchemaChangeJobNoOp: func() bool {
+					return startRename == nil
 				},
 			},
 		}}
@@ -392,9 +399,10 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 	}
 
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
-	// The expected version will be the result of two increments for the
-	// two schema changes and one increment for signaling of the completion
-	// of the drain.
+	// The expected version will be the result of two increments for the two
+	// schema changes and one increment for signaling of the completion of the
+	// drain. See the above comment for an explanation of why there's only one
+	// expected version update for draining names.
 	expectedVersion := tableDesc.Version + 3
 
 	// Concurrently, rename the table.

@@ -14,7 +14,6 @@ import (
 	"context"
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -46,26 +45,13 @@ type insertNode struct {
 
 // insertRun contains the run-time state of insertNode during local execution.
 type insertRun struct {
-	ti          tableInserter
-	checkHelper *sqlbase.CheckHelper
-	rowsNeeded  bool
+	ti         tableInserter
+	rowsNeeded bool
+
+	checkOrds checkSet
 
 	// insertCols are the columns being inserted into.
 	insertCols []sqlbase.ColumnDescriptor
-
-	// defaultExprs are the expressions used to generate default values.
-	defaultExprs []tree.TypedExpr
-
-	// computedCols are the columns that need to be (re-)computed as
-	// the result of updating some of the columns in updateCols.
-	computedCols []sqlbase.ColumnDescriptor
-	// computeExprs are the expressions to evaluate to re-compute the
-	// columns in computedCols.
-	computeExprs []tree.TypedExpr
-	// iVarContainerForComputedCols is used as a temporary buffer that
-	// holds the updated values for every column in the source, to
-	// serve as input for indexed vars contained in the computeExprs.
-	iVarContainerForComputedCols sqlbase.RowIndexedVarContainer
 
 	// rowCount is the number of rows in the current batch.
 	rowCount int
@@ -101,58 +87,105 @@ type insertRun struct {
 	traceKV bool
 }
 
+func (r *insertRun) initRowContainer(
+	params runParams, columns sqlbase.ResultColumns, rowCapacity int,
+) {
+	if !r.rowsNeeded {
+		return
+	}
+	r.rows = rowcontainer.NewRowContainer(
+		params.EvalContext().Mon.MakeBoundAccount(),
+		sqlbase.ColTypeInfoFromResCols(columns),
+		rowCapacity,
+	)
+
+	// In some cases (e.g. `INSERT INTO t (a) ...`) the data source
+	// does not provide all the table columns. However we do need to
+	// produce result rows that contain values for all the table
+	// columns, in the correct order.  This will be done by
+	// re-ordering the data into resultRowBuffer.
+	//
+	// Also we need to re-order the values in the source, ordered by
+	// insertCols, when writing them to resultRowBuffer, according to
+	// the rowIdxToTabColIdx mapping.
+
+	r.resultRowBuffer = make(tree.Datums, len(columns))
+	for i := range r.resultRowBuffer {
+		r.resultRowBuffer[i] = tree.DNull
+	}
+
+	colIDToRetIndex := make(map[sqlbase.ColumnID]int)
+	cols := r.ti.tableDesc().Columns
+	for i := range cols {
+		colIDToRetIndex[cols[i].ID] = i
+	}
+
+	r.rowIdxToTabColIdx = make([]int, len(r.insertCols))
+	for i, col := range r.insertCols {
+		if idx, ok := colIDToRetIndex[col.ID]; !ok {
+			// Column must be write only and not public.
+			r.rowIdxToTabColIdx[i] = -1
+		} else {
+			r.rowIdxToTabColIdx[i] = idx
+		}
+	}
+}
+
+// processSourceRow processes one row from the source for insertion and, if
+// result rows are needed, saves it in the result row container.
+func (r *insertRun) processSourceRow(params runParams, rowVals tree.Datums) error {
+	if err := enforceLocalColumnConstraints(rowVals, r.insertCols); err != nil {
+		return err
+	}
+
+	// Verify the CHECK constraint results, if any.
+	if !r.checkOrds.Empty() {
+		checkVals := rowVals[len(r.insertCols):]
+		if err := checkMutationInput(r.ti.tableDesc(), r.checkOrds, checkVals); err != nil {
+			return err
+		}
+		rowVals = rowVals[:len(r.insertCols)]
+	}
+
+	// Queue the insert in the KV batch.
+	if err := r.ti.row(params.ctx, rowVals, r.traceKV); err != nil {
+		return err
+	}
+
+	// If result rows need to be accumulated, do it.
+	if r.rows != nil {
+		for i, val := range rowVals {
+			// The downstream consumer will want the rows in the order of
+			// the table descriptor, not that of insertCols. Reorder them
+			// and ignore non-public columns.
+			if tabIdx := r.rowIdxToTabColIdx[i]; tabIdx >= 0 {
+				if retIdx := r.tabColIdxToRetIdx[tabIdx]; retIdx >= 0 {
+					r.resultRowBuffer[retIdx] = val
+				}
+			}
+		}
+
+		if _, err := r.rows.AddRow(params.ctx, r.resultRowBuffer); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // maxInsertBatchSize is the max number of entries in the KV batch for
 // the insert operation (including secondary index updates, FK
 // cascading updates, etc), before the current KV batch is executed
 // and a new batch is started.
-const maxInsertBatchSize = 10000
+var maxInsertBatchSize = 10000
 
 func (n *insertNode) startExec(params runParams) error {
-	if err := params.p.maybeSetSystemConfig(n.run.ti.tableDesc().GetID()); err != nil {
-		return err
-	}
-
-	// cache traceKV during execution, to avoid re-evaluating it for every row.
+	// Cache traceKV during execution, to avoid re-evaluating it for every row.
 	n.run.traceKV = params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 
-	if n.run.rowsNeeded {
-		n.run.rows = rowcontainer.NewRowContainer(
-			params.EvalContext().Mon.MakeBoundAccount(),
-			sqlbase.ColTypeInfoFromResCols(n.columns), 0)
+	n.run.initRowContainer(params, n.columns, 0 /* rowCapacity */)
 
-		// In some cases (e.g. `INSERT INTO t (a) ...`) the data source
-		// does not provide all the table columns. However we do need to
-		// produce result rows that contain values for all the table
-		// columns, in the correct order.  This will be done by
-		// re-ordering the data into resultRowBuffer.
-		//
-		// Also we need to re-order the values in the source, ordered by
-		// insertCols, when writing them to resultRowBuffer, according to
-		// the rowIdxToTabColIdx mapping.
-
-		n.run.resultRowBuffer = make(tree.Datums, len(n.columns))
-		for i := range n.run.resultRowBuffer {
-			n.run.resultRowBuffer[i] = tree.DNull
-		}
-
-		colIDToRetIndex := make(map[sqlbase.ColumnID]int)
-		cols := n.run.ti.tableDesc().Columns
-		for i := range cols {
-			colIDToRetIndex[cols[i].ID] = i
-		}
-
-		n.run.rowIdxToTabColIdx = make([]int, len(n.run.insertCols))
-		for i, col := range n.run.insertCols {
-			if idx, ok := colIDToRetIndex[col.ID]; !ok {
-				// Column must be write only and not public.
-				n.run.rowIdxToTabColIdx[i] = -1
-			} else {
-				n.run.rowIdxToTabColIdx[i] = idx
-			}
-		}
-	}
-
-	return n.run.ti.init(params.p.txn, params.EvalContext())
+	return n.run.ti.init(params.ctx, params.p.txn, params.EvalContext())
 }
 
 // Next is required because batchedPlanNode inherits from planNode, but
@@ -197,7 +230,7 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 
 		// Process the insertion for the current source row, potentially
 		// accumulating the result row for later.
-		if err := n.processSourceRow(params, n.source.Values()); err != nil {
+		if err := n.run.processSourceRow(params, n.source.Values()); err != nil {
 			return false, err
 		}
 
@@ -237,73 +270,6 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 	return n.run.rowCount > 0, nil
 }
 
-// processSourceRow processes one row from the source for insertion and, if
-// result rows are needed, saves it in the result row container.
-func (n *insertNode) processSourceRow(params runParams, sourceVals tree.Datums) error {
-	// Process the incoming row tuple and generate the full inserted
-	// row. This fills in the defaults, computes computed columns, and
-	// check the data width complies with the schema constraints.
-	rowVals, err := row.GenerateInsertRow(
-		n.run.defaultExprs,
-		n.run.computeExprs,
-		n.run.insertCols,
-		n.run.computedCols,
-		params.EvalContext().Copy(),
-		n.run.ti.tableDesc(),
-		sourceVals,
-		&n.run.iVarContainerForComputedCols,
-	)
-	if err != nil {
-		return err
-	}
-
-	// Run the CHECK constraints, if any. CheckHelper will either evaluate the
-	// constraints itself, or else inspect boolean columns from the input that
-	// contain the results of evaluation.
-	if n.run.checkHelper != nil {
-		if n.run.checkHelper.NeedsEval() {
-			if err := n.run.checkHelper.LoadEvalRow(
-				n.run.ti.ri.InsertColIDtoRowIndex, rowVals, false); err != nil {
-				return err
-			}
-			if err := n.run.checkHelper.CheckEval(params.EvalContext()); err != nil {
-				return err
-			}
-		} else {
-			checkVals := rowVals[len(n.run.insertCols):]
-			if err := n.run.checkHelper.CheckInput(checkVals); err != nil {
-				return err
-			}
-			rowVals = rowVals[:len(n.run.insertCols)]
-		}
-	}
-
-	// Queue the insert in the KV batch.
-	if err = n.run.ti.row(params.ctx, rowVals, n.run.traceKV); err != nil {
-		return err
-	}
-
-	// If result rows need to be accumulated, do it.
-	if n.run.rows != nil {
-		for i, val := range rowVals {
-			// The downstream consumer will want the rows in the order of
-			// the table descriptor, not that of insertCols. Reorder them
-			// and ignore non-public columns.
-			if tabIdx := n.run.rowIdxToTabColIdx[i]; tabIdx >= 0 {
-				if retIdx := n.run.tabColIdxToRetIdx[tabIdx]; retIdx >= 0 {
-					n.run.resultRowBuffer[retIdx] = val
-				}
-			}
-		}
-
-		if _, err := n.run.rows.AddRow(params.ctx, n.run.resultRowBuffer); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // BatchedCount implements the batchedPlanNode interface.
 func (n *insertNode) BatchedCount() int { return n.run.rowCount }
 
@@ -323,4 +289,11 @@ func (n *insertNode) Close(ctx context.Context) {
 // See planner.autoCommit.
 func (n *insertNode) enableAutoCommit() {
 	n.run.ti.enableAutoCommit()
+}
+
+// TestingSetInsertBatchSize exports a constant for testing only.
+func TestingSetInsertBatchSize(val int) func() {
+	oldVal := maxInsertBatchSize
+	maxInsertBatchSize = val
+	return func() { maxInsertBatchSize = oldVal }
 }

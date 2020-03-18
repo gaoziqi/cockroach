@@ -54,6 +54,7 @@ func TestSecondaryGC(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	l := NewSecondaryLogger(ctx, &tmpDirName, "woo", false /*enableGc*/, false /*syncWrites*/, true /*msgCount*/)
+	defer l.Close()
 
 	testLogGC(t, &l.logger, l.Logf)
 }
@@ -101,9 +102,9 @@ func testLogGC(
 	// Check that the file exists, and also measure its size.
 	// We'll use this as base value for the maximum combined size
 	// below, to force GC.
-	dir, err := logger.logDir.get()
-	if err != nil {
-		t.Fatal(err)
+	dir, isSet := logger.logDir.get()
+	if !isSet {
+		t.Fatal(errDirectoryNotSet)
 	}
 	stat, err := os.Stat(filepath.Join(dir, allFilesOriginal[0].Name))
 	if err != nil {

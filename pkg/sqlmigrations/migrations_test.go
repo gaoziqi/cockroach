@@ -20,11 +20,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sqlmigrations/leasemanager"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -62,19 +64,19 @@ type fakeLeaseManager struct {
 
 func (f *fakeLeaseManager) AcquireLease(
 	ctx context.Context, key roachpb.Key,
-) (*client.Lease, error) {
-	return &client.Lease{}, nil
+) (*leasemanager.Lease, error) {
+	return &leasemanager.Lease{}, nil
 }
 
-func (f *fakeLeaseManager) ExtendLease(ctx context.Context, l *client.Lease) error {
+func (f *fakeLeaseManager) ExtendLease(ctx context.Context, l *leasemanager.Lease) error {
 	return f.extendErr
 }
 
-func (f *fakeLeaseManager) ReleaseLease(ctx context.Context, l *client.Lease) error {
+func (f *fakeLeaseManager) ReleaseLease(ctx context.Context, l *leasemanager.Lease) error {
 	return f.releaseErr
 }
 
-func (f *fakeLeaseManager) TimeRemaining(l *client.Lease) time.Duration {
+func (f *fakeLeaseManager) TimeRemaining(l *leasemanager.Lease) time.Duration {
 	// Default to a reasonable amount of time left if the field wasn't set.
 	if f.leaseTimeRemaining == 0 {
 		return leaseRefreshInterval * 2
@@ -90,7 +92,7 @@ type fakeDB struct {
 
 func (f *fakeDB) Scan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
-) ([]client.KeyValue, error) {
+) ([]kv.KeyValue, error) {
 	if f.scanErr != nil {
 		return nil, f.scanErr
 	}
@@ -100,9 +102,9 @@ func (f *fakeDB) Scan(
 	if !bytes.Equal(end.(roachpb.Key), keys.MigrationKeyMax) {
 		return nil, errors.Errorf("expected end key %q, got %q", keys.MigrationKeyMax, end)
 	}
-	var results []client.KeyValue
+	var results []kv.KeyValue
 	for k, v := range f.kvs {
-		results = append(results, client.KeyValue{
+		results = append(results, kv.KeyValue{
 			Key:   []byte(k),
 			Value: &roachpb.Value{RawBytes: v},
 		})
@@ -110,19 +112,21 @@ func (f *fakeDB) Scan(
 	return results, nil
 }
 
-func (f *fakeDB) Get(ctx context.Context, key interface{}) (client.KeyValue, error) {
-	return client.KeyValue{}, errors.New("unimplemented")
+func (f *fakeDB) Get(ctx context.Context, key interface{}) (kv.KeyValue, error) {
+	return kv.KeyValue{}, errors.New("unimplemented")
 }
 
 func (f *fakeDB) Put(ctx context.Context, key, value interface{}) error {
 	if f.putErr != nil {
 		return f.putErr
 	}
-	f.kvs[string(key.(roachpb.Key))] = []byte(value.(string))
+	if f.kvs != nil {
+		f.kvs[string(key.(roachpb.Key))] = []byte(value.(string))
+	}
 	return nil
 }
 
-func (f *fakeDB) Txn(context.Context, func(context.Context, *client.Txn) error) error {
+func (f *fakeDB) Txn(context.Context, func(context.Context, *kv.Txn) error) error {
 	return errors.New("unimplemented")
 }
 
@@ -201,7 +205,7 @@ func TestEnsureMigrations(t *testing.T) {
 			}
 			backwardCompatibleMigrations = tc.migrations
 
-			err := mgr.EnsureMigrations(context.Background(), AllMigrations)
+			err := mgr.EnsureMigrations(context.Background(), roachpb.Version{} /* bootstrapVersion */)
 			if !testutils.IsError(err, tc.expectedErr) {
 				t.Errorf("expected error %q, got error %v", tc.expectedErr, err)
 			}
@@ -223,6 +227,40 @@ func TestEnsureMigrations(t *testing.T) {
 	if !fnGotCalled {
 		t.Errorf("expected fnGotCalledDescriptor to be run by the migration coordinator, but it wasn't")
 	}
+}
+
+func TestSkipMigrationsIncludedInBootstrap(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	db := &fakeDB{}
+	mgr := Manager{
+		stopper:      stop.NewStopper(),
+		leaseManager: &fakeLeaseManager{},
+		db:           db,
+	}
+	defer mgr.stopper.Stop(ctx)
+	defer func(prev []migrationDescriptor) {
+		backwardCompatibleMigrations = prev
+	}(backwardCompatibleMigrations)
+
+	v := roachpb.MustParseVersion("19.1")
+	fnGotCalled := false
+	backwardCompatibleMigrations = []migrationDescriptor{{
+		name:                "got-called-verifier",
+		includedInBootstrap: v,
+		workFn: func(context.Context, runner) error {
+			fnGotCalled = true
+			return nil
+		},
+	}}
+	// If the cluster has been bootstrapped at an old version, the migration should run.
+	require.NoError(t, mgr.EnsureMigrations(ctx, roachpb.Version{} /* bootstrapVersion */))
+	require.True(t, fnGotCalled)
+	fnGotCalled = false
+	// If the cluster has been bootstrapped at a new version, the migration should
+	// not run.
+	require.NoError(t, mgr.EnsureMigrations(ctx, v /* bootstrapVersion */))
+	require.False(t, fnGotCalled)
 }
 
 func TestDBErrors(t *testing.T) {
@@ -264,7 +302,7 @@ func TestDBErrors(t *testing.T) {
 			db.scanErr = tc.scanErr
 			db.putErr = tc.putErr
 			db.kvs = make(map[string][]byte)
-			err := mgr.EnsureMigrations(context.Background(), AllMigrations)
+			err := mgr.EnsureMigrations(context.Background(), roachpb.Version{} /* bootstrapVersion */)
 			if !testutils.IsError(err, tc.expectedErr) {
 				t.Errorf("expected error %q, got error %v", tc.expectedErr, err)
 			}
@@ -302,7 +340,7 @@ func TestLeaseErrors(t *testing.T) {
 	migration := noopMigration1
 	defer func(prev []migrationDescriptor) { backwardCompatibleMigrations = prev }(backwardCompatibleMigrations)
 	backwardCompatibleMigrations = []migrationDescriptor{migration}
-	if err := mgr.EnsureMigrations(context.Background(), AllMigrations); err != nil {
+	if err := mgr.EnsureMigrations(context.Background(), roachpb.Version{} /* bootstrapVersion */); err != nil {
 		t.Error(err)
 	}
 	if _, ok := db.kvs[string(migrationKey(migration))]; !ok {
@@ -349,7 +387,7 @@ func TestLeaseExpiration(t *testing.T) {
 	}
 	defer func(prev []migrationDescriptor) { backwardCompatibleMigrations = prev }(backwardCompatibleMigrations)
 	backwardCompatibleMigrations = []migrationDescriptor{waitForExitMigration}
-	if err := mgr.EnsureMigrations(context.Background(), AllMigrations); err != nil {
+	if err := mgr.EnsureMigrations(context.Background(), roachpb.Version{} /* bootstrapVersion */); err != nil {
 		t.Error(err)
 	}
 }
@@ -364,7 +402,7 @@ type migrationTest struct {
 	oldMigrations []migrationDescriptor
 	server        serverutils.TestServerInterface
 	sqlDB         *sqlutils.SQLRunner
-	kvDB          *client.DB
+	kvDB          *kv.DB
 	memMetrics    *sql.MemoryMetrics
 }
 
@@ -430,6 +468,7 @@ func (mt *migrationTest) runMigration(ctx context.Context, m migrationDescriptor
 		return nil
 	}
 	return m.workFn(ctx, runner{
+		settings:    mt.server.ClusterSettings(),
 		db:          mt.kvDB,
 		sqlExecutor: mt.server.InternalExecutor().(*sql.InternalExecutor),
 	})
@@ -462,7 +501,7 @@ func TestCreateSystemTable(t *testing.T) {
 	sqlbase.SystemAllowedPrivileges[table.ID] = sqlbase.SystemAllowedPrivileges[keys.NamespaceTableID]
 
 	table.Name = "dummy"
-	nameKey := sqlbase.NewTableKey(table.ParentID, table.Name).Key()
+	nameKey := sqlbase.NewPublicTableKey(table.ParentID, table.Name).Key()
 	descKey := sqlbase.MakeDescMetadataKey(table.ID)
 	descVal := sqlbase.WrapDescriptor(&table)
 
@@ -619,7 +658,7 @@ func TestExpectedInitialRangeCount(t *testing.T) {
 			if err := rows.Scan(&rangeID, &startKey, &endKey); err != nil {
 				return err
 			}
-			if sysCfg.NeedsSplit(ctx, startKey, endKey) {
+			if sysCfg.NeedsSplit(startKey, endKey) {
 				return fmt.Errorf("range %d needs split", rangeID)
 			}
 			nranges++
@@ -667,4 +706,54 @@ func TestUpdateSystemLocationData(t *testing.T) {
 	if count != len(roachpb.DefaultLocationInformation) {
 		t.Fatalf("Exected to find 0 rows in system.locations. Found  %d instead", count)
 	}
+}
+
+func TestMigrateNamespaceTableDescriptors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	mt := makeMigrationTest(ctx, t)
+	defer mt.close(ctx)
+
+	migration := mt.pop(t, "create new system.namespace table")
+	mt.start(t, base.TestServerArgs{})
+
+	// Since we're already on 20.1, mimic the beginning state by deleting the
+	// new namespace descriptor and changing the old one's name to "namespace".
+	key := sqlbase.MakeDescMetadataKey(keys.NamespaceTableID)
+	require.NoError(t, mt.kvDB.Del(ctx, key))
+
+	deprecatedKey := sqlbase.MakeDescMetadataKey(keys.DeprecatedNamespaceTableID)
+	desc := &sqlbase.Descriptor{}
+	require.NoError(t, mt.kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		ts, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
+		require.NoError(t, err)
+		desc.Table(ts).Name = sqlbase.NamespaceTable.Name
+		return txn.Put(ctx, deprecatedKey, desc)
+	}))
+
+	// Run the migration.
+	require.NoError(t, mt.runMigration(ctx, migration))
+
+	require.NoError(t, mt.kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		// Check that the persisted descriptors now match our in-memory versions,
+		// ignoring create and modification times.
+		{
+			ts, err := txn.GetProtoTs(ctx, key, desc)
+			require.NoError(t, err)
+			table := desc.Table(ts)
+			table.CreateAsOfTime = sqlbase.NamespaceTable.CreateAsOfTime
+			table.ModificationTime = sqlbase.NamespaceTable.ModificationTime
+			require.True(t, table.Equal(sqlbase.NamespaceTable))
+		}
+		{
+			ts, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
+			require.NoError(t, err)
+			table := desc.Table(ts)
+			table.CreateAsOfTime = sqlbase.DeprecatedNamespaceTable.CreateAsOfTime
+			table.ModificationTime = sqlbase.DeprecatedNamespaceTable.ModificationTime
+			require.True(t, table.Equal(sqlbase.DeprecatedNamespaceTable))
+		}
+		return nil
+	}))
 }

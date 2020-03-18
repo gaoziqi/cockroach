@@ -38,10 +38,12 @@ func (f *stubFactory) ConstructScan(
 	needed exec.ColumnOrdinalSet,
 	indexConstraint *constraint.Constraint,
 	hardLimit int64,
+	softLimit int64,
 	reverse bool,
 	maxResults uint64,
 	reqOrdering exec.OutputOrdering,
 	rowCount float64,
+	locking *tree.LockingItem,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -119,7 +121,11 @@ func (f *stubFactory) ConstructScalarGroupBy(
 }
 
 func (f *stubFactory) ConstructDistinct(
-	input exec.Node, distinctCols, orderedCols exec.ColumnOrdinalSet, reqOrdering exec.OutputOrdering,
+	input exec.Node,
+	distinctCols, orderedCols exec.ColumnOrdinalSet,
+	reqOrdering exec.OutputOrdering,
+	nullsAreDistinct bool,
+	errorOnDup string,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -186,7 +192,7 @@ func (f *stubFactory) ConstructLimit(
 	return struct{}{}, nil
 }
 
-func (f *stubFactory) ConstructMax1Row(input exec.Node) (exec.Node, error) {
+func (f *stubFactory) ConstructMax1Row(input exec.Node, errorText string) (exec.Node, error) {
 	return struct{}{}, nil
 }
 
@@ -238,6 +244,17 @@ func (f *stubFactory) ConstructInsert(
 	return struct{}{}, nil
 }
 
+func (f *stubFactory) ConstructInsertFastPath(
+	rows [][]tree.TypedExpr,
+	table cat.Table,
+	insertCols exec.ColumnOrdinalSet,
+	returnCols exec.ColumnOrdinalSet,
+	checkCols exec.CheckOrdinalSet,
+	fkChecks []exec.InsertFastPathFKCheck,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
 func (f *stubFactory) ConstructUpdate(
 	input exec.Node,
 	table cat.Table,
@@ -262,6 +279,7 @@ func (f *stubFactory) ConstructUpsert(
 	returnCols exec.ColumnOrdinalSet,
 	checks exec.CheckOrdinalSet,
 	allowAutoCommit bool,
+	skipFKChecks bool,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -366,6 +384,7 @@ func (f *stubFactory) ConstructCancelSessions(input exec.Node, ifExists bool) (e
 func (f *stubFactory) ConstructCreateView(
 	schema cat.Schema,
 	viewName string,
+	ifNotExists bool,
 	temporary bool,
 	viewQuery string,
 	columns sqlbase.ResultColumns,

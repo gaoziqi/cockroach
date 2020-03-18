@@ -30,11 +30,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -72,16 +72,20 @@ func (ef *execFactory) ConstructScan(
 	needed exec.ColumnOrdinalSet,
 	indexConstraint *constraint.Constraint,
 	hardLimit int64,
+	softLimit int64,
 	reverse bool,
 	maxResults uint64,
 	reqOrdering exec.OutputOrdering,
 	rowCount float64,
+	locking *tree.LockingItem,
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
 	indexDesc := index.(*optIndex).desc
 	// Create a scanNode.
 	scan := ef.planner.Scan()
 	colCfg := makeScanColumnsConfig(table, needed)
+
+	sb := span.MakeBuilder(tabDesc.TableDesc(), indexDesc)
 
 	// initTable checks that the current user has the correct privilege to access
 	// the table. However, the privilege has already been checked in optbuilder,
@@ -97,20 +101,17 @@ func (ef *execFactory) ConstructScan(
 	if indexConstraint != nil && indexConstraint.IsContradiction() {
 		return newZeroNode(scan.resultColumns), nil
 	}
+
 	scan.index = indexDesc
 	scan.isSecondaryIndex = (indexDesc != &tabDesc.PrimaryIndex)
 	scan.hardLimit = hardLimit
+	scan.softLimit = softLimit
+
 	scan.reverse = reverse
 	scan.maxResults = maxResults
 	scan.parallelScansEnabled = sqlbase.ParallelScans.Get(&ef.planner.extendedEvalCtx.Settings.SV)
 	var err error
-	scan.spans, err = spansFromConstraint(
-		tabDesc,
-		indexDesc,
-		indexConstraint,
-		needed,
-		false, /* forDelete */
-	)
+	scan.spans, err = sb.SpansFromConstraint(indexConstraint, needed, false /* forDelete */)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +122,10 @@ func (ef *execFactory) ConstructScan(
 	}
 	scan.reqOrdering = ReqOrdering(reqOrdering)
 	scan.estimatedRowCount = uint64(rowCount)
-	scan.createdByOpt = true
+	if locking != nil {
+		scan.lockingStrength = sqlbase.ToScanLockingStrength(locking.Strength)
+		scan.lockingWaitPolicy = sqlbase.ToScanLockingWaitPolicy(locking.WaitPolicy)
+	}
 	return scan, nil
 }
 
@@ -145,8 +149,8 @@ func (ef *execFactory) ConstructVirtualScan(table cat.Table) (exec.Node, error) 
 func asDataSource(n exec.Node) planDataSource {
 	plan := n.(planNode)
 	return planDataSource{
-		info: &sqlbase.DataSourceInfo{SourceColumns: planColumns(plan)},
-		plan: plan,
+		columns: planColumns(plan),
+		plan:    plan,
 	}
 }
 
@@ -158,6 +162,7 @@ func (ef *execFactory) ConstructFilter(
 	// limit (it would make the limit apply AFTER the filter).
 	if s, ok := n.(*scanNode); ok && s.filter == nil && s.hardLimit == 0 {
 		s.filter = s.filterVars.Rebind(filter, true /* alsoReset */, false /* normalizeToNonNil */)
+		// Note: if the filter statically evaluates to true, s.filter stays nil.
 		s.reqOrdering = ReqOrdering(reqOrdering)
 		return s, nil
 	}
@@ -166,8 +171,12 @@ func (ef *execFactory) ConstructFilter(
 	f := &filterNode{
 		source: src,
 	}
-	f.ivarHelper = tree.MakeIndexedVarHelper(f, len(src.info.SourceColumns))
+	f.ivarHelper = tree.MakeIndexedVarHelper(f, len(src.columns))
 	f.filter = f.ivarHelper.Rebind(filter, true /* alsoReset */, false /* normalizeToNonNil */)
+	if f.filter == nil {
+		// Filter statically evaluates to true. Just return the input plan.
+		return n, nil
+	}
 	f.reqOrdering = ReqOrdering(reqOrdering)
 
 	// If there's a spool, pull it up.
@@ -264,9 +273,7 @@ func (ef *execFactory) ConstructHashJoin(
 	p := ef.planner
 	leftSrc := asDataSource(left)
 	rightSrc := asDataSource(right)
-	pred, _, err := p.makeJoinPredicate(
-		context.TODO(), leftSrc.info, rightSrc.info, joinType, nil, /* cond */
-	)
+	pred, err := makePredicate(joinType, leftSrc.columns, rightSrc.columns)
 	if err != nil {
 		return nil, err
 	}
@@ -283,8 +290,8 @@ func (ef *execFactory) ConstructHashJoin(
 	for i := range leftEqCols {
 		pred.leftEqualityIndices[i] = int(leftEqCols[i])
 		pred.rightEqualityIndices[i] = int(rightEqCols[i])
-		pred.leftColNames[i] = tree.Name(leftSrc.info.SourceColumns[leftEqCols[i]].Name)
-		pred.rightColNames[i] = tree.Name(rightSrc.info.SourceColumns[rightEqCols[i]].Name)
+		pred.leftColNames[i] = tree.Name(leftSrc.columns[leftEqCols[i]].Name)
+		pred.rightColNames[i] = tree.Name(rightSrc.columns[rightEqCols[i]].Name)
 	}
 	pred.leftEqKey = leftEqColsAreKey
 	pred.rightEqKey = rightEqColsAreKey
@@ -310,17 +317,14 @@ func (ef *execFactory) ConstructApplyJoin(
 	leftSrc := asDataSource(left)
 	rightSrc := asDataSource(fakeRight)
 	rightSrc.plan.Close(context.TODO())
-	p := ef.planner
-	pred, _, err := p.makeJoinPredicate(
-		context.TODO(), leftSrc.info, rightSrc.info, joinType, nil, /* cond */
-	)
+	pred, err := makePredicate(joinType, leftSrc.columns, rightSrc.columns)
 	if err != nil {
 		return nil, err
 	}
 	pred.onCond = pred.iVarHelper.Rebind(
 		onCond, false /* alsoReset */, false, /* normalizeToNonNil */
 	)
-	rightCols := rightSrc.info.SourceColumns
+	rightCols := rightSrc.columns
 	return newApplyJoinNode(joinType, asDataSource(left), leftBoundColMap, rightProps, rightCols, right, pred, memo)
 }
 
@@ -336,9 +340,7 @@ func (ef *execFactory) ConstructMergeJoin(
 	p := ef.planner
 	leftSrc := asDataSource(left)
 	rightSrc := asDataSource(right)
-	pred, _, err := p.makeJoinPredicate(
-		context.TODO(), leftSrc.info, rightSrc.info, joinType, nil, /* cond */
-	)
+	pred, err := makePredicate(joinType, leftSrc.columns, rightSrc.columns)
 	if err != nil {
 		return nil, err
 	}
@@ -360,8 +362,8 @@ func (ef *execFactory) ConstructMergeJoin(
 		leftColIdx, rightColIdx := leftOrdering[i].ColIdx, rightOrdering[i].ColIdx
 		pred.leftEqualityIndices[i] = leftColIdx
 		pred.rightEqualityIndices[i] = rightColIdx
-		pred.leftColNames[i] = tree.Name(leftSrc.info.SourceColumns[leftColIdx].Name)
-		pred.rightColNames[i] = tree.Name(rightSrc.info.SourceColumns[rightColIdx].Name)
+		pred.leftColNames[i] = tree.Name(leftSrc.columns[leftColIdx].Name)
+		pred.rightColNames[i] = tree.Name(rightSrc.columns[rightColIdx].Name)
 	}
 
 	node := p.makeJoinNode(leftSrc, rightSrc, pred)
@@ -423,7 +425,7 @@ func (ef *execFactory) ConstructGroupBy(
 		f := n.newAggregateFuncHolder(
 			builtins.AnyNotNull,
 			inputCols[col].Typ,
-			col,
+			[]int{col},
 			builtins.NewAnyNotNullAggregate,
 			nil, /* arguments */
 			ef.planner.EvalContext().Mon.MakeBoundAccount(),
@@ -442,32 +444,21 @@ func (ef *execFactory) addAggregations(n *groupNode, aggregations []exec.AggInfo
 	for i := range aggregations {
 		agg := &aggregations[i]
 		builtin := agg.Builtin
-		var renderIdx int
-		var aggFn func(*tree.EvalContext, tree.Datums) tree.AggregateFunc
-
-		switch len(agg.ArgCols) {
-		case 0:
-			renderIdx = noRenderIdx
-			aggFn = func(evalCtx *tree.EvalContext, arguments tree.Datums) tree.AggregateFunc {
-				return builtin.AggregateFunc([]*types.T{}, evalCtx, arguments)
-			}
-
-		case 1:
-			renderIdx = int(agg.ArgCols[0])
-			aggFn = func(evalCtx *tree.EvalContext, arguments tree.Datums) tree.AggregateFunc {
-				return builtin.AggregateFunc([]*types.T{inputCols[renderIdx].Typ}, evalCtx, arguments)
-			}
-
-		default:
-			return unimplemented.NewWithIssue(28417,
-				"aggregate functions with multiple non-constant expressions are not supported",
-			)
+		renderIdxs := make([]int, len(agg.ArgCols))
+		params := make([]*types.T, len(agg.ArgCols))
+		for j, col := range agg.ArgCols {
+			renderIdx := int(col)
+			renderIdxs[j] = renderIdx
+			params[j] = inputCols[renderIdx].Typ
+		}
+		aggFn := func(evalCtx *tree.EvalContext, arguments tree.Datums) tree.AggregateFunc {
+			return builtin.AggregateFunc(params, evalCtx, arguments)
 		}
 
 		f := n.newAggregateFuncHolder(
 			agg.FuncName,
 			agg.ResultType,
-			renderIdx,
+			renderIdxs,
 			aggFn,
 			agg.ConstArgs,
 			ef.planner.EvalContext().Mon.MakeBoundAccount(),
@@ -494,13 +485,19 @@ func (ef *execFactory) addAggregations(n *groupNode, aggregations []exec.AggInfo
 
 // ConstructDistinct is part of the exec.Factory interface.
 func (ef *execFactory) ConstructDistinct(
-	input exec.Node, distinctCols, orderedCols exec.ColumnOrdinalSet, reqOrdering exec.OutputOrdering,
+	input exec.Node,
+	distinctCols, orderedCols exec.ColumnOrdinalSet,
+	reqOrdering exec.OutputOrdering,
+	nullsAreDistinct bool,
+	errorOnDup string,
 ) (exec.Node, error) {
 	return &distinctNode{
 		plan:              input.(planNode),
 		distinctOnColIdxs: distinctCols,
 		columnsInOrder:    orderedCols,
 		reqOrdering:       ReqOrdering(reqOrdering),
+		nullsAreDistinct:  nullsAreDistinct,
+		errorOnDup:        errorOnDup,
 	}, nil
 }
 
@@ -758,10 +755,11 @@ func (ef *execFactory) ConstructLimit(
 }
 
 // ConstructMax1Row is part of the exec.Factory interface.
-func (ef *execFactory) ConstructMax1Row(input exec.Node) (exec.Node, error) {
+func (ef *execFactory) ConstructMax1Row(input exec.Node, errorText string) (exec.Node, error) {
 	plan := input.(planNode)
 	return &max1RowNode{
-		plan: plan,
+		plan:      plan,
+		errorText: errorText,
 	}, nil
 }
 
@@ -797,12 +795,12 @@ func (ef *execFactory) ConstructProjectSet(
 	n exec.Node, exprs tree.TypedExprs, zipCols sqlbase.ResultColumns, numColsPerGen []int,
 ) (exec.Node, error) {
 	src := asDataSource(n)
-	cols := append(src.info.SourceColumns, zipCols...)
+	cols := append(src.columns, zipCols...)
 	p := &projectSetNode{
 		source:          src.plan,
-		sourceInfo:      src.info,
+		sourceCols:      src.columns,
 		columns:         cols,
-		numColsInSource: len(src.info.SourceColumns),
+		numColsInSource: len(src.columns),
 		exprs:           exprs,
 		funcs:           make([]*tree.FuncExpr, len(exprs)),
 		numColsPerGen:   numColsPerGen,
@@ -854,6 +852,22 @@ func (ef *execFactory) ConstructWindow(root exec.Node, wi exec.WindowInfo) (exec
 			columnOrdering: wi.Ordering,
 			frame:          wi.Exprs[i].WindowDef.Frame,
 		}
+		if len(wi.Ordering) == 0 {
+			frame := p.funcs[i].frame
+			if frame.Mode == tree.RANGE && frame.Bounds.HasOffset() {
+				// We have an empty ordering, but RANGE mode when at least one bound
+				// has 'offset' requires a single column in ORDER BY. We have optimized
+				// it out, but the execution still needs information about which column
+				// it was, so we reconstruct the "original" ordering (note that the
+				// direction of the ordering doesn't actually matter, so we leave it
+				// with the default value).
+				p.funcs[i].columnOrdering = sqlbase.ColumnOrdering{
+					sqlbase.ColumnOrderInfo{
+						ColIdx: int(wi.RangeOffsetColumn),
+					},
+				}
+			}
+		}
 
 		p.windowRender[wi.OutputIdxs[i]] = p.funcs[i]
 	}
@@ -873,8 +887,9 @@ func (ef *execFactory) ConstructPlan(
 		plan: root.(planNode),
 		// TODO(radu): these fields can be modified by planning various opaque
 		// statements. We should have a cleaner way of plumbing these.
-		avoidBuffering: ef.planner.curPlan.avoidBuffering,
-		auditEvents:    ef.planner.curPlan.auditEvents,
+		avoidBuffering:  ef.planner.curPlan.avoidBuffering,
+		auditEvents:     ef.planner.curPlan.auditEvents,
+		instrumentation: ef.planner.curPlan.instrumentation,
 	}
 	if len(subqueries) > 0 {
 		res.subqueryPlans = make([]subquery, len(subqueries))
@@ -947,10 +962,11 @@ func (e *urlOutputter) finish() (url.URL, error) {
 // environmentQuery is a helper to run a query to build up the output of
 // showEnv. It expects a query that returns a single string column.
 func (ef *execFactory) environmentQuery(query string) (string, error) {
-	r, err := ef.planner.extendedEvalCtx.InternalExecutor.QueryRow(
+	r, err := ef.planner.extendedEvalCtx.InternalExecutor.(*InternalExecutor).QueryRowEx(
 		ef.planner.EvalContext().Context,
 		"EXPLAIN (env)",
 		ef.planner.Txn(),
+		sqlbase.InternalExecutorSessionDataOverride{},
 		query,
 	)
 	if err != nil {
@@ -1079,7 +1095,7 @@ FROM
 
 	for _, param := range []string{
 		"enable_zigzag_join",
-		"experimental_optimizer_foreign_keys",
+		"optimizer_foreign_keys",
 	} {
 		value, err := ef.environmentQuery(fmt.Sprintf("SHOW %s", param))
 		if err != nil {
@@ -1144,10 +1160,12 @@ func (ef *execFactory) ConstructExplain(
 	switch options.Mode {
 	case tree.ExplainDistSQL:
 		return &explainDistSQLNode{
-			plan:          p.plan,
-			subqueryPlans: p.subqueryPlans,
-			analyze:       analyzeSet,
-			stmtType:      stmtType,
+			options:        options,
+			plan:           p.plan,
+			subqueryPlans:  p.subqueryPlans,
+			postqueryPlans: p.postqueryPlans,
+			analyze:        analyzeSet,
+			stmtType:       stmtType,
 		}, nil
 
 	case tree.ExplainVec:
@@ -1196,31 +1214,6 @@ func (ef *execFactory) ConstructShowTrace(typ tree.ShowTraceType, compact bool) 
 	return node, nil
 }
 
-// mutationRowIdxToReturnIdx returns the mapping from the origColDescs to the
-// returnColDescs (where returnColDescs is a subset of the origColDescs).
-// -1 is used for columns not part of the returnColDescs.
-// It is the responsibility of the caller to ensure a mapping is possible.
-func mutationRowIdxToReturnIdx(origColDescs, returnColDescs []sqlbase.ColumnDescriptor) []int {
-	// Create a ColumnID to index map.
-	colIDToRetIndex := row.ColIDtoRowIndexFromCols(origColDescs)
-
-	// Initialize the rowIdxToTabColIdx array.
-	rowIdxToRetIdx := make([]int, len(origColDescs))
-	for i := range rowIdxToRetIdx {
-		// -1 value indicates that this column is not being returned.
-		rowIdxToRetIdx[i] = -1
-	}
-
-	// Set the appropriate index values for the returning columns.
-	for i := range returnColDescs {
-		if idx, ok := colIDToRetIndex[returnColDescs[i].ID]; ok {
-			rowIdxToRetIdx[idx] = i
-		}
-	}
-
-	return rowIdxToRetIdx
-}
-
 func (ef *execFactory) ConstructInsert(
 	input exec.Node,
 	table cat.Table,
@@ -1230,74 +1223,137 @@ func (ef *execFactory) ConstructInsert(
 	allowAutoCommit bool,
 	skipFKChecks bool,
 ) (exec.Node, error) {
+	ctx := ef.planner.extendedEvalCtx.Context
+
 	// Derive insert table and column descriptors.
 	rowsNeeded := !returnColOrdSet.Empty()
 	tabDesc := table.(*optTable).desc
 	colDescs := makeColDescList(table, insertColOrdSet)
 
-	// Construct the check helper if there are any check constraints.
-	checkHelper := sqlbase.NewInputCheckHelper(checkOrdSet, tabDesc)
-
-	// Determine the foreign key tables involved in the update.
-	fkTables, err := ef.makeFkMetadata(tabDesc, row.CheckInserts, checkHelper)
-	if err != nil {
+	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
 		return nil, err
 	}
 
-	// Create the table insert, which does the bulk of the work.
-	checkFKs := row.CheckFKs
-	if skipFKChecks {
-		checkFKs = row.SkipFKs
-	}
-	ri, err := row.MakeInserter(ef.planner.txn, tabDesc, fkTables, colDescs,
-		checkFKs, &ef.planner.alloc)
-	if err != nil {
-		return nil, err
-	}
-
-	// Determine the relational type of the generated insert node.
-	// If rows are not needed, no columns are returned.
-	var returnCols sqlbase.ResultColumns
-	var tabColIdxToRetIdx []int
-	if rowsNeeded {
-		returnColDescs := makeColDescList(table, returnColOrdSet)
-
-		// Only return the columns that are part of the table descriptor.
-		// This is important when columns are added and being back-filled
-		// as part of the same transaction when the delete runs.
-		// In such cases, the newly added columns shouldn't be returned.
-		// See regression logic tests for #29494.
-		if len(tabDesc.Columns) < len(returnColDescs) {
-			returnColDescs = returnColDescs[:len(tabDesc.Columns)]
+	var fkTables row.FkTableMetadata
+	checkFKs := row.SkipFKs
+	if !skipFKChecks {
+		checkFKs = row.CheckFKs
+		// Determine the foreign key tables involved in the update.
+		var err error
+		fkTables, err = ef.makeFkMetadata(tabDesc, row.CheckInserts)
+		if err != nil {
+			return nil, err
 		}
-
-		returnCols = sqlbase.ResultColumnsFromColDescs(returnColDescs)
-
-		// Update the tabColIdxToRetIdx for the mutation. Insert always
-		// returns non-mutation columns in the same order they are defined in
-		// the table.
-		tabColIdxToRetIdx = mutationRowIdxToReturnIdx(tabDesc.Columns, returnColDescs)
+	}
+	// Create the table inserter, which does the bulk of the work.
+	ri, err := row.MakeInserter(
+		ctx, ef.planner.txn, tabDesc, colDescs, checkFKs, fkTables, &ef.planner.alloc,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	// Regular path for INSERT.
 	ins := insertNodePool.Get().(*insertNode)
 	*ins = insertNode{
-		source:  input.(planNode),
-		columns: returnCols,
+		source: input.(planNode),
 		run: insertRun{
-			ti:          tableInserter{ri: ri},
-			checkHelper: checkHelper,
-			rowsNeeded:  rowsNeeded,
-			iVarContainerForComputedCols: sqlbase.RowIndexedVarContainer{
-				Cols:    tabDesc.Columns,
-				Mapping: ri.InsertColIDtoRowIndex,
-			},
-			insertCols:        ri.InsertCols,
-			tabColIdxToRetIdx: tabColIdxToRetIdx,
+			ti:         tableInserter{ri: ri},
+			checkOrds:  checkOrdSet,
+			insertCols: ri.InsertCols,
 		},
 	}
 
+	// If rows are not needed, no columns are returned.
+	if rowsNeeded {
+		returnColDescs := makeColDescList(table, returnColOrdSet)
+		ins.columns = sqlbase.ResultColumnsFromColDescs(returnColDescs)
+
+		// Set the tabColIdxToRetIdx for the mutation. Insert always returns
+		// non-mutation columns in the same order they are defined in the table.
+		ins.run.tabColIdxToRetIdx = row.ColMapping(tabDesc.Columns, returnColDescs)
+		ins.run.rowsNeeded = true
+	}
+
 	if allowAutoCommit && ef.planner.autoCommit {
+		ins.enableAutoCommit()
+	}
+
+	// serialize the data-modifying plan to ensure that no data is
+	// observed that hasn't been validated first. See the comments
+	// on BatchedNext() in plan_batch.go.
+	if rowsNeeded {
+		return &spoolNode{source: &serializeNode{source: ins}}, nil
+	}
+
+	// We could use serializeNode here, but using rowCountNode is an
+	// optimization that saves on calls to Next() by the caller.
+	return &rowCountNode{source: ins}, nil
+}
+
+func (ef *execFactory) ConstructInsertFastPath(
+	rows [][]tree.TypedExpr,
+	table cat.Table,
+	insertColOrdSet exec.ColumnOrdinalSet,
+	returnColOrdSet exec.ColumnOrdinalSet,
+	checkOrdSet exec.CheckOrdinalSet,
+	fkChecks []exec.InsertFastPathFKCheck,
+) (exec.Node, error) {
+	ctx := ef.planner.extendedEvalCtx.Context
+
+	// Derive insert table and column descriptors.
+	rowsNeeded := !returnColOrdSet.Empty()
+	tabDesc := table.(*optTable).desc
+	colDescs := makeColDescList(table, insertColOrdSet)
+
+	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
+		return nil, err
+	}
+
+	// Create the table inserter, which does the bulk of the work.
+	ri, err := row.MakeInserter(
+		ctx, ef.planner.txn, tabDesc, colDescs, row.SkipFKs, nil /* fkTables */, &ef.planner.alloc,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Regular path for INSERT.
+	ins := insertFastPathNodePool.Get().(*insertFastPathNode)
+	*ins = insertFastPathNode{
+		input: rows,
+		run: insertFastPathRun{
+			insertRun: insertRun{
+				ti:         tableInserter{ri: ri},
+				checkOrds:  checkOrdSet,
+				insertCols: ri.InsertCols,
+			},
+		},
+	}
+
+	if len(fkChecks) > 0 {
+		ins.run.fkChecks = make([]insertFastPathFKCheck, len(fkChecks))
+		for i := range fkChecks {
+			ins.run.fkChecks[i].InsertFastPathFKCheck = fkChecks[i]
+		}
+	}
+
+	// If rows are not needed, no columns are returned.
+	if rowsNeeded {
+		returnColDescs := makeColDescList(table, returnColOrdSet)
+		ins.columns = sqlbase.ResultColumnsFromColDescs(returnColDescs)
+
+		// Set the tabColIdxToRetIdx for the mutation. Insert always returns
+		// non-mutation columns in the same order they are defined in the table.
+		ins.run.tabColIdxToRetIdx = row.ColMapping(tabDesc.Columns, returnColDescs)
+		ins.run.rowsNeeded = true
+	}
+
+	if len(rows) == 0 {
+		return &zeroNode{columns: ins.columns}, nil
+	}
+
+	if ef.planner.autoCommit {
 		ins.enableAutoCommit()
 	}
 
@@ -1324,10 +1380,16 @@ func (ef *execFactory) ConstructUpdate(
 	allowAutoCommit bool,
 	skipFKChecks bool,
 ) (exec.Node, error) {
+	ctx := ef.planner.extendedEvalCtx.Context
+
 	// Derive table and column descriptors.
 	rowsNeeded := !returnColOrdSet.Empty()
 	tabDesc := table.(*optTable).desc
 	fetchColDescs := makeColDescList(table, fetchColOrdSet)
+
+	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
+		return nil, err
+	}
 
 	// Add each column to update as a sourceSlot. The CBO only uses scalarSlot,
 	// since it compiles tuples and subqueries into a simple sequence of target
@@ -1338,33 +1400,21 @@ func (ef *execFactory) ConstructUpdate(
 		sourceSlots[i] = scalarSlot{column: updateColDescs[i], sourceIndex: len(fetchColDescs) + i}
 	}
 
-	// Construct the check helper if there are any check constraints.
-	checkHelper := sqlbase.NewInputCheckHelper(checks, tabDesc)
-
-	checkFKs := row.CheckFKs
-	if skipFKChecks {
-		checkFKs = row.SkipFKs
+	var fkTables row.FkTableMetadata
+	checkFKs := row.SkipFKs
+	if !skipFKChecks {
+		checkFKs = row.CheckFKs
+		// Determine the foreign key tables involved in the update.
+		var err error
+		fkTables, err = ef.makeFkMetadata(tabDesc, row.CheckUpdates)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// Determine the foreign key tables involved in the update.
-	fkTables, err := row.MakeFkMetadata(
-		ef.planner.extendedEvalCtx.Context,
-		tabDesc,
-		row.CheckUpdates,
-		ef.planner.LookupTableByID,
-		ef.planner.CheckPrivilege,
-		ef.planner.analyzeExpr,
-		checkHelper,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create the table updater, which does the bulk of the work. In the HP,
-	// the updater derives the columns that need to be fetched. By contrast, the
-	// CBO will have already determined the set of fetch and update columns, and
-	// passes those sets into the updater (which will basically be a no-op).
+	// Create the table updater, which does the bulk of the work.
 	ru, err := row.MakeUpdater(
+		ctx,
 		ef.planner.txn,
 		tabDesc,
 		fkTables,
@@ -1383,38 +1433,6 @@ func (ef *execFactory) ConstructUpdate(
 	// computed a correct set that can sometimes be smaller.
 	ru.FetchCols = ru.FetchCols[:len(fetchColDescs)]
 
-	// Determine the relational type of the generated update node.
-	// If rows are not needed, no columns are returned.
-	var returnCols sqlbase.ResultColumns
-	var rowIdxToRetIdx []int
-	if rowsNeeded {
-		returnColDescs := makeColDescList(table, returnColOrdSet)
-
-		// Only return the columns that are part of the table descriptor.
-		// This is important when columns are added and being back-filled
-		// as part of the same transaction when the update runs.
-		// In such cases, the newly added columns shouldn't be returned.
-		// See regression logic tests for #29494.
-		if len(tabDesc.Columns) < len(returnColDescs) {
-			returnColDescs = returnColDescs[:len(tabDesc.Columns)]
-		}
-
-		returnCols = sqlbase.ResultColumnsFromColDescs(returnColDescs)
-
-		// Add the passthrough columns to the returning columns.
-		returnCols = append(returnCols, passthrough...)
-
-		// Update the rowIdxToRetIdx for the mutation. Update returns
-		// the non-mutation columns specified, in the same order they are
-		// defined in the table.
-		//
-		// The Updater derives/stores the fetch columns of the mutation and
-		// since the return columns are always a subset of the fetch columns,
-		// we can use use the fetch columns to generate the mapping for the
-		// returned rows.
-		rowIdxToRetIdx = mutationRowIdxToReturnIdx(ru.FetchCols, returnColDescs)
-	}
-
 	// updateColsIdx inverts the mapping of UpdateCols to FetchCols. See
 	// the explanatory comments in updateRun.
 	updateColsIdx := make(map[sqlbase.ColumnID]int, len(ru.UpdateCols))
@@ -1425,12 +1443,10 @@ func (ef *execFactory) ConstructUpdate(
 
 	upd := updateNodePool.Get().(*updateNode)
 	*upd = updateNode{
-		source:  input.(planNode),
-		columns: returnCols,
+		source: input.(planNode),
 		run: updateRun{
-			tu:          tableUpdater{ru: ru},
-			checkHelper: checkHelper,
-			rowsNeeded:  rowsNeeded,
+			tu:        tableUpdater{ru: ru},
+			checkOrds: checks,
 			iVarContainerForComputedCols: sqlbase.RowIndexedVarContainer{
 				CurSourceRow: make(tree.Datums, len(ru.FetchCols)),
 				Cols:         ru.FetchCols,
@@ -1439,9 +1455,27 @@ func (ef *execFactory) ConstructUpdate(
 			sourceSlots:    sourceSlots,
 			updateValues:   make(tree.Datums, len(ru.UpdateCols)),
 			updateColsIdx:  updateColsIdx,
-			rowIdxToRetIdx: rowIdxToRetIdx,
 			numPassthrough: len(passthrough),
 		},
+	}
+
+	// If rows are not needed, no columns are returned.
+	if rowsNeeded {
+		returnColDescs := makeColDescList(table, returnColOrdSet)
+
+		upd.columns = sqlbase.ResultColumnsFromColDescs(returnColDescs)
+		// Add the passthrough columns to the returning columns.
+		upd.columns = append(upd.columns, passthrough...)
+
+		// Set the rowIdxToRetIdx for the mutation. Update returns the non-mutation
+		// columns specified, in the same order they are defined in the table.
+		//
+		// The Updater derives/stores the fetch columns of the mutation and
+		// since the return columns are always a subset of the fetch columns,
+		// we can use use the fetch columns to generate the mapping for the
+		// returned rows.
+		upd.run.rowIdxToRetIdx = row.ColMapping(ru.FetchCols, returnColDescs)
+		upd.run.rowsNeeded = true
 	}
 
 	if allowAutoCommit && ef.planner.autoCommit {
@@ -1461,10 +1495,21 @@ func (ef *execFactory) ConstructUpdate(
 }
 
 func (ef *execFactory) makeFkMetadata(
-	tabDesc *sqlbase.ImmutableTableDescriptor,
-	fkCheckType row.FKCheckType,
-	checkHelper *sqlbase.CheckHelper,
+	tabDesc *sqlbase.ImmutableTableDescriptor, fkCheckType row.FKCheckType,
 ) (row.FkTableMetadata, error) {
+	ctx := ef.planner.extendedEvalCtx.Context
+
+	// Create a CheckHelper, used in case of cascading actions that cause changes
+	// in the original table. This is only possible with UPDATE (together with
+	// cascade loops or self-references).
+	var checkHelper *sqlbase.CheckHelper
+	if fkCheckType == row.CheckUpdates {
+		var err error
+		checkHelper, err = sqlbase.NewEvalCheckHelper(ctx, ef.planner.analyzeExpr, tabDesc)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// Determine the foreign key tables involved in the upsert.
 	return row.MakeFkMetadata(
 		ef.planner.extendedEvalCtx.Context,
@@ -1487,7 +1532,10 @@ func (ef *execFactory) ConstructUpsert(
 	returnColOrdSet exec.ColumnOrdinalSet,
 	checks exec.CheckOrdinalSet,
 	allowAutoCommit bool,
+	skipFKChecks bool,
 ) (exec.Node, error) {
+	ctx := ef.planner.extendedEvalCtx.Context
+
 	// Derive table and column descriptors.
 	rowsNeeded := !returnColOrdSet.Empty()
 	tabDesc := table.(*optTable).desc
@@ -1495,35 +1543,41 @@ func (ef *execFactory) ConstructUpsert(
 	fetchColDescs := makeColDescList(table, fetchColOrdSet)
 	updateColDescs := makeColDescList(table, updateColOrdSet)
 
-	// Construct the check helper if there are any check constraints.
-	checkHelper := sqlbase.NewInputCheckHelper(checks, tabDesc)
-
-	// Determine the foreign key tables involved in the upsert.
-	fkTables, err := ef.makeFkMetadata(tabDesc, row.CheckUpdates, checkHelper)
-	if err != nil {
+	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
 		return nil, err
 	}
 
+	var fkTables row.FkTableMetadata
+	checkFKs := row.SkipFKs
+	if !skipFKChecks {
+		checkFKs = row.CheckFKs
+
+		// Determine the foreign key tables involved in the upsert.
+		var err error
+		fkTables, err = ef.makeFkMetadata(tabDesc, row.CheckUpdates)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Create the table inserter, which does the bulk of the insert-related work.
-	ri, err := row.MakeInserter(ef.planner.txn, tabDesc, fkTables, insertColDescs,
-		row.CheckFKs, &ef.planner.alloc)
+	ri, err := row.MakeInserter(
+		ctx, ef.planner.txn, tabDesc, insertColDescs, checkFKs, fkTables, &ef.planner.alloc,
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	// Create the table updater, which does the bulk of the update-related work.
-	// In the HP, the updater derives the columns that need to be fetched. By
-	// contrast, the CBO will have already determined the set of fetch and update
-	// columns, and passes those sets into the updater (which will basically be a
-	// no-op).
 	ru, err := row.MakeUpdater(
+		ctx,
 		ef.planner.txn,
 		tabDesc,
 		fkTables,
 		updateColDescs,
 		fetchColDescs,
 		row.UpdaterDefault,
-		row.CheckFKs,
+		checkFKs,
 		ef.planner.EvalContext(),
 		&ef.planner.alloc,
 	)
@@ -1534,31 +1588,6 @@ func (ef *execFactory) ConstructUpsert(
 	// Truncate any FetchCols added by MakeUpdater. The optimizer has already
 	// computed a correct set that can sometimes be smaller.
 	ru.FetchCols = ru.FetchCols[:len(fetchColDescs)]
-
-	// Determine the relational type of the generated upsert node.
-	// If rows are not needed, no columns are returned.
-	var returnCols sqlbase.ResultColumns
-	var returnColDescs []sqlbase.ColumnDescriptor
-	var tabColIdxToRetIdx []int
-	if rowsNeeded {
-		returnColDescs = makeColDescList(table, returnColOrdSet)
-
-		// Only return the columns that are part of the table descriptor.
-		// This is important when columns are added and being back-filled
-		// as part of the same transaction when the delete runs.
-		// In such cases, the newly added columns shouldn't be returned.
-		// See regression logic tests for #29494.
-		if len(tabDesc.Columns) < len(returnColDescs) {
-			returnColDescs = returnColDescs[:len(tabDesc.Columns)]
-		}
-
-		returnCols = sqlbase.ResultColumnsFromColDescs(returnColDescs)
-
-		// Update the tabColIdxToRetIdx for the mutation. Upsert returns
-		// non-mutation columns specified, in the same order they are defined
-		// in the table.
-		tabColIdxToRetIdx = mutationRowIdxToReturnIdx(tabDesc.Columns, returnColDescs)
-	}
 
 	// updateColsIdx inverts the mapping of UpdateCols to FetchCols. See
 	// the explanatory comments in updateRun.
@@ -1571,30 +1600,33 @@ func (ef *execFactory) ConstructUpsert(
 	// Instantiate the upsert node.
 	ups := upsertNodePool.Get().(*upsertNode)
 	*ups = upsertNode{
-		source:  input.(planNode),
-		columns: returnCols,
+		source: input.(planNode),
 		run: upsertRun{
-			checkHelper: checkHelper,
-			insertCols:  ri.InsertCols,
-			iVarContainerForComputedCols: sqlbase.RowIndexedVarContainer{
-				Cols:    tabDesc.Columns,
-				Mapping: ri.InsertColIDtoRowIndex,
-			},
-			tw: &optTableUpserter{
-				tableUpserterBase: tableUpserterBase{
-					ri:          ri,
-					alloc:       &ef.planner.alloc,
-					collectRows: rowsNeeded,
-				},
-				canaryOrdinal:     int(canaryCol),
-				fkTables:          fkTables,
-				fetchCols:         fetchColDescs,
-				updateCols:        updateColDescs,
-				returnCols:        returnColDescs,
-				ru:                ru,
-				tabColIdxToRetIdx: tabColIdxToRetIdx,
+			checkOrds:  checks,
+			insertCols: ri.InsertCols,
+			tw: optTableUpserter{
+				ri:            ri,
+				alloc:         &ef.planner.alloc,
+				canaryOrdinal: int(canaryCol),
+				fkTables:      fkTables,
+				fetchCols:     fetchColDescs,
+				updateCols:    updateColDescs,
+				ru:            ru,
 			},
 		},
+	}
+
+	// If rows are not needed, no columns are returned.
+	if rowsNeeded {
+		returnColDescs := makeColDescList(table, returnColOrdSet)
+		ups.columns = sqlbase.ResultColumnsFromColDescs(returnColDescs)
+
+		// Update the tabColIdxToRetIdx for the mutation. Upsert returns
+		// non-mutation columns specified, in the same order they are defined
+		// in the table.
+		ups.run.tw.tabColIdxToRetIdx = row.ColMapping(tabDesc.Columns, returnColDescs)
+		ups.run.tw.returnCols = returnColDescs
+		ups.run.tw.collectRows = true
 	}
 
 	if allowAutoCommit && ef.planner.autoCommit {
@@ -1613,55 +1645,6 @@ func (ef *execFactory) ConstructUpsert(
 	return &rowCountNode{source: ups}, nil
 }
 
-// colsRequiredForDelete returns all the columns required to perform a delete
-// of a row on the table. This will include the returnColDescs columns that
-// are referenced in the RETURNING clause of the delete mutation. This
-// is different from the fetch columns of the delete mutation as the
-// fetch columns includes more columns. Specifically, the fetch columns also
-// include columns that are not part of index keys or the RETURNING columns
-// (columns, for example, referenced in the WHERE clause).
-func colsRequiredForDelete(
-	table cat.Table, tableColDescs, returnColDescs []sqlbase.ColumnDescriptor,
-) []sqlbase.ColumnDescriptor {
-	// Find all the columns that are part of the rows returned by the delete.
-	deleteDescs := make([]sqlbase.ColumnDescriptor, 0, len(tableColDescs))
-	var deleteCols util.FastIntSet
-	for i := 0; i < table.IndexCount(); i++ {
-		index := table.Index(i)
-		for j := 0; j < index.KeyColumnCount(); j++ {
-			col := *index.Column(j).Column.(*sqlbase.ColumnDescriptor)
-			if deleteCols.Contains(int(col.ID)) {
-				continue
-			}
-
-			deleteDescs = append(deleteDescs, col)
-			deleteCols.Add(int(col.ID))
-		}
-	}
-
-	// Add columns specified in the RETURNING clause.
-	for _, col := range returnColDescs {
-		if deleteCols.Contains(int(col.ID)) {
-			continue
-		}
-
-		deleteDescs = append(deleteDescs, col)
-		deleteCols.Add(int(col.ID))
-	}
-
-	// The order of the columns processed by the delete must be in the order they
-	// are present in the table.
-	tabDescs := make([]sqlbase.ColumnDescriptor, 0, len(deleteDescs))
-	for i := 0; i < len(tableColDescs); i++ {
-		col := tableColDescs[i]
-		if deleteCols.Contains(int(col.ID)) {
-			tabDescs = append(tabDescs, col)
-		}
-	}
-
-	return tabDescs
-}
-
 func (ef *execFactory) ConstructDelete(
 	input exec.Node,
 	table cat.Table,
@@ -1670,20 +1653,28 @@ func (ef *execFactory) ConstructDelete(
 	allowAutoCommit bool,
 	skipFKChecks bool,
 ) (exec.Node, error) {
+	ctx := ef.planner.extendedEvalCtx.Context
+
 	// Derive table and column descriptors.
 	rowsNeeded := !returnColOrdSet.Empty()
 	tabDesc := table.(*optTable).desc
 	fetchColDescs := makeColDescList(table, fetchColOrdSet)
 
+	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
+		return nil, err
+	}
+
 	// Determine the foreign key tables involved in the delete.
-	fkTables, err := ef.makeFkMetadata(tabDesc, row.CheckDeletes, nil /* checkHelper */)
+	// This will include all the interleaved child tables as we need them
+	// to see if we can execute the fast path delete.
+	fkTables, err := ef.makeFkMetadata(tabDesc, row.CheckDeletes)
 	if err != nil {
 		return nil, err
 	}
 
 	fastPathInterleaved := canDeleteFastInterleaved(tabDesc, fkTables)
 	if fastPathNode, ok := maybeCreateDeleteFastNode(
-		context.TODO(), input.(planNode), tabDesc, fastPathInterleaved, rowsNeeded); ok {
+		ctx, input.(planNode), tabDesc, fkTables, fastPathInterleaved, rowsNeeded); ok {
 		return fastPathNode, nil
 	}
 
@@ -1696,6 +1687,7 @@ func (ef *execFactory) ConstructDelete(
 	// CBO will have already determined the set of fetch columns, and passes
 	// those sets into the deleter (which will basically be a no-op).
 	rd, err := row.MakeDeleter(
+		ctx,
 		ef.planner.txn,
 		tabDesc,
 		fkTables,
@@ -1712,44 +1704,24 @@ func (ef *execFactory) ConstructDelete(
 	// computed a correct set that can sometimes be smaller.
 	rd.FetchCols = rd.FetchCols[:len(fetchColDescs)]
 
-	// Determine the relational type of the generated delete node.
-	// If rows are not needed, no columns are returned.
-	var returnCols sqlbase.ResultColumns
-	var rowIdxToRetIdx []int
-	if rowsNeeded {
-		returnColDescs := makeColDescList(table, returnColOrdSet)
-
-		// Only return the columns that are part of the table descriptor.
-		// This is important when columns are added and being back-filled
-		// as part of the same transaction when the delete runs.
-		// In such cases, the newly added columns shouldn't be returned.
-		// See regression logic tests for #29494.
-		if len(tabDesc.Columns) < len(returnColDescs) {
-			returnColDescs = returnColDescs[:len(tabDesc.Columns)]
-		}
-
-		// Delete returns the non-mutation columns specified, in the same
-		// order they are defined in the table.
-		returnCols = sqlbase.ResultColumnsFromColDescs(returnColDescs)
-
-		// Find all the columns that the deleteNode receives. The returning
-		// columns of the mutation are a subset of this column set.
-		requiredDeleteColumns := colsRequiredForDelete(table, tabDesc.Columns, returnColDescs)
-
-		// Update the rowIdxToReturnIdx for the mutation.
-		rowIdxToRetIdx = mutationRowIdxToReturnIdx(requiredDeleteColumns, returnColDescs)
-	}
-
 	// Now make a delete node. We use a pool.
 	del := deleteNodePool.Get().(*deleteNode)
 	*del = deleteNode{
-		source:  input.(planNode),
-		columns: returnCols,
+		source: input.(planNode),
 		run: deleteRun{
-			td:             tableDeleter{rd: rd, alloc: &ef.planner.alloc},
-			rowsNeeded:     rowsNeeded,
-			rowIdxToRetIdx: rowIdxToRetIdx,
+			td: tableDeleter{rd: rd, alloc: &ef.planner.alloc},
 		},
+	}
+
+	// If rows are not needed, no columns are returned.
+	if rowsNeeded {
+		returnColDescs := makeColDescList(table, returnColOrdSet)
+		// Delete returns the non-mutation columns specified, in the same
+		// order they are defined in the table.
+		del.columns = sqlbase.ResultColumnsFromColDescs(returnColDescs)
+
+		del.run.rowIdxToRetIdx = row.ColMapping(rd.FetchCols, returnColDescs)
+		del.run.rowsNeeded = true
 	}
 
 	if allowAutoCommit && ef.planner.autoCommit {
@@ -1777,16 +1749,15 @@ func (ef *execFactory) ConstructDeleteRange(
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
 	indexDesc := &tabDesc.PrimaryIndex
+	sb := span.MakeBuilder(tabDesc.TableDesc(), indexDesc)
+
+	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
+		return nil, err
+	}
 
 	// Setting the "forDelete" flag includes all column families in case where a
 	// single record is deleted.
-	spans, err := spansFromConstraint(
-		tabDesc,
-		indexDesc,
-		indexConstraint,
-		needed,
-		true, /* forDelete */
-	)
+	spans, err := sb.SpansFromConstraint(indexConstraint, needed, true /* forDelete */)
 	if err != nil {
 		return nil, err
 	}
@@ -1832,6 +1803,7 @@ func (ef *execFactory) ConstructCreateTable(
 func (ef *execFactory) ConstructCreateView(
 	schema cat.Schema,
 	viewName string,
+	ifNotExists bool,
 	temporary bool,
 	viewQuery string,
 	columns sqlbase.ResultColumns,
@@ -1862,12 +1834,13 @@ func (ef *execFactory) ConstructCreateView(
 	}
 
 	return &createViewNode{
-		viewName:  tree.Name(viewName),
-		temporary: temporary,
-		viewQuery: viewQuery,
-		dbDesc:    schema.(*optSchema).desc,
-		columns:   columns,
-		planDeps:  planDeps,
+		viewName:    tree.Name(viewName),
+		ifNotExists: ifNotExists,
+		temporary:   temporary,
+		viewQuery:   viewQuery,
+		dbDesc:      schema.(*optSchema).desc,
+		columns:     columns,
+		planDeps:    planDeps,
 	}, nil
 }
 
@@ -1912,7 +1885,6 @@ func (ef *execFactory) ConstructAlterTableSplit(
 	}
 
 	return &splitNode{
-		force:          ef.planner.SessionData().ForceSplitAt,
 		tableDesc:      &index.Table().(*optTable).desc.TableDescriptor,
 		index:          index.(*optIndex).desc,
 		rows:           input.(planNode),
@@ -1987,12 +1959,11 @@ type renderBuilder struct {
 func (rb *renderBuilder) init(n exec.Node, reqOrdering exec.OutputOrdering, cap int) {
 	src := asDataSource(n)
 	rb.r = &renderNode{
-		source:     src,
-		sourceInfo: sqlbase.MultiSourceInfo{src.info},
-		render:     make([]tree.TypedExpr, 0, cap),
-		columns:    make([]sqlbase.ResultColumn, 0, cap),
+		source:  src,
+		render:  make([]tree.TypedExpr, 0, cap),
+		columns: make([]sqlbase.ResultColumn, 0, cap),
 	}
-	rb.r.ivarHelper = tree.MakeIndexedVarHelper(rb.r, len(src.info.SourceColumns))
+	rb.r.ivarHelper = tree.MakeIndexedVarHelper(rb.r, len(src.columns))
 	rb.r.reqOrdering = ReqOrdering(reqOrdering)
 
 	// If there's a spool, pull it up.

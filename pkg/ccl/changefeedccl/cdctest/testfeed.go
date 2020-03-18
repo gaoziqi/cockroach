@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/jackc/pgx"
 	"github.com/pkg/errors"
@@ -260,7 +262,27 @@ func (f *jobFeed) fetchJobError() error {
 
 func (f *jobFeed) Pause() error {
 	_, err := f.db.Exec(`PAUSE JOB $1`, f.JobID)
-	return err
+	if err != nil {
+		return err
+	}
+	// PAUSE JOB does not actually pause the job but only sends a request for
+	// it. Actually block until the job state changes.
+	opts := retry.Options{
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     time.Second,
+		Multiplier:     2,
+	}
+	ctx := context.Background()
+	return retry.WithMaxAttempts(ctx, opts, 10, func() error {
+		var status string
+		if err := f.db.QueryRowContext(ctx, `SELECT status FROM system.jobs WHERE id = $1`, f.JobID).Scan(&status); err != nil {
+			return err
+		}
+		if jobs.Status(status) != jobs.StatusPaused {
+			return errors.New("could not pause job")
+		}
+		return nil
+	})
 }
 
 func (f *jobFeed) Resume() error {
@@ -299,7 +321,7 @@ func MakeTableFeedFactory(
 }
 
 // Feed implements the TestFeedFactory interface
-func (f *tableFeedFactory) Feed(create string, args ...interface{}) (TestFeed, error) {
+func (f *tableFeedFactory) Feed(create string, args ...interface{}) (_ TestFeed, err error) {
 	sink := f.sink
 	sink.Path = fmt.Sprintf(`table_%d`, timeutil.Now().UnixNano())
 
@@ -307,6 +329,11 @@ func (f *tableFeedFactory) Feed(create string, args ...interface{}) (TestFeed, e
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil {
+			_ = db.Close()
+		}
+	}()
 
 	sink.Scheme = `experimental-sql`
 	c := &TableFeed{
@@ -350,6 +377,14 @@ type TableFeed struct {
 
 	rows *gosql.Rows
 	seen map[string]struct{}
+}
+
+// ResetSeen is useful when manually pausing and resuming a TableFeed.
+// We want to be able to assert that rows are not re-emitted in some cases.
+func (c *TableFeed) ResetSeen() {
+	for k := range c.seen {
+		delete(c.seen, k)
+	}
 }
 
 // Partitions implements the TestFeed interface.
@@ -470,7 +505,7 @@ func (f *cloudFeedFactory) Feed(create string, args ...interface{}) (TestFeed, e
 	}
 	feedDir := strconv.Itoa(f.feedIdx)
 	f.feedIdx++
-	sinkURI := `experimental-nodelocal:///` + feedDir
+	sinkURI := `experimental-nodelocal://0/` + feedDir
 	// TODO(dan): This is a pretty unsatisfying way to test that the sink passes
 	// through params it doesn't understand to ExternalStorage.
 	sinkURI += `?should_be=ignored`
@@ -525,6 +560,25 @@ func (c *cloudFeed) Partitions() []string {
 	return []string{cloudFeedPartition}
 }
 
+// ReformatJSON marshals a golang stdlib based JSON into a byte slice preserving
+// whitespace in accordance with the crdb json library.
+func ReformatJSON(j interface{}) ([]byte, error) {
+	printed, err := gojson.Marshal(j)
+	if err != nil {
+		return nil, err
+	}
+	// The golang stdlib json library prints whitespace differently than our
+	// internal one. Roundtrip through the crdb json library to get the
+	// whitespace back to where it started.
+	parsed, err := json.ParseJSON(string(printed))
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	parsed.Format(&buf)
+	return buf.Bytes(), nil
+}
+
 // extractKeyFromJSONValue extracts the `WITH key_in_value` key from a `WITH
 // format=json, envelope=wrapped` value.
 func extractKeyFromJSONValue(wrapped []byte) (key []byte, value []byte, _ error) {
@@ -535,28 +589,11 @@ func extractKeyFromJSONValue(wrapped []byte) (key []byte, value []byte, _ error)
 	keyParsed := parsed[`key`]
 	delete(parsed, `key`)
 
-	reformatJSON := func(j interface{}) ([]byte, error) {
-		printed, err := gojson.Marshal(j)
-		if err != nil {
-			return nil, err
-		}
-		// The golang stdlib json library prints whitespace differently than our
-		// internal one. Roundtrip through the crdb json library to get the
-		// whitespace back to where it started.
-		parsed, err := json.ParseJSON(string(printed))
-		if err != nil {
-			return nil, err
-		}
-		var buf bytes.Buffer
-		parsed.Format(&buf)
-		return buf.Bytes(), nil
-	}
-
 	var err error
-	if key, err = reformatJSON(keyParsed); err != nil {
+	if key, err = ReformatJSON(keyParsed); err != nil {
 		return nil, nil, err
 	}
-	if value, err = reformatJSON(parsed); err != nil {
+	if value, err = ReformatJSON(parsed); err != nil {
 		return nil, nil, err
 	}
 	return key, value, nil
@@ -611,10 +648,20 @@ func (c *cloudFeed) Next() (*TestFeedMessage, error) {
 	}
 }
 
-func (c *cloudFeed) walkDir(path string, info os.FileInfo, _ error) error {
+func (c *cloudFeed) walkDir(path string, info os.FileInfo, err error) error {
 	if strings.HasSuffix(path, `.tmp`) {
 		// File in the process of being written by ExternalStorage. Ignore.
 		return nil
+	}
+
+	if err != nil {
+		// From filepath.WalkFunc:
+		//  If there was a problem walking to the file or directory named by
+		//  path, the incoming error will describe the problem and the function
+		//  can decide how to handle that error (and Walk will not descend into
+		//  that directory). In the case of an error, the info argument will be
+		//  nil. If an error is returned, processing stops.
+		return err
 	}
 
 	if info.IsDir() {

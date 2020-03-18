@@ -28,19 +28,18 @@ type SerialUnorderedSynchronizer struct {
 	inputs []Operator
 	// curSerialInputIdx indicates the index of the current input being consumed.
 	curSerialInputIdx int
-	zeroBatch         coldata.Batch
 }
 
 var _ Operator = &SerialUnorderedSynchronizer{}
 var _ execinfra.OpNode = &SerialUnorderedSynchronizer{}
 
 // ChildCount implements the execinfra.OpNode interface.
-func (s *SerialUnorderedSynchronizer) ChildCount() int {
+func (s *SerialUnorderedSynchronizer) ChildCount(verbose bool) int {
 	return len(s.inputs)
 }
 
 // Child implements the execinfra.OpNode interface.
-func (s *SerialUnorderedSynchronizer) Child(nth int) execinfra.OpNode {
+func (s *SerialUnorderedSynchronizer) Child(nth int, verbose bool) execinfra.OpNode {
 	return s.inputs[nth]
 }
 
@@ -51,7 +50,6 @@ func NewSerialUnorderedSynchronizer(
 	return &SerialUnorderedSynchronizer{
 		inputs:            inputs,
 		curSerialInputIdx: 0,
-		zeroBatch:         coldata.NewMemBatchWithSize(typs, 0),
 	}
 }
 
@@ -66,7 +64,7 @@ func (s *SerialUnorderedSynchronizer) Init() {
 func (s *SerialUnorderedSynchronizer) Next(ctx context.Context) coldata.Batch {
 	for {
 		if s.curSerialInputIdx == len(s.inputs) {
-			return s.zeroBatch
+			return coldata.ZeroBatch
 		}
 		b := s.inputs[s.curSerialInputIdx].Next(ctx)
 		if b.Length() == 0 {

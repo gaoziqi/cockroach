@@ -42,7 +42,9 @@ func (c *CustomFuncs) NeededExplainCols(private *memo.ExplainPrivate) opt.ColSet
 // needed by the mutation private; it simply returns the input columns that are
 // referenced by it. Other rules filter the FetchCols, CheckCols, etc. and can
 // in turn trigger the PruneMutationInputCols rule.
-func (c *CustomFuncs) NeededMutationCols(private *memo.MutationPrivate) opt.ColSet {
+func (c *CustomFuncs) NeededMutationCols(
+	private *memo.MutationPrivate, checks memo.FKChecksExpr,
+) opt.ColSet {
 	var cols opt.ColSet
 
 	// Add all input columns referenced by the mutation private.
@@ -62,6 +64,13 @@ func (c *CustomFuncs) NeededMutationCols(private *memo.MutationPrivate) opt.ColS
 	addCols(private.PassthroughCols)
 	if private.CanaryCol != 0 {
 		cols.Add(private.CanaryCol)
+	}
+
+	if private.WithID != 0 {
+		for i := range checks {
+			withUses := c.WithUses(checks[i].Check)
+			cols.UnionWith(withUses[private.WithID].UsedCols)
+		}
 	}
 
 	return cols
@@ -399,7 +408,7 @@ func (c *CustomFuncs) NeededWindowCols(windows memo.WindowsExpr, p *memo.WindowP
 	needed.UnionWith(p.Partition)
 	needed.UnionWith(p.Ordering.ColSet())
 	for i := range windows {
-		needed.UnionWith(windows[i].ScalarProps(c.mem).OuterCols)
+		needed.UnionWith(windows[i].ScalarProps().OuterCols)
 	}
 	return needed
 }
@@ -521,13 +530,16 @@ func DerivePruneCols(e memo.RelExpr) opt.ColSet {
 		// make sure that we still get the correct number of rows in the output.
 		projectSet := e.(*memo.ProjectSetExpr)
 		relProps.Rule.PruneCols = DerivePruneCols(projectSet.Input).Copy()
-		usedCols := projectSet.Zip.OuterCols(e.Memo())
+		usedCols := projectSet.Zip.OuterCols()
 		relProps.Rule.PruneCols.DifferenceWith(usedCols)
 
 	case opt.UnionAllOp:
-		// All columns can potentially be pruned from the UnionAll, if they're never
-		// used in a higher-level expression.
-		relProps.Rule.PruneCols = relProps.OutputCols.Copy()
+		// Pruning can be beneficial as long as one of our inputs has advertised pruning,
+		// so that we can push down the project and eliminate the advertisement.
+		u := e.(*memo.UnionAllExpr)
+		pruneFromLeft := opt.TranslateColSet(DerivePruneCols(u.Left), u.LeftCols, u.OutCols)
+		pruneFromRight := opt.TranslateColSet(DerivePruneCols(u.Right), u.RightCols, u.OutCols)
+		relProps.Rule.PruneCols = pruneFromLeft.Union(pruneFromRight)
 
 	case opt.WindowOp:
 		win := e.(*memo.WindowExpr)
@@ -536,7 +548,7 @@ func DerivePruneCols(e memo.RelExpr) opt.ColSet {
 		relProps.Rule.PruneCols.DifferenceWith(win.Ordering.ColSet())
 		for _, w := range win.Windows {
 			relProps.Rule.PruneCols.Add(w.Col)
-			relProps.Rule.PruneCols.DifferenceWith(w.ScalarProps(e.Memo()).OuterCols)
+			relProps.Rule.PruneCols.DifferenceWith(w.ScalarProps().OuterCols)
 		}
 
 	case opt.UpdateOp, opt.UpsertOp, opt.DeleteOp:

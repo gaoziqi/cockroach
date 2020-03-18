@@ -14,7 +14,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -63,12 +63,15 @@ const (
 // Flow represents a flow which consists of processors and streams.
 type Flow interface {
 	// Setup sets up all the infrastructure for the flow as defined by the flow
-	// spec. The flow will then need to be started and run.
-	Setup(ctx context.Context, spec *execinfrapb.FlowSpec, opt FuseOpt) error
+	// spec. The flow will then need to be started and run. A new context (along
+	// with a context cancellation function) is derived. The new context must be
+	// used when running a flow so that all components running in their own
+	// goroutines could listen for a cancellation on the same context.
+	Setup(ctx context.Context, spec *execinfrapb.FlowSpec, opt FuseOpt) (context.Context, error)
 
 	// SetTxn is used to provide the transaction in which the flow will run.
 	// It needs to be called after Setup() and before Start/Run.
-	SetTxn(*client.Txn)
+	SetTxn(*kv.Txn)
 
 	// Start starts the flow. Processors run asynchronously in their own goroutines.
 	// Wait() needs to be called to wait for the flow to finish.
@@ -124,8 +127,6 @@ type FlowBase struct {
 	execinfra.FlowCtx
 
 	flowRegistry *FlowRegistry
-	// isVectorized indicates whether it is a vectorized flow.
-	isVectorized bool
 	// processors contains a subset of the processors in the flow - the ones that
 	// run in their own goroutines. Some processors that implement RowSource are
 	// scheduled to run in their consumer's goroutine; those are not present here.
@@ -170,12 +171,17 @@ type FlowBase struct {
 }
 
 // Setup is part of the Flow interface.
-func (f *FlowBase) Setup(context.Context, *execinfrapb.FlowSpec, FuseOpt) error {
-	panic("Setup should not be called on FlowBase")
+func (f *FlowBase) Setup(
+	ctx context.Context, spec *execinfrapb.FlowSpec, _ FuseOpt,
+) (context.Context, error) {
+	ctx, f.ctxCancel = contextutil.WithCancel(ctx)
+	f.ctxDone = ctx.Done()
+	f.spec = spec
+	return ctx, nil
 }
 
 // SetTxn is part of the Flow interface.
-func (f *FlowBase) SetTxn(txn *client.Txn) {
+func (f *FlowBase) SetTxn(txn *kv.Txn) {
 	f.FlowCtx.Txn = txn
 	f.EvalCtx.Txn = txn
 }
@@ -193,12 +199,10 @@ func NewFlowBase(
 	flowReg *FlowRegistry,
 	syncFlowConsumer execinfra.RowReceiver,
 	localProcessors []execinfra.LocalProcessor,
-	isVectorized bool,
 ) *FlowBase {
 	base := &FlowBase{
 		FlowCtx:          flowCtx,
 		flowRegistry:     flowReg,
-		isVectorized:     isVectorized,
 		syncFlowConsumer: syncFlowConsumer,
 		localProcessors:  localProcessors,
 	}
@@ -244,12 +248,6 @@ func (f *FlowBase) GetCtxDone() <-chan struct{} {
 	return f.ctxDone
 }
 
-// SetSpec sets the flow spec of this flow. This is useful for debugging
-// purposes.
-func (f *FlowBase) SetSpec(spec *execinfrapb.FlowSpec) {
-	f.spec = spec
-}
-
 // GetCancelFlowFn returns the context cancellation function of the context of
 // this flow.
 func (f *FlowBase) GetCancelFlowFn() context.CancelFunc {
@@ -279,17 +277,14 @@ func (f *FlowBase) GetLocalProcessors() []execinfra.LocalProcessor {
 
 // startInternal starts the flow. All processors are started, each in their own
 // goroutine. The caller must forward any returned error to syncFlowConsumer if
-// set. A new context is derived and returned, and it must be used when this
-// method returns so that all components running in their own goroutines could
-// listen for a cancellation on the same context.
-func (f *FlowBase) startInternal(ctx context.Context, doneFn func()) (context.Context, error) {
+// set.
+func (f *FlowBase) startInternal(
+	ctx context.Context, processors []execinfra.Processor, doneFn func(),
+) error {
 	f.doneFn = doneFn
 	log.VEventf(
-		ctx, 1, "starting (%d processors, %d startables)", len(f.processors), len(f.startables),
+		ctx, 1, "starting (%d processors, %d startables)", len(processors), len(f.startables),
 	)
-
-	ctx, f.ctxCancel = contextutil.WithCancel(ctx)
-	f.ctxDone = ctx.Done()
 
 	// Only register the flow if there will be inbound stream connections that
 	// need to look up this flow in the flow registry.
@@ -303,7 +298,7 @@ func (f *FlowBase) startInternal(ctx context.Context, doneFn func()) (context.Co
 		if err := f.flowRegistry.RegisterFlow(
 			ctx, f.ID, f, f.inboundStreams, SettingFlowStreamTimeout.Get(&f.FlowCtx.Cfg.Settings.SV),
 		); err != nil {
-			return ctx, err
+			return err
 		}
 	}
 
@@ -315,15 +310,15 @@ func (f *FlowBase) startInternal(ctx context.Context, doneFn func()) (context.Co
 	for _, s := range f.startables {
 		s.Start(ctx, &f.waitGroup, f.ctxCancel)
 	}
-	for i := 0; i < len(f.processors); i++ {
+	for i := 0; i < len(processors); i++ {
 		f.waitGroup.Add(1)
 		go func(i int) {
-			f.processors[i].Run(ctx)
+			processors[i].Run(ctx)
 			f.waitGroup.Done()
 		}(i)
 	}
-	f.startedGoroutines = len(f.startables) > 0 || len(f.processors) > 0 || !f.IsLocal()
-	return ctx, nil
+	f.startedGoroutines = len(f.startables) > 0 || len(processors) > 0 || !f.IsLocal()
+	return nil
 }
 
 // IsLocal returns whether this flow does not have any remote execution.
@@ -333,12 +328,12 @@ func (f *FlowBase) IsLocal() bool {
 
 // IsVectorized returns whether this flow will run with vectorized execution.
 func (f *FlowBase) IsVectorized() bool {
-	return f.isVectorized
+	panic("IsVectorized should not be called on FlowBase")
 }
 
 // Start is part of the Flow interface.
 func (f *FlowBase) Start(ctx context.Context, doneFn func()) error {
-	if _, err := f.startInternal(ctx, doneFn); err != nil {
+	if err := f.startInternal(ctx, f.processors, doneFn); err != nil {
 		// For sync flows, the error goes to the consumer.
 		if f.syncFlowConsumer != nil {
 			f.syncFlowConsumer.Push(nil /* row */, &execinfrapb.ProducerMetadata{Err: err})
@@ -360,10 +355,10 @@ func (f *FlowBase) Run(ctx context.Context, doneFn func()) error {
 		return errors.AssertionFailedf("no processors in flow")
 	}
 	headProc = f.processors[len(f.processors)-1]
-	f.processors = f.processors[:len(f.processors)-1]
+	otherProcs := f.processors[:len(f.processors)-1]
 
 	var err error
-	if ctx, err = f.startInternal(ctx, doneFn); err != nil {
+	if err = f.startInternal(ctx, otherProcs, doneFn); err != nil {
 		// For sync flows, the error goes to the consumer.
 		if f.syncFlowConsumer != nil {
 			f.syncFlowConsumer.Push(nil /* row */, &execinfrapb.ProducerMetadata{Err: err})
@@ -417,13 +412,11 @@ type Releasable interface {
 }
 
 // Cleanup is part of the Flow interface.
+// NOTE: this implements only the shared clean up logic between row-based and
+// vectorized flows.
 func (f *FlowBase) Cleanup(ctx context.Context) {
 	if f.status == FlowFinished {
 		panic("flow cleanup called twice")
-	}
-
-	if f.VectorizedBoundAccount != nil {
-		f.VectorizedBoundAccount.Close(ctx)
 	}
 
 	// This closes the monitor opened in ServerImpl.setupFlow.
@@ -443,9 +436,12 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 	}
 	f.status = FlowFinished
 	f.ctxCancel()
-	f.doneFn()
-	f.doneFn = nil
-	sp.Finish()
+	if f.doneFn != nil {
+		f.doneFn()
+	}
+	if sp != nil {
+		sp.Finish()
+	}
 }
 
 // cancel iterates through all unconnected streams of this flow and marks them canceled.

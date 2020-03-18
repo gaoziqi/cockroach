@@ -14,15 +14,18 @@ option go_package = "serverpb";
 
 import "build/info.proto";
 import "gossip/gossip.proto";
+import "jobs/jobspb/jobs.proto";
 import "roachpb/app_stats.proto";
 import "roachpb/data.proto";
 import "roachpb/metadata.proto";
 import "server/diagnosticspb/diagnostics.proto";
 import "server/status/statuspb/status.proto";
-import "storage/engine/enginepb/mvcc.proto";
-import "storage/engine/enginepb/rocksdb.proto";
-import "storage/storagepb/lease_status.proto";
-import "storage/storagepb/state.proto";
+import "storage/enginepb/engine.proto";
+import "storage/enginepb/mvcc.proto";
+import "storage/enginepb/rocksdb.proto";
+import "kv/kvserver/storagepb/lease_status.proto";
+import "kv/kvserver/storagepb/state.proto";
+import "kv/kvserver/storagepb/liveness.proto";
 import "util/log/log.proto";
 import "util/unresolved_addr.proto";
 
@@ -76,13 +79,12 @@ message CertificatesResponse {
 }
 
 // DetailsRequest requests a nodes details.
+// Note: this does *not* check readiness. Use the Health RPC for that purpose.
 message DetailsRequest {
   // node_id is a string so that "local" can be used to specify that no
   // forwarding is necessary.
   string node_id = 1;
-  // ready specifies whether the client wants to know whether a node is ready to
-  // receive traffic. If a node is unready, an error will be returned.
-  bool ready = 2;
+  reserved 2;
 }
 
 // SystemInfo contains information about the host system.
@@ -110,6 +112,11 @@ message NodesRequest {}
 
 message NodesResponse {
   repeated server.status.statuspb.NodeStatus nodes = 1 [ (gogoproto.nullable) = false ];
+  map<int32, cockroach.kv.kvserver.storagepb.NodeLivenessStatus> liveness_by_node_id = 2 [
+    (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID",
+    (gogoproto.nullable) = false,
+    (gogoproto.customname) = "LivenessByNodeID"
+  ];
 }
 
 message NodeRequest {
@@ -177,7 +184,7 @@ message PrettySpan {
 message RangeInfo {
   PrettySpan span = 1 [ (gogoproto.nullable) = false ];
   RaftState raft_state = 2 [ (gogoproto.nullable) = false ];
-  storage.storagepb.RangeInfo state = 4 [ (gogoproto.nullable) = false ];
+  kv.kvserver.storagepb.RangeInfo state = 4 [ (gogoproto.nullable) = false ];
   int32 source_node_id = 5 [
     (gogoproto.customname) = "SourceNodeID",
     (gogoproto.casttype) =
@@ -192,9 +199,9 @@ message RangeInfo {
   repeated roachpb.Lease lease_history = 8 [ (gogoproto.nullable) = false ];
   RangeProblems problems = 9 [ (gogoproto.nullable) = false ];
   RangeStatistics stats = 10 [ (gogoproto.nullable) = false ];
-  storage.storagepb.LatchManagerInfo latches_local = 11 [ (gogoproto.nullable) = false ];
-  storage.storagepb.LatchManagerInfo latches_global = 12 [ (gogoproto.nullable) = false ];
-  storage.LeaseStatus lease_status = 13 [ (gogoproto.nullable) = false ];
+  kv.kvserver.storagepb.LatchManagerInfo latches_local = 11 [ (gogoproto.nullable) = false ];
+  kv.kvserver.storagepb.LatchManagerInfo latches_global = 12 [ (gogoproto.nullable) = false ];
+  kv.kvserver.storagepb.LeaseStatus lease_status = 13 [ (gogoproto.nullable) = false ];
   bool quiescent = 14;
   bool ticking = 15;
 }
@@ -226,7 +233,8 @@ message EngineStatsInfo {
     (gogoproto.casttype) =
         "github.com/cockroachdb/cockroach/pkg/roachpb.StoreID"
   ];
-  cockroach.storage.engine.enginepb.TickersAndHistograms tickers_and_histograms = 2;
+  cockroach.storage.enginepb.TickersAndHistograms tickers_and_histograms = 2;
+  cockroach.storage.enginepb.EngineType engine_type = 3;
 }
 
 message EngineStatsRequest {
@@ -316,10 +324,16 @@ message LogFileRequest {
   string file = 2;
 }
 
+enum StacksType {
+  GOROUTINE_STACKS = 0;
+  THREAD_STACKS = 1;
+}
+
 message StacksRequest {
   // node_id is a string so that "local" can be used to specify that no
   // forwarding is necessary.
   string node_id = 1;
+  StacksType type = 2;
 }
 
 // Represents the type of file.
@@ -430,6 +444,8 @@ message ActiveQuery {
   }
   // phase stores the current phase of execution for this query.
   Phase phase = 5;
+
+  float progress = 6;
 }
 
 // Request object for ListSessions and ListLocalSessions.
@@ -546,7 +562,7 @@ message SpanStatsRequest {
 message SpanStatsResponse {
   int32 range_count = 2;
   uint64 approximate_disk_bytes = 3;
-  cockroach.storage.engine.enginepb.MVCCStats total_stats = 1
+  cockroach.storage.enginepb.MVCCStats total_stats = 1
       [ (gogoproto.nullable) = false ];
 }
 
@@ -743,6 +759,70 @@ message StatementsResponse {
   string internal_app_name_prefix = 4;
 }
 
+message StatementDiagnosticsReport {
+  int64 id = 1;
+  bool completed = 2;
+  string statement_fingerprint = 3;
+  int64 statement_diagnostics_id = 4
+    [ (gogoproto.nullable) = true ];
+  google.protobuf.Timestamp requested_at = 5
+    [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
+}
+
+message CreateStatementDiagnosticsReportRequest {
+  string statement_fingerprint = 1;
+}
+
+message CreateStatementDiagnosticsReportResponse {
+  StatementDiagnosticsReport report = 1;
+}
+
+message StatementDiagnosticsReportsRequest {}
+
+message StatementDiagnosticsReportsResponse {
+  repeated StatementDiagnosticsReport reports = 1 [ (gogoproto.nullable) = false ];
+}
+
+message StatementDiagnostics {
+  int64 id = 1;
+  string statement_fingerprint = 2;
+  google.protobuf.Timestamp collected_at = 3
+    [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
+  string trace = 4;
+}
+
+message StatementDiagnosticsRequest {
+  int64 statement_diagnostics_id = 1;
+}
+
+message StatementDiagnosticsResponse {
+  StatementDiagnostics diagnostics = 2;
+}
+
+message JobRegistryStatusRequest {
+  string node_id = 1;
+}
+
+message JobRegistryStatusResponse {
+  int32 node_id = 1 [
+                    (gogoproto.customname) = "NodeID",
+                    (gogoproto.casttype) =
+                    "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"
+                    ];
+  message Job {
+    int64 id = 1;
+  }
+  repeated Job running_jobs = 2;
+}
+
+message JobStatusRequest {
+  int64 job_id = 1;
+}
+
+message JobStatusResponse {
+  cockroach.sql.jobs.jobspb.Job job = 1;
+}
+
 service Status {
   rpc Certificates(CertificatesRequest) returns (CertificatesResponse) {
     option (google.api.http) = {
@@ -752,7 +832,6 @@ service Status {
   rpc Details(DetailsRequest) returns (DetailsResponse) {
     option (google.api.http) = {
       get : "/_status/details/{node_id}"
-      additional_bindings {get : "/health"}
     };
   }
   rpc Nodes(NodesRequest) returns (NodesResponse) {
@@ -893,5 +972,30 @@ service Status {
       get: "/_status/statements"
     };
   }
+  rpc CreateStatementDiagnosticsReport(CreateStatementDiagnosticsReportRequest) returns (CreateStatementDiagnosticsReportResponse) {
+    option (google.api.http) = {
+      post: "/_status/stmtdiagreports"
+      body: "*"
+    };
+  }
+  rpc StatementDiagnosticsRequests(StatementDiagnosticsReportsRequest) returns (StatementDiagnosticsReportsResponse) {
+    option (google.api.http) = {
+      get: "/_status/stmtdiagreports"
+    };
+  }
+  rpc StatementDiagnostics(StatementDiagnosticsRequest) returns (StatementDiagnosticsResponse) {
+    option (google.api.http) = {
+      get: "/_status/stmtdiag/{statement_diagnostics_id}"
+    };
+  }
+  rpc JobRegistryStatus(JobRegistryStatusRequest) returns (JobRegistryStatusResponse) {
+    option (google.api.http) = {
+      get : "/_status/job_registry/{node_id}"
+    };
+  }
+  rpc JobStatus(JobStatusRequest) returns (JobStatusResponse) {
+    option (google.api.http) = {
+      get : "/_status/job/{job_id}"
+    };
+  }
 }
-

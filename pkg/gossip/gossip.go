@@ -178,7 +178,7 @@ var (
 )
 
 // KeyNotPresentError is returned by gossip when queried for a key that doesn't
-// exist of has expired.
+// exist or has expired.
 type KeyNotPresentError struct {
 	key string
 }
@@ -1248,11 +1248,6 @@ func (g *Gossip) Start(advertAddr net.Addr, resolvers []resolver.Resolver) {
 	g.server.start(advertAddr) // serve gossip protocol
 	g.bootstrap()              // bootstrap gossip client
 	g.manage()                 // manage gossip clients
-}
-
-// Stopper returns the stopper for this gossip instance.
-func (g *Gossip) Stopper() *stop.Stopper {
-	return g.server.stopper
 }
 
 // hasIncomingLocked returns whether the server has an incoming gossip

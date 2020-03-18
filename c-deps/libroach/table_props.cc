@@ -9,9 +9,9 @@
 // licenses/APL.txt.
 
 #include "table_props.h"
-#include <rocksdb/table_properties.h>
 #include <rocksdb/slice.h>
 #include <rocksdb/status.h>
+#include <rocksdb/table_properties.h>
 #include <rocksdb/types.h>
 #include "encoding.h"
 
@@ -29,7 +29,7 @@ class TimeBoundTblPropCollector : public rocksdb::TablePropertiesCollector {
       // Check to see if an intent was the last key in the SSTable. If
       // it was, we need to extract the timestamp from the intent and
       // update the bounds to include that timestamp.
-      cockroach::storage::engine::enginepb::MVCCMetadata meta;
+      cockroach::storage::enginepb::MVCCMetadata meta;
       if (!meta.ParseFromArray(last_value_.data(), last_value_.size())) {
         // We're unable to parse the MVCCMetadata. Fail open by not
         // setting the min/max timestamp properties.
@@ -109,9 +109,8 @@ class DeleteRangeTblPropCollector : public rocksdb::TablePropertiesCollector {
     return rocksdb::Status::OK();
   }
 
-  rocksdb::Status AddUserKey(const rocksdb::Slice&, const rocksdb::Slice&,
-                             rocksdb::EntryType type, rocksdb::SequenceNumber,
-                             uint64_t) override {
+  rocksdb::Status AddUserKey(const rocksdb::Slice&, const rocksdb::Slice&, rocksdb::EntryType type,
+                             rocksdb::SequenceNumber, uint64_t) override {
     if (type == rocksdb::kEntryRangeDeletion) {
       ntombstones_++;
     }

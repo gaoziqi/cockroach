@@ -17,8 +17,10 @@ import (
 	"text/template"
 )
 
+const castTmpl = "pkg/sql/colexec/cast_tmpl.go"
+
 func genCastOperators(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/cast_tmpl.go")
+	t, err := ioutil.ReadFile(castTmpl)
 	if err != nil {
 		return err
 	}
@@ -26,17 +28,14 @@ func genCastOperators(wr io.Writer) error {
 	s := string(t)
 
 	assignCast := makeFunctionRegex("_ASSIGN_CAST", 2)
-	s = assignCast.ReplaceAllString(s, `{{.Assign "$1" "$2"}}`)
+	s = assignCast.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 2))
 	s = strings.Replace(s, "_ALLTYPES", "{{$typ}}", -1)
-	s = strings.Replace(s, "_OVERLOADTYPES", "{{.ToTyp}}", -1)
 	s = strings.Replace(s, "_FROMTYPE", "{{.FromTyp}}", -1)
 	s = strings.Replace(s, "_TOTYPE", "{{.ToTyp}}", -1)
 	s = strings.Replace(s, "_GOTYPE", "{{.ToGoTyp}}", -1)
 
 	// replace _FROM_TYPE_SLICE's with execgen.SLICE's of the correct type.
 	s = strings.Replace(s, "_FROM_TYPE_SLICE", "execgen.SLICE", -1)
-	s = replaceManipulationFuncs(".FromTyp", s)
-
 	// replace the _FROM_TYPE_UNSAFEGET's with execgen.UNSAFEGET's of the correct type.
 	s = strings.Replace(s, "_FROM_TYPE_UNSAFEGET", "execgen.UNSAFEGET", -1)
 	s = replaceManipulationFuncs(".FromTyp", s)
@@ -58,5 +57,5 @@ func genCastOperators(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genCastOperators, "cast.eg.go")
+	registerGenerator(genCastOperators, "cast.eg.go", castTmpl)
 }

@@ -5,7 +5,7 @@ EXPLAIN (PLAN) SELECT 1 FROM system.jobs WHERE FALSE
 ----
 tree    field        description
 ·       distributed  false
-·       vectorized   false
+·       vectorized   true
 norows  ·            ·
 
 query TTT colnames
@@ -13,7 +13,7 @@ EXPLAIN (PLAN) SELECT 1 FROM system.jobs WHERE NULL
 ----
 tree    field        description
 ·       distributed  false
-·       vectorized   false
+·       vectorized   true
 norows  ·            ·
 
 query TTT colnames
@@ -21,7 +21,7 @@ EXPLAIN (PLAN) SELECT 1 FROM system.jobs WHERE TRUE
 ----
 tree       field        description
 ·          distributed  false
-·          vectorized   false
+·          vectorized   true
 render     ·            ·
  └── scan  ·            ·
 ·          table        jobs@jobs_status_created_idx
@@ -358,13 +358,46 @@ render                                       ·            ·
 query TTT
 EXPLAIN SHOW USERS
 ----
-·          distributed  false
-·          vectorized   true
-render     ·            ·
- └── scan  ·            ·
-·          table        users@primary
-·          spans        ALL
-·          filter       "isRole" = false
+·                                                                  distributed        false
+·                                                                  vectorized         false
+render                                                             ·                  ·
+ └── sort                                                          ·                  ·
+      │                                                            order              +username
+      └── render                                                   ·                  ·
+           └── group                                               ·                  ·
+                │                                                  aggregate 0        username
+                │                                                  aggregate 1        array_agg(role)
+                │                                                  aggregate 2        any_not_null(any_not_null)
+                │                                                  aggregate 3        any_not_null(role)
+                │                                                  group by           username
+                └── render                                         ·                  ·
+                     └── sort                                      ·                  ·
+                          │                                        order              +role
+                          └── hash-join                            ·                  ·
+                               │                                   type               left outer
+                               │                                   equality           (username) = (member)
+                               │                                   left cols are key  ·
+                               ├── group                           ·                  ·
+                               │    │                              aggregate 0        username
+                               │    │                              aggregate 1        any_not_null(string_agg)
+                               │    │                              group by           username
+                               │    └── render                     ·                  ·
+                               │         └── window                ·                  ·
+                               │              └── render           ·                  ·
+                               │                   └── merge-join  ·                  ·
+                               │                        │          type               left outer
+                               │                        │          equality           (username) = (username)
+                               │                        │          left cols are key  ·
+                               │                        │          mergeJoinOrder     +"(username=username)"
+                               │                        ├── scan   ·                  ·
+                               │                        │          table              users@primary
+                               │                        │          spans              ALL
+                               │                        └── scan   ·                  ·
+                               │                                   table              role_options@primary
+                               │                                   spans              ALL
+                               └── scan                            ·                  ·
+·                                                                  table              role_members@role_members_role_idx
+·                                                                  spans              ALL
 
 # EXPLAIN selecting from a sequence.
 statement ok
@@ -391,25 +424,26 @@ render                ·            ·            ("?column?")                  
 statement ok
 CREATE TABLE t (
   k INT PRIMARY KEY,
-  v INT
+  v INT,
+  FAMILY "primary" (k, v)
 )
 
 query TTT
 EXPLAIN INSERT INTO t VALUES (1, 2)
 ----
-·                 distributed  false
-·                 vectorized   false
-count             ·            ·
- └── insert       ·            ·
-      │           into         t(k, v)
-      │           strategy     inserter
-      └── values  ·            ·
-·                 size         2 columns, 1 row
+·                      distributed  false
+·                      vectorized   false
+count                  ·            ·
+ └── insert-fast-path  ·            ·
+·                      into         t(k, v)
+·                      strategy     inserter
+·                      auto commit  ·
+·                      size         2 columns, 1 row
 
 query I
 SELECT max(level) FROM [EXPLAIN (VERBOSE) INSERT INTO t VALUES (1, 2)]
 ----
-2
+1
 
 statement ok
 INSERT INTO t VALUES (1, 2)
@@ -464,7 +498,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM t WHERE k % 2 = 0
 ----
 ·     distributed  false        ·       ·
-·     vectorized   false        ·       ·
+·     vectorized   true         ·       ·
 scan  ·            ·            (k, v)  ·
 ·     table        t@primary    ·       ·
 ·     spans        ALL          ·       ·
@@ -489,23 +523,21 @@ values  ·            ·
 query TTT
 SELECT tree, field, description FROM [EXPLAIN (VERBOSE) SELECT * FROM t WITH ORDINALITY LIMIT 1 OFFSET 1]
 ----
-·                     distributed  false
-·                     vectorized   true
-limit                 ·            ·
- │                    offset       1
- └── limit            ·            ·
-      │               count        2
-      └── ordinality  ·            ·
-           └── scan   ·            ·
-·                     table        t@primary
-·                     spans        ALL
-·                     limit        2
+·                distributed  false
+·                vectorized   true
+limit            ·            ·
+ │               offset       1
+ └── ordinality  ·            ·
+      └── scan   ·            ·
+·                table        t@primary
+·                spans        ALL
+·                limit        2
 
 query TTT
 EXPLAIN SELECT DISTINCT v FROM t
 ----
 ·          distributed  false
-·          vectorized   false
+·          vectorized   true
 distinct   ·            ·
  │         distinct on  v
  └── scan  ·            ·
@@ -516,7 +548,7 @@ query TTT
 SELECT tree, field, description FROM [EXPLAIN (VERBOSE) SELECT DISTINCT v FROM t LIMIT 1 OFFSET 1]
 ----
 ·                    distributed  false
-·                    vectorized   false
+·                    vectorized   true
 limit                ·            ·
  │                   offset       1
  └── limit           ·            ·
@@ -534,7 +566,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM tc WHERE a = 10 ORDER BY b
 ----
 ·                distributed  false       ·                   ·
-·                vectorized   false       ·                   ·
+·                vectorized   true        ·                   ·
 sort             ·            ·           (a, b)              +b
  │               order        +b          ·                   ·
  └── index-join  ·            ·           (a, b)              ·
@@ -547,17 +579,17 @@ sort             ·            ·           (a, b)              +b
 query TTTTT colnames
 EXPLAIN (TYPES) INSERT INTO t VALUES (1, 2)
 ----
-tree              field          description       columns                     ordering
-·                 distributed    false             ·                           ·
-·                 vectorized     false             ·                           ·
-count             ·              ·                 ()                          ·
- └── insert       ·              ·                 ()                          ·
-      │           into           t(k, v)           ·                           ·
-      │           strategy       inserter          ·                           ·
-      └── values  ·              ·                 (column1 int, column2 int)  ·
-·                 size           2 columns, 1 row  ·                           ·
-·                 row 0, expr 0  (1)[int]          ·                           ·
-·                 row 0, expr 1  (2)[int]          ·                           ·
+tree                   field          description       columns  ordering
+·                      distributed    false             ·        ·
+·                      vectorized     false             ·        ·
+count                  ·              ·                 ()       ·
+ └── insert-fast-path  ·              ·                 ()       ·
+·                      into           t(k, v)           ·        ·
+·                      strategy       inserter          ·        ·
+·                      auto commit    ·                 ·        ·
+·                      size           2 columns, 1 row  ·        ·
+·                      row 0, expr 0  (1)[int]          ·        ·
+·                      row 0, expr 1  (2)[int]          ·        ·
 
 query TTTTT
 EXPLAIN (TYPES) SELECT 42 AS a
@@ -623,7 +655,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT 2*count(k) as z, v FROM t WHERE v>123 GROUP BY v HAVING v<2 AND count(k)>1
 ----
 ·            distributed  false     ·               ·
-·            vectorized   false     ·               ·
+·            vectorized   true      ·               ·
 render       ·            ·         (z int, v int)  ·
  │           render 0     (z)[int]  ·               ·
  │           render 1     (v)[int]  ·               ·
@@ -638,6 +670,7 @@ count                ·            ·                            ()             
  └── delete          ·            ·                            ()              ·
       │              from         t                            ·               ·
       │              strategy     deleter                      ·               ·
+      │              auto commit  ·                            ·               ·
       └── render     ·            ·                            (k int)         ·
            │         render 0     (k)[int]                     ·               ·
            └── scan  ·            ·                            (k int, v int)  ·
@@ -655,6 +688,7 @@ count                ·            ·                              ()           
       │              table        t                              ·                            ·
       │              set          v                              ·                            ·
       │              strategy     updater                        ·                            ·
+      │              auto commit  ·                              ·                            ·
       └── render     ·            ·                              (k int, v int, column5 int)  ·
            │         render 0     (k)[int]                       ·                            ·
            │         render 1     (v)[int]                       ·                            ·
@@ -690,7 +724,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT v FROM t ORDER BY v
 ----
 ·          distributed  false      ·        ·
-·          vectorized   false      ·        ·
+·          vectorized   true       ·        ·
 sort       ·            ·          (v int)  +v
  │         order        +v         ·        ·
  └── scan  ·            ·          (v int)  ·
@@ -895,7 +929,7 @@ inner-join (hash)
  │    ├── prune: (4,5)
  │    └── interesting orderings: (+4)
  └── filters
-      └── k = a [outer=(1,4), constraints=(/1: (/NULL - ]; /4: (/NULL - ]), fd=(1)==(4), (4)==(1)]
+      └── k:4 = a:1 [outer=(1,4), constraints=(/1: (/NULL - ]; /4: (/NULL - ]), fd=(1)==(4), (4)==(1)]
 
 query T
 EXPLAIN (OPT) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
@@ -939,9 +973,9 @@ sort
       │    │    ├── prune: (1,2)
       │    │    └── interesting orderings: (+1)
       │    └── filters
-      │         └── (a + (b * 2)) > 1 [outer=(1,2)]
+      │         └── (a:1 + (b:2 * 2)) > 1 [outer=(1,2)]
       └── projections
-           └── a * b [outer=(1,2)]
+           └── a:1 * b:2 [as=column4:4, outer=(1,2)]
 
 query T
 EXPLAIN (OPT, TYPES) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
@@ -975,12 +1009,36 @@ sort
       │    └── filters
       │         └── gt [type=bool, outer=(1,2)]
       │              ├── plus [type=int]
-      │              │    ├── variable: a [type=int]
+      │              │    ├── variable: a:1 [type=int]
       │              │    └── mult [type=int]
-      │              │         ├── variable: b [type=int]
+      │              │         ├── variable: b:2 [type=int]
       │              │         └── const: 2 [type=int]
       │              └── const: 1 [type=int]
       └── projections
-           └── mult [type=int, outer=(1,2)]
-                ├── variable: a [type=int]
-                └── variable: b [type=int]
+           └── mult [as=column4:4, type=int, outer=(1,2)]
+                ├── variable: a:1 [type=int]
+                └── variable: b:2 [type=int]
+
+query TTT colnames
+EXPLAIN SELECT string_agg(x, y) FROM (VALUES ('foo', 'foo'), ('bar', 'bar')) t(x, y)
+----
+tree         field        description
+·            distributed  false
+·            vectorized   false
+group        ·            ·
+ │           aggregate 0  string_agg(column1, column2)
+ │           scalar       ·
+ └── values  ·            ·
+·            size         2 columns, 2 rows
+
+query TTT
+EXPLAIN SELECT corr(a, b) FROM tc;
+----
+·          distributed  false
+·          vectorized   true
+group      ·            ·
+ │         aggregate 0  corr(a, b)
+ │         scalar       ·
+ └── scan  ·            ·
+·          table        tc@primary
+·          spans        ALL

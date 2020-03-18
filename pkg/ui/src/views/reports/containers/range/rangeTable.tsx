@@ -13,15 +13,14 @@ import _ from "lodash";
 import Long from "long";
 import moment from "moment";
 import React from "react";
-
 import * as protos from "src/js/protos";
+import { cockroach } from "src/js/protos";
+import { LongToMoment, NanoToMilli, SecondsToNano } from "src/util/convert";
 import { FixLong } from "src/util/fixLong";
-import {LongToMoment, NanoToMilli, SecondsToNano} from "src/util/convert";
 import { Bytes } from "src/util/format";
 import Lease from "src/views/reports/containers/range/lease";
 import Print from "src/views/reports/containers/range/print";
 import RangeInfo from "src/views/reports/containers/range/rangeInfo";
-import {cockroach} from "src/js/protos";
 
 interface RangeTableProps {
   infos: protos.cockroach.server.serverpb.IRangeInfo[];
@@ -105,8 +104,8 @@ const rangeTableQuiescent: RangeTableCellContent = {
   className: ["range-table__cell--quiescent"],
 };
 
-function convertLeaseState(leaseState: protos.cockroach.storage.LeaseState) {
-  return protos.cockroach.storage.LeaseState[leaseState].toLowerCase();
+function convertLeaseState(leaseState: protos.cockroach.kv.kvserver.storagepb.LeaseState) {
+  return protos.cockroach.kv.kvserver.storagepb.LeaseState[leaseState].toLowerCase();
 }
 
 export default class RangeTable extends React.Component<RangeTableProps, {}> {
@@ -162,7 +161,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
     };
   }
 
-  contentGCAvgAge(mvcc: cockroach.storage.engine.enginepb.IMVCCStats): RangeTableCellContent {
+  contentGCAvgAge(mvcc: cockroach.storage.enginepb.IMVCCStats): RangeTableCellContent {
     if (mvcc === null) {
       return this.contentDuration(Long.fromNumber(0));
     }
@@ -175,7 +174,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
     }
   }
 
-  createContentIntentAvgAge(mvcc: cockroach.storage.engine.enginepb.IMVCCStats): RangeTableCellContent {
+  createContentIntentAvgAge(mvcc: cockroach.storage.enginepb.IMVCCStats): RangeTableCellContent {
     if (mvcc === null) {
       return this.contentDuration(Long.fromNumber(0));
     }
@@ -428,9 +427,10 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
     const { infos, replicas } = this.props;
     const leader = _.head(infos);
     const rangeID = leader.state.state.desc.range_id;
+    const data = _.chain(infos);
 
     // We want to display ordered by store ID.
-    const sortedStoreIDs = _.chain(infos)
+    const sortedStoreIDs = data
       .map(info => info.source_store_id)
       .sortBy(id => id)
       .value();
@@ -456,7 +456,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
       } else {
         leaseState = this.createContent(
           convertLeaseState(info.lease_status.state),
-          info.lease_status.state === protos.cockroach.storage.LeaseState.VALID ? "" :
+          info.lease_status.state === protos.cockroach.kv.kvserver.storagepb.LeaseState.VALID ? "" :
             "range-table__cell--warning",
         );
       }
@@ -554,7 +554,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
 
     return (
       <div>
-        <h2>Range r{rangeID.toString()} at {Print.Time(moment().utc())} UTC</h2>
+        <h2 className="base-heading">Range r{rangeID.toString()} at {Print.Time(moment().utc())} UTC</h2>
         <table className="range-table">
           <tbody>
             {

@@ -14,12 +14,13 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -81,7 +82,8 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	if err != nil {
 		return PhysicalPlan{}, err
 	}
-	scan.spans, err = unconstrainedSpans(desc, scan.index, scan.isDeleteSource)
+	sb := span.MakeBuilder(desc.TableDesc(), scan.index)
+	scan.spans, err = sb.UnconstrainedSpans(scan.isDeleteSource)
 	if err != nil {
 		return PhysicalPlan{}, err
 	}
@@ -224,7 +226,7 @@ func (dsp *DistSQLPlanner) planAndRunCreateStats(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
 	planCtx *PlanningCtx,
-	txn *client.Txn,
+	txn *kv.Txn,
 	job *jobs.Job,
 	resultRows *RowResultWriter,
 ) error {

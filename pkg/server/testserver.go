@@ -26,9 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -37,10 +39,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/tscache"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -66,7 +67,7 @@ func makeTestConfig(st *cluster.Settings) Config {
 	cfg.Insecure = false
 
 	// Configure test storage engine.
-	cfg.StorageEngine = engine.TestStorageEngine
+	cfg.StorageEngine = storage.DefaultStorageEngine
 
 	// Configure the default in-memory temp storage for all tests unless
 	// otherwise configured.
@@ -103,7 +104,7 @@ func makeTestConfig(st *cluster.Settings) Config {
 func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	st := params.Settings
 	if params.Settings == nil {
-		st = cluster.MakeClusterSettings(cluster.BinaryMinimumSupportedVersion, cluster.BinaryServerVersion)
+		st = cluster.MakeClusterSettings()
 	}
 	st.ExternalIODir = params.ExternalIODir
 	cfg := makeTestConfig(st)
@@ -124,7 +125,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg.RetryOptions = params.RetryOptions
 	cfg.Locality = params.Locality
 	if knobs := params.Knobs.Store; knobs != nil {
-		if mo := knobs.(*storage.StoreTestingKnobs).MaxOffset; mo != 0 {
+		if mo := knobs.(*kvserver.StoreTestingKnobs).MaxOffset; mo != 0 {
 			cfg.MaxOffset = MaxOffsetType(mo)
 		}
 	}
@@ -159,6 +160,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	}
 	if params.SQLMemoryPoolSize != 0 {
 		cfg.SQLMemoryPoolSize = params.SQLMemoryPoolSize
+	}
+	if params.CacheSize != 0 {
+		cfg.CacheSize = params.CacheSize
 	}
 
 	if params.JoinAddr != "" {
@@ -229,9 +233,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	}
 
 	if cfg.TestingKnobs.Store == nil {
-		cfg.TestingKnobs.Store = &storage.StoreTestingKnobs{}
+		cfg.TestingKnobs.Store = &kvserver.StoreTestingKnobs{}
 	}
-	cfg.TestingKnobs.Store.(*storage.StoreTestingKnobs).SkipMinSizeCheck = true
+	cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs).SkipMinSizeCheck = true
 	return cfg
 }
 
@@ -254,7 +258,7 @@ type TestServer struct {
 	*Server
 	// authClient is an http.Client that has been authenticated to access the
 	// Admin UI.
-	authClient struct {
+	authClient [2]struct {
 		httpClient http.Client
 		cookie     *serverpb.SessionCookie
 		once       sync.Once
@@ -313,7 +317,7 @@ func (ts *TestServer) TsDB() *ts.DB {
 }
 
 // DB returns the client.DB instance used by the TestServer.
-func (ts *TestServer) DB() *client.DB {
+func (ts *TestServer) DB() *kv.DB {
 	if ts != nil {
 		return ts.db
 	}
@@ -329,7 +333,7 @@ func (ts *TestServer) PGServer() *pgwire.Server {
 }
 
 // RaftTransport returns the RaftTransport used by the TestServer.
-func (ts *TestServer) RaftTransport() *storage.RaftTransport {
+func (ts *TestServer) RaftTransport() *kvserver.RaftTransport {
 	if ts != nil {
 		return ts.raftTransport
 	}
@@ -391,7 +395,7 @@ func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
 // ExpectedInitialRangeCount returns the expected number of ranges that should
 // be on the server after bootstrap.
 func ExpectedInitialRangeCount(
-	db *client.DB, defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
+	db *kv.DB, defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) (int, error) {
 	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(context.Background(), db, defaultZoneConfig, defaultSystemZoneConfig)
 	if err != nil {
@@ -415,7 +419,7 @@ func ExpectedInitialRangeCount(
 }
 
 // Stores returns the collection of stores from this TestServer's node.
-func (ts *TestServer) Stores() *storage.Stores {
+func (ts *TestServer) Stores() *kvserver.Stores {
 	return ts.node.stores
 }
 
@@ -430,7 +434,7 @@ func (ts *TestServer) ClusterSettings() *cluster.Settings {
 }
 
 // Engines returns the TestServer's engines.
-func (ts *TestServer) Engines() []engine.Engine {
+func (ts *TestServer) Engines() []storage.Engine {
 	return ts.engines
 }
 
@@ -477,24 +481,41 @@ func (ts *TestServer) GetHTTPClient() (http.Client, error) {
 }
 
 const authenticatedUserName = "authentic_user"
+const authenticatedUserNameNoAdmin = "authentic_user_noadmin"
 
-// GetAuthenticatedHTTPClient implements the TestServerInterface.
-func (ts *TestServer) GetAuthenticatedHTTPClient() (http.Client, error) {
-	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie()
+// GetAdminAuthenticatedHTTPClient implements the TestServerInterface.
+func (ts *TestServer) GetAdminAuthenticatedHTTPClient() (http.Client, error) {
+	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authenticatedUserName, true)
 	return httpClient, err
 }
 
-func (ts *TestServer) getAuthenticatedHTTPClientAndCookie() (
-	http.Client,
-	*serverpb.SessionCookie,
-	error,
-) {
-	ts.authClient.once.Do(func() {
-		// Create an authentication session for an arbitrary user. We do not
-		// currently have an authorization mechanism, so a specific user is not
-		// necessary.
-		ts.authClient.err = func() error {
-			id, secret, err := ts.authentication.newAuthSession(context.TODO(), authenticatedUserName)
+// GetAuthenticatedHTTPClient implements the TestServerInterface.
+func (ts *TestServer) GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, error) {
+	authUser := authenticatedUserName
+	if !isAdmin {
+		authUser = authenticatedUserNameNoAdmin
+	}
+	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authUser, isAdmin)
+	return httpClient, err
+}
+
+func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
+	authUser string, isAdmin bool,
+) (http.Client, *serverpb.SessionCookie, error) {
+	authIdx := 0
+	if isAdmin {
+		authIdx = 1
+	}
+	authClient := &ts.authClient[authIdx]
+	authClient.once.Do(func() {
+		// Create an authentication session for an arbitrary admin user.
+		authClient.err = func() error {
+			// The user needs to exist as the admin endpoints will check its role.
+			if err := ts.createAuthUser(authUser, isAdmin); err != nil {
+				return err
+			}
+
+			id, secret, err := ts.authentication.newAuthSession(context.TODO(), authUser)
 			if err != nil {
 				return err
 			}
@@ -517,17 +538,39 @@ func (ts *TestServer) getAuthenticatedHTTPClientAndCookie() (
 			}
 			cookieJar.SetCookies(url, []*http.Cookie{cookie})
 			// Create an httpClient and attach the cookie jar to the client.
-			ts.authClient.httpClient, err = ts.Cfg.GetHTTPClient()
+			authClient.httpClient, err = ts.Cfg.GetHTTPClient()
 			if err != nil {
 				return err
 			}
-			ts.authClient.httpClient.Jar = cookieJar
-			ts.authClient.cookie = rawCookie
+			authClient.httpClient.Jar = cookieJar
+			authClient.cookie = rawCookie
 			return nil
 		}()
 	})
 
-	return ts.authClient.httpClient, ts.authClient.cookie, ts.authClient.err
+	return authClient.httpClient, authClient.cookie, authClient.err
+}
+
+func (ts *TestServer) createAuthUser(userName string, isAdmin bool) error {
+	if _, err := ts.Server.internalExecutor.ExecEx(context.TODO(),
+		"create-auth-user", nil,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		"CREATE USER $1", userName,
+	); err != nil {
+		return err
+	}
+	if isAdmin {
+		// We can't use the GRANT statement here because we don't want
+		// to rely on CCL code.
+		if _, err := ts.Server.internalExecutor.ExecEx(context.TODO(),
+			"grant-admin", nil,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+			"INSERT INTO system.role_members (role, member, \"isAdmin\") VALUES ('admin', $1, true)", userName,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // MustGetSQLCounter implements TestServerInterface.
@@ -595,11 +638,6 @@ func (ts *TestServer) GetNode() *Node {
 	return ts.node
 }
 
-// GetNodeLiveness exposes the Server's nodeLiveness.
-func (ts *TestServer) GetNodeLiveness() *storage.NodeLiveness {
-	return ts.nodeLiveness
-}
-
 // DistSenderI is part of DistSendeInterface.
 func (ts *TestServer) DistSenderI() interface{} {
 	return ts.distSender
@@ -607,8 +645,13 @@ func (ts *TestServer) DistSenderI() interface{} {
 
 // DistSender is like DistSenderI(), but returns the real type instead of
 // interface{}.
-func (ts *TestServer) DistSender() *kv.DistSender {
-	return ts.DistSenderI().(*kv.DistSender)
+func (ts *TestServer) DistSender() *kvcoord.DistSender {
+	return ts.DistSenderI().(*kvcoord.DistSender)
+}
+
+// SQLServer is part of TestServerInterface.
+func (ts *TestServer) SQLServer() interface{} {
+	return ts.PGServer().SQLServer
 }
 
 // DistSQLServer is part of TestServerInterface.
@@ -617,14 +660,14 @@ func (ts *TestServer) DistSQLServer() interface{} {
 }
 
 // SetDistSQLSpanResolver is part of TestServerInterface.
-func (ts *Server) SetDistSQLSpanResolver(spanResolver interface{}) {
-	ts.execCfg.DistSQLPlanner.SetSpanResolver(spanResolver.(physicalplan.SpanResolver))
+func (s *Server) SetDistSQLSpanResolver(spanResolver interface{}) {
+	s.execCfg.DistSQLPlanner.SetSpanResolver(spanResolver.(physicalplan.SpanResolver))
 }
 
 // GetFirstStoreID is part of TestServerInterface.
 func (ts *TestServer) GetFirstStoreID() roachpb.StoreID {
 	firstStoreID := roachpb.StoreID(-1)
-	err := ts.Stores().VisitStores(func(s *storage.Store) error {
+	err := ts.Stores().VisitStores(func(s *kvserver.Store) error {
 		if firstStoreID == -1 {
 			firstStoreID = s.Ident.StoreID
 		}
@@ -638,7 +681,7 @@ func (ts *TestServer) GetFirstStoreID() roachpb.StoreID {
 
 // LookupRange returns the descriptor of the range containing key.
 func (ts *TestServer) LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, error) {
-	rs, _, err := client.RangeLookup(context.Background(), ts.DB().NonTransactionalSender(),
+	rs, _, err := kv.RangeLookup(context.Background(), ts.DB().NonTransactionalSender(),
 		key, roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
 	if err != nil {
 		return roachpb.RangeDescriptor{}, errors.Errorf(
@@ -656,7 +699,7 @@ func (ts *TestServer) MergeRanges(leftKey roachpb.Key) (roachpb.RangeDescriptor,
 			Key: leftKey,
 		},
 	}
-	_, pErr := client.SendWrapped(ctx, ts.DB().NonTransactionalSender(), &mergeReq)
+	_, pErr := kv.SendWrapped(ctx, ts.DB().NonTransactionalSender(), &mergeReq)
 	if pErr != nil {
 		return roachpb.RangeDescriptor{},
 			errors.Errorf(
@@ -687,7 +730,7 @@ func (ts *TestServer) SplitRange(
 		SplitKey:       splitKey,
 		ExpirationTime: hlc.MaxTimestamp,
 	}
-	_, pErr := client.SendWrapped(ctx, ts.DB().NonTransactionalSender(), &splitReq)
+	_, pErr := kv.SendWrapped(ctx, ts.DB().NonTransactionalSender(), &splitReq)
 	if pErr != nil {
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
 			errors.Errorf(
@@ -707,9 +750,9 @@ func (ts *TestServer) SplitRange(
 	// be retried. Instead, the message to wrap is stored in case of
 	// non-retryable failures and then wrapped when the full transaction fails.
 	var wrappedMsg string
-	if err := ts.DB().Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := ts.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		scanMeta := func(key roachpb.RKey, reverse bool) (desc roachpb.RangeDescriptor, err error) {
-			var kvs []client.KeyValue
+			var kvs []kv.KeyValue
 			if reverse {
 				// Find the last range that ends at or before key.
 				kvs, err = txn.ReverseScan(
@@ -771,7 +814,7 @@ func (ts *TestServer) GetRangeLease(
 			Key: key,
 		},
 	}
-	leaseResp, pErr := client.SendWrappedWith(
+	leaseResp, pErr := kv.SendWrappedWith(
 		ctx,
 		ts.DB().NonTransactionalSender(),
 		roachpb.Header{
@@ -808,7 +851,7 @@ func (ts *TestServer) GCSystemLog(
 	return ts.gcSystemLog(ctx, table, timestampLowerBound, timestampUpperBound)
 }
 
-// ForceTableGC sends a GCRequest for the ranges corresponding to a table.
+// ForceTableGC is part of TestServerInterface.
 func (ts *TestServer) ForceTableGC(
 	ctx context.Context, database, table string, timestamp hlc.Timestamp,
 ) error {
@@ -817,8 +860,10 @@ func (ts *TestServer) ForceTableGC(
    JOIN system.namespace dbs ON dbs.id = tables."parentID"
    WHERE dbs.name = $1 AND tables.name = $2
  `
-	row, err := ts.internalExecutor.QueryRow(
-		ctx, "resolve-table-id", nil /* txn */, tableIDQuery, database, table)
+	row, err := ts.internalExecutor.QueryRowEx(
+		ctx, "resolve-table-id", nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		tableIDQuery, database, table)
 	if err != nil {
 		return err
 	}
@@ -837,7 +882,7 @@ func (ts *TestServer) ForceTableGC(
 		},
 		Threshold: timestamp,
 	}
-	_, pErr := client.SendWrapped(ctx, ts.distSender, &gcr)
+	_, pErr := kv.SendWrapped(ctx, ts.distSender, &gcr)
 	return pErr.GoError()
 }
 

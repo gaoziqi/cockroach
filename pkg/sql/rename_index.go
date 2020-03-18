@@ -34,9 +34,13 @@ type renameIndexNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNode, error) {
-	_, tableDesc, err := expandMutableIndexName(ctx, p, n.Index, true /* requireTable */)
+	_, tableDesc, err := expandMutableIndexName(ctx, p, n.Index, !n.IfExists /* requireTable */)
 	if err != nil {
 		return nil, err
+	}
+	if tableDesc == nil {
+		// IfExists specified and table did not exist -- noop.
+		return newZeroNode(nil /* columns */), nil
 	}
 
 	idx, _, err := tableDesc.FindIndexByName(string(n.Index.Index))
@@ -55,6 +59,11 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 
 	return &renameIndexNode{n: n, idx: idx, tableDesc: tableDesc}, nil
 }
+
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because RENAME DATABASE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *renameIndexNode) ReadingOwnWrites() {}
 
 func (n *renameIndexNode) startExec(params runParams) error {
 	p := params.p
@@ -91,7 +100,8 @@ func (n *renameIndexNode) startExec(params runParams) error {
 		return err
 	}
 
-	return p.writeSchemaChange(ctx, tableDesc, sqlbase.InvalidMutationID)
+	return p.writeSchemaChange(
+		ctx, tableDesc, sqlbase.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()))
 }
 
 func (n *renameIndexNode) Next(runParams) (bool, error) { return false, nil }

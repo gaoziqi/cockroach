@@ -15,13 +15,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan/replicaoracle"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -32,7 +32,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
-const expectedFollowerReadOffset = -1 * (30 * (1 + .2*3)) * time.Second
+const (
+	defaultInterval                          = 3
+	defaultFraction                          = .2
+	defaultMultiple                          = 3
+	expectedFollowerReadOffset time.Duration = 1e9 * /* 1 second */
+		-defaultInterval * (1 + defaultFraction*defaultMultiple)
+)
 
 func TestEvalFollowerReadOffset(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -57,13 +63,13 @@ func TestCanSendToFollower(t *testing.T) {
 	disableEnterprise := utilccl.TestingEnableEnterprise()
 	defer disableEnterprise()
 	st := cluster.MakeTestingClusterSettings()
-	storage.FollowerReadsEnabled.Override(&st.SV, true)
+	kvserver.FollowerReadsEnabled.Override(&st.SV, true)
 
 	old := hlc.Timestamp{
 		WallTime: timeutil.Now().Add(2 * expectedFollowerReadOffset).UnixNano(),
 	}
 	oldHeader := roachpb.Header{Txn: &roachpb.Transaction{
-		OrigTimestamp: old,
+		ReadTimestamp: old,
 	}}
 	rw := roachpb.BatchRequest{Header: oldHeader}
 	rw.Add(&roachpb.PutRequest{})
@@ -88,21 +94,21 @@ func TestCanSendToFollower(t *testing.T) {
 	roRWTxnOld := roachpb.BatchRequest{Header: roachpb.Header{
 		Txn: &roachpb.Transaction{
 			TxnMeta:       enginepb.TxnMeta{Key: []byte("key")},
-			OrigTimestamp: old,
+			ReadTimestamp: old,
 		},
 	}}
 	roRWTxnOld.Add(&roachpb.GetRequest{})
 	if canSendToFollower(uuid.MakeV4(), st, roRWTxnOld) {
 		t.Fatalf("should not be able to send a ro request from a rw txn to a follower")
 	}
-	storage.FollowerReadsEnabled.Override(&st.SV, false)
+	kvserver.FollowerReadsEnabled.Override(&st.SV, false)
 	if canSendToFollower(uuid.MakeV4(), st, roOld) {
 		t.Fatalf("should not be able to send an old ro batch to a follower when follower reads are disabled")
 	}
-	storage.FollowerReadsEnabled.Override(&st.SV, true)
+	kvserver.FollowerReadsEnabled.Override(&st.SV, true)
 	roNew := roachpb.BatchRequest{Header: roachpb.Header{
 		Txn: &roachpb.Transaction{
-			OrigTimestamp: hlc.Timestamp{WallTime: timeutil.Now().UnixNano()},
+			ReadTimestamp: hlc.Timestamp{WallTime: timeutil.Now().UnixNano()},
 		},
 	}}
 	if canSendToFollower(uuid.MakeV4(), st, roNew) {
@@ -143,16 +149,16 @@ func TestOracleFactory(t *testing.T) {
 	disableEnterprise := utilccl.TestingEnableEnterprise()
 	defer disableEnterprise()
 	st := cluster.MakeTestingClusterSettings()
-	storage.FollowerReadsEnabled.Override(&st.SV, true)
+	kvserver.FollowerReadsEnabled.Override(&st.SV, true)
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
 	rpcContext := rpc.NewInsecureTestingContext(clock, stopper)
-	c := client.NewDB(log.AmbientContext{
+	c := kv.NewDB(log.AmbientContext{
 		Tracer: tracing.NewTracer(),
-	}, client.MockTxnSenderFactory{},
+	}, kv.MockTxnSenderFactory{},
 		hlc.NewClock(hlc.UnixNano, time.Nanosecond))
-	txn := client.NewTxn(context.TODO(), c, 0, client.RootTxn)
+	txn := kv.NewTxn(context.TODO(), c, 0)
 	of := replicaoracle.NewOracleFactory(followerReadAwareChoice, replicaoracle.Config{
 		Settings:   st,
 		RPCContext: rpcContext,

@@ -22,15 +22,17 @@ package colexec
 import (
 	"bytes"
 	"math"
+	"time"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	// {{/*
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// */}}
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
+	// */}}
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -42,6 +44,12 @@ var _ bytes.Buffer
 
 // Dummy import to pull in "apd" package.
 var _ apd.Decimal
+
+// Dummy import to pull in "time" package.
+var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // Dummy import to pull in "tree" package.
 var _ tree.Datum
@@ -63,19 +71,16 @@ func _ASSIGN_CMP(_, _, _ string) bool {
 
 // */}}
 
-// Use execgen package to remove unused import warning.
-var _ interface{} = execgen.UNSAFEGET
-
 // {{range .}} {{/* for each aggregation (min and max) */}}
 
 // {{/* Capture the aggregation name so we can use it in the inner loop. */}}
 // {{$agg := .AggNameLower}}
 
-func new_AGG_TITLEAgg(t coltypes.T) (aggregateFunc, error) {
+func new_AGG_TITLEAgg(allocator *Allocator, t coltypes.T) (aggregateFunc, error) {
 	switch t {
 	// {{range .Overloads}}
 	case _TYPES_T:
-		return &_AGG_TYPEAgg{}, nil
+		return &_AGG_TYPEAgg{allocator: allocator}, nil
 	// {{end}}
 	default:
 		return nil, errors.Errorf("unsupported min agg type %s", t)
@@ -85,14 +90,18 @@ func new_AGG_TITLEAgg(t coltypes.T) (aggregateFunc, error) {
 // {{range .Overloads}}
 
 type _AGG_TYPEAgg struct {
-	done   bool
-	groups []bool
-	curIdx int
+	allocator *Allocator
+	done      bool
+	groups    []bool
+	curIdx    int
 	// curAgg holds the running min/max, so we can index into the slice once per
 	// group, instead of on each iteration.
+	// NOTE: if foundNonNullForCurrentGroup is false, curAgg is undefined.
 	curAgg _GOTYPE
-	// vec points to the output vector we are updating.
-	vec _GOTYPESLICE
+	// col points to the output vector we are updating.
+	col _GOTYPESLICE
+	// vec is the same as col before conversion from coldata.Vec.
+	vec coldata.Vec
 	// nulls points to the output null vector that we are updating.
 	nulls *coldata.Nulls
 	// foundNonNullForCurrentGroup tracks if we have seen any non-null values
@@ -104,15 +113,13 @@ var _ aggregateFunc = &_AGG_TYPEAgg{}
 
 func (a *_AGG_TYPEAgg) Init(groups []bool, v coldata.Vec) {
 	a.groups = groups
-	a.vec = v._TYPE()
+	a.vec = v
+	a.col = v._TYPE()
 	a.nulls = v.Nulls()
 	a.Reset()
 }
 
 func (a *_AGG_TYPEAgg) Reset() {
-	// TODO(asubiotto): Zeros don't seem necessary.
-	execgen.ZERO(a.vec)
-	a.curAgg = zero_TYPEColumn[0]
 	a.curIdx = -1
 	a.foundNonNullForCurrentGroup = false
 	a.nulls.UnsetNulls()
@@ -126,10 +133,7 @@ func (a *_AGG_TYPEAgg) CurrentOutputIndex() int {
 func (a *_AGG_TYPEAgg) SetOutputIndex(idx int) {
 	if a.curIdx != -1 {
 		a.curIdx = idx
-		vecLen := execgen.LEN(a.vec)
-		target := execgen.SLICE(a.vec, idx+1, vecLen)
-		execgen.ZERO(target)
-		a.nulls.UnsetNullsAfter(uint16(idx + 1))
+		a.nulls.UnsetNullsAfter(idx + 1)
 	}
 }
 
@@ -143,40 +147,51 @@ func (a *_AGG_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 		// any non-nulls for this group so far, the output for this group should
 		// be null.
 		if !a.foundNonNullForCurrentGroup {
-			a.nulls.SetNull(uint16(a.curIdx))
+			a.nulls.SetNull(a.curIdx)
+		} else {
+			a.allocator.PerformOperation(
+				[]coldata.Vec{a.vec},
+				func() {
+					execgen.SET(a.col, a.curIdx, a.curAgg)
+				},
+			)
 		}
-		execgen.SET(a.vec, a.curIdx, a.curAgg)
 		a.curIdx++
 		a.done = true
 		return
 	}
 	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
 	col, nulls := vec._TYPE(), vec.Nulls()
-	if nulls.MaybeHasNulls() {
-		if sel != nil {
-			sel = sel[:inputLen]
-			for _, i := range sel {
-				_ACCUMULATE_MINMAX(a, nulls, i, true)
+	a.allocator.PerformOperation(
+		[]coldata.Vec{a.vec},
+		func() {
+			if nulls.MaybeHasNulls() {
+				if sel != nil {
+					sel = sel[:inputLen]
+					for _, i := range sel {
+						_ACCUMULATE_MINMAX(a, nulls, i, true)
+					}
+				} else {
+					col = execgen.SLICE(col, 0, inputLen)
+					for execgen.RANGE(i, col, 0, inputLen) {
+						_ACCUMULATE_MINMAX(a, nulls, i, true)
+					}
+				}
+			} else {
+				if sel != nil {
+					sel = sel[:inputLen]
+					for _, i := range sel {
+						_ACCUMULATE_MINMAX(a, nulls, i, false)
+					}
+				} else {
+					col = execgen.SLICE(col, 0, inputLen)
+					for execgen.RANGE(i, col, 0, inputLen) {
+						_ACCUMULATE_MINMAX(a, nulls, i, false)
+					}
+				}
 			}
-		} else {
-			col = execgen.SLICE(col, 0, int(inputLen))
-			for execgen.RANGE(i, col) {
-				_ACCUMULATE_MINMAX(a, nulls, i, true)
-			}
-		}
-	} else {
-		if sel != nil {
-			sel = sel[:inputLen]
-			for _, i := range sel {
-				_ACCUMULATE_MINMAX(a, nulls, i, false)
-			}
-		} else {
-			col = execgen.SLICE(col, 0, int(inputLen))
-			for execgen.RANGE(i, col) {
-				_ACCUMULATE_MINMAX(a, nulls, i, false)
-			}
-		}
-	}
+		},
+	)
 }
 
 func (a *_AGG_TYPEAgg) HandleEmptyInputScalar() {
@@ -200,31 +215,28 @@ func _ACCUMULATE_MINMAX(a *_AGG_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS
 		// negative, it means that this is the first group.
 		if a.curIdx >= 0 {
 			if !a.foundNonNullForCurrentGroup {
-				a.nulls.SetNull(uint16(a.curIdx))
+				a.nulls.SetNull(a.curIdx)
+			} else {
+				execgen.SET(a.col, a.curIdx, a.curAgg)
 			}
-			execgen.SET(a.vec, a.curIdx, a.curAgg)
 		}
 		a.curIdx++
 		a.foundNonNullForCurrentGroup = false
-		// The next element of vec is guaranteed  to be initialized to the zero
-		// value. We can't use zero_TYPEColumn here because this is outside of
-		// the earlier template block.
-		a.curAgg = execgen.UNSAFEGET(a.vec, a.curIdx)
 	}
 	var isNull bool
 	// {{ if .HasNulls }}
-	isNull = nulls.NullAt(uint16(i))
+	isNull = nulls.NullAt(i)
 	// {{ else }}
 	isNull = false
 	// {{ end }}
 	if !isNull {
 		if !a.foundNonNullForCurrentGroup {
-			a.curAgg = execgen.UNSAFEGET(col, int(i))
+			a.curAgg = execgen.UNSAFEGET(col, i)
 			a.foundNonNullForCurrentGroup = true
 		} else {
 			var cmp bool
-			candidate := execgen.UNSAFEGET(col, int(i))
-			_ASSIGN_CMP("cmp", "candidate", "a.curAgg")
+			candidate := execgen.UNSAFEGET(col, i)
+			_ASSIGN_CMP(cmp, candidate, a.curAgg)
 			if cmp {
 				a.curAgg = candidate
 			}

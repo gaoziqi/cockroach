@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"time"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -34,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -52,12 +54,18 @@ var _ tree.Datum
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
 
+// Dummy import to pull in "time" package.
+var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
+
 // Dummy import to pull in "coltypes" package.
 var _ = coltypes.Bool
 
 // _ASSIGN_CMP is the template function for assigning the result of comparing
 // the second input to the third input into the first input.
-func _ASSIGN_CMP(_, _, _ interface{}) uint64 {
+func _ASSIGN_CMP(_, _, _ interface{}) int {
 	execerror.VectorizedInternalPanic("")
 }
 
@@ -72,8 +80,8 @@ func _SEL_CONST_LOOP(_HAS_NULLS bool) { // */}}
 		sel = sel[:n]
 		for _, i := range sel {
 			var cmp bool
-			arg := execgen.UNSAFEGET(col, int(i))
-			_ASSIGN_CMP("cmp", "arg", "p.constArg")
+			arg := execgen.UNSAFEGET(col, i)
+			_ASSIGN_CMP(cmp, arg, p.constArg)
 			// {{if _HAS_NULLS}}
 			isNull := nulls.NullAt(i)
 			// {{else}}
@@ -87,18 +95,18 @@ func _SEL_CONST_LOOP(_HAS_NULLS bool) { // */}}
 	} else {
 		batch.SetSelection(true)
 		sel := batch.Selection()
-		col = execgen.SLICE(col, 0, int(n))
-		for execgen.RANGE(i, col) {
+		col = execgen.SLICE(col, 0, n)
+		for execgen.RANGE(i, col, 0, n) {
 			var cmp bool
 			arg := execgen.UNSAFEGET(col, i)
-			_ASSIGN_CMP("cmp", "arg", "p.constArg")
+			_ASSIGN_CMP(cmp, arg, p.constArg)
 			// {{if _HAS_NULLS}}
-			isNull := nulls.NullAt(uint16(i))
+			isNull := nulls.NullAt(i)
 			// {{else}}
 			isNull := false
 			// {{end}}
 			if cmp && !isNull {
-				sel[idx] = uint16(i)
+				sel[idx] = i
 				idx++
 			}
 		}
@@ -117,9 +125,9 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 		sel = sel[:n]
 		for _, i := range sel {
 			var cmp bool
-			arg1 := execgen.UNSAFEGET(col1, int(i))
-			arg2 := _R_UNSAFEGET(col2, int(i))
-			_ASSIGN_CMP("cmp", "arg1", "arg2")
+			arg1 := execgen.UNSAFEGET(col1, i)
+			arg2 := _R_UNSAFEGET(col2, i)
+			_ASSIGN_CMP(cmp, arg1, arg2)
 			// {{if _HAS_NULLS}}
 			isNull := nulls.NullAt(i)
 			// {{else}}
@@ -133,21 +141,26 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 	} else {
 		batch.SetSelection(true)
 		sel := batch.Selection()
-		col1 = execgen.SLICE(col1, 0, int(n))
+		// {{if not (eq .LTyp.String "Bytes")}}
+		// {{/* Slice is a noop for Bytes type, so col1Len below might contain an
+		// incorrect value. In order to keep bounds check elimination for all other
+		// types, we simply omit this code snippet for Bytes. */}}
+		col1 = execgen.SLICE(col1, 0, n)
 		col1Len := execgen.LEN(col1)
 		col2 = _R_SLICE(col2, 0, col1Len)
-		for execgen.RANGE(i, col1) {
+		// {{end}}
+		for execgen.RANGE(i, col1, 0, n) {
 			var cmp bool
 			arg1 := execgen.UNSAFEGET(col1, i)
 			arg2 := _R_UNSAFEGET(col2, i)
-			_ASSIGN_CMP("cmp", "arg1", "arg2")
+			_ASSIGN_CMP(cmp, arg1, arg2)
 			// {{if _HAS_NULLS}}
-			isNull := nulls.NullAt(uint16(i))
+			isNull := nulls.NullAt(i)
 			// {{else}}
 			isNull := false
 			// {{end}}
 			if cmp && !isNull {
-				sel[idx] = uint16(i)
+				sel[idx] = i
 				idx++
 			}
 		}
@@ -157,6 +170,22 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 	// {{/*
 } // */}}
 
+// selConstOpBase contains all of the fields for binary selections with a
+// constant, except for the constant itself.
+type selConstOpBase struct {
+	OneInputNode
+	colIdx         int
+	decimalScratch decimalOverloadScratch
+}
+
+// selOpBase contains all of the fields for non-constant binary selections.
+type selOpBase struct {
+	OneInputNode
+	col1Idx        int
+	col2Idx        int
+	decimalScratch decimalOverloadScratch
+}
+
 // {{define "selConstOp"}}
 type _OP_CONST_NAME struct {
 	selConstOpBase
@@ -164,6 +193,12 @@ type _OP_CONST_NAME struct {
 }
 
 func (p *_OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
+	// In order to inline the templated code of overloads, we need to have a
+	// `decimalScratch` local variable of type `decimalOverloadScratch`.
+	decimalScratch := p.decimalScratch
+	// However, the scratch is not used in all of the selection operators, so
+	// we add this to go around "unused" error.
+	_ = decimalScratch
 	for {
 		batch := p.input.Next(ctx)
 		if batch.Length() == 0 {
@@ -172,7 +207,7 @@ func (p *_OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
 
 		vec := batch.ColVec(p.colIdx)
 		col := vec._L_TYP()
-		var idx uint16
+		var idx int
 		n := batch.Length()
 		if vec.MaybeHasNulls() {
 			nulls := vec.Nulls()
@@ -199,6 +234,12 @@ type _OP_NAME struct {
 }
 
 func (p *_OP_NAME) Next(ctx context.Context) coldata.Batch {
+	// In order to inline the templated code of overloads, we need to have a
+	// `decimalScratch` local variable of type `decimalOverloadScratch`.
+	decimalScratch := p.decimalScratch
+	// However, the scratch is not used in all of the selection operators, so
+	// we add this to go around "unused" error.
+	_ = decimalScratch
 	for {
 		batch := p.input.Next(ctx)
 		if batch.Length() == 0 {
@@ -211,7 +252,7 @@ func (p *_OP_NAME) Next(ctx context.Context) coldata.Batch {
 		col2 := vec2._R_TYP()
 		n := batch.Length()
 
-		var idx uint16
+		var idx int
 		if vec1.MaybeHasNulls() || vec2.MaybeHasNulls() {
 			nulls := vec1.Nulls().Or(vec2.Nulls())
 			_SEL_LOOP(true)

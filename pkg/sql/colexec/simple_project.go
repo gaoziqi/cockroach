@@ -14,8 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // simpleProjectOp is an operator that implements "simple projection" - removal of
@@ -24,10 +23,15 @@ type simpleProjectOp struct {
 	OneInputNode
 	NonExplainable
 
-	batch *projectingBatch
+	projection []uint32
+	batches    map[coldata.Batch]*projectingBatch
+	// numBatchesLoggingThreshold is the threshold on the number of items in
+	// 'batches' map at which we will log a message when a new projectingBatch
+	// is created. It is growing exponentially.
+	numBatchesLoggingThreshold int
 }
 
-var _ Operator = &simpleProjectOp{}
+var _ closableOperator = &simpleProjectOp{}
 
 // projectingBatch is a Batch that applies a simple projection to another,
 // underlying batch, discarding all columns but the ones in its projection
@@ -36,6 +40,9 @@ type projectingBatch struct {
 	coldata.Batch
 
 	projection []uint32
+	// colVecs is a lazily populated slice of coldata.Vecs to support returning
+	// these in ColVecs().
+	colVecs []coldata.Vec
 }
 
 func newProjectionBatch(projection []uint32) *projectingBatch {
@@ -49,17 +56,24 @@ func (b *projectingBatch) ColVec(i int) coldata.Vec {
 }
 
 func (b *projectingBatch) ColVecs() []coldata.Vec {
-	execerror.VectorizedInternalPanic("projectingBatch doesn't support ColVecs()")
-	// This code is unreachable, but the compiler cannot infer that.
-	return nil
+	if b.Batch == coldata.ZeroBatch {
+		return nil
+	}
+	if b.colVecs == nil {
+		b.colVecs = make([]coldata.Vec, len(b.projection))
+	}
+	for i := range b.colVecs {
+		b.colVecs[i] = b.Batch.ColVec(int(b.projection[i]))
+	}
+	return b.colVecs
 }
 
 func (b *projectingBatch) Width() int {
 	return len(b.projection)
 }
 
-func (b *projectingBatch) AppendCol(t coltypes.T) {
-	b.Batch.AppendCol(t)
+func (b *projectingBatch) AppendCol(col coldata.Vec) {
+	b.Batch.AppendCol(col)
 	b.projection = append(b.projection, uint32(b.Batch.Width())-1)
 }
 
@@ -81,8 +95,10 @@ func NewSimpleProjectOp(input Operator, numInputCols int, projection []uint32) O
 		}
 	}
 	return &simpleProjectOp{
-		OneInputNode: NewOneInputNode(input),
-		batch:        newProjectionBatch(projection),
+		OneInputNode:               NewOneInputNode(input),
+		projection:                 projection,
+		batches:                    make(map[coldata.Batch]*projectingBatch),
+		numBatchesLoggingThreshold: 128,
 	}
 }
 
@@ -92,7 +108,25 @@ func (d *simpleProjectOp) Init() {
 
 func (d *simpleProjectOp) Next(ctx context.Context) coldata.Batch {
 	batch := d.input.Next(ctx)
-	d.batch.Batch = batch
+	projBatch, found := d.batches[batch]
+	if !found {
+		// We pass in a copy of d.projection just to be safe.
+		projBatch = newProjectionBatch(append([]uint32{}, d.projection...))
+		d.batches[batch] = projBatch
+		if len(d.batches) == d.numBatchesLoggingThreshold {
+			if log.V(1) {
+				log.Infof(ctx, "simpleProjectOp: size of 'batches' map = %d", len(d.batches))
+			}
+			d.numBatchesLoggingThreshold = d.numBatchesLoggingThreshold * 2
+		}
+	}
+	projBatch.Batch = batch
+	return projBatch
+}
 
-	return d.batch
+func (d *simpleProjectOp) Close(ctx context.Context) error {
+	if c, ok := d.input.(closer); ok {
+		return c.Close(ctx)
+	}
+	return nil
 }

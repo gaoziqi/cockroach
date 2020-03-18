@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -188,8 +189,8 @@ func EmptyCompleteZoneConfig() *ZoneConfig {
 func DefaultZoneConfig() ZoneConfig {
 	return ZoneConfig{
 		NumReplicas:   proto.Int32(3),
-		RangeMinBytes: proto.Int64(16 << 20), // 16 MB
-		RangeMaxBytes: proto.Int64(64 << 20), // 64 MB
+		RangeMinBytes: proto.Int64(128 << 20), // 128 MB
+		RangeMaxBytes: proto.Int64(512 << 20), // 512 MB
 		GC: &GCPolicy{
 			// Use 25 hours instead of the previous 24 to make users successful by
 			// default. Users desiring to take incremental backups every 24h may
@@ -216,8 +217,8 @@ func DefaultZoneConfigRef() *ZoneConfig {
 func DefaultSystemZoneConfig() ZoneConfig {
 	return ZoneConfig{
 		NumReplicas:   proto.Int32(5),
-		RangeMinBytes: proto.Int64(16 << 20), // 16 MB
-		RangeMaxBytes: proto.Int64(64 << 20), // 64 MB
+		RangeMinBytes: proto.Int64(128 << 30), // 128 MB
+		RangeMaxBytes: proto.Int64(512 << 30), // 512 MB
 		GC: &GCPolicy{
 			// Use 25 hours instead of the previous 24 to make users successful by
 			// default. Users desiring to take incremental backups every 24h may
@@ -662,4 +663,9 @@ func (c *Constraint) GetKey() string {
 // GetValue is part of the cat.Constraint interface.
 func (c *Constraint) GetValue() string {
 	return c.Value
+}
+
+// TTL returns the implies TTL as a time.Duration.
+func (m *GCPolicy) TTL() time.Duration {
+	return time.Duration(m.TTLSeconds) * time.Second
 }

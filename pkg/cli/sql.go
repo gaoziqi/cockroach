@@ -28,6 +28,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -37,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	readline "github.com/knz/go-libedit"
-	"github.com/lib/pq"
 	isatty "github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
@@ -49,6 +49,7 @@ const (
 # To exit, type: \q.
 #
 `
+	// TODO(#42242): document the \demo_node command.
 	helpMessageFmt = `You are using 'cockroach sql', CockroachDB's lightweight SQL client.
 Type:
   \? or "help"      print this help.
@@ -252,6 +253,12 @@ func (c *cliState) invalidOptSet(nextState cliStateEnum, args []string) cliState
 
 func (c *cliState) invalidOptionChange(nextState cliStateEnum, opt string) cliStateEnum {
 	fmt.Fprintf(stderr, "cannot change option during multi-line editing: %s\n", opt)
+	return nextState
+}
+
+func (c *cliState) internalServerError(nextState cliStateEnum, err error) cliStateEnum {
+	fmt.Fprintf(stderr, "internal server error: %v\n", err)
+	c.exitErr = err
 	return nextState
 }
 
@@ -461,6 +468,58 @@ func (c *cliState) handleUnset(args []string, nextState, errState cliStateEnum) 
 
 func isEndOfStatement(lastTok int) bool {
 	return lastTok == ';' || lastTok == parser.HELPTOKEN
+}
+
+// handleDemoNode handles operations on \demo_node.
+// This can only be done from `cockroach demo`.
+func (c *cliState) handleDemoNode(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
+	usageStr := `Usage: \demo_node <shutdown|restart|recommission|decommission> <node_id>` + "\n"
+	// A transient cluster signifies the presence of `cockroach demo`.
+	if demoCtx.transientCluster == nil {
+		return c.invalidSyntax(errState, `\demo_node can only be run with cockroach demo`)
+	}
+	if len(cmd) != 2 {
+		fmt.Fprint(stderr, usageStr)
+		c.exitErr = errInvalidSyntax
+		return errState
+	}
+	nodeID, err := strconv.ParseInt(cmd[1], 10, 32)
+	if err != nil {
+		return c.invalidSyntax(
+			errState,
+			"%s",
+			errors.Wrapf(err, "cannot convert %s to string", cmd[2]).Error(),
+		)
+	}
+	switch cmd[0] {
+	case "shutdown":
+		if err := demoCtx.transientCluster.DrainNode(roachpb.NodeID(nodeID)); err != nil {
+			return c.internalServerError(errState, err)
+		}
+		fmt.Printf("node %d has been shutdown\n", nodeID)
+		return nextState
+	case "restart":
+		if err := demoCtx.transientCluster.RestartNode(roachpb.NodeID(nodeID)); err != nil {
+			return c.internalServerError(errState, err)
+		}
+		fmt.Printf("node %d has been restarted\n", nodeID)
+		return nextState
+	case "recommission":
+		if err := demoCtx.transientCluster.CallDecommission(roachpb.NodeID(nodeID), false /* decommissioning */); err != nil {
+			return c.internalServerError(errState, err)
+		}
+		fmt.Printf("node %d has been recommissioned\n", nodeID)
+		return nextState
+	case "decommission":
+		if err := demoCtx.transientCluster.CallDecommission(roachpb.NodeID(nodeID), true /* decommissioning */); err != nil {
+			return c.internalServerError(errState, err)
+		}
+		fmt.Printf("node %d has been decommissioned\n", nodeID)
+		return nextState
+	}
+	fmt.Fprint(stderr, usageStr)
+	c.exitErr = errInvalidSyntax
+	return errState
 }
 
 // handleHelp prints SQL help.
@@ -681,14 +740,12 @@ func (c *cliState) refreshTransactionStatus() {
 
 	// Change the prompt based on the response from the server.
 	switch txnString {
-	case sql.NoTxnStr:
+	case sql.NoTxnStateStr:
 		c.lastKnownTxnStatus = ""
 	case sql.AbortedStateStr:
 		c.lastKnownTxnStatus = " ERROR"
 	case sql.CommitWaitStateStr:
 		c.lastKnownTxnStatus = "  DONE"
-	case sql.RestartWaitStateStr:
-		c.lastKnownTxnStatus = " RETRY"
 	case sql.OpenStateStr:
 		// The state AutoRetry is reported by the server as Open, so no need to
 		// handle it here.
@@ -758,8 +815,8 @@ func (c *cliState) GetCompletions(_ string) []string {
 			fmt.Fprintf(c.ins.Stdout(), "\nSuggestion:\n%s\n", helpText)
 		} else if err != nil {
 			// Some other error. Display it.
-			fmt.Fprintf(c.ins.Stdout(), "\n%v\n", err)
-			maybeShowErrorDetails(c.ins.Stdout(), err, false)
+			fmt.Fprintln(c.ins.Stdout())
+			cliOutputError(c.ins.Stdout(), err, true /*showSeverity*/, false /*verbose*/)
 		}
 	}
 
@@ -773,55 +830,7 @@ func (c *cliState) doStart(nextState cliStateEnum) cliStateEnum {
 	c.partialLines = []string{}
 
 	if cliCtx.isInteractive {
-		// If a human user is providing the input, we want to help them with
-		// what they are entering:
-		c.errExit = false // let the user retry failing commands
-		if !sqlCtx.debugMode {
-			// Also, try to enable syntax checking if supported by the server.
-			// This is a form of client-side error checking to help with large txns.
-			c.tryEnableCheckSyntax()
-		}
-
 		fmt.Println("#\n# Enter \\? for a brief introduction.\n#")
-	} else {
-		// When running non-interactive, by default we want errors to stop
-		// further processing and we can just let syntax checking to be
-		// done server-side to avoid client-side churn.
-		c.errExit = true
-		c.checkSyntax = false
-		// We also don't need (smart) prompts at all.
-	}
-
-	if c.hasEditor() {
-		// We only enable prompt and history management when the
-		// interactive input prompter is enabled. This saves on churn and
-		// memory when e.g. piping a large SQL script through the
-		// command-line client.
-
-		// Default prompt is part of the connection URL. eg: "marc@localhost:26257>".
-		c.customPromptPattern = defaultPromptPattern
-		if sqlCtx.debugMode {
-			c.customPromptPattern = debugPromptPattern
-		}
-
-		c.ins.SetCompleter(c)
-		if err := c.ins.UseHistory(-1 /*maxEntries*/, true /*dedup*/); err != nil {
-			log.Warningf(context.TODO(), "cannot enable history: %v", err)
-		} else {
-			homeDir, err := envutil.HomeDir()
-			if err != nil {
-				log.Warningf(context.TODO(), "cannot retrieve user information: %v", err)
-				log.Warning(context.TODO(), "history will not be saved")
-			} else {
-				histFile := filepath.Join(homeDir, cmdHistFile)
-				err = c.ins.LoadHistory(histFile)
-				if err != nil {
-					log.Warningf(context.TODO(), "cannot load the command-line history (file corrupted?): %v", err)
-					log.Warning(context.TODO(), "the history file will be cleared upon first entry")
-				}
-				c.ins.SetAutoSaveHistory(histFile, true)
-			}
-		}
 	}
 
 	return nextState
@@ -1047,6 +1056,9 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		}
 		return c.invalidSyntax(errState, `%s. Try \? for help.`, c.lastInputLine)
 
+	case `\demo_node`:
+		return c.handleDemoNode(cmd[1:], loopState, errState)
+
 	default:
 		if strings.HasPrefix(cmd[0], `\d`) {
 			// Unrecognized command for now, but we want to be helpful.
@@ -1123,8 +1135,8 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 			fmt.Println(helpText)
 		}
 
-		_ = c.invalidSyntax(0, "statement ignored: %v", err)
-		maybeShowErrorDetails(stderr, err, false)
+		_ = c.invalidSyntax(0, "statement ignored: %v",
+			&formattedError{err: err, showSeverity: false, verbose: false})
 
 		// Stop here if exiterr is set.
 		if c.errExit {
@@ -1176,8 +1188,7 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 		// with the specified options.
 		c.exitErr = c.conn.Exec("SET tracing = off; SET tracing = "+c.autoTrace, nil)
 		if c.exitErr != nil {
-			fmt.Fprintln(stderr, c.exitErr)
-			maybeShowErrorDetails(stderr, c.exitErr, false)
+			cliOutputError(stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
 			if c.errExit {
 				return cliStop
 			}
@@ -1188,8 +1199,7 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 	// Now run the statement/query.
 	c.exitErr = runQueryAndFormatResults(c.conn, os.Stdout, makeQuery(c.concatLines))
 	if c.exitErr != nil {
-		fmt.Fprintln(stderr, c.exitErr)
-		maybeShowErrorDetails(stderr, c.exitErr, false)
+		cliOutputError(stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
 	}
 
 	// If we are tracing, stop tracing and display the trace. We do
@@ -1199,8 +1209,7 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 		if err := c.conn.Exec("SET tracing = off", nil); err != nil {
 			// Print the error for the SET tracing statement. This will
 			// appear below the error for the main query above, if any,
-			fmt.Fprintln(stderr, err)
-			maybeShowErrorDetails(stderr, err, false)
+			cliOutputError(stderr, err, true /*showSeverity*/, false /*verbose*/)
 			if c.exitErr == nil {
 				// The query had encountered no error above, but now we are
 				// encountering an error on SET tracing. Consider this to
@@ -1217,8 +1226,7 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 			}
 			if err := runQueryAndFormatResults(c.conn, os.Stdout,
 				makeQuery(fmt.Sprintf("SHOW %s TRACE FOR SESSION", traceType))); err != nil {
-				fmt.Fprintln(stderr, err)
-				maybeShowErrorDetails(stderr, err, false)
+				cliOutputError(stderr, err, true /*showSeverity*/, false /*verbose*/)
 				if c.exitErr == nil {
 					// Both the query and SET tracing had encountered no error
 					// above, but now we are encountering an error on SHOW TRACE
@@ -1237,33 +1245,6 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 	}
 
 	return nextState
-}
-
-// maybeShowErrorDetails displays the pg "Detail" and "Hint" fields
-// embedded in the error, if any, to the user. If printNewline is set,
-// a newline character is printed before anything else.
-func maybeShowErrorDetails(w io.Writer, err error, printNewline bool) {
-	var hint, detail string
-	if pqErr, ok := errors.UnwrapAll(err).(*pq.Error); ok {
-		hint, detail = pqErr.Hint, pqErr.Detail
-	} else {
-		// Extract the standard hint and details.
-		hint = errors.FlattenHints(err)
-		detail = errors.FlattenDetails(err)
-	}
-	if detail != "" {
-		if printNewline {
-			fmt.Fprintln(w)
-			printNewline = false
-		}
-		fmt.Fprintln(w, "DETAIL:", detail)
-	}
-	if hint != "" {
-		if printNewline {
-			fmt.Fprintln(w)
-		}
-		fmt.Fprintln(w, "HINT:", hint)
-	}
 }
 
 func (c *cliState) doDecidePath() cliStateEnum {
@@ -1290,59 +1271,14 @@ func runInteractive(conn *sqlConn) (exitErr error) {
 		}
 		switch state {
 		case cliStart:
-			if len(sqlCtx.setStmts) > 0 {
-				// Execute any \set commands to allow setting client variables
-				// before statement execution non-interactive mode.
-				for i := range sqlCtx.setStmts {
-					if c.handleSet(sqlCtx.setStmts[i:i+1], cliStart, cliStop) == cliStop {
-						return c.exitErr
-					}
-				}
+			cleanupFn, err := c.configurePreShellDefaults()
+			defer cleanupFn()
+			if err != nil {
+				return err
 			}
-
 			if len(sqlCtx.execStmts) > 0 {
 				// Single-line sql; run as simple as possible, without noise on stdout.
 				return c.runStatements(sqlCtx.execStmts)
-			}
-
-			if cliCtx.terminalOutput {
-				// If results are shown on a terminal also enable printing of
-				// times by default.
-				sqlCtx.showTimes = true
-			}
-			if cliCtx.isInteractive && !sqlCtx.debugMode {
-				// If the terminal is interactive and this was not explicitly disabled by setting the debug mode,
-				// enable the smart prompt.
-				c.smartPrompt = true
-			}
-
-			// An interactive readline prompter is comparatively slow at
-			// reading input, so we only use it in interactive mode and when
-			// there is also a terminal on stdout.
-			if cliCtx.isInteractive && cliCtx.terminalOutput {
-				// The readline initialization is not placed in
-				// the doStart() method because of the defer.
-				c.ins, c.exitErr = readline.InitFiles("cockroach",
-					true, /* wideChars */
-					stdin, os.Stdout, stderr)
-				if c.exitErr == readline.ErrWidecharNotSupported {
-					log.Warning(context.TODO(), "wide character support disabled")
-					c.ins, c.exitErr = readline.InitFiles("cockroach",
-						false, stdin, os.Stdout, stderr)
-				}
-				if c.exitErr != nil {
-					return c.exitErr
-				}
-				// If the user has used bind -v or bind -l in their ~/.editrc,
-				// this will reset the standard bindings. However we really
-				// want in this shell that Ctrl+C, tab, Ctrl+Z and Ctrl+R
-				// always have the same meaning.  So reload these bindings
-				// explicitly no matter what ~/.editrc may have changed.
-				c.ins.RebindControlKeys()
-				defer c.ins.Close()
-			} else {
-				c.ins = noLineEditor
-				c.buf = bufio.NewReader(stdin)
 			}
 
 			state = c.doStart(cliStartLine)
@@ -1387,6 +1323,115 @@ func runInteractive(conn *sqlConn) (exitErr error) {
 	return c.exitErr
 }
 
+// configurePreShellDefaults should be called after command-line flags
+// have been loaded into the cliCtx/sqlCtx and .isInteractive /
+// .terminalOutput have been initialized, but before the SQL shell or
+// execution starts.
+//
+// The returned cleanupFn must be called even when the err return is
+// not nil.
+func (c *cliState) configurePreShellDefaults() (cleanupFn func(), err error) {
+	if cliCtx.terminalOutput {
+		// If results are shown on a terminal also enable printing of
+		// times by default.
+		sqlCtx.showTimes = true
+	}
+	if cliCtx.isInteractive && !sqlCtx.debugMode {
+		// If the terminal is interactive and this was not explicitly
+		// disabled by setting the debug mode, enable the smart prompt.
+		c.smartPrompt = true
+	}
+
+	if cliCtx.isInteractive {
+		// If a human user is providing the input, we want to help them with
+		// what they are entering:
+		c.errExit = false // let the user retry failing commands
+		if !sqlCtx.debugMode {
+			// Also, try to enable syntax checking if supported by the server.
+			// This is a form of client-side error checking to help with large txns.
+			c.tryEnableCheckSyntax()
+		}
+	} else {
+		// When running non-interactive, by default we want errors to stop
+		// further processing and we can just let syntax checking to be
+		// done server-side to avoid client-side churn.
+		c.errExit = true
+		c.checkSyntax = false
+		// We also don't need (smart) prompts at all.
+	}
+
+	// An interactive readline prompter is comparatively slow at
+	// reading input, so we only use it in interactive mode and when
+	// there is also a terminal on stdout.
+	if cliCtx.isInteractive && cliCtx.terminalOutput {
+		// The readline initialization is not placed in
+		// the doStart() method because of the defer.
+		c.ins, c.exitErr = readline.InitFiles("cockroach",
+			true, /* wideChars */
+			stdin, os.Stdout, stderr)
+		if c.exitErr == readline.ErrWidecharNotSupported {
+			log.Warning(context.TODO(), "wide character support disabled")
+			c.ins, c.exitErr = readline.InitFiles("cockroach",
+				false, stdin, os.Stdout, stderr)
+		}
+		if c.exitErr != nil {
+			return cleanupFn, c.exitErr
+		}
+		// If the user has used bind -v or bind -l in their ~/.editrc,
+		// this will reset the standard bindings. However we really
+		// want in this shell that Ctrl+C, tab, Ctrl+Z and Ctrl+R
+		// always have the same meaning.  So reload these bindings
+		// explicitly no matter what ~/.editrc may have changed.
+		c.ins.RebindControlKeys()
+		cleanupFn = func() { c.ins.Close() }
+	} else {
+		c.ins = noLineEditor
+		c.buf = bufio.NewReader(stdin)
+		cleanupFn = func() {}
+	}
+
+	if c.hasEditor() {
+		// We only enable prompt and history management when the
+		// interactive input prompter is enabled. This saves on churn and
+		// memory when e.g. piping a large SQL script through the
+		// command-line client.
+
+		// Default prompt is part of the connection URL. eg: "marc@localhost:26257>".
+		c.customPromptPattern = defaultPromptPattern
+		if sqlCtx.debugMode {
+			c.customPromptPattern = debugPromptPattern
+		}
+
+		c.ins.SetCompleter(c)
+		if err := c.ins.UseHistory(-1 /*maxEntries*/, true /*dedup*/); err != nil {
+			log.Warningf(context.TODO(), "cannot enable history: %v", err)
+		} else {
+			homeDir, err := envutil.HomeDir()
+			if err != nil {
+				log.Warningf(context.TODO(), "cannot retrieve user information: %v", err)
+				log.Warning(context.TODO(), "history will not be saved")
+			} else {
+				histFile := filepath.Join(homeDir, cmdHistFile)
+				err = c.ins.LoadHistory(histFile)
+				if err != nil {
+					log.Warningf(context.TODO(), "cannot load the command-line history (file corrupted?): %v", err)
+					log.Warning(context.TODO(), "the history file will be cleared upon first entry")
+				}
+				c.ins.SetAutoSaveHistory(histFile, true)
+			}
+		}
+	}
+
+	// After all the local options have been computed/initialized above,
+	// process any overrides from the command line.
+	for i := range sqlCtx.setStmts {
+		if c.handleSet(sqlCtx.setStmts[i:i+1], cliStart, cliStop) == cliStop {
+			return cleanupFn, c.exitErr
+		}
+	}
+	return cleanupFn, nil
+}
+
 // runOneStatement executes one statement and terminates
 // on error.
 func (c *cliState) runStatements(stmts []string) error {
@@ -1400,8 +1445,7 @@ func (c *cliState) runStatements(stmts []string) error {
 			if c.exitErr != nil {
 				if !c.errExit && i < len(stmts)-1 {
 					// Print the error now because we don't get a chance later.
-					fmt.Fprintln(stderr, c.exitErr)
-					maybeShowErrorDetails(stderr, c.exitErr, false)
+					cliOutputError(stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
 				}
 				if c.errExit {
 					break
@@ -1420,10 +1464,7 @@ func (c *cliState) runStatements(stmts []string) error {
 	if c.exitErr != nil {
 		// Don't write the error to stderr ourselves. Cobra will do this for
 		// us on the exit path. We do want the details though, so add them.
-		var buf bytes.Buffer
-		fmt.Fprintln(&buf, c.exitErr)
-		maybeShowErrorDetails(&buf, c.exitErr, false)
-		c.exitErr = errors.New(strings.TrimSuffix(buf.String(), "\n"))
+		c.exitErr = &formattedError{err: c.exitErr, showSeverity: true, verbose: false}
 	}
 	return c.exitErr
 }

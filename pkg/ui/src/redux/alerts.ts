@@ -16,8 +16,7 @@
 import _ from "lodash";
 import moment from "moment";
 import { createSelector } from "reselect";
-import { Store } from "redux";
-import { Dispatch } from "react-redux";
+import { Store, Dispatch, Action } from "redux";
 import { ThunkAction } from "redux-thunk";
 
 import { LocalSetting } from "./localsettings";
@@ -26,7 +25,7 @@ import {
   saveUIData, loadUIData, isInFlight, UIDataState, UIDataStatus,
 } from "./uiData";
 import { refreshCluster, refreshNodes, refreshVersion, refreshHealth } from "./apiReducers";
-import { nodeStatusesSelector, livenessByNodeIDSelector } from "./nodes";
+import { singleVersionSelector, versionsSelector } from "src/redux/nodes";
 import { AdminUIState } from "./state";
 import * as docsURL from "src/util/docs";
 
@@ -34,6 +33,7 @@ export enum AlertLevel {
   NOTIFICATION,
   WARNING,
   CRITICAL,
+  SUCCESS,
 }
 
 export interface AlertInfo {
@@ -51,6 +51,11 @@ export interface Alert extends AlertInfo {
   // ThunkAction which will result in this alert being dismissed. This
   // function will be dispatched to the redux store when the alert is dismissed.
   dismiss: ThunkAction<Promise<void>, AdminUIState, void>;
+  // Makes alert to be positioned in the top right corner of the screen instead of
+  // stretching to full width.
+  showAsAlert?: boolean;
+  autoClose?: boolean;
+  closable?: boolean;
 }
 
 const localSettingsSelector = (state: AdminUIState) => state.localSettings;
@@ -93,7 +98,7 @@ export const instructionsBoxCollapsedSelector = createSelector(
 );
 
 export function setInstructionsBoxCollapsed(collapsed: boolean) {
-  return (dispatch: Dispatch<AdminUIState>) => {
+  return (dispatch: Dispatch<Action, AdminUIState>) => {
     dispatch(instructionsBoxCollapsedSetting.set(collapsed));
     dispatch(saveUIData({
       key: INSTRUCTIONS_BOX_COLLAPSED_KEY,
@@ -107,23 +112,6 @@ export function setInstructionsBoxCollapsed(collapsed: boolean) {
 ////////////////////////////////////////
 export const staggeredVersionDismissedSetting = new LocalSetting(
   "staggered_version_dismissed", localSettingsSelector, false,
-);
-
-export const versionsSelector = createSelector(
-  nodeStatusesSelector,
-  livenessByNodeIDSelector,
-  (nodeStatuses, livenessStatusByNodeID) =>
-    _.chain(nodeStatuses)
-      // Ignore nodes for which we don't have any build info.
-      .filter((status) => !!status.build_info )
-      // Exclude this node if it's known to be decommissioning.
-      .filter((status) => !status.desc ||
-                          !livenessStatusByNodeID[status.desc.node_id] ||
-                          !livenessStatusByNodeID[status.desc.node_id].decommissioning)
-      // Collect the surviving nodes' build tags.
-      .map((status) => status.build_info.tag)
-      .uniq()
-      .value(),
 );
 
 /**
@@ -148,7 +136,7 @@ export const staggeredVersionWarningSelector = createSelector(
       text: `We have detected that multiple versions of CockroachDB are running
       in this cluster. This may be part of a normal rolling upgrade process, but
       should be investigated if this is unexpected.`,
-      dismiss: (dispatch) => {
+      dismiss: (dispatch: Dispatch<Action, AdminUIState>) => {
         dispatch(staggeredVersionDismissedSetting.set(true));
         return Promise.resolve();
       },
@@ -197,7 +185,7 @@ export const newVersionNotificationSelector = createSelector(
 
     // Check local dismissal. Local dismissal is valid for one day.
     const yesterday = moment().subtract(1, "day");
-    if (newVersionDismissedLocal.isAfter(yesterday)) {
+    if (newVersionDismissedLocal.isAfter && newVersionDismissedLocal.isAfter(yesterday)) {
       return undefined;
     }
 
@@ -213,7 +201,7 @@ export const newVersionNotificationSelector = createSelector(
       title: "New Version Available",
       text: "A new version of CockroachDB is available.",
       link: docsURL.upgradeCockroachVersion,
-      dismiss: (dispatch) => {
+      dismiss: (dispatch: any) => {
         const dismissedAt = moment();
         // Dismiss locally.
         dispatch(newVersionDismissedLocalSetting.set(dismissedAt));
@@ -250,8 +238,74 @@ export const disconnectedAlertSelector = createSelector(
     return {
       level: AlertLevel.CRITICAL,
       title: "We're currently having some trouble fetching updated data. If this persists, it might be a good idea to check your network connection to the CockroachDB cluster.",
-      dismiss: (dispatch) => {
+      dismiss: (dispatch: Dispatch<Action, AdminUIState>) => {
         dispatch(disconnectedDismissedLocalSetting.set(moment()));
+        return Promise.resolve();
+      },
+    };
+  },
+);
+
+export const emailSubscriptionAlertLocalSetting = new LocalSetting(
+  "email_subscription_alert", localSettingsSelector, false,
+);
+
+export const emailSubscriptionAlertSelector = createSelector(
+  emailSubscriptionAlertLocalSetting.selector,
+  ( emailSubscriptionAlert): Alert => {
+    if (!emailSubscriptionAlert) {
+      return undefined;
+    }
+    return {
+      level: AlertLevel.SUCCESS,
+      title: "You successfully signed up for CockroachDB release notes",
+      text: "You will receive emails about CockroachDB releases and best practices. You can unsubscribe from these emails anytime.",
+      showAsAlert: true,
+      dismiss: (dispatch: Dispatch<Action, AdminUIState>) => {
+        dispatch(emailSubscriptionAlertLocalSetting.set(false));
+        return Promise.resolve();
+      },
+    };
+  },
+);
+
+type CreateStatementDiagnosticsAlertPayload = {
+  show: boolean;
+  status?: "SUCCESS" | "FAILED";
+};
+
+export const createStatementDiagnosticsAlertLocalSetting = new LocalSetting<AdminUIState, CreateStatementDiagnosticsAlertPayload>(
+  "create_stmnt_diagnostics_alert", localSettingsSelector, { show: false },
+);
+
+export const createStatementDiagnosticsAlertSelector = createSelector(
+  createStatementDiagnosticsAlertLocalSetting.selector,
+  ( createStatementDiagnosticsAlert): Alert => {
+    if (!createStatementDiagnosticsAlert || !createStatementDiagnosticsAlert.show) {
+      return undefined;
+    }
+    const { status } = createStatementDiagnosticsAlert;
+
+    if (status === "FAILED") {
+      return {
+        level: AlertLevel.CRITICAL,
+        title: "There was an error activating statement diagnostics",
+        text: "Please try activating again. If the problem continues please reach out to customer support.",
+        showAsAlert: true,
+        dismiss: (dispatch: Dispatch<Action, AdminUIState>) => {
+          dispatch(createStatementDiagnosticsAlertLocalSetting.set({ show: false }));
+          return Promise.resolve();
+        },
+      };
+    }
+    return {
+      level: AlertLevel.SUCCESS,
+      title: "Statement diagnostics were successfully activated",
+      showAsAlert: true,
+      autoClose: true,
+      closable: false,
+      dismiss: (dispatch: Dispatch<Action, AdminUIState>) => {
+        dispatch(createStatementDiagnosticsAlertLocalSetting.set({ show: false }));
         return Promise.resolve();
       },
     };
@@ -279,20 +333,10 @@ export const panelAlertsSelector = createSelector(
  */
 export const bannerAlertsSelector = createSelector(
   disconnectedAlertSelector,
+  emailSubscriptionAlertSelector,
+  createStatementDiagnosticsAlertSelector,
   (...alerts: Alert[]): Alert[] => {
     return _.without(alerts, null, undefined);
-  },
-);
-
-// Select the current build version of the cluster, returning undefined if the
-// cluster's version is currently staggered.
-const singleVersionSelector = createSelector(
-  versionsSelector,
-  (builds) => {
-    if (!builds || builds.length !== 1) {
-      return undefined;
-    }
-    return builds[0];
   },
 );
 

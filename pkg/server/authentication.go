@@ -26,9 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -43,11 +45,12 @@ const (
 	loginPath  = "/login"
 	logoutPath = "/logout"
 	// secretLength is the number of random bytes generated for session secrets.
-	secretLength      = 16
-	sessionCookieName = "session"
+	secretLength = 16
+	// SessionCookieName is the name of the cookie used for HTTP auth.
+	SessionCookieName = "session"
 )
 
-var webSessionTimeout = settings.RegisterNonNegativeDurationSetting(
+var webSessionTimeout = settings.RegisterPublicNonNegativeDurationSetting(
 	"server.web_session_timeout",
 	"the duration that a newly created web session will be valid",
 	7*24*time.Hour,
@@ -100,19 +103,17 @@ func (s *authenticationServer) UserLogin(
 		)
 	}
 
-	// Root user does not have a password, simply disallow this.
-	if username == security.RootUser {
-		return nil, status.Errorf(
-			codes.Unauthenticated,
-			"user %s must use certificate authentication instead of password authentication",
-			security.RootUser,
-		)
-	}
-
 	// Verify the provided username/password pair.
-	verified, err := s.verifyPassword(ctx, username, req.Password)
+	verified, expired, err := s.verifyPassword(ctx, username, req.Password)
 	if err != nil {
 		return nil, apiInternalError(ctx, err)
+	}
+	if expired {
+		return nil, status.Errorf(
+			codes.Unauthenticated,
+			"the password for %s has expired",
+			username,
+		)
 	}
 	if !verified {
 		return nil, status.Errorf(
@@ -166,10 +167,11 @@ func (s *authenticationServer) UserLogout(
 	}
 
 	// Revoke the session.
-	if n, err := s.server.internalExecutor.Exec(
+	if n, err := s.server.internalExecutor.ExecEx(
 		ctx,
 		"revoke-auth-session",
 		nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		`UPDATE system.web_sessions SET "revokedAt" = now() WHERE id = $1`,
 		sessionID,
 	); err != nil {
@@ -213,10 +215,12 @@ WHERE id = $1`
 		isRevoked    bool
 	)
 
-	row, err := s.server.internalExecutor.QueryRow(
+	row, err := s.server.internalExecutor.QueryRowEx(
 		ctx,
 		"lookup-auth-session",
-		nil /* txn */, sessionQuery, cookie.ID)
+		nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessionQuery, cookie.ID)
 	if row == nil || err != nil {
 		return false, "", err
 	}
@@ -258,17 +262,45 @@ WHERE id = $1`
 // not be completed.
 func (s *authenticationServer) verifyPassword(
 	ctx context.Context, username string, password string,
-) (bool, error) {
-	exists, hashedPassword, err := sql.GetUserHashedPassword(
-		ctx, s.server.execCfg.InternalExecutor, s.memMetrics, username,
+) (valid bool, expired bool, err error) {
+	exists, canLogin, pwRetrieveFn, validUntilFn, err := sql.GetUserHashedPassword(
+		ctx, s.server.execCfg.InternalExecutor, username,
 	)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	if !exists {
-		return false, nil
+	if !exists || !canLogin {
+		return false, false, nil
 	}
-	return (security.CompareHashAndPassword(hashedPassword, password) == nil), nil
+	hashedPassword, err := pwRetrieveFn(ctx)
+	if err != nil {
+		return false, false, err
+	}
+
+	validUntil, err := validUntilFn(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	if validUntil != nil {
+		if validUntil.Time.Sub(timeutil.Now()) < 0 {
+			return false, true, nil
+		}
+	}
+
+	return security.CompareHashAndPassword(hashedPassword, password) == nil, false, nil
+}
+
+// CreateAuthSecret creates a secret, hash pair to populate a session auth token.
+func CreateAuthSecret() (secret, hashedSecret []byte, err error) {
+	secret = make([]byte, secretLength)
+	if _, err := rand.Read(secret); err != nil {
+		return nil, nil, err
+	}
+
+	hasher := sha256.New()
+	_, _ = hasher.Write(secret)
+	hashedSecret = hasher.Sum(nil)
+	return secret, hashedSecret, nil
 }
 
 // newAuthSession attempts to create a new authentication session for the given
@@ -276,14 +308,11 @@ func (s *authenticationServer) verifyPassword(
 func (s *authenticationServer) newAuthSession(
 	ctx context.Context, username string,
 ) (int64, []byte, error) {
-	secret := make([]byte, secretLength)
-	if _, err := rand.Read(secret); err != nil {
+	secret, hashedSecret, err := CreateAuthSecret()
+	if err != nil {
 		return 0, nil, err
 	}
 
-	hasher := sha256.New()
-	_, _ = hasher.Write(secret)
-	hashedSecret := hasher.Sum(nil)
 	expiration := s.server.clock.PhysicalTime().Add(webSessionTimeout.Get(&s.server.st.SV))
 
 	insertSessionStmt := `
@@ -293,10 +322,11 @@ RETURNING id
 `
 	var id int64
 
-	row, err := s.server.internalExecutor.QueryRow(
+	row, err := s.server.internalExecutor.QueryRowEx(
 		ctx,
 		"create-auth-session",
 		nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		insertSessionStmt,
 		hashedSecret,
 		username,
@@ -385,7 +415,7 @@ func EncodeSessionCookie(sessionCookie *serverpb.SessionCookie) (*http.Cookie, e
 
 func makeCookieWithValue(value string) *http.Cookie {
 	return &http.Cookie{
-		Name:     sessionCookieName,
+		Name:     SessionCookieName,
 		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
@@ -400,7 +430,7 @@ func (am *authenticationMux) getSession(
 	w http.ResponseWriter, req *http.Request,
 ) (string, *serverpb.SessionCookie, error) {
 	// Validate the returned cookie.
-	rawCookie, err := req.Cookie(sessionCookieName)
+	rawCookie, err := req.Cookie(SessionCookieName)
 	if err != nil {
 		return "", nil, err
 	}

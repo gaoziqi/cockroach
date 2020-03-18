@@ -13,6 +13,7 @@ package types
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
@@ -79,6 +80,7 @@ import (
 // | UUID              | UUID           | T_uuid        | 0         | 0     |
 // | INET              | INET           | T_inet        | 0         | 0     |
 // | TIME              | TIME           | T_time        | 0         | 0     |
+// | TIMETZ            | TIMETZ         | T_timetz      | 0         | 0     |
 // | JSON              | JSONB          | T_jsonb       | 0         | 0     |
 // | JSONB             | JSONB          | T_jsonb       | 0         | 0     |
 // |                   |                |               |           |       |
@@ -245,15 +247,39 @@ var (
 	//   HH:MM:SS.ssssss
 	//
 	Time = &T{InternalType: InternalType{
-		Family: TimeFamily, Oid: oid.T_time, Locale: &emptyLocale}}
+		Family:             TimeFamily,
+		Precision:          0,
+		TimePrecisionIsSet: false,
+		Oid:                oid.T_time,
+		Locale:             &emptyLocale,
+	}}
+
+	// TimeTZ is the type specifying hour, minute, second and timezone with
+	// no date component. By default, it has microsecond precision.
+	// For example:
+	//
+	//   HH:MM:SS.ssssss+-ZZ:ZZ
+	TimeTZ = &T{InternalType: InternalType{
+		Family:             TimeTZFamily,
+		Precision:          0,
+		TimePrecisionIsSet: false,
+		Oid:                oid.T_timetz,
+		Locale:             &emptyLocale,
+	}}
 
 	// Timestamp is the type of a value specifying year, month, day, hour, minute,
 	// and second, but with no associated timezone. By default, it has microsecond
 	// precision. For example:
 	//
 	//   YYYY-MM-DD HH:MM:SS.ssssss
+	//
 	Timestamp = &T{InternalType: InternalType{
-		Family: TimestampFamily, Precision: -1, Oid: oid.T_timestamp, Locale: &emptyLocale}}
+		Family:             TimestampFamily,
+		Precision:          0,
+		TimePrecisionIsSet: false,
+		Oid:                oid.T_timestamp,
+		Locale:             &emptyLocale,
+	}}
 
 	// TimestampTZ is the type of a value specifying year, month, day, hour,
 	// minute, and second, as well as an associated timezone. By default, it has
@@ -262,12 +288,23 @@ var (
 	//   YYYY-MM-DD HH:MM:SS.ssssss+-ZZ:ZZ
 	//
 	TimestampTZ = &T{InternalType: InternalType{
-		Family: TimestampTZFamily, Precision: -1, Oid: oid.T_timestamptz, Locale: &emptyLocale}}
+		Family:             TimestampTZFamily,
+		Precision:          0,
+		TimePrecisionIsSet: false,
+		Oid:                oid.T_timestamptz,
+		Locale:             &emptyLocale,
+	}}
 
 	// Interval is the type of a value describing a duration of time. By default,
 	// it has microsecond precision.
 	Interval = &T{InternalType: InternalType{
-		Family: IntervalFamily, Oid: oid.T_interval, Locale: &emptyLocale}}
+		Family:                IntervalFamily,
+		Precision:             0,
+		TimePrecisionIsSet:    false,
+		Oid:                   oid.T_interval,
+		Locale:                &emptyLocale,
+		IntervalDurationField: &IntervalDurationField{},
+	}}
 
 	// Jsonb is the type of a JavaScript Object Notation (JSON) value that is
 	// stored in a decomposed binary format (hence the "b" in jsonb).
@@ -309,6 +346,7 @@ var (
 		Uuid,
 		INet,
 		Time,
+		TimeTZ,
 		Jsonb,
 		VarBit,
 	}
@@ -439,6 +477,12 @@ const (
 	unknownArrayOid = 0
 )
 
+const (
+	// defaultTimePrecision is the default precision to return for time families
+	// if time is not set.
+	defaultTimePrecision = 6
+)
+
 var (
 	emptyLocale = ""
 )
@@ -460,11 +504,24 @@ func MakeScalar(family Family, o oid.Oid, precision, width int32, locale string)
 		panic(errors.AssertionFailedf("non-collation type cannot have locale %s", locale))
 	}
 
-	if precision < 0 {
-		panic(errors.AssertionFailedf("negative precision is not allowed"))
-	}
+	timePrecisionIsSet := false
+	var intervalDurationField *IntervalDurationField
 	switch family {
-	case DecimalFamily, TimeFamily, TimestampFamily, TimestampTZFamily:
+	case IntervalFamily:
+		intervalDurationField = &IntervalDurationField{}
+		if precision < 0 || precision > 6 {
+			panic(errors.AssertionFailedf("precision must be between 0 and 6 inclusive"))
+		}
+		timePrecisionIsSet = true
+	case TimestampFamily, TimestampTZFamily, TimeFamily, TimeTZFamily:
+		if precision < 0 || precision > 6 {
+			panic(errors.AssertionFailedf("precision must be between 0 and 6 inclusive"))
+		}
+		timePrecisionIsSet = true
+	case DecimalFamily:
+		if precision < 0 {
+			panic(errors.AssertionFailedf("negative precision is not allowed"))
+		}
 	default:
 		if precision != 0 {
 			panic(errors.AssertionFailedf("type %s cannot have precision", family))
@@ -501,11 +558,13 @@ func MakeScalar(family Family, o oid.Oid, precision, width int32, locale string)
 	}
 
 	return &T{InternalType: InternalType{
-		Family:    family,
-		Oid:       o,
-		Precision: precision,
-		Width:     width,
-		Locale:    &locale,
+		Family:                family,
+		Oid:                   o,
+		Precision:             precision,
+		TimePrecisionIsSet:    timePrecisionIsSet,
+		Width:                 width,
+		Locale:                &locale,
+		IntervalDurationField: intervalDurationField,
 	}}
 }
 
@@ -629,35 +688,127 @@ func MakeDecimal(precision, scale int32) *T {
 
 // MakeTime constructs a new instance of a TIME type (oid = T_time) that has at
 // most the given number of fractional second digits.
+//
+// To use the default precision, use the `Time` variable.
 func MakeTime(precision int32) *T {
-	if precision == 0 {
-		return Time
-	}
-	if precision != 6 {
-		panic(errors.AssertionFailedf("precision %d is not currently supported", precision))
-	}
 	return &T{InternalType: InternalType{
-		Family: TimeFamily, Oid: oid.T_time, Precision: precision, Locale: &emptyLocale}}
+		Family:             TimeFamily,
+		Oid:                oid.T_time,
+		Precision:          precision,
+		TimePrecisionIsSet: true,
+		Locale:             &emptyLocale,
+	}}
+}
+
+// MakeTimeTZ constructs a new instance of a TIMETZ type (oid = T_timetz) that
+// has at most the given number of fractional second digits.
+//
+// To use the default precision, use the `TimeTZ` variable.
+func MakeTimeTZ(precision int32) *T {
+	return &T{InternalType: InternalType{
+		Family:             TimeTZFamily,
+		Oid:                oid.T_timetz,
+		Precision:          precision,
+		TimePrecisionIsSet: true,
+		Locale:             &emptyLocale,
+	}}
+}
+
+var (
+	// DefaultIntervalTypeMetadata returns a duration field that is unset,
+	// using INTERVAL or INTERVAL ( iconst32 ) syntax instead of INTERVAL
+	// with a qualifier afterwards.
+	DefaultIntervalTypeMetadata = IntervalTypeMetadata{}
+)
+
+// IntervalTypeMetadata is metadata pertinent for intervals.
+type IntervalTypeMetadata struct {
+	// DurationField represents the duration field definition.
+	DurationField IntervalDurationField
+	// Precision is the precision to use - note this matches InternalType rules.
+	Precision int32
+	// PrecisionIsSet indicates whether Precision is explicitly set.
+	PrecisionIsSet bool
+}
+
+// IsMinuteToSecond returns whether the IntervalDurationField represents
+// the MINUTE TO SECOND interval qualifier.
+func (m *IntervalDurationField) IsMinuteToSecond() bool {
+	return m.FromDurationType == IntervalDurationType_MINUTE &&
+		m.DurationType == IntervalDurationType_SECOND
+}
+
+// IsDayToHour returns whether the IntervalDurationField represents
+// the DAY TO HOUR interval qualifier.
+func (m *IntervalDurationField) IsDayToHour() bool {
+	return m.FromDurationType == IntervalDurationType_DAY &&
+		m.DurationType == IntervalDurationType_HOUR
+}
+
+// IntervalTypeMetadata returns the IntervalTypeMetadata for interval types.
+func (t *T) IntervalTypeMetadata() (IntervalTypeMetadata, error) {
+	if t.Family() != IntervalFamily {
+		return IntervalTypeMetadata{}, errors.Newf("cannot call IntervalTypeMetadata on non-intervals")
+	}
+	return IntervalTypeMetadata{
+		DurationField:  *t.InternalType.IntervalDurationField,
+		Precision:      t.InternalType.Precision,
+		PrecisionIsSet: t.InternalType.TimePrecisionIsSet,
+	}, nil
+}
+
+// MakeInterval constructs a new instance of a
+// INTERVAL type (oid = T_interval) with a duration field.
+//
+// To use the default precision and field, use the `Interval` variable.
+func MakeInterval(itm IntervalTypeMetadata) *T {
+	switch itm.DurationField.DurationType {
+	case IntervalDurationType_SECOND, IntervalDurationType_UNSET:
+	default:
+		if itm.PrecisionIsSet {
+			panic(errors.Errorf("cannot set precision for duration type %s", itm.DurationField.DurationType))
+		}
+	}
+	if itm.Precision > 0 && !itm.PrecisionIsSet {
+		panic(errors.Errorf("precision must be set if Precision > 0"))
+	}
+
+	return &T{InternalType: InternalType{
+		Family:                IntervalFamily,
+		Oid:                   oid.T_interval,
+		Locale:                &emptyLocale,
+		Precision:             itm.Precision,
+		TimePrecisionIsSet:    itm.PrecisionIsSet,
+		IntervalDurationField: &itm.DurationField,
+	}}
 }
 
 // MakeTimestamp constructs a new instance of a TIMESTAMP type that has at most
 // the given number of fractional second digits.
+//
+// To use the default precision, use the `Timestamp` variable.
 func MakeTimestamp(precision int32) *T {
-	if precision == 0 || precision == 6 {
-		return &T{InternalType: InternalType{
-			Family: TimestampFamily, Oid: oid.T_timestamp, Precision: precision, Locale: &emptyLocale}}
-	}
-	panic(errors.AssertionFailedf("precision %d is not currently supported", precision))
+	return &T{InternalType: InternalType{
+		Family:             TimestampFamily,
+		Oid:                oid.T_timestamp,
+		Precision:          precision,
+		TimePrecisionIsSet: true,
+		Locale:             &emptyLocale,
+	}}
 }
 
 // MakeTimestampTZ constructs a new instance of a TIMESTAMPTZ type that has at
 // most the given number of fractional second digits.
+//
+// To use the default precision, use the `TimestampTZ` variable.
 func MakeTimestampTZ(precision int32) *T {
-	if precision == 0 || precision == 6 {
-		return &T{InternalType: InternalType{
-			Family: TimestampTZFamily, Oid: oid.T_timestamptz, Precision: precision, Locale: &emptyLocale}}
-	}
-	panic(errors.AssertionFailedf("precision %d is not currently supported", precision))
+	return &T{InternalType: InternalType{
+		Family:             TimestampTZFamily,
+		Oid:                oid.T_timestamptz,
+		Precision:          precision,
+		TimePrecisionIsSet: true,
+		Locale:             &emptyLocale,
+	}}
 }
 
 // MakeArray constructs a new instance of an ArrayFamily type with the given
@@ -764,13 +915,23 @@ func (t *T) Width() int32 {
 // Precision is the accuracy of the data type.
 //
 //   DECIMAL    : max # digits (must be >= Width/Scale)
+//   INTERVAL   : max # fractional second digits
 //   TIME       : max # fractional second digits
+//   TIMETZ     : max # fractional second digits
 //   TIMESTAMP  : max # fractional second digits
 //   TIMESTAMPTZ: max # fractional second digits
 //
-// For TIMESTAMP and TIMESTAMP TZ, the precision field is -1 for a default precision value of 6.
+// Precision for time-related families has special rules for 0 -- see
+// `precision_is_set` on the `InternalType` proto.
+//
 // Precision is always 0 for other types.
 func (t *T) Precision() int32 {
+	switch t.InternalType.Family {
+	case IntervalFamily, TimestampFamily, TimestampTZFamily, TimeFamily, TimeTZFamily:
+		if t.InternalType.Precision == 0 && !t.InternalType.TimePrecisionIsSet {
+			return defaultTimePrecision
+		}
+	}
 	return t.InternalType.Precision
 }
 
@@ -879,6 +1040,8 @@ func (t *T) Name() string {
 		return "timestamp"
 	case TimestampTZFamily:
 		return "timestamptz"
+	case TimeTZFamily:
+		return "timetz"
 	case TupleFamily:
 		// Tuple types are currently anonymous, with no name.
 		return ""
@@ -924,6 +1087,13 @@ func (t *T) PGName() string {
 //
 func (t *T) SQLStandardName() string {
 	return t.SQLStandardNameWithTypmod(false, 0)
+}
+
+var telemetryNameReplaceRegex = regexp.MustCompile("[^a-zA-Z0-9]")
+
+// TelemetryName returns a name that is friendly for telemetry.
+func (t *T) TelemetryName() string {
+	return strings.ToLower(telemetryNameReplaceRegex.ReplaceAllString(t.SQLString(), "_"))
 }
 
 // SQLStandardNameWithTypmod is like SQLStandardName but it also accepts a
@@ -1007,7 +1177,9 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 			panic(errors.AssertionFailedf("programming error: unknown int width: %d", t.Width()))
 		}
 	case IntervalFamily:
-		// TODO(jordan): intervals can have typmods, but we don't support them yet.
+		// TODO(jordan): intervals can have typmods, but we don't support them in the same way.
+		// Masking is used to extract the precision (src/include/utils/timestamp.h), whereas
+		// we store it as `IntervalDurationField`.
 		return "interval"
 	case JsonFamily:
 		// Only binary JSON is currently supported.
@@ -1067,17 +1239,22 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 		return buf.String()
 
 	case TimeFamily:
-		if !haveTypmod || typmod <= 0 {
+		if !haveTypmod || typmod < 0 {
 			return "time without time zone"
 		}
 		return fmt.Sprintf("time(%d) without time zone", typmod)
+	case TimeTZFamily:
+		if !haveTypmod || typmod < 0 {
+			return "time with time zone"
+		}
+		return fmt.Sprintf("time(%d) with time zone", typmod)
 	case TimestampFamily:
-		if !haveTypmod || typmod <= 0 {
+		if !haveTypmod || typmod < 0 {
 			return "timestamp without time zone"
 		}
 		return fmt.Sprintf("timestamp(%d) without time zone", typmod)
 	case TimestampTZFamily:
-		if !haveTypmod || typmod <= 0 {
+		if !haveTypmod || typmod < 0 {
 			return "timestamp with time zone"
 		}
 		return fmt.Sprintf("timestamp(%d) with time zone", typmod)
@@ -1154,15 +1331,32 @@ func (t *T) SQLString() string {
 	case JsonFamily:
 		// Only binary JSON is currently supported.
 		return "JSONB"
-	case TimestampFamily, TimestampTZFamily:
-		if t.Precision() != -1 {
+	case TimestampFamily, TimestampTZFamily, TimeFamily, TimeTZFamily:
+		if t.InternalType.Precision > 0 || t.InternalType.TimePrecisionIsSet {
 			return fmt.Sprintf("%s(%d)", strings.ToUpper(t.Name()), t.Precision())
 		}
-		// This is the timestamp with the default precision value
-		return strings.ToUpper(t.Name())
-	case TimeFamily:
-		if t.Precision() > 0 {
-			return fmt.Sprintf("%s(%d)", strings.ToUpper(t.Name()), t.Precision())
+	case IntervalFamily:
+		switch t.InternalType.IntervalDurationField.DurationType {
+		case IntervalDurationType_UNSET:
+			if t.InternalType.Precision > 0 || t.InternalType.TimePrecisionIsSet {
+				return fmt.Sprintf("%s(%d)", strings.ToUpper(t.Name()), t.Precision())
+			}
+		default:
+			fromStr := ""
+			if t.InternalType.IntervalDurationField.FromDurationType != IntervalDurationType_UNSET {
+				fromStr = fmt.Sprintf("%s TO ", t.InternalType.IntervalDurationField.FromDurationType.String())
+			}
+			precisionStr := ""
+			if t.InternalType.Precision > 0 || t.InternalType.TimePrecisionIsSet {
+				precisionStr = fmt.Sprintf("(%d)", t.Precision())
+			}
+			return fmt.Sprintf(
+				"%s %s%s%s",
+				strings.ToUpper(t.Name()),
+				fromStr,
+				t.InternalType.IntervalDurationField.DurationType.String(),
+				precisionStr,
+			)
 		}
 	case OidFamily:
 		if name, ok := oid.TypeName[t.Oid()]; ok {
@@ -1284,6 +1478,18 @@ func (t *InternalType) Identical(other *InternalType) bool {
 		return false
 	}
 	if t.Precision != other.Precision {
+		return false
+	}
+	if t.TimePrecisionIsSet != other.TimePrecisionIsSet {
+		return false
+	}
+	if t.IntervalDurationField != nil && other.IntervalDurationField != nil {
+		if *t.IntervalDurationField != *other.IntervalDurationField {
+			return false
+		}
+	} else if t.IntervalDurationField != nil {
+		return false
+	} else if other.IntervalDurationField != nil {
 		return false
 	}
 	if t.Locale != nil && other.Locale != nil {
@@ -1412,6 +1618,28 @@ func (t *T) upgradeType() error {
 		// Precision should always be set to 0 going forward.
 		t.InternalType.Precision = 0
 
+	case TimestampFamily, TimestampTZFamily, TimeFamily, TimeTZFamily:
+		// Some bad/experimental versions of master had precision stored as `-1`.
+		// This represented a default - so upgrade this to 0 with TimePrecisionIsSet = false.
+		if t.InternalType.Precision == -1 {
+			t.InternalType.Precision = 0
+			t.InternalType.TimePrecisionIsSet = false
+		}
+		// Going forwards after 19.2, we want `TimePrecisionIsSet` to be explicitly set
+		// if Precision is > 0.
+		if t.InternalType.Precision > 0 {
+			t.InternalType.TimePrecisionIsSet = true
+		}
+	case IntervalFamily:
+		// Fill in the IntervalDurationField here.
+		if t.InternalType.IntervalDurationField == nil {
+			t.InternalType.IntervalDurationField = &IntervalDurationField{}
+		}
+		// Going forwards after 19.2, we want `TimePrecisionIsSet` to be explicitly set
+		// if Precision is > 0.
+		if t.InternalType.Precision > 0 {
+			t.InternalType.TimePrecisionIsSet = true
+		}
 	case StringFamily, CollatedStringFamily:
 		// Map string-related visible types to corresponding Oid values.
 		switch t.InternalType.VisibleType {
@@ -1654,6 +1882,10 @@ func (t *T) String() string {
 			buf.WriteByte('}')
 		}
 		return buf.String()
+	case IntervalFamily, TimestampFamily, TimestampTZFamily, TimeFamily, TimeTZFamily:
+		if t.InternalType.Precision > 0 || t.InternalType.TimePrecisionIsSet {
+			return fmt.Sprintf("%s(%d)", t.Name(), t.Precision())
+		}
 	}
 	return t.Name()
 }
@@ -1729,6 +1961,8 @@ func IsDateTimeType(t *T) bool {
 	case DateFamily:
 		return true
 	case TimeFamily:
+		return true
+	case TimeTZFamily:
 		return true
 	case TimestampFamily:
 		return true

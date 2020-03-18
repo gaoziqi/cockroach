@@ -14,12 +14,13 @@ import (
 	"context"
 	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -92,7 +93,7 @@ type Server struct {
 	queryWorkerMax   int
 	workerMemMonitor mon.BytesMonitor
 	resultMemMonitor mon.BytesMonitor
-	workerSem        chan struct{}
+	workerSem        *quotapool.IntPool
 }
 
 // MakeServer instantiates a new Server which services requests with data from
@@ -115,7 +116,8 @@ func MakeServer(
 	if cfg.QueryMemoryMax != 0 {
 		queryMemoryMax = cfg.QueryMemoryMax
 	}
-
+	workerSem := quotapool.NewIntPool("ts.Server worker", uint64(queryWorkerMax))
+	stopper.AddCloser(workerSem.Closer("stopper"))
 	return Server{
 		AmbientContext: ambient,
 		db:             db,
@@ -143,7 +145,7 @@ func MakeServer(
 		),
 		queryMemoryMax: queryMemoryMax,
 		queryWorkerMax: queryWorkerMax,
-		workerSem:      make(chan struct{}, queryWorkerMax),
+		workerSem:      workerSem,
 	}
 }
 
@@ -180,7 +182,7 @@ func (s *Server) Query(
 	// dead. This is a conservatively long span, but gives us a good indication of
 	// when a gap likely indicates an outage (and thus missing values should not
 	// be interpolated).
-	interpolationLimit := storage.TimeUntilStoreDead.Get(&s.db.st.SV).Nanoseconds()
+	interpolationLimit := kvserver.TimeUntilStoreDead.Get(&s.db.st.SV).Nanoseconds()
 
 	// Get the estimated number of nodes on the cluster, used to compute more
 	// accurate memory usage estimates. Set a minimum of 1 in order to avoid
@@ -318,7 +320,7 @@ func (s *Server) Dump(req *tspb.DumpRequest, stream tspb.TimeSeries_DumpServer) 
 	}
 
 	for span != nil {
-		b := &client.Batch{}
+		b := &kv.Batch{}
 		b.Header.MaxSpanRequestKeys = dumpBatchSize
 		b.Scan(span.Key, span.EndKey)
 		err := s.db.db.Run(ctx, b)

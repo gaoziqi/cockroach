@@ -31,14 +31,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -50,8 +53,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 )
@@ -330,7 +335,7 @@ func initTempStorageConfig(
 	// the temporary directory record file before creating any new
 	// temporary directories in case the disk is completely full.
 	if recordPath != "" {
-		if err = engine.CleanupTempDirs(recordPath); err != nil {
+		if err = storage.CleanupTempDirs(recordPath); err != nil {
 			return base.TempStorageConfig{}, errors.Wrap(err, "could not cleanup temporary directories from record file")
 		}
 	}
@@ -387,14 +392,14 @@ func initTempStorageConfig(
 		tempDir = firstStore.Path
 	}
 	// Create the temporary subdirectory for the temp engine.
-	if tempStorageConfig.Path, err = engine.CreateTempDir(tempDir, server.TempDirPrefix, stopper); err != nil {
+	if tempStorageConfig.Path, err = storage.CreateTempDir(tempDir, server.TempDirPrefix, stopper); err != nil {
 		return base.TempStorageConfig{}, errors.Wrap(err, "could not create temporary directory for temp storage")
 	}
 
 	// We record the new temporary directory in the record file (if it
 	// exists) for cleanup in case the node crashes.
 	if recordPath != "" {
-		if err = engine.RecordTempDir(recordPath, tempStorageConfig.Path); err != nil {
+		if err = storage.RecordTempDir(recordPath, tempStorageConfig.Path); err != nil {
 			return base.TempStorageConfig{}, errors.Wrapf(
 				err,
 				"could not record temporary directory path to record file: %s",
@@ -406,7 +411,24 @@ func initTempStorageConfig(
 	return tempStorageConfig, nil
 }
 
-var errCannotUseJoin = errors.New("cannot use --join with 'cockroach start-single-node' -- use 'cockrach start' instead")
+// Checks if the passed-in engine type is default, and if so, resolves it to
+// the storage engine last used to write to the store at dir (or rocksdb if
+// a store wasn't found).
+func resolveStorageEngineType(engineType enginepb.EngineType, dir string) enginepb.EngineType {
+	if engineType == enginepb.EngineTypeDefault {
+		engineType = enginepb.EngineTypeRocksDB
+		// Check if this storage directory was last written to by pebble. In that
+		// case, default to opening a Pebble engine.
+		if version, err := pebble.GetVersion(dir, vfs.Default); err == nil {
+			if version != "" && !strings.HasPrefix(version, "rocksdb") {
+				engineType = enginepb.EngineTypePebble
+			}
+		}
+	}
+	return engineType
+}
+
+var errCannotUseJoin = errors.New("cannot use --join with 'cockroach start-single-node' -- use 'cockroach start' instead")
 
 func runStartSingleNode(cmd *cobra.Command, args []string) error {
 	joinFlag := flagSetForCmd(cmd).Lookup(cliflags.Join.Name)
@@ -437,11 +459,26 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 	// First things first: if the user wants background processing,
 	// relinquish the terminal ASAP by forking and exiting.
 	//
-	// If executing in the backround, the function returns ok == true in
+	// If executing in the background, the function returns ok == true in
 	// the parent process (regardless of err) and the parent exits at
 	// this point.
 	if ok, err := maybeRerunBackground(); ok {
 		return err
+	}
+
+	// Change the permission mask for all created files.
+	//
+	// We're considering everything produced by a cockroach node
+	// to potentially contain sensitive information, so it should
+	// not be world-readable.
+	disableOtherPermissionBits()
+
+	// TODO(knz): the following call is not in the right place.
+	// See: https://github.com/cockroachdb/cockroach/issues/44041
+	if s, err := serverCfg.Stores.GetPreventedStartupMessage(); err != nil {
+		return err
+	} else if s != "" {
+		log.Fatal(context.Background(), s)
 	}
 
 	// Set up the signal handlers. This also ensures that any of these
@@ -507,6 +544,9 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 	//
 	// This includes propagating server flags dependent on the
 	// flags specified for the command.
+	if err := security.SetCertPrincipalMap(startCtx.serverCertPrincipalMap); err != nil {
+		return err
+	}
 	serverCfg.Insecure = startCtx.serverInsecure
 	serverCfg.SSLCertsDir = startCtx.serverSSLCertsDir
 	serverCfg.User = security.NodeUser
@@ -514,6 +554,10 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 	if serverCfg.Settings.ExternalIODir, err = initExternalIODir(ctx, serverCfg.Stores.Specs[0]); err != nil {
 		return err
 	}
+	// If the storage engine is set to "default", check the engine type used in
+	// this store directory in a past run. If this check fails for any reason,
+	// use RocksDB as the default engine type.
+	serverCfg.StorageEngine = resolveStorageEngineType(serverCfg.StorageEngine, serverCfg.Stores.Specs[0].Path)
 	// Find a StoreSpec that has encryption at rest turned on. If can't find
 	// one, use the first StoreSpec in the list.
 	var specIdx = 0
@@ -543,7 +587,9 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 	// Until/unless CockroachDB embeds its own tz database, we want
 	// an early sanity check. It's better to inform the user early
 	// than to get surprising errors during SQL queries.
-	checkTzDatabaseAvailability(ctx)
+	if err := checkTzDatabaseAvailability(ctx); err != nil {
+		return errors.Wrap(err, "failed to initialize node")
+	}
 
 	// ReadyFn will be called when the server has started listening on
 	// its network sockets, but perhaps before it has done bootstrapping
@@ -853,7 +899,8 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 		log.SetSync(true)
 
 		log.Infof(shutdownCtx, "received signal '%s'", sig)
-		if sig == os.Interrupt {
+		switch sig {
+		case os.Interrupt:
 			// Graceful shutdown after an interrupt should cause the process
 			// to terminate with a non-zero exit code; however SIGTERM is
 			// "legitimate" and should be acknowledged with a success exit
@@ -866,6 +913,9 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 			}
 			msgDouble := "Note: a second interrupt will skip graceful shutdown and terminate forcefully"
 			fmt.Fprintln(os.Stdout, msgDouble)
+
+		case quitSignal:
+			log.DumpStacks(shutdownCtx)
 		}
 
 		// Start the draining process in a separate goroutine so that it
@@ -942,7 +992,6 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 	// So we also pay attention to any additional signal received beyond
 	// this point (maybe some service monitor was impatient and sends
 	// another signal to hasten the shutdown process).
-	// And we also pay attention to an additional timeout.
 	//
 	// If any such trigger to hasten occurs, we simply return, which
 	// will cause the process to exit and the server goroutines to be
@@ -957,9 +1006,6 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 			"received signal '%s' during shutdown, initiating hard shutdown%s", sig, hardShutdownHint))
 		handleSignalDuringShutdown(sig)
 		panic("unreachable")
-
-	case <-time.After(time.Minute):
-		return errors.Errorf("time limit reached, initiating hard shutdown%s", hardShutdownHint)
 
 	case <-stopper.IsStopped():
 		const msgDone = "server drained and shutdown completed"
@@ -1005,13 +1051,33 @@ func clientFlagsRPC() string {
 	return strings.Join(flags, " ")
 }
 
-func checkTzDatabaseAvailability(ctx context.Context) {
+func checkTzDatabaseAvailability(ctx context.Context) error {
 	if _, err := timeutil.LoadLocation("America/New_York"); err != nil {
-		log.Shout(ctx, log.Severity_ERROR,
-			"unable to load named time zones, time zone support will be degraded.\n"+
-				"Hint: check that the time zone database is installed on your system, or\n"+
+		log.Errorf(ctx, "timeutil.LoadLocation: %v", err)
+		reportedErr := errors.WithHint(
+			errors.WithIssueLink(
+				errors.New("unable to load named timezones"),
+				errors.IssueLink{IssueURL: unimplemented.MakeURL(36864)}),
+			"Check that the time zone database is installed on your system, or\n"+
 				"set the ZONEINFO environment variable to a Go time zone .zip archive.")
+
+		if envutil.EnvOrDefaultBool("COCKROACH_INCONSISTENT_TIME_ZONES", false) {
+			// The user tells us they really know what they want.
+			reportedErr := &formattedError{err: reportedErr}
+			log.Shout(ctx, log.Severity_WARNING, reportedErr.Error())
+		} else {
+			// Prevent a successful start.
+			//
+			// In the past, we were simply using log.Shout to emit an error,
+			// informing the user that startup could continue with degraded
+			// behavior.  However, usage demonstrated that users typically do
+			// not see the error and instead run into silently incorrect SQL
+			// results. To avoid this situation altogether, it's better to
+			// stop early.
+			return reportedErr
+		}
 	}
+	return nil
 }
 
 func reportConfiguration(ctx context.Context) {
@@ -1042,19 +1108,6 @@ func maybeWarnMemorySizes(ctx context.Context) {
 		log.Warning(ctx, buf.String())
 	}
 
-	if !sqlSizeValue.IsSet() {
-		var buf bytes.Buffer
-		fmt.Fprintf(&buf, "Using the default setting for --max-sql-memory (%s).\n", sqlSizeValue)
-		fmt.Fprintf(&buf, "  A significantly larger value is usually needed in production.\n")
-		if size, err := status.GetTotalMemory(context.Background()); err == nil {
-			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is --max-sql-memory=.25 (%s).",
-				humanizeutil.IBytes(size/4))
-		} else {
-			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is 25%% of physical memory.")
-		}
-		log.Warning(ctx, buf.String())
-	}
-
 	// Check that the total suggested "max" memory is well below the available memory.
 	if maxMemory, err := status.GetTotalMemory(ctx); err == nil {
 		requestedMem := serverCfg.CacheSize + serverCfg.SQLMemoryPoolSize
@@ -1078,7 +1131,7 @@ func logOutputDirectory() string {
 // occurs here and not in an OnInitialize function.
 func setupAndInitializeLoggingAndProfiling(
 	ctx context.Context, cmd *cobra.Command,
-) (*stop.Stopper, error) {
+) (stopper *stop.Stopper, err error) {
 	// Default the log directory to the "logs" subdirectory of the first
 	// non-memory store. If more than one non-memory stores is detected,
 	// print a warning.
@@ -1137,14 +1190,22 @@ func setupAndInitializeLoggingAndProfiling(
 		// directory too large.
 		log.StartGCDaemon(ctx)
 
-		// We have a valid logging directory. Configure RocksDB to log into it.
-		engine.InitRocksDBLogger(ctx)
+		defer func() {
+			if stopper != nil {
+				// When the function complete successfully, start the loggers
+				// for the storage engines. We need to do this at the end
+				// because we need to register the loggers.
+				stopper.AddCloser(storage.InitPebbleLogger(ctx))
+				stopper.AddCloser(storage.InitRocksDBLogger(ctx))
+			}
+		}()
 	}
 
 	outputDirectory := "."
 	if p := logOutputDirectory(); p != "" {
 		outputDirectory = p
 	}
+	startCtx.backtraceOutputDir = outputDirectory
 
 	if ambiguousLogDirs {
 		// Note that we can't report this message earlier, because the log directory
@@ -1193,7 +1254,7 @@ func setupAndInitializeLoggingAndProfiling(
 	// Disable Stopper task tracking as performing that call site tracking is
 	// moderately expensive (certainly outweighing the infrequent benefit it
 	// provides).
-	stopper := initBacktrace(outputDirectory)
+	stopper = initBacktrace(outputDirectory)
 	log.Event(ctx, "initialized profiles")
 
 	return stopper, nil
@@ -1212,7 +1273,9 @@ func addrWithDefaultHost(addr string) (string, error) {
 
 // getClientGRPCConn returns a ClientConn, a Clock and a method that blocks
 // until the connection (and its associated goroutines) have terminated.
-func getClientGRPCConn(ctx context.Context) (*grpc.ClientConn, *hlc.Clock, func(), error) {
+func getClientGRPCConn(
+	ctx context.Context, cfg server.Config,
+) (*grpc.ClientConn, *hlc.Clock, func(), error) {
 	if ctx.Done() == nil {
 		return nil, nil, nil, errors.New("context must be cancellable")
 	}
@@ -1222,13 +1285,13 @@ func getClientGRPCConn(ctx context.Context) (*grpc.ClientConn, *hlc.Clock, func(
 	clock := hlc.NewClock(hlc.UnixNano, 0)
 	stopper := stop.NewStopper()
 	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: serverCfg.Settings.Tracer},
-		serverCfg.Config,
+		log.AmbientContext{Tracer: cfg.Settings.Tracer},
+		cfg.Config,
 		clock,
 		stopper,
-		&serverCfg.Settings.Version,
+		cfg.Settings,
 	)
-	addr, err := addrWithDefaultHost(serverCfg.AdvertiseAddr)
+	addr, err := addrWithDefaultHost(cfg.AdvertiseAddr)
 	if err != nil {
 		stopper.Stop(ctx)
 		return nil, nil, nil, err
@@ -1253,8 +1316,8 @@ func getClientGRPCConn(ctx context.Context) (*grpc.ClientConn, *hlc.Clock, func(
 
 // getAdminClient returns an AdminClient and a closure that must be invoked
 // to free associated resources.
-func getAdminClient(ctx context.Context) (serverpb.AdminClient, func(), error) {
-	conn, _, finish, err := getClientGRPCConn(ctx)
+func getAdminClient(ctx context.Context, cfg server.Config) (serverpb.AdminClient, func(), error) {
+	conn, _, finish, err := getClientGRPCConn(ctx, cfg)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "Failed to connect to the node")
 	}
@@ -1365,14 +1428,14 @@ func runQuit(cmd *cobra.Command, args []string) (err error) {
 		onModes[i] = int32(m)
 	}
 
-	c, finish, err := getAdminClient(ctx)
+	c, finish, err := getAdminClient(ctx, serverCfg)
 	if err != nil {
 		return err
 	}
 	defer finish()
 
 	if quitCtx.serverDecommission {
-		var myself []string // will remain empty, which means target yourself
+		var myself []roachpb.NodeID // will remain empty, which means target yourself
 		if err := runDecommissionNodeImpl(ctx, c, nodeDecommissionWaitAll, myself); err != nil {
 			return err
 		}

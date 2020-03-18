@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package colflow
+package colflow_test
 
 import (
 	"context"
@@ -29,8 +29,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -107,10 +109,20 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 	dialer := &execinfrapb.MockDialer{Addr: addr}
 	defer dialer.Close()
 
+	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
+	defer cleanup()
+
 	for run := 0; run < 10; run++ {
 		for _, shutdownOperation := range shutdownScenarios {
 			t.Run(fmt.Sprintf("shutdownScenario=%s", shutdownOperation.string), func(t *testing.T) {
 				ctxLocal := context.Background()
+				ctxRemote, cancelRemote := context.WithCancel(context.Background())
+				// Linter says there is a possibility of "context leak" because
+				// cancelRemote variable may not be used, so we defer the call to it.
+				// This does not change anything about the test since we're blocking on
+				// the wait group and we will call cancelRemote() below, so this defer
+				// is actually a noop.
+				defer cancelRemote()
 				st := cluster.MakeTestingClusterSettings()
 				evalCtx := tree.MakeTestingEvalContext(st)
 				defer evalCtx.Stop(ctxLocal)
@@ -118,7 +130,6 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					EvalCtx: &evalCtx,
 					Cfg:     &execinfra.ServerConfig{Settings: st},
 				}
-
 				rng, _ := randutil.NewPseudoRand()
 				var (
 					err             error
@@ -126,6 +137,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					typs            = []coltypes.T{coltypes.Int64}
 					semtyps         = []types.T{*types.Int}
 					hashRouterInput = colexec.NewRandomDataOp(
+						testAllocator,
 						rng,
 						colexec.RandomDataOpArgs{
 							DeterministicTyps: typs,
@@ -145,9 +157,20 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					addAnotherRemote            = rng.Float64() < 0.5
 				)
 
-				hashRouter, hashRouterOutputs := colexec.NewHashRouter(hashRouterInput, typs, []int{0}, numHashRouterOutputs)
+				// Create an allocator for each output.
+				allocators := make([]*colexec.Allocator, numHashRouterOutputs)
+				for i := range allocators {
+					acc := testMemMonitor.MakeBoundAccount()
+					defer acc.Close(ctxRemote)
+					allocators[i] = colexec.NewAllocator(ctxRemote, &acc)
+				}
+				hashRouter, hashRouterOutputs := colexec.NewHashRouter(allocators, hashRouterInput, typs, []uint32{0}, 64<<20 /* 64 MiB */, queueCfg, &colexec.TestingSemaphore{}, testDiskAcc)
 				for i := 0; i < numInboxes; i++ {
-					inbox, err := colrpc.NewInbox(typs, execinfrapb.StreamID(streamID))
+					inboxMemAccount := testMemMonitor.MakeBoundAccount()
+					defer inboxMemAccount.Close(ctxLocal)
+					inbox, err := colrpc.NewInbox(
+						colexec.NewAllocator(ctxLocal, &inboxMemAccount), typs, execinfrapb.StreamID(streamID),
+					)
 					require.NoError(t, err)
 					inboxes = append(inboxes, inbox)
 					materializerMetadataSources = append(materializerMetadataSources, inbox)
@@ -159,12 +182,14 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				runOutboxInbox := func(
 					ctx context.Context,
 					cancelFn context.CancelFunc,
+					outboxMemAcc *mon.BoundAccount,
 					outboxInput colexec.Operator,
 					inbox *colrpc.Inbox,
 					id int,
 					outboxMetadataSources []execinfrapb.MetadataSource,
 				) {
 					outbox, err := colrpc.NewOutbox(
+						colexec.NewAllocator(ctx, outboxMemAcc),
 						outboxInput,
 						typs,
 						append(outboxMetadataSources,
@@ -195,13 +220,6 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					}(id, serverStream, doneFn)
 				}
 
-				ctxRemote, cancelRemote := context.WithCancel(context.Background())
-				// Linter says there is a possibility of "context leak" because
-				// cancelRemote variable may not be used, so we defer the call to it.
-				// This does not change anything about the test since we're blocking on
-				// the wait group.
-				defer cancelRemote()
-
 				wg.Add(1)
 				go func() {
 					hashRouter.Run(ctxRemote)
@@ -209,16 +227,21 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				}()
 				for i := 0; i < numInboxes; i++ {
 					var outboxMetadataSources []execinfrapb.MetadataSource
+					outboxMemAccount := testMemMonitor.MakeBoundAccount()
+					defer outboxMemAccount.Close(ctxRemote)
 					if i < numHashRouterOutputs {
 						if i == 0 {
 							// Only one outbox should drain the hash router.
 							outboxMetadataSources = append(outboxMetadataSources, hashRouter)
 						}
-						runOutboxInbox(ctxRemote, cancelRemote, hashRouterOutputs[i], inboxes[i], streamID, outboxMetadataSources)
+						runOutboxInbox(ctxRemote, cancelRemote, &outboxMemAccount, hashRouterOutputs[i], inboxes[i], streamID, outboxMetadataSources)
 					} else {
-						batch := coldata.NewMemBatch(typs)
+						sourceMemAccount := testMemMonitor.MakeBoundAccount()
+						defer sourceMemAccount.Close(ctxRemote)
+						remoteAllocator := colexec.NewAllocator(ctxRemote, &sourceMemAccount)
+						batch := remoteAllocator.NewMemBatch(typs)
 						batch.SetLength(coldata.BatchSize())
-						runOutboxInbox(ctxRemote, cancelRemote, colexec.NewRepeatableBatchSource(batch), inboxes[i], streamID, outboxMetadataSources)
+						runOutboxInbox(ctxRemote, cancelRemote, &outboxMemAccount, colexec.NewRepeatableBatchSource(remoteAllocator, batch), inboxes[i], streamID, outboxMetadataSources)
 					}
 					streamID++
 				}
@@ -227,10 +250,17 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				ctxAnotherRemote, cancelAnotherRemote := context.WithCancel(context.Background())
 				if addAnotherRemote {
 					// Add another "remote" node to the flow.
-					inbox, err := colrpc.NewInbox(typs, execinfrapb.StreamID(streamID))
+					inboxMemAccount := testMemMonitor.MakeBoundAccount()
+					defer inboxMemAccount.Close(ctxAnotherRemote)
+					inbox, err := colrpc.NewInbox(
+						colexec.NewAllocator(ctxAnotherRemote, &inboxMemAccount),
+						typs, execinfrapb.StreamID(streamID),
+					)
 					require.NoError(t, err)
 					inboxes = append(inboxes, inbox)
-					runOutboxInbox(ctxAnotherRemote, cancelAnotherRemote, synchronizer, inbox, streamID, materializerMetadataSources)
+					outboxMemAccount := testMemMonitor.MakeBoundAccount()
+					defer outboxMemAccount.Close(ctxAnotherRemote)
+					runOutboxInbox(ctxAnotherRemote, cancelAnotherRemote, &outboxMemAccount, synchronizer, inbox, streamID, materializerMetadataSources)
 					streamID++
 					// There is now only a single Inbox on the "local" node which is the
 					// only metadata source.

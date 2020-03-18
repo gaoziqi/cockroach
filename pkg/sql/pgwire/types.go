@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -151,6 +152,12 @@ func (b *writeBuffer) writeTextDatum(
 	case *tree.DTime:
 		// Start at offset 4 because `putInt32` clobbers the first 4 bytes.
 		s := formatTime(timeofday.TimeOfDay(*v), b.putbuf[4:4])
+		b.putInt32(int32(len(s)))
+		b.write(s)
+
+	case *tree.DTimeTZ:
+		// Start at offset 4 because `putInt32` clobbers the first 4 bytes.
+		s := formatTimeTZ(v.TimeTZ, b.putbuf[4:4])
 		b.putInt32(int32(len(s)))
 		b.write(s)
 
@@ -419,6 +426,11 @@ func (b *writeBuffer) writeBinaryDatum(
 		b.putInt32(8)
 		b.putInt64(int64(*v))
 
+	case *tree.DTimeTZ:
+		b.putInt32(12)
+		b.putInt64(int64(v.TimeOfDay))
+		b.putInt32(v.OffsetSecs)
+
 	case *tree.DInterval:
 		b.putInt32(16)
 		b.putInt64(v.Nanos() / int64(time.Microsecond/time.Nanosecond))
@@ -446,7 +458,11 @@ func (b *writeBuffer) writeBinaryDatum(
 		// TODO(andrei): We shouldn't be allocating a new buffer for every array.
 		subWriter := newWriteBuffer(nil /* bytecount */)
 		// Put the number of dimensions. We currently support 1d arrays only.
-		subWriter.putInt32(1)
+		var ndims int32 = 1
+		if v.Len() == 0 {
+			ndims = 0
+		}
+		subWriter.putInt32(ndims)
 		hasNulls := 0
 		if v.HasNulls {
 			hasNulls = 1
@@ -454,11 +470,13 @@ func (b *writeBuffer) writeBinaryDatum(
 		oid := v.ParamTyp.Oid()
 		subWriter.putInt32(int32(hasNulls))
 		subWriter.putInt32(int32(oid))
-		subWriter.putInt32(int32(v.Len()))
-		// Lower bound, we only support a lower bound of 1.
-		subWriter.putInt32(1)
-		for _, elem := range v.Array {
-			subWriter.writeBinaryDatum(ctx, elem, sessionLoc, oid)
+		if v.Len() > 0 {
+			subWriter.putInt32(int32(v.Len()))
+			// Lower bound, we only support a lower bound of 1.
+			subWriter.putInt32(1)
+			for _, elem := range v.Array {
+				subWriter.writeBinaryDatum(ctx, elem, sessionLoc, oid)
+			}
 		}
 		b.writeLengthPrefixedBuffer(&subWriter.wrapped)
 	case *tree.DJSON:
@@ -477,6 +495,7 @@ func (b *writeBuffer) writeBinaryDatum(
 
 const (
 	pgTimeFormat              = "15:04:05.999999"
+	pgTimeTZFormat            = pgTimeFormat + "-07:00"
 	pgDateFormat              = "2006-01-02"
 	pgTimeStampFormatNoOffset = pgDateFormat + " " + pgTimeFormat
 	pgTimeStampFormat         = pgTimeStampFormatNoOffset + "-07:00"
@@ -487,6 +506,15 @@ const (
 // the resulting buffer.
 func formatTime(t timeofday.TimeOfDay, tmp []byte) []byte {
 	return t.ToTime().AppendFormat(tmp, pgTimeFormat)
+}
+
+// formatTimeTZ formats t into a format lib/pq understands, appending to the
+// provided tmp buffer and reallocating if needed. The function will then return
+// the resulting buffer.
+// Note it does not understand the "second" component of the offset as lib/pq
+// cannot parse it.
+func formatTimeTZ(t timetz.TimeTZ, tmp []byte) []byte {
+	return t.ToTime().AppendFormat(tmp, pgTimeTZFormat)
 }
 
 func formatTs(t time.Time, offset *time.Location, tmp []byte) (b []byte) {

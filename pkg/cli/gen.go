@@ -118,7 +118,7 @@ func runGenAutocompleteCmd(cmd *cobra.Command, args []string) error {
 		err = cmd.Root().GenZshCompletionFile(autoCompletePath)
 	}
 	if err != nil {
-		return nil
+		return err
 	}
 
 	fmt.Printf("Generated %s completion file: %s\n", shell, autoCompletePath)
@@ -199,18 +199,27 @@ Output the list of cluster settings known to this binary.
 
 		var rows [][]string
 		for _, name := range settings.Keys() {
-			setting, ok := settings.Lookup(name)
+			setting, ok := settings.Lookup(name, settings.LookupForLocalAccess)
 			if !ok {
 				panic(fmt.Sprintf("could not find setting %q", name))
+			}
+			if setting.Visibility() != settings.Public {
+				// We don't document non-public settings at this time.
+				continue
 			}
 
 			typ, ok := settings.ReadableTypes[setting.Typ()]
 			if !ok {
 				panic(fmt.Sprintf("unknown setting type %q", setting.Typ()))
 			}
-			defaultVal := setting.String(&s.SV)
-			if override, ok := sqlmigrations.SettingsDefaultOverrides[name]; ok {
-				defaultVal = override
+			var defaultVal string
+			if sm, ok := setting.(*settings.StateMachineSetting); ok {
+				defaultVal = sm.SettingsListDefault()
+			} else {
+				defaultVal = setting.String(&s.SV)
+				if override, ok := sqlmigrations.SettingsDefaultOverrides[name]; ok {
+					defaultVal = override
+				}
 			}
 			row := []string{wrapCode(name), typ, wrapCode(defaultVal), setting.Description()}
 			rows = append(rows, row)

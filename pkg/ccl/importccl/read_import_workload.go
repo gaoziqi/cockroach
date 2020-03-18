@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/pkg/errors"
 )
@@ -48,16 +49,12 @@ func newWorkloadReader(
 func (w *workloadReader) start(ctx ctxgroup.Group) {
 }
 
-func (w *workloadReader) inputFinished(ctx context.Context) {
-	close(w.kvCh)
-}
-
 // makeDatumFromColOffset tries to fast-path a few workload-generated types into
 // directly datums, to dodge making a string and then the parsing it.
 func makeDatumFromColOffset(
 	alloc *sqlbase.DatumAlloc, hint *types.T, evalCtx *tree.EvalContext, col coldata.Vec, rowIdx int,
 ) (tree.Datum, error) {
-	if col.Nulls().NullAt64(uint64(rowIdx)) {
+	if col.Nulls().NullAt(rowIdx) {
 		return tree.DNull, nil
 	}
 	switch col.Type() {
@@ -70,6 +67,17 @@ func makeDatumFromColOffset(
 		case types.DecimalFamily:
 			d := *apd.New(col.Int64()[rowIdx], 0)
 			return alloc.NewDDecimal(tree.DDecimal{Decimal: d}), nil
+		case types.DateFamily:
+			date, err := pgdate.MakeDateFromUnixEpoch(col.Int64()[rowIdx])
+			if err != nil {
+				return nil, err
+			}
+			return alloc.NewDDate(tree.DDate{Date: date}), nil
+		}
+	case coltypes.Int16:
+		switch hint.Family() {
+		case types.IntFamily:
+			return alloc.NewDInt(tree.DInt(col.Int16()[rowIdx])), nil
 		}
 	case coltypes.Float64:
 		switch hint.Family() {
@@ -93,7 +101,7 @@ func makeDatumFromColOffset(
 		default:
 			data := col.Bytes().Get(rowIdx)
 			str := *(*string)(unsafe.Pointer(&data))
-			return tree.ParseDatumStringAs(hint, str, evalCtx)
+			return sqlbase.ParseDatumStringAs(hint, str, evalCtx)
 		}
 	}
 	return nil, errors.Errorf(
@@ -103,9 +111,12 @@ func makeDatumFromColOffset(
 func (w *workloadReader) readFiles(
 	ctx context.Context,
 	dataFiles map[int32]string,
+	_ map[int32]int64,
 	_ roachpb.IOFileFormat,
 	_ cloud.ExternalStorageFactory,
 ) error {
+
+	wcs := make([]*WorkloadKVConverter, 0, len(dataFiles))
 	for fileID, fileName := range dataFiles {
 		file, err := url.Parse(fileName)
 		if err != nil {
@@ -142,10 +153,15 @@ func (w *workloadReader) readFiles(
 			return errors.Wrapf(err, `unknown table %s for generator %s`, conf.Table, meta.Name)
 		}
 
-		if err := ctxgroup.GroupWorkers(ctx, runtime.NumCPU(), func(ctx context.Context) error {
+		wc := NewWorkloadKVConverter(
+			fileID, w.table, t.InitialRows, int(conf.BatchBegin), int(conf.BatchEnd), w.kvCh)
+		wcs = append(wcs, wc)
+	}
+
+	for _, wc := range wcs {
+		if err := ctxgroup.GroupWorkers(ctx, runtime.NumCPU(), func(ctx context.Context, _ int) error {
 			evalCtx := w.evalCtx.Copy()
-			return NewWorkloadKVConverter(
-				fileID, w.table, t.InitialRows, int(conf.BatchBegin), int(conf.BatchEnd), w.kvCh).Worker(ctx, evalCtx)
+			return wc.Worker(ctx, evalCtx)
 		}); err != nil {
 			return err
 		}
@@ -198,7 +214,7 @@ func NewWorkloadKVConverter(
 //
 // This worker needs its own EvalContext and DatumAlloc.
 func (w *WorkloadKVConverter) Worker(ctx context.Context, evalCtx *tree.EvalContext) error {
-	conv, err := row.NewDatumRowConverter(w.tableDesc, nil /* targetColNames */, evalCtx, w.kvCh)
+	conv, err := row.NewDatumRowConverter(ctx, w.tableDesc, nil /* targetColNames */, evalCtx, w.kvCh)
 	if err != nil {
 		return err
 	}
@@ -217,7 +233,7 @@ func (w *WorkloadKVConverter) Worker(ctx context.Context, evalCtx *tree.EvalCont
 		}
 		a = a[:0]
 		w.rows.FillBatch(batchIdx, cb, &a)
-		for rowIdx, numRows := 0, int(cb.Length()); rowIdx < numRows; rowIdx++ {
+		for rowIdx, numRows := 0, cb.Length(); rowIdx < numRows; rowIdx++ {
 			for colIdx, col := range cb.ColVecs() {
 				// TODO(dan): This does a type switch once per-datum. Reduce this to
 				// a one-time switch per column.

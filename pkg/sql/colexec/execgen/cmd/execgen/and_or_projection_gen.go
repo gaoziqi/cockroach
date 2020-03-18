@@ -24,8 +24,10 @@ type logicalOperation struct {
 	IsOr bool
 }
 
+const andOrProjTmpl = "pkg/sql/colexec/and_or_projection_tmpl.go"
+
 func genAndOrProjectionOps(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/and_or_projection_tmpl.go")
+	t, err := ioutil.ReadFile(andOrProjTmpl)
 	if err != nil {
 		return err
 	}
@@ -36,14 +38,13 @@ func genAndOrProjectionOps(wr io.Writer) error {
 	s = strings.Replace(s, "_IS_OR_OP", ".IsOr", -1)
 	s = strings.Replace(s, "_L_HAS_NULLS", "$.lHasNulls", -1)
 	s = strings.Replace(s, "_R_HAS_NULLS", "$.rHasNulls", -1)
-	s = strings.Replace(s, "_USES_SEL", "$.usesSel", -1)
 
 	addTupleForRight := makeFunctionRegex("_ADD_TUPLE_FOR_RIGHT", 1)
 	s = addTupleForRight.ReplaceAllString(s, `{{template "addTupleForRight" buildDict "Global" $ "lHasNulls" $1}}`)
 	setValues := makeFunctionRegex("_SET_VALUES", 3)
 	s = setValues.ReplaceAllString(s, `{{template "setValues" buildDict "Global" $ "IsOr" $1 "lHasNulls" $2 "rHasNulls" $3}}`)
-	setSingleValue := makeFunctionRegex("_SET_SINGLE_VALUE", 4)
-	s = setSingleValue.ReplaceAllString(s, `{{template "setSingleValue" buildDict "Global" $ "IsOr" $1 "usesSel" $2 "lHasNulls" $3 "rHasNulls" $4}}`)
+	setSingleValue := makeFunctionRegex("_SET_SINGLE_VALUE", 3)
+	s = setSingleValue.ReplaceAllString(s, `{{template "setSingleValue" buildDict "Global" $ "IsOr" $1 "lHasNulls" $2 "rHasNulls" $3}}`)
 
 	tmpl, err := template.New("and").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)
 	if err != nil {
@@ -67,5 +68,5 @@ func genAndOrProjectionOps(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genAndOrProjectionOps, "and_or_projection.eg.go")
+	registerGenerator(genAndOrProjectionOps, "and_or_projection.eg.go", andOrProjTmpl)
 }

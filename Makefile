@@ -20,7 +20,60 @@
 # double-hash (##) comments throughout this Makefile. Please submit
 # improvements!
 
--include build/defs.mk
+# We need to define $(GO) early because it's needed for defs.mk.
+GO      ?= go
+# xgo is needed also for defs.mk.
+override xgo := GOFLAGS= $(GO)
+
+# defs.mk stores cached values of shell commands to avoid recomputing them on
+# every Make invocation. This has a small but noticeable effect, especially on
+# noop builds.
+# This needs to be the first rule because we're including build/defs.mk
+# first thing below, and Make needs to know how to build it.
+.SECONDARY: build/defs.mk
+build/defs.mk: Makefile build/defs.mk.sig remove_obsolete_execgen
+ifndef IGNORE_GOVERS
+	@build/go-version-check.sh $(GO) || { echo "Disable this check with IGNORE_GOVERS=1." >&2; exit 1; }
+endif
+	@echo "macos-version = $$(sw_vers -productVersion 2>/dev/null | grep -oE '[0-9]+\.[0-9]+')" > $@.tmp
+	@echo "GOEXE = $$($(xgo) env GOEXE)" >> $@.tmp
+	@echo "NCPUS = $$({ getconf _NPROCESSORS_ONLN || sysctl -n hw.ncpu || nproc; } 2>/dev/null)" >> $@.tmp
+	@echo "UNAME = $$(uname)" >> $@.tmp
+	@echo "HOST_TRIPLE = $$($$($(GO) env CC) -dumpmachine)" >> $@.tmp
+	@echo "GIT_DIR = $$(git rev-parse --git-dir 2>/dev/null)" >> $@.tmp
+	@echo "GITHOOKSDIR = $$(test -d .git && echo '.git/hooks' || git rev-parse --git-path hooks)" >> $@.tmp
+	@echo "have-defs = 1" >> $@.tmp
+	@set -e; \
+	if ! cmp -s $@.tmp $@; then \
+	   mv -f $@.tmp $@; \
+	   echo "Detected change in build system. Rebooting make." >&2; \
+	else rm -f $@.tmp; fi
+
+include build/defs.mk
+
+# Nearly everything below this point needs to have the vendor directory ready
+# for use and will depend on bin/.submodules-initialized. In order to
+# ensure this is available before the first "include" directive depending
+# on it, we'll have it listed first thing.
+#
+# Note how the actions for this rule are *not* using $(GIT_DIR) which
+# is otherwise defined in defs.mk above. This is because submodules
+# are used in the process of definining the .mk files included by the
+# Makefile, so it is not yet defined by the time
+# `.submodules-initialized` is needed during a fresh build after a
+# checkout.
+.SECONDARY: bin/.submodules-initialized
+bin/.submodules-initialized:
+	gitdir=$$(git rev-parse --git-dir 2>/dev/null || true); \
+	if test -n "$$gitdir"; then \
+	   git submodule update --init --recursive; \
+	fi
+	mkdir -p $(@D)
+	touch $@
+
+# If the user wants to persist customizations for some variables, they
+# can do so by defining `customenv.mk` in their work tree.
+-include customenv.mk
 
 ifeq "$(findstring bench,$(MAKECMDGOALS))" "bench"
 $(if $(TESTS),$(error TESTS cannot be specified with `make bench` (did you mean BENCHES?)))
@@ -42,7 +95,12 @@ ifneq "$(TYPE)" ""
 $(error Make no longer understands TYPE. Use 'build/builder.sh mkrelease $(subst release-,,$(TYPE))' instead)
 endif
 
-## Which package to run tests against, e.g. "./pkg/storage".
+# dep-build is set to non-empty if the .d files should be included.
+# This definition makes it empty when only the targets "help" and/or "clean"
+# are specified.
+build-with-dep-files := $(or $(if $(MAKECMDGOALS),,implicit-all),$(filter-out help clean,$(MAKECMDGOALS)))
+
+## Which package to run tests against, e.g. "./pkg/foo".
 PKG := ./pkg/...
 
 ## Tests to run for use with `make test` or `make check-libroach`.
@@ -79,6 +137,11 @@ BENCHTIMEOUT := 5m
 
 ## Extra flags to pass to the go test runner, e.g. "-v --vmodule=raft=1"
 TESTFLAGS :=
+
+## Flags to pass to `go test` invocations that actually run tests, but not
+## elsewhere. Used for the -json flag which we'll only want to pass
+## selectively.  There's likely a better solution.
+GOTESTFLAGS :=
 
 ## Extra flags to pass to `stress` during `make stress`.
 STRESSFLAGS :=
@@ -158,7 +221,6 @@ export CFLAGS CXXFLAGS LDFLAGS CGO_CFLAGS CGO_CXXFLAGS CGO_LDFLAGS
 # toolchain.
 override LINKFLAGS = -X github.com/cockroachdb/cockroach/pkg/build.typ=$(BUILDTYPE) -extldflags "$(LDFLAGS)"
 
-GO      ?= go
 GOFLAGS ?=
 TAR     ?= tar
 
@@ -244,19 +306,6 @@ $(call make-lazy,yellow)
 $(call make-lazy,cyan)
 $(call make-lazy,term-reset)
 
-# Print an error if the user specified any variables on the command line that
-# don't appear in this Makefile. The list of valid variables is automatically
-# rebuilt on the first successful `make` invocation after the Makefile changes.
-#
-# TODO(peter): Figure out how to disallow overriding of variables that
-# are not in the valid list from the environment. The problem is that
-# any environment variable becomes a make variable and environments
-# are dirty. For instance, my includes GREP_COLOR.
-include build/variables.mk
-$(foreach v,$(filter-out $(strip $(VALID_VARS)),$(.VARIABLES)),\
-	$(if $(findstring command line,$(origin $v)),$(error Variable '$v' is not recognized by this Makefile)))
--include customenv.mk
-
 # Tell Make to delete the target if its recipe fails. Otherwise, if a recipe
 # modifies its target before failing, the target's timestamp will make it appear
 # up-to-date on the next invocation of Make, even though it is likely corrupt.
@@ -314,6 +363,7 @@ bin/.bootstrap: $(GITHOOKS) Gopkg.lock | bin/.submodules-initialized
 		./vendor/github.com/kisielk/errcheck \
 		./vendor/github.com/mattn/goveralls \
 		./vendor/github.com/mibk/dupl \
+		./vendor/github.com/mmatczuk/go_generics/cmd/go_generics \
 		./vendor/github.com/wadey/gocovmerge \
 		./vendor/golang.org/x/lint/golint \
 		./vendor/golang.org/x/perf/cmd/benchstat \
@@ -323,38 +373,7 @@ bin/.bootstrap: $(GITHOOKS) Gopkg.lock | bin/.submodules-initialized
 		./vendor/honnef.co/go/tools/cmd/staticcheck
 	touch $@
 
-.SECONDARY: bin/.submodules-initialized
-bin/.submodules-initialized:
-ifneq ($(GIT_DIR),)
-	git submodule update --init --recursive
-endif
-	mkdir -p $(@D)
-	touch $@
-
 IGNORE_GOVERS :=
-
-# Make doesn't expose a list of the variables declared in a given file, so we
-# resort to sed magic. Roughly, this sed command prints VARIABLE in lines of the
-# following forms:
-#
-#     [export] VARIABLE [:+?]=
-#     TARGET-NAME: [export] VARIABLE [:+?]=
-#
-# The additional complexity below handles whitespace and comments.
-#
-# The special comments at the beginning are for Github/Go/Reviewable:
-# https://github.com/golang/go/issues/13560#issuecomment-277804473
-# https://github.com/Reviewable/Reviewable/wiki/FAQ#how-do-i-tell-reviewable-that-a-file-is-generated-and-should-not-be-reviewed
-build/variables.mk: Makefile build/archive/contents/Makefile pkg/ui/Makefile build/defs.mk
-	@echo '# Code generated by Make. DO NOT EDIT.' > $@
-	@echo '# GENERATED FILE DO NOT EDIT' >> $@
-	@echo 'define VALID_VARS' >> $@
-	@sed -nE -e '/^	/d' -e 's/([^#]*)#.*/\1/' \
-	  -e 's/(^|^[^:]+:)[ ]*(export)?[ ]*([[:upper:]_]+)[ ]*[:?+]?=.*/  \3/p' $^ \
-	  | sort -u >> $@
-	# Special case for 'prefix' variable, which is required by Homebrew.
-	@echo '  prefix' >> $@
-	@echo 'endef' >> $@
 
 # The following section handles building our C/C++ dependencies. These are
 # common because both the root Makefile and protobuf.mk have C dependencies.
@@ -403,7 +422,6 @@ configure-flags :=
 # Similarly for xconfigure-flags and configure-flags, and xgo and GO.
 xcmake-flags := $(cmake-flags) $(EXTRA_XCMAKE_FLAGS)
 xconfigure-flags := $(configure-flags) $(EXTRA_XCONFIGURE_FLAGS)
-override xgo := GOFLAGS= $(GO)
 
 # If we're cross-compiling, inform Autotools and CMake.
 ifdef is-cross-compile
@@ -497,12 +515,13 @@ native-tag := $(subst -,_,$(TARGET_TRIPLE))$(if $(use-stdmalloc),_stdmalloc)$(if
 #
 # Suffixed flags files (e.g. zcgo_flags_{native-tag}.go) have the build
 # constraint `{native-tag}` and are built the first time a Make-driven build
-# encounters a given native tag. These tags are unset when building with the Go
-# toolchain directly, so these files are only compiled when building with Make.
+# encounters a given native tag or when the build signature changes (see
+# build/defs.mk.sig). These tags are unset when building with the Go toolchain
+# directly, so these files are only compiled when building with Make.
 CGO_PKGS := \
 	pkg/cli \
 	pkg/server/status \
-	pkg/storage/engine \
+	pkg/storage \
 	pkg/ccl/storageccl/engineccl \
 	pkg/ccl/gssapiccl \
 	vendor/github.com/knz/go-libedit/unix
@@ -512,9 +531,8 @@ CGO_SUFFIXED_FLAGS_FILES   := $(addprefix ./,$(addsuffix /zcgo_flags_$(native-ta
 BASE_CGO_FLAGS_FILES := $(CGO_UNSUFFIXED_FLAGS_FILES) $(CGO_SUFFIXED_FLAGS_FILES)
 CGO_FLAGS_FILES := $(BASE_CGO_FLAGS_FILES) vendor/github.com/knz/go-libedit/unix/zcgo_flags_extra.go
 
-$(CGO_UNSUFFIXED_FLAGS_FILES): build/defs.mk.sig
-
-$(BASE_CGO_FLAGS_FILES): Makefile | bin/.submodules-initialized
+$(BASE_CGO_FLAGS_FILES): Makefile build/defs.mk.sig | bin/.submodules-initialized
+	@echo "regenerating $@"
 	@echo '// GENERATED FILE DO NOT EDIT' > $@
 	@echo >> $@
 	@echo '// +build $(if $(findstring $(native-tag),$@),$(native-tag),!make)' >> $@
@@ -526,6 +544,7 @@ $(BASE_CGO_FLAGS_FILES): Makefile | bin/.submodules-initialized
 	@echo 'import "C"' >> $@
 
 vendor/github.com/knz/go-libedit/unix/zcgo_flags_extra.go: Makefile | bin/.submodules-initialized
+	@echo "regenerating $@"
 	@echo '// GENERATED FILE DO NOT EDIT' > $@
 	@echo >> $@
 	@echo 'package $($(@D)-package)' >> $@
@@ -746,29 +765,12 @@ override TAGS += make $(native-tag)
 # set LC_ALL so this is consistent across systems.
 export LC_ALL=C
 
-# defs.mk stores cached values of shell commands to avoid recomputing them on
-# every Make invocation. This has a small but noticeable effect, especially on
-# noop builds.
-build/defs.mk: Makefile build/defs.mk.sig
-ifndef IGNORE_GOVERS
-	@build/go-version-check.sh $(GO) || { echo "Disable this check with IGNORE_GOVERS=1." >&2; exit 1; }
-endif
-	@echo "macos-version = $$(sw_vers -productVersion 2>/dev/null | grep -oE '[0-9]+\.[0-9]+')" > $@
-	@echo "GOEXE = $$($(xgo) env GOEXE)" >> $@
-	@echo "NCPUS = $$({ getconf _NPROCESSORS_ONLN || sysctl -n hw.ncpu || nproc; } 2>/dev/null)" >> $@
-	@echo "UNAME = $$(uname)" >> $@
-	@echo "HOST_TRIPLE = $$($$($(GO) env CC) -dumpmachine)" >> $@
-	@echo "GIT_DIR = $$(git rev-parse --git-dir 2>/dev/null)" >> $@
-	@echo "GITHOOKSDIR = $$(test -d .git && echo '.git/hooks' || git rev-parse --git-path hooks)" >> $@
-	@echo "have-defs = 1" >> $@
-	$(if $(have-defs),$(info Detected change in build system. Rebooting Make.))
-
 # defs.mk.sig attempts to capture common cases where defs.mk needs to be
 # recomputed, like when compiling for a different platform or using a different
 # Go binary. It is not intended to be perfect. Upgrading the compiler toolchain
 # in place will go unnoticed, for example. Similar problems exist in all Make-
 # based build systems and are not worth solving.
-build/defs.mk.sig: sig = $(PATH):$(CURDIR):$(GO):$(GOPATH):$(CC):$(CXX):$(TARGET_TRIPLE):$(BUILDTYPE):$(IGNORE_GOVERS)
+build/defs.mk.sig: sig = $(PATH):$(CURDIR):$(GO):$(GOPATH):$(CC):$(CXX):$(TARGET_TRIPLE):$(BUILDTYPE):$(IGNORE_GOVERS):$(ENABLE_LIBROACH_ASSERTIONS):$(ENABLE_ROCKSDB_ASSERTIONS)
 build/defs.mk.sig: .ALWAYS_REBUILD
 	@echo '$(sig)' | cmp -s - $@ || echo '$(sig)' > $@
 
@@ -793,11 +795,15 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/and_or_projection.eg.go \
   pkg/sql/colexec/any_not_null_agg.eg.go \
   pkg/sql/colexec/avg_agg.eg.go \
+  pkg/sql/colexec/bool_and_or_agg.eg.go \
   pkg/sql/colexec/cast.eg.go \
   pkg/sql/colexec/const.eg.go \
+  pkg/sql/colexec/count_agg.eg.go \
   pkg/sql/colexec/distinct.eg.go \
   pkg/sql/colexec/hashjoiner.eg.go \
-  pkg/sql/colexec/joiner_util.eg.go \
+  pkg/sql/colexec/hashtable.eg.go \
+  pkg/sql/colexec/hash_aggregator.eg.go \
+  pkg/sql/colexec/hash_utils.eg.go \
   pkg/sql/colexec/like_ops.eg.go \
   pkg/sql/colexec/mergejoinbase.eg.go \
   pkg/sql/colexec/mergejoiner_fullouter.eg.go \
@@ -807,27 +813,32 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/mergejoiner_leftsemi.eg.go \
   pkg/sql/colexec/mergejoiner_rightouter.eg.go \
   pkg/sql/colexec/min_max_agg.eg.go \
+  pkg/sql/colexec/orderedsynchronizer.eg.go \
   pkg/sql/colexec/overloads_test_utils.eg.go \
   pkg/sql/colexec/proj_const_left_ops.eg.go \
   pkg/sql/colexec/proj_const_right_ops.eg.go \
   pkg/sql/colexec/proj_non_const_ops.eg.go \
-  pkg/sql/colexec/rank.eg.go \
-  pkg/sql/colexec/row_number.eg.go \
   pkg/sql/colexec/quicksort.eg.go \
+  pkg/sql/colexec/rank.eg.go \
+  pkg/sql/colexec/relative_rank.eg.go \
+  pkg/sql/colexec/row_number.eg.go \
   pkg/sql/colexec/rowstovec.eg.go \
   pkg/sql/colexec/selection_ops.eg.go \
   pkg/sql/colexec/select_in.eg.go \
   pkg/sql/colexec/sort.eg.go \
+  pkg/sql/colexec/substring.eg.go \
   pkg/sql/colexec/sum_agg.eg.go \
-  pkg/sql/colexec/tuples_differ.eg.go \
+  pkg/sql/colexec/values_differ.eg.go \
   pkg/sql/colexec/vec_comparators.eg.go \
-  pkg/sql/colexec/zerocolumns.eg.go
+  pkg/sql/colexec/window_peer_grouper.eg.go
 
-execgen-exclusions = $(addprefix -not -path ,$(EXECGEN_TARGETS))
-
-$(info Cleaning old generated files.)
-$(shell find pkg/sql/colexec -type f -name '*.eg.go' $(execgen-exclusions) -delete)
-$(shell find pkg/sql/exec -type f -name '*.eg.go' $(execgen-exclusions) -delete 2>/dev/null)
+.PHONY: remove_obsolete_execgen
+remove_obsolete_execgen:
+	@obsolete="$(filter-out $(EXECGEN_TARGETS), $(shell find pkg/col/coldata pkg/sql/colexec pkg/sql/exec -name '*.eg.go' 2>/dev/null))"; \
+	for file in $${obsolete}; do \
+	  echo "Removing obsolete file $${file}..."; \
+	  rm -f $${file}; \
+	done
 
 OPTGEN_TARGETS = \
 	pkg/sql/opt/memo/expr.og.go \
@@ -838,7 +849,9 @@ OPTGEN_TARGETS = \
 	pkg/sql/opt/rule_name_string.go
 
 go-targets-ccl := \
-	$(COCKROACH) $(COCKROACHSHORT) go-install \
+	$(COCKROACH) $(COCKROACHSHORT) \
+	bin/workload \
+	go-install \
 	bench benchshort \
 	check test testshort testslow testrace testraceslow testbuild \
 	stress stressrace \
@@ -969,13 +982,13 @@ benchshort: override TESTFLAGS += -benchtime=1ns -short
 .PHONY: check test testshort testrace testlogic testbaselogic testccllogic testoptlogic bench benchshort
 test: ## Run tests.
 check test testshort testrace bench benchshort:
-	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
 
 .PHONY: stress stressrace
 stress: ## Run tests under stress.
 stressrace: ## Run tests under stress with the race detector enabled.
 stress stressrace:
-	$(xgo) test $(GOFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
 
 .PHONY: roachprod-stress roachprod-stressrace
 roachprod-stress roachprod-stressrace: bin/roachprod-stress
@@ -985,7 +998,7 @@ roachprod-stress roachprod-stressrace: bin/roachprod-stress
 	@if [ -z "$(CLUSTER)" ]; then \
 	  echo "ERROR: missing or empty CLUSTER"; \
 	else \
-	  bin/roachprod-stress $(CLUSTER) $(STRESSFLAGS) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) \
+	  bin/roachprod-stress $(CLUSTER) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) $(STRESSFLAGS) -- \
 	    -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
 	fi
 
@@ -1021,7 +1034,7 @@ testraceslow: TESTTIMEOUT := $(RACETIMEOUT)
 .PHONY: testslow testraceslow
 testslow testraceslow: override TESTFLAGS += -v
 testslow testraceslow:
-	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS) | grep -F ': Test' | sed -E 's/(--- PASS: |\(|\))//g' | awk '{ print $$2, $$1 }' | sort -rn | head -n 10
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS) | grep -F ': Test' | sed -E 's/(--- PASS: |\(|\))//g' | awk '{ print $$2, $$1 }' | sort -rn | head -n 10
 
 .PHONY: upload-coverage
 upload-coverage: bin/.bootstrap
@@ -1034,6 +1047,11 @@ acceptance: TESTTIMEOUT := $(ACCEPTANCETIMEOUT)
 acceptance: export TESTTIMEOUT := $(TESTTIMEOUT)
 acceptance: ## Run acceptance tests.
 	+@pkg/acceptance/run.sh
+
+.PHONY: compose
+compose: export TESTTIMEOUT := $(TESTTIMEOUT)
+compose: ## Run compose tests.
+	+@pkg/compose/run.sh
 
 .PHONY: dupl
 dupl: bin/.bootstrap
@@ -1058,19 +1076,19 @@ lint lintshort: TESTTIMEOUT := $(LINTTIMEOUT)
 .PHONY: lint
 lint: override TAGS += lint
 lint: ## Run all style checkers and linters.
-lint: bin/returncheck bin/roachlint
+lint: bin/returncheck bin/roachvet
 	@if [ -t 1 ]; then echo '$(yellow)NOTE: `make lint` is very slow! Perhaps `make lintshort`?$(term-reset)'; fi
 	@# Run 'go build -i' to ensure we have compiled object files available for all
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
 	@# https://groups.google.com/forum/#!msg/golang-dev/qfa3mHN4ZPA/X2UzjNV1BAAJ.
 	$(xgo) build -i -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
-	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -timeout $(TESTTIMEOUT) -run 'Lint/$(TESTS)'
+	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -timeout $(TESTTIMEOUT) -run 'Lint/$(TESTS)'
 
 .PHONY: lintshort
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
-lintshort: bin/roachlint
-	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
+lintshort: bin/roachvet
+	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
 protobuf: $(PROTOBUF_TARGETS)
@@ -1184,7 +1202,7 @@ UI_JS_OSS := pkg/ui/src/js/protos.js
 UI_TS_OSS := pkg/ui/src/js/protos.d.ts
 UI_PROTOS_OSS := $(UI_JS_OSS) $(UI_TS_OSS)
 
-CPP_PROTOS := $(filter %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/roachpb/errors.proto %/roachpb/api.proto %util/tracing/recorded_span.proto %/engine/enginepb/mvcc.proto %/engine/enginepb/mvcc3.proto %/engine/enginepb/file_registry.proto %/engine/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/log/log.proto %/unresolved_addr.proto,$(GO_PROTOS))
+CPP_PROTOS := $(filter %/roachpb/api.proto %/roachpb/metadata.proto %/roachpb/data.proto %/roachpb/internal.proto %/roachpb/errors.proto %util/tracing/recorded_span.proto %/concurrency/lock/locking.proto %/enginepb/mvcc.proto %/enginepb/mvcc3.proto %/enginepb/file_registry.proto %/enginepb/rocksdb.proto %/hlc/legacy_timestamp.proto %/hlc/timestamp.proto %/log/log.proto %/unresolved_addr.proto,$(GO_PROTOS))
 CPP_HEADERS := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.h))
 CPP_SOURCES := $(subst ./pkg,$(CPP_PROTO_ROOT),$(CPP_PROTOS:%.proto=%.pb.cc))
 
@@ -1266,7 +1284,7 @@ STYLINT            := ./node_modules/.bin/stylint
 TSLINT             := ./node_modules/.bin/tslint
 TSC                := ./node_modules/.bin/tsc
 KARMA              := ./node_modules/.bin/karma
-WEBPACK            := ./node_modules/.bin/webpack $(if $(MAKE_TERMERR),--progress)
+WEBPACK            := ./node_modules/.bin/webpack
 WEBPACK_DEV_SERVER := ./node_modules/.bin/webpack-dev-server
 WEBPACK_DASHBOARD  := ./opt/node_modules/.bin/webpack-dashboard
 
@@ -1356,7 +1374,7 @@ ui-watch-secure: export TARGET ?= https://localhost:8080/
 ui-watch: export TARGET ?= http://localhost:8080
 ui-watch ui-watch-secure: PORT := 3000
 ui-watch ui-watch-secure: $(UI_CCL_DLLS) pkg/ui/yarn.opt.installed
-	cd pkg/ui && $(WEBPACK_DASHBOARD) -- $(WEBPACK_DEV_SERVER) --config webpack.app.js --env.dist=ccl --port $(PORT) $(WEBPACK_DEV_SERVER_FLAGS)
+	cd pkg/ui && $(WEBPACK_DASHBOARD) -- $(WEBPACK_DEV_SERVER) --config webpack.app.js --env.dist=ccl --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
 
 .PHONY: ui-clean
 ui-clean: ## Remove build artifacts.
@@ -1473,40 +1491,52 @@ settings-doc-gen := $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),
 $(SETTINGS_DOC_PAGE): $(settings-doc-gen)
 	@$(settings-doc-gen) gen settings-list --format=html > $@
 
-pkg/col/coldata/vec.eg.go: pkg/col/coldata/vec_tmpl.go
-pkg/sql/colexec/and_or_projection.eg.go: pkg/sql/colexec/and_or_projection_tmpl.go
-pkg/sql/colexec/any_not_null_agg.eg.go: pkg/sql/colexec/any_not_null_agg_tmpl.go
-pkg/sql/colexec/avg_agg.eg.go: pkg/sql/colexec/avg_agg_tmpl.go
-pkg/sql/colexec/cast.eg.go: pkg/sql/colexec/cast_tmpl.go
-pkg/sql/colexec/const.eg.go: pkg/sql/colexec/const_tmpl.go
-pkg/sql/colexec/distinct.eg.go: pkg/sql/colexec/distinct_tmpl.go
-pkg/sql/colexec/hashjoiner.eg.go: pkg/sql/colexec/hashjoiner_tmpl.go
-pkg/sql/colexec/joiner_util.eg.go: pkg/sql/colexec/joiner_util_tmpl.go
-pkg/sql/colexec/mergejoinbase.eg.go: pkg/sql/colexec/mergejoinbase_tmpl.go
-pkg/sql/colexec/mergejoiner_fullouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
-pkg/sql/colexec/mergejoiner_inner.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
-pkg/sql/colexec/mergejoiner_leftanti.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
-pkg/sql/colexec/mergejoiner_leftouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
-pkg/sql/colexec/mergejoiner_leftsemi.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
-pkg/sql/colexec/mergejoiner_rightouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
-pkg/sql/colexec/min_max_agg.eg.go: pkg/sql/colexec/min_max_agg_tmpl.go
-pkg/sql/colexec/proj_const_left_ops.eg.go: pkg/sql/colexec/proj_const_ops_tmpl.go
-pkg/sql/colexec/proj_const_right_ops.eg.go: pkg/sql/colexec/proj_const_ops_tmpl.go
-pkg/sql/colexec/proj_non_const_ops.eg.go: pkg/sql/colexec/proj_non_const_ops_tmpl.go
-pkg/sql/colexec/quicksort.eg.go: pkg/sql/colexec/quicksort_tmpl.go
-pkg/sql/colexec/rank.eg.go: pkg/sql/colexec/rank_tmpl.go
-pkg/sql/colexec/row_number.eg.go: pkg/sql/colexec/row_number_tmpl.go
-pkg/sql/colexec/rowstovec.eg.go: pkg/sql/colexec/rowstovec_tmpl.go
-pkg/sql/colexec/select_in.eg.go: pkg/sql/colexec/select_in_tmpl.go
-pkg/sql/colexec/selection_ops.eg.go: pkg/sql/colexec/selection_ops_tmpl.go
-pkg/sql/colexec/sort.eg.go: pkg/sql/colexec/sort_tmpl.go
-pkg/sql/colexec/sum_agg.eg.go: pkg/sql/colexec/sum_agg_tmpl.go
-pkg/sql/colexec/tuples_differ.eg.go: pkg/sql/colexec/tuples_differ_tmpl.go
-pkg/sql/colexec/vec_comparators.eg.go: pkg/sql/colexec/vec_comparators_tmpl.go
-pkg/sql/colexec/zerocolumns.eg.go: pkg/sql/colexec/zerocolumns_tmpl.go
+# Produce the dependency list for all the .eg.go files, to make them
+# depend on the right template. We use the -M flag to execgen which
+# produces the dependencies, then include them below.
+.SECONDARY: bin/execgen_out.d
+bin/execgen_out.d: bin/execgen
+	@echo EXECGEN $@; execgen -M $(EXECGEN_TARGETS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	@mv -f $@.tmp $@
 
-$(EXECGEN_TARGETS): bin/execgen
-	execgen $@
+# No need to pull all the world in when a user just wants
+# to know how to invoke `make` or clean up.
+ifneq ($(build-with-dep-files),)
+-include bin/execgen_out.d
+endif
+
+# Generate the colexec files.
+#
+# Note how the dependency work is complete after the cmp/rm/mv
+# dance to write to the output.
+# However, because it does not always change the timestamp of the
+# target file, it is possible to get a situation where the target is
+# older than both bin/execgen and the _tmpl.go file, but does not get
+# changed by this rule. This happens e.g. after a 'git checkout' to a
+# different branch, when the execgen binary and templates do not
+# change across branches.
+#
+# In order to prevent the rule from kicking again in every
+# make invocation, we tweak the timestamp of the output file
+# to be the latest of either bin/execgen or the input template.
+# This makes it just new enough that 'make' will be satisfied
+# that it does not need an update any more.
+#
+# Note that we don't want to ratchet the timestamp all the way
+# to the present, because then it will becomes newer
+# than all the other produced artifacts downstream and force
+# them to rebuild too.
+%.eg.go: bin/execgen
+	@echo EXECGEN $@
+	@execgen $@ > $@.tmp || { rm -f $@.tmp; exit 1; }
+	@cmp $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
+	@set -e; \
+	  depfile=$$(execgen -M $@ | cut -d: -f2); \
+	  target_timestamp_file=$${depfile:-bin/execgen}; \
+	  if test bin/execgen -nt $$target_timestamp_file; then \
+	    target_timestamp_file=bin/execgen; \
+	  fi; \
+	  touch -r $$target_timestamp_file $@
 
 optgen-defs := pkg/sql/opt/ops/*.opt
 optgen-norm-rules := pkg/sql/opt/norm/rules/*.opt
@@ -1603,7 +1633,7 @@ bins = \
   bin/publish-provisional-artifacts \
   bin/optgen \
   bin/returncheck \
-  bin/roachlint \
+  bin/roachvet \
   bin/roachprod \
   bin/roachprod-stress \
   bin/roachtest \
@@ -1633,8 +1663,7 @@ logictest-bins := bin/logictest bin/logictestopt bin/logictestccl
 # TODO(benesch): Derive this automatically. This is getting out of hand.
 bin/workload bin/docgen bin/execgen bin/roachtest $(logictest-bins): $(SQLPARSER_TARGETS) $(PROTOBUF_TARGETS)
 bin/workload bin/roachtest $(logictest-bins): $(EXECGEN_TARGETS)
-bin/roachtest $(logictest-bins): $(C_LIBS_CCL) $(CGO_FLAGS_FILES)
-bin/roachtest bin/logictestopt: $(OPTGEN_TARGETS)
+bin/roachtest $(logictest-bins): $(C_LIBS_CCL) $(CGO_FLAGS_FILES) $(OPTGEN_TARGETS)
 
 $(bins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
 	@echo go install -v $*
@@ -1646,9 +1675,9 @@ $(testbins): bin/%: bin/%.d | bin/prereqs $(SUBMODULES_TARGET)
 	@echo go test -c $($*-package)
 	bin/prereqs -bin-name=$* -test $($*-package) > $@.d.tmp
 	mv -f $@.d.tmp $@.d
-	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -c -o $@ $($*-package)
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -c -o $@ $($*-package)
 
-bin/prereqs: ./pkg/cmd/prereqs/*.go
+bin/prereqs: ./pkg/cmd/prereqs/*.go | bin/.submodules-initialized
 	@echo go install -v ./pkg/cmd/prereqs
 	@$(GO_INSTALL) -v ./pkg/cmd/prereqs
 
@@ -1657,7 +1686,53 @@ fuzz: ## Run fuzz tests.
 fuzz: bin/fuzz
 	bin/fuzz $(TESTFLAGS) -tests $(TESTS) -timeout $(TESTTIMEOUT) $(PKG)
 
+
+# No need to include all the dependency files if the user is just
+# requesting help or cleanup.
+ifneq ($(build-with-dep-files),)
+.SECONDARY: bin/%.d
 .PRECIOUS: bin/%.d
 bin/%.d: ;
 
 include $(wildcard bin/*.d)
+endif
+
+# Make doesn't expose a list of the variables declared in a given file, so we
+# resort to sed magic. Roughly, this sed command prints VARIABLE in lines of the
+# following forms:
+#
+#     [export] VARIABLE [:+?]=
+#     TARGET-NAME: [export] VARIABLE [:+?]=
+#
+# The additional complexity below handles whitespace and comments.
+#
+# The special comments at the beginning are for Github/Go/Reviewable:
+# https://github.com/golang/go/issues/13560#issuecomment-277804473
+# https://github.com/Reviewable/Reviewable/wiki/FAQ#how-do-i-tell-reviewable-that-a-file-is-generated-and-should-not-be-reviewed
+# Note how the 'prefix' variable is manually appended. This is required by Homebrew.
+.SECONDARY: build/variables.mk
+build/variables.mk: Makefile build/archive/contents/Makefile pkg/ui/Makefile build/defs.mk
+	@echo '# Code generated by Make. DO NOT EDIT.' > $@.tmp
+	@echo '# GENERATED FILE DO NOT EDIT' >> $@.tmp
+	@echo 'define VALID_VARS' >> $@.tmp
+	@sed -nE -e '/^	/d' -e 's/([^#]*)#.*/\1/' \
+	  -e 's/(^|^[^:]+:)[ ]*(export)?[ ]*([[:upper:]_]+)[ ]*[:?+]?=.*/  \3/p' $^ \
+	  | sort -u >> $@.tmp
+	@echo '  prefix' >> $@.tmp
+	@echo 'endef' >> $@.tmp
+	@set -e; \
+	if ! cmp -s $@.tmp $@; then \
+	   mv -f $@.tmp $@; \
+	else rm -f $@.tmp; fi
+
+# Print an error if the user specified any variables on the command line that
+# don't appear in this Makefile. The list of valid variables is automatically
+# rebuilt on the first successful `make` invocation after the Makefile changes.
+#
+# TODO(peter): Figure out how to disallow overriding of variables that
+# are not in the valid list from the environment. The problem is that
+# any environment variable becomes a make variable and environments
+# are dirty. For instance, my includes GREP_COLOR.
+include build/variables.mk
+$(foreach v,$(filter-out $(strip $(VALID_VARS)),$(.VARIABLES)),\
+	$(if $(findstring command line,$(origin $v)),$(error Variable '$v' is not recognized by this Makefile)))

@@ -162,10 +162,11 @@ func registerDrop(r *testRegistry) {
 	numNodes := 9
 
 	// 1GB
-	initDiskSpace := int(1E9)
+	initDiskSpace := int(1e9)
 
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("drop/tpcc/w=%d,nodes=%d", warehouses, numNodes),
+		Owner:      OwnerKV,
 		MinVersion: `v2.1.0`,
 		Cluster:    makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -176,7 +177,7 @@ func registerDrop(r *testRegistry) {
 				warehouses = 1
 
 				// 100 MB
-				initDiskSpace = 1E8
+				initDiskSpace = 1e8
 				fmt.Printf("running with w=%d,nodes=%d in local mode\n", warehouses, numNodes)
 			}
 			runDrop(ctx, t, c, warehouses, numNodes, initDiskSpace)

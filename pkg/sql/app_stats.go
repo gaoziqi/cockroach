@@ -38,7 +38,6 @@ type stmtKey struct {
 	stmt        string
 	failed      bool
 	distSQLUsed bool
-	optUsed     bool
 	implicitTxn bool
 }
 
@@ -68,37 +67,37 @@ type transactionStats struct {
 
 // stmtStatsEnable determines whether to collect per-statement
 // statistics.
-var stmtStatsEnable = settings.RegisterBoolSetting(
+var stmtStatsEnable = settings.RegisterPublicBoolSetting(
 	"sql.metrics.statement_details.enabled", "collect per-statement query statistics", true,
 )
 
 // txnStatsEnable determines whether to collect per-application transaction
 // statistics.
-var txnStatsEnable = settings.RegisterBoolSetting(
+var txnStatsEnable = settings.RegisterPublicBoolSetting(
 	"sql.metrics.transaction_details.enabled", "collect per-application transaction statistics", true,
 )
 
 // sqlStatsCollectionLatencyThreshold specifies the minimum amount of time
 // consumed by a SQL statement before it is collected for statistics reporting.
-var sqlStatsCollectionLatencyThreshold = settings.RegisterDurationSetting(
+var sqlStatsCollectionLatencyThreshold = settings.RegisterPublicDurationSetting(
 	"sql.metrics.statement_details.threshold",
 	"minimum execution time to cause statistics to be collected",
 	0,
 )
 
-var dumpStmtStatsToLogBeforeReset = settings.RegisterBoolSetting(
+var dumpStmtStatsToLogBeforeReset = settings.RegisterPublicBoolSetting(
 	"sql.metrics.statement_details.dump_to_logs",
 	"dump collected statement statistics to node logs when periodically cleared",
 	false,
 )
 
-var sampleLogicalPlans = settings.RegisterBoolSetting(
+var sampleLogicalPlans = settings.RegisterPublicBoolSetting(
 	"sql.metrics.statement_details.plan_collection.enabled",
 	"periodically save a logical plan for each fingerprint",
 	true,
 )
 
-var logicalPlanCollectionPeriod = settings.RegisterNonNegativeDurationSetting(
+var logicalPlanCollectionPeriod = settings.RegisterPublicNonNegativeDurationSetting(
 	"sql.metrics.statement_details.plan_collection.period",
 	"the time until a new logical plan is collected",
 	5*time.Minute,
@@ -116,9 +115,6 @@ func (s stmtKey) flags() string {
 	if s.distSQLUsed {
 		b.WriteByte('+')
 	}
-	if !s.optUsed {
-		b.WriteByte('-')
-	}
 	return b.String()
 }
 
@@ -129,7 +125,6 @@ func (a *appStats) recordStatement(
 	stmt *Statement,
 	samplePlanDescription *roachpb.ExplainTreePlanNode,
 	distSQLUsed bool,
-	optUsed bool,
 	implicitTxn bool,
 	automaticRetryCount int,
 	numRows int,
@@ -146,7 +141,7 @@ func (a *appStats) recordStatement(
 	}
 
 	// Get the statistics object.
-	s := a.getStatsForStmt(stmt, distSQLUsed, optUsed, implicitTxn, err, true /* createIfNonexistent */)
+	s := a.getStatsForStmt(stmt, distSQLUsed, implicitTxn, err, true /* createIfNonexistent */)
 
 	// Collect the per-statement statistics.
 	s.Lock()
@@ -177,16 +172,11 @@ func (a *appStats) recordStatement(
 
 // getStatsForStmt retrieves the per-stmt stat object.
 func (a *appStats) getStatsForStmt(
-	stmt *Statement,
-	distSQLUsed bool,
-	optimizerUsed bool,
-	implicitTxn bool,
-	err error,
-	createIfNonexistent bool,
+	stmt *Statement, distSQLUsed bool, implicitTxn bool, err error, createIfNonexistent bool,
 ) *stmtStats {
 	// Extend the statement key with various characteristics, so
 	// that we use separate buckets for the different situations.
-	key := stmtKey{failed: err != nil, distSQLUsed: distSQLUsed, optUsed: optimizerUsed, implicitTxn: implicitTxn}
+	key := stmtKey{failed: err != nil, distSQLUsed: distSQLUsed, implicitTxn: implicitTxn}
 	if stmt.AnonymizedStr != "" {
 		// Use the cached anonymized string.
 		key.stmt = stmt.AnonymizedStr
@@ -208,6 +198,45 @@ func (a *appStats) getStatsForStmtWithKey(key stmtKey, createIfNonexistent bool)
 	}
 	a.Unlock()
 	return s
+}
+
+// Add combines one appStats into another. Add manages locks on a, so taking
+// a lock on a will cause a deadlock.
+func (a *appStats) Add(other *appStats) {
+	other.Lock()
+	statMap := make(map[stmtKey]*stmtStats)
+	for k, v := range other.stmts {
+		statMap[k] = v
+	}
+	other.Unlock()
+
+	// Copy the statement stats for each statement key.
+	for k, v := range statMap {
+		v.Lock()
+		statCopy := &stmtStats{data: v.data}
+		v.Unlock()
+		statMap[k] = statCopy
+	}
+
+	// Merge the statement stats.
+	for k, v := range statMap {
+		s := a.getStatsForStmtWithKey(k, true)
+		s.Lock()
+		// Note that we don't need to take a lock on v because
+		// no other thread knows about v yet.
+		s.data.Add(&v.data)
+		s.Unlock()
+	}
+
+	// Create a copy of the other's transactions statistics.
+	other.txns.mu.Lock()
+	txnStats := other.txns.mu.TxnStats
+	other.txns.mu.Unlock()
+
+	// Merge the transaction stats.
+	a.txns.mu.Lock()
+	a.txns.mu.TxnStats.Add(txnStats)
+	a.txns.mu.Unlock()
 }
 
 func anonymizeStmt(ast tree.Statement) string {
@@ -251,6 +280,29 @@ func (a *appStats) recordTransaction(txnTimeSec float64, ev txnEvent, implicit b
 	a.txns.recordTransaction(txnTimeSec, ev, implicit)
 }
 
+// shouldSaveLogicalPlanDescription returns whether we should save this as a
+// sample logical plan for its corresponding fingerprint. We use
+// `logicalPlanCollectionPeriod` to assess how frequently to sample logical
+// plans.
+func (a *appStats) shouldSaveLogicalPlanDescription(
+	stmt *Statement, useDistSQL bool, implicitTxn bool, err error,
+) bool {
+	if !sampleLogicalPlans.Get(&a.st.SV) {
+		return false
+	}
+	stats := a.getStatsForStmt(stmt, useDistSQL, implicitTxn, err, false /* createIfNonexistent */)
+	if stats == nil {
+		// Save logical plan the first time we see new statement fingerprint.
+		return true
+	}
+	now := timeutil.Now()
+	period := logicalPlanCollectionPeriod.Get(&a.st.SV)
+	stats.Lock()
+	defer stats.Unlock()
+	timeLastSampled := stats.data.SensitiveInfo.MostRecentPlanTimestamp
+	return now.Sub(timeLastSampled) >= period
+}
+
 // sqlStats carries per-application statistics for all applications.
 type sqlStats struct {
 	syncutil.Mutex
@@ -274,6 +326,20 @@ func (s *sqlStats) getStatsForApplication(appName string) *appStats {
 	}
 	s.apps[appName] = a
 	return a
+}
+
+func (s *sqlStats) Add(other *sqlStats) {
+	other.Lock()
+	appStatsCopy := make(map[string]*appStats)
+	for k, v := range other.apps {
+		appStatsCopy[k] = v
+	}
+	other.Unlock()
+	for k, v := range appStatsCopy {
+		stats := s.getStatsForApplication(k)
+		// Add manages locks for itself, so we don't need to guard it with locks.
+		stats.Add(v)
+	}
 }
 
 // resetStats clears all the stored per-app and per-statement
@@ -413,7 +479,7 @@ func (s *sqlStats) getStmtStats(
 				k := roachpb.StatementStatisticsKey{
 					Query:       maybeScrubbed,
 					DistSQL:     q.distSQLUsed,
-					Opt:         q.optUsed,
+					Opt:         true,
 					ImplicitTxn: q.implicitTxn,
 					Failed:      q.failed,
 					App:         maybeHashedAppName,

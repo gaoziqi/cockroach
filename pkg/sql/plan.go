@@ -13,8 +13,10 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -68,7 +70,9 @@ func (r *runParams) creationTimeForNewTableDescriptor() hlc.Timestamp {
 	// CreateAsOfTime and ModificationTime when creating a table descriptor and then
 	// upon reading use the MVCC timestamp to populate the values.
 	var ts hlc.Timestamp
-	if !r.ExecCfg().Settings.Version.IsActive(cluster.VersionTableDescModificationTimeFromMVCC) {
+	if !r.ExecCfg().Settings.Version.IsActive(
+		r.ctx, clusterversion.VersionTableDescModificationTimeFromMVCC,
+	) {
 		ts = r.p.txn.CommitTimestamp()
 	}
 	return ts
@@ -111,6 +115,9 @@ type planNode interface {
 	// This method must not be called during execution - the planNode
 	// tree must remain "live" and readable via walk() even after
 	// execution completes.
+	//
+	// The node must not be used again after this method is called. Some nodes put
+	// themselves back into memory pools on Close.
 	Close(ctx context.Context)
 }
 
@@ -128,6 +135,25 @@ type planNodeFastPath interface {
 	FastPathResults() (int, bool)
 }
 
+// planNodeReadingOwnWrites can be implemented by planNodes which do
+// not use the standard SQL principle of reading at the snapshot
+// established at the start of the transaction. It requests that
+// the top-level (shared) `startExec` function disable stepping
+// mode for the duration of the node's `startExec()` call.
+//
+// This done e.g. for most DDL statements that perform multiple KV
+// operations on descriptors, expecting to read their own writes.
+//
+// Note that only `startExec()` runs with the modified stepping mode,
+// not the `Next()` methods. This interface (and the idea of
+// temporarily disabling stepping mode) is neither sensical nor
+// applicable to planNodes whose execution is interleaved with
+// that of others.
+type planNodeReadingOwnWrites interface {
+	// ReadingOwnWrites is a marker interface.
+	ReadingOwnWrites()
+}
+
 var _ planNode = &alterIndexNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
@@ -140,7 +166,7 @@ var _ planNode = &createIndexNode{}
 var _ planNode = &createSequenceNode{}
 var _ planNode = &createStatsNode{}
 var _ planNode = &createTableNode{}
-var _ planNode = &CreateUserNode{}
+var _ planNode = &CreateRoleNode{}
 var _ planNode = &createViewNode{}
 var _ planNode = &delayedNode{}
 var _ planNode = &deleteNode{}
@@ -150,17 +176,19 @@ var _ planNode = &dropDatabaseNode{}
 var _ planNode = &dropIndexNode{}
 var _ planNode = &dropSequenceNode{}
 var _ planNode = &dropTableNode{}
-var _ planNode = &DropUserNode{}
+var _ planNode = &DropRoleNode{}
 var _ planNode = &dropViewNode{}
 var _ planNode = &errorIfRowsNode{}
 var _ planNode = &explainDistSQLNode{}
 var _ planNode = &explainPlanNode{}
 var _ planNode = &explainVecNode{}
 var _ planNode = &filterNode{}
+var _ planNode = &GrantRoleNode{}
 var _ planNode = &groupNode{}
 var _ planNode = &hookFnNode{}
 var _ planNode = &indexJoinNode{}
 var _ planNode = &insertNode{}
+var _ planNode = &insertFastPathNode{}
 var _ planNode = &joinNode{}
 var _ planNode = &limitNode{}
 var _ planNode = &max1RowNode{}
@@ -173,6 +201,7 @@ var _ planNode = &renameDatabaseNode{}
 var _ planNode = &renameIndexNode{}
 var _ planNode = &renameTableNode{}
 var _ planNode = &renderNode{}
+var _ planNode = &RevokeRoleNode{}
 var _ planNode = &rowCountNode{}
 var _ planNode = &scanBufferNode{}
 var _ planNode = &scanNode{}
@@ -195,14 +224,24 @@ var _ planNode = &virtualTableNode{}
 var _ planNode = &windowNode{}
 var _ planNode = &zeroNode{}
 
-var _ planNodeFastPath = &CreateUserNode{}
-var _ planNodeFastPath = &DropUserNode{}
-var _ planNodeFastPath = &alterUserSetPasswordNode{}
+var _ planNodeFastPath = &CreateRoleNode{}
+var _ planNodeFastPath = &DropRoleNode{}
+var _ planNodeFastPath = &alterRoleNode{}
 var _ planNodeFastPath = &deleteRangeNode{}
 var _ planNodeFastPath = &rowCountNode{}
 var _ planNodeFastPath = &serializeNode{}
 var _ planNodeFastPath = &setZoneConfigNode{}
 var _ planNodeFastPath = &controlJobsNode{}
+
+var _ planNodeReadingOwnWrites = &alterIndexNode{}
+var _ planNodeReadingOwnWrites = &alterSequenceNode{}
+var _ planNodeReadingOwnWrites = &alterTableNode{}
+var _ planNodeReadingOwnWrites = &createIndexNode{}
+var _ planNodeReadingOwnWrites = &createSequenceNode{}
+var _ planNodeReadingOwnWrites = &createTableNode{}
+var _ planNodeReadingOwnWrites = &createViewNode{}
+var _ planNodeReadingOwnWrites = &changePrivilegesNode{}
+var _ planNodeReadingOwnWrites = &setZoneConfigNode{}
 
 // planNodeRequireSpool serves as marker for nodes whose parent must
 // ensure that the node is fully run to completion (and the results
@@ -236,11 +275,16 @@ var _ planNodeSpooled = &spoolNode{}
 // TODO(jordan): investigate whether/how per-plan state like
 // placeholder data can be concentrated in a single struct.
 type planTop struct {
-	// AST is the syntax tree for the current statement.
-	AST tree.Statement
+	// stmt is a reference to the current statement (AST and other metadata).
+	stmt *Statement
 
 	// plan is the top-level node of the logical plan.
 	plan planNode
+
+	// mem/catalog retains the memo and catalog that were used to create the
+	// plan.
+	mem     *memo.Memo
+	catalog *optCatalog
 
 	// deps, if non-nil, collects the table/view dependencies for this query.
 	// Any planNode constructors that resolves a table name or reference in the query
@@ -248,11 +292,6 @@ type planTop struct {
 	// This is (currently) used by CREATE VIEW.
 	// TODO(knz): Remove this in favor of a better encapsulated mechanism.
 	deps planDependencies
-
-	// hasStar collects whether any star expansion has occurred during
-	// logical plan construction. This is used by CREATE VIEW until
-	// #10028 is addressed.
-	hasStar bool
 
 	// subqueryPlans contains all the sub-query plans.
 	subqueryPlans []subquery
@@ -271,17 +310,11 @@ type planTop struct {
 	// execErr retains the last execution error, if any.
 	execErr error
 
-	// maybeSavePlan, if defined, is called during close() to
-	// conditionally save the logical plan to savedPlanForStats.
-	maybeSavePlan func(context.Context) *roachpb.ExplainTreePlanNode
-
-	// savedPlanForStats is conditionally populated at the end of
-	// statement execution, for registration in statement statistics.
-	savedPlanForStats *roachpb.ExplainTreePlanNode
-
 	// avoidBuffering, when set, causes the execution to avoid buffering
 	// results.
 	avoidBuffering bool
+
+	instrumentation planInstrumentation
 }
 
 // postquery is a query tree that is executed after the main one. It can only
@@ -290,12 +323,17 @@ type postquery struct {
 	plan planNode
 }
 
+// init resets planTop to point to a given statement; used at the start of the
+// planning process.
+func (p *planTop) init(stmt *Statement, appStats *appStats) {
+	*p = planTop{stmt: stmt}
+	p.instrumentation.init(appStats)
+}
+
 // close ensures that the plan's resources have been deallocated.
 func (p *planTop) close(ctx context.Context) {
 	if p.plan != nil {
-		if p.maybeSavePlan != nil && p.flags.IsSet(planFlagExecDone) {
-			p.savedPlanForStats = p.maybeSavePlan(ctx)
-		}
+		p.instrumentation.savePlanInfo(ctx, p)
 		p.plan.Close(ctx)
 		p.plan = nil
 	}
@@ -317,8 +355,21 @@ func (p *planTop) close(ctx context.Context) {
 	}
 }
 
+// formatOptPlan returns a visual representation of the optimizer plan that was
+// used.
+func (p *planTop) formatOptPlan(flags memo.ExprFmtFlags) string {
+	f := memo.MakeExprFmtCtx(flags, p.mem, p.catalog)
+	f.FormatExpr(p.mem.RootExpr())
+	return f.Buffer.String()
+}
+
 // startExec calls startExec() on each planNode using a depth-first, post-order
 // traversal.  The subqueries, if any, are also started.
+//
+// If the planNode also implements the nodeReadingOwnWrites interface,
+// the txn is temporarily reconfigured to use read-your-own-writes for
+// the duration of the call to startExec. This is used e.g. by
+// DDL statements.
 //
 // Reminder: walkPlan() ensures that subqueries and sub-plans are
 // started before startExec() is called.
@@ -335,7 +386,11 @@ func startExec(params runParams, plan planNode) error {
 			}
 			return true, nil
 		},
-		leaveNode: func(_ string, n planNode) error {
+		leaveNode: func(_ string, n planNode) (err error) {
+			if _, ok := n.(planNodeReadingOwnWrites); ok {
+				prevMode := params.p.Txn().ConfigureStepping(params.ctx, kv.SteppingDisabled)
+				defer func() { _ = params.p.Txn().ConfigureStepping(params.ctx, prevMode) }()
+			}
 			return n.startExec(params)
 		},
 	}
@@ -384,12 +439,9 @@ func (p *planner) maybeSetSystemConfig(id sqlbase.ID) error {
 type planFlags uint32
 
 const (
-	// planFlagOptUsed is set if the optimizer was used to create the plan.
-	planFlagOptUsed planFlags = (1 << iota)
-
 	// planFlagOptCacheHit is set if a plan from the query plan cache was used (and
 	// re-optimized).
-	planFlagOptCacheHit
+	planFlagOptCacheHit = (1 << iota)
 
 	// planFlagOptCacheMiss is set if we looked for a plan in the query plan cache but
 	// did not find one.
@@ -409,6 +461,9 @@ const (
 	// planFlagImplicitTxn marks that the plan was run inside of an implicit
 	// transaction.
 	planFlagImplicitTxn
+
+	// planFlagIsDDL marks that the plan contains DDL.
+	planFlagIsDDL
 )
 
 func (pf planFlags) IsSet(flag planFlags) bool {
@@ -417,4 +472,39 @@ func (pf planFlags) IsSet(flag planFlags) bool {
 
 func (pf *planFlags) Set(flag planFlags) {
 	*pf |= flag
+}
+
+// planInstrumentation handles collection of plan information before the plan is
+// closed.
+type planInstrumentation struct {
+	appStats          *appStats
+	savedPlanForStats *roachpb.ExplainTreePlanNode
+
+	// If savePlanString is set to true, an EXPLAIN (VERBOSE)-style plan string
+	// will be saved in planString.
+	savePlanString bool
+	planString     string
+}
+
+func (pi *planInstrumentation) init(appStats *appStats) {
+	pi.appStats = appStats
+}
+
+// savePlanInfo is called before the plan is closed.
+func (pi *planInstrumentation) savePlanInfo(ctx context.Context, curPlan *planTop) {
+	if !curPlan.flags.IsSet(planFlagExecDone) {
+		return
+	}
+	if pi.appStats != nil && pi.appStats.shouldSaveLogicalPlanDescription(
+		curPlan.stmt,
+		curPlan.flags.IsSet(planFlagDistributed),
+		curPlan.flags.IsSet(planFlagImplicitTxn),
+		curPlan.execErr,
+	) {
+		pi.savedPlanForStats = planToTree(ctx, curPlan)
+	}
+
+	if pi.savePlanString {
+		pi.planString = planToString(ctx, curPlan.plan, curPlan.subqueryPlans, curPlan.postqueryPlans)
+	}
 }

@@ -32,6 +32,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/workload/kv"       // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/movr"     // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/tpcc"     // registers workloads
+	_ "github.com/cockroachdb/cockroach/pkg/workload/tpch"     // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/ycsb"     // registers workloads
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
@@ -71,8 +72,7 @@ func exitWithError(cmdName string, err error) {
 	errCode := 0
 	if err != nil {
 		// Display the error and its details/hints.
-		fmt.Fprintln(stderr, "Error:", err.Error())
-		maybeShowErrorDetails(stderr, err, false /* printNewline */)
+		cliOutputError(stderr, err, true /*showSeverity*/, false /*verbose*/)
 
 		// Remind the user of which command was being run.
 		fmt.Fprintf(stderr, "Failed running %q\n", cmdName)
@@ -197,9 +197,10 @@ func init() {
 		quitCmd,
 
 		sqlShellCmd,
-		userCmd,
+		authCmd,
 		nodeCmd,
 		dumpCmd,
+		nodeLocalCmd,
 
 		// Miscellaneous commands.
 		// TODO(pmattis): stats

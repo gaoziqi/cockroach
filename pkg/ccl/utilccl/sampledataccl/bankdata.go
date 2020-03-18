@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -62,7 +62,7 @@ func toBackup(t testing.TB, data workload.Table, dir string, chunkBytes int64) (
 
 	// TODO(dan): The csv load will be less overhead, use it when we have it.
 	ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
-	desc, err := importccl.Load(ctx, db, &stmts, `data`, `nodelocal://`+dir, ts, chunkBytes, tempDir)
+	desc, err := importccl.Load(ctx, db, &stmts, `data`, `nodelocal://0/`, ts, chunkBytes, tempDir, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +74,7 @@ type Backup struct {
 	// BaseDir can be used for a RESTORE. All paths in the descriptor are
 	// relative to this.
 	BaseDir string
-	Desc    backupccl.BackupDescriptor
+	Desc    backupccl.BackupManifest
 
 	fileIdx int
 	iterIdx int
@@ -93,7 +93,7 @@ func (b *Backup) ResetKeyValueIteration() {
 // remainer.
 func (b *Backup) NextKeyValues(
 	count int, newTableID sqlbase.ID,
-) ([]engine.MVCCKeyValue, roachpb.Span, error) {
+) ([]storage.MVCCKeyValue, roachpb.Span, error) {
 	var userTables []*sqlbase.TableDescriptor
 	for _, d := range b.Desc.Descriptors {
 		if t := d.Table(hlc.Timestamp{}); t != nil && t.ParentID != keys.SystemDatabaseID {
@@ -113,12 +113,12 @@ func (b *Backup) NextKeyValues(
 		return nil, roachpb.Span{}, err
 	}
 
-	var kvs []engine.MVCCKeyValue
+	var kvs []storage.MVCCKeyValue
 	span := roachpb.Span{Key: keys.MaxKey}
 	for ; b.fileIdx < len(b.Desc.Files); b.fileIdx++ {
 		file := b.Desc.Files[b.fileIdx]
 
-		sst := engine.MakeRocksDBSstFileReader()
+		sst := storage.MakeRocksDBSstFileReader()
 		defer sst.Close()
 		fileContents, err := ioutil.ReadFile(filepath.Join(b.BaseDir, file.Path))
 		if err != nil {
@@ -128,9 +128,9 @@ func (b *Backup) NextKeyValues(
 			return nil, roachpb.Span{}, err
 		}
 
-		it := sst.NewIterator(engine.IterOptions{UpperBound: roachpb.KeyMax})
+		it := sst.NewIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
 		defer it.Close()
-		it.Seek(engine.MVCCKey{Key: file.Span.Key})
+		it.SeekGE(storage.MVCCKey{Key: file.Span.Key})
 
 		iterIdx := 0
 		for ; ; it.Next() {
@@ -166,7 +166,7 @@ func (b *Backup) NextKeyValues(
 			v := roachpb.Value{RawBytes: it.Value()}
 			v.ClearChecksum()
 			v.InitChecksum(key.Key)
-			kvs = append(kvs, engine.MVCCKeyValue{Key: key, Value: v.RawBytes})
+			kvs = append(kvs, storage.MVCCKeyValue{Key: key, Value: v.RawBytes})
 
 			if key.Key.Compare(span.Key) < 0 {
 				span.Key = append(span.Key[:0], key.Key...)

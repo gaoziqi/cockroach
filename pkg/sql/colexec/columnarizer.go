@@ -30,8 +30,10 @@ type Columnarizer struct {
 	execinfra.ProcessorBase
 	NonExplainable
 
-	input execinfra.RowSource
-	da    sqlbase.DatumAlloc
+	allocator  *Allocator
+	input      execinfra.RowSource
+	da         sqlbase.DatumAlloc
+	initStatus OperatorInitStatus
 
 	buffered        sqlbase.EncDatumRows
 	batch           coldata.Batch
@@ -40,16 +42,21 @@ type Columnarizer struct {
 	typs            []coltypes.T
 }
 
-var _ StaticMemoryOperator = &Columnarizer{}
+var _ Operator = &Columnarizer{}
 
 // NewColumnarizer returns a new Columnarizer.
 func NewColumnarizer(
-	ctx context.Context, flowCtx *execinfra.FlowCtx, processorID int32, input execinfra.RowSource,
+	ctx context.Context,
+	allocator *Allocator,
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	input execinfra.RowSource,
 ) (*Columnarizer, error) {
 	var err error
 	c := &Columnarizer{
-		input: input,
-		ctx:   ctx,
+		allocator: allocator,
+		input:     input,
+		ctx:       ctx,
 	}
 	if err = c.ProcessorBase.Init(
 		nil,
@@ -68,28 +75,28 @@ func NewColumnarizer(
 	return c, err
 }
 
-// EstimateStaticMemoryUsage is part of the StaticMemoryOperator
-// interface.
-func (c *Columnarizer) EstimateStaticMemoryUsage() int {
-	return EstimateBatchSizeBytes(c.typs, int(coldata.BatchSize()))
-}
-
 // Init is part of the Operator interface.
 func (c *Columnarizer) Init() {
-	c.batch = coldata.NewMemBatch(c.typs)
-	c.buffered = make(sqlbase.EncDatumRows, coldata.BatchSize())
-	for i := range c.buffered {
-		c.buffered[i] = make(sqlbase.EncDatumRow, len(c.typs))
+	// We don't want to call Start on the input to columnarizer and allocating
+	// internal objects several times if Init method is called more than once, so
+	// we have this check in place.
+	if c.initStatus == OperatorNotInitialized {
+		c.batch = c.allocator.NewMemBatch(c.typs)
+		c.buffered = make(sqlbase.EncDatumRows, coldata.BatchSize())
+		for i := range c.buffered {
+			c.buffered[i] = make(sqlbase.EncDatumRow, len(c.typs))
+		}
+		c.accumulatedMeta = make([]execinfrapb.ProducerMetadata, 0, 1)
+		c.input.Start(c.ctx)
+		c.initStatus = OperatorInitialized
 	}
-	c.accumulatedMeta = make([]execinfrapb.ProducerMetadata, 0, 1)
-	c.input.Start(c.ctx)
 }
 
 // Next is part of the Operator interface.
 func (c *Columnarizer) Next(context.Context) coldata.Batch {
 	c.batch.ResetInternalBatch()
 	// Buffer up n rows.
-	nRows := uint16(0)
+	nRows := 0
 	columnTypes := c.OutputTypes()
 	for ; nRows < coldata.BatchSize(); nRows++ {
 		row, meta := c.input.Next()
@@ -105,15 +112,15 @@ func (c *Columnarizer) Next(context.Context) coldata.Batch {
 		// phase.
 		copy(c.buffered[nRows], row)
 	}
-	c.batch.SetLength(nRows)
 
 	// Write each column into the output batch.
 	for idx, ct := range columnTypes {
-		err := EncDatumRowsToColVec(c.buffered[:nRows], c.batch.ColVec(idx), idx, &ct, &c.da)
+		err := EncDatumRowsToColVec(c.allocator, c.buffered[:nRows], c.batch.ColVec(idx), idx, &ct, &c.da)
 		if err != nil {
 			execerror.VectorizedInternalPanic(err)
 		}
 	}
+	c.batch.SetLength(nRows)
 	return c.batch
 }
 
@@ -142,7 +149,7 @@ func (c *Columnarizer) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 }
 
 // ChildCount is part of the Operator interface.
-func (c *Columnarizer) ChildCount() int {
+func (c *Columnarizer) ChildCount(verbose bool) int {
 	if _, ok := c.input.(execinfra.OpNode); ok {
 		return 1
 	}
@@ -150,7 +157,7 @@ func (c *Columnarizer) ChildCount() int {
 }
 
 // Child is part of the Operator interface.
-func (c *Columnarizer) Child(nth int) execinfra.OpNode {
+func (c *Columnarizer) Child(nth int, verbose bool) execinfra.OpNode {
 	if nth == 0 {
 		if n, ok := c.input.(execinfra.OpNode); ok {
 			return n

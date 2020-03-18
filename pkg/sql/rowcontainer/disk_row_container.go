@@ -13,11 +13,11 @@ package rowcontainer
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -275,6 +275,7 @@ func (d *DiskRowContainer) keyValToRow(k []byte, v []byte) (sqlbase.EncDatumRow,
 // diskRowIterator iterates over the rows in a DiskRowContainer.
 type diskRowIterator struct {
 	rowContainer *DiskRowContainer
+	rowBuf       []byte
 	diskmap.SortedDiskMapIterator
 }
 
@@ -305,7 +306,23 @@ func (r *diskRowIterator) Row() (sqlbase.EncDatumRow, error) {
 		return nil, errors.AssertionFailedf("invalid row")
 	}
 
-	return r.rowContainer.keyValToRow(r.Key(), r.Value())
+	k := r.UnsafeKey()
+	v := r.UnsafeValue()
+	// TODO(asubiotto): the "true ||" should not be necessary. We should be to
+	// reuse rowBuf, yet doing so causes
+	// TestDiskBackedIndexedRowContainer/ReorderingOnDisk, TestHashJoiner, and
+	// TestSorter to fail. Some caller of Row() is presumably not making a copy
+	// of the return value.
+	if true || cap(r.rowBuf) < len(k)+len(v) {
+		r.rowBuf = make([]byte, 0, len(k)+len(v))
+	}
+	r.rowBuf = r.rowBuf[:len(k)+len(v)]
+	copy(r.rowBuf, k)
+	copy(r.rowBuf[len(k):], v)
+	k = r.rowBuf[:len(k)]
+	v = r.rowBuf[len(k):]
+
+	return r.rowContainer.keyValToRow(k, v)
 }
 
 func (r *diskRowIterator) Close() {
@@ -336,7 +353,7 @@ func (d *DiskRowContainer) NewFinalIterator(ctx context.Context) RowIterator {
 }
 
 func (r *diskRowFinalIterator) Rewind() {
-	r.Seek(r.diskRowIterator.rowContainer.lastReadKey)
+	r.SeekGE(r.diskRowIterator.rowContainer.lastReadKey)
 	if r.diskRowIterator.rowContainer.lastReadKey != nil {
 		r.Next()
 	}
@@ -347,7 +364,8 @@ func (r *diskRowFinalIterator) Row() (sqlbase.EncDatumRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.diskRowIterator.rowContainer.lastReadKey = r.Key()
+	r.diskRowIterator.rowContainer.lastReadKey =
+		append(r.diskRowIterator.rowContainer.lastReadKey[:0], r.UnsafeKey()...)
 	return row, nil
 }
 

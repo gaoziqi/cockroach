@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/axiomhq/hyperloglog"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -109,6 +109,7 @@ func newSampleAggregator(
 		sketchCol:    rankCol + 4,
 	}
 
+	var sampleCols util.FastIntSet
 	for i := range spec.Sketches {
 		s.sketches[i] = sketchInfo{
 			spec:     spec.Sketches[i],
@@ -116,9 +117,12 @@ func newSampleAggregator(
 			numNulls: 0,
 			numRows:  0,
 		}
+		if spec.Sketches[i].GenerateHistogram {
+			sampleCols.Add(int(spec.Sketches[i].Columns[0]))
+		}
 	}
 
-	s.sr.Init(int(spec.SampleSize), input.OutputTypes()[:rankCol], &s.memAcc)
+	s.sr.Init(int(spec.SampleSize), input.OutputTypes()[:rankCol], &s.memAcc, sampleCols)
 
 	if err := s.Init(
 		nil, post, []types.T{}, flowCtx, processorID, output, memMonitor,
@@ -310,7 +314,7 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 	// internal executor instead of doing this weird thing where it uses the
 	// internal executor to execute one statement at a time inside a db.Txn()
 	// closure.
-	if err := s.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := s.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		for _, si := range s.sketches {
 			distinctCount := int64(si.sketch.Estimate())
 			var histogram *stats.HistogramData

@@ -14,9 +14,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -38,11 +38,11 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// createStatsPostEvents controls the cluster setting for enabling
-// automatic table statistics collection.
-var createStatsPostEvents = settings.RegisterBoolSetting(
+// createStatsPostEvents controls the cluster setting for logging
+// automatic table statistics collection to the event log.
+var createStatsPostEvents = settings.RegisterPublicBoolSetting(
 	"sql.stats.post_events.enabled",
-	"if set, an event is shown for every CREATE STATISTICS job",
+	"if set, an event is logged for every CREATE STATISTICS job",
 	false,
 )
 
@@ -72,6 +72,7 @@ type createStatsRun struct {
 }
 
 func (n *createStatsNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("stats"))
 	n.run.resultsCh = make(chan tree.Datums)
 	n.run.errCh = make(chan error)
 	go func() {
@@ -119,7 +120,7 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 		telemetry.Inc(sqltelemetry.CreateStatisticsUseCounter)
 	}
 
-	job, errCh, err := n.p.ExecCfg().JobRegistry.StartJob(ctx, resultsCh, *record)
+	job, errCh, err := n.p.ExecCfg().JobRegistry.CreateAndStartJob(ctx, resultsCh, *record)
 	if err != nil {
 		return err
 	}
@@ -265,7 +266,8 @@ const maxNonIndexCols = 100
 // collect statistics on a, {a, b}, b, and {b, c}.
 //
 // In addition to the index columns, we collect stats on up to maxNonIndexCols
-// other columns from the table. We only collect histograms for index columns.
+// other columns from the table. We only collect histograms for index columns,
+// plus any other boolean columns (where the "histogram" is tiny).
 //
 // TODO(rytaft): This currently only generates one single-column stat per
 // index. Add code to collect multi-column stats once they are supported.
@@ -307,7 +309,7 @@ func createStatsDefaultColumns(
 		if col.Type.Family() != types.JsonFamily && !requestedCols.Contains(int(col.ID)) {
 			colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
 				ColumnIDs:    []sqlbase.ColumnID{col.ID},
-				HasHistogram: false,
+				HasHistogram: col.Type.Family() == types.BoolFamily,
 			})
 			nonIdxCols++
 		}
@@ -331,13 +333,10 @@ func (n *createStatsNode) makePlanForExplainDistSQL(
 }
 
 // createStatsResumer implements the jobs.Resumer interface for CreateStats
-// jobs. A new instance is created for each job. evalCtx is populated inside
-// createStatsResumer.Resume so it can be used in createStatsResumer.OnSuccess
-// (if the job is successful).
+// jobs. A new instance is created for each job.
 type createStatsResumer struct {
 	job     *jobs.Job
 	tableID sqlbase.ID
-	evalCtx *extendedEvalContext
 }
 
 var _ jobs.Resumer = &createStatsResumer{}
@@ -357,10 +356,10 @@ func (r *createStatsResumer) Resume(
 	}
 
 	r.tableID = details.Table.ID
-	r.evalCtx = p.ExtendedEvalContext()
+	evalCtx := p.ExtendedEvalContext()
 
 	ci := sqlbase.ColTypeInfoFromColTypes([]types.T{})
-	rows := rowcontainer.NewRowContainer(r.evalCtx.Mon.MakeBoundAccount(), ci, 0)
+	rows := rowcontainer.NewRowContainer(evalCtx.Mon.MakeBoundAccount(), ci, 0)
 	defer func() {
 		if rows != nil {
 			rows.Close(ctx)
@@ -368,17 +367,17 @@ func (r *createStatsResumer) Resume(
 	}()
 
 	dsp := p.DistSQLPlanner()
-	return p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		if details.AsOf != nil {
 			p.semaCtx.AsOfTimestamp = details.AsOf
 			p.extendedEvalCtx.SetTxnTimestamp(details.AsOf.GoTime())
 			txn.SetFixedTimestamp(ctx, *details.AsOf)
 		}
 
-		planCtx := dsp.NewPlanningCtx(ctx, r.evalCtx, txn)
+		planCtx := dsp.NewPlanningCtx(ctx, evalCtx, txn)
 		planCtx.planner = p
 		if err := dsp.planAndRunCreateStats(
-			ctx, r.evalCtx, planCtx, txn, r.job, NewRowResultWriter(rows),
+			ctx, evalCtx, planCtx, txn, r.job, NewRowResultWriter(rows),
 		); err != nil {
 			// Check if this was a context canceled error and restart if it was.
 			if s, ok := status.FromError(errors.UnwrapAll(err)); ok {
@@ -407,6 +406,38 @@ func (r *createStatsResumer) Resume(
 		}
 
 		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Invalidate the local cache synchronously; this guarantees that the next
+	// statement in the same session won't use a stale cache (whereas the gossip
+	// update is handled asynchronously).
+	evalCtx.ExecCfg.TableStatsCache.InvalidateTableStats(ctx, r.tableID)
+
+	// Record this statistics creation in the event log.
+	if !createStatsPostEvents.Get(&evalCtx.Settings.SV) {
+		return nil
+	}
+
+	// TODO(rytaft): This creates a new transaction for the CREATE STATISTICS
+	// event. It must be different from the CREATE STATISTICS transaction,
+	// because that transaction must be read-only. In the future we may want
+	// to use the transaction that inserted the new stats into the
+	// system.table_statistics table, but that would require calling
+	// MakeEventLogger from the distsqlrun package.
+	return evalCtx.ExecCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		return MakeEventLogger(evalCtx.ExecCfg).InsertEventRecord(
+			ctx,
+			txn,
+			EventLogCreateStatistics,
+			int32(details.Table.ID),
+			int32(evalCtx.NodeID),
+			struct {
+				TableName string
+				Statement string
+			}{details.FQTableName, details.Statement},
+		)
 	})
 }
 
@@ -455,50 +486,7 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p *planner) error {
 }
 
 // OnFailOrCancel is part of the jobs.Resumer interface.
-func (r *createStatsResumer) OnFailOrCancel(ctx context.Context, txn *client.Txn) error {
-	return nil
-}
-
-// OnSuccess is part of the jobs.Resumer interface.
-func (r *createStatsResumer) OnSuccess(ctx context.Context, _ *client.Txn) error {
-	details := r.job.Details().(jobspb.CreateStatsDetails)
-
-	// Invalidate the local cache synchronously; this guarantees that the next
-	// statement in the same session won't use a stale cache (whereas the gossip
-	// update is handled asynchronously).
-	r.evalCtx.ExecCfg.TableStatsCache.InvalidateTableStats(ctx, r.tableID)
-
-	// Record this statistics creation in the event log.
-	if !createStatsPostEvents.Get(&r.evalCtx.Settings.SV) {
-		return nil
-	}
-
-	// TODO(rytaft): This creates a new transaction for the CREATE STATISTICS
-	// event. It must be different from the CREATE STATISTICS transaction,
-	// because that transaction must be read-only. In the future we may want
-	// to use the transaction that inserted the new stats into the
-	// system.table_statistics table, but that would require calling
-	// MakeEventLogger from the distsqlrun package.
-	return r.evalCtx.ExecCfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		return MakeEventLogger(r.evalCtx.ExecCfg).InsertEventRecord(
-			ctx,
-			txn,
-			EventLogCreateStatistics,
-			int32(details.Table.ID),
-			int32(r.evalCtx.NodeID),
-			struct {
-				TableName string
-				Statement string
-			}{details.FQTableName, details.Statement},
-		)
-	})
-}
-
-// OnTerminal is part of the jobs.Resumer interface.
-func (r *createStatsResumer) OnTerminal(
-	ctx context.Context, status jobs.Status, resultsCh chan<- tree.Datums,
-) {
-}
+func (r *createStatsResumer) OnFailOrCancel(context.Context, interface{}) error { return nil }
 
 func init() {
 	createResumerFn := func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {

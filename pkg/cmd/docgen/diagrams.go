@@ -333,7 +333,7 @@ var specs = []stmtSpec{
 	{
 		name:    "add_constraint",
 		stmt:    "alter_onetable_stmt",
-		replace: map[string]string{"relation_expr": "table_name", "alter_table_cmds": "'ADD' 'CONSTRAINT' constraint_name constraint_elem"},
+		replace: map[string]string{"relation_expr": "table_name", "alter_table_cmds": "'ADD' 'CONSTRAINT' constraint_name constraint_elem opt_validate_behavior"},
 		unlink:  []string{"table_name"},
 	},
 	{
@@ -350,9 +350,14 @@ var specs = []stmtSpec{
 		unlink: []string{"table_name"},
 	},
 	{
-		name:    "alter_user_password_stmt",
-		replace: map[string]string{"string_or_placeholder 'WITH'": "name 'WITH'", "'PASSWORD' string_or_placeholder": "'PASSWORD' password"},
-		unlink:  []string{"name", "password"},
+		name:   "alter_role_stmt",
+		inline: []string{"role_or_group_or_user", "opt_role_options"},
+		replace: map[string]string{
+			"string_or_placeholder":             "name'",
+			"opt_role_options":                  "OPTIONS",
+			"string_or_placeholder  'PASSWORD'": "name 'PASSWORD'",
+			"'PASSWORD' string_or_placeholder":  "'PASSWORD' password"},
+		unlink: []string{"name", "password"},
 	},
 	{
 		name:    "alter_sequence_options_stmt",
@@ -479,9 +484,10 @@ var specs = []stmtSpec{
 		inline: []string{"col_qualification_elem"},
 	},
 	{
-		name:   "comment_stmt",
-		stmt:   "comment_stmt",
-		unlink: []string{"column_path"},
+		name:    "comment",
+		stmt:    "comment_stmt",
+		replace: map[string]string{"column_path": "column_name"},
+		unlink:  []string{"column_path"},
 	},
 	{
 		name:   "commit_transaction",
@@ -494,6 +500,14 @@ var specs = []stmtSpec{
 		stmt:    "cancel_jobs_stmt",
 		replace: map[string]string{"a_expr": "job_id"},
 		unlink:  []string{"job_id"},
+	},
+	{
+		name:   "create_as_col_qual_list",
+		inline: []string{"create_as_col_qualification", "create_as_col_qualification_elem"},
+	},
+	{
+		name:   "create_as_constraint_def",
+		inline: []string{"create_as_constraint_elem"},
 	},
 	{name: "cancel_query", stmt: "cancel_queries_stmt", replace: map[string]string{"a_expr": "query_id"}, unlink: []string{"query_id"}},
 	{name: "cancel_session", stmt: "cancel_sessions_stmt", replace: map[string]string{"a_expr": "session_id"}, unlink: []string{"session_id"}},
@@ -512,10 +526,16 @@ var specs = []stmtSpec{
 		unlink: []string{"table_name", "sink", "option", "value"},
 	},
 	{
-		name:    "create_index_stmt",
-		inline:  []string{"opt_unique", "opt_storing", "storing", "opt_name", "index_params", "index_elem", "opt_asc_desc"},
-		replace: map[string]string{"opt_using_gin_btree": "", "a_expr": "column_name"},
-		exclude: []*regexp.Regexp{regexp.MustCompile("'CREATE' 'INVERTED'")},
+		name:   "create_index_stmt",
+		inline: []string{"opt_unique", "opt_storing", "storing", "index_params", "index_elem", "opt_asc_desc", "opt_using_gin_btree"},
+		replace: map[string]string{
+			"a_expr":          "column_name",
+			"opt_nulls_order": "",
+		},
+		regreplace: map[string]string{
+			".* 'CREATE' .* 'INVERTED' 'INDEX' .*": "",
+		},
+		nosplit: true,
 	},
 	{
 		name:   "create_index_interleaved_stmt",
@@ -557,7 +577,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "create_table_as_stmt",
-		inline: []string{"opt_column_list", "name_list"},
+		inline: []string{"create_as_opt_col_list", "create_as_table_defs"},
 	},
 	{
 		name:   "create_table_stmt",
@@ -569,20 +589,12 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "create_role_stmt",
-		inline: []string{"role_or_group"},
+		inline: []string{"role_or_group_or_user", "opt_role_options"},
 		replace: map[string]string{
-			"string_or_placeholder": "name",
-		},
-	},
-	{
-		name:   "create_user_stmt",
-		inline: []string{"opt_with", "opt_password"},
-		replace: map[string]string{
-			"'PASSWORD' string_or_placeholder": "'PASSWORD' password",
-			"'USER' string_or_placeholder":     "'USER' name",
-			"'EXISTS' string_or_placeholder":   "'EXISTS' name",
-		},
-		unlink: []string{"password"},
+			"string_or_placeholder":             "name",
+			"opt_role_options":                  "OPTIONS",
+			"string_or_placeholder  'PASSWORD'": "name 'PASSWORD'",
+			"'PASSWORD' string_or_placeholder":  "'PASSWORD' password"},
 	},
 	{
 		name: "default_value_column_level",
@@ -594,7 +606,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "delete_stmt",
-		inline: []string{"opt_with_clause", "with_clause", "cte_list", "table_name_expr_opt_alias_idx", "table_name_expr_with_index", "opt_where_clause", "where_clause", "returning_clause", "opt_sort_clause", "opt_limit_clause"},
+		inline: []string{"opt_with_clause", "with_clause", "cte_list", "table_expr_opt_alias_idx", "table_name_opt_idx", "opt_where_clause", "where_clause", "returning_clause", "opt_sort_clause", "opt_limit_clause"},
 		replace: map[string]string{
 			"relation_expr": "table_name",
 		},
@@ -651,13 +663,11 @@ var specs = []stmtSpec{
 		regreplace: map[string]string{
 			regList: "",
 		},
-		replace: map[string]string{
-			"qualified_name": "table_name",
-		},
-		unlink: []string{"table_name", "index_name"},
+		replace: map[string]string{"standalone_index_name": "index_name"},
 	},
 	{
 		name:    "drop_role_stmt",
+		inline:  []string{"role_or_group_or_user"},
 		replace: map[string]string{"string_or_placeholder_list": "name"},
 	},
 	{
@@ -706,6 +716,12 @@ var specs = []stmtSpec{
 		match: []*regexp.Regexp{regexp.MustCompile("relation_expr 'PARTITION")},
 	},
 	{
+		name:    "alter_index_partition_by",
+		stmt:    "alter_oneindex_stmt",
+		inline:  []string{"alter_index_cmds", "alter_index_cmd", "partition_by", "table_index_name"},
+		replace: map[string]string{"standalone_index_name": "index_name"},
+	},
+	{
 		name:    "create_table_partition_by",
 		stmt:    "create_table_stmt",
 		inline:  []string{"opt_partition_by", "partition_by"},
@@ -717,14 +733,17 @@ var specs = []stmtSpec{
 		name:   "explain_stmt",
 		inline: []string{"explain_option_list"},
 		replace: map[string]string{
-			"explain_option_name": "( 'VERBOSE' | 'TYPES' | 'OPT' | 'DISTSQL' )",
+			"explain_option_name": "( 'VERBOSE' | 'TYPES' | 'OPT' | 'DISTSQL' | 'VEC' )",
 		},
-		exclude: []*regexp.Regexp{regexp.MustCompile("'ANALYZE'")},
+		exclude: []*regexp.Regexp{
+			regexp.MustCompile("'ANALYZE'"),
+			regexp.MustCompile("'ANALYSE'"),
+		},
 	},
 	{
 		name:  "explain_analyze_stmt",
 		stmt:  "explain_stmt",
-		match: []*regexp.Regexp{regexp.MustCompile("ANALYZE")},
+		match: []*regexp.Regexp{regexp.MustCompile("'ANALY[SZ]E'")},
 		replace: map[string]string{
 			"explain_option_list": "'DISTSQL'",
 		},
@@ -800,6 +819,22 @@ var specs = []stmtSpec{
 		unlink: []string{"file_location"},
 	},
 	{
+		name:   "import_into",
+		stmt:   "import_stmt",
+		match:  []*regexp.Regexp{regexp.MustCompile("INTO")},
+		inline: []string{"insert_column_list", "string_or_placeholder_list", "opt_with_options", "kv_option_list"},
+		replace: map[string]string{
+			"table_option":          "table_name",
+			"insert_column_item":    "column_name",
+			"import_format":         "'CSV'",
+			"string_or_placeholder": "file_location",
+			"kv_option":             "option '=' value"},
+		unlink: []string{"table_name", "column_name", "file_location", "option", "value"},
+		exclude: []*regexp.Regexp{
+			regexp.MustCompile("'WITH' 'OPTIONS'"),
+		},
+	},
+	{
 		name:   "import_dump",
 		stmt:   "import_stmt",
 		inline: []string{"string_or_placeholder_list", "opt_with_options"},
@@ -820,11 +855,12 @@ var specs = []stmtSpec{
 	},
 	{
 		name: "on_conflict",
-		inline: []string{"opt_conf_expr", "name_list", "opt_where_clause", "where_clause", "set_clause_list", "insert_column_list",
+		inline: []string{"opt_conf_expr", "name_list", "set_clause_list", "insert_column_list",
 			"insert_column_item", "set_clause", "single_set_clause", "multiple_set_clause", "in_expr", "expr_list",
 			"expr_tuple1_ambiguous", "tuple1_ambiguous_values"},
 		replace: map[string]string{
 			"select_with_parens": "'(' select_stmt ')'",
+			"opt_where_clause":   "",
 		},
 		nosplit: true,
 	},
@@ -891,8 +927,8 @@ var specs = []stmtSpec{
 		stmt:    "alter_rename_index_stmt",
 		match:   []*regexp.Regexp{regexp.MustCompile("'ALTER' 'INDEX'")},
 		inline:  []string{"table_index_name"},
-		replace: map[string]string{"qualified_name": "table_name", "'@' name": "'@' index_name"},
-		unlink:  []string{"table_name", "index_name"}},
+		replace: map[string]string{"standalone_index_name": "index_name"},
+	},
 	{
 		name:    "rename_sequence",
 		stmt:    "alter_rename_sequence_stmt",
@@ -952,10 +988,9 @@ var specs = []stmtSpec{
 	{
 		name:    "rollback_transaction",
 		stmt:    "rollback_stmt",
-		inline:  []string{"opt_to_savepoint"},
+		inline:  []string{"opt_transaction"},
 		match:   []*regexp.Regexp{regexp.MustCompile("'ROLLBACK'")},
-		replace: map[string]string{"'TRANSACTION'": "", "'TO'": "'TO' 'SAVEPOINT'", "savepoint_name": "cockroach_restart"},
-		unlink:  []string{"cockroach_restart"},
+		replace: map[string]string{"'TRANSACTION'": "", "'TO'": "'TO' 'SAVEPOINT'"},
 	},
 	{
 		name:   "limit_clause",
@@ -1087,11 +1122,8 @@ var specs = []stmtSpec{
 		stmt: "show_csettings_stmt",
 	},
 	{
-		name:    "show_columns",
-		stmt:    "show_stmt",
-		match:   []*regexp.Regexp{regexp.MustCompile("'SHOW' 'COLUMNS'")},
-		replace: map[string]string{"var_name": "table_name"},
-		unlink:  []string{"table_name"},
+		name:   "show_columns_stmt",
+		inline: []string{"with_comment"},
 	},
 	{
 		name:    "show_constraints",
@@ -1106,9 +1138,8 @@ var specs = []stmtSpec{
 		unlink:  []string{"object_name"},
 	},
 	{
-		name:  "show_databases",
-		stmt:  "show_stmt",
-		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'DATABASES'")},
+		name:   "show_databases_stmt",
+		inline: []string{"with_comment"},
 	},
 	{
 		name:    "show_backup",
@@ -1133,6 +1164,10 @@ var specs = []stmtSpec{
 		unlink: []string{"role_name", "table_name", "database_name", "user_name"},
 	},
 	{
+		name: "show_indexes",
+		stmt: "show_indexes_stmt",
+	},
+	{
 		name:    "show_index",
 		stmt:    "show_stmt",
 		match:   []*regexp.Regexp{regexp.MustCompile("'SHOW' 'INDEX'")},
@@ -1145,6 +1180,14 @@ var specs = []stmtSpec{
 		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'KEYS'")},
 	},
 	{
+		name:    "show_locality",
+		stmt:    "show_roles_stmt",
+		replace: map[string]string{"'ROLES'": "'LOCALITY'"},
+	},
+	{
+		name: "show_partitions_stmt",
+	},
+	{
 		name:   "show_queries",
 		stmt:   "show_queries_stmt",
 		inline: []string{"opt_cluster"},
@@ -1155,6 +1198,13 @@ var specs = []stmtSpec{
 	{
 		name: "show_ranges_stmt",
 		stmt: "show_ranges_stmt",
+	},
+	{
+		name:    "show_range_for_row_stmt",
+		stmt:    "show_range_for_row_stmt",
+		inline:  []string{"expr_list"},
+		replace: map[string]string{"a_expr": "row_vals"},
+		unlink:  []string{"row_vals"},
 	},
 	{
 		name: "show_schemas",
@@ -1192,6 +1242,11 @@ var specs = []stmtSpec{
 		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'TRANSACTION'")},
 	},
 	{
+		name:  "show_savepoint_status",
+		stmt:  "show_savepoint_stmt",
+		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'SAVEPOINT' 'STATUS'")},
+	},
+	{
 		name:  "show_users",
 		stmt:  "show_stmt",
 		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'USERS'")},
@@ -1208,8 +1263,7 @@ var specs = []stmtSpec{
 		name:    "split_index_at",
 		stmt:    "alter_split_index_stmt",
 		inline:  []string{"table_index_name"},
-		replace: map[string]string{"qualified_name": "table_name", "'@' name": "'@' index_name"},
-		unlink:  []string{"table_name", "index_name"},
+		replace: map[string]string{"standalone_index_name": "index_name"},
 	},
 	{
 		name:   "split_table_at",
@@ -1239,13 +1293,24 @@ var specs = []stmtSpec{
 		unlink: []string{"table_name", "check_expr", "table_constraints"},
 	},
 	{
+		name:    "unsplit_index_at",
+		stmt:    "alter_unsplit_index_stmt",
+		inline:  []string{"table_index_name"},
+		replace: map[string]string{"standalone_index_name": "index_name"},
+	},
+	{
+		name:   "unsplit_table_at",
+		stmt:   "alter_unsplit_stmt",
+		unlink: []string{"table_name"},
+	},
+	{
 		name: "update_stmt",
 		inline: []string{
 			"opt_with_clause",
 			"with_clause",
 			"cte_list",
-			"table_name_expr_opt_alias_idx",
-			"table_name_expr_with_index",
+			"table_expr_opt_alias_idx",
+			"table_name_opt_idx",
 			"set_clause_list",
 			"set_clause",
 			"single_set_clause",
@@ -1284,6 +1349,14 @@ var specs = []stmtSpec{
 		stmt:    "alter_onetable_stmt",
 		replace: map[string]string{"alter_table_cmds": "'VALIDATE' 'CONSTRAINT' constraint_name", "relation_expr": "table_name"},
 		unlink:  []string{"constraint_name", "table_name"},
+	},
+	{
+		name:   "window_definition",
+		inline: []string{"window_specification"},
+	},
+	{
+		name:   "opt_frame_clause",
+		inline: []string{"frame_extent"},
 	},
 }
 

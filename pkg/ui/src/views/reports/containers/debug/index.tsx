@@ -55,7 +55,7 @@ function DebugTableRow(props: { title: string, children?: React.ReactNode }) {
 function DebugTable(props: { heading: string, children?: React.ReactNode }) {
   return (
     <div>
-      <h2>{props.heading}</h2>
+      <h2 className="base-heading">{props.heading}</h2>
       <table className="debug-table">
         <tbody>
           {props.children}
@@ -82,10 +82,8 @@ function DebugPanelLink(props: { name: string, url: string,  note: string }) {
 export default function Debug() {
   return (
     <div className="section">
-      <Helmet>
-        <title>Debug</title>
-      </Helmet>
-      <h1>Advanced Debugging</h1>
+      <Helmet title="Debug" />
+      <h1 className="base-heading">Advanced Debugging</h1>
       <div className="debug-header">
         <InfoBox>
           <p>
@@ -112,11 +110,6 @@ export default function Debug() {
           name="Problem Ranges"
           url="#/reports/problemranges"
           note="View ranges in your cluster that are unavailable, underreplicated, slow, or have other problems."
-        />
-        <DebugPanelLink
-          name="Network Latency"
-          url="#/reports/network"
-          note="Check latencies between all nodes in your cluster."
         />
         <DebugPanelLink
           name="Data Distribution and Zone Configs"
@@ -148,6 +141,11 @@ export default function Debug() {
             url="#/reports/nodes?locality=region=us-east"
             note="#/reports/nodes?locality=[regex]"
           />
+          <DebugTableLink
+            name="Decommissioned node history"
+            url="#/reports/nodes/history"
+            note="#/reports/nodes/history"
+          />
         </DebugTableRow>
         <DebugTableRow title="Stores">
           <DebugTableLink name="Stores on this node" url="#/reports/stores/local" />
@@ -155,18 +153,6 @@ export default function Debug() {
             name="Stores on a specific node"
             url="#/reports/stores/1"
             note="#/reports/stores/[node_id]"
-          />
-        </DebugTableRow>
-        <DebugTableRow title="Network">
-          <DebugTableLink
-            name="Latency filtered by node IDs"
-            url="#/reports/network?node_ids=1,2"
-            note="#/reports/network?node_ids=[node_id{,node_id...}]"
-          />
-          <DebugTableLink
-            name="Latency filtered by locality (regex)"
-            url="#/reports/network?locality=region=us-east"
-            note="#/reports/network?locality=[regex]"
           />
         </DebugTableRow>
         <DebugTableRow title="Security">
@@ -192,6 +178,13 @@ export default function Debug() {
           />
           <DebugTableLink name="Raft Messages" url="#/raft/messages/all" />
           <DebugTableLink name="Raft for all ranges" url="#/raft/ranges" />
+        </DebugTableRow>
+        <DebugTableRow title="Statements">
+          <DebugTableLink
+            name="Statement diagnostics history"
+            url="#/reports/statements/diagnosticshistory"
+            note="#/reports/statements/diagnosticshistory"
+          />
         </DebugTableRow>
       </DebugTable>
       <DebugTable heading="Tracing and Profiling Endpoints (local node only)">
@@ -228,6 +221,9 @@ export default function Debug() {
           <DebugTableLink name="UI (count)" url="/debug/pprof/goroutineui?sort=count" />
           <DebugTableLink name="UI (wait)" url="/debug/pprof/goroutineui?sort=wait" />
           <DebugTableLink name="Raw" url="/debug/pprof/goroutine?debug=2" />
+        </DebugTableRow>
+        <DebugTableRow title="Threads">
+          <DebugTableLink name="Raw" url="/debug/threads" />
         </DebugTableRow>
         <DebugTableRow title="Runtime Trace">
           <DebugTableLink name="Trace" url="/debug/pprof/trace?debug=1" />

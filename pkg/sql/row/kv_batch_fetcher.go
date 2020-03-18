@@ -13,8 +13,10 @@ package row
 import (
 	"bytes"
 	"context"
+	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -28,8 +30,9 @@ import (
 // TODO(radu): parameters like this should be configurable
 var kvBatchSize int64 = 10000
 
-// SetKVBatchSize changes the kvBatchFetcher batch size, and returns a function that restores it.
-func SetKVBatchSize(val int64) func() {
+// TestingSetKVBatchSize changes the kvBatchFetcher batch size, and returns a function that restores it.
+// This is to be used only in tests - we have no test coverage for arbitrary kv batch sizes at this time.
+func TestingSetKVBatchSize(val int64) func() {
 	oldVal := kvBatchSize
 	kvBatchSize = val
 	return func() { kvBatchSize = oldVal }
@@ -52,6 +55,8 @@ type txnKVFetcher struct {
 	firstBatchLimit int64
 	useBatchLimit   bool
 	reverse         bool
+	// lockStr represents the locking mode to use when fetching KVs.
+	lockStr sqlbase.ScanLockingStrength
 	// returnRangeInfo, if set, causes the kvBatchFetcher to populate rangeInfos.
 	// See also rowFetcher.returnRangeInfo.
 	returnRangeInfo bool
@@ -131,6 +136,34 @@ func (f *txnKVFetcher) getBatchSizeForIdx(batchIdx int) int64 {
 	}
 }
 
+// getKeyLockingStrength returns the configured per-key locking strength to use
+// for key-value scans.
+func (f *txnKVFetcher) getKeyLockingStrength() lock.Strength {
+	switch f.lockStr {
+	case sqlbase.ScanLockingStrength_FOR_NONE:
+		return lock.None
+
+	case sqlbase.ScanLockingStrength_FOR_KEY_SHARE:
+		// Promote to FOR_SHARE.
+		fallthrough
+	case sqlbase.ScanLockingStrength_FOR_SHARE:
+		// We currently perform no per-key locking when FOR_SHARE is used
+		// because Shared locks have not yet been implemented.
+		return lock.None
+
+	case sqlbase.ScanLockingStrength_FOR_NO_KEY_UPDATE:
+		// Promote to FOR_UPDATE.
+		fallthrough
+	case sqlbase.ScanLockingStrength_FOR_UPDATE:
+		// We currently perform exclusive per-key locking when FOR_UPDATE is
+		// used because Upgrade locks have not yet been implemented.
+		return lock.Exclusive
+
+	default:
+		panic(fmt.Sprintf("unknown locking strength %s", f.lockStr))
+	}
+}
+
 // makeKVBatchFetcher initializes a kvBatchFetcher for the given spans.
 //
 // If useBatchLimit is true, batches are limited to kvBatchSize. If
@@ -139,11 +172,12 @@ func (f *txnKVFetcher) getBatchSizeForIdx(batchIdx int) int64 {
 //
 // Batch limits can only be used if the spans are ordered.
 func makeKVBatchFetcher(
-	txn *client.Txn,
+	txn *kv.Txn,
 	spans roachpb.Spans,
 	reverse bool,
 	useBatchLimit bool,
 	firstBatchLimit int64,
+	lockStr sqlbase.ScanLockingStrength,
 	returnRangeInfo bool,
 ) (txnKVFetcher, error) {
 	sendFn := func(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
@@ -154,7 +188,7 @@ func makeKVBatchFetcher(
 		return res, nil
 	}
 	return makeKVBatchFetcherWithSendFunc(
-		sendFn, spans, reverse, useBatchLimit, firstBatchLimit, returnRangeInfo,
+		sendFn, spans, reverse, useBatchLimit, firstBatchLimit, lockStr, returnRangeInfo,
 	)
 }
 
@@ -166,6 +200,7 @@ func makeKVBatchFetcherWithSendFunc(
 	reverse bool,
 	useBatchLimit bool,
 	firstBatchLimit int64,
+	lockStr sqlbase.ScanLockingStrength,
 	returnRangeInfo bool,
 ) (txnKVFetcher, error) {
 	if firstBatchLimit < 0 || (!useBatchLimit && firstBatchLimit != 0) {
@@ -217,6 +252,7 @@ func makeKVBatchFetcherWithSendFunc(
 		reverse:         reverse,
 		useBatchLimit:   useBatchLimit,
 		firstBatchLimit: firstBatchLimit,
+		lockStr:         lockStr,
 		returnRangeInfo: returnRangeInfo,
 	}, nil
 }
@@ -225,20 +261,33 @@ func makeKVBatchFetcherWithSendFunc(
 func (f *txnKVFetcher) fetch(ctx context.Context) error {
 	var ba roachpb.BatchRequest
 	ba.Header.MaxSpanRequestKeys = f.getBatchSize()
+	if ba.Header.MaxSpanRequestKeys > 0 {
+		// If this kvfetcher limits the number of rows returned, also use
+		// target bytes to guard against the case in which the average row
+		// is very large.
+		// If no limit is set, the assumption is that SQL *knows* that there
+		// is only a "small" amount of data to be read, and wants to preserve
+		// concurrency for this request inside of DistSender, which setting
+		// TargetBytes would interfere with.
+		ba.Header.TargetBytes = 10 * (1 << 20)
+	}
 	ba.Header.ReturnRangeInfo = f.returnRangeInfo
 	ba.Requests = make([]roachpb.RequestUnion, len(f.spans))
+	keyLocking := f.getKeyLockingStrength()
 	if f.reverse {
 		scans := make([]roachpb.ReverseScanRequest, len(f.spans))
 		for i := range f.spans {
-			scans[i].ScanFormat = roachpb.BATCH_RESPONSE
 			scans[i].SetSpan(f.spans[i])
+			scans[i].ScanFormat = roachpb.BATCH_RESPONSE
+			scans[i].KeyLocking = keyLocking
 			ba.Requests[i].MustSetInner(&scans[i])
 		}
 	} else {
 		scans := make([]roachpb.ScanRequest, len(f.spans))
 		for i := range f.spans {
-			scans[i].ScanFormat = roachpb.BATCH_RESPONSE
 			scans[i].SetSpan(f.spans[i])
+			scans[i].ScanFormat = roachpb.BATCH_RESPONSE
+			scans[i].KeyLocking = keyLocking
 			ba.Requests[i].MustSetInner(&scans[i])
 		}
 	}

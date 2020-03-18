@@ -22,7 +22,7 @@ import (
 func TestOffset(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tcs := []struct {
-		offset   uint64
+		offset   int
 		tuples   []tuple
 		expected []tuple
 	}{
@@ -64,9 +64,9 @@ func TestOffset(t *testing.T) {
 
 func BenchmarkOffset(b *testing.B) {
 	ctx := context.Background()
-	batch := coldata.NewMemBatch([]coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64})
+	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64})
 	batch.SetLength(coldata.BatchSize())
-	source := NewRepeatableBatchSource(batch)
+	source := NewRepeatableBatchSource(testAllocator, batch)
 	source.Init()
 
 	o := NewOffsetOp(source, 1)

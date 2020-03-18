@@ -74,27 +74,19 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 		panic(pgerror.DangerousStatementf("UPDATE without WHERE clause"))
 	}
 
-	var ctes []cteSource
-	if upd.With != nil {
-		inScope, ctes = b.buildCTEs(upd.With, inScope)
-	}
-
-	// UPDATE xx AS yy - we want to know about xx (tn) because
-	// that's what we get the descriptor with, and yy (alias) because
-	// that's what RETURNING will use.
-	tn, alias := getAliasedTableName(upd.Table)
-
 	// Find which table we're working on, check the permissions.
-	tab, resName := b.resolveTable(tn, privilege.UPDATE)
-	if alias == nil {
-		alias = &resName
+	tab, depName, alias, refColumns := b.resolveTableForMutation(upd.Table, privilege.UPDATE)
+
+	if refColumns != nil {
+		panic(pgerror.Newf(pgcode.Syntax,
+			"cannot specify a list of column IDs with UPDATE"))
 	}
 
 	// Check Select permission as well, since existing values must be read.
-	b.checkPrivilege(opt.DepByName(tn), tab, privilege.SELECT)
+	b.checkPrivilege(depName, tab, privilege.SELECT)
 
 	var mb mutationBuilder
-	mb.init(b, "update", tab, *alias)
+	mb.init(b, "update", tab, alias)
 
 	// Build the input expression that selects the rows that will be updated:
 	//
@@ -121,8 +113,6 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 	} else {
 		mb.buildUpdate(nil /* returning */)
 	}
-
-	mb.outScope.expr = b.wrapWithCTEs(mb.outScope.expr, ctes)
 
 	return mb.outScope
 }
@@ -153,7 +143,7 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 				for i := range desiredTypes {
 					desiredTypes[i] = mb.md.ColumnMeta(mb.targetColList[targetIdx+i]).Type
 				}
-				outScope := mb.b.buildSelectStmt(t.Select, desiredTypes, mb.outScope)
+				outScope := mb.b.buildSelectStmt(t.Select, noRowLocking, desiredTypes, mb.outScope)
 				mb.subqueries = append(mb.subqueries, outScope)
 				n = len(outScope.cols)
 
@@ -261,7 +251,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 				mb.outScope.appendColumnsFromScope(subqueryScope)
 				mb.outScope.expr = mb.b.factory.ConstructLeftJoinApply(
 					mb.outScope.expr,
-					mb.b.factory.ConstructMax1Row(subqueryScope.expr),
+					mb.b.factory.ConstructMax1Row(subqueryScope.expr, multiRowSubqueryErrText),
 					memo.TrueFilter,
 					memo.EmptyJoinPrivate,
 				)

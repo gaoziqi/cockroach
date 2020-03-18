@@ -21,19 +21,19 @@ import (
 type limitOp struct {
 	OneInputNode
 
-	internalBatch coldata.Batch
-	limit         uint64
+	limit int
 
 	// seen is the number of tuples seen so far.
-	seen uint64
+	seen int
 	// done is true if the limit has been reached.
 	done bool
 }
 
 var _ Operator = &limitOp{}
+var _ closableOperator = &limitOp{}
 
 // NewLimitOp returns a new limit operator with the given limit.
-func NewLimitOp(input Operator, limit uint64) Operator {
+func NewLimitOp(input Operator, limit int) Operator {
 	c := &limitOp{
 		OneInputNode: NewOneInputNode(input),
 		limit:        limit,
@@ -42,26 +42,39 @@ func NewLimitOp(input Operator, limit uint64) Operator {
 }
 
 func (c *limitOp) Init() {
-	c.internalBatch = coldata.NewMemBatch(nil)
 	c.input.Init()
 }
 
 func (c *limitOp) Next(ctx context.Context) coldata.Batch {
 	if c.done {
-		c.internalBatch.SetLength(0)
-		return c.internalBatch
+		return coldata.ZeroBatch
 	}
 	bat := c.input.Next(ctx)
 	length := bat.Length()
 	if length == 0 {
 		return bat
 	}
-	newSeen := c.seen + uint64(length)
+	newSeen := c.seen + length
 	if newSeen >= c.limit {
 		c.done = true
-		bat.SetLength(uint16(c.limit - c.seen))
+		bat.SetLength(c.limit - c.seen)
 		return bat
 	}
 	c.seen = newSeen
 	return bat
+}
+
+// Close is a temporary method to support the specific case in which an upstream
+// operator must be Closed (e.g. an external sorter) to assert a certain state
+// during tests.
+// TODO(asubiotto): This method only exists because an external sorter is
+//  wrapped with a limit op when doing a top K sort and some tests that don't
+//  exhaust the sorter (e.g. allNullsInjection) need to close the operator
+//  explicitly. This should be removed once we have a better way of closing
+//  operators even when they are not exhausted.
+func (c *limitOp) Close(ctx context.Context) error {
+	if c, ok := c.input.(closer); ok {
+		return c.Close(ctx)
+	}
+	return nil
 }

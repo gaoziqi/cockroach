@@ -13,10 +13,11 @@ package row
 import (
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
@@ -29,7 +30,7 @@ import (
 // txn should be passed as argument.
 type fkExistenceCheckBaseHelper struct {
 	// txn is the current KV transaction.
-	txn *client.Txn
+	txn *kv.Txn
 
 	// dir indicates the direction of the check.
 	//
@@ -58,9 +59,6 @@ type fkExistenceCheckBaseHelper struct {
 	// `(x,y,z)`.
 	prefixLen int
 
-	// Pre-computed KV key prefix for searchIdx.
-	searchPrefix []byte
-
 	// ids maps column IDs in index searchIdx to positions of the `row`
 	// array provided to each FK existence check. This tells the checker
 	// where to find the values in the row for each column of the
@@ -86,6 +84,9 @@ type fkExistenceCheckBaseHelper struct {
 	// valuesScratch is memory used to populate an error message when the check
 	// fails.
 	valuesScratch tree.Datums
+
+	// spanBuilder is responsible for constructing spans for FK lookups.
+	spanBuilder *span.Builder
 }
 
 // makeFkExistenceCheckBaseHelper instantiates a FK helper.
@@ -116,7 +117,7 @@ type fkExistenceCheckBaseHelper struct {
 //   TODO(knz): this should become homogeneous across the 3 packages
 //   sql, sqlbase, row. The proliferation is annoying.
 func makeFkExistenceCheckBaseHelper(
-	txn *client.Txn,
+	txn *kv.Txn,
 	otherTables FkTableMetadata,
 	ref *sqlbase.ForeignKeyConstraint,
 	searchIdx *sqlbase.IndexDescriptor,
@@ -136,9 +137,6 @@ func makeFkExistenceCheckBaseHelper(
 		return ret, err
 	}
 
-	// Precompute the KV lookup prefix.
-	searchPrefix := sqlbase.MakeIndexKeyPrefix(searchTable.TableDesc(), searchIdx.ID)
-
 	// Initialize the row fetcher.
 	tableArgs := FetcherTableArgs{
 		Desc:             searchTable,
@@ -149,7 +147,13 @@ func makeFkExistenceCheckBaseHelper(
 	}
 	rf := &Fetcher{}
 	if err := rf.Init(
-		false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, alloc, tableArgs); err != nil {
+		false, /* reverse */
+		sqlbase.ScanLockingStrength_FOR_NONE,
+		false, /* returnRangeInfo */
+		false, /* isCheck */
+		alloc,
+		tableArgs,
+	); err != nil {
 		return ret, err
 	}
 
@@ -163,8 +167,8 @@ func makeFkExistenceCheckBaseHelper(
 		mutatedIdx:    mutatedIdx,
 		ids:           ids,
 		prefixLen:     len(ref.OriginColumnIDs),
-		searchPrefix:  searchPrefix,
 		valuesScratch: make(tree.Datums, len(ref.OriginColumnIDs)),
+		spanBuilder:   span.MakeBuilder(searchTable.TableDesc(), searchIdx),
 	}, nil
 }
 

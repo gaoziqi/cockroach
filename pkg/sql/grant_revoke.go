@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/pkg/errors"
 )
 
@@ -29,9 +30,16 @@ import (
 //   Notes: postgres requires the object owner.
 //          mysql requires the "grant option" and the same privileges, and sometimes superuser.
 func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
+	if n.Targets.Databases != nil {
+		sqltelemetry.IncIAMGrantPrivilegesCounter(sqltelemetry.OnDatabase)
+	} else {
+		sqltelemetry.IncIAMGrantPrivilegesCounter(sqltelemetry.OnTable)
+	}
+
 	return &changePrivilegesNode{
-		targets:  n.Targets,
-		grantees: n.Grantees,
+		targets:      n.Targets,
+		grantees:     n.Grantees,
+		desiredprivs: n.Privileges,
 		changePrivilege: func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
 			privDesc.Grant(grantee, n.Privileges)
 		},
@@ -48,9 +56,16 @@ func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
 //   Notes: postgres requires the object owner.
 //          mysql requires the "grant option" and the same privileges, and sometimes superuser.
 func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) {
+	if n.Targets.Databases != nil {
+		sqltelemetry.IncIAMRevokePrivilegesCounter(sqltelemetry.OnDatabase)
+	} else {
+		sqltelemetry.IncIAMRevokePrivilegesCounter(sqltelemetry.OnTable)
+	}
+
 	return &changePrivilegesNode{
-		targets:  n.Targets,
-		grantees: n.Grantees,
+		targets:      n.Targets,
+		grantees:     n.Grantees,
+		desiredprivs: n.Privileges,
 		changePrivilege: func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
 			privDesc.Revoke(grantee, n.Privileges)
 		},
@@ -60,14 +75,20 @@ func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) 
 type changePrivilegesNode struct {
 	targets         tree.TargetList
 	grantees        tree.NameList
+	desiredprivs    privilege.List
 	changePrivilege func(*sqlbase.PrivilegeDescriptor, string)
 }
+
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because GRANT/REVOKE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *changePrivilegesNode) ReadingOwnWrites() {}
 
 func (n *changePrivilegesNode) startExec(params runParams) error {
 	ctx := params.ctx
 	p := params.p
 	// Check whether grantees exists
-	users, err := p.GetAllUsersAndRoles(ctx)
+	users, err := p.GetAllRoles(ctx)
 	if err != nil {
 		return err
 	}
@@ -99,6 +120,15 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 		if err := p.CheckPrivilege(ctx, descriptor, privilege.GRANT); err != nil {
 			return err
 		}
+
+		// Only allow granting/revoking privileges that the requesting
+		// user themselves have on the descriptor.
+		for _, priv := range n.desiredprivs {
+			if err := p.CheckPrivilege(ctx, descriptor, priv); err != nil {
+				return err
+			}
+		}
+
 		privileges := descriptor.GetPrivileges()
 		for _, grantee := range n.grantees {
 			n.changePrivilege(privileges, string(grantee))
@@ -120,9 +150,16 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			}
 
 		case *sqlbase.MutableTableDescriptor:
+			// TODO (lucy): This should probably have a single consolidated job like
+			// DROP DATABASE.
+			// TODO (lucy): Have more consistent/informative names for dependent jobs.
+			if err := p.createOrUpdateSchemaChangeJob(
+				ctx, d, "updating privileges", sqlbase.InvalidMutationID,
+			); err != nil {
+				return err
+			}
 			if !d.Dropped() {
-				if err := p.writeSchemaChangeToBatch(
-					ctx, d, sqlbase.InvalidMutationID, b); err != nil {
+				if err := p.writeSchemaChangeToBatch(ctx, d, b); err != nil {
 					return err
 				}
 			}

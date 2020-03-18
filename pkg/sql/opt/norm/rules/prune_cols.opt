@@ -265,6 +265,8 @@
 )
 
 # PruneAggCols discards aggregation columns in a GroupBy that are never used.
+# Note that UpsertDistinctOn is not included here because its columns are always
+# used.
 [PruneAggCols, Normalize]
 (Project
     $input:(GroupBy | ScalarGroupBy | DistinctOn
@@ -290,7 +292,8 @@
     $passthrough
 )
 
-# PruneGroupByCols discards GroupBy input columns that are never used.
+# PruneGroupByCols discards GroupBy input columns that are never used. Note that
+# UpsertDistinctOn is not included here because its columns are always used.
 [PruneGroupByCols, Normalize]
 (GroupBy | DistinctOn
     $input:*
@@ -478,7 +481,7 @@
     $input:*
     $checks:*
     $mutationPrivate:* &
-        (CanPruneCols $input $needed:(NeededMutationCols $mutationPrivate))
+        (CanPruneCols $input $needed:(NeededMutationCols $mutationPrivate $checks))
 )
 =>
 ((OpName)
@@ -582,7 +585,7 @@
 # EliminateProject.
 [PruneUnionAllCols, Normalize]
 (Project
-    (UnionAll
+    $union:(UnionAll
         $left:*
         $right:*
         $colmap:*
@@ -590,21 +593,17 @@
     $projections:*
     $passthrough:* &
         (CanPruneCols
-            $left
-            $neededLeft:(NeededColMapLeft
-                $needed:(UnionCols
-                    (ProjectionOuterCols $projections) $passthrough
-                )
-                $colmap
-            )
-        ) &
-        (CanPruneCols $right $neededRight:(NeededColMapRight $needed $colmap))
+             $union
+             $needed:(UnionCols
+                 (ProjectionOuterCols $projections) $passthrough
+             )
+         )
 )
 =>
 (Project
     (UnionAll
-        (Project $left [] $neededLeft)
-        (Project $right [] $neededRight)
+        (Project $left [] (NeededColMapLeft $needed $colmap))
+        (Project $right [] (NeededColMapRight $needed $colmap))
         (PruneSetPrivate $needed $colmap)
     )
     $projections

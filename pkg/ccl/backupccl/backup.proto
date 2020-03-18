@@ -23,14 +23,22 @@ enum MVCCFilter {
   All = 1;
 }
 
-// BackupDescriptor represents a consistent snapshot of ranges.
+// RowCount tracks the size and row/index entry counts.
+message RowCount {
+  int64 data_size = 1;
+  int64 rows = 2;
+  int64 index_entries = 3;
+  reserved 4; // was BulkOpSummary's system_records.
+}
+
+// BackupManifest represents a consistent snapshot of ranges.
 //
 // Each range snapshot includes a path to data that is a diff of the data in
 // that key range between a start and end timestamp. The end timestamp of all
 // ranges in a backup is the same, but the start may vary (to allow individual
 // tables to be backed up on different schedules).
-message BackupDescriptor {
-  // BackupDescriptor_File represents a file that contains the diff for a key
+message BackupManifest {
+  // BackupManifest_File represents a file that contains the diff for a key
   // range between two timestamps.
   message File {
     roachpb.Span span = 1 [(gogoproto.nullable) = false];
@@ -38,7 +46,7 @@ message BackupDescriptor {
     reserved 3;
     bytes sha512 = 4;
     reserved 5;
-    roachpb.BulkOpSummary entry_counts = 6 [(gogoproto.nullable) = false];
+    RowCount entry_counts = 6 [(gogoproto.nullable) = false];
 
     // StartTime 0 is sometimes legitimately used, so it is only meaningful if
     // EndTime is non-zero, otherwise both just inherit from containing backup.
@@ -82,7 +90,7 @@ message BackupDescriptor {
   repeated uint32 complete_dbs = 14 [
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"];
   reserved 6;
-  roachpb.BulkOpSummary entry_counts = 12 [(gogoproto.nullable) = false];
+  RowCount entry_counts = 12 [(gogoproto.nullable) = false];
 
   roachpb.ExternalStorage dir = 7 [(gogoproto.nullable) = false];
 
@@ -102,12 +110,27 @@ message BackupDescriptor {
   repeated string partition_descriptor_filenames = 19;
   repeated string locality_kvs = 20 [(gogoproto.customname) = "LocalityKVs"];
   repeated sql.stats.TableStatisticProto statistics = 21;
+  int32 descriptor_coverage = 22 [
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/tree.DescriptorCoverage"];
 }
 
 message BackupPartitionDescriptor{
   string locality_kv = 1 [(gogoproto.customname) = "LocalityKV"];
-  repeated BackupDescriptor.File files = 2 [(gogoproto.nullable) = false];
+  repeated BackupManifest.File files = 2 [(gogoproto.nullable) = false];
   bytes backup_id = 3 [(gogoproto.nullable) = false,
                       (gogoproto.customname) = "BackupID",
                       (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"];
+}
+
+
+// EncryptionInfo is stored IN PLAINTEXT along side collections of encrypted
+// files stored outside of cockroach, for example by BACKUP/RESTORE.
+message EncryptionInfo {
+  enum Scheme {
+    AES256GCM = 0;
+  }
+  option (gogoproto.equal) = true;
+
+  Scheme scheme = 1;
+  bytes salt = 2;
 }

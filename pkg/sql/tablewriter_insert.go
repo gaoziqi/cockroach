@@ -13,7 +13,7 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -26,11 +26,13 @@ type tableInserter struct {
 	ri row.Inserter
 }
 
+var _ tableWriter = &tableInserter{}
+
 // desc is part of the tableWriter interface.
 func (*tableInserter) desc() string { return "inserter" }
 
 // init is part of the tableWriter interface.
-func (ti *tableInserter) init(txn *client.Txn, _ *tree.EvalContext) error {
+func (ti *tableInserter) init(_ context.Context, txn *kv.Txn, _ *tree.EvalContext) error {
 	ti.tableWriterBase.init(txn)
 	return nil
 }
@@ -41,10 +43,10 @@ func (ti *tableInserter) row(ctx context.Context, values tree.Datums, traceKV bo
 	return ti.ri.InsertRow(ctx, ti.b, values, false /* overwrite */, row.CheckFKs, traceKV)
 }
 
-// atBatchEnd is part of the extendedTableWriter interface.
+// atBatchEnd is part of the tableWriter interface.
 func (ti *tableInserter) atBatchEnd(_ context.Context, _ bool) error { return nil }
 
-// flushAndStartNewBatch is part of the extendedTableWriter interface.
+// flushAndStartNewBatch is part of the tableWriter interface.
 func (ti *tableInserter) flushAndStartNewBatch(ctx context.Context) error {
 	return ti.tableWriterBase.flushAndStartNewBatch(ctx, ti.tableDesc())
 }

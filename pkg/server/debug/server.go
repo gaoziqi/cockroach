@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/debug/pprofui"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -57,19 +58,24 @@ const Endpoint = "/debug/"
 
 // DebugRemote controls which clients are allowed to access certain
 // confidential debug pages, such as those served under the /debug/ prefix.
-var DebugRemote = settings.RegisterValidatedStringSetting(
-	"server.remote_debugging.mode",
-	"set to enable remote debugging, localhost-only or disable (any, local, off)",
-	"local",
-	func(sv *settings.Values, s string) error {
-		switch RemoteMode(strings.ToLower(s)) {
-		case RemoteOff, RemoteLocal, RemoteAny:
-			return nil
-		default:
-			return errors.Errorf("invalid mode: '%s'", s)
-		}
-	},
-)
+var DebugRemote = func() *settings.StringSetting {
+	s := settings.RegisterValidatedStringSetting(
+		"server.remote_debugging.mode",
+		"set to enable remote debugging, localhost-only or disable (any, local, off)",
+		"local",
+		func(sv *settings.Values, s string) error {
+			switch RemoteMode(strings.ToLower(s)) {
+			case RemoteOff, RemoteLocal, RemoteAny:
+				return nil
+			default:
+				return errors.Errorf("invalid mode: '%s'", s)
+			}
+		},
+	)
+	s.SetReportable(true)
+	s.SetVisibility(settings.Public)
+	return s
+}()
 
 // Server serves the /debug/* family of tools.
 type Server struct {
@@ -79,7 +85,7 @@ type Server struct {
 }
 
 // NewServer sets up a debug server.
-func NewServer(st *cluster.Settings) *Server {
+func NewServer(st *cluster.Settings, hbaConfDebugFn http.HandlerFunc) *Server {
 	mux := http.NewServeMux()
 
 	// Install a redirect to the UI's collection of debug tools.
@@ -105,6 +111,12 @@ func NewServer(st *cluster.Settings) *Server {
 	mux.Handle("/debug/metrics", exp.ExpHandler(metrics.DefaultRegistry))
 	// Also register /debug/vars (even though /debug/metrics is better).
 	mux.Handle("/debug/vars", expvar.Handler())
+
+	if hbaConfDebugFn != nil {
+		// Expose the processed HBA configuration through the debug
+		// interface for inspection during troubleshooting.
+		mux.HandleFunc("/debug/hba_conf", hbaConfDebugFn)
+	}
 
 	// Register the stopper endpoint, which lists all active tasks.
 	mux.HandleFunc("/debug/stopper", stop.HandleDebug)
@@ -147,12 +159,16 @@ func NewServer(st *cluster.Settings) *Server {
 		_ = dump.HTML(w)
 	})
 
+	mux.HandleFunc("/debug/threads", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Add("Content-type", "text/plain")
+		fmt.Fprint(w, storage.ThreadStacks())
+	})
+
 	return &Server{
 		st:  st,
 		mux: mux,
 		spy: spy,
 	}
-
 }
 
 // ServeHTTP serves various tools under the /debug endpoint. It restricts access

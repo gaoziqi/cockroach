@@ -62,6 +62,7 @@ func (b *Builder) buildCreateView(cv *memo.CreateViewExpr) (execPlan, error) {
 	root, err := b.factory.ConstructCreateView(
 		schema,
 		cv.ViewName,
+		cv.IfNotExists,
 		cv.Temporary,
 		cv.ViewQuery,
 		cols,
@@ -77,7 +78,8 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 		fmtFlags := memo.ExprFmtHideAll
 		switch {
 		case explain.Options.Flags.Contains(tree.ExplainFlagVerbose):
-			fmtFlags = memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes
+			fmtFlags = memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars |
+				memo.ExprFmtHideTypes | memo.ExprFmtHideNotNull
 
 		case explain.Options.Flags.Contains(tree.ExplainFlagTypes):
 			fmtFlags = memo.ExprFmtHideQualifications
@@ -114,6 +116,14 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 			return execPlan{}, err
 		}
 	} else {
+
+		// The auto commit flag should reflect what would happen if this statement
+		// was run without the explain, so recalculate it.
+		defer func(oldVal bool) {
+			b.allowAutoCommit = oldVal
+		}(b.allowAutoCommit)
+		b.allowAutoCommit = b.canAutoCommit(explain.Input)
+
 		input, err := b.buildRelational(explain.Input)
 		if err != nil {
 			return execPlan{}, err

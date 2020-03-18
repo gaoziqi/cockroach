@@ -18,9 +18,9 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -96,7 +96,7 @@ type DistSQLPlanner struct {
 	nodeHealth distSQLNodeHealth
 
 	// distSender is used to construct the spanResolver upon SetNodeDesc.
-	distSender *kv.DistSender
+	distSender *kvcoord.DistSender
 	// rpcCtx is used to construct the spanResolver upon SetNodeDesc.
 	rpcCtx *rpc.Context
 }
@@ -145,7 +145,7 @@ func NewDistSQLPlanner(
 	nodeDesc roachpb.NodeDescriptor,
 	rpcCtx *rpc.Context,
 	distSQLSrv *distsql.ServerImpl,
-	distSender *kv.DistSender,
+	distSender *kvcoord.DistSender,
 	gossip *gossip.Gossip,
 	stopper *stop.Stopper,
 	liveness livenessProvider,
@@ -289,31 +289,36 @@ func newQueryNotSupportedErrorf(format string, args ...interface{}) error {
 	return &queryNotSupportedError{msg: fmt.Sprintf(format, args...)}
 }
 
-var mutationsNotSupportedError = newQueryNotSupportedError("mutations not supported")
-var setNotSupportedError = newQueryNotSupportedError("SET / SET CLUSTER SETTING should never distribute")
+// planNodeNotSupportedErr is the catch-all error value returned from
+// checkSupportForNode when a planNode type does not support distributed
+// execution.
+var planNodeNotSupportedErr = newQueryNotSupportedError("unsupported node")
+
+var cannotDistributeRowLevelLockingErr = newQueryNotSupportedError(
+	"scans with row-level locking are not supported by distsql",
+)
 
 // mustWrapNode returns true if a node has no DistSQL-processor equivalent.
 // This must be kept in sync with createPlanForNode.
 // TODO(jordan): refactor these to use the observer pattern to avoid duplication.
 func (dsp *DistSQLPlanner) mustWrapNode(planCtx *PlanningCtx, node planNode) bool {
 	switch n := node.(type) {
-	case *scanNode:
-	case *indexJoinNode:
-	case *lookupJoinNode:
-	case *zigzagJoinNode:
-	case *joinNode:
-	case *renderNode:
-	case *groupNode:
-	case *sortNode:
-	case *filterNode:
-	case *limitNode:
+	// Keep these cases alphabetized, please!
 	case *distinctNode:
-	case *unionNode:
-	case *virtualTableNode:
+	case *exportNode:
+	case *filterNode:
+	case *groupNode:
+	case *indexJoinNode:
+	case *joinNode:
+	case *limitNode:
+	case *lookupJoinNode:
+	case *ordinalityNode:
 	case *projectSetNode:
+	case *renderNode:
+	case *scanNode:
+	case *sortNode:
 	case *unaryNode:
-	case *windowNode:
-	case *zeroNode:
+	case *unionNode:
 	case *valuesNode:
 		// This is unfortunately duplicated by createPlanForNode, and must be kept
 		// in sync with its implementation.
@@ -321,6 +326,9 @@ func (dsp *DistSQLPlanner) mustWrapNode(planCtx *PlanningCtx, node planNode) boo
 			return true
 		}
 		return false
+	case *windowNode:
+	case *zeroNode:
+	case *zigzagJoinNode:
 	default:
 		return true
 	}
@@ -334,28 +342,34 @@ func (dsp *DistSQLPlanner) mustWrapNode(planCtx *PlanningCtx, node planNode) boo
 // TODO(radu): add tests for this.
 func (dsp *DistSQLPlanner) checkSupportForNode(node planNode) (distRecommendation, error) {
 	switch n := node.(type) {
+	// Keep these cases alphabetized, please!
+	case *distinctNode:
+		return dsp.checkSupportForNode(n.plan)
+
+	case *exportNode:
+		return dsp.checkSupportForNode(n.source)
+
 	case *filterNode:
 		if err := dsp.checkExpr(n.filter); err != nil {
 			return cannotDistribute, err
 		}
 		return dsp.checkSupportForNode(n.source.plan)
 
-	case *renderNode:
-		for _, e := range n.render {
-			if err := dsp.checkExpr(e); err != nil {
-				return cannotDistribute, err
-			}
-		}
-		return dsp.checkSupportForNode(n.source.plan)
-
-	case *sortNode:
+	case *groupNode:
 		rec, err := dsp.checkSupportForNode(n.plan)
 		if err != nil {
 			return cannotDistribute, err
 		}
-		// If we have to sort, distribute the query.
-		rec = rec.compose(shouldDistribute)
-		return rec, nil
+		// Distribute aggregations if possible.
+		return rec.compose(shouldDistribute), nil
+
+	case *indexJoinNode:
+		// n.table doesn't have meaningful spans, but we need to check support (e.g.
+		// for any filtering expression).
+		if _, err := dsp.checkSupportForNode(n.table); err != nil {
+			return cannotDistribute, err
+		}
+		return dsp.checkSupportForNode(n.input)
 
 	case *joinNode:
 		if err := dsp.checkExpr(n.pred.onCond); err != nil {
@@ -378,7 +392,44 @@ func (dsp *DistSQLPlanner) checkSupportForNode(node planNode) (distRecommendatio
 		}
 		return rec, nil
 
+	case *limitNode:
+		if err := dsp.checkExpr(n.countExpr); err != nil {
+			return cannotDistribute, err
+		}
+		if err := dsp.checkExpr(n.offsetExpr); err != nil {
+			return cannotDistribute, err
+		}
+		return dsp.checkSupportForNode(n.plan)
+
+	case *lookupJoinNode:
+		if err := dsp.checkExpr(n.onCond); err != nil {
+			return cannotDistribute, err
+		}
+		if _, err := dsp.checkSupportForNode(n.input); err != nil {
+			return cannotDistribute, err
+		}
+		return shouldDistribute, nil
+
+	case *projectSetNode:
+		return dsp.checkSupportForNode(n.source)
+
+	case *renderNode:
+		for _, e := range n.render {
+			if err := dsp.checkExpr(e); err != nil {
+				return cannotDistribute, err
+			}
+		}
+		return dsp.checkSupportForNode(n.source.plan)
+
 	case *scanNode:
+		if n.lockingStrength != sqlbase.ScanLockingStrength_FOR_NONE {
+			// Scans that are performing row-level locking cannot currently be
+			// distributed because their locks would not be propagated back to
+			// the root transaction coordinator.
+			// TODO(nvanbenschoten): lift this restriction.
+			return cannotDistribute, cannotDistributeRowLevelLockingErr
+		}
+
 		rec := canDistribute
 		if n.softLimit != 0 {
 			// We don't yet recommend distributing plans where soft limits propagate
@@ -400,48 +451,17 @@ func (dsp *DistSQLPlanner) checkSupportForNode(node planNode) (distRecommendatio
 		}
 		return rec, nil
 
-	case *indexJoinNode:
-		// n.table doesn't have meaningful spans, but we need to check support (e.g.
-		// for any filtering expression).
-		if _, err := dsp.checkSupportForNode(n.table); err != nil {
-			return cannotDistribute, err
-		}
-		return dsp.checkSupportForNode(n.input)
-
-	case *lookupJoinNode:
-		if err := dsp.checkExpr(n.onCond); err != nil {
-			return cannotDistribute, err
-		}
-		if _, err := dsp.checkSupportForNode(n.input); err != nil {
-			return cannotDistribute, err
-		}
-		return shouldDistribute, nil
-
-	case *zigzagJoinNode:
-		if err := dsp.checkExpr(n.onCond); err != nil {
-			return cannotDistribute, err
-		}
-		return shouldDistribute, nil
-
-	case *groupNode:
+	case *sortNode:
 		rec, err := dsp.checkSupportForNode(n.plan)
 		if err != nil {
 			return cannotDistribute, err
 		}
-		// Distribute aggregations if possible.
-		return rec.compose(shouldDistribute), nil
+		// If we have to sort, distribute the query.
+		rec = rec.compose(shouldDistribute)
+		return rec, nil
 
-	case *limitNode:
-		if err := dsp.checkExpr(n.countExpr); err != nil {
-			return cannotDistribute, err
-		}
-		if err := dsp.checkExpr(n.offsetExpr); err != nil {
-			return cannotDistribute, err
-		}
-		return dsp.checkSupportForNode(n.plan)
-
-	case *distinctNode:
-		return dsp.checkSupportForNode(n.plan)
+	case *unaryNode:
+		return canDistribute, nil
 
 	case *unionNode:
 		recLeft, err := dsp.checkSupportForNode(n.left)
@@ -471,31 +491,20 @@ func (dsp *DistSQLPlanner) checkSupportForNode(node planNode) (distRecommendatio
 		}
 		return canDistribute, nil
 
-	case *insertNode, *updateNode, *deleteNode, *upsertNode:
-		// This is a potential hot path.
-		return cannotDistribute, mutationsNotSupportedError
-
-	case *setVarNode, *setClusterSettingNode:
-		// SET statements are never distributed.
-		return cannotDistribute, setNotSupportedError
-
-	case *projectSetNode:
-		return dsp.checkSupportForNode(n.source)
-
-	case *unaryNode:
-		return canDistribute, nil
+	case *windowNode:
+		return dsp.checkSupportForNode(n.plan)
 
 	case *zeroNode:
 		return canDistribute, nil
 
-	case *windowNode:
-		return dsp.checkSupportForNode(n.plan)
-
-	case *exportNode:
-		return dsp.checkSupportForNode(n.source)
+	case *zigzagJoinNode:
+		if err := dsp.checkExpr(n.onCond); err != nil {
+			return cannotDistribute, err
+		}
+		return shouldDistribute, nil
 
 	default:
-		return cannotDistribute, newQueryNotSupportedErrorf("unsupported node %T", node)
+		return cannotDistribute, planNodeNotSupportedErr
 	}
 }
 
@@ -682,7 +691,8 @@ func (h *distSQLNodeHealth) check(ctx context.Context, nodeID roachpb.NodeID) er
 		// written on startup, the most likely scenario is
 		// that the node is ready. We therefore return no
 		// error.
-		return nil
+		// TODO(ajwerner): Determine the expected error types and only filter those.
+		return nil //nolint:returnerrcheck
 	}
 
 	if drainingInfo.Draining {
@@ -743,7 +753,7 @@ func (dsp *DistSQLPlanner) PartitionSpans(
 		// We break up rspan into its individual ranges (which may or
 		// may not be on separate nodes). We then create "partitioned
 		// spans" using the end keys of these individual ranges.
-		for it.Seek(ctx, span, kv.Ascending); ; it.Next(ctx) {
+		for it.Seek(ctx, span, kvcoord.Ascending); ; it.Next(ctx) {
 			if !it.Valid() {
 				return nil, it.Error()
 			}
@@ -869,10 +879,12 @@ func initTableReaderSpec(
 ) (*execinfrapb.TableReaderSpec, execinfrapb.PostProcessSpec, error) {
 	s := physicalplan.NewTableReaderSpec()
 	*s = execinfrapb.TableReaderSpec{
-		Table:      *n.desc.TableDesc(),
-		Reverse:    n.reverse,
-		IsCheck:    n.isCheck,
-		Visibility: n.colCfg.visibility.toDistSQLScanVisibility(),
+		Table:             *n.desc.TableDesc(),
+		Reverse:           n.reverse,
+		IsCheck:           n.isCheck,
+		Visibility:        n.colCfg.visibility.toDistSQLScanVisibility(),
+		LockingStrength:   n.lockingStrength,
+		LockingWaitPolicy: n.lockingWaitPolicy,
 
 		// Retain the capacity of the spans slice.
 		Spans: s.Spans[:0],
@@ -1009,9 +1021,9 @@ func (dsp *DistSQLPlanner) getNodeIDForScan(
 	// Determine the node ID for the first range to be scanned.
 	it := planCtx.spanIter
 	if reverse {
-		it.Seek(planCtx.ctx, spans[len(spans)-1], kv.Descending)
+		it.Seek(planCtx.ctx, spans[len(spans)-1], kvcoord.Descending)
 	} else {
-		it.Seek(planCtx.ctx, spans[0], kv.Ascending)
+		it.Seek(planCtx.ctx, spans[0], kvcoord.Ascending)
 	}
 	if !it.Valid() {
 		return 0, it.Error()
@@ -1110,6 +1122,7 @@ func (dsp *DistSQLPlanner) createTableReaders(
 		}
 
 		tr.MaxResults = n.maxResults
+		p.TotalEstimatedScannedRows += n.estimatedRowCount
 		if n.estimatedRowCount > p.MaxEstimatedRowCount {
 			p.MaxEstimatedRowCount = n.estimatedRowCount
 		}
@@ -1194,25 +1207,15 @@ func (dsp *DistSQLPlanner) createTableReaders(
 func (dsp *DistSQLPlanner) selectRenders(
 	p *PhysicalPlan, n *renderNode, planCtx *PlanningCtx,
 ) error {
-	// We want to skip any unused renders.
-	planToStreamColMap := makePlanToStreamColMap(len(n.render))
-	renders := make([]tree.TypedExpr, 0, len(n.render))
-	for i, r := range n.render {
-		if !n.columns[i].Omitted {
-			planToStreamColMap[i] = len(renders)
-			renders = append(renders, r)
-		}
-	}
-
-	typs, err := getTypesForPlanResult(n, planToStreamColMap)
+	typs, err := getTypesForPlanResult(n, nil /* planToStreamColMap */)
 	if err != nil {
 		return err
 	}
-	err = p.AddRendering(renders, planCtx, p.PlanToStreamColMap, typs)
+	err = p.AddRendering(n.render, planCtx, p.PlanToStreamColMap, typs)
 	if err != nil {
 		return err
 	}
-	p.PlanToStreamColMap = planToStreamColMap
+	p.PlanToStreamColMap = identityMap(p.PlanToStreamColMap, len(n.render))
 	return nil
 }
 
@@ -1266,8 +1269,8 @@ func (dsp *DistSQLPlanner) addAggregators(
 		}
 		aggregations[i].Func = execinfrapb.AggregatorSpec_Func(funcIdx)
 		aggregations[i].Distinct = fholder.isDistinct()
-		if fholder.argRenderIdx != noRenderIdx {
-			aggregations[i].ColIdx = []uint32{uint32(p.PlanToStreamColMap[fholder.argRenderIdx])}
+		for _, renderIdx := range fholder.argRenderIdxs {
+			aggregations[i].ColIdx = append(aggregations[i].ColIdx, uint32(p.PlanToStreamColMap[renderIdx]))
 		}
 		if fholder.hasFilter() {
 			col := uint32(p.PlanToStreamColMap[fholder.filterRenderIdx])
@@ -1823,9 +1826,11 @@ func (dsp *DistSQLPlanner) createPlanForIndexJoin(
 	plan.AddProjection(pkCols)
 
 	joinReaderSpec := execinfrapb.JoinReaderSpec{
-		Table:      *n.table.desc.TableDesc(),
-		IndexIdx:   0,
-		Visibility: n.table.colCfg.visibility.toDistSQLScanVisibility(),
+		Table:             *n.table.desc.TableDesc(),
+		IndexIdx:          0,
+		Visibility:        n.table.colCfg.visibility.toDistSQLScanVisibility(),
+		LockingStrength:   n.table.lockingStrength,
+		LockingWaitPolicy: n.table.lockingWaitPolicy,
 	}
 
 	filter, err := physicalplan.MakeExpression(
@@ -1839,15 +1844,12 @@ func (dsp *DistSQLPlanner) createPlanForIndexJoin(
 	}
 
 	// Calculate the output columns from n.cols.
-	post.OutputColumns = make([]uint32, 0, len(n.cols))
-	plan.PlanToStreamColMap = makePlanToStreamColMap(len(n.cols))
+	post.OutputColumns = make([]uint32, len(n.cols))
+	plan.PlanToStreamColMap = identityMap(plan.PlanToStreamColMap, len(n.cols))
 
 	for i := range n.cols {
-		if !n.resultColumns[i].Omitted {
-			plan.PlanToStreamColMap[i] = len(post.OutputColumns)
-			ord := tableOrdinal(n.table.desc, n.cols[i].ID, n.table.colCfg.visibility)
-			post.OutputColumns = append(post.OutputColumns, uint32(ord))
-		}
+		ord := tableOrdinal(n.table.desc, n.cols[i].ID, n.table.colCfg.visibility)
+		post.OutputColumns[i] = uint32(ord)
 	}
 
 	types, err := getTypesForPlanResult(n, plan.PlanToStreamColMap)
@@ -1891,9 +1893,11 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 	}
 
 	joinReaderSpec := execinfrapb.JoinReaderSpec{
-		Table:      *n.table.desc.TableDesc(),
-		Type:       n.joinType,
-		Visibility: n.table.colCfg.visibility.toDistSQLScanVisibility(),
+		Table:             *n.table.desc.TableDesc(),
+		Type:              n.joinType,
+		Visibility:        n.table.colCfg.visibility.toDistSQLScanVisibility(),
+		LockingStrength:   n.table.lockingStrength,
+		LockingWaitPolicy: n.table.lockingWaitPolicy,
 	}
 	joinReaderSpec.IndexIdx, err = getIndexIdx(n.table)
 	if err != nil {
@@ -1982,12 +1986,12 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 ) (plan PhysicalPlan, err error) {
 
 	tables := make([]sqlbase.TableDescriptor, len(n.sides))
-	indexIds := make([]uint32, len(n.sides))
+	indexOrdinals := make([]uint32, len(n.sides))
 	cols := make([]execinfrapb.Columns, len(n.sides))
 	numStreamCols := 0
 	for i, side := range n.sides {
 		tables[i] = *side.scan.desc.TableDesc()
-		indexIds[i], err = getIndexIdx(side.scan)
+		indexOrdinals[i], err = getIndexIdx(side.scan)
 		if err != nil {
 			return PhysicalPlan{}, err
 		}
@@ -2003,10 +2007,10 @@ func (dsp *DistSQLPlanner) createPlanForZigzagJoin(
 	// The zigzag join node only represents inner joins, so hardcode Type to
 	// InnerJoin.
 	zigzagJoinerSpec := execinfrapb.ZigzagJoinerSpec{
-		Tables:    tables,
-		IndexIds:  indexIds,
-		EqColumns: cols,
-		Type:      sqlbase.InnerJoin,
+		Tables:        tables,
+		IndexOrdinals: indexOrdinals,
+		EqColumns:     cols,
+		Type:          sqlbase.InnerJoin,
 	}
 	zigzagJoinerSpec.FixedValues = make([]*execinfrapb.ValuesCoreSpec, len(n.sides))
 
@@ -2284,28 +2288,20 @@ func (dsp *DistSQLPlanner) createPlanForNode(
 	planCtx.planDepth++
 
 	switch n := node.(type) {
-	case *scanNode:
-		plan, err = dsp.createTableReaders(planCtx, n, nil)
+	// Keep these cases alphabetized, please!
+	case *distinctNode:
+		plan, err = dsp.createPlanForDistinct(planCtx, n)
 
-	case *indexJoinNode:
-		plan, err = dsp.createPlanForIndexJoin(planCtx, n)
+	case *exportNode:
+		plan, err = dsp.createPlanForExport(planCtx, n)
 
-	case *lookupJoinNode:
-		plan, err = dsp.createPlanForLookupJoin(planCtx, n)
-
-	case *zigzagJoinNode:
-		plan, err = dsp.createPlanForZigzagJoin(planCtx, n)
-
-	case *joinNode:
-		plan, err = dsp.createPlanForJoin(planCtx, n)
-
-	case *renderNode:
+	case *filterNode:
 		plan, err = dsp.createPlanForNode(planCtx, n.source.plan)
 		if err != nil {
 			return PhysicalPlan{}, err
 		}
-		err = dsp.selectRenders(&plan, n, planCtx)
-		if err != nil {
+
+		if err := plan.AddFilter(n.filter, planCtx, plan.PlanToStreamColMap); err != nil {
 			return PhysicalPlan{}, err
 		}
 
@@ -2319,23 +2315,11 @@ func (dsp *DistSQLPlanner) createPlanForNode(
 			return PhysicalPlan{}, err
 		}
 
-	case *sortNode:
-		plan, err = dsp.createPlanForNode(planCtx, n.plan)
-		if err != nil {
-			return PhysicalPlan{}, err
-		}
+	case *indexJoinNode:
+		plan, err = dsp.createPlanForIndexJoin(planCtx, n)
 
-		dsp.addSorters(&plan, n)
-
-	case *filterNode:
-		plan, err = dsp.createPlanForNode(planCtx, n.source.plan)
-		if err != nil {
-			return PhysicalPlan{}, err
-		}
-
-		if err := plan.AddFilter(n.filter, planCtx, plan.PlanToStreamColMap); err != nil {
-			return PhysicalPlan{}, err
-		}
+	case *joinNode:
+		plan, err = dsp.createPlanForJoin(planCtx, n)
 
 	case *limitNode:
 		plan, err = dsp.createPlanForNode(planCtx, n.plan)
@@ -2349,11 +2333,38 @@ func (dsp *DistSQLPlanner) createPlanForNode(
 			return PhysicalPlan{}, err
 		}
 
-	case *distinctNode:
-		plan, err = dsp.createPlanForDistinct(planCtx, n)
+	case *lookupJoinNode:
+		plan, err = dsp.createPlanForLookupJoin(planCtx, n)
 
 	case *ordinalityNode:
 		plan, err = dsp.createPlanForOrdinality(planCtx, n)
+
+	case *projectSetNode:
+		plan, err = dsp.createPlanForProjectSet(planCtx, n)
+
+	case *renderNode:
+		plan, err = dsp.createPlanForNode(planCtx, n.source.plan)
+		if err != nil {
+			return PhysicalPlan{}, err
+		}
+		err = dsp.selectRenders(&plan, n, planCtx)
+		if err != nil {
+			return PhysicalPlan{}, err
+		}
+
+	case *scanNode:
+		plan, err = dsp.createTableReaders(planCtx, n, nil)
+
+	case *sortNode:
+		plan, err = dsp.createPlanForNode(planCtx, n.plan)
+		if err != nil {
+			return PhysicalPlan{}, err
+		}
+
+		dsp.addSorters(&plan, n)
+
+	case *unaryNode:
+		plan, err = dsp.createPlanForUnary(planCtx, n)
 
 	case *unionNode:
 		plan, err = dsp.createPlanForSetOp(planCtx, n)
@@ -2382,20 +2393,14 @@ func (dsp *DistSQLPlanner) createPlanForNode(
 			plan, err = dsp.createPlanForValues(planCtx, n)
 		}
 
-	case *projectSetNode:
-		plan, err = dsp.createPlanForProjectSet(planCtx, n)
-
-	case *unaryNode:
-		plan, err = dsp.createPlanForUnary(planCtx, n)
+	case *windowNode:
+		plan, err = dsp.createPlanForWindow(planCtx, n)
 
 	case *zeroNode:
 		plan, err = dsp.createPlanForZero(planCtx, n)
 
-	case *windowNode:
-		plan, err = dsp.createPlanForWindow(planCtx, n)
-
-	case *exportNode:
-		plan, err = dsp.createPlanForExport(planCtx, n)
+	case *zigzagJoinNode:
+		plan, err = dsp.createPlanForZigzagJoin(planCtx, n)
 
 	default:
 		// Can't handle a node? We wrap it and continue on our way.
@@ -2677,8 +2682,10 @@ func createDistinctSpec(n *distinctNode, cols []int) *execinfrapb.DistinctSpec {
 	}
 
 	return &execinfrapb.DistinctSpec{
-		OrderedColumns:  orderedColumns,
-		DistinctColumns: distinctColumns,
+		OrderedColumns:   orderedColumns,
+		DistinctColumns:  distinctColumns,
+		NullsAreDistinct: n.nullsAreDistinct,
+		ErrorOnDup:       n.errorOnDup,
 	}
 }
 
@@ -2964,6 +2971,16 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 			p.AddSingleGroupStage(
 				dsp.nodeDesc.NodeID, distinctSpec, execinfrapb.PostProcessSpec{}, p.ResultTypes)
 		} else {
+			// With UNION ALL, we can end up with multiple streams on the same node.
+			// We don't want to have unnecessary routers and cross-node streams, so
+			// merge these streams now.
+			//
+			// More importantly, we need to guarantee that if everything is planned
+			// on a single node (which is always the case when there are mutations),
+			// we can fuse everything so there are no concurrent KV operations (see
+			// #40487, #41307).
+			p.EnsureSingleStreamPerNode()
+
 			// UNION ALL is special: it doesn't have any required downstream
 			// processor, so its two inputs might have different post-processing
 			// which would violate an assumption later down the line. Check for this
@@ -2975,16 +2992,6 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 					execinfrapb.PostProcessSpec{},
 					p.ResultTypes,
 				)
-			} else {
-				// With UNION ALL, we can end up with multiple streams on the same node.
-				// We don't want to have unnecessary routers and cross-node streams, so
-				// merge these streams now.
-				//
-				// More importantly, we need to guarantee that if everything is planned
-				// on a single node (which is always the case when there are mutations),
-				// we can fuse everything so there are no concurrent KV operations (see
-				// #40487, #41307).
-				p.EnsureSingleStreamPerNode()
 			}
 		}
 	} else {
@@ -3234,7 +3241,7 @@ func (dsp *DistSQLPlanner) createPlanForExport(
 
 // NewPlanningCtx returns a new PlanningCtx.
 func (dsp *DistSQLPlanner) NewPlanningCtx(
-	ctx context.Context, evalCtx *extendedEvalContext, txn *client.Txn,
+	ctx context.Context, evalCtx *extendedEvalContext, txn *kv.Txn,
 ) *PlanningCtx {
 	planCtx := dsp.newLocalPlanningCtx(ctx, evalCtx)
 	planCtx.spanIter = dsp.spanResolver.NewSpanResolverIterator(txn)

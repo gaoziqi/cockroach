@@ -13,36 +13,30 @@ package sqlsmith
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 var (
-	alters       []statementWeight
-	alterWeights []int
-)
-
-func init() {
-	alters = []statementWeight{
-		{1, makeRenameTable},
-		{1, makeCreateTable},
+	alters               = append(altersTableExistence, altersExistingTable...)
+	altersTableExistence = []statementWeight{
+		{10, makeCreateTable},
 		{1, makeDropTable},
-
-		{1, makeAddColumn},
-		{1, makeDropColumn},
-		{1, makeRenameColumn},
-		{1, makeAlterColumnType},
-
-		{1, makeCreateIndex},
-		{1, makeDropIndex},
-		{1, makeRenameIndex},
 	}
-	alterWeights = func() []int {
-		m := make([]int, len(alters))
-		for i, s := range alters {
-			m[i] = s.weight
-		}
-		return m
-	}()
-}
+	altersExistingTable = []statementWeight{
+		{5, makeRenameTable},
+
+		{10, makeAddColumn},
+		{10, makeJSONComputedColumn},
+		{10, makeAlterPrimaryKey},
+		{1, makeDropColumn},
+		{5, makeRenameColumn},
+		{5, makeAlterColumnType},
+
+		{10, makeCreateIndex},
+		{1, makeDropIndex},
+		{5, makeRenameIndex},
+	}
+)
 
 func makeAlter(s *Smither) (tree.Statement, bool) {
 	if s.canRecurse() {
@@ -55,8 +49,7 @@ func makeAlter(s *Smither) (tree.Statement, bool) {
 		// test some additional logic.
 		_ = s.ReloadSchemas()
 		for i := 0; i < retryCount; i++ {
-			idx := s.alters.Next()
-			stmt, ok := alters[idx].fn(s)
+			stmt, ok := s.alterSampler.Next()(s)
 			if ok {
 				return stmt, ok
 			}
@@ -66,7 +59,7 @@ func makeAlter(s *Smither) (tree.Statement, bool) {
 }
 
 func makeCreateTable(s *Smither) (tree.Statement, bool) {
-	table := sqlbase.RandCreateTable(s.rnd, 0)
+	table := sqlbase.RandCreateTable(s.rnd, "", 0)
 	table.Table = tree.MakeUnqualifiedTableName(s.name("tab"))
 	return table, true
 }
@@ -169,6 +162,44 @@ func makeAddColumn(s *Smither) (tree.Statement, bool) {
 	}, true
 }
 
+func makeJSONComputedColumn(s *Smither) (tree.Statement, bool) {
+	_, _, tableRef, colRefs, ok := s.getSchemaTable()
+	if !ok {
+		return nil, false
+	}
+	colRefs.stripTableName()
+	// Shuffle columns and find the first one that's JSON.
+	s.rnd.Shuffle(len(colRefs), func(i, j int) {
+		colRefs[i], colRefs[j] = colRefs[j], colRefs[i]
+	})
+	var ref *colRef
+	for _, c := range colRefs {
+		if c.typ.Family() == types.JsonFamily {
+			ref = c
+			break
+		}
+	}
+	// If we didn't find any JSON columns, return.
+	if ref == nil {
+		return nil, false
+	}
+	col, err := tree.NewColumnTableDef(s.name("col"), types.Jsonb, false /* isSerial */, nil)
+	if err != nil {
+		return nil, false
+	}
+	col.Computed.Computed = true
+	col.Computed.Expr = tree.NewTypedBinaryExpr(tree.JSONFetchText, ref.typedExpr(), sqlbase.RandDatumSimple(s.rnd, types.String), types.String)
+
+	return &tree.AlterTable{
+		Table: tableRef.TableName.ToUnresolvedObjectName(),
+		Cmds: tree.AlterTableCmds{
+			&tree.AlterTableAddColumn{
+				ColumnDef: col,
+			},
+		},
+	}, true
+}
+
 func makeDropColumn(s *Smither) (tree.Statement, bool) {
 	_, _, tableRef, _, ok := s.getSchemaTable()
 	if !ok {
@@ -187,6 +218,40 @@ func makeDropColumn(s *Smither) (tree.Statement, bool) {
 	}, true
 }
 
+func makeAlterPrimaryKey(s *Smither) (tree.Statement, bool) {
+	_, _, tableRef, _, ok := s.getSchemaTable()
+	if !ok {
+		return nil, false
+	}
+	// Collect all columns that are NOT NULL to be candidate new primary keys.
+	var candidateColumns tree.IndexElemList
+	for _, c := range tableRef.Columns {
+		if c.Nullable.Nullability == tree.NotNull {
+			candidateColumns = append(candidateColumns, tree.IndexElem{Column: c.Name})
+		}
+	}
+	if len(candidateColumns) == 0 {
+		return nil, false
+	}
+	s.rnd.Shuffle(len(candidateColumns), func(i, j int) {
+		candidateColumns[i], candidateColumns[j] = candidateColumns[j], candidateColumns[i]
+	})
+	// Pick some randomly short prefix of the candidate columns as a potential new primary key.
+	i := 1
+	for len(candidateColumns) > i && s.rnd.Intn(2) == 0 {
+		i++
+	}
+	candidateColumns = candidateColumns[:i]
+	return &tree.AlterTable{
+		Table: tableRef.TableName.ToUnresolvedObjectName(),
+		Cmds: tree.AlterTableCmds{
+			&tree.AlterTableAlterPrimaryKey{
+				Columns: candidateColumns,
+			},
+		},
+	}, true
+}
+
 func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 	_, _, tableRef, _, ok := s.getSchemaTable()
 	if !ok {
@@ -194,19 +259,32 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 	}
 	var cols tree.IndexElemList
 	seen := map[tree.Name]bool{}
+	inverted := false
+	unique := s.coin()
 	for len(cols) < 1 || s.coin() {
 		col := tableRef.Columns[s.rnd.Intn(len(tableRef.Columns))]
 		if seen[col.Name] {
 			continue
 		}
 		seen[col.Name] = true
-		cols = append(cols, tree.IndexElem{
-			Column:    col.Name,
-			Direction: s.randDirection(),
-		})
+		// If this is the first column and it's invertable (i.e., JSONB), make an inverted index.
+		if len(cols) == 0 && sqlbase.ColumnTypeIsInvertedIndexable(col.Type) {
+			inverted = true
+			unique = false
+			cols = append(cols, tree.IndexElem{
+				Column: col.Name,
+			})
+			break
+		}
+		if sqlbase.ColumnTypeIsIndexable(col.Type) {
+			cols = append(cols, tree.IndexElem{
+				Column:    col.Name,
+				Direction: s.randDirection(),
+			})
+		}
 	}
 	var storing tree.NameList
-	for s.coin() {
+	for !inverted && s.coin() {
 		col := tableRef.Columns[s.rnd.Intn(len(tableRef.Columns))]
 		if seen[col.Name] {
 			continue
@@ -216,11 +294,12 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 	}
 
 	return &tree.CreateIndex{
-		Name:    s.name("idx"),
-		Table:   *tableRef.TableName,
-		Unique:  s.coin(),
-		Columns: cols,
-		Storing: storing,
+		Name:     s.name("idx"),
+		Table:    *tableRef.TableName,
+		Unique:   unique,
+		Columns:  cols,
+		Storing:  storing,
+		Inverted: inverted,
 	}, true
 }
 

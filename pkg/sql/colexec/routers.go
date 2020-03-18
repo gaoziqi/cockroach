@@ -17,10 +17,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
+	"github.com/marusama/semaphore"
 )
 
 // routerOutput is an interface implemented by router outputs. It exists for
@@ -30,22 +35,25 @@ type routerOutput interface {
 	// addBatch adds the elements specified by the selection vector from batch to
 	// the output. It returns whether or not the output changed its state to
 	// blocked (see implementations).
-	addBatch(coldata.Batch, []uint16) bool
+	addBatch(context.Context, coldata.Batch, []int) bool
 	// cancel tells the output to stop producing batches.
-	cancel()
+	cancel(ctx context.Context)
 }
 
-// defaultRouterOutputBlockedThreshold is the number of unread values buffered
-// by the routerOutputOp after which the output is considered blocked.
-var defaultRouterOutputBlockedThreshold = int(coldata.BatchSize() * 2)
+// getDefaultRouterOutputBlockedThreshold returns the number of unread values
+// buffered by the routerOutputOp after which the output is considered blocked.
+// It is a function rather than a variable so that in tests we could modify
+// coldata.BatchSize() (if it were a variable, then its value would be
+// evaluated before we set the desired batch size).
+func getDefaultRouterOutputBlockedThreshold() int {
+	return coldata.BatchSize() * 2
+}
 
 type routerOutputOp struct {
 	// input is a reference to our router.
 	input execinfra.OpNode
 
 	types []coltypes.T
-	// zeroBatch is used to return a 0 length batch in some cases.
-	zeroBatch coldata.Batch
 
 	// unblockedEventsChan is signaled when a routerOutput changes state from
 	// blocked to unblocked.
@@ -53,12 +61,53 @@ type routerOutputOp struct {
 
 	mu struct {
 		syncutil.Mutex
-		cond *sync.Cond
-		done bool
-		// TODO(asubiotto): Use a ring buffer once we have disk spilling.
-		data      []coldata.Batch
+		// unlimitedAllocator tracks the memory usage of this router output,
+		// providing a signal for when it should spill to disk.
+		// The memory lifecycle is as follows:
+		//
+		// o.mu.pendingBatch is allocated as a "staging" area. Tuples are copied
+		// into it in addBatch.
+		// A read may come in in this state, in which case pendingBatch is returned
+		// and references to it are removed. Since batches are unsafe for reuse,
+		// the batch is also manually released from the allocator.
+		// If a read does not come in and the batch becomes full of tuples, that
+		// batch is stored in o.mu.data, which is a queue with an in-memory circular
+		// buffer backed by disk. If the batch fits in memory, a reference to it
+		// is retained and a new pendingBatch is allocated.
+		//
+		// If a read comes in at this point, the batch is dequeued from o.mu.data
+		// and returned, but the memory is still accounted for. In fact, memory use
+		// increases up to when o.mu.data is full and must spill to disk.
+		// Once it spills to disk, the spillingQueue (o.mu.data), will release
+		// batches it spills to disk to stop accounting for them.
+		// The tricky part comes when o.mu.data is dequeued from. In this case, the
+		// reference for a previously-returned batch is overwritten with an on-disk
+		// batch, so the memory for the overwritten batch is released, while the
+		// new batch's memory is retained. Note that if batches are being dequeued
+		// from disk, it must be the case that the circular buffer is now empty,
+		// holding references to batches that have been previously returned.
+		//
+		// In short, batches whose references are retained are also retained in the
+		// allocator, but if any references are overwritten or lost, those batches
+		// are released.
+		unlimitedAllocator *Allocator
+		cond               *sync.Cond
+		done               bool
+		// pendingBatch is a partially-filled batch with data added through
+		// addBatch. Once this batch reaches capacity, it is flushed to data. The
+		// main use of pendingBatch is coalescing various fragmented batches into
+		// one.
+		pendingBatch coldata.Batch
+		// data is a spillingQueue, a circular buffer backed by a disk queue.
+		data      *spillingQueue
 		numUnread int
 		blocked   bool
+	}
+
+	testingKnobs struct {
+		// alwaysFlush, if set to true, will always flush o.mu.pendingBatch to
+		// o.mu.data.
+		alwaysFlush bool
 	}
 
 	// These fields default to defaultRouterOutputBlockedThreshold and
@@ -69,11 +118,11 @@ type routerOutputOp struct {
 	outputBatchSize  int
 }
 
-func (o *routerOutputOp) ChildCount() int {
+func (o *routerOutputOp) ChildCount(verbose bool) int {
 	return 1
 }
 
-func (o *routerOutputOp) Child(nth int) execinfra.OpNode {
+func (o *routerOutputOp) Child(nth int, verbose bool) execinfra.OpNode {
 	if nth == 0 {
 		return o.input
 	}
@@ -86,29 +135,42 @@ var _ Operator = &routerOutputOp{}
 
 // newRouterOutputOp creates a new router output. The caller must ensure that
 // unblockedEventsChan is a buffered channel, as the router output will write to
-// it.
-func newRouterOutputOp(types []coltypes.T, unblockedEventsChan chan<- struct{}) *routerOutputOp {
-	return newRouterOutputOpWithBlockedThresholdAndBatchSize(
-		types, unblockedEventsChan, defaultRouterOutputBlockedThreshold, int(coldata.BatchSize()),
-	)
+// it. The provided allocator must not have a hard limit. The passed in
+// memoryLimit will act as a soft limit to allow the router output to use disk
+// when it is exceeded.
+func newRouterOutputOp(
+	unlimitedAllocator *Allocator,
+	types []coltypes.T,
+	unblockedEventsChan chan<- struct{},
+	memoryLimit int64,
+	cfg colcontainer.DiskQueueCfg,
+	fdSemaphore semaphore.Semaphore,
+	diskAcc *mon.BoundAccount,
+) *routerOutputOp {
+	return newRouterOutputOpWithBlockedThresholdAndBatchSize(unlimitedAllocator, types, unblockedEventsChan, memoryLimit, cfg, fdSemaphore, getDefaultRouterOutputBlockedThreshold(), coldata.BatchSize(), diskAcc)
 }
 
 func newRouterOutputOpWithBlockedThresholdAndBatchSize(
+	unlimitedAllocator *Allocator,
 	types []coltypes.T,
 	unblockedEventsChan chan<- struct{},
+	memoryLimit int64,
+	cfg colcontainer.DiskQueueCfg,
+	fdSemaphore semaphore.Semaphore,
 	blockedThreshold int,
 	outputBatchSize int,
+	diskAcc *mon.BoundAccount,
 ) *routerOutputOp {
 	o := &routerOutputOp{
 		types:               types,
-		zeroBatch:           coldata.NewMemBatchWithSize(types, 0 /* size */),
 		unblockedEventsChan: unblockedEventsChan,
 		blockedThreshold:    blockedThreshold,
 		outputBatchSize:     outputBatchSize,
 	}
-	o.zeroBatch.SetLength(0)
+	o.mu.unlimitedAllocator = unlimitedAllocator
 	o.mu.cond = sync.NewCond(&o.mu)
-	o.mu.data = make([]coldata.Batch, 0, o.blockedThreshold/o.outputBatchSize)
+	o.mu.data = newSpillingQueue(unlimitedAllocator, types, memoryLimit, cfg, fdSemaphore, outputBatchSize, diskAcc)
+
 	return o
 }
 
@@ -117,41 +179,63 @@ func (o *routerOutputOp) Init() {}
 // Next returns the next coldata.Batch from the routerOutputOp. Note that Next
 // is designed for only one concurrent caller and will block until data is
 // ready.
-func (o *routerOutputOp) Next(context.Context) coldata.Batch {
+func (o *routerOutputOp) Next(ctx context.Context) coldata.Batch {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.mu.done {
-		return o.zeroBatch
+		return coldata.ZeroBatch
 	}
-	for len(o.mu.data) == 0 && !o.mu.done {
+	for o.mu.pendingBatch == nil && o.mu.data.empty() && !o.mu.done {
+		// Wait until there is data to read or the output is canceled.
 		o.mu.cond.Wait()
 	}
 	if o.mu.done {
-		return o.zeroBatch
+		return coldata.ZeroBatch
 	}
-	// Get the first batch and advance the start of the buffer.
-	b := o.mu.data[0]
-	o.mu.data = o.mu.data[1:]
-	o.mu.numUnread -= int(b.Length())
+	var b coldata.Batch
+	if o.mu.pendingBatch != nil && o.mu.data.empty() {
+		// o.mu.data is empty (i.e. nothing has been flushed to the spillingQueue),
+		// but there is a o.mu.pendingBatch that has not been flushed yet. Return
+		// this batch directly.
+		b = o.mu.pendingBatch
+		o.mu.unlimitedAllocator.ReleaseBatch(b)
+		o.mu.pendingBatch = nil
+	} else {
+		var err error
+		b, err = o.mu.data.dequeue(ctx)
+		if err != nil {
+			execerror.VectorizedInternalPanic(err)
+		}
+	}
+	o.mu.numUnread -= b.Length()
 	if o.mu.numUnread <= o.blockedThreshold {
 		o.maybeUnblockLocked()
 	}
 	if b.Length() == 0 {
-		// This is the last batch. Set done to protect against further calls to
-		// Next since this is allowed by the interface.
-		o.mu.done = true
+		// This is the last batch. closeLocked will set done to protect against
+		// further calls to Next since this is allowed by the interface as well as
+		// cleaning up and releasing possible disk infrastructure.
+		o.closeLocked(ctx)
 	}
 	return b
+}
+
+func (o *routerOutputOp) closeLocked(ctx context.Context) {
+	o.mu.done = true
+	if err := o.mu.data.close(ctx); err != nil {
+		// This log message is Info instead of Warning because the flow will also
+		// attempt to clean up the parent directory, so this failure might not have
+		// any effect.
+		log.Infof(ctx, "error closing vectorized hash router output, files may be left over: %s", err)
+	}
 }
 
 // cancel wakes up a reader in Next if there is one and results in the output
 // returning zero length batches for every Next call after cancel. Note that
 // all accumulated data that hasn't been read will not be returned.
-func (o *routerOutputOp) cancel() {
+func (o *routerOutputOp) cancel(ctx context.Context) {
 	o.mu.Lock()
-	o.mu.done = true
-	// Release o.mu.data to GC.
-	o.mu.data = nil
+	o.closeLocked(ctx)
 	// Some goroutine might be waiting on the condition variable, so wake it up.
 	// Note that read goroutines check o.mu.done, so won't wait on the condition
 	// variable after we unlock the mutex.
@@ -167,15 +251,24 @@ func (o *routerOutputOp) cancel() {
 // same batch with different selection vectors to many different outputs.
 // True is returned if the the output changes state to blocked (note: if the
 // output is already blocked, false is returned).
-func (o *routerOutputOp) addBatch(batch coldata.Batch, selection []uint16) bool {
-	if len(selection) > int(batch.Length()) {
+// TODO(asubiotto): We should explore pipelining addBatch if disk-spilling
+//  performance becomes a concern. The main router goroutine will be writing to
+//  disk as the code is written, meaning that we impact the performance of
+//  writing rows to a fast output if we have to write to disk for a single
+//  slow output.
+func (o *routerOutputOp) addBatch(ctx context.Context, batch coldata.Batch, selection []int) bool {
+	if len(selection) > batch.Length() {
 		selection = selection[:batch.Length()]
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if batch.Length() == 0 {
-		// End of data. o.mu.done will be set in Next.
-		o.mu.data = append(o.mu.data, o.zeroBatch)
+		if o.mu.pendingBatch != nil {
+			if err := o.mu.data.enqueue(ctx, o.mu.pendingBatch); err != nil {
+				execerror.VectorizedInternalPanic(err)
+			}
+		}
+		o.mu.pendingBatch = coldata.ZeroBatch
 		o.mu.cond.Signal()
 		return false
 	}
@@ -185,52 +278,45 @@ func (o *routerOutputOp) addBatch(batch coldata.Batch, selection []uint16) bool 
 		return false
 	}
 
-	writeIdx := 0
-	if len(o.mu.data) == 0 {
-		// New output batch.
-		o.mu.data = append(o.mu.data, coldata.NewMemBatchWithSize(o.types, o.outputBatchSize))
-	} else {
-		if int(o.mu.data[len(o.mu.data)-1].Length()) == o.outputBatchSize {
-			// No space in last batch, append new output batch.
-			o.mu.data = append(o.mu.data, coldata.NewMemBatchWithSize(o.types, o.outputBatchSize))
-		}
-		writeIdx = len(o.mu.data) - 1
-	}
-
 	// Increment o.mu.numUnread before going into the loop, as we will consume
 	// selection.
 	o.mu.numUnread += len(selection)
 
-	// Append the batch to o.mu.data. The batch at writeIdx is at most
-	// o.outputBatchSize-1, so if all of the elements cannot be accommodated at
-	// that index, spill over to the following batch.
-	for toAppend := uint16(len(selection)); toAppend > 0; writeIdx++ {
-		dst := o.mu.data[writeIdx]
-
-		available := uint16(o.outputBatchSize) - dst.Length()
+	for toAppend := len(selection); toAppend > 0; {
+		if o.mu.pendingBatch == nil {
+			o.mu.pendingBatch = o.mu.unlimitedAllocator.NewMemBatchWithSize(o.types, o.outputBatchSize)
+		}
+		available := o.outputBatchSize - o.mu.pendingBatch.Length()
 		numAppended := toAppend
 		if toAppend > available {
 			numAppended = available
-			// Need to create a new batch to append to in the next o.mu.data slot.
-			// This will be used in the next iteration.
-			o.mu.data = append(o.mu.data, coldata.NewMemBatchWithSize(o.types, o.outputBatchSize))
 		}
-
-		for i, t := range o.types {
-			dst.ColVec(i).Append(
-				coldata.SliceArgs{
-					ColType:   t,
-					Src:       batch.ColVec(i),
-					Sel:       selection,
-					DestIdx:   uint64(dst.Length()),
-					SrcEndIdx: uint64(len(selection)),
-				},
-			)
+		o.mu.unlimitedAllocator.PerformOperation(o.mu.pendingBatch.ColVecs(), func() {
+			for i, t := range o.types {
+				o.mu.pendingBatch.ColVec(i).Copy(
+					coldata.CopySliceArgs{
+						SliceArgs: coldata.SliceArgs{
+							ColType:   t,
+							Src:       batch.ColVec(i),
+							Sel:       selection[:numAppended],
+							DestIdx:   o.mu.pendingBatch.Length(),
+							SrcEndIdx: numAppended,
+						},
+					},
+				)
+			}
+		})
+		newLength := o.mu.pendingBatch.Length() + numAppended
+		o.mu.pendingBatch.SetLength(newLength)
+		if o.testingKnobs.alwaysFlush || newLength >= o.outputBatchSize {
+			// The capacity in o.mu.pendingBatch has been filled.
+			if err := o.mu.data.enqueue(ctx, o.mu.pendingBatch); err != nil {
+				execerror.VectorizedInternalPanic(err)
+			}
+			o.mu.pendingBatch = nil
 		}
-
-		selection = selection[numAppended:]
-		dst.SetLength(dst.Length() + numAppended)
 		toAppend -= numAppended
+		selection = selection[numAppended:]
 	}
 
 	stateChanged := false
@@ -254,10 +340,10 @@ func (o *routerOutputOp) maybeUnblockLocked() {
 }
 
 // reset resets the routerOutputOp for a benchmark run.
-func (o *routerOutputOp) reset() {
+func (o *routerOutputOp) reset(ctx context.Context) {
 	o.mu.Lock()
 	o.mu.done = false
-	o.mu.data = o.mu.data[:0]
+	o.mu.data.reset(ctx)
 	o.mu.numUnread = 0
 	o.mu.blocked = false
 	o.mu.Unlock()
@@ -270,11 +356,8 @@ type HashRouter struct {
 	OneInputNode
 	// types are the input coltypes.
 	types []coltypes.T
-	// ht is not fully initialized to a hashTable, only the utility methods are
-	// used.
-	ht hashTable
 	// hashCols is a slice of indices of the columns used for hashing.
-	hashCols []int
+	hashCols []uint32
 
 	// One output for each stream.
 	outputs []routerOutput
@@ -290,23 +373,35 @@ type HashRouter struct {
 		bufferedMeta []execinfrapb.ProducerMetadata
 	}
 
-	scratch struct {
-		// buckets is scratch space for the computed hash value of a group of columns
-		// with the same index in the current coldata.Batch.
-		buckets []uint64
-		// selections is scratch space for selection vectors used by router outputs.
-		selections [][]uint16
-	}
+	// tupleDistributor is used to decide to which output a particular tuple
+	// should be routed.
+	tupleDistributor *tupleHashDistributor
 }
 
 // NewHashRouter creates a new hash router that consumes coldata.Batches from
-// input and hashes each row according to hashCols to one of numOutputs outputs.
-// These outputs are exposed as Operators.
+// input and hashes each row according to hashCols to one of the outputs
+// returned as Operators.
+// The number of allocators provided will determine the number of outputs
+// returned. Note that each allocator must be unlimited, memory will be limited
+// by comparing memory use in the allocator with the memoryLimit argument. Each
+// Operator must have an independent allocator (this means that each allocator
+// should be linked to an independent mem account) as Operator.Next will usually
+// be called concurrently between different outputs.
 func NewHashRouter(
-	input Operator, types []coltypes.T, hashCols []int, numOutputs int,
+	unlimitedAllocators []*Allocator,
+	input Operator,
+	types []coltypes.T,
+	hashCols []uint32,
+	memoryLimit int64,
+	diskQueueCfg colcontainer.DiskQueueCfg,
+	fdSemaphore semaphore.Semaphore,
+	diskAcc *mon.BoundAccount,
 ) (*HashRouter, []Operator) {
-	outputs := make([]routerOutput, numOutputs)
-	outputsAsOps := make([]Operator, numOutputs)
+	if diskQueueCfg.CacheMode != colcontainer.DiskQueueCacheModeDefault {
+		execerror.VectorizedInternalPanic(errors.Errorf("hash router instantiated with incompatible disk queue cache mode: %d", diskQueueCfg.CacheMode))
+	}
+	outputs := make([]routerOutput, len(unlimitedAllocators))
+	outputsAsOps := make([]Operator, len(unlimitedAllocators))
 	// unblockEventsChan is buffered to 2*numOutputs as we don't want the outputs
 	// writing to it to block.
 	// Unblock events only happen after a corresponding block event. Since these
@@ -314,9 +409,10 @@ func NewHashRouter(
 	// on the channel, which is why we want the channel to be buffered in the
 	// first place), every time the HashRouter blocks an output, it *must* read
 	// all unblock events preceding it since these *must* be on the channel.
-	unblockEventsChan := make(chan struct{}, 2*numOutputs)
-	for i := 0; i < numOutputs; i++ {
-		op := newRouterOutputOp(types, unblockEventsChan)
+	unblockEventsChan := make(chan struct{}, 2*len(unlimitedAllocators))
+	memoryLimitPerOutput := memoryLimit / int64(len(unlimitedAllocators))
+	for i := range unlimitedAllocators {
+		op := newRouterOutputOp(unlimitedAllocators[i], types, unblockEventsChan, memoryLimitPerOutput, diskQueueCfg, fdSemaphore, diskAcc)
 		outputs[i] = op
 		outputsAsOps[i] = op
 	}
@@ -330,7 +426,7 @@ func NewHashRouter(
 func newHashRouterWithOutputs(
 	input Operator,
 	types []coltypes.T,
-	hashCols []int,
+	hashCols []uint32,
 	unblockEventsChan <-chan struct{},
 	outputs []routerOutput,
 ) *HashRouter {
@@ -340,11 +436,7 @@ func newHashRouterWithOutputs(
 		hashCols:            hashCols,
 		outputs:             outputs,
 		unblockedEventsChan: unblockEventsChan,
-	}
-	r.scratch.buckets = make([]uint64, coldata.BatchSize())
-	r.scratch.selections = make([][]uint16, len(outputs))
-	for i := range r.scratch.selections {
-		r.scratch.selections[i] = make([]uint16, 0, coldata.BatchSize())
+		tupleDistributor:    newTupleHashDistributor(defaultInitHashValue, len(outputs)),
 	}
 	return r
 }
@@ -361,7 +453,7 @@ func (r *HashRouter) Run(ctx context.Context) {
 			r.mu.Unlock()
 		}
 		for _, o := range r.outputs {
-			o.cancel()
+			o.cancel(ctx)
 		}
 	}
 	var done bool
@@ -416,45 +508,20 @@ func (r *HashRouter) Run(ctx context.Context) {
 // each column to its corresponding output, returning whether the input is
 // done.
 func (r *HashRouter) processNextBatch(ctx context.Context) bool {
-	r.ht.initHash(r.scratch.buckets, uint64(len(r.scratch.buckets)))
 	b := r.input.Next(ctx)
-	if b.Length() == 0 {
+	n := b.Length()
+	if n == 0 {
 		// Done. Push an empty batch to outputs to tell them the data is done as
 		// well.
 		for _, o := range r.outputs {
-			o.addBatch(b, nil)
+			o.addBatch(ctx, b, nil)
 		}
 		return true
 	}
 
-	for _, i := range r.hashCols {
-		r.ht.rehash(ctx, r.scratch.buckets, i, r.types[i], b.ColVec(i), uint64(b.Length()), b.Selection())
-	}
-
-	// Reset selections.
-	for i := 0; i < len(r.outputs); i++ {
-		r.scratch.selections[i] = r.scratch.selections[i][:0]
-	}
-
-	// finalizeHash has an assumption that bucketSize is a power of 2, so
-	// finalize the hash in our own way. While doing this, we will build a
-	// selection vector for each output.
-	selection := b.Selection()
-	if selection != nil {
-		selection = selection[:b.Length()]
-		for i, selIdx := range selection {
-			outputIdx := r.scratch.buckets[i] % uint64(len(r.outputs))
-			r.scratch.selections[outputIdx] = append(r.scratch.selections[outputIdx], selIdx)
-		}
-	} else {
-		for i, hash := range r.scratch.buckets[:b.Length()] {
-			outputIdx := hash % uint64(len(r.outputs))
-			r.scratch.selections[outputIdx] = append(r.scratch.selections[outputIdx], uint16(i))
-		}
-	}
-
+	selections := r.tupleDistributor.distribute(ctx, b, r.types, r.hashCols)
 	for i, o := range r.outputs {
-		if o.addBatch(b, r.scratch.selections[i]) {
+		if o.addBatch(ctx, b, selections[i]) {
 			// This batch blocked the output.
 			r.numBlockedOutputs++
 		}
@@ -463,9 +530,9 @@ func (r *HashRouter) processNextBatch(ctx context.Context) bool {
 }
 
 // reset resets the HashRouter for a benchmark run.
-func (r *HashRouter) reset() {
+func (r *HashRouter) reset(ctx context.Context) {
 	if i, ok := r.input.(resetter); ok {
-		i.reset()
+		i.reset(ctx)
 	}
 	r.numBlockedOutputs = 0
 	for moreToRead := true; moreToRead; {
@@ -476,7 +543,7 @@ func (r *HashRouter) reset() {
 		}
 	}
 	for _, o := range r.outputs {
-		o.(resetter).reset()
+		o.(resetter).reset(ctx)
 	}
 }
 

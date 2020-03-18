@@ -17,12 +17,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/sampledataccl"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -54,10 +54,8 @@ func BenchmarkAddSSTable(b *testing.B) {
 			b.StopTimer()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				sst, err := engine.MakeRocksDBSstFileWriter()
-				if err != nil {
-					b.Fatalf("%+v", err)
-				}
+				sstFile := &storage.MemFile{}
+				sst := storage.MakeBackupSSTWriter(sstFile)
 
 				id++
 				backup.ResetKeyValueIteration()
@@ -70,15 +68,17 @@ func BenchmarkAddSSTable(b *testing.B) {
 						b.Fatalf("%+v", err)
 					}
 				}
-				data, err := sst.Finish()
-				if err != nil {
+				if err := sst.Finish(); err != nil {
 					b.Fatalf("%+v", err)
 				}
 				sst.Close()
+				data := sstFile.Data()
 				totalLen += int64(len(data))
 
 				b.StartTimer()
-				if err := kvDB.AddSSTable(ctx, span.Key, span.EndKey, data, false /* disallowShadowing */, nil /* stats */); err != nil {
+				if err := kvDB.AddSSTable(
+					ctx, span.Key, span.EndKey, data, false /* disallowShadowing */, nil /* stats */, false, /* ingestAsWrites */
+				); err != nil {
 					b.Fatalf("%+v", err)
 				}
 				b.StopTimer()
@@ -107,7 +107,7 @@ func BenchmarkWriteBatch(b *testing.B) {
 			kvDB := tc.Server(0).DB()
 
 			id := sqlbase.ID(keys.MinUserDescID)
-			var batch engine.RocksDBBatchBuilder
+			var batch storage.RocksDBBatchBuilder
 
 			var totalLen int64
 			b.StopTimer()
@@ -152,7 +152,7 @@ func BenchmarkImport(b *testing.B) {
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
-			storage, err := cloud.ExternalStorageConfFromURI(`nodelocal:///` + subdir)
+			storage, err := cloud.ExternalStorageConfFromURI(`nodelocal://0/` + subdir)
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
@@ -205,7 +205,7 @@ func BenchmarkImport(b *testing.B) {
 					Files:         files,
 					Rekeys:        rekeys,
 				}
-				res, pErr := client.SendWrapped(ctx, kvDB.NonTransactionalSender(), req)
+				res, pErr := kv.SendWrapped(ctx, kvDB.NonTransactionalSender(), req)
 				if pErr != nil {
 					b.Fatalf("%+v", pErr.GoError())
 				}

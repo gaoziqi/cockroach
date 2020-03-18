@@ -13,7 +13,7 @@ package row
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/errors"
@@ -43,7 +43,8 @@ type fkExistenceCheckForInsert struct {
 
 // makeFkExistenceCheckHelperForInsert instantiates an insert helper.
 func makeFkExistenceCheckHelperForInsert(
-	txn *client.Txn,
+	ctx context.Context,
+	txn *kv.Txn,
 	table *sqlbase.ImmutableTableDescriptor,
 	otherTables FkTableMetadata,
 	colMap map[sqlbase.ColumnID]int,
@@ -64,15 +65,15 @@ func makeFkExistenceCheckHelperForInsert(
 			return h, errors.AssertionFailedf("referenced table %d not in provided table map %+v", ref.ReferencedTableID,
 				otherTables)
 		}
-		searchIdx, err := searchTable.TableDesc().FindIndexByID(ref.LegacyReferencedIndex)
+		searchIdx, err := sqlbase.FindFKReferencedIndex(searchTable.TableDesc(), ref.ReferencedColumnIDs)
 		if err != nil {
 			return h, errors.NewAssertionErrorWithWrappedErrf(err,
-				"failed to find search index %d for fk %q", ref.LegacyReferencedIndex, ref.Name)
+				"failed to find suitable search index for fk %q", ref.Name)
 		}
-		mutatedIdx, err := table.TableDesc().FindIndexByID(ref.LegacyOriginIndex)
+		mutatedIdx, err := sqlbase.FindFKOriginIndex(table.TableDesc(), ref.OriginColumnIDs)
 		if err != nil {
 			return h, errors.NewAssertionErrorWithWrappedErrf(err,
-				"failed to find search index %d for fk %q", ref.LegacyOriginIndex, ref.Name)
+				"failed to find suitable search index for fk %q", ref.Name)
 		}
 		fk, err := makeFkExistenceCheckBaseHelper(txn, otherTables, ref, searchIdx, mutatedIdx, colMap, alloc, CheckInserts)
 		if err == errSkipUnusedFK {
@@ -85,6 +86,26 @@ func makeFkExistenceCheckHelperForInsert(
 			h.fks = make(map[sqlbase.IndexID][]fkExistenceCheckBaseHelper)
 		}
 		h.fks[mutatedIdx.ID] = append(h.fks[mutatedIdx.ID], fk)
+	}
+
+	if len(h.fks) > 0 {
+		// TODO(knz,radu): FK existence checks need to see the writes
+		// performed by the mutation.
+		//
+		// In order to make this true, we need to split the existence
+		// checks into a separate sequencing step, and have the first
+		// check happen no early than the end of all the "main" part of
+		// the statement. Unfortunately, the organization of the code does
+		// not allow this today.
+		//
+		// See: https://github.com/cockroachdb/cockroach/issues/33475
+		//
+		// In order to "make do" and preserve a modicum of FK semantics we
+		// thus need to disable step-wise execution here. The result is that
+		// it will also enable any interleaved read part to observe the
+		// mutation, and thus introduce the risk of a Halloween problem for
+		// any mutation that uses FK relationships.
+		_ = txn.ConfigureStepping(ctx, kv.SteppingDisabled)
 	}
 
 	return h, nil

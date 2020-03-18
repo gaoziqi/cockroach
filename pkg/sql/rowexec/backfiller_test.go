@@ -15,9 +15,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
@@ -38,11 +38,8 @@ func TestWriteResumeSpan(t *testing.T) {
 		Knobs: base.TestingKnobs{
 			// Disable all schema change execution.
 			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-				SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
-					tscc.ClearSchemaChangers()
-				},
-				AsyncExecNotification: func() error {
-					return errors.New("async schema changer disabled")
+				SchemaChangeJobNoOp: func() bool {
+					return true
 				},
 			},
 			// Disable backfill migrations, we still need the jobs table migration.
@@ -174,7 +171,7 @@ func TestWriteResumeSpan(t *testing.T) {
 	}
 
 	var got []roachpb.Span
-	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		var err error
 		got, _, _, err = rowexec.GetResumeSpans(
 			ctx, registry, txn, tableDesc.ID, mutationID, backfill.IndexMutationFilter)

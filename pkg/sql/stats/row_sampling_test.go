@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -29,7 +30,7 @@ import (
 func runSampleTest(t *testing.T, evalCtx *tree.EvalContext, numSamples int, ranks []int) {
 	ctx := context.Background()
 	var sr SampleReservoir
-	sr.Init(numSamples, []types.T{*types.Int}, nil /* memAcc */)
+	sr.Init(numSamples, []types.T{*types.Int}, nil /* memAcc */, util.MakeFastIntSet(0))
 	for _, r := range ranks {
 		d := sqlbase.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(r)))
 		if err := sr.SampleRow(ctx, evalCtx, sqlbase.EncDatumRow{d}, uint64(r)); err != nil {
@@ -107,9 +108,15 @@ func TestTruncateDatum(t *testing.T) {
 	expected3 := tree.DString("Hello 世")
 	runTest(&original3, &expected3)
 
-	original4 := tree.NewDCollatedString(`IT was lovely summer weather in the country, and the golden
+	original4, err := tree.NewDCollatedString(`IT was lovely summer weather in the country, and the golden
 corn, the green oats, and the haystacks piled up in the meadows looked beautiful`,
 		"en_US", &tree.CollationEnvironment{})
-	expected4 := tree.NewDCollatedString("IT was lov", "en_US", &tree.CollationEnvironment{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected4, err := tree.NewDCollatedString("IT was lov", "en_US", &tree.CollationEnvironment{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	runTest(original4, expected4)
 }

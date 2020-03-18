@@ -29,7 +29,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -38,7 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -54,12 +57,25 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func getStatusJSONProto(
 	ts serverutils.TestServerInterface, path string, response protoutil.Message,
 ) error {
 	return serverutils.GetJSONProto(ts, statusPrefix+path, response)
+}
+
+func postStatusJSONProto(
+	ts serverutils.TestServerInterface, path string, request, response protoutil.Message,
+) error {
+	return serverutils.PostJSONProto(ts, statusPrefix+path, request, response)
+}
+
+func getStatusJSONProtoWithAdminOption(
+	ts serverutils.TestServerInterface, path string, response protoutil.Message, isAdmin bool,
+) error {
+	return serverutils.GetJSONProtoWithAdminOption(ts, statusPrefix+path, response, isAdmin)
 }
 
 // TestStatusLocalStacks verifies that goroutine stack traces are available
@@ -114,7 +130,6 @@ func TestStatusJson(t *testing.T) {
 	})
 
 	for _, path := range []string{
-		"/health",
 		statusPrefix + "details/local",
 		statusPrefix + "details/" + strconv.FormatUint(uint64(nodeID), 10),
 	} {
@@ -262,6 +277,11 @@ func TestStatusEngineStatsJson(t *testing.T) {
 		t.Fatal(errors.Errorf("expected one engine stats, got: %v", engineStats))
 	}
 
+	if engineStats.Stats[0].EngineType == enginepb.EngineTypePebble {
+		// Pebble does not have RocksDB style TickersAnd Histogram.
+		return
+	}
+
 	tickers := engineStats.Stats[0].TickersAndHistograms.Tickers
 	if len(tickers) == 0 {
 		t.Fatal(errors.Errorf("expected non-empty tickers list, got: %v", tickers))
@@ -328,7 +348,7 @@ func startServer(t *testing.T) *TestServer {
 func newRPCTestContext(ts *TestServer, cfg *base.Config) *rpc.Context {
 	rpcContext := rpc.NewContext(
 		log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, cfg, ts.Clock(), ts.Stopper(),
-		&ts.ClusterSettings().Version)
+		ts.ClusterSettings())
 	// Ensure that the RPC client context validates the server cluster ID.
 	// This ensures that a test where the server is restarted will not let
 	// its test RPC client talk to a server started by an unrelated concurrent test.
@@ -874,7 +894,7 @@ func TestHotRangesResponse(t *testing.T) {
 
 func TestRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer storage.EnableLeaseHistory(100)()
+	defer kvserver.EnableLeaseHistory(100)()
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.TODO())
 
@@ -984,7 +1004,7 @@ func TestSpanStatsResponse(t *testing.T) {
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.TODO())
 
-	httpClient, err := ts.GetAuthenticatedHTTPClient()
+	httpClient, err := ts.GetAdminAuthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1141,7 +1161,7 @@ func TestDiagnosticsResponse(t *testing.T) {
 
 func TestRangeResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer storage.EnableLeaseHistory(100)()
+	defer kvserver.EnableLeaseHistory(100)()
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.TODO())
 
@@ -1217,8 +1237,7 @@ func TestRemoteDebugModeSetting(t *testing.T) {
 	// Create a split so that there's some records in the system.rangelog table.
 	// The test needs them.
 	if _, err := db.Exec(
-		`set experimental_force_split_at = true;
-		create table t(x int primary key);
+		`create table t(x int primary key);
 		alter table t split at values(1);`,
 	); err != nil {
 		t.Fatal(err)
@@ -1423,33 +1442,50 @@ func TestListSessionsSecurity(t *testing.T) {
 	ts := s.(*TestServer)
 	defer ts.Stopper().Stop(context.TODO())
 
-	// HTTP requests respect the authenticated username from the HTTP session.
-	testCases := []struct {
-		endpoint    string
-		expectedErr string
-	}{
-		{"local_sessions", ""},
-		{"sessions", ""},
-		{fmt.Sprintf("local_sessions?username=%s", authenticatedUserName), ""},
-		{fmt.Sprintf("sessions?username=%s", authenticatedUserName), ""},
-		{"local_sessions?username=root", "does not have permission to view sessions from user"},
-		{"sessions?username=root", "does not have permission to view sessions from user"},
-	}
-	for _, tc := range testCases {
-		var response serverpb.ListSessionsResponse
-		err := getStatusJSONProto(ts, tc.endpoint, &response)
-		if tc.expectedErr == "" {
-			if err != nil || len(response.Errors) > 0 {
-				t.Errorf("unexpected failure listing sessions from %s; error: %v; response errors: %v",
-					tc.endpoint, err, response.Errors)
+	ctx := context.TODO()
+
+	for _, requestWithAdmin := range []bool{true, false} {
+		t.Run(fmt.Sprintf("admin=%v", requestWithAdmin), func(t *testing.T) {
+			myUser := authenticatedUserNameNoAdmin
+			expectedErrOnListingRootSessions := "does not have permission to view sessions from user"
+			if requestWithAdmin {
+				myUser = authenticatedUserName
+				expectedErrOnListingRootSessions = ""
 			}
-		} else {
-			if !testutils.IsError(err, tc.expectedErr) &&
-				!strings.Contains(response.Errors[0].Message, tc.expectedErr) {
-				t.Errorf("did not get expected error %q when listing sessions from %s: %v",
-					tc.expectedErr, tc.endpoint, err)
+
+			// HTTP requests respect the authenticated username from the HTTP session.
+			testCases := []struct {
+				endpoint    string
+				expectedErr string
+			}{
+				{"local_sessions", ""},
+				{"sessions", ""},
+				{fmt.Sprintf("local_sessions?username=%s", myUser), ""},
+				{fmt.Sprintf("sessions?username=%s", myUser), ""},
+				{"local_sessions?username=root", expectedErrOnListingRootSessions},
+				{"sessions?username=root", expectedErrOnListingRootSessions},
 			}
-		}
+			for _, tc := range testCases {
+				var response serverpb.ListSessionsResponse
+				err := getStatusJSONProtoWithAdminOption(ts, tc.endpoint, &response, requestWithAdmin)
+				if tc.expectedErr == "" {
+					if err != nil || len(response.Errors) > 0 {
+						t.Errorf("unexpected failure listing sessions from %s; error: %v; response errors: %v",
+							tc.endpoint, err, response.Errors)
+					}
+				} else {
+					respErr := "<no error>"
+					if len(response.Errors) > 0 {
+						respErr = response.Errors[0].Message
+					}
+					if !testutils.IsError(err, tc.expectedErr) &&
+						!strings.Contains(respErr, tc.expectedErr) {
+						t.Errorf("did not get expected error %q when listing sessions from %s: %v",
+							tc.expectedErr, tc.endpoint, err)
+					}
+				}
+			}
+		})
 	}
 
 	// gRPC requests behave as root and thus are always allowed.
@@ -1462,7 +1498,7 @@ func TestListSessionsSecurity(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := serverpb.NewStatusClient(conn)
-	ctx := context.Background()
+
 	for _, user := range []string{"", authenticatedUserName, "root"} {
 		request := &serverpb.ListSessionsRequest{Username: user}
 		if resp, err := client.ListLocalSessions(ctx, request); err != nil || len(resp.Errors) > 0 {
@@ -1474,4 +1510,135 @@ func TestListSessionsSecurity(t *testing.T) {
 				user, err, resp.Errors)
 		}
 	}
+}
+
+func TestCreateStatementDiagnosticsReport(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	req := &serverpb.CreateStatementDiagnosticsReportRequest{
+		StatementFingerprint: "INSERT INTO test VALUES (_)",
+	}
+	var resp serverpb.CreateStatementDiagnosticsReportResponse
+	if err := postStatusJSONProto(s, "stmtdiagreports", req, &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	var respGet serverpb.StatementDiagnosticsReportsResponse
+	if err := getStatusJSONProto(s, "stmtdiagreports", &respGet); err != nil {
+		t.Fatal(err)
+	}
+
+	if respGet.Reports[0].StatementFingerprint != req.StatementFingerprint {
+		t.Fatal("statement diagnostics request was not persisted")
+	}
+}
+
+func TestStatementDiagnosticsCompleted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	_, err := db.Exec("CREATE TABLE test (x int PRIMARY KEY)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := &serverpb.CreateStatementDiagnosticsReportRequest{
+		StatementFingerprint: "INSERT INTO test VALUES (_)",
+	}
+	var resp serverpb.CreateStatementDiagnosticsReportResponse
+	if err := postStatusJSONProto(s, "stmtdiagreports", req, &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec("INSERT INTO test VALUES (1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var respGet serverpb.StatementDiagnosticsReportsResponse
+	if err := getStatusJSONProto(s, "stmtdiagreports", &respGet); err != nil {
+		t.Fatal(err)
+	}
+
+	if respGet.Reports[0].Completed != true {
+		t.Fatal("statement diagnostics was not captured")
+	}
+
+	var diagRespGet serverpb.StatementDiagnosticsResponse
+	diagPath := fmt.Sprintf("stmtdiag/%d", respGet.Reports[0].StatementDiagnosticsId)
+	if err := getStatusJSONProto(s, diagPath, &diagRespGet); err != nil {
+		t.Fatal(err)
+	}
+
+	json := diagRespGet.Diagnostics.Trace
+	if json == "" ||
+		!strings.Contains(json, "traced statement") ||
+		!strings.Contains(json, "statement execution committed the txn") {
+		t.Fatal("statement diagnostics did not capture a trace")
+	}
+}
+
+func TestJobStatusResponse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ts := startServer(t)
+	defer ts.Stopper().Stop(context.TODO())
+
+	rootConfig := testutils.NewTestBaseContext(security.RootUser)
+	rpcContext := newRPCTestContext(ts, rootConfig)
+
+	url := ts.ServingRPCAddr()
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := serverpb.NewStatusClient(conn)
+
+	request := &serverpb.JobStatusRequest{JobId: -1}
+	response, err := client.JobStatus(context.Background(), request)
+	require.Regexp(t, `job with ID -1 does not exist`, err)
+	require.Nil(t, response)
+
+	ctx := context.Background()
+	job, err := ts.JobRegistry().(*jobs.Registry).CreateJobWithTxn(
+		ctx,
+		jobs.Record{
+			Description: "testing",
+			Statement:   "SELECT 1",
+			Username:    "root",
+			Details: jobspb.ImportDetails{
+				Tables: []jobspb.ImportDetails_Table{
+					{
+						Desc: &sqlbase.TableDescriptor{
+							ID: 1,
+						},
+					},
+					{
+						Desc: &sqlbase.TableDescriptor{
+							ID: 2,
+						},
+					},
+				},
+				URIs: []string{"a", "b"},
+			},
+			Progress:      jobspb.ImportProgress{},
+			DescriptorIDs: []sqlbase.ID{1, 2, 3},
+		},
+		nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.JobId = *job.ID()
+	response, err = client.JobStatus(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, *job.ID(), response.Job.Id)
+	require.Equal(t, job.Payload(), *response.Job.Payload)
+	require.Equal(t, job.Progress(), *response.Job.Progress)
 }

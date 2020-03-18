@@ -19,8 +19,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
+const selectInTmpl = "pkg/sql/colexec/select_in_tmpl.go"
+
 func genSelectIn(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/select_in_tmpl.go")
+	t, err := ioutil.ReadFile(selectInTmpl)
 	if err != nil {
 		return err
 	}
@@ -28,7 +30,7 @@ func genSelectIn(wr io.Writer) error {
 	s := string(t)
 
 	assignEq := makeFunctionRegex("_ASSIGN_EQ", 3)
-	s = assignEq.ReplaceAllString(s, `{{.Assign "$1" "$2" "$3"}}`)
+	s = assignEq.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 3))
 	s = strings.Replace(s, "_GOTYPE", "{{.LGoType}}", -1)
 	s = strings.Replace(s, "_TYPE", "{{.LTyp}}", -1)
 	s = strings.Replace(s, "_TemplateType", "{{.LTyp}}", -1)
@@ -44,5 +46,5 @@ func genSelectIn(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genSelectIn, "select_in.eg.go")
+	registerGenerator(genSelectIn, "select_in.eg.go", selectInTmpl)
 }

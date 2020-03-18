@@ -13,7 +13,8 @@ package rowexec
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
@@ -21,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -87,14 +87,14 @@ func newIndexBackfiller(
 
 func (ib *indexBackfiller) prepare(ctx context.Context) error {
 	minBufferSize := backfillerBufferSize.Get(&ib.flowCtx.Cfg.Settings.SV)
-	maxBufferSize := backfillerMaxBufferSize.Get(&ib.flowCtx.Cfg.Settings.SV)
-	sstSize := backillerSSTSize.Get(&ib.flowCtx.Cfg.Settings.SV)
+	maxBufferSize := func() int64 { return backfillerMaxBufferSize.Get(&ib.flowCtx.Cfg.Settings.SV) }
+	sstSize := func() int64 { return backillerSSTSize.Get(&ib.flowCtx.Cfg.Settings.SV) }
 	stepSize := backfillerBufferIncrementSize.Get(&ib.flowCtx.Cfg.Settings.SV)
 	opts := storagebase.BulkAdderOptions{
-		SSTSize:        uint64(sstSize),
-		MinBufferSize:  uint64(minBufferSize),
-		MaxBufferSize:  uint64(maxBufferSize),
-		StepBufferSize: uint64(stepSize),
+		SSTSize:        sstSize,
+		MinBufferSize:  minBufferSize,
+		MaxBufferSize:  maxBufferSize,
+		StepBufferSize: stepSize,
 		SkipDuplicates: ib.ContainsInvertedIndex(),
 	}
 	adder, err := ib.flowCtx.Cfg.BulkAdder(ctx, ib.flowCtx.Cfg.DB, ib.spec.ReadAsOf, opts)
@@ -159,7 +159,7 @@ func (ib *indexBackfiller) runChunk(
 
 	start := timeutil.Now()
 	var entries []sqlbase.IndexEntry
-	if err := ib.flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := ib.flowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		txn.SetFixedTimestamp(ctx, readAsOf)
 
 		// TODO(knz): do KV tracing in DistSQL processors.

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -116,6 +117,8 @@ func newSamplerProcessor(
 		sketches:        make([]sketchInfo, len(spec.Sketches)),
 		maxFractionIdle: spec.MaxFractionIdle,
 	}
+
+	var sampleCols util.FastIntSet
 	for i := range spec.Sketches {
 		s.sketches[i] = sketchInfo{
 			spec:     spec.Sketches[i],
@@ -123,9 +126,12 @@ func newSamplerProcessor(
 			numNulls: 0,
 			numRows:  0,
 		}
+		if spec.Sketches[i].GenerateHistogram {
+			sampleCols.Add(int(spec.Sketches[i].Columns[0]))
+		}
 	}
 
-	s.sr.Init(int(spec.SampleSize), input.OutputTypes(), &s.memAcc)
+	s.sr.Init(int(spec.SampleSize), input.OutputTypes(), &s.memAcc, sampleCols)
 
 	inTypes := input.OutputTypes()
 	outTypes := make([]types.T, 0, len(inTypes)+5)
@@ -302,9 +308,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 				binary.LittleEndian.PutUint64(intbuf[:], uint64(val))
 				s.sketches[i].sketch.Insert(intbuf[:])
 			} else {
-				// We need to use a KEY encoding because equal values should have the same
-				// encoding.
-				buf, err = row[col].Encode(&s.outTypes[col], &da, sqlbase.DatumEncoding_ASCENDING_KEY, buf[:0])
+				buf, err = row[col].Fingerprint(&s.outTypes[col], &da, buf[:0])
 				if err != nil {
 					return false, err
 				}

@@ -97,11 +97,74 @@ func TestColumnConversions(t *testing.T) {
 		"STRING(5)": {
 			"BYTES": ColumnConversionTrivial,
 		},
+
+		"TIME": {
+			"TIME":    ColumnConversionTrivial,
+			"TIME(5)": ColumnConversionValidate,
+			"TIME(6)": ColumnConversionTrivial,
+		},
+		"TIMETZ": {
+			"TIMETZ":    ColumnConversionTrivial,
+			"TIMETZ(5)": ColumnConversionValidate,
+			"TIMETZ(6)": ColumnConversionTrivial,
+		},
 		"TIMESTAMP": {
-			"TIMESTAMPTZ": ColumnConversionTrivial,
+			"TIMESTAMP":      ColumnConversionTrivial,
+			"TIMESTAMP(5)":   ColumnConversionValidate,
+			"TIMESTAMP(6)":   ColumnConversionTrivial,
+			"TIMESTAMPTZ":    ColumnConversionTrivial,
+			"TIMESTAMPTZ(5)": ColumnConversionValidate,
+			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
+		},
+		"TIMESTAMP(0)": {
+			"TIMESTAMP(3)":   ColumnConversionTrivial,
+			"TIMESTAMP(6)":   ColumnConversionTrivial,
+			"TIMESTAMP":      ColumnConversionTrivial,
+			"TIMESTAMPTZ(3)": ColumnConversionTrivial,
+			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
+			"TIMESTAMPTZ":    ColumnConversionTrivial,
+		},
+		"TIMESTAMP(3)": {
+			"TIMESTAMP(0)": ColumnConversionValidate,
+			"TIMESTAMP(1)": ColumnConversionValidate,
+			"TIMESTAMP(3)": ColumnConversionTrivial,
+			"TIMESTAMP(6)": ColumnConversionTrivial,
+			"TIMESTAMP":    ColumnConversionTrivial,
+
+			"TIMESTAMPTZ(0)": ColumnConversionValidate,
+			"TIMESTAMPTZ(1)": ColumnConversionValidate,
+			"TIMESTAMPTZ(3)": ColumnConversionTrivial,
+			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
+			"TIMESTAMPTZ":    ColumnConversionTrivial,
 		},
 		"TIMESTAMPTZ": {
-			"TIMESTAMP": ColumnConversionTrivial,
+			"TIMESTAMP":      ColumnConversionTrivial,
+			"TIMESTAMP(5)":   ColumnConversionValidate,
+			"TIMESTAMP(6)":   ColumnConversionTrivial,
+			"TIMESTAMPTZ":    ColumnConversionTrivial,
+			"TIMESTAMPTZ(5)": ColumnConversionValidate,
+			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
+		},
+		"TIMESTAMPTZ(3)": {
+			"TIMESTAMP(0)": ColumnConversionValidate,
+			"TIMESTAMP(1)": ColumnConversionValidate,
+			"TIMESTAMP(3)": ColumnConversionTrivial,
+			"TIMESTAMP(6)": ColumnConversionTrivial,
+			"TIMESTAMP":    ColumnConversionTrivial,
+
+			"TIMESTAMPTZ(0)": ColumnConversionValidate,
+			"TIMESTAMPTZ(1)": ColumnConversionValidate,
+			"TIMESTAMPTZ(3)": ColumnConversionTrivial,
+			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
+			"TIMESTAMPTZ":    ColumnConversionTrivial,
+		},
+		"TIMESTAMPTZ(0)": {
+			"TIMESTAMP(3)":   ColumnConversionTrivial,
+			"TIMESTAMP(6)":   ColumnConversionTrivial,
+			"TIMESTAMP":      ColumnConversionTrivial,
+			"TIMESTAMPTZ(3)": ColumnConversionTrivial,
+			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
+			"TIMESTAMPTZ":    ColumnConversionTrivial,
 		},
 
 		"UUID": {
@@ -220,9 +283,11 @@ func TestColumnConversions(t *testing.T) {
 
 					case types.TimeFamily,
 						types.TimestampFamily,
-						types.TimestampTZFamily:
+						types.TimestampTZFamily,
+						types.TimeTZFamily:
 
 						const timeOnly = "15:04:05"
+						const timeOnlyWithZone = "15:04:05 -0700"
 						const noZone = "2006-01-02 15:04:05"
 						const withZone = "2006-01-02 15:04:05 -0700"
 
@@ -234,6 +299,8 @@ func TestColumnConversions(t *testing.T) {
 							fromFmt = noZone
 						case types.TimestampTZFamily:
 							fromFmt = withZone
+						case types.TimeTZFamily:
+							fromFmt = timeOnlyWithZone
 						}
 
 						// Always use a non-UTC zone for this test
@@ -251,7 +318,8 @@ func TestColumnConversions(t *testing.T) {
 						case
 							types.TimeFamily,
 							types.TimestampFamily,
-							types.TimestampTZFamily:
+							types.TimestampTZFamily,
+							types.TimeTZFamily:
 							// We're going to re-parse the text as though we're in UTC
 							// so that we can drop the TZ info.
 							if parsed, err := time.ParseInLocation(fromFmt, now, time.UTC); err == nil {

@@ -15,12 +15,14 @@ func _() {
 	_ = x[Int32-4]
 	_ = x[Int64-5]
 	_ = x[Float64-6]
-	_ = x[Unhandled-7]
+	_ = x[Timestamp-7]
+	_ = x[Interval-8]
+	_ = x[Unhandled-9]
 }
 
-const _T_name = "BoolBytesDecimalInt16Int32Int64Float64Unhandled"
+const _T_name = "BoolBytesDecimalInt16Int32Int64Float64TimestampIntervalUnhandled"
 
-var _T_index = [...]uint8{0, 4, 9, 16, 21, 26, 31, 38, 47}
+var _T_index = [...]uint8{0, 4, 9, 16, 21, 26, 31, 38, 47, 55, 64}
 
 func (i T) String() string {
 	if i < 0 || i >= T(len(_T_index)-1) {

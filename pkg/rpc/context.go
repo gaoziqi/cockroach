@@ -121,7 +121,7 @@ func requireSuperUser(ctx context.Context) error {
 		// This is an in-process request. Bypass authentication check.
 	} else if peer, ok := peer.FromContext(ctx); ok {
 		if tlsInfo, ok := peer.AuthInfo.(credentials.TLSInfo); ok {
-			certUser, err := security.GetCertificateUser(&tlsInfo.State)
+			certUsers, err := security.GetCertificateUsers(&tlsInfo.State)
 			if err != nil {
 				return err
 			}
@@ -129,8 +129,9 @@ func requireSuperUser(ctx context.Context) error {
 			// NodeUser. This is not a security concern, as RootUser has access to
 			// read and write all data, merely good hygiene. For example, there is
 			// no reason to permit the root user to send raw Raft RPCs.
-			if certUser != security.NodeUser && certUser != security.RootUser {
-				return errors.Errorf("user %s is not allowed to perform this RPC", certUser)
+			if !security.ContainsUser(security.NodeUser, certUsers) &&
+				!security.ContainsUser(security.RootUser, certUsers) {
+				return errors.Errorf("user %s is not allowed to perform this RPC", certUsers)
 			}
 		}
 	} else {
@@ -283,7 +284,7 @@ func NewServerWithInterceptor(
 		disableClusterNameVerification:        ctx.disableClusterNameVerification,
 		clusterID:                             &ctx.ClusterID,
 		nodeID:                                &ctx.NodeID,
-		version:                               ctx.version,
+		settings:                              ctx.settings,
 		testingAllowNamedRPCToAnonymousServer: ctx.TestingAllowNamedRPCToAnonymousServer,
 	})
 	return s
@@ -291,7 +292,7 @@ func NewServerWithInterceptor(
 
 type heartbeatResult struct {
 	everSucceeded bool  // true if the heartbeat has ever succeeded
-	err           error // heartbeat error. should not be nil if everSucceeded is false
+	err           error // heartbeat error, initialized to ErrNotHeartbeated
 }
 
 // state is a helper to return the heartbeatState implied by a heartbeatResult.
@@ -321,8 +322,7 @@ type Connection struct {
 	// the lifetime of a Connection object.
 	remoteNodeID roachpb.NodeID
 
-	initOnce      sync.Once
-	validatedOnce sync.Once
+	initOnce sync.Once
 }
 
 func newConnectionToNodeID(stopper *stop.Stopper, remoteNodeID roachpb.NodeID) *Connection {
@@ -354,15 +354,10 @@ func (c *Connection) Connect(ctx context.Context) (*grpc.ClientConn, error) {
 	// If connection is invalid, return latest heartbeat error.
 	h := c.heartbeatResult.Load().(heartbeatResult)
 	if !h.everSucceeded {
+		// If we've never succeeded, h.err will be ErrNotHeartbeated.
 		return nil, netutil.NewInitialHeartBeatFailedError(h.err)
 	}
 	return c.grpcConn, nil
-}
-
-func (c *Connection) setInitialHeartbeatDone() {
-	c.validatedOnce.Do(func() {
-		close(c.initialHeartbeatDone)
-	})
 }
 
 // Health returns an error indicating the success or failure of the
@@ -397,7 +392,7 @@ type Context struct {
 
 	ClusterID base.ClusterIDContainer
 	NodeID    base.NodeIDContainer
-	version   *cluster.ExposedClusterVersion
+	settings  *cluster.Settings
 
 	clusterName                    string
 	disableClusterNameVerification bool
@@ -436,9 +431,9 @@ func NewContext(
 	baseCtx *base.Config,
 	hlcClock *hlc.Clock,
 	stopper *stop.Stopper,
-	version *cluster.ExposedClusterVersion,
+	st *cluster.Settings,
 ) *Context {
-	return NewContextWithTestingKnobs(ambient, baseCtx, hlcClock, stopper, version,
+	return NewContextWithTestingKnobs(ambient, baseCtx, hlcClock, stopper, st,
 		ContextTestingKnobs{})
 }
 
@@ -448,7 +443,7 @@ func NewContextWithTestingKnobs(
 	baseCtx *base.Config,
 	hlcClock *hlc.Clock,
 	stopper *stop.Stopper,
-	version *cluster.ExposedClusterVersion,
+	st *cluster.Settings,
 	knobs ContextTestingKnobs,
 ) *Context {
 	if hlcClock == nil {
@@ -462,7 +457,7 @@ func NewContextWithTestingKnobs(
 			clock: hlcClock,
 		},
 		rpcCompression:                 enableRPCCompression,
-		version:                        version,
+		settings:                       st,
 		clusterName:                    baseCtx.ClusterName,
 		disableClusterNameVerification: baseCtx.DisableClusterNameVerification,
 		testingKnobs:                   knobs,
@@ -1027,12 +1022,22 @@ func (ctx *Context) runHeartbeat(
 	conn *Connection, target string, redialChan <-chan struct{},
 ) (retErr error) {
 	ctx.metrics.HeartbeatLoopsStarted.Inc(1)
+	// setInitialHeartbeatDone is idempotent and is critical to notify Connect
+	// callers of the failure in the case where no heartbeat is ever sent.
 	state := updateHeartbeatState(&ctx.metrics, heartbeatNotRunning, heartbeatInitializing)
+	initialHeartbeatDone := false
+	setInitialHeartbeatDone := func() {
+		if !initialHeartbeatDone {
+			close(conn.initialHeartbeatDone)
+			initialHeartbeatDone = true
+		}
+	}
 	defer func() {
 		if retErr != nil {
 			ctx.metrics.HeartbeatLoopsExited.Inc(1)
 		}
 		updateHeartbeatState(&ctx.metrics, state, heartbeatNotRunning)
+		setInitialHeartbeatDone()
 	}()
 	maxOffset := ctx.LocalClock.MaxOffset()
 	maxOffsetNanos := maxOffset.Nanoseconds()
@@ -1063,7 +1068,7 @@ func (ctx *Context) runHeartbeat(
 				MaxOffsetNanos: maxOffsetNanos,
 				ClusterID:      &clusterID,
 				NodeID:         conn.remoteNodeID,
-				ServerVersion:  ctx.version.ServerVersion,
+				ServerVersion:  ctx.settings.Version.BinaryVersion(),
 			}
 
 			var response *PingResponse
@@ -1097,7 +1102,7 @@ func (ctx *Context) runHeartbeat(
 
 			if err == nil {
 				err = errors.Wrap(
-					checkVersion(ctx.version, response.ServerVersion),
+					checkVersion(goCtx, ctx.settings, response.ServerVersion),
 					"version compatibility check failed on ping response")
 			}
 
@@ -1109,9 +1114,7 @@ func (ctx *Context) runHeartbeat(
 				// successful response from the server.
 				pingDuration := receiveTime.Sub(sendTime)
 				maxOffset := ctx.LocalClock.MaxOffset()
-				if maxOffset != timeutil.ClocklessMaxOffset &&
-					pingDuration > maximumPingDurationMult*maxOffset {
-
+				if pingDuration > maximumPingDurationMult*maxOffset {
 					request.Offset.Reset()
 				} else {
 					// Offset and error are measured using the remote clock reading
@@ -1137,7 +1140,7 @@ func (ctx *Context) runHeartbeat(
 			}
 			state = updateHeartbeatState(&ctx.metrics, state, hr.state())
 			conn.heartbeatResult.Store(hr)
-			conn.setInitialHeartbeatDone()
+			setInitialHeartbeatDone()
 			return nil
 		}); err != nil {
 			return err

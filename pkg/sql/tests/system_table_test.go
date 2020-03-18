@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -24,16 +25,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
+	"github.com/stretchr/testify/require"
 )
 
 func TestInitialKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-
 	const keysPerDesc = 2
 	const nonDescKeys = 9
 
 	ms := sqlbase.MakeMetadataSchema(zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
-	kv, _ /* splits */ := ms.GetInitialValues()
+	kv, _ /* splits */ := ms.GetInitialValues(clusterversion.TestingClusterVersion)
 	expected := nonDescKeys + keysPerDesc*ms.SystemDescriptorCount()
 	if actual := len(kv); actual != expected {
 		t.Fatalf("Wrong number of initial sql kv pairs: %d, wanted %d", actual, expected)
@@ -52,7 +53,7 @@ func TestInitialKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	ms.AddDescriptor(keys.SystemDatabaseID, &desc)
-	kv, _ /* splits */ = ms.GetInitialValues()
+	kv, _ /* splits */ = ms.GetInitialValues(clusterversion.TestingClusterVersion)
 	expected = nonDescKeys + keysPerDesc*ms.SystemDescriptorCount()
 	if actual := len(kv); actual != expected {
 		t.Fatalf("Wrong number of initial sql kv pairs: %d, wanted %d", actual, expected)
@@ -117,6 +118,12 @@ func TestSystemTableLiterals(t *testing.T) {
 		{keys.LocationsTableID, sqlbase.LocationsTableSchema, sqlbase.LocationsTable},
 		{keys.RoleMembersTableID, sqlbase.RoleMembersTableSchema, sqlbase.RoleMembersTable},
 		{keys.CommentsTableID, sqlbase.CommentsTableSchema, sqlbase.CommentsTable},
+		{keys.ProtectedTimestampsMetaTableID, sqlbase.ProtectedTimestampsMetaTableSchema, sqlbase.ProtectedTimestampsMetaTable},
+		{keys.ProtectedTimestampsRecordsTableID, sqlbase.ProtectedTimestampsRecordsTableSchema, sqlbase.ProtectedTimestampsRecordsTable},
+		{keys.RoleOptionsTableID, sqlbase.RoleOptionsTableSchema, sqlbase.RoleOptionsTable},
+		{keys.StatementBundleChunksTableID, sqlbase.StatementBundleChunksTableSchema, sqlbase.StatementBundleChunksTable},
+		{keys.StatementDiagnosticsRequestsTableID, sqlbase.StatementDiagnosticsRequestsTableSchema, sqlbase.StatementDiagnosticsRequestsTable},
+		{keys.StatementDiagnosticsTableID, sqlbase.StatementDiagnosticsTableSchema, sqlbase.StatementDiagnosticsTable},
 	} {
 		privs := *test.pkg.Privileges
 		gen, err := sql.CreateTestTableDescriptor(
@@ -129,6 +136,7 @@ func TestSystemTableLiterals(t *testing.T) {
 		if err != nil {
 			t.Fatalf("test: %+v, err: %v", test, err)
 		}
+		require.NoError(t, gen.ValidateTable())
 
 		if !proto.Equal(&test.pkg, &gen) {
 			diff := strings.Join(pretty.Diff(&test.pkg, &gen), "\n")

@@ -82,10 +82,17 @@ import (
 
 // logStatementsExecuteEnabled causes the Executor to log executed
 // statements and, if any, resulting errors.
-var logStatementsExecuteEnabled = settings.RegisterBoolSetting(
+var logStatementsExecuteEnabled = settings.RegisterPublicBoolSetting(
 	"sql.trace.log_statement_execute",
 	"set to true to enable logging of executed statements",
 	false,
+)
+
+var slowQueryLogThreshold = settings.RegisterPublicDurationSetting(
+	"sql.log.slow_query.latency_threshold",
+	"when set to non-zero, log statements whose service latency exceeds "+
+		"the threshold to a secondary logger on each node",
+	0,
 )
 
 type executorType int
@@ -126,9 +133,11 @@ func (p *planner) maybeLogStatementInternal(
 
 	logV := log.V(2)
 	logExecuteEnabled := logStatementsExecuteEnabled.Get(&p.execCfg.Settings.SV)
+	slowLogThreshold := slowQueryLogThreshold.Get(&p.execCfg.Settings.SV)
+	slowQueryLogEnabled := slowLogThreshold != 0
 	auditEventsDetected := len(p.curPlan.auditEvents) != 0
 
-	if !logV && !logExecuteEnabled && !auditEventsDetected {
+	if !logV && !logExecuteEnabled && !auditEventsDetected && !slowQueryLogEnabled {
 		return
 	}
 
@@ -155,11 +164,12 @@ func (p *planner) maybeLogStatementInternal(
 		logTrigger = buf.String()
 	}
 
-	stmtStr := p.curPlan.AST.String()
+	stmtStr := p.curPlan.stmt.AST.String()
 
 	plStr := p.extendedEvalCtx.Placeholders.Values.String()
 
-	age := float64(timeutil.Now().Sub(startTime).Nanoseconds()) / 1e6
+	queryDuration := timeutil.Now().Sub(startTime)
+	age := float64(queryDuration.Nanoseconds()) / 1e6
 
 	// rows passed as argument.
 
@@ -177,6 +187,11 @@ func (p *planner) maybeLogStatementInternal(
 		logger := p.execCfg.AuditLogger
 		logger.Logf(ctx, "%s %q %s %q %s %.3f %d %s %d",
 			lbl, appName, logTrigger, stmtStr, plStr, age, rows, auditErrStr, numRetries)
+	}
+	if queryDuration > slowLogThreshold {
+		logger := p.execCfg.SlowQueryLogger
+		logger.Logf(ctx, "%.3fms %s %q %s %q %s %d %q %d",
+			age, lbl, appName, logTrigger, stmtStr, plStr, rows, execErrStr, numRetries)
 	}
 	if logExecuteEnabled {
 		logger := p.execCfg.ExecLogger

@@ -35,6 +35,7 @@
 #include "protos/roachpb/errors.pb.h"
 #include "row_counter.h"
 #include "snapshot.h"
+#include "stack_trace.h"
 #include "status.h"
 #include "table_props.h"
 #include "timestamp.h"
@@ -501,8 +502,9 @@ DBStatus DBEnvWriteFile(DBEngine* db, DBSlice path, DBSlice contents) {
   return db->EnvWriteFile(path, contents);
 }
 
-DBStatus DBEnvOpenFile(DBEngine* db, DBSlice path, DBWritableFile* file) {
-  return db->EnvOpenFile(path, (rocksdb::WritableFile**)file);
+DBStatus DBEnvOpenFile(DBEngine* db, DBSlice path,  uint64_t bytes_per_sync,
+                       DBWritableFile* file) {
+  return db->EnvOpenFile(path, bytes_per_sync, (rocksdb::WritableFile**)file);
 }
 
 DBStatus DBEnvReadFile(DBEngine* db, DBSlice path, DBSlice* contents) {
@@ -548,7 +550,7 @@ DBIterState DBCheckForKeyCollisions(DBIterator* existingIter, DBIterator* sstIte
 
     // Encountered an inline value or a write intent.
     if (existing_ts == kZeroTimestamp) {
-      cockroach::storage::engine::enginepb::MVCCMetadata meta;
+      cockroach::storage::enginepb::MVCCMetadata meta;
       if (!meta.ParseFromArray(existingIter->rep->value().data(),
                                existingIter->rep->value().size())) {
         state.status = FmtStatus("failed to parse meta");
@@ -572,8 +574,8 @@ DBIterState DBCheckForKeyCollisions(DBIterator* existingIter, DBIterator* sstIte
         // target key space, which will require appropriate resolution logic.
         cockroach::roachpb::WriteIntentError err;
         cockroach::roachpb::Intent* intent = err.add_intents();
-        intent->mutable_span()->set_key(existingIter->rep->key().data(),
-                                        existingIter->rep->key().size());
+        intent->mutable_single_key_span()->set_key(existingIter->rep->key().data(),
+                                                   existingIter->rep->key().size());
         intent->mutable_txn()->CopyFrom(meta.txn());
 
         *write_intent = ToDBString(err.SerializeAsString());
@@ -672,6 +674,12 @@ IteratorStats DBIterStats(DBIterator* iter) {
 DBIterState DBIterSeek(DBIterator* iter, DBKey key) {
   ScopedStats stats(iter);
   iter->rep->Seek(EncodeKey(key));
+  return DBIterGetState(iter);
+}
+
+DBIterState DBIterSeekForPrev(DBIterator* iter, DBKey key) {
+  ScopedStats stats(iter);
+  iter->rep->SeekForPrev(EncodeKey(key));
   return DBIterGetState(iter);
 }
 
@@ -774,12 +782,12 @@ void DBIterSetUpperBound(DBIterator* iter, DBKey key) { iter->SetUpperBound(key)
 DBStatus DBMerge(DBSlice existing, DBSlice update, DBString* new_value, bool full_merge) {
   new_value->len = 0;
 
-  cockroach::storage::engine::enginepb::MVCCMetadata meta;
+  cockroach::storage::enginepb::MVCCMetadata meta;
   if (!meta.ParseFromArray(existing.data, existing.len)) {
     return ToDBString("corrupted existing value");
   }
 
-  cockroach::storage::engine::enginepb::MVCCMetadata update_meta;
+  cockroach::storage::enginepb::MVCCMetadata update_meta;
   if (!update_meta.ParseFromArray(update.data, update.len)) {
     return ToDBString("corrupted update value");
   }
@@ -800,7 +808,9 @@ DBStatus DBPartialMergeOne(DBSlice existing, DBSlice update, DBString* new_value
 
 // DBGetStats queries the given DBEngine for various operational stats and
 // write them to the provided DBStatsResult instance.
-DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats) { return db->GetStats(stats); }
+DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats) {
+  return db->GetStats(stats);
+}
 
 // `DBGetTickersAndHistograms` retrieves maps of all RocksDB tickers and histograms.
 // It differs from `DBGetStats` by getting _every_ ticker and histogram, and by not
@@ -829,8 +839,7 @@ DBStatus DBGetSortedWALFiles(DBEngine* db, DBWALFile** files, int* n) {
 
 DBString DBGetUserProperties(DBEngine* db) { return db->GetUserProperties(); }
 
-DBStatus DBIngestExternalFiles(DBEngine* db, char** paths, size_t len, bool move_files,
-                               bool write_global_seqno, bool allow_file_modifications) {
+DBStatus DBIngestExternalFiles(DBEngine* db, char** paths, size_t len, bool move_files) {
   std::vector<std::string> paths_vec;
   for (size_t i = 0; i < len; i++) {
     paths_vec.push_back(paths[i]);
@@ -851,15 +860,15 @@ DBStatus DBIngestExternalFiles(DBEngine* db, char** paths, size_t len, bool move
   // After https://github.com/facebook/rocksdb/pull/4172 this can be disabled
   // (with the mutable manifest/metadata tracking that instead). However it is
   // only safe to disable the seqno write if older versions of RocksDB (<5.16)
-  // will not be used to read these SSTs.
-  //
+  // will not be used to read these SSTs; luckily we no longer need to
+  // interoperate with such older versions.
+  ingest_options.write_global_seqno = false;
   // RocksDB checks the option allow_global_seqno and, if it is false, returns
   // an error instead of ingesting a file that would require one. However it
-  // does this check *even if it is not planning on writing seqno* at all, so we
-  // need to set allow_global_seqno to true for !write_global_seqno to have the
-  // desired effect.
-  ingest_options.write_global_seqno = write_global_seqno;
-  ingest_options.allow_global_seqno = allow_file_modifications || !write_global_seqno;
+  // does this check *even if it is not planning on writing seqno* at all (and
+  // we're not planning on writing any as per write_global_seqno above), so we
+  // need to set allow_global_seqno to true.
+  ingest_options.allow_global_seqno = true;
   // If there are mutations in the memtable for the keyrange covered by the file
   // being ingested, this option is checked. If true, the memtable is flushed
   // using a blocking, write-stalling flush and the ingest run. If false, an
@@ -932,6 +941,10 @@ DBSstFileWriter* DBSstFileWriterNew() {
   table_options.format_version = 0;
   table_options.checksum = rocksdb::kCRC32c;
   table_options.whole_key_filtering = false;
+  // This makes the sstables produced by Pebble and RocksDB byte-by-byte identical, which is
+  // useful for testing.
+  table_options.index_shortening =
+      rocksdb::BlockBasedTableOptions::IndexShorteningMode::kShortenSeparatorsAndSuccessor;
 
   rocksdb::Options* options = new rocksdb::Options();
   options->comparator = &kComparator;
@@ -1019,7 +1032,7 @@ DBStatus DBSstFileWriterCopyData(DBSstFileWriter* fw, DBString* data) {
     return ToDBStatus(status);
   }
   if (sst_contents.size() != file_size) {
-    return FmtStatus("expected to read %" PRIu64 " bytes but got %zu", file_size,
+        return FmtStatus("expected to read %" PRIu64 " bytes but got %zu", file_size,
                      sst_contents.size());
   }
 
@@ -1066,9 +1079,10 @@ DBStatus DBUnlockFile(DBFileLock lock) {
   return ToDBStatus(rocksdb::Env::Default()->UnlockFile((rocksdb::FileLock*)lock));
 }
 
-DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIterOptions iter_opts,
-                       DBEngine* engine, DBString* data, DBString* write_intent,
-                       DBString* summary) {
+DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions,
+                       uint64_t target_size, uint64_t max_size,
+                       DBIterOptions iter_opts, DBEngine* engine, DBString* data,
+                       DBString* write_intent, DBString* summary, DBString* resume) {
   DBSstFileWriter* writer = DBSstFileWriterNew();
   DBStatus status = DBSstFileWriterOpen(writer);
   if (status.data != NULL) {
@@ -1078,19 +1092,28 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIter
   DBIncrementalIterator iter(engine, iter_opts, start, end, write_intent);
 
   roachpb::BulkOpSummary bulkop_summary;
-  RowCounter row_counter;
+  RowCounter row_counter(&bulkop_summary);
 
   bool skip_current_key_versions = !export_all_revisions;
   DBIterState state;
   const std::string end_key = EncodeKey(end);
-  for (state = iter.seek(start);; state = iter.next(skip_current_key_versions)) {
+  // cur_key is used when paginated is true and export_all_revisions is
+  // true. If we're exporting all revisions and we're returning a paginated
+  // SST then we need to keep track of when we've finished adding all of the
+  // versions of a key to the writer.
+  const bool paginated = target_size > 0;
+  std::string cur_key;
+  std::string resume_key;
+  // Seek to the MVCC metadata key for the provided start key and let the
+  // incremental iterator find the appropriate version.
+  const DBKey seek_key = {.key = start.key};
+  for (state = iter.seek(seek_key);; state = iter.next(skip_current_key_versions)) {
     if (state.status.data != NULL) {
       DBSstFileWriterClose(writer);
       return state.status;
     } else if (!state.valid || kComparator.Compare(iter.key(), end_key) >= 0) {
       break;
     }
-
     rocksdb::Slice decoded_key;
     int64_t wall_time = 0;
     int32_t logical_time = 0;
@@ -1100,11 +1123,30 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIter
       return ToDBString("Unable to decode key");
     }
 
+    const bool is_new_key = !export_all_revisions || decoded_key.compare(cur_key) != 0;
+    if (paginated && export_all_revisions && is_new_key) {
+      // Reuse the underlying buffer in cur_key.
+      cur_key.clear();
+      cur_key.reserve(decoded_key.size());
+      cur_key.assign(decoded_key.data(), decoded_key.size());
+    }
+
     // Skip tombstone (len=0) records when start time is zero (non-incremental)
     // and we are not exporting all versions.
-    bool is_skipping_deletes = start.wall_time == 0 && start.logical == 0 && !export_all_revisions;
+    const bool is_skipping_deletes =
+        start.wall_time == 0 && start.logical == 0 && !export_all_revisions;
     if (is_skipping_deletes && iter.value().size() == 0) {
       continue;
+    }
+
+    // Check to see if this is the first version of key and adding it would
+    // put us over the limit (we might already be over the limit).
+    const int64_t cur_size = bulkop_summary.data_size();
+    const bool reached_target_size = cur_size > 0 && cur_size >= target_size;
+    if (paginated && is_new_key && reached_target_size) {
+      resume_key.reserve(decoded_key.size());
+      resume_key.assign(decoded_key.data(), decoded_key.size());
+      break;
     }
 
     // Insert key into sst and update statistics.
@@ -1114,11 +1156,15 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIter
       return status;
     }
 
-    if (!row_counter.Count((iter.key()), &bulkop_summary)) {
+    if (!row_counter.Count(iter.key())) {
       return ToDBString("Error in row counter");
     }
-    bulkop_summary.set_data_size(bulkop_summary.data_size() + decoded_key.size() +
-                                 iter.value().size());
+    const int64_t new_size = cur_size + decoded_key.size() + iter.value().size();
+    if (max_size > 0 && new_size > max_size) {
+      return FmtStatus("export size (%" PRIi64 " bytes) exceeds max size (%" PRIi64 " bytes)",
+                       new_size, max_size);
+    }
+    bulkop_summary.set_data_size(new_size);
   }
   *summary = ToDBString(bulkop_summary.SerializeAsString());
 
@@ -1130,5 +1176,66 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIter
   auto res = DBSstFileWriterFinish(writer, data);
   DBSstFileWriterClose(writer);
 
+  // If we're not returning an error, check to see if we need to return the resume key.
+  if (res.data == NULL && resume_key.length() > 0) {
+    *resume = ToDBString(resume_key);
+  }
+
   return res;
+}
+
+DBStatus DBEnvOpenReadableFile(DBEngine* db, DBSlice path, DBReadableFile* file) {
+  return db->EnvOpenReadableFile(path, (rocksdb::RandomAccessFile**)file);
+}
+
+DBStatus DBEnvReadAtFile(DBEngine* db, DBReadableFile file, DBSlice buffer, int64_t offset,
+                         int* n) {
+  return db->EnvReadAtFile((rocksdb::RandomAccessFile*)file, buffer, offset, n);
+}
+
+DBStatus DBEnvCloseReadableFile(DBEngine* db, DBReadableFile file) {
+  return db->EnvCloseReadableFile((rocksdb::RandomAccessFile*)file);
+}
+
+DBStatus DBEnvOpenDirectory(DBEngine* db, DBSlice path, DBDirectory* file) {
+  return db->EnvOpenDirectory(path, (rocksdb::Directory**)file);
+}
+
+DBStatus DBEnvSyncDirectory(DBEngine* db, DBDirectory file) {
+  return db->EnvSyncDirectory((rocksdb::Directory*)file);
+}
+
+DBStatus DBEnvCloseDirectory(DBEngine* db, DBDirectory file) {
+  return db->EnvCloseDirectory((rocksdb::Directory*)file);
+}
+
+DBStatus DBEnvRenameFile(DBEngine* db, DBSlice oldname, DBSlice newname) {
+  return db->EnvRenameFile(oldname, newname);
+}
+
+DBStatus DBEnvCreateDir(DBEngine* db, DBSlice name) {
+  return db->EnvCreateDir(name);
+}
+
+DBStatus DBEnvDeleteDir(DBEngine* db, DBSlice name) {
+  return db->EnvDeleteDir(name);
+}
+
+DBListDirResults DBEnvListDir(DBEngine* db, DBSlice name) {
+  DBListDirResults result;
+  std::vector<std::string> contents;
+  result.status = db->EnvListDir(name, &contents);
+  result.n = contents.size();
+  // We malloc the names so it can be deallocated by the caller using free().
+  const int size = contents.size() * sizeof(DBString);
+  result.names = reinterpret_cast<DBString*>(malloc(size));
+  memset(result.names, 0, size);
+  for (int i = 0; i < contents.size(); i++) {
+    result.names[i] = ToDBString(rocksdb::Slice(contents[i].data(), contents[i].size()));
+  }
+  return result;
+}
+
+DBString DBDumpThreadStacks() {
+  return ToDBString(DumpThreadStacks());
 }

@@ -107,6 +107,14 @@ const (
 	// justification for this constant.
 	lookupJoinRetrieveRowCost = 2 * seqIOCostFactor
 
+	// Input rows to a join are processed in batches of this size.
+	// See joinreader.go.
+	joinReaderBatchSize = 100.0
+
+	// In the case of a limit hint, a scan will read this multiple of the expected
+	// number of rows. See scanNode.limitHint.
+	scanSoftLimitMultiplier = 2.0
+
 	// latencyCostFactor represents the throughput impact of doing scans on an
 	// index that may be remotely located in a different locality. If latencies
 	// are higher, then overall cluster throughput will suffer somewhat, as there
@@ -174,7 +182,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		cost = c.computeIndexJoinCost(candidate.(*memo.IndexJoinExpr))
 
 	case opt.LookupJoinOp:
-		cost = c.computeLookupJoinCost(candidate.(*memo.LookupJoinExpr))
+		cost = c.computeLookupJoinCost(candidate.(*memo.LookupJoinExpr), required)
 
 	case opt.ZigzagJoinOp:
 		cost = c.computeZigzagJoinCost(candidate.(*memo.ZigzagJoinExpr))
@@ -183,7 +191,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp:
 		cost = c.computeSetCost(candidate)
 
-	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp:
+	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.UpsertDistinctOnOp:
 		cost = c.computeGroupingCost(candidate, required)
 
 	case opt.LimitOp:
@@ -281,6 +289,10 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 	rowCount := scan.Relational().Stats.RowCount
 	perRowCost := c.rowScanCost(scan.Table, scan.Index, scan.Cols.Len())
 
+	if required.LimitHint != 0 {
+		rowCount = math.Min(rowCount, required.LimitHint*scanSoftLimitMultiplier)
+	}
+
 	if ordering.ScanIsReverse(scan, &required.Ordering) {
 		if rowCount > 1 {
 			// Need to do binary search to seek to the previous row.
@@ -328,7 +340,7 @@ func (c *coster) computeValuesCost(values *memo.ValuesExpr) memo.Cost {
 }
 
 func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
-	if join.Private().(*memo.JoinPrivate).Flags.DisallowHashJoin {
+	if !join.Private().(*memo.JoinPrivate).Flags.Has(memo.AllowHashJoinStoreRight) {
 		return hugeCost
 	}
 	leftRowCount := join.Child(0).(memo.RelExpr).Relational().Stats.RowCount
@@ -394,14 +406,32 @@ func (c *coster) computeIndexJoinCost(join *memo.IndexJoinExpr) memo.Cost {
 	return memo.Cost(leftRowCount) * perRowCost
 }
 
-func (c *coster) computeLookupJoinCost(join *memo.LookupJoinExpr) memo.Cost {
-	leftRowCount := join.Input.Relational().Stats.RowCount
+func (c *coster) computeLookupJoinCost(
+	join *memo.LookupJoinExpr, required *physical.Required,
+) memo.Cost {
+	lookupCount := join.Input.Relational().Stats.RowCount
+
+	// Lookup joins can return early if enough rows have been found. An otherwise
+	// expensive lookup join might have a lower cost if its limit hint estimates
+	// that most rows will not be needed.
+	if required.LimitHint != 0 {
+		outputRows := join.Relational().Stats.RowCount
+		lookupCount = lookupJoinInputLimitHint(lookupCount, outputRows, required.LimitHint)
+	}
 
 	// The rows in the (left) input are used to probe into the (right) table.
 	// Since the matching rows in the table may not all be in the same range, this
 	// counts as random I/O.
 	perLookupCost := memo.Cost(randIOCostFactor)
-	cost := memo.Cost(leftRowCount) * perLookupCost
+	if !join.LookupColsAreTableKey {
+		// If the lookup columns don't form a key, execution will have to limit
+		// KV batches which prevents running requests to multiple nodes in parallel.
+		// An experiment on a 4 node cluster with a table with 100k rows split into
+		// 100 ranges showed that a "non-parallel" lookup join is about 5 times
+		// slower.
+		perLookupCost *= 5
+	}
+	cost := memo.Cost(lookupCount) * perLookupCost
 
 	// Each lookup might retrieve many rows; add the IO cost of retrieving the
 	// rows (relevant when we expect many resulting rows per lookup) and the CPU
@@ -475,8 +505,13 @@ func (c *coster) computeSetCost(set memo.RelExpr) memo.Cost {
 }
 
 func (c *coster) computeGroupingCost(grouping memo.RelExpr, required *physical.Required) memo.Cost {
+	// Start with some extra fixed overhead, since the grouping operators have
+	// setup overhead that is greater than other operators like Project. This
+	// can matter for rules like ReplaceMaxWithLimit.
+	cost := memo.Cost(cpuCostFactor)
+
 	// Add the CPU cost of emitting the rows.
-	cost := memo.Cost(grouping.Relational().Stats.RowCount) * cpuCostFactor
+	cost += memo.Cost(grouping.Relational().Stats.RowCount) * cpuCostFactor
 
 	// GroupBy must process each input row once. Cost per row depends on the
 	// number of grouping columns and the number of aggregates.
@@ -752,4 +787,15 @@ func localityMatchScore(zone cat.Zone, locality roachpb.Locality) float64 {
 
 	// Weight the constraintScore twice as much as the lease score.
 	return (constraintScore*2 + leaseScore) / 3
+}
+
+// lookupJoinInputLimitHint calculates an appropriate limit hint for the input
+// to a lookup join.
+func lookupJoinInputLimitHint(inputRowCount, outputRowCount, outputLimitHint float64) float64 {
+	// Estimate the number of lookups needed to output LimitHint rows.
+	expectedLookupCount := outputLimitHint * inputRowCount / outputRowCount
+
+	// Round up to the nearest multiple of a batch.
+	expectedLookupCount = math.Ceil(expectedLookupCount/joinReaderBatchSize) * joinReaderBatchSize
+	return math.Min(inputRowCount, expectedLookupCount)
 }

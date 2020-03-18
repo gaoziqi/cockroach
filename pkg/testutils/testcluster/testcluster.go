@@ -23,12 +23,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -119,7 +119,7 @@ func (tc *TestCluster) StopServer(idx int) {
 
 // StartTestCluster starts up a TestCluster made up of `nodes` in-memory testing
 // servers.
-// The cluster should be stopped using cluster.Stop().
+// The cluster should be stopped using TestCluster.Stopper().Stop().
 func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestCluster {
 	if nodes < 1 {
 		t.Fatal("invalid cluster size: ", nodes)
@@ -169,6 +169,7 @@ func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestC
 		errCh = make(chan error, nodes)
 	}
 
+	disableLBS := false
 	for i := 0; i < nodes; i++ {
 		var serverArgs base.TestServerArgs
 		if perNodeServerArgs, ok := args.ServerArgsPerNode[i]; ok {
@@ -202,6 +203,19 @@ func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestC
 			//serverArgs.JoinAddr = tc.Servers[0].ServingRPCAddr()
 			serverArgs.JoinAddr = firstListener.Addr().String()
 		}
+
+		// Disable LBS if any server has a very low scan interval.
+		if serverArgs.ScanInterval > 0 && serverArgs.ScanInterval <= 100*time.Millisecond {
+			disableLBS = true
+		}
+
+		// Note: uncomment to have the testcluster stored on disk which can aid
+		// post-mortem debugging.
+		//
+		// serverArgs.StoreSpecs = []base.StoreSpec{{
+		// 	Path: fmt.Sprintf("cluster/%d", i+1),
+		// }}
+
 		if args.ParallelStart {
 			go func() {
 				errCh <- tc.doAddServer(t, serverArgs)
@@ -224,6 +238,24 @@ func StartTestCluster(t testing.TB, nodes int, args base.TestClusterArgs) *TestC
 			}
 		}
 		tc.WaitForStores(t, tc.Servers[0].Gossip())
+	}
+
+	if tc.replicationMode == base.ReplicationManual {
+		// We've already disabled the merge queue via testing knobs above, but ALTER
+		// TABLE ... SPLIT AT will throw an error unless we also disable merges via
+		// the cluster setting.
+		//
+		// TODO(benesch): this won't be necessary once we have sticky bits for
+		// splits.
+		if _, err := tc.Conns[0].Exec(`SET CLUSTER SETTING kv.range_merge.queue_enabled = false`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if disableLBS {
+		if _, err := tc.Conns[0].Exec(`SET CLUSTER SETTING kv.range_split.by_load_enabled = false`); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Create a closer that will stop the individual server stoppers when the
@@ -261,7 +293,7 @@ func checkServerArgsForCluster(
 		return errors.Errorf("can't set individual server stoppers when starting a cluster")
 	}
 	if args.Knobs.Store != nil {
-		storeKnobs := args.Knobs.Store.(*storage.StoreTestingKnobs)
+		storeKnobs := args.Knobs.Store.(*kvserver.StoreTestingKnobs)
 		if storeKnobs.DisableSplitQueue || storeKnobs.DisableReplicateQueue {
 			return errors.Errorf("can't disable an individual server's queues when starting a cluster; " +
 				"the cluster controls replication")
@@ -305,9 +337,9 @@ func (tc *TestCluster) doAddServer(t testing.TB, serverArgs base.TestServerArgs)
 	}
 	serverArgs.Stopper = stop.NewStopper()
 	if tc.replicationMode == base.ReplicationManual {
-		var stkCopy storage.StoreTestingKnobs
+		var stkCopy kvserver.StoreTestingKnobs
 		if stk := serverArgs.Knobs.Store; stk != nil {
-			stkCopy = *stk.(*storage.StoreTestingKnobs)
+			stkCopy = *stk.(*kvserver.StoreTestingKnobs)
 		}
 		stkCopy.DisableSplitQueue = true
 		stkCopy.DisableMergeQueue = true
@@ -319,25 +351,6 @@ func (tc *TestCluster) doAddServer(t testing.TB, serverArgs base.TestServerArgs)
 
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
-
-	if tc.replicationMode == base.ReplicationManual && len(tc.Servers) == 0 {
-		// We've already disabled the merge queue via testing knobs above, but ALTER
-		// TABLE ... SPLIT AT will throw an error unless we also disable merges via
-		// the cluster setting.
-		//
-		// TODO(benesch): this won't be necessary once we have sticky bits for
-		// splits.
-		if _, err := conn.Exec(`SET CLUSTER SETTING kv.range_merge.queue_enabled = false`); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Disable LBS if the server being added has a scan interval arg this low.
-	if serverArgs.ScanInterval > 0 && serverArgs.ScanInterval <= 100*time.Millisecond {
-		if _, err := conn.Exec(`SET CLUSTER SETTING kv.range_split.by_load_enabled = false`); err != nil {
-			t.Fatal(err)
-		}
-	}
 
 	tc.Servers = append(tc.Servers, s.(*server.TestServer))
 	tc.Conns = append(tc.Conns, conn)
@@ -722,7 +735,7 @@ func (tc *TestCluster) WaitForSplitAndInitialization(startKey roachpb.Key) error
 }
 
 // findMemberStore returns the store containing a given replica.
-func (tc *TestCluster) findMemberStore(storeID roachpb.StoreID) (*storage.Store, error) {
+func (tc *TestCluster) findMemberStore(storeID roachpb.StoreID) (*kvserver.Store, error) {
 	for _, server := range tc.Servers {
 		if server.Stores().HasStore(storeID) {
 			store, err := server.Stores().GetStore(storeID)
@@ -762,7 +775,7 @@ func (tc *TestCluster) WaitForFullReplication() error {
 	for r := retry.Start(opts); r.Next() && notReplicated; {
 		notReplicated = false
 		for _, s := range tc.Servers {
-			err := s.Stores().VisitStores(func(s *storage.Store) error {
+			err := s.Stores().VisitStores(func(s *kvserver.Store) error {
 				if n := s.ClusterNodeCount(); n != len(tc.Servers) {
 					log.Infof(context.TODO(), "%s only sees %d/%d available nodes", s, n, len(tc.Servers))
 					notReplicated = true

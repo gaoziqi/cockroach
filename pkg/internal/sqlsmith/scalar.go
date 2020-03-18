@@ -12,22 +12,14 @@ package sqlsmith
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/cockroachdb/cockroach/pkg/util/json"
 )
 
 var (
-	scalars, bools             []scalarWeight
-	scalarWeights, boolWeights []int
-)
-
-func init() {
-	scalars = []scalarWeight{
+	scalars = []scalarExprWeight{
 		{10, scalarNoContext(makeAnd)},
 		{1, scalarNoContext(makeCaseExpr)},
 		{1, scalarNoContext(makeCoalesceExpr)},
@@ -45,9 +37,8 @@ func init() {
 			return makeConstExpr(s, typ, refs), true
 		}},
 	}
-	scalarWeights = extractWeights(scalars)
 
-	bools = []scalarWeight{
+	bools = []scalarExprWeight{
 		{1, scalarNoContext(makeColRef)},
 		{1, scalarNoContext(makeAnd)},
 		{1, scalarNoContext(makeOr)},
@@ -61,29 +52,13 @@ func init() {
 		{1, scalarNoContext(makeExists)},
 		{1, makeFunc},
 	}
-	boolWeights = extractWeights(bools)
-}
+)
 
 // TODO(mjibson): remove this and correctly pass around the Context.
-func scalarNoContext(fn func(*Smither, *types.T, colRefs) (tree.TypedExpr, bool)) scalarFn {
+func scalarNoContext(fn func(*Smither, *types.T, colRefs) (tree.TypedExpr, bool)) scalarExpr {
 	return func(s *Smither, ctx Context, t *types.T, refs colRefs) (tree.TypedExpr, bool) {
 		return fn(s, t, refs)
 	}
-}
-
-type scalarFn func(*Smither, Context, *types.T, colRefs) (expr tree.TypedExpr, ok bool)
-
-type scalarWeight struct {
-	weight int
-	fn     scalarFn
-}
-
-func extractWeights(weights []scalarWeight) []int {
-	w := make([]int, len(weights))
-	for i, s := range weights {
-		w[i] = s.weight
-	}
-	return w
 }
 
 // makeScalar attempts to construct a scalar expression of the requested type.
@@ -93,7 +68,7 @@ func makeScalar(s *Smither, typ *types.T, refs colRefs) tree.TypedExpr {
 }
 
 func makeScalarContext(s *Smither, ctx Context, typ *types.T, refs colRefs) tree.TypedExpr {
-	return makeScalarSample(s.scalars, scalars, s, ctx, typ, refs)
+	return makeScalarSample(s.scalarExprSampler, s, ctx, typ, refs)
 }
 
 func makeBoolExpr(s *Smither, refs colRefs) tree.TypedExpr {
@@ -101,16 +76,11 @@ func makeBoolExpr(s *Smither, refs colRefs) tree.TypedExpr {
 }
 
 func makeBoolExprContext(s *Smither, ctx Context, refs colRefs) tree.TypedExpr {
-	return makeScalarSample(s.bools, bools, s, ctx, types.Bool, refs)
+	return makeScalarSample(s.boolExprSampler, s, ctx, types.Bool, refs)
 }
 
 func makeScalarSample(
-	sampler *WeightedSampler,
-	weights []scalarWeight,
-	s *Smither,
-	ctx Context,
-	typ *types.T,
-	refs colRefs,
+	sampler *scalarExprSampler, s *Smither, ctx Context, typ *types.T, refs colRefs,
 ) tree.TypedExpr {
 	// If we are in a GROUP BY, attempt to find an aggregate function.
 	if ctx.fnClass == tree.AggregateClass {
@@ -122,8 +92,7 @@ func makeScalarSample(
 		for {
 			// No need for a retry counter here because makeConstExpr will eventually
 			// be called and it always succeeds.
-			idx := sampler.Next()
-			result, ok := weights[idx].fn(s, ctx, typ, refs)
+			result, ok := sampler.Next()(s, ctx, typ, refs)
 			if ok {
 				return result
 			}
@@ -211,39 +180,7 @@ func makeConstDatum(s *Smither, typ *types.T) tree.Datum {
 	}
 	datum = sqlbase.RandDatumWithNullChance(s.rnd, typ, nullChance)
 	if f := datum.ResolvedType().Family(); f != types.UnknownFamily && s.simpleDatums {
-		switch f {
-		case types.TupleFamily:
-			// TODO(mjibson): improve
-			datum = tree.DNull
-		case types.StringFamily:
-			p := make([]byte, s.rnd.Intn(5))
-			for i := range p {
-				p[i] = byte('A' + s.rnd.Intn(26))
-			}
-			datum = tree.NewDString(string(p))
-		case types.BytesFamily:
-			p := make([]byte, s.rnd.Intn(5))
-			for i := range p {
-				p[i] = byte('A' + s.rnd.Intn(26))
-			}
-			datum = tree.NewDBytes(tree.DBytes(p))
-		case types.IntervalFamily:
-			datum = &tree.DInterval{Duration: duration.MakeDuration(
-				s.rnd.Int63n(3),
-				s.rnd.Int63n(3),
-				s.rnd.Int63n(3),
-			)}
-		case types.JsonFamily:
-			p := make([]byte, s.rnd.Intn(5))
-			for i := range p {
-				p[i] = byte('A' + s.rnd.Intn(26))
-			}
-			datum = tree.NewDJSON(json.FromString(string(p)))
-		case types.TimestampFamily:
-			datum = tree.MakeDTimestamp(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), time.Microsecond)
-		case types.TimestampTZFamily:
-			datum = tree.MakeDTimestampTZ(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), time.Microsecond)
-		}
+		datum = sqlbase.RandDatumSimple(s.rnd, typ)
 	}
 	s.lock.Unlock()
 
@@ -267,10 +204,7 @@ func getColRef(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, *colRef,
 		return nil, nil, false
 	}
 	col := cols[s.rnd.Intn(len(cols))]
-	return makeTypedExpr(
-		col.item,
-		col.typ,
-	), col, true
+	return col.typedExpr(), col, true
 }
 
 // castType tries to wrap expr in a CastExpr. This can be useful for times
@@ -340,11 +274,14 @@ var compareOps = [...]tree.ComparisonOperator{
 }
 
 func makeCompareOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
-	typ, ok := s.pickAnyType(typ)
-	if !ok {
+	if f := typ.Family(); f != types.BoolFamily && f != types.AnyFamily {
 		return nil, false
 	}
+	typ = s.randScalarType()
 	op := compareOps[s.rnd.Intn(len(compareOps))]
+	if _, ok := tree.CmpOps[op].LookupImpl(typ, typ); !ok {
+		return nil, false
+	}
 	if s.vectorizable && (op == tree.IsDistinctFrom || op == tree.IsNotDistinctFrom) {
 		return nil, false
 	}
@@ -478,16 +415,21 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		s.sample(len(refs), 2, func(i int) {
 			parts = append(parts, refs[i].item)
 		})
-		var order tree.OrderBy
+		var (
+			order      tree.OrderBy
+			orderTypes []*types.T
+		)
 		s.sample(len(refs)-len(parts), 2, func(i int) {
+			ref := refs[i+len(parts)]
 			order = append(order, &tree.Order{
-				Expr:      refs[i+len(parts)].item,
+				Expr:      ref.item,
 				Direction: s.randDirection(),
 			})
+			orderTypes = append(orderTypes, ref.typ)
 		})
 		var frame *tree.WindowFrame
 		if s.coin() {
-			frame = makeWindowFrame(s, refs, order)
+			frame = makeWindowFrame(s, refs, orderTypes)
 		}
 		window = &tree.WindowDef{
 			Partitions: parts,
@@ -520,11 +462,11 @@ func randWindowFrameMode(s *Smither) tree.WindowFrameMode {
 	return windowFrameModes[s.rnd.Intn(len(windowFrameModes))]
 }
 
-func makeWindowFrame(s *Smither, refs colRefs, orderBy tree.OrderBy) *tree.WindowFrame {
+func makeWindowFrame(s *Smither, refs colRefs, orderTypes []*types.T) *tree.WindowFrame {
 	var frameMode tree.WindowFrameMode
 	for {
 		frameMode = randWindowFrameMode(s)
-		if len(orderBy) > 0 || frameMode != tree.GROUPS {
+		if len(orderTypes) > 0 || frameMode != tree.GROUPS {
 			// GROUPS mode requires an ORDER BY clause, so if it is not present and
 			// GROUPS mode was randomly chosen, we need to generate again; otherwise,
 			// we're done.
@@ -535,13 +477,19 @@ func makeWindowFrame(s *Smither, refs colRefs, orderBy tree.OrderBy) *tree.Windo
 	// bound can be omitted.
 	var startBound tree.WindowFrameBound
 	var endBound *tree.WindowFrameBound
-	if frameMode == tree.RANGE {
-		// RANGE mode is special in that if a bound is of type OffsetPreceding or
-		// OffsetFollowing, it requires that ORDER BY clause of the window function
-		// have exactly one column that can be only of the following types:
-		// DInt, DFloat, DDecimal, DInterval; so for now let's avoid this
-		// complication and not choose offset bound types.
-		// TODO(yuzefovich): fix this.
+	// RANGE mode is special in that if a bound is of type OffsetPreceding or
+	// OffsetFollowing, it requires that ORDER BY clause of the window function
+	// have exactly one column that can be only of the following types:
+	// Int, Float, Decimal, Interval.
+	allowRangeWithOffsets := false
+	if len(orderTypes) == 1 {
+		switch orderTypes[0].Family() {
+		case types.IntFamily, types.FloatFamily,
+			types.DecimalFamily, types.IntervalFamily:
+			allowRangeWithOffsets = true
+		}
+	}
+	if frameMode == tree.RANGE && !allowRangeWithOffsets {
 		if s.coin() {
 			startBound.BoundType = tree.UnboundedPreceding
 		} else {
@@ -582,10 +530,15 @@ func makeWindowFrame(s *Smither, refs colRefs, orderBy tree.OrderBy) *tree.Windo
 		}
 		// We will set offsets regardless of the bound type, but they will only be
 		// used when a bound is either OffsetPreceding or OffsetFollowing. Both
-		// ROWS and GROUPS mode need non-negative integers as bounds.
-		startBound.OffsetExpr = makeScalar(s, types.Int, refs)
+		// ROWS and GROUPS mode need non-negative integers as bounds whereas RANGE
+		// mode takes the type as the single ORDER BY clause has.
+		typ := types.Int
+		if frameMode == tree.RANGE {
+			typ = orderTypes[0]
+		}
+		startBound.OffsetExpr = makeScalar(s, typ, refs)
 		if endBound != nil {
-			endBound.OffsetExpr = makeScalar(s, types.Int, refs)
+			endBound.OffsetExpr = makeScalar(s, typ, refs)
 		}
 	}
 	return &tree.WindowFrame{

@@ -11,13 +11,15 @@ package changefeedccl
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
@@ -71,6 +73,22 @@ func distChangefeedFlow(
 		return err
 	}
 
+	// NB: A non-empty high water indicates that we have checkpointed a resolved
+	// timestamp. Skipping the initial scan is equivalent to starting the
+	// changefeed from a checkpoint at its start time. Initialize the progress
+	// based on whether we should perform an initial scan.
+	{
+		h := progress.GetHighWater()
+		noHighWater := (h == nil || *h == (hlc.Timestamp{}))
+		// We want to set the highWater and thus avoid an initial scan if either
+		// this is a cursor and there was no request for one, or we don't have a
+		// cursor but we have a request to not have an initial scan.
+		if noHighWater && !initialScanFromOptions(details.Opts) {
+			// If there is a cursor, the statement time has already been set to it.
+			progress.Progress = &jobspb.Progress_HighWater{HighWater: &details.StatementTime}
+		}
+	}
+
 	spansTS := details.StatementTime
 	var initialHighWater hlc.Timestamp
 	if h := progress.GetHighWater(); h != nil && *h != (hlc.Timestamp{}) {
@@ -87,7 +105,7 @@ func distChangefeedFlow(
 	}
 
 	// Changefeed flows handle transactional consistency themselves.
-	var noTxn *client.Txn
+	var noTxn *kv.Txn
 	gatewayNodeID := execCfg.NodeID.Get()
 	dsp := phs.DistSQLPlanner()
 	evalCtx := phs.ExtendedEvalContext()
@@ -190,6 +208,26 @@ func distChangefeedFlow(
 	evalCtxCopy := *evalCtx
 	dsp.Run(planCtx, noTxn, &p, recv, &evalCtxCopy, finishedSetupFn)()
 	return resultRows.Err()
+}
+
+func fetchSpansForTargets(
+	ctx context.Context, db *kv.DB, targets jobspb.ChangefeedTargets, ts hlc.Timestamp,
+) ([]roachpb.Span, error) {
+	var spans []roachpb.Span
+	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		spans = nil
+		txn.SetFixedTimestamp(ctx, ts)
+		// Note that all targets are currently guaranteed to be tables.
+		for tableID := range targets {
+			tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+			if err != nil {
+				return err
+			}
+			spans = append(spans, tableDesc.PrimaryIndexSpan())
+		}
+		return nil
+	})
+	return spans, err
 }
 
 // changefeedResultWriter implements the `rowexec.resultWriter` that sends

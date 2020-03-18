@@ -13,12 +13,12 @@ package base
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -136,45 +136,6 @@ type lazyCertificateManager struct {
 	once sync.Once
 	cm   *security.CertificateManager
 	err  error
-}
-
-// EngineType specifies type of storage engine (eg. rocksdb, pebble).
-type EngineType int
-
-// Engine types.
-const (
-	// Denotes RocksDB as the underlying storage engine type.
-	EngineTypeRocksDB EngineType = iota
-	// Denotes Pebble as the underlying storage engine type.
-	EngineTypePebble
-)
-
-// Type implements the pflag.Value interface.
-func (e *EngineType) Type() string { return "string" }
-
-// String implements the pflag.Value interface.
-func (e *EngineType) String() string {
-	switch *e {
-	case EngineTypeRocksDB:
-		return "rocksdb"
-	case EngineTypePebble:
-		return "pebble"
-	}
-	return ""
-}
-
-// Set implements the pflag.Value interface.
-func (e *EngineType) Set(s string) error {
-	switch s {
-	case "rocksdb":
-		*e = EngineTypeRocksDB
-	case "pebble":
-		*e = EngineTypePebble
-	default:
-		return fmt.Errorf("invalid storage engine: %s "+
-			"(possible values: rocksdb, pebble)", s)
-	}
-	return nil
 }
 
 // Config is embedded by server.Config. A base config is not meant to be used
@@ -687,6 +648,29 @@ func DefaultRetryOptions() retry.Options {
 	}
 }
 
+// StorageConfig contains storage configs for all storage engine.
+type StorageConfig struct {
+	Attrs roachpb.Attributes
+	// Dir is the data directory for the Pebble instance.
+	Dir string
+	// If true, creating the instance fails if the target directory does not hold
+	// an initialized instance.
+	//
+	// Makes no sense for in-memory instances.
+	MustExist bool
+	// MaxSize is used for calculating free space and making rebalancing
+	// decisions. Zero indicates that there is no maximum size.
+	MaxSize int64
+	// Settings instance for cluster-wide knobs.
+	Settings *cluster.Settings
+	// UseFileRegistry is true if the file registry is needed (eg: encryption-at-rest).
+	// This may force the store version to versionFileRegistry if currently lower.
+	UseFileRegistry bool
+	// ExtraOptions is a serialized protobuf set by Go CCL code and passed through
+	// to C CCL code.
+	ExtraOptions []byte
+}
+
 const (
 	// DefaultTempStorageMaxSizeBytes is the default maximum budget
 	// for temp storage.
@@ -713,6 +697,20 @@ type TempStorageConfig struct {
 	Mon *mon.BytesMonitor
 	// StoreIdx stores the index of the StoreSpec this TempStorageConfig will use.
 	SpecIdx int
+}
+
+// ExternalIOConfig describes various configuration options pertaining
+// to external storage implementations.
+type ExternalIOConfig struct {
+	// Disables the use of external HTTP endpoints.
+	// This turns off http:// external storage as well as any custom
+	// endpoints cloud storage implementations.
+	DisableHTTP bool
+	// Disables the use of implicit credentials when accessing external services.
+	// Implicit credentials are obtained from the system environment.
+	// This turns off implicit credentials, and requires the user to provide
+	// necessary access keys.
+	DisableImplicitCredentials bool
 }
 
 // TempStorageConfigFromEnv creates a TempStorageConfig.

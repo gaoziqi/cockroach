@@ -13,17 +13,18 @@ package main
 import (
 	"io"
 	"io/ioutil"
-	"regexp"
 	"strings"
 	"text/template"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 )
 
+const projConstOpsTmpl = "pkg/sql/colexec/proj_const_ops_tmpl.go"
+
 // getProjConstOpTmplString returns a "projConstOp" template with isConstLeft
 // determining whether the constant is on the left or on the right.
 func getProjConstOpTmplString(isConstLeft bool) (string, error) {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/proj_const_ops_tmpl.go")
+	t, err := ioutil.ReadFile(projConstOpsTmpl)
 	if err != nil {
 		return "", err
 	}
@@ -58,8 +59,8 @@ func replaceProjTmplVariables(tmpl string) string {
 	tmpl = strings.Replace(tmpl, "_R_TYP", "{{.RTyp}}", -1)
 	tmpl = strings.Replace(tmpl, "_RET_TYP", "{{.RetTyp}}", -1)
 
-	assignRe := regexp.MustCompile(`_ASSIGN\((.*),(.*),(.*)\)`)
-	tmpl = assignRe.ReplaceAllString(tmpl, "{{.Assign $1 $2 $3}}")
+	assignRe := makeFunctionRegex("_ASSIGN", 3)
+	tmpl = assignRe.ReplaceAllString(tmpl, makeTemplateFunctionCall("Assign", 3))
 
 	tmpl = strings.Replace(tmpl, "_HAS_NULLS", "$hasNulls", -1)
 	setProjectionRe := makeFunctionRegex("_SET_PROJECTION", 1)
@@ -88,9 +89,11 @@ func replaceProjConstTmplVariables(tmpl string, isConstLeft bool) string {
 	return replaceProjTmplVariables(tmpl)
 }
 
+const projNonConstOpsTmpl = "pkg/sql/colexec/proj_non_const_ops_tmpl.go"
+
 // genProjNonConstOps is the generator for projection operators on two vectors.
 func genProjNonConstOps(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/proj_non_const_ops_tmpl.go")
+	t, err := ioutil.ReadFile(projNonConstOpsTmpl)
 	if err != nil {
 		return err
 	}
@@ -140,7 +143,7 @@ func init() {
 		}
 	}
 
-	registerGenerator(projConstOpsGenerator(true /* isConstLeft */), "proj_const_left_ops.eg.go")
-	registerGenerator(projConstOpsGenerator(false /* isConstLeft */), "proj_const_right_ops.eg.go")
-	registerGenerator(genProjNonConstOps, "proj_non_const_ops.eg.go")
+	registerGenerator(projConstOpsGenerator(true /* isConstLeft */), "proj_const_left_ops.eg.go", projConstOpsTmpl)
+	registerGenerator(projConstOpsGenerator(false /* isConstLeft */), "proj_const_right_ops.eg.go", projConstOpsTmpl)
+	registerGenerator(genProjNonConstOps, "proj_non_const_ops.eg.go", projNonConstOpsTmpl)
 }

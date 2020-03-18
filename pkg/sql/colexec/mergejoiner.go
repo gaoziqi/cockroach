@@ -12,14 +12,16 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/marusama/semaphore"
 )
 
 // group is an ADT representing a contiguous set of rows that match on their
@@ -43,22 +45,38 @@ type group struct {
 	unmatched bool
 }
 
+// mjBuildFrom is an indicator of which source we're building the output from.
+type mjBuildFrom int
+
+const (
+	// mjBuildFromBatch indicates that we should be building from the current
+	// probing batches. Note that in such case we might have multiple groups to
+	// build.
+	mjBuildFromBatch mjBuildFrom = iota
+	// mjBuildFromBufferedGroup indicates that we should be building from the
+	// buffered group. Note that in such case we might have at most one group to
+	// build.
+	mjBuildFromBufferedGroup
+)
+
 // mjBuilderState contains all the state required to execute the build phase.
 type mjBuilderState struct {
-	// Fields to hold the input sources batches from which to build the cross
-	// products.
-	lBatch coldata.Batch
-	rBatch coldata.Batch
+	buildFrom mjBuildFrom
 
 	// Fields to identify the groups in the input sources.
 	lGroups []group
 	rGroups []group
 
 	// outCount keeps record of the current number of rows in the output.
-	outCount uint16
+	outCount int
 	// outFinished is used to determine if the builder is finished outputting
 	// the groups from input.
 	outFinished bool
+
+	// lBufferedGroupBatch and rBufferedGroupBatch are the current batches that
+	// we're building from when we're building the buffered group.
+	lBufferedGroupBatch coldata.Batch
+	rBufferedGroupBatch coldata.Batch
 
 	// Cross product materialization state.
 	left  mjBuilderCrossProductState
@@ -72,6 +90,32 @@ type mjBuilderCrossProductState struct {
 	groupsIdx      int
 	curSrcStartIdx int
 	numRepeatsIdx  int
+}
+
+// mjBufferedGroup is a helper struct that stores information about the tuples
+// from both inputs for the buffered group.
+type mjBufferedGroup struct {
+	*spillingQueue
+	// firstTuple stores a single tuple that was first in the buffered group.
+	firstTuple []coldata.Vec
+	numTuples  int
+}
+
+func (bg *mjBufferedGroup) reset(ctx context.Context) {
+	if err := bg.close(ctx); err != nil {
+		execerror.VectorizedInternalPanic(err)
+	}
+	bg.numTuples = 0
+}
+
+func (bg *mjBufferedGroup) close(ctx context.Context) error {
+	if bg.spillingQueue != nil {
+		if err := bg.spillingQueue.close(ctx); err != nil {
+			return err
+		}
+		bg.spillingQueue = nil
+	}
+	return nil
 }
 
 // mjProberState contains all the state required to execute in the probing
@@ -88,8 +132,10 @@ type mjProberState struct {
 	// Local buffer for the last left and right groups which is used when the
 	// group ends with a batch and the group on each side needs to be saved to
 	// state in order to be able to continue it in the next batch.
-	lBufferedGroup *mjBufferedGroup
-	rBufferedGroup *mjBufferedGroup
+	lBufferedGroup            mjBufferedGroup
+	rBufferedGroup            mjBufferedGroup
+	lBufferedGroupNeedToReset bool
+	rBufferedGroupNeedToReset bool
 }
 
 // mjState represents the state of the merge joiner.
@@ -120,16 +166,17 @@ const (
 	// are built, i.e. materialized to the output member by creating the cross
 	// product.
 	mjBuild
+
+	// mjDone is the final state of the merge joiner in which it'll be returning
+	// only zero-length batches. In this state, the disk infrastructure is
+	// cleaned up.
+	mjDone
 )
 
 type mergeJoinInput struct {
 	// eqCols specify the indices of the source table equality columns during the
 	// merge join.
 	eqCols []uint32
-
-	// outCols specify the indices of the columns that should be outputted by the
-	// merge joiner.
-	outCols []uint32
 
 	// directions specifies the ordering direction of each column. Note that each
 	// direction corresponds to an equality column at the same location, i.e. the
@@ -167,49 +214,28 @@ type mergeJoinInput struct {
 // expanding the groups (leftGroups and rightGroups) when a group spans
 // multiple batches.
 
-// NewMergeJoinOp returns a new merge join operator with the given spec that
+// newMergeJoinOp returns a new merge join operator with the given spec that
 // implements sort-merge join. It performs a merge on the left and right input
 // sources, based on the equality columns, assuming both inputs are in sorted
 // order.
-func NewMergeJoinOp(
+func newMergeJoinOp(
+	unlimitedAllocator *Allocator,
+	memoryLimit int64,
+	diskQueueCfg colcontainer.DiskQueueCfg,
+	fdSemaphore semaphore.Semaphore,
 	joinType sqlbase.JoinType,
 	left Operator,
 	right Operator,
-	leftOutCols []uint32,
-	rightOutCols []uint32,
 	leftTypes []coltypes.T,
 	rightTypes []coltypes.T,
 	leftOrdering []execinfrapb.Ordering_Column,
 	rightOrdering []execinfrapb.Ordering_Column,
-	filterConstructor func(Operator) (Operator, error),
-	filterOnlyOnLeft bool,
-) (Operator, error) {
+	diskAcc *mon.BoundAccount,
+) (resettableOperator, error) {
 	base, err := newMergeJoinBase(
-		left,
-		right,
-		leftOutCols,
-		rightOutCols,
-		leftTypes,
-		rightTypes,
-		leftOrdering,
-		rightOrdering,
-		filterConstructor,
-		filterOnlyOnLeft,
+		unlimitedAllocator, memoryLimit, diskQueueCfg, fdSemaphore, joinType,
+		left, right, leftTypes, rightTypes, leftOrdering, rightOrdering, diskAcc,
 	)
-	if filterConstructor != nil {
-		switch joinType {
-		case sqlbase.JoinType_INNER:
-			execerror.VectorizedInternalPanic("INNER JOIN with ON expression is handled differently")
-		case sqlbase.JoinType_LEFT_SEMI:
-			return &mergeJoinLeftSemiWithOnExprOp{base}, err
-		case sqlbase.JoinType_LEFT_ANTI:
-			return &mergeJoinLeftAntiWithOnExprOp{base}, err
-		default:
-			execerror.VectorizedInternalPanic(
-				fmt.Sprintf("unsupported join type %s with ON expression", joinType.String()),
-			)
-		}
-	}
 	switch joinType {
 	case sqlbase.JoinType_INNER:
 		return &mergeJoinInnerOp{base}, err
@@ -258,16 +284,18 @@ func (s *mjBuilderCrossProductState) setBuilderColumnState(target mjBuilderCross
 }
 
 func newMergeJoinBase(
+	unlimitedAllocator *Allocator,
+	memoryLimit int64,
+	diskQueueCfg colcontainer.DiskQueueCfg,
+	fdSemaphore semaphore.Semaphore,
+	joinType sqlbase.JoinType,
 	left Operator,
 	right Operator,
-	leftOutCols []uint32,
-	rightOutCols []uint32,
 	leftTypes []coltypes.T,
 	rightTypes []coltypes.T,
 	leftOrdering []execinfrapb.Ordering_Column,
 	rightOrdering []execinfrapb.Ordering_Column,
-	filterConstructor func(Operator) (Operator, error),
-	filterOnlyOnLeft bool,
+	diskAcc *mon.BoundAccount,
 ) (mergeJoinBase, error) {
 	lEqCols := make([]uint32, len(leftOrdering))
 	lDirections := make([]execinfrapb.Ordering_Column_Direction, len(leftOrdering))
@@ -283,22 +311,28 @@ func newMergeJoinBase(
 		rDirections[i] = c.Direction
 	}
 
+	diskQueueCfg.CacheMode = colcontainer.DiskQueueCacheModeReuseCache
+	diskQueueCfg.SetDefaultBufferSizeBytesForCacheMode()
 	base := mergeJoinBase{
-		twoInputNode: newTwoInputNode(left, right),
+		twoInputNode:       newTwoInputNode(left, right),
+		unlimitedAllocator: unlimitedAllocator,
+		memoryLimit:        memoryLimit,
+		diskQueueCfg:       diskQueueCfg,
+		fdSemaphore:        fdSemaphore,
+		joinType:           joinType,
 		left: mergeJoinInput{
 			source:      left,
-			outCols:     leftOutCols,
 			sourceTypes: leftTypes,
 			eqCols:      lEqCols,
 			directions:  lDirections,
 		},
 		right: mergeJoinInput{
 			source:      right,
-			outCols:     rightOutCols,
 			sourceTypes: rightTypes,
 			eqCols:      rEqCols,
 			directions:  rDirections,
 		},
+		diskAcc: diskAcc,
 	}
 	var err error
 	base.left.distincterInput = &feedOperator{}
@@ -313,26 +347,25 @@ func newMergeJoinBase(
 	if err != nil {
 		return base, err
 	}
-	if filterConstructor != nil {
-		base.filter, err = newJoinerFilter(
-			leftTypes,
-			rightTypes,
-			filterConstructor,
-			filterOnlyOnLeft,
-		)
-	}
+	base.scratch.tempVecByType = make(map[coltypes.T]coldata.Vec)
 	return base, err
 }
 
 // mergeJoinBase extracts the common logic between all merge join operators.
 type mergeJoinBase struct {
 	twoInputNode
-	left  mergeJoinInput
-	right mergeJoinInput
+
+	unlimitedAllocator *Allocator
+	memoryLimit        int64
+	diskQueueCfg       colcontainer.DiskQueueCfg
+	fdSemaphore        semaphore.Semaphore
+	joinType           sqlbase.JoinType
+	left               mergeJoinInput
+	right              mergeJoinInput
 
 	// Output buffer definition.
 	output          coldata.Batch
-	outputBatchSize uint16
+	outputBatchSize int
 	// outputReady is a flag to indicate that merge joiner is ready to emit an
 	// output batch.
 	outputReady bool
@@ -343,71 +376,83 @@ type mergeJoinBase struct {
 	state        mjState
 	proberState  mjProberState
 	builderState mjBuilderState
+	scratch      struct {
+		// tempVecByType is a map from the type to a temporary vector that can be
+		// used during a cast operation in the probing phase. These vectors should
+		// *not* be exposed outside of the merge joiner.
+		tempVecByType map[coltypes.T]coldata.Vec
+		// lBufferedGroupBatch and rBufferedGroupBatch are scratch batches that are
+		// used to select out the tuples that belong to the buffered batch before
+		// enqueueing them into corresponding mjBufferedGroups. These are lazily
+		// instantiated.
+		// TODO(yuzefovich): uncomment when spillingQueue actually copies the
+		// enqueued batches when those are kept in memory.
+		//lBufferedGroupBatch coldata.Batch
+		//rBufferedGroupBatch coldata.Batch
+	}
 
-	filter *joinerFilter
+	diskAcc *mon.BoundAccount
 }
 
-func (o *mergeJoinBase) getOutColTypes() []coltypes.T {
-	outColTypes := make([]coltypes.T, 0, len(o.left.outCols)+len(o.right.outCols))
-	for _, leftOutCol := range o.left.outCols {
-		outColTypes = append(outColTypes, o.left.sourceTypes[leftOutCol])
+var _ resetter = &mergeJoinBase{}
+var _ closer = &mergeJoinBase{}
+
+func (o *mergeJoinBase) reset(ctx context.Context) {
+	if r, ok := o.left.source.(resetter); ok {
+		r.reset(ctx)
 	}
-	for _, rightOutCol := range o.right.outCols {
-		outColTypes = append(outColTypes, o.right.sourceTypes[rightOutCol])
+	if r, ok := o.right.source.(resetter); ok {
+		r.reset(ctx)
 	}
-	return outColTypes
+	o.outputReady = false
+	o.state = mjEntry
+	o.proberState.lBatch = nil
+	o.proberState.rBatch = nil
+	o.proberState.lBufferedGroup.reset(ctx)
+	o.proberState.rBufferedGroup.reset(ctx)
+	o.resetBuilderCrossProductState()
 }
 
-func (o *mergeJoinBase) EstimateStaticMemoryUsage() int {
+func (o *mergeJoinBase) InternalMemoryUsage() int {
 	const sizeOfGroup = int(unsafe.Sizeof(group{}))
-	leftDistincter := o.left.distincter.(StaticMemoryOperator)
-	rightDistincter := o.right.distincter.(StaticMemoryOperator)
-	filterMemUsage := 0
-	if o.filter != nil {
-		filterMemUsage = o.filter.EstimateStaticMemoryUsage()
-	}
-	return EstimateBatchSizeBytes(
-		o.getOutColTypes(), int(coldata.BatchSize()),
-	) + // base.output
-		EstimateBatchSizeBytes(
-			o.left.sourceTypes, int(coldata.BatchSize()),
-		) + // base.proberState.lBufferedGroup
-		EstimateBatchSizeBytes(
-			o.right.sourceTypes, int(coldata.BatchSize()),
-		) + // base.proberState.rBufferedGroup
-		4*sizeOfGroup*int(coldata.BatchSize()) + // base.groups
-		leftDistincter.EstimateStaticMemoryUsage() + // base.left.distincter
-		rightDistincter.EstimateStaticMemoryUsage() + // base.right.distincter
-		filterMemUsage
+	return 8 * coldata.BatchSize() * sizeOfGroup // o.groups
 }
 
 func (o *mergeJoinBase) Init() {
 	o.initWithOutputBatchSize(coldata.BatchSize())
 }
 
-func (o *mergeJoinBase) initWithOutputBatchSize(outBatchSize uint16) {
-	o.output = coldata.NewMemBatchWithSize(o.getOutColTypes(), int(outBatchSize))
+func (o *mergeJoinBase) initWithOutputBatchSize(outBatchSize int) {
+	outputTypes := append([]coltypes.T{}, o.left.sourceTypes...)
+	if o.joinType != sqlbase.LeftSemiJoin && o.joinType != sqlbase.LeftAntiJoin {
+		outputTypes = append(outputTypes, o.right.sourceTypes...)
+	}
+	o.output = o.unlimitedAllocator.NewMemBatchWithSize(outputTypes, outBatchSize)
 	o.left.source.Init()
 	o.right.source.Init()
 	o.outputBatchSize = outBatchSize
 	// If there are no output columns, then the operator is for a COUNT query,
-	// in which case we treat the output batch size as the max uint16.
+	// in which case we treat the output batch size as the max int.
 	if o.output.Width() == 0 {
+		// TODO(yuzefovich): evaluate whether we can increase this now that
+		// coldata.Batch operates with 'int' length.
 		o.outputBatchSize = 1<<16 - 1
 	}
 
-	o.proberState.lBufferedGroup = newMJBufferedGroup(o.left.sourceTypes)
-	o.proberState.rBufferedGroup = newMJBufferedGroup(o.right.sourceTypes)
+	o.proberState.lBufferedGroup.firstTuple = make([]coldata.Vec, len(o.left.sourceTypes))
+	for colIdx, colType := range o.left.sourceTypes {
+		o.proberState.lBufferedGroup.firstTuple[colIdx] = o.unlimitedAllocator.NewMemColumn(colType, 1)
+	}
+	o.proberState.rBufferedGroup.firstTuple = make([]coldata.Vec, len(o.right.sourceTypes))
+	for colIdx, colType := range o.right.sourceTypes {
+		o.proberState.rBufferedGroup.firstTuple[colIdx] = o.unlimitedAllocator.NewMemColumn(colType, 1)
+	}
 
 	o.builderState.lGroups = make([]group, 1)
 	o.builderState.rGroups = make([]group, 1)
 
-	o.groups = makeGroupsBuffer(int(coldata.BatchSize()))
+	o.groups = makeGroupsBuffer(coldata.BatchSize())
 	o.resetBuilderCrossProductState()
-
-	if o.filter != nil {
-		o.filter.Init()
-	}
 }
 
 func (o *mergeJoinBase) resetBuilderCrossProductState() {
@@ -420,30 +465,94 @@ func (o *mergeJoinBase) resetBuilderCrossProductState() {
 // source. This needs to happen when a group starts at the end of an input
 // batch and can continue into the following batches.
 func (o *mergeJoinBase) appendToBufferedGroup(
-	input *mergeJoinInput, batch coldata.Batch, sel []uint16, groupStartIdx int, groupLength int,
+	ctx context.Context,
+	input *mergeJoinInput,
+	batch coldata.Batch,
+	sel []int,
+	groupStartIdx int,
+	groupLength int,
 ) {
-	bufferedGroup := o.proberState.lBufferedGroup
-	if input == &o.right {
-		bufferedGroup = o.proberState.rBufferedGroup
+	if groupLength == 0 {
+		return
 	}
-	destStartIdx := bufferedGroup.length
-	groupEndIdx := groupStartIdx + groupLength
-	for cIdx, cType := range input.sourceTypes {
-		bufferedGroup.ColVec(cIdx).Append(
-			coldata.SliceArgs{
-				ColType:     cType,
-				Src:         batch.ColVec(cIdx),
-				Sel:         sel,
-				DestIdx:     destStartIdx,
-				SrcStartIdx: uint64(groupStartIdx),
-				SrcEndIdx:   uint64(groupEndIdx),
-			},
-		)
+	var (
+		bufferedGroup *mjBufferedGroup
+		scratchBatch  coldata.Batch
+		sourceTypes   []coltypes.T
+	)
+	if input == &o.left {
+		sourceTypes = o.left.sourceTypes
+		bufferedGroup = &o.proberState.lBufferedGroup
+		if bufferedGroup.spillingQueue == nil {
+			bufferedGroup.spillingQueue = newSpillingQueue(
+				o.unlimitedAllocator, o.left.sourceTypes, o.memoryLimit,
+				o.diskQueueCfg, o.fdSemaphore, coldata.BatchSize(), o.diskAcc,
+			)
+		}
+		// TODO(yuzefovich): uncomment when spillingQueue actually copies the
+		// enqueued batches when those are kept in memory.
+		//if o.scratch.lBufferedGroupBatch == nil {
+		//	o.scratch.lBufferedGroupBatch = o.unlimitedAllocator.NewMemBatch(o.left.sourceTypes)
+		//}
+		//scratchBatch = o.scratch.lBufferedGroupBatch
+	} else {
+		sourceTypes = o.right.sourceTypes
+		bufferedGroup = &o.proberState.rBufferedGroup
+		if bufferedGroup.spillingQueue == nil {
+			bufferedGroup.spillingQueue = newRewindableSpillingQueue(
+				o.unlimitedAllocator, o.right.sourceTypes, o.memoryLimit,
+				o.diskQueueCfg, o.fdSemaphore, coldata.BatchSize(), o.diskAcc,
+			)
+		}
+		// TODO(yuzefovich): uncomment when spillingQueue actually copies the
+		// enqueued batches when those are kept in memory.
+		//if o.scratch.rBufferedGroupBatch == nil {
+		//	o.scratch.rBufferedGroupBatch = o.unlimitedAllocator.NewMemBatch(o.right.sourceTypes)
+		//}
+		//scratchBatch = o.scratch.rBufferedGroupBatch
 	}
+	scratchBatch = o.unlimitedAllocator.NewMemBatchWithSize(sourceTypes, groupLength)
+	if bufferedGroup.numTuples == 0 {
+		o.unlimitedAllocator.PerformOperation(bufferedGroup.firstTuple, func() {
+			for colIdx, colType := range sourceTypes {
+				bufferedGroup.firstTuple[colIdx].Copy(
+					coldata.CopySliceArgs{
+						SliceArgs: coldata.SliceArgs{
+							ColType:     colType,
+							Src:         batch.ColVec(colIdx),
+							Sel:         sel,
+							DestIdx:     0,
+							SrcStartIdx: groupStartIdx,
+							SrcEndIdx:   groupStartIdx + 1,
+						},
+					},
+				)
+			}
+		})
+	}
+	bufferedGroup.numTuples += groupLength
 
-	// We've added groupLength number of tuples to bufferedGroup, so we need to
-	// adjust its length.
-	bufferedGroup.length += uint64(groupLength)
+	o.unlimitedAllocator.PerformOperation(scratchBatch.ColVecs(), func() {
+		for cIdx, cType := range input.sourceTypes {
+			scratchBatch.ColVec(cIdx).Copy(
+				coldata.CopySliceArgs{
+					SliceArgs: coldata.SliceArgs{
+						ColType:     cType,
+						Src:         batch.ColVec(cIdx),
+						Sel:         sel,
+						DestIdx:     0,
+						SrcStartIdx: groupStartIdx,
+						SrcEndIdx:   groupStartIdx + groupLength,
+					},
+				},
+			)
+		}
+	})
+	scratchBatch.SetSelection(false)
+	scratchBatch.SetLength(groupLength)
+	if err := bufferedGroup.enqueue(ctx, scratchBatch); err != nil {
+		execerror.VectorizedInternalPanic(err)
+	}
 }
 
 // setBuilderSourceToBatch sets the builder state to use groups from the
@@ -452,8 +561,7 @@ func (o *mergeJoinBase) appendToBufferedGroup(
 // sources.
 func (o *mergeJoinBase) setBuilderSourceToBatch() {
 	o.builderState.lGroups, o.builderState.rGroups = o.groups.getGroups()
-	o.builderState.lBatch = o.proberState.lBatch
-	o.builderState.rBatch = o.proberState.rBatch
+	o.builderState.buildFrom = mjBuildFromBatch
 }
 
 // initProberState sets the batches, lengths, and current indices to the right
@@ -463,24 +571,26 @@ func (o *mergeJoinBase) initProberState(ctx context.Context) {
 	// next batch.
 	if o.proberState.lBatch == nil || (o.proberState.lLength != 0 && o.proberState.lIdx == o.proberState.lLength) {
 		o.proberState.lIdx, o.proberState.lBatch = 0, o.left.source.Next(ctx)
-		o.proberState.lLength = int(o.proberState.lBatch.Length())
+		o.proberState.lLength = o.proberState.lBatch.Length()
 	}
 	if o.proberState.rBatch == nil || (o.proberState.rLength != 0 && o.proberState.rIdx == o.proberState.rLength) {
 		o.proberState.rIdx, o.proberState.rBatch = 0, o.right.source.Next(ctx)
-		o.proberState.rLength = int(o.proberState.rBatch.Length())
+		o.proberState.rLength = o.proberState.rBatch.Length()
 	}
-	if o.proberState.lBufferedGroup.needToReset {
-		o.proberState.lBufferedGroup.reset()
+	if o.proberState.lBufferedGroupNeedToReset {
+		o.proberState.lBufferedGroup.reset(ctx)
+		o.proberState.lBufferedGroupNeedToReset = false
 	}
-	if o.proberState.rBufferedGroup.needToReset {
-		o.proberState.rBufferedGroup.reset()
+	if o.proberState.rBufferedGroupNeedToReset {
+		o.proberState.rBufferedGroup.reset(ctx)
+		o.proberState.rBufferedGroupNeedToReset = false
 	}
 }
 
 // nonEmptyBufferedGroup returns true if there is a buffered group that needs
 // to be finished.
 func (o *mergeJoinBase) nonEmptyBufferedGroup() bool {
-	return o.proberState.lBufferedGroup.length > 0 || o.proberState.rBufferedGroup.length > 0
+	return o.proberState.lBufferedGroup.numTuples > 0 || o.proberState.rBufferedGroup.numTuples > 0
 }
 
 // sourceFinished returns true if either of input sources has no more rows.
@@ -501,18 +611,18 @@ func (o *mergeJoinBase) sourceFinished() bool {
 func (o *mergeJoinBase) completeBufferedGroup(
 	ctx context.Context, input *mergeJoinInput, batch coldata.Batch, rowIdx int,
 ) (_ coldata.Batch, idx int, batchLength int) {
-	batchLength = int(batch.Length())
+	batchLength = batch.Length()
 	if o.isBufferedGroupFinished(input, batch, rowIdx) {
 		return batch, rowIdx, batchLength
 	}
 
 	isBufferedGroupComplete := false
-	input.distincter.(resetter).reset()
+	input.distincter.(resetter).reset(ctx)
 	// Ignore the first row of the distincter in the first pass since we already
 	// know that we are in the same group and, thus, the row is not distinct,
 	// regardless of what the distincter outputs.
 	loopStartIndex := 1
-	var sel []uint16
+	var sel []int
 	for !isBufferedGroupComplete {
 		// Note that we're not resetting the distincter on every loop iteration
 		// because if we're doing the second, third, etc, iteration, then all the
@@ -543,11 +653,11 @@ func (o *mergeJoinBase) completeBufferedGroup(
 		}
 
 		// Zero out the distinct output for the next pass.
-		copy(input.distinctOutput, zeroBoolColumn)
+		copy(input.distinctOutput[:batchLength], zeroBoolColumn)
 		loopStartIndex = 0
 
 		// Buffer all the tuples that are part of the buffered group.
-		o.appendToBufferedGroup(input, batch, sel, rowIdx, groupLength)
+		o.appendToBufferedGroup(ctx, input, batch, sel, rowIdx, groupLength)
 		rowIdx += groupLength
 
 		if !isBufferedGroupComplete {
@@ -555,7 +665,7 @@ func (o *mergeJoinBase) completeBufferedGroup(
 			// just appended all the tuples from batch to it, so we need to get a
 			// fresh batch from the input.
 			rowIdx, batch = 0, input.source.Next(ctx)
-			batchLength = int(batch.Length())
+			batchLength = batch.Length()
 			if batchLength == 0 {
 				// The input has been exhausted, so the buffered group is now complete.
 				isBufferedGroupComplete = true
@@ -580,4 +690,28 @@ func (o *mergeJoinBase) finishProbe(ctx context.Context) {
 		o.proberState.rBatch,
 		o.proberState.rIdx,
 	)
+}
+
+func (o *mergeJoinBase) Close(ctx context.Context) error {
+	var lastErr error
+	for _, op := range []Operator{o.left.source, o.right.source} {
+		if c, ok := op.(closer); ok {
+			if err := c.Close(ctx); err != nil {
+				lastErr = err
+			}
+		}
+	}
+	if o.proberState.lBufferedGroup.spillingQueue != nil {
+		if err := o.proberState.lBufferedGroup.close(ctx); err != nil {
+			lastErr = err
+		}
+		o.proberState.lBufferedGroup.spillingQueue = nil
+	}
+	if o.proberState.rBufferedGroup.spillingQueue != nil {
+		if err := o.proberState.rBufferedGroup.close(ctx); err != nil {
+			lastErr = err
+		}
+		o.proberState.rBufferedGroup.spillingQueue = nil
+	}
+	return lastErr
 }

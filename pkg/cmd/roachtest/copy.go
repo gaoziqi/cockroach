@@ -121,11 +121,14 @@ func registerCopy(r *testRegistry) {
 			if err != nil {
 				t.Fatalf("failed to copy rows: %s", err)
 			}
-
+			rangeMinBytes, rangeMaxBytes, err := getDefaultRangeSize(ctx, db)
+			if err != nil {
+				t.Fatalf("failed to get default range size: %v", err)
+			}
 			rc := rangeCount()
 			t.l.Printf("range count after copy = %d\n", rc)
-			highExp := (rows * rowEstimate) / (32 << 20 /* 32MB */)
-			lowExp := (rows * rowEstimate) / (64 << 20 /* 64MB */)
+			highExp := (rows * rowEstimate) / rangeMinBytes
+			lowExp := (rows * rowEstimate) / rangeMaxBytes
 			if rc > highExp || rc < lowExp {
 				return errors.Errorf("expected range count for table between %d and %d, found %d",
 					lowExp, highExp, rc)
@@ -135,17 +138,35 @@ func registerCopy(r *testRegistry) {
 		m.Wait()
 	}
 
-	const rows = int(1E7)
+	const rows = int(1e7)
 	const numNodes = 9
 
 	for _, inTxn := range []bool{true, false} {
 		inTxn := inTxn
 		r.Add(testSpec{
 			Name:    fmt.Sprintf("copy/bank/rows=%d,nodes=%d,txn=%t", rows, numNodes, inTxn),
+			Owner:   OwnerKV,
 			Cluster: makeClusterSpec(numNodes),
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runCopy(ctx, t, c, rows, inTxn)
 			},
 		})
 	}
+}
+
+func getDefaultRangeSize(
+	ctx context.Context, db *gosql.DB,
+) (rangeMinBytes, rangeMaxBytes int, err error) {
+	err = db.QueryRow(`SELECT
+    regexp_extract(regexp_extract(raw_config_sql, e'range_min_bytes = \\d+'), e'\\d+')::INT8
+        AS range_min_bytes,
+    regexp_extract(regexp_extract(raw_config_sql, e'range_max_bytes = \\d+'), e'\\d+')::INT8
+        AS range_max_bytes
+FROM
+    [SHOW ZONE CONFIGURATION FOR RANGE default];`).Scan(&rangeMinBytes, &rangeMaxBytes)
+	// Older cluster versions do not contain this column. Use the old default.
+	if err != nil && strings.Contains(err.Error(), `column "raw_config_sql" does not exist`) {
+		rangeMinBytes, rangeMaxBytes, err = 32<<20 /* 32MB */, 64<<20 /* 64MB */, nil
+	}
+	return rangeMinBytes, rangeMaxBytes, err
 }

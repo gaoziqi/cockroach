@@ -23,9 +23,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStopper(t *testing.T) {
@@ -49,6 +51,7 @@ func TestStopper(t *testing.T) {
 	<-s.ShouldStop()
 	select {
 	case <-waiting:
+		close(cleanup)
 		t.Fatal("expected stopper to have blocked")
 	case <-time.After(100 * time.Millisecond):
 		// Expected.
@@ -58,6 +61,7 @@ func TestStopper(t *testing.T) {
 	case <-waiting:
 		// Success.
 	case <-time.After(time.Second):
+		close(cleanup)
 		t.Fatal("stopper should have finished waiting")
 	}
 	close(cleanup)
@@ -356,7 +360,7 @@ func TestStopperRunTaskPanic(t *testing.T) {
 		func() {
 			_ = s.RunLimitedAsyncTask(
 				context.Background(), "test",
-				make(chan struct{}, 1),
+				quotapool.NewIntPool("test", 1),
 				true, /* wait */
 				func(ctx context.Context) { explode(ctx) },
 			)
@@ -500,6 +504,7 @@ func TestStopperShouldQuiesce(t *testing.T) {
 	// yet.
 	select {
 	case <-s.ShouldStop():
+		close(cleanup)
 		t.Fatal("expected ShouldStop() to block until quiesceing complete")
 	default:
 		// Expected.
@@ -513,6 +518,7 @@ func TestStopperShouldQuiesce(t *testing.T) {
 	// use the "waiting" channel to detect this.
 	select {
 	case <-waiting:
+		close(cleanup)
 		t.Fatal("expected stopper to have blocked")
 	default:
 		// Expected.
@@ -531,7 +537,7 @@ func TestStopperRunLimitedAsyncTask(t *testing.T) {
 
 	const maxConcurrency = 5
 	const numTasks = maxConcurrency * 3
-	sem := make(chan struct{}, maxConcurrency)
+	sem := quotapool.NewIntPool("test", maxConcurrency)
 	taskSignal := make(chan struct{}, maxConcurrency)
 	var mu syncutil.Mutex
 	concurrency := 0
@@ -585,9 +591,10 @@ func TestStopperRunLimitedAsyncTask(t *testing.T) {
 			peakConcurrency, maxConcurrency)
 	}
 
-	sem = make(chan struct{}, 1)
-	sem <- struct{}{}
-	err := s.RunLimitedAsyncTask(
+	sem = quotapool.NewIntPool("test", 1)
+	_, err := sem.Acquire(context.Background(), 1)
+	require.NoError(t, err)
+	err = s.RunLimitedAsyncTask(
 		context.Background(), "test", sem, false /* wait */, func(_ context.Context) {
 		},
 	)
@@ -596,13 +603,36 @@ func TestStopperRunLimitedAsyncTask(t *testing.T) {
 	}
 }
 
+// This test ensures that if a quotapool has been registered as a Closer for
+// the stopper and the stopper is Quiesced then blocked tasks will return
+// ErrUnavailable.
+func TestStopperRunLimitedAsyncTaskCloser(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	s := stop.NewStopper()
+	defer s.Stop(ctx)
+
+	sem := quotapool.NewIntPool("test", 1)
+	s.AddCloser(sem.Closer("stopper"))
+	_, err := sem.Acquire(ctx, 1)
+	require.NoError(t, err)
+	go func() {
+		time.Sleep(time.Millisecond)
+		s.Stop(ctx)
+	}()
+	err = s.RunLimitedAsyncTask(ctx, "foo", sem, true /* wait */, func(context.Context) {})
+	require.Equal(t, stop.ErrUnavailable, err)
+	<-s.IsStopped()
+}
+
 func TestStopperRunLimitedAsyncTaskCancelContext(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	defer s.Stop(context.Background())
 
 	const maxConcurrency = 5
-	sem := make(chan struct{}, maxConcurrency)
+	sem := quotapool.NewIntPool("test", maxConcurrency)
 
 	// Synchronization channels.
 	workersDone := make(chan struct{})

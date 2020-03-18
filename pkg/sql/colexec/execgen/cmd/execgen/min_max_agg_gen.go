@@ -13,22 +13,20 @@ package main
 import (
 	"io"
 	"io/ioutil"
-	"regexp"
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 type aggOverloads struct {
-	Agg       execinfrapb.AggregatorSpec_Func
+	Agg       string
 	Overloads []*overload
 }
 
 // AggNameLower returns the aggregation name in lower case, e.g. "min".
 func (a aggOverloads) AggNameLower() string {
-	return strings.ToLower(a.Agg.String())
+	return strings.ToLower(a.Agg)
 }
 
 // AggNameTitle returns the aggregation name in title case, e.g. "Min".
@@ -40,8 +38,10 @@ func (a aggOverloads) AggNameTitle() string {
 var _ = aggOverloads{}.AggNameLower()
 var _ = aggOverloads{}.AggNameTitle()
 
+const minMaxAggTmpl = "pkg/sql/colexec/min_max_agg_tmpl.go"
+
 func genMinMaxAgg(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/min_max_agg_tmpl.go")
+	t, err := ioutil.ReadFile(minMaxAggTmpl)
 	if err != nil {
 		return err
 	}
@@ -54,8 +54,8 @@ func genMinMaxAgg(wr io.Writer) error {
 	s = strings.Replace(s, "_TYPES_T", "coltypes.{{.LTyp}}", -1)
 	s = strings.Replace(s, "_TYPE", "{{.LTyp}}", -1)
 
-	assignCmpRe := regexp.MustCompile(`_ASSIGN_CMP\((.*),(.*),(.*)\)`)
-	s = assignCmpRe.ReplaceAllString(s, "{{.Global.Assign $1 $2 $3}}")
+	assignCmpRe := makeFunctionRegex("_ASSIGN_CMP", 3)
+	s = assignCmpRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.Assign", 3))
 
 	accumulateMinMax := makeFunctionRegex("_ACCUMULATE_MINMAX", 4)
 	s = accumulateMinMax.ReplaceAllString(s, `{{template "accumulateMinMax" buildDict "Global" . "LTyp" .LTyp "HasNulls" $4}}`)
@@ -69,11 +69,11 @@ func genMinMaxAgg(wr io.Writer) error {
 	}
 	data := []aggOverloads{
 		{
-			Agg:       execinfrapb.AggregatorSpec_MIN,
+			Agg:       "MIN",
 			Overloads: sameTypeComparisonOpToOverloads[tree.LT],
 		},
 		{
-			Agg:       execinfrapb.AggregatorSpec_MAX,
+			Agg:       "MAX",
 			Overloads: sameTypeComparisonOpToOverloads[tree.GT],
 		},
 	}
@@ -81,5 +81,5 @@ func genMinMaxAgg(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genMinMaxAgg, "min_max_agg.eg.go")
+	registerGenerator(genMinMaxAgg, "min_max_agg.eg.go", minMaxAggTmpl)
 }

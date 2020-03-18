@@ -30,10 +30,23 @@ import (
 
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/blobs"
+	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/container"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptreconcile"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/reports"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -42,12 +55,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/heapprofiler"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	_ "github.com/cockroachdb/cockroach/pkg/sql/gcjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -56,12 +72,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/bulk"
-	"github.com/cockroachdb/cockroach/pkg/storage/closedts/container"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/reports"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ui"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -80,9 +92,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/logtags"
-	"github.com/getsentry/raven-go"
+	raven "github.com/getsentry/raven-go"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/marusama/semaphore"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
@@ -95,26 +108,26 @@ var (
 	// for a graceful shutdown.
 	GracefulDrainModes = []serverpb.DrainMode{serverpb.DrainMode_CLIENT, serverpb.DrainMode_LEASES}
 
-	queryWait = settings.RegisterDurationSetting(
+	queryWait = settings.RegisterPublicDurationSetting(
 		"server.shutdown.query_wait",
 		"the server will wait for at least this amount of time for active queries to finish",
 		10*time.Second,
 	)
 
-	drainWait = settings.RegisterDurationSetting(
+	drainWait = settings.RegisterPublicDurationSetting(
 		"server.shutdown.drain_wait",
 		"the amount of time a server waits in an unready state before proceeding with the rest "+
 			"of the shutdown process",
 		0*time.Second,
 	)
 
-	forwardClockJumpCheckEnabled = settings.RegisterBoolSetting(
+	forwardClockJumpCheckEnabled = settings.RegisterPublicBoolSetting(
 		"server.clock.forward_jump_check_enabled",
 		"if enabled, forward clock jumps > max_offset/2 will cause a panic",
 		false,
 	)
 
-	persistHLCUpperBoundInterval = settings.RegisterDurationSetting(
+	persistHLCUpperBoundInterval = settings.RegisterPublicDurationSetting(
 		"server.clock.persist_upper_bound_interval",
 		"the interval between persisting the wall time upper bound of the clock. The clock "+
 			"does not generate a wall time greater than the persisted timestamp and will panic if "+
@@ -162,11 +175,11 @@ type Server struct {
 	grpc             *grpcServer
 	gossip           *gossip.Gossip
 	nodeDialer       *nodedialer.Dialer
-	nodeLiveness     *storage.NodeLiveness
-	storePool        *storage.StorePool
-	tcsFactory       *kv.TxnCoordSenderFactory
-	distSender       *kv.DistSender
-	db               *client.DB
+	nodeLiveness     *kvserver.NodeLiveness
+	storePool        *kvserver.StorePool
+	tcsFactory       *kvcoord.TxnCoordSenderFactory
+	distSender       *kvcoord.DistSender
+	db               *kv.DB
 	pgServer         *pgwire.Server
 	distSQLServer    *distsql.ServerImpl
 	node             *Node
@@ -179,22 +192,27 @@ type Server struct {
 	initServer       *initServer
 	tsDB             *ts.DB
 	tsServer         ts.Server
-	raftTransport    *storage.RaftTransport
+	raftTransport    *kvserver.RaftTransport
 	stopper          *stop.Stopper
 	execCfg          *sql.ExecutorConfig
 	internalExecutor *sql.InternalExecutor
 	leaseMgr         *sql.LeaseManager
+	blobService      *blobs.Service
+	debug            *debug.Server
 	// sessionRegistry can be queried for info on running SQL sessions. It is
 	// shared between the sql.Server and the statusServer.
-	sessionRegistry     *sql.SessionRegistry
-	jobRegistry         *jobs.Registry
-	statsRefresher      *stats.Refresher
-	replicationReporter *reports.Reporter
-	engines             Engines
-	internalMemMetrics  sql.MemoryMetrics
-	adminMemMetrics     sql.MemoryMetrics
+	sessionRegistry        *sql.SessionRegistry
+	jobRegistry            *jobs.Registry
+	statsRefresher         *stats.Refresher
+	replicationReporter    *reports.Reporter
+	temporaryObjectCleaner *sql.TemporaryObjectCleaner
+	engines                Engines
+	internalMemMetrics     sql.MemoryMetrics
+	adminMemMetrics        sql.MemoryMetrics
 	// sqlMemMetrics are used to track memory usage of sql sessions.
-	sqlMemMetrics sql.MemoryMetrics
+	sqlMemMetrics         sql.MemoryMetrics
+	protectedtsProvider   protectedts.Provider
+	protectedtsReconciler *ptreconcile.Reconciler
 }
 
 // NewServer creates a Server from a server.Config.
@@ -257,12 +275,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	if knobs := s.cfg.TestingKnobs.Server; knobs != nil {
 		serverKnobs := knobs.(*TestingKnobs)
 		s.rpcContext = rpc.NewContextWithTestingKnobs(
-			s.cfg.AmbientCtx, s.cfg.Config, s.clock, s.stopper, &cfg.Settings.Version,
+			s.cfg.AmbientCtx, s.cfg.Config, s.clock, s.stopper, cfg.Settings,
 			serverKnobs.ContextTestingKnobs,
 		)
 	} else {
 		s.rpcContext = rpc.NewContext(s.cfg.AmbientCtx, s.cfg.Config, s.clock, s.stopper,
-			&cfg.Settings.Version)
+			cfg.Settings)
 	}
 	s.rpcContext.HeartbeatCB = func() {
 		if err := s.rpcContext.RemoteClocks.VerifyClockOffset(ctx); err != nil {
@@ -286,6 +304,14 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	)
 	s.nodeDialer = nodedialer.New(s.rpcContext, gossip.AddressResolver(s.gossip))
 
+	// Create blob service for inter-node file sharing.
+	if blobService, err := blobs.NewBlobService(s.ClusterSettings().ExternalIODir); err != nil {
+		log.Fatal(ctx, err)
+	} else {
+		s.blobService = blobService
+	}
+	blobspb.RegisterBlobServer(s.grpc.Server, s.blobService)
+
 	// A custom RetryOptions is created which uses stopper.ShouldQuiesce() as
 	// the Closer. This prevents infinite retry loops from occurring during
 	// graceful server shutdown
@@ -297,16 +323,16 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// However, on a single-node setup (such as a test), retries will never
 	// succeed because the only server has been shut down; thus, the
 	// DistSender needs to know that it should not retry in this situation.
-	var clientTestingKnobs kv.ClientTestingKnobs
+	var clientTestingKnobs kvcoord.ClientTestingKnobs
 	if kvKnobs := s.cfg.TestingKnobs.KVClient; kvKnobs != nil {
-		clientTestingKnobs = *kvKnobs.(*kv.ClientTestingKnobs)
+		clientTestingKnobs = *kvKnobs.(*kvcoord.ClientTestingKnobs)
 	}
 	retryOpts := s.cfg.RetryOptions
 	if retryOpts == (retry.Options{}) {
 		retryOpts = base.DefaultRetryOptions()
 	}
 	retryOpts.Closer = s.stopper.ShouldQuiesce()
-	distSenderCfg := kv.DistSenderConfig{
+	distSenderCfg := kvcoord.DistSenderConfig{
 		AmbientCtx:      s.cfg.AmbientCtx,
 		Settings:        st,
 		Clock:           s.clock,
@@ -315,12 +341,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		TestingKnobs:    clientTestingKnobs,
 		NodeDialer:      s.nodeDialer,
 	}
-	s.distSender = kv.NewDistSender(distSenderCfg, s.gossip)
+	s.distSender = kvcoord.NewDistSender(distSenderCfg, s.gossip)
 	s.registry.AddMetricStruct(s.distSender.Metrics())
 
-	txnMetrics := kv.MakeTxnMetrics(s.cfg.HistogramWindowInterval())
+	txnMetrics := kvcoord.MakeTxnMetrics(s.cfg.HistogramWindowInterval())
 	s.registry.AddMetricStruct(txnMetrics)
-	txnCoordSenderFactoryCfg := kv.TxnCoordSenderFactoryConfig{
+	txnCoordSenderFactoryCfg := kvcoord.TxnCoordSenderFactoryConfig{
 		AmbientCtx:   s.cfg.AmbientCtx,
 		Settings:     st,
 		Clock:        s.clock,
@@ -329,16 +355,16 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		Metrics:      txnMetrics,
 		TestingKnobs: clientTestingKnobs,
 	}
-	s.tcsFactory = kv.NewTxnCoordSenderFactory(txnCoordSenderFactoryCfg, s.distSender)
+	s.tcsFactory = kvcoord.NewTxnCoordSenderFactory(txnCoordSenderFactoryCfg, s.distSender)
 
-	dbCtx := client.DefaultDBContext()
+	dbCtx := kv.DefaultDBContext()
 	dbCtx.NodeID = &s.nodeIDContainer
 	dbCtx.Stopper = s.stopper
-	s.db = client.NewDBWithContext(s.cfg.AmbientCtx, s.tcsFactory, s.clock, dbCtx)
+	s.db = kv.NewDBWithContext(s.cfg.AmbientCtx, s.tcsFactory, s.clock, dbCtx)
 
 	nlActive, nlRenewal := s.cfg.NodeLivenessDurations()
 
-	s.nodeLiveness = storage.NewNodeLiveness(
+	s.nodeLiveness = kvserver.NewNodeLiveness(
 		s.cfg.AmbientCtx,
 		s.clock,
 		s.db,
@@ -351,17 +377,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	)
 	s.registry.AddMetricStruct(s.nodeLiveness.Metrics())
 
-	s.storePool = storage.NewStorePool(
+	s.storePool = kvserver.NewStorePool(
 		s.cfg.AmbientCtx,
 		s.st,
 		s.gossip,
 		s.clock,
 		s.nodeLiveness.GetNodeCount,
-		storage.MakeStorePoolNodeLivenessFunc(s.nodeLiveness),
+		kvserver.MakeStorePoolNodeLivenessFunc(s.nodeLiveness),
 		/* deterministic */ false,
 	)
 
-	s.raftTransport = storage.NewRaftTransport(
+	s.raftTransport = kvserver.NewRaftTransport(
 		s.cfg.AmbientCtx, st, s.nodeDialer, s.grpc.Server, s.stopper,
 	)
 
@@ -394,7 +420,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// Set up the DistSQL temp engine.
 
 	useStoreSpec := cfg.Stores.Specs[s.cfg.TempStorageConfig.SpecIdx]
-	tempEngine, err := engine.NewTempEngine(s.cfg.StorageEngine, s.cfg.TempStorageConfig, useStoreSpec)
+	tempEngine, tempFS, err := storage.NewTempEngine(ctx, s.cfg.StorageEngine, s.cfg.TempStorageConfig, useStoreSpec)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not create temp storage")
 	}
@@ -413,7 +439,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			// also remove the record after the temp directory is
 			// removed.
 			recordPath := filepath.Join(firstStore.Path, TempDirsRecordFilename)
-			err = engine.CleanupTempDirs(recordPath)
+			err = storage.CleanupTempDirs(recordPath)
 		}
 		if err != nil {
 			log.Errorf(context.TODO(), "could not remove temporary store directory: %v", err.Error())
@@ -440,17 +466,39 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	// This function defines how ExternalStorage objects are created.
 	externalStorage := func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
-		return cloud.MakeExternalStorage(ctx, dest, st)
+		return cloud.MakeExternalStorage(
+			ctx, dest, s.cfg.ExternalIOConfig, st,
+			blobs.NewBlobClientFactory(
+				s.nodeIDContainer.Get(),
+				s.nodeDialer,
+				st.ExternalIODir,
+			),
+		)
 	}
 	externalStorageFromURI := func(ctx context.Context, uri string) (cloud.ExternalStorage, error) {
-		return cloud.ExternalStorageFromURI(ctx, uri, st)
+		return cloud.ExternalStorageFromURI(
+			ctx, uri, s.cfg.ExternalIOConfig, st,
+			blobs.NewBlobClientFactory(
+				s.nodeIDContainer.Get(),
+				s.nodeDialer,
+				st.ExternalIODir,
+			),
+		)
+	}
+
+	if s.protectedtsProvider, err = ptprovider.New(ptprovider.Config{
+		DB:               s.db,
+		InternalExecutor: internalExecutor,
+		Settings:         st,
+	}); err != nil {
+		return nil, err
 	}
 
 	// Similarly for execCfg.
 	var execCfg sql.ExecutorConfig
 
 	// TODO(bdarnell): make StoreConfig configurable.
-	storeCfg := storage.StoreConfig{
+	storeCfg := kvserver.StoreConfig{
 		DefaultZoneConfig:       &s.cfg.DefaultZoneConfig,
 		Settings:                st,
 		AmbientCtx:              s.cfg.AmbientCtx,
@@ -484,7 +532,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			// before this is ever called.
 			Refresh: func(rangeIDs ...roachpb.RangeID) {
 				for _, rangeID := range rangeIDs {
-					repl, err := s.node.stores.GetReplicaForRangeID(rangeID)
+					repl, _, err := s.node.stores.GetReplicaForRangeID(rangeID)
 					if err != nil || repl == nil {
 						continue
 					}
@@ -494,12 +542,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			Dialer: s.nodeDialer.CTDialer(),
 		}),
 
-		EnableEpochRangeLeases: true,
-		ExternalStorage:        externalStorage,
-		ExternalStorageFromURI: externalStorageFromURI,
+		EnableEpochRangeLeases:  true,
+		ExternalStorage:         externalStorage,
+		ExternalStorageFromURI:  externalStorageFromURI,
+		ProtectedTimestampCache: s.protectedtsProvider,
 	}
 	if storeTestingKnobs := s.cfg.TestingKnobs.Store; storeTestingKnobs != nil {
-		storeCfg.TestingKnobs = *storeTestingKnobs.(*storage.StoreTestingKnobs)
+		storeCfg.TestingKnobs = *storeTestingKnobs.(*kvserver.StoreTestingKnobs)
 	}
 
 	s.recorder = status.NewMetricsRecorder(s.clock, s.nodeLiveness, s.rpcContext, s.gossip, st)
@@ -512,13 +561,20 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		storeCfg, s.recorder, s.registry, s.stopper,
 		txnMetrics, nil /* execCfg */, &s.rpcContext.ClusterID)
 	roachpb.RegisterInternalServer(s.grpc.Server, s.node)
-	storage.RegisterPerReplicaServer(s.grpc.Server, s.node.perReplicaServer)
+	kvserver.RegisterPerReplicaServer(s.grpc.Server, s.node.perReplicaServer)
 	s.node.storeCfg.ClosedTimestamp.RegisterClosedTimestampServer(s.grpc.Server)
 	s.replicationReporter = reports.NewReporter(
 		s.db, s.node.stores, s.storePool,
 		s.ClusterSettings(), s.nodeLiveness, internalExecutor)
 
 	s.sessionRegistry = sql.NewSessionRegistry()
+	var jobAdoptionStopFile string
+	for _, spec := range s.cfg.Stores.Specs {
+		if !spec.InMemory && spec.Path != "" {
+			jobAdoptionStopFile = filepath.Join(spec.Path, jobs.PreventAdoptionFile)
+			break
+		}
+	}
 	s.jobRegistry = jobs.MakeRegistry(
 		s.cfg.AmbientCtx,
 		s.stopper,
@@ -533,8 +589,20 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			// in sql/jobs/registry.go on planHookMaker.
 			return sql.NewInternalPlanner(opName, nil, user, &sql.MemoryMetrics{}, &execCfg)
 		},
+		jobAdoptionStopFile,
 	)
 	s.registry.AddMetricStruct(s.jobRegistry.MetricsStruct())
+	s.protectedtsReconciler = ptreconcile.NewReconciler(ptreconcile.Config{
+		Settings: s.st,
+		Stores:   s.node.stores,
+		DB:       s.db,
+		Storage:  s.protectedtsProvider,
+		Cache:    s.protectedtsProvider,
+		StatusFuncs: ptreconcile.StatusFuncs{
+			jobsprotectedts.MetaType: jobsprotectedts.MakeStatusFunc(s.jobRegistry),
+		},
+	})
+	s.registry.AddMetricStruct(s.protectedtsReconciler.Metrics())
 
 	distSQLMetrics := execinfra.MakeDistSQLMetrics(cfg.HistogramWindowInterval())
 	s.registry.AddMetricStruct(distSQLMetrics)
@@ -563,24 +631,31 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		RuntimeStats:   s.runtime,
 		DB:             s.db,
 		Executor:       internalExecutor,
-		FlowDB:         client.NewDB(s.cfg.AmbientCtx, s.tcsFactory, s.clock),
+		FlowDB:         kv.NewDB(s.cfg.AmbientCtx, s.tcsFactory, s.clock),
 		RPCContext:     s.rpcContext,
 		Stopper:        s.stopper,
 		NodeID:         &s.nodeIDContainer,
 		ClusterID:      &s.rpcContext.ClusterID,
 		ClusterName:    s.cfg.ClusterName,
 
-		TempStorage: tempEngine,
-		DiskMonitor: s.cfg.TempStorageConfig.Mon,
+		TempStorage:     tempEngine,
+		TempStoragePath: s.cfg.TempStorageConfig.Path,
+		TempFS:          tempFS,
+		// COCKROACH_VEC_MAX_OPEN_FDS specifies the maximum number of open file
+		// descriptors that the vectorized execution engine may have open at any
+		// one time. This limit is implemented as a weighted semaphore acquired
+		// before opening files.
+		VecFDSemaphore: semaphore.New(envutil.EnvOrDefaultInt("COCKROACH_VEC_MAX_OPEN_FDS", colexec.VecMaxOpenFDsLimit)),
+		DiskMonitor:    s.cfg.TempStorageConfig.Mon,
 
 		ParentMemoryMonitor: &rootSQLMemoryMonitor,
 		BulkAdder: func(
-			ctx context.Context, db *client.DB, ts hlc.Timestamp, opts storagebase.BulkAdderOptions,
+			ctx context.Context, db *kv.DB, ts hlc.Timestamp, opts storagebase.BulkAdderOptions,
 		) (storagebase.BulkAdder, error) {
 			// Attach a child memory monitor to enable control over the BulkAdder's
 			// memory usage.
 			bulkMon := execinfra.NewMonitor(ctx, &bulkMemoryMonitor, fmt.Sprintf("bulk-adder-monitor"))
-			return bulk.MakeBulkAdder(ctx, db, s.distSender.RangeDescriptorCache(), ts, opts, bulkMon)
+			return bulk.MakeBulkAdder(ctx, db, s.distSender.RangeDescriptorCache(), s.st, ts, opts, bulkMon)
 		},
 
 		Metrics: &distSQLMetrics,
@@ -593,6 +668,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		ExternalStorage:        externalStorage,
 		ExternalStorageFromURI: externalStorageFromURI,
 	}
+	s.cfg.TempStorageConfig.Mon.SetMetrics(distSQLMetrics.CurDiskBytesCount, distSQLMetrics.MaxDiskBytesHist)
 	if distSQLTestingKnobs := s.cfg.TestingKnobs.DistSQL; distSQLTestingKnobs != nil {
 		distSQLCfg.TestingKnobs = *distSQLTestingKnobs.(*execinfra.TestingKnobs)
 	}
@@ -615,6 +691,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		s.node.stores,
 		s.stopper,
 		s.sessionRegistry,
+		internalExecutor,
 	)
 	s.authentication = newAuthenticationServer(s)
 	for _, gw := range []grpcGatewayServer{s.admin, s.status, s.authentication, &s.tsServer} {
@@ -674,6 +751,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		HistogramWindowInterval: s.cfg.HistogramWindowInterval(),
 		RangeDescriptorCache:    s.distSender.RangeDescriptorCache(),
 		LeaseHolderCache:        s.distSender.LeaseHolderCache(),
+		RoleMemberCache:         &sql.MembershipCache{},
 		TestingKnobs:            sqlExecutorTestingKnobs,
 
 		DistSQLPlanner: sql.NewDistSQLPlanner(
@@ -698,23 +776,57 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			internalExecutor,
 		),
 
+		// Note: don't forget to add the secondary loggers as closers
+		// on the Stopper, below.
+
 		ExecLogger: log.NewSecondaryLogger(
 			loggerCtx, nil /* dirName */, "sql-exec",
 			true /* enableGc */, false /*forceSyncWrites*/, true, /* enableMsgCount */
 		),
 
+		// Note: the auth logger uses sync writes because we don't want an
+		// attacker to easily "erase their traces" after an attack by
+		// crashing the server before it has a chance to write the last
+		// few log lines to disk.
+		//
+		// TODO(knz): We could worry about disk I/O activity incurred by
+		// logging here in case a malicious user spams the server with
+		// (failing) connection attempts to cause a DoS failure; this
+		// would be a good reason to invest into a syslog sink for logs.
+		AuthLogger: log.NewSecondaryLogger(
+			loggerCtx, nil /* dirName */, "auth",
+			true /* enableGc */, true /*forceSyncWrites*/, true, /* enableMsgCount */
+		),
+
+		// AuditLogger syncs to disk for the same reason as AuthLogger.
 		AuditLogger: log.NewSecondaryLogger(
 			loggerCtx, s.cfg.SQLAuditLogDirName, "sql-audit",
 			true /*enableGc*/, true /*forceSyncWrites*/, true, /* enableMsgCount */
 		),
 
-		QueryCache: querycache.New(s.cfg.SQLQueryCacheSize),
+		SlowQueryLogger: log.NewSecondaryLogger(
+			loggerCtx, nil, "sql-slow",
+			true /*enableGc*/, false /*forceSyncWrites*/, true, /* enableMsgCount */
+		),
+
+		QueryCache:                 querycache.New(s.cfg.SQLQueryCacheSize),
+		ProtectedTimestampProvider: s.protectedtsProvider,
 	}
+
+	s.stopper.AddCloser(execCfg.ExecLogger)
+	s.stopper.AddCloser(execCfg.AuditLogger)
+	s.stopper.AddCloser(execCfg.SlowQueryLogger)
+	s.stopper.AddCloser(execCfg.AuthLogger)
 
 	if sqlSchemaChangerTestingKnobs := s.cfg.TestingKnobs.SQLSchemaChanger; sqlSchemaChangerTestingKnobs != nil {
 		execCfg.SchemaChangerTestingKnobs = sqlSchemaChangerTestingKnobs.(*sql.SchemaChangerTestingKnobs)
 	} else {
 		execCfg.SchemaChangerTestingKnobs = new(sql.SchemaChangerTestingKnobs)
+	}
+	if gcJobTestingKnobs := s.cfg.TestingKnobs.GCJob; gcJobTestingKnobs != nil {
+		execCfg.GCJobTestingKnobs = gcJobTestingKnobs.(*sql.GCJobTestingKnobs)
+	} else {
+		execCfg.GCJobTestingKnobs = new(sql.GCJobTestingKnobs)
 	}
 	if distSQLRunTestingKnobs := s.cfg.TestingKnobs.DistSQL; distSQLRunTestingKnobs != nil {
 		execCfg.DistSQLRunTestingKnobs = distSQLRunTestingKnobs.(*execinfra.TestingKnobs)
@@ -751,20 +863,24 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	// Now that we have a pgwire.Server (which has a sql.Server), we can close a
 	// circular dependency between the rowexec.Server and sql.Server and set
-	// SessionBoundInternalExecutorFactory.
-	s.distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory =
-		func(
-			ctx context.Context, sessionData *sessiondata.SessionData,
-		) sqlutil.InternalExecutor {
-			ie := sql.NewSessionBoundInternalExecutor(
-				ctx,
-				sessionData,
-				s.pgServer.SQLServer,
-				s.sqlMemMetrics,
-				s.st,
-			)
-			return ie
-		}
+	// SessionBoundInternalExecutorFactory. The same applies for setting a
+	// SessionBoundInternalExecutor on the the job registry.
+	ieFactory := func(
+		ctx context.Context, sessionData *sessiondata.SessionData,
+	) sqlutil.InternalExecutor {
+		ie := sql.MakeInternalExecutor(
+			ctx,
+			s.pgServer.SQLServer,
+			s.sqlMemMetrics,
+			s.st,
+		)
+		ie.SetSessionData(sessionData)
+		return &ie
+	}
+	s.distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory = ieFactory
+	s.jobRegistry.SetSessionBoundInternalExecutorFactory(ieFactory)
+
+	s.distSQLServer.ServerConfig.ProtectedTimestampProvider = execCfg.ProtectedTimestampProvider
 
 	for _, m := range s.pgServer.Metrics() {
 		s.registry.AddMetricStruct(m)
@@ -774,7 +890,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	)
 	s.internalExecutor = internalExecutor
 	execCfg.InternalExecutor = internalExecutor
-
+	s.status.stmtDiagnosticsRequester = execCfg.NewStmtDiagnosticsRequestRegistry()
 	s.execCfg = &execCfg
 
 	s.leaseMgr.SetInternalExecutor(execCfg.InternalExecutor)
@@ -783,6 +899,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	s.node.InitLogger(&execCfg)
 	s.cfg.DefaultZoneConfig = cfg.DefaultZoneConfig
+
+	s.debug = debug.NewServer(s.ClusterSettings(), s.pgServer.HBADebugFn())
+
+	s.temporaryObjectCleaner = sql.NewTemporaryObjectCleaner(
+		s.st,
+		s.db,
+		s.distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory,
+		s.status,
+		s.node.stores.IsMeta1Leaseholder,
+		sqlExecutorTestingKnobs,
+	)
 
 	return s, nil
 }
@@ -839,40 +966,44 @@ type ListenError struct {
 	Addr string
 }
 
+// inspectEngines goes through engines and checks which ones are bootstrapped
+// and which ones are empty.
+// It also calls SynthesizeClusterVersionFromEngines to get the cluster version,
+// or to set it if no engines have a version in them already.
 func inspectEngines(
 	ctx context.Context,
-	engines []engine.Engine,
-	minVersion, serverVersion roachpb.Version,
+	engines []storage.Engine,
+	binaryVersion, binaryMinSupportedVersion roachpb.Version,
 	clusterIDContainer *base.ClusterIDContainer,
 ) (
-	bootstrappedEngines []engine.Engine,
-	emptyEngines []engine.Engine,
-	_ cluster.ClusterVersion,
+	bootstrappedEngines []storage.Engine,
+	emptyEngines []storage.Engine,
+	_ clusterversion.ClusterVersion,
 	_ error,
 ) {
-	for _, engine := range engines {
-		storeIdent, err := storage.ReadStoreIdent(ctx, engine)
-		if _, notBootstrapped := err.(*storage.NotBootstrappedError); notBootstrapped {
-			emptyEngines = append(emptyEngines, engine)
+	for _, eng := range engines {
+		storeIdent, err := kvserver.ReadStoreIdent(ctx, eng)
+		if _, notBootstrapped := err.(*kvserver.NotBootstrappedError); notBootstrapped {
+			emptyEngines = append(emptyEngines, eng)
 			continue
 		} else if err != nil {
-			return nil, nil, cluster.ClusterVersion{}, err
+			return nil, nil, clusterversion.ClusterVersion{}, err
 		}
 		clusterID := clusterIDContainer.Get()
 		if storeIdent.ClusterID != uuid.Nil {
 			if clusterID == uuid.Nil {
 				clusterIDContainer.Set(ctx, storeIdent.ClusterID)
 			} else if storeIdent.ClusterID != clusterID {
-				return nil, nil, cluster.ClusterVersion{},
+				return nil, nil, clusterversion.ClusterVersion{},
 					errors.Errorf("conflicting store cluster IDs: %s, %s", storeIdent.ClusterID, clusterID)
 			}
 		}
-		bootstrappedEngines = append(bootstrappedEngines, engine)
+		bootstrappedEngines = append(bootstrappedEngines, eng)
 	}
 
-	cv, err := storage.SynthesizeClusterVersionFromEngines(ctx, bootstrappedEngines, minVersion, serverVersion)
+	cv, err := kvserver.SynthesizeClusterVersionFromEngines(ctx, bootstrappedEngines, binaryVersion, binaryMinSupportedVersion)
 	if err != nil {
-		return nil, nil, cluster.ClusterVersion{}, err
+		return nil, nil, clusterversion.ClusterVersion{}, err
 	}
 	return bootstrappedEngines, emptyEngines, cv, nil
 }
@@ -974,12 +1105,7 @@ func ensureClockMonotonicity(
 		// As an optimization for tests, we don't sleep if all the stores are brand
 		// new. In this case, the node will not serve anything anyway until it
 		// synchronizes with other nodes.
-
-		// Don't have to sleep for monotonicity when using clockless reads
-		// (nor can we, for we would sleep forever).
-		if maxOffset := clock.MaxOffset(); maxOffset != timeutil.ClocklessMaxOffset {
-			sleepUntil = startTime.UnixNano() + int64(maxOffset) + 1
-		}
+		sleepUntil = startTime.UnixNano() + int64(clock.MaxOffset()) + 1
 	}
 
 	currentWallTimeFn := func() int64 { /* function to report current time */
@@ -1146,9 +1272,6 @@ func (s *Server) startPersistingHLCUpperBound(
 // The passed context can be used to trace the server startup. The context
 // should represent the general startup operation.
 func (s *Server) Start(ctx context.Context) error {
-	if !s.st.Initialized {
-		return errors.New("must pass initialized ClusterSettings")
-	}
 	ctx = s.AnnotateCtx(ctx)
 
 	// Start the time sanity checker.
@@ -1209,7 +1332,7 @@ func (s *Server) Start(ctx context.Context) error {
 	//
 	// TODO(marc): when cookie-based authentication exists, apply it to all web
 	// endpoints.
-	s.mux.Handle(debug.Endpoint, debug.NewServer(s.st))
+	s.mux.Handle(debug.Endpoint, s.debug)
 
 	// Initialize grpc-gateway mux and context in order to get the /health
 	// endpoint working even before the node has fully initialized.
@@ -1276,6 +1399,11 @@ func (s *Server) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	// Handle /health early. This is necessary for orchestration.  Note
+	// that /health is not authenticated, on purpose. This is both
+	// because it needs to be available before the cluster is up and can
+	// serve authentication requests, and also because it must work for
+	// monitoring tools which operate without authentication.
 	s.mux.Handle("/health", gwMux)
 
 	s.engines, err = s.cfg.CreateEngines(ctx)
@@ -1308,8 +1436,10 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	bootstrappedEngines, _, _, err := inspectEngines(
-		ctx, s.engines, s.cfg.Settings.Version.MinSupportedVersion,
-		s.cfg.Settings.Version.ServerVersion, &s.rpcContext.ClusterID)
+		ctx, s.engines,
+		s.cfg.Settings.Version.BinaryVersion(),
+		s.cfg.Settings.Version.BinaryMinSupportedVersion(),
+		&s.rpcContext.ClusterID)
 	if err != nil {
 		return errors.Wrap(err, "inspecting engines")
 	}
@@ -1337,7 +1467,7 @@ func (s *Server) Start(ctx context.Context) error {
 			s.cfg.ReadyFn(false /*waitForInit*/)
 		}
 
-		hlcUpperBound, err := storage.ReadMaxHLCUpperBound(ctx, bootstrappedEngines)
+		hlcUpperBound, err := kvserver.ReadMaxHLCUpperBound(ctx, bootstrappedEngines)
 		if err != nil {
 			log.Fatal(ctx, err)
 		}
@@ -1379,7 +1509,7 @@ func (s *Server) Start(ctx context.Context) error {
 			//
 			// However we want to be somewhat precisely informative to the user
 			// about whether the node is waiting on init / join, or whether
-			// the join was successful straight away. So we spawn this gogoroutine
+			// the join was successful straight away. So we spawn this goroutine
 			// and either:
 			// - its timer will fire after 2 seconds and we call ReadyFn(true)
 			// - bootstrap completes earlier and the ready chan gets closed,
@@ -1417,7 +1547,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 		doBootstrap = initRes == needBootstrap
 		if doBootstrap {
-			if err := s.bootstrapCluster(ctx); err != nil {
+			if err := s.bootstrapCluster(ctx, s.bootstrapVersion()); err != nil {
 				return err
 			}
 		}
@@ -1429,8 +1559,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// We ran this before, but might've bootstrapped in the meantime. This time
 	// we'll get the actual list of bootstrapped and empty engines.
 	bootstrappedEngines, emptyEngines, cv, err := inspectEngines(
-		ctx, s.engines, s.cfg.Settings.Version.MinSupportedVersion,
-		s.cfg.Settings.Version.ServerVersion, &s.rpcContext.ClusterID)
+		ctx, s.engines,
+		s.cfg.Settings.Version.BinaryVersion(),
+		s.cfg.Settings.Version.BinaryMinSupportedVersion(),
+		&s.rpcContext.ClusterID)
 	if err != nil {
 		return errors.Wrap(err, "inspecting engines")
 	}
@@ -1465,6 +1597,7 @@ func (s *Server) Start(ctx context.Context) error {
 		time.NewTicker,
 	)
 	s.replicationReporter.Start(ctx, s.stopper)
+	s.temporaryObjectCleaner.Start(ctx, s.stopper)
 
 	// Cluster ID should have been determined by this point.
 	if s.rpcContext.ClusterID.Get() == uuid.Nil {
@@ -1499,26 +1632,6 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	})
 
-	// Create and start the schema change manager only after a NodeID
-	// has been assigned.
-	var testingKnobs *sql.SchemaChangerTestingKnobs
-	if s.cfg.TestingKnobs.SQLSchemaChanger != nil {
-		testingKnobs = s.cfg.TestingKnobs.SQLSchemaChanger.(*sql.SchemaChangerTestingKnobs)
-	} else {
-		testingKnobs = new(sql.SchemaChangerTestingKnobs)
-	}
-
-	sql.NewSchemaChangeManager(
-		s.cfg.AmbientCtx,
-		s.execCfg,
-		testingKnobs,
-		*s.db,
-		s.node.Descriptor,
-		s.execCfg.DistSQLPlanner,
-		// We're reusing the ieFactory from the distSQLServer.
-		s.distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory,
-	).Start(s.stopper)
-
 	s.distSQLServer.Start()
 	s.pgServer.Start(ctx, s.stopper)
 
@@ -1541,7 +1654,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// updated.
 	s.nodeLiveness.StartHeartbeat(ctx, s.stopper, func(ctx context.Context) {
 		now := s.clock.Now()
-		if err := s.node.stores.VisitStores(func(s *storage.Store) error {
+		if err := s.node.stores.VisitStores(func(s *kvserver.Store) error {
 			return s.WriteLastUpTimestamp(ctx, now)
 		}); err != nil {
 			log.Warning(ctx, errors.Wrap(err, "writing last up timestamp"))
@@ -1551,20 +1664,16 @@ func (s *Server) Start(ctx context.Context) error {
 	// Begin recording status summaries.
 	s.node.startWriteNodeStatus(DefaultMetricsSampleInterval)
 
-	{
-		var regLiveness jobs.NodeLiveness = s.nodeLiveness
-		if testingLiveness := s.cfg.TestingKnobs.RegistryLiveness; testingLiveness != nil {
-			regLiveness = testingLiveness.(*jobs.FakeNodeLiveness)
-		}
-		if err := s.jobRegistry.Start(
-			ctx, s.stopper, regLiveness, jobs.DefaultCancelInterval, jobs.DefaultAdoptInterval,
-		); err != nil {
-			return err
-		}
-	}
-
 	// Start the background thread for periodically refreshing table statistics.
 	if err := s.statsRefresher.Start(ctx, s.stopper, stats.DefaultRefreshInterval); err != nil {
+		return err
+	}
+
+	// Start the protected timestamp subsystem.
+	if err := s.protectedtsProvider.Start(ctx, s.stopper); err != nil {
+		return err
+	}
+	if err := s.protectedtsReconciler.Start(ctx, s.stopper); err != nil {
 		return err
 	}
 
@@ -1576,31 +1685,28 @@ func (s *Server) Start(ctx context.Context) error {
 	if migrationManagerTestingKnobs := s.cfg.TestingKnobs.SQLMigrationManager; migrationManagerTestingKnobs != nil {
 		mmKnobs = *migrationManagerTestingKnobs.(*sqlmigrations.MigrationManagerTestingKnobs)
 	}
+	migrationsExecutor := sql.MakeInternalExecutor(
+		ctx, s.pgServer.SQLServer, s.internalMemMetrics, s.ClusterSettings())
+	migrationsExecutor.SetSessionData(
+		&sessiondata.SessionData{
+			// Migrations need an executor with query distribution turned off. This is
+			// because the node crashes if migrations fail to execute, and query
+			// distribution introduces more moving parts. Local execution is more
+			// robust; for example, the DistSender has retries if it can't connect to
+			// another node, but DistSQL doesn't. Also see #44101 for why DistSQL is
+			// particularly fragile immediately after a node is started (i.e. the
+			// present situation).
+			DistSQLMode: sessiondata.DistSQLOff,
+		})
 	migMgr := sqlmigrations.NewManager(
 		s.stopper,
 		s.db,
-		s.internalExecutor,
+		&migrationsExecutor,
 		s.clock,
 		mmKnobs,
 		s.NodeID().String(),
+		s.ClusterSettings(),
 	)
-	migrationFilter := sqlmigrations.AllMigrations
-	if doBootstrap {
-		// If we've just bootstrapped, some migrations are unnecessary because
-		// they're included in the metadata schema that we've written to the store
-		// by hand.
-		migrationFilter = sqlmigrations.ExcludeMigrationsIncludedInBootstrap
-	}
-	if err := migMgr.EnsureMigrations(ctx, migrationFilter); err != nil {
-		select {
-		case <-s.stopper.ShouldQuiesce():
-			// Avoid turning an early shutdown into a fatal error. See #19579.
-			return errors.New("server is shutting down")
-		default:
-			log.Fatalf(ctx, "%+v", err)
-		}
-	}
-	log.Infof(ctx, "done ensuring all necessary migrations have run")
 
 	// Start garbage collecting system events.
 	s.startSystemLogsGC(ctx)
@@ -1635,13 +1741,47 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.mux.Handle(adminPrefix, authHandler)
 	// Exempt the health check endpoint from authentication.
+	// This mirrors the handling of /health above.
 	s.mux.Handle("/_admin/v1/health", gwMux)
 	s.mux.Handle(ts.URLPrefix, authHandler)
 	s.mux.Handle(statusPrefix, authHandler)
+	// The /login endpoint is, by definition, available pre-authentication.
 	s.mux.Handle(loginPath, gwMux)
 	s.mux.Handle(logoutPath, authHandler)
+	// The /_status/vars endpoint is not authenticated either. Useful for monitoring.
 	s.mux.Handle(statusVars, http.HandlerFunc(s.status.handleVars))
 	log.Event(ctx, "added http endpoints")
+
+	// Start the jobs subsystem.
+	{
+		var regLiveness jobs.NodeLiveness = s.nodeLiveness
+		if testingLiveness := s.cfg.TestingKnobs.RegistryLiveness; testingLiveness != nil {
+			regLiveness = testingLiveness.(*jobs.FakeNodeLiveness)
+		}
+		if err := s.jobRegistry.Start(
+			ctx, s.stopper, regLiveness, jobs.DefaultCancelInterval, jobs.DefaultAdoptInterval,
+		); err != nil {
+			return err
+		}
+	}
+
+	// Run startup migrations (note: these depend on jobs subsystem running).
+	var bootstrapVersion roachpb.Version
+	if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		return txn.GetProto(ctx, keys.BootstrapVersionKey, &bootstrapVersion)
+	}); err != nil {
+		return err
+	}
+	if err := migMgr.EnsureMigrations(ctx, bootstrapVersion); err != nil {
+		select {
+		case <-s.stopper.ShouldQuiesce():
+			// Avoid turning an early shutdown into a fatal error. See #19579.
+			return errors.New("server is shutting down")
+		default:
+			log.Fatalf(ctx, "%+v", err)
+		}
+	}
+	log.Infof(ctx, "done ensuring all necessary migrations have run")
 
 	// Attempt to upgrade cluster version.
 	s.startAttemptUpgrade(ctx)
@@ -1650,6 +1790,26 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.startServeSQL(ctx, workersCtx, connManager, pgL); err != nil {
 		return err
 	}
+
+	// Record node start in telemetry. Get the right counter for this storage
+	// engine type as well as type of start (initial boot vs restart).
+	nodeStartCounter := "storage.engine."
+	switch s.cfg.StorageEngine {
+	case enginepb.EngineTypePebble:
+		nodeStartCounter += "pebble."
+	case enginepb.EngineTypeDefault:
+		nodeStartCounter += "default."
+	case enginepb.EngineTypeRocksDB:
+		nodeStartCounter += "rocksdb."
+	case enginepb.EngineTypeTeePebbleRocksDB:
+		nodeStartCounter += "pebble+rocksdb."
+	}
+	if s.InitialBoot() {
+		nodeStartCounter += "initial-boot"
+	} else {
+		nodeStartCounter += "restart"
+	}
+	telemetry.Count(nodeStartCounter)
 
 	// Record that this node joined the cluster in the event log. Since this
 	// executes a SQL query, this must be done after the SQL layer is ready.
@@ -1864,8 +2024,8 @@ func (s *Server) startServeSQL(
 			connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
 			tcpKeepAlive.configure(connCtx, conn)
 
-			if err := s.pgServer.ServeConn(connCtx, conn); err != nil {
-				log.Error(connCtx, err)
+			if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketTCP); err != nil {
+				log.Errorf(connCtx, "serving SQL client conn: %v", err)
 			}
 		}))
 	})
@@ -1890,7 +2050,7 @@ func (s *Server) startServeSQL(
 		s.stopper.RunWorker(pgCtx, func(pgCtx context.Context) {
 			netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, s.stopper, unixLn, func(conn net.Conn) {
 				connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
-				if err := s.pgServer.ServeConn(connCtx, conn); err != nil {
+				if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
 					log.Error(connCtx, err)
 				}
 			}))
@@ -1899,15 +2059,21 @@ func (s *Server) startServeSQL(
 	return nil
 }
 
-func (s *Server) bootstrapCluster(ctx context.Context) error {
-	bootstrapVersion := s.cfg.Settings.Version.BootstrapVersion()
-	if s.cfg.TestingKnobs.Store != nil {
-		if storeKnobs, ok := s.cfg.TestingKnobs.Store.(*storage.StoreTestingKnobs); ok && storeKnobs.BootstrapVersion != nil {
-			bootstrapVersion = *storeKnobs.BootstrapVersion
+func (s *Server) bootstrapVersion() roachpb.Version {
+	v := s.cfg.Settings.Version.BinaryVersion()
+	if knobs := s.cfg.TestingKnobs.Server; knobs != nil {
+		if ov := knobs.(*TestingKnobs).BootstrapVersionOverride; ov != (roachpb.Version{}) {
+			v = ov
 		}
 	}
+	return v
+}
 
-	if err := s.node.bootstrapCluster(ctx, s.engines, bootstrapVersion, &s.cfg.DefaultZoneConfig, &s.cfg.DefaultSystemZoneConfig); err != nil {
+func (s *Server) bootstrapCluster(ctx context.Context, bootstrapVersion roachpb.Version) error {
+	if err := s.node.bootstrapCluster(
+		ctx, s.engines, clusterversion.ClusterVersion{Version: bootstrapVersion},
+		&s.cfg.DefaultZoneConfig, &s.cfg.DefaultSystemZoneConfig,
+	); err != nil {
 		return err
 	}
 	// Force all the system ranges through the replication queue so they
@@ -1915,7 +2081,7 @@ func (s *Server) bootstrapCluster(ctx context.Context) error {
 	// code, the upreplication would be up to the whim of the scanner, which
 	// might be too slow for new clusters.
 	done := false
-	return s.node.stores.VisitStores(func(store *storage.Store) error {
+	return s.node.stores.VisitStores(func(store *kvserver.Store) error {
 		if !done {
 			done = true
 			return store.ForceReplicationScanAndProcess()
@@ -2022,7 +2188,7 @@ func (s *Server) Decommission(ctx context.Context, setTo bool, nodeIDs []roachpb
 			// update, this would force a 2PC and potentially leave write intents in
 			// the node liveness range. Better to make the event logging best effort
 			// than to slow down future node liveness transactions.
-			if err := s.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+			if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 				return eventLogger.InsertEventRecord(
 					ctx, txn, eventType, int32(nodeID), int32(s.NodeID()), struct{}{},
 				)

@@ -126,8 +126,10 @@ func registerPsycopg(r *testRegistry) {
 
 	r.Add(testSpec{
 		Name:       "psycopg",
+		Owner:      OwnerAppDev,
 		Cluster:    makeClusterSpec(1),
 		MinVersion: "v19.1.0",
+		Tags:       []string{`default`, `driver`},
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runPsycopg(ctx, t, c)
 		},

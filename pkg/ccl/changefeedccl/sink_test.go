@@ -167,9 +167,11 @@ func TestKafkaSinkEscaping(t *testing.T) {
 
 type testEncoder struct{}
 
-func (testEncoder) EncodeKey(encodeRow) ([]byte, error)   { panic(`unimplemented`) }
-func (testEncoder) EncodeValue(encodeRow) ([]byte, error) { panic(`unimplemented`) }
-func (testEncoder) EncodeResolvedTimestamp(_ string, ts hlc.Timestamp) ([]byte, error) {
+func (testEncoder) EncodeKey(context.Context, encodeRow) ([]byte, error)   { panic(`unimplemented`) }
+func (testEncoder) EncodeValue(context.Context, encodeRow) ([]byte, error) { panic(`unimplemented`) }
+func (testEncoder) EncodeResolvedTimestamp(
+	_ context.Context, _ string, ts hlc.Timestamp,
+) ([]byte, error) {
 	return []byte(ts.String()), nil
 }
 
@@ -272,18 +274,18 @@ func TestSQLSink(t *testing.T) {
 	sqlDB.CheckQueryResults(t,
 		`SELECT topic, partition, key, value, resolved FROM sink ORDER BY PRIMARY KEY sink`,
 		[][]string{
-			{`bar`, `0`, ``, ``, `0.000000000,0`},
+			{`bar`, `0`, ``, ``, `0,0`},
 			{`bar`, `0`, ``, ``, `0.000000001,0`},
-			{`bar`, `1`, ``, ``, `0.000000000,0`},
+			{`bar`, `1`, ``, ``, `0,0`},
 			{`bar`, `1`, ``, ``, `0.000000001,0`},
-			{`bar`, `2`, ``, ``, `0.000000000,0`},
+			{`bar`, `2`, ``, ``, `0,0`},
 			{`bar`, `2`, ``, ``, `0.000000001,0`},
-			{`foo`, `0`, ``, ``, `0.000000000,0`},
+			{`foo`, `0`, ``, ``, `0,0`},
 			{`foo`, `0`, `foo0`, `v0`, ``},
 			{`foo`, `0`, ``, ``, `0.000000001,0`},
-			{`foo`, `1`, ``, ``, `0.000000000,0`},
+			{`foo`, `1`, ``, ``, `0,0`},
 			{`foo`, `1`, ``, ``, `0.000000001,0`},
-			{`foo`, `2`, ``, ``, `0.000000000,0`},
+			{`foo`, `2`, ``, ``, `0,0`},
 			{`foo`, `2`, ``, ``, `0.000000001,0`},
 		},
 	)

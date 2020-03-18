@@ -21,8 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -31,14 +30,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/require"
 )
 
 type indexKeyTest struct {
@@ -112,7 +109,7 @@ func decodeIndex(
 	}
 	values := make([]EncDatum, len(index.ColumnIDs))
 	colDirs := index.ColumnDirections
-	_, ok, err := DecodeIndexKey(tableDesc, index, types, values, colDirs, key)
+	_, ok, _, err := DecodeIndexKey(tableDesc, index, types, values, colDirs, key)
 	if err != nil {
 		return nil, err
 	}
@@ -198,6 +195,23 @@ func TestIndexKey(t *testing.T) {
 		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer evalCtx.Stop(context.Background())
 		tableDesc, colMap := makeTableDescForTest(test)
+		// Add the default family to each test, since secondary indexes support column families.
+		var (
+			colNames []string
+			colIDs   ColumnIDs
+		)
+		for _, c := range tableDesc.Columns {
+			colNames = append(colNames, c.Name)
+			colIDs = append(colIDs, c.ID)
+		}
+		tableDesc.Families = []ColumnFamilyDescriptor{{
+			Name:            "defaultFamily",
+			ID:              0,
+			ColumnNames:     colNames,
+			ColumnIDs:       colIDs,
+			DefaultColumnID: colIDs[0],
+		}}
+
 		testValues := append(test.primaryValues, test.secondaryValues...)
 
 		primaryKeyPrefix := MakeIndexKeyPrefix(&tableDesc, tableDesc.PrimaryIndex.ID)
@@ -207,23 +221,22 @@ func TestIndexKey(t *testing.T) {
 			t.Fatal(err)
 		}
 		primaryValue := roachpb.MakeValueFromBytes(nil)
-		primaryIndexKV := client.KeyValue{Key: primaryKey, Value: &primaryValue}
+		primaryIndexKV := kv.KeyValue{Key: primaryKey, Value: &primaryValue}
 
 		secondaryIndexEntry, err := EncodeSecondaryIndex(
-			&tableDesc, &tableDesc.Indexes[0], colMap, testValues)
-
+			&tableDesc, &tableDesc.Indexes[0], colMap, testValues, true /* includeEmpty */)
 		if len(secondaryIndexEntry) != 1 {
 			t.Fatalf("expected 1 index entry, got %d. got %#v", len(secondaryIndexEntry), secondaryIndexEntry)
 		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		secondaryIndexKV := client.KeyValue{
+		secondaryIndexKV := kv.KeyValue{
 			Key:   secondaryIndexEntry[0].Key,
 			Value: &secondaryIndexEntry[0].Value,
 		}
 
-		checkEntry := func(index *IndexDescriptor, entry client.KeyValue) {
+		checkEntry := func(index *IndexDescriptor, entry kv.KeyValue) {
 			values, err := decodeIndex(&tableDesc, index, entry.Key)
 			if err != nil {
 				t.Fatal(err)
@@ -1508,56 +1521,4 @@ func TestDecodeTableValue(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestSplitKeysForTable(t *testing.T) {
-	var val roachpb.Value
-	err := val.SetProto(&Descriptor{
-		Union: &Descriptor_Table{
-			Table: &TableDescriptor{
-				// Fill in the descriptor just enough for the test to work.
-				ID: ID(50),
-			},
-		},
-	})
-	require.NoError(t, err)
-	// We need to set some timestamp on this proto, otherwise unwrapping the
-	// descriptor fatals.
-	val.Timestamp = hlc.Timestamp{WallTime: 123}
-
-	indexKey := encoding.EncodeUvarintAscending(nil, 1)
-	// Remove any excess capacity, assuring that all the following encodes will
-	// create new slices.
-	indexKey = indexKey[:len(indexKey):len(indexKey)]
-	k1 := encoding.EncodeUvarintAscending(indexKey, 10)
-	k2 := encoding.EncodeUvarintAscending(indexKey, 20)
-	k3 := encoding.EncodeUvarintAscending(indexKey, 30)
-	k4 := encoding.EncodeUvarintAscending(indexKey, 40)
-	zone := zonepb.ZoneConfig{
-		SubzoneSpans: []zonepb.SubzoneSpan{{
-			Key:          k1,
-			EndKey:       k2,
-			SubzoneIndex: 0,
-		}, {
-			Key:          k3,
-			EndKey:       k4,
-			SubzoneIndex: 1,
-		}},
-	}
-	splits, err := SplitKeysForTable(&val, &zone)
-	require.NoError(t, err)
-
-	tableKey := encoding.EncodeUvarintAscending(nil, 50)
-	tableAndIndexKey := EncodeTableIDIndexID(nil, 50, 1)
-	// Remove any excess capacity, assuring that all the following encodes will
-	// create new slices.
-	tableAndIndexKey = tableAndIndexKey[:len(tableAndIndexKey):len(tableAndIndexKey)]
-	exp := []roachpb.RKey{
-		tableKey,
-		encoding.EncodeUvarintAscending(tableAndIndexKey, 10),
-		encoding.EncodeUvarintAscending(tableAndIndexKey, 20),
-		encoding.EncodeUvarintAscending(tableAndIndexKey, 30),
-		encoding.EncodeUvarintAscending(tableAndIndexKey, 40),
-	}
-	require.Equal(t, exp, splits)
 }

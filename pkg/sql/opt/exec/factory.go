@@ -51,19 +51,27 @@ type Factory interface {
 	//   - If indexConstraint is not nil, the scan is restricted to the spans in
 	//     in the constraint.
 	//   - If hardLimit > 0, then only up to hardLimit rows can be returned from
-	//     the scan.
+	//     the scan. If hardLimit > 0, softLimit must be 0.
+	//   - If softLimit > 0, then the scan may be required to return up to all
+	//     of its rows, but can be optimized under the assumption that only
+	//     softLimit rows will be needed. If softLimit > 0, then hardLimit must
+	//     be 0.
 	//   - If maxResults > 0, the scan is guaranteed to return at most maxResults
 	//     rows.
+	//   - If locking is provided, the scan should use the specified row-level
+	//     locking mode.
 	ConstructScan(
 		table cat.Table,
 		index cat.Index,
 		needed ColumnOrdinalSet,
 		indexConstraint *constraint.Constraint,
 		hardLimit int64,
+		softLimit int64,
 		reverse bool,
 		maxResults uint64,
 		reqOrdering OutputOrdering,
 		rowCount float64,
+		locking *tree.LockingItem,
 	) (Node, error)
 
 	// ConstructVirtualScan returns a node that represents the scan of a virtual
@@ -181,7 +189,11 @@ type Factory interface {
 	// ordered along these columns (i.e. all rows with the same values on these
 	// columns are a contiguous part of the input).
 	ConstructDistinct(
-		input Node, distinctCols, orderedCols ColumnOrdinalSet, reqOrdering OutputOrdering,
+		input Node,
+		distinctCols, orderedCols ColumnOrdinalSet,
+		reqOrdering OutputOrdering,
+		nullsAreDistinct bool,
+		errorOnDup string,
 	) (Node, error)
 
 	// ConstructSetOp returns a node that performs a UNION / INTERSECT / EXCEPT
@@ -259,9 +271,9 @@ type Factory interface {
 	ConstructLimit(input Node, limit, offset tree.TypedExpr) (Node, error)
 
 	// ConstructMax1Row returns a node that permits at most one row from the
-	// given input node, returning an error at runtime if the node tries to return
-	// more than one row.
-	ConstructMax1Row(input Node) (Node, error)
+	// given input node, returning an error with the given text at runtime if
+	// the node tries to return more than one row.
+	ConstructMax1Row(input Node, errorText string) (Node, error)
 
 	// ConstructProjectSet returns a node that performs a lateral cross join
 	// between the output of the given node and the functional zip of the given
@@ -321,9 +333,31 @@ type Factory interface {
 		table cat.Table,
 		insertCols ColumnOrdinalSet,
 		returnCols ColumnOrdinalSet,
-		checks CheckOrdinalSet,
+		checkCols CheckOrdinalSet,
 		allowAutoCommit bool,
 		skipFKChecks bool,
+	) (Node, error)
+
+	// ConstructInsertFastPath creates a node that implements a special (but very
+	// common) case of insert, satisfying the following conditions:
+	//  - the input is Values with at most InsertFastPathMaxRows, and there are no
+	//    subqueries;
+	//  - there are no other mutations in the statement, and the output of the
+	//    insert is not processed through side-effecting expressions (see
+	//    allowAutoCommit flag for ConstructInsert);
+	//  - there are no self-referencing foreign keys;
+	//  - all FK checks can be performed using direct lookups into unique indexes.
+	//
+	// In this case, the foreign-key checks can run before (or even concurrently
+	// with) the insert. If they are run before, the insert is allowed to
+	// auto-commit.
+	ConstructInsertFastPath(
+		rows [][]tree.TypedExpr,
+		table cat.Table,
+		insertCols ColumnOrdinalSet,
+		returnCols ColumnOrdinalSet,
+		checkCols CheckOrdinalSet,
+		fkChecks []InsertFastPathFKCheck,
 	) (Node, error)
 
 	// ConstructUpdate creates a node that implements an UPDATE statement. The
@@ -391,6 +425,11 @@ type Factory interface {
 	// transaction (if appropriate, i.e. if it is in an implicit transaction).
 	// This is false if there are multiple mutations in a statement, or the output
 	// of the mutation is processed through side-effecting expressions.
+	//
+	// If skipFKChecks is set, foreign keys are not checked as part of the
+	// execution of the upsert for the insert half. This is used when the FK
+	// checks are planned by the optimizer and are run separately as plan
+	// postqueries.
 	ConstructUpsert(
 		input Node,
 		table cat.Table,
@@ -401,6 +440,7 @@ type Factory interface {
 		returnCols ColumnOrdinalSet,
 		checks CheckOrdinalSet,
 		allowAutoCommit bool,
+		skipFKChecks bool,
 	) (Node, error)
 
 	// ConstructDelete creates a node that implements a DELETE statement. The
@@ -417,8 +457,8 @@ type Factory interface {
 	// of the mutation is processed through side-effecting expressions.
 	//
 	// If skipFKChecks is set, foreign keys are not checked as part of the
-	// execution of the insertion. This is used when the FK checks are planned by
-	// the optimizer and are run separately as plan postqueries.
+	// execution of the delete. This is used when the FK checks are planned
+	// by the optimizer and are run separately as plan postqueries.
 	ConstructDelete(
 		input Node,
 		table cat.Table,
@@ -445,6 +485,7 @@ type Factory interface {
 	ConstructCreateView(
 		schema cat.Schema,
 		viewName string,
+		ifNotExists bool,
 		temporary bool,
 		viewQuery string,
 		columns sqlbase.ResultColumns,
@@ -622,6 +663,13 @@ type WindowInfo struct {
 
 	// Ordering is the set of input columns to order on.
 	Ordering sqlbase.ColumnOrdering
+
+	// RangeOffsetColumn is the column ID of a single column from ORDER BY clause
+	// when window frame has RANGE mode of framing and at least one 'offset'
+	// boundary. We store it separately because the ordering might be simplified
+	// (when that single column is in Partition), but the execution still needs
+	// to know the original ordering.
+	RangeOffsetColumn ColumnOrdinal
 }
 
 // ExplainEnvData represents the data that's going to be displayed in EXPLAIN (env).
@@ -640,7 +688,31 @@ type KVOption struct {
 	Value tree.TypedExpr
 }
 
+// InsertFastPathMaxRows is the maximum number of rows for which we can use the
+// insert fast path.
+const InsertFastPathMaxRows = 10000
+
 // RecursiveCTEIterationFn creates a plan for an iteration of WITH RECURSIVE,
 // given the result of the last iteration (as a Buffer that can be used with
 // ConstructScanBuffer).
 type RecursiveCTEIterationFn func(bufferRef Node) (Plan, error)
+
+// InsertFastPathFKCheck contains information about a foreign key check to be
+// performed by the insert fast-path (see ConstructInsertFastPath). It
+// identifies the index into which we can perform the lookup.
+type InsertFastPathFKCheck struct {
+	ReferencedTable cat.Table
+	ReferencedIndex cat.Index
+
+	// InsertCols contains the FK columns from the origin table, in the order of
+	// the ReferencedIndex columns. For each, the value in the array indicates the
+	// index of the column in the input table.
+	InsertCols []ColumnOrdinal
+
+	MatchMethod tree.CompositeKeyMatchMethod
+
+	// MkErr is called when a violation is detected (i.e. the index has no entries
+	// for a given inserted row). The values passed correspond to InsertCols
+	// above.
+	MkErr func(tree.Datums) error
+}

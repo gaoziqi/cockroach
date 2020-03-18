@@ -13,6 +13,7 @@ package sqlbase
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -23,9 +24,6 @@ type ResultColumn struct {
 
 	// If set, this is an implicit column; used internally.
 	Hidden bool
-
-	// If set, a value won't be produced for this column; used internally.
-	Omitted bool
 }
 
 // ResultColumns is the type used throughout the sql module to
@@ -67,6 +65,12 @@ func (r ResultColumns) TypesEqual(other ResultColumns) bool {
 		}
 	}
 	return true
+}
+
+// NodeFormatter returns a tree.NodeFormatter that, when formatted,
+// represents the column at the input column index.
+func (r ResultColumns) NodeFormatter(colIdx int) tree.NodeFormatter {
+	return &varFormatter{ColumnName: tree.Name(r[colIdx].Name)}
 }
 
 // ExplainPlanColumns are the result columns of an EXPLAIN (PLAN) ...
@@ -119,6 +123,11 @@ var ExplainOptColumns = ResultColumns{
 // ExplainVecColumns are the result columns of an
 // EXPLAIN (VEC) statement.
 var ExplainVecColumns = ResultColumns{
+	{Name: "text", Typ: types.String},
+}
+
+// ExplainBundleColumns are the result columns of an EXPLAIN BUNDLE statement.
+var ExplainBundleColumns = ResultColumns{
 	{Name: "text", Typ: types.String},
 }
 

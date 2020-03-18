@@ -15,10 +15,10 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"time"
 
 	toxiproxy "github.com/Shopify/toxiproxy/client"
+	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	_ "github.com/lib/pq"
 )
 
@@ -26,7 +26,7 @@ import (
 // correctly.
 func runNetworkSanity(ctx context.Context, t *test, origC *cluster, nodes int) {
 	origC.Put(ctx, cockroach, "./cockroach", origC.All())
-	c, err := Toxify(ctx, t.l, origC, origC.All())
+	c, err := Toxify(ctx, origC, origC.All())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func runNetworkTPCC(ctx context.Context, t *test, origC *cluster, nodes int) {
 	origC.Put(ctx, cockroach, "./cockroach", origC.All())
 	origC.Put(ctx, workload, "./workload", origC.All())
 
-	c, err := Toxify(ctx, t.l, origC, serverNodes)
+	c, err := Toxify(ctx, origC, serverNodes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,17 +130,12 @@ func runNetworkTPCC(ctx context.Context, t *test, origC *cluster, nodes int) {
 	m.Go(func(ctx context.Context) error {
 		t.WorkerStatus("running tpcc")
 
-		tpccL, err := c.l.ChildLogger("tpcc", quietStdout, quietStderr)
-		if err != nil {
-			return err
-		}
-
 		cmd := fmt.Sprintf(
 			"./workload run tpcc --warehouses=%d --wait=false"+
 				" --histograms="+perfArtifactsDir+"/stats.json"+
 				" --duration=%s {pgurl:2-%d}",
 			warehouses, duration, c.spec.NodeCount-1)
-		return c.RunL(ctx, tpccL, workerNode, cmd)
+		return c.RunE(ctx, workerNode, cmd)
 	})
 
 	checkGoroutines := func(ctx context.Context) int {
@@ -154,9 +149,12 @@ func runNetworkTPCC(ctx context.Context, t *test, origC *cluster, nodes int) {
 
 		uiAddrs := c.ExternalAdminUIAddr(ctx, serverNodes)
 		var maxSeen int
+		// The goroutine dump may take a while to generate, maybe more
+		// than the 3 second timeout of the default http client.
+		httpClient := httputil.NewClientWithTimeout(15 * time.Second)
 		for _, addr := range uiAddrs {
 			url := "http://" + addr + "/debug/pprof/goroutine?debug=2"
-			resp, err := http.Get(url)
+			resp, err := httpClient.Get(ctx, url)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -240,6 +238,7 @@ func registerNetwork(r *testRegistry) {
 
 	r.Add(testSpec{
 		Name:    fmt.Sprintf("network/sanity/nodes=%d", numNodes),
+		Owner:   OwnerKV,
 		Cluster: makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runNetworkSanity(ctx, t, c, numNodes)
@@ -247,6 +246,7 @@ func registerNetwork(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:    fmt.Sprintf("network/tpcc/nodes=%d", numNodes),
+		Owner:   OwnerKV,
 		Cluster: makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runNetworkTPCC(ctx, t, c, numNodes)

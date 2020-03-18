@@ -71,7 +71,7 @@ query TTT
 EXPLAIN SELECT * FROM abcd@{FORCE_INDEX=primary,ASC} WHERE a >= 20 AND a <= 30 ORDER BY a DESC
 ----
 ·          distributed  false
-·          vectorized   false
+·          vectorized   true
 sort       ·            ·
  │         order        -a
  └── scan  ·            ·

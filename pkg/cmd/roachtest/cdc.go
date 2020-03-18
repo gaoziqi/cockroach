@@ -27,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
 	"github.com/codahale/hdrhistogram"
-	"github.com/pkg/errors"
 )
 
 type workloadType string
@@ -246,7 +246,7 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 		nodes: kafkaNode,
 	}
 	kafka.install(ctx)
-	if !kafka.c.isLocal() {
+	if !c.isLocal() {
 		// TODO(dan): This test currently connects to kafka from the test
 		// runner, so kafka needs to advertise the external address. Better
 		// would be a binary we could run on one of the roachprod machines.
@@ -275,9 +275,16 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 	); err != nil {
 		t.Fatal(err)
 	}
+
+	// NB: the WITH diff option was not supported until v20.1.
+	withDiff := t.IsBuildVersion("v20.1.0")
+	var opts = []string{`updated`, `resolved`}
+	if withDiff {
+		opts = append(opts, `diff`)
+	}
 	var jobID string
 	if err := db.QueryRow(
-		`CREATE CHANGEFEED FOR bank.bank INTO $1 WITH updated, resolved`, kafka.sinkURL(ctx),
+		`CREATE CHANGEFEED FOR bank.bank INTO $1 WITH `+strings.Join(opts, `, `), kafka.sinkURL(ctx),
 	).Scan(&jobID); err != nil {
 		t.Fatal(err)
 	}
@@ -291,10 +298,15 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 		if atomic.LoadInt64(&doneAtomic) > 0 {
 			return nil
 		}
-		return err
+		return errors.Wrap(err, "workload failed")
 	})
-	m.Go(func(ctx context.Context) error {
+	m.Go(func(ctx context.Context) (_err error) {
 		defer workloadCancel()
+
+		defer func() {
+			_err = errors.Wrap(_err, "CDC failed")
+		}()
+
 		l, err := t.l.ChildLogger(`changefeed`)
 		if err != nil {
 			return err
@@ -310,18 +322,26 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 		if _, err := db.Exec(
 			`CREATE TABLE fprint (id INT PRIMARY KEY, balance INT, payload STRING)`,
 		); err != nil {
-			return err
+			return errors.Wrap(err, "CREATE TABLE failed")
 		}
 
 		const requestedResolved = 100
-		fprintV, err := cdctest.NewFingerprintValidator(db, `bank.bank`, `fprint`, tc.partitions)
+		fprintV, err := cdctest.NewFingerprintValidator(db, `bank.bank`, `fprint`, tc.partitions, 0)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "error creating validator")
 		}
-		v := cdctest.MakeCountValidator(cdctest.Validators{
+		validators := cdctest.Validators{
 			cdctest.NewOrderValidator(`bank`),
 			fprintV,
-		})
+		}
+		if withDiff {
+			baV, err := cdctest.NewBeforeAfterValidator(db, `bank.bank`)
+			if err != nil {
+				return err
+			}
+			validators = append(validators, baV)
+		}
+		v := cdctest.MakeCountValidator(validators)
 
 		for {
 			m := tc.Next(ctx)
@@ -335,7 +355,9 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 
 			partitionStr := strconv.Itoa(int(m.Partition))
 			if len(m.Key) > 0 {
-				v.NoteRow(partitionStr, string(m.Key), string(m.Value), updated)
+				if err := v.NoteRow(partitionStr, string(m.Key), string(m.Value), updated); err != nil {
+					return err
+				}
 			} else {
 				if err := v.NoteResolved(partitionStr, resolved); err != nil {
 					return err
@@ -349,7 +371,7 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 			}
 		}
 		if failures := v.Failures(); len(failures) > 0 {
-			return errors.New(strings.Join(failures, "\n"))
+			return errors.New("validator failures:\n" + strings.Join(failures, "\n"))
 		}
 		return nil
 	})
@@ -380,10 +402,16 @@ func runCDCSchemaRegistry(ctx context.Context, t *test, c *cluster) {
 	if _, err := db.Exec(`CREATE TABLE foo (a INT PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
 	}
+
+	// NB: the WITH diff option was not supported until v20.1.
+	withDiff := t.IsBuildVersion("v20.1.0")
+	var opts = []string{`updated`, `resolved`, `format=experimental_avro`, `confluent_schema_registry=$2`}
+	if withDiff {
+		opts = append(opts, `diff`)
+	}
 	var jobID string
 	if err := db.QueryRow(
-		`CREATE CHANGEFEED FOR foo INTO $1`+
-			`WITH updated, resolved, format=experimental_avro, confluent_schema_registry=$2`,
+		`CREATE CHANGEFEED FOR foo INTO $1 WITH `+strings.Join(opts, `, `),
 		kafka.sinkURL(ctx), kafka.schemaRegistryURL(ctx),
 	).Scan(&jobID); err != nil {
 		t.Fatal(err)
@@ -441,14 +469,30 @@ func runCDCSchemaRegistry(ctx context.Context, t *test, c *cluster) {
 	}
 	sort.Strings(updated)
 
-	expected := []string{
-		`{"updated":{"string":""},"after":{"foo":{"a":{"long":1},"c":null}}}`,
-		`{"updated":{"string":""},"after":{"foo":{"a":{"long":1}}}}`,
-		`{"updated":{"string":""},"after":{"foo":{"a":{"long":2},"b":{"string":"2"}}}}`,
-		`{"updated":{"string":""},"after":{"foo":{"a":{"long":2},"c":null}}}`,
-		`{"updated":{"string":""},"after":{"foo":{"a":{"long":3},"b":{"string":"3"},"c":{"long":3}}}}`,
-		`{"updated":{"string":""},"after":{"foo":{"a":{"long":3},"c":{"long":3}}}}`,
-		`{"updated":{"string":""},"after":{"foo":{"a":{"long":4},"c":{"long":4}}}}`,
+	var expected []string
+	if withDiff {
+		expected = []string{
+			`{"before":null,"after":{"foo":{"a":{"long":1}}},"updated":{"string":""}}`,
+			`{"before":null,"after":{"foo":{"a":{"long":2},"b":{"string":"2"}}},"updated":{"string":""}}`,
+			`{"before":null,"after":{"foo":{"a":{"long":3},"b":{"string":"3"},"c":{"long":3}}},"updated":{"string":""}}`,
+			`{"before":null,"after":{"foo":{"a":{"long":4},"c":{"long":4}}},"updated":{"string":""}}`,
+			`{"before":{"foo_before":{"a":{"long":1},"b":null,"c":null}},"after":{"foo":{"a":{"long":1},"c":null}},"updated":{"string":""}}`,
+			`{"before":{"foo_before":{"a":{"long":1},"c":null}},"after":{"foo":{"a":{"long":1},"c":null}},"updated":{"string":""}}`,
+			`{"before":{"foo_before":{"a":{"long":2},"b":{"string":"2"},"c":null}},"after":{"foo":{"a":{"long":2},"c":null}},"updated":{"string":""}}`,
+			`{"before":{"foo_before":{"a":{"long":2},"c":null}},"after":{"foo":{"a":{"long":2},"c":null}},"updated":{"string":""}}`,
+			`{"before":{"foo_before":{"a":{"long":3},"b":{"string":"3"},"c":{"long":3}}},"after":{"foo":{"a":{"long":3},"c":{"long":3}}},"updated":{"string":""}}`,
+			`{"before":{"foo_before":{"a":{"long":3},"c":{"long":3}}},"after":{"foo":{"a":{"long":3},"c":{"long":3}}},"updated":{"string":""}}`,
+		}
+	} else {
+		expected = []string{
+			`{"updated":{"string":""},"after":{"foo":{"a":{"long":1},"c":null}}}`,
+			`{"updated":{"string":""},"after":{"foo":{"a":{"long":1}}}}`,
+			`{"updated":{"string":""},"after":{"foo":{"a":{"long":2},"b":{"string":"2"}}}}`,
+			`{"updated":{"string":""},"after":{"foo":{"a":{"long":2},"c":null}}}`,
+			`{"updated":{"string":""},"after":{"foo":{"a":{"long":3},"b":{"string":"3"},"c":{"long":3}}}}`,
+			`{"updated":{"string":""},"after":{"foo":{"a":{"long":3},"c":{"long":3}}}}`,
+			`{"updated":{"string":""},"after":{"foo":{"a":{"long":4},"c":{"long":4}}}}`,
+		}
 	}
 	if strings.Join(expected, "\n") != strings.Join(updated, "\n") {
 		t.Fatalf("expected\n%s\n\ngot\n%s\n\n",
@@ -470,6 +514,7 @@ func registerCDC(r *testRegistry) {
 
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("cdc/tpcc-1000/rangefeed=%t", useRangeFeed),
+		Owner:      `cdc`,
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -485,6 +530,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("cdc/initial-scan/rangefeed=%t", useRangeFeed),
+		Owner:      `cdc`,
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -500,7 +546,8 @@ func registerCDC(r *testRegistry) {
 		},
 	})
 	r.Add(testSpec{
-		Name: "cdc/poller/rangefeed=false",
+		Name:  "cdc/poller/rangefeed=false",
+		Owner: `cdc`,
 		// When testing a 2.1 binary, we use the poller for all the other tests
 		// and this is close enough to cdc/tpcc-1000 test to be redundant, so
 		// skip it.
@@ -518,7 +565,8 @@ func registerCDC(r *testRegistry) {
 		},
 	})
 	r.Add(testSpec{
-		Name: fmt.Sprintf("cdc/sink-chaos/rangefeed=%t", useRangeFeed),
+		Name:  fmt.Sprintf("cdc/sink-chaos/rangefeed=%t", useRangeFeed),
+		Owner: `cdc`,
 		// TODO(dan): Re-enable this test on 2.1 if we decide to backport #36852.
 		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
@@ -535,8 +583,9 @@ func registerCDC(r *testRegistry) {
 		},
 	})
 	r.Add(testSpec{
-		Name: fmt.Sprintf("cdc/crdb-chaos/rangefeed=%t", useRangeFeed),
-		Skip: "#37716",
+		Name:  fmt.Sprintf("cdc/crdb-chaos/rangefeed=%t", useRangeFeed),
+		Owner: `cdc`,
+		Skip:  "#37716",
 		// TODO(dan): Re-enable this test on 2.1 if we decide to backport #36852.
 		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
@@ -558,6 +607,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("cdc/ledger/rangefeed=%t", useRangeFeed),
+		Owner:      `cdc`,
 		MinVersion: "v2.1.0",
 		// TODO(mrtracy): This workload is designed to be running on a 20CPU nodes,
 		// but this cannot be allocated without some sort of configuration outside
@@ -577,6 +627,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:       "cdc/cloud-sink-gcs/rangefeed=true",
+		Owner:      `cdc`,
 		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -597,11 +648,9 @@ func registerCDC(r *testRegistry) {
 			})
 		},
 	})
-	// TODO(dan): This currently gets its own cluster during the nightly
-	// acceptance tests. Decide whether it's safe to share with the one made for
-	// "acceptance/*".
 	r.Add(testSpec{
 		Name:       "cdc/bank",
+		Owner:      `cdc`,
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(4),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -610,6 +659,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:       "cdc/schemareg",
+		Owner:      `cdc`,
 		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(1),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -631,6 +681,7 @@ func (k kafkaManager) basePath() string {
 }
 
 func (k kafkaManager) install(ctx context.Context) {
+	k.c.status("installing kafka")
 	folder := k.basePath()
 	k.c.Run(ctx, k.nodes, `mkdir -p `+folder)
 	k.c.Run(ctx, k.nodes, `curl -s https://packages.confluent.io/archive/4.0/confluent-oss-4.0.0-2.11.tar.gz | tar -xz -C `+folder)

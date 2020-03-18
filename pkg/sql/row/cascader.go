@@ -13,12 +13,13 @@ package row
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/schema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -29,7 +30,7 @@ import (
 
 // cascader is used to handle all referential integrity cascading actions.
 type cascader struct {
-	txn      *client.Txn
+	txn      *kv.Txn
 	fkTables FkTableMetadata
 	alloc    *sqlbase.DatumAlloc
 	evalCtx  *tree.EvalContext
@@ -51,7 +52,8 @@ type cascader struct {
 // makeDeleteCascader only creates a cascader if there is a chance that there is
 // a possible cascade. It returns a cascader if one is required and nil if not.
 func makeDeleteCascader(
-	txn *client.Txn,
+	ctx context.Context,
+	txn *kv.Txn,
 	table *sqlbase.ImmutableTableDescriptor,
 	tablesByID FkTableMetadata,
 	evalCtx *tree.EvalContext,
@@ -86,6 +88,27 @@ func makeDeleteCascader(
 	if !required {
 		return nil, nil
 	}
+
+	// TODO(knz,radu): FK cascading actions need to see the writes
+	// performed by the mutation.  Moreover, each stage of the cascading
+	// actions must observe the writes from the previous stages but not
+	// its own writes.
+	//
+	// In order to make this true, we need to split the cascading
+	// actions into separate sequencing steps, and have the first
+	// cascading action happen no early than the end of all the
+	// "main" part of the statement. Unfortunately, the organization
+	// of the code does not allow this today.
+	//
+	// See: https://github.com/cockroachdb/cockroach/issues/33475
+	//
+	// In order to "make do" and preserve a modicum of FK semantics we
+	// thus need to disable step-wise execution here. The result is that
+	// it will also enable any interleaved read part to observe the
+	// mutation, and thus introduce the risk of a Halloween problem for
+	// any mutation that uses FK relationships.
+	_ = txn.ConfigureStepping(ctx, kv.SteppingDisabled)
+
 	return &cascader{
 		txn:                txn,
 		fkTables:           tablesByID,
@@ -105,7 +128,8 @@ func makeDeleteCascader(
 // makeUpdateCascader only creates a cascader if there is a chance that there is
 // a possible cascade. It returns a cascader if one is required and nil if not.
 func makeUpdateCascader(
-	txn *client.Txn,
+	ctx context.Context,
+	txn *kv.Txn,
 	table *sqlbase.ImmutableTableDescriptor,
 	tablesByID FkTableMetadata,
 	updateCols []sqlbase.ColumnDescriptor,
@@ -155,6 +179,27 @@ func makeUpdateCascader(
 	if !required {
 		return nil, nil
 	}
+
+	// TODO(knz,radu): FK cascading actions need to see the writes
+	// performed by the mutation.  Moreover, each stage of the cascading
+	// actions must observe the writes from the previous stages but not
+	// its own writes.
+	//
+	// In order to make this true, we need to split the cascading
+	// actions into separate sequencing steps, and have the first
+	// cascading action happen no early than the end of all the
+	// "main" part of the statement. Unfortunately, the organization
+	// of the code does not allow this today.
+	//
+	// See: https://github.com/cockroachdb/cockroach/issues/33475
+	//
+	// In order to "make do" and preserve a modicum of FK semantics we
+	// thus need to disable step-wise execution here. The result is that
+	// it will also enable any interleaved read part to observe the
+	// mutation, and thus introduce the risk of a Halloween problem for
+	// any mutation that uses FK relationships.
+	_ = txn.ConfigureStepping(ctx, kv.SteppingDisabled)
+
 	return &cascader{
 		txn:                txn,
 		fkTables:           tablesByID,
@@ -370,6 +415,7 @@ func (c *cascader) addIndexPKRowFetcher(
 	var rowFetcher Fetcher
 	if err := rowFetcher.Init(
 		false, /* reverse */
+		sqlbase.ScanLockingStrength_FOR_NONE,
 		false, /* returnRangeInfo */
 		false, /* isCheck */
 		c.alloc,
@@ -391,7 +437,7 @@ func (c *cascader) addIndexPKRowFetcher(
 
 // addRowDeleter creates the row deleter and primary index row fetcher.
 func (c *cascader) addRowDeleter(
-	table *sqlbase.ImmutableTableDescriptor,
+	ctx context.Context, table *sqlbase.ImmutableTableDescriptor,
 ) (Deleter, Fetcher, error) {
 	// Is there a cached row fetcher and deleter?
 	if rowDeleter, exists := c.rowDeleters[table.ID]; exists {
@@ -407,6 +453,7 @@ func (c *cascader) addRowDeleter(
 	// Create the row deleter. The row deleter is needed prior to the row fetcher
 	// as it will dictate what columns are required in the row fetcher.
 	rowDeleter, err := makeRowDeleterWithoutCascader(
+		ctx,
 		c.txn,
 		table,
 		c.fkTables,
@@ -433,6 +480,10 @@ func (c *cascader) addRowDeleter(
 	var rowFetcher Fetcher
 	if err := rowFetcher.Init(
 		false, /* reverse */
+		// TODO(nvanbenschoten): it might make sense to use a FOR_UPDATE locking
+		// strength here. Consider hooking this in to the same knob that will
+		// control whether we perform locking implicitly during DELETEs.
+		sqlbase.ScanLockingStrength_FOR_NONE,
 		false, /* returnRangeInfo */
 		false, /* isCheck */
 		c.alloc,
@@ -449,7 +500,7 @@ func (c *cascader) addRowDeleter(
 
 // addRowUpdater creates the row updater and primary index row fetcher.
 func (c *cascader) addRowUpdater(
-	table *sqlbase.ImmutableTableDescriptor,
+	ctx context.Context, table *sqlbase.ImmutableTableDescriptor,
 ) (Updater, Fetcher, error) {
 	// Is there a cached updater?
 	rowUpdater, existsUpdater := c.rowUpdaters[table.ID]
@@ -466,6 +517,7 @@ func (c *cascader) addRowUpdater(
 	// Create the row updater. The row updater requires all the columns in the
 	// table.
 	rowUpdater, err := makeUpdaterWithoutCascader(
+		ctx,
 		c.txn,
 		table,
 		c.fkTables,
@@ -494,6 +546,10 @@ func (c *cascader) addRowUpdater(
 	var rowFetcher Fetcher
 	if err := rowFetcher.Init(
 		false, /* reverse */
+		// TODO(nvanbenschoten): it might make sense to use a FOR_UPDATE locking
+		// strength here. Consider hooking this in to the same knob that will
+		// control whether we perform locking implicitly during UPDATEs.
+		sqlbase.ScanLockingStrength_FOR_NONE,
 		false, /* returnRangeInfo */
 		false, /* isCheck */
 		c.alloc,
@@ -585,7 +641,7 @@ func (c *cascader) deleteRows(
 	}
 
 	// Create or retrieve the row deleter and primary index row fetcher.
-	rowDeleter, pkRowFetcher, err := c.addRowDeleter(referencingTable)
+	rowDeleter, pkRowFetcher, err := c.addRowDeleter(ctx, referencingTable)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -672,6 +728,7 @@ func (c *cascader) updateRows(
 	match sqlbase.ForeignKeyReference_Match,
 	values cascadeQueueElement,
 	action sqlbase.ForeignKeyReference_Action,
+	fk *sqlbase.ForeignKeyConstraint,
 	traceKV bool,
 ) (*rowcontainer.RowContainer, *rowcontainer.RowContainer, map[sqlbase.ColumnID]int, int, error) {
 	// Create the span to search for index values.
@@ -682,7 +739,7 @@ func (c *cascader) updateRows(
 	}
 
 	// Create or retrieve the row updater and row fetcher.
-	rowUpdater, rowFetcher, err := c.addRowUpdater(referencingTable)
+	rowUpdater, rowFetcher, err := c.addRowUpdater(ctx, referencingTable)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -755,6 +812,28 @@ func (c *cascader) updateRows(
 	// values being updated will change based on both the original and updated
 	// values.
 	for i := values.startIndex; i < values.endIndex; i++ {
+		// If the rows are the same on the FK columns, then we don't want to continue the cascade.
+		// We skip this check when values.updatedValues is nil. This happens when a cascade is started
+		// because of a delete, upon which a row container is not created because there is not an
+		// updated value when a row is deleted.
+		// TODO (rohany): this check could be sped up greatly by storing a mask/map of what
+		//  actually changed instead of having to check every FK column.
+		if values.updatedValues != nil {
+			allFKColsUnchanged := true
+			origValues := values.originalValues.At(i)
+			updatedValues := values.updatedValues.At(i)
+			for _, colID := range fk.ReferencedColumnIDs {
+				colIdx := values.colIDtoRowIndex[colID]
+				if origValues[colIdx].Compare(c.evalCtx, updatedValues[colIdx]) != 0 {
+					allFKColsUnchanged = false
+					break
+				}
+			}
+			if allFKColsUnchanged {
+				continue
+			}
+		}
+
 		// Extract a single value to update at a time.
 		req, valueColIDtoRowIndex, err := batchRequestForIndexValues(
 			ctx, referencedIndex, referencingTable, referencingIndex, match, cascadeQueueElement{
@@ -870,9 +949,18 @@ func (c *cascader) updateRows(
 									if err != nil {
 										return nil, nil, nil, 0, err
 									}
+									schema, err := schema.ResolveNameByID(
+										ctx,
+										c.txn,
+										referencingTable.ParentID,
+										referencingTable.GetParentSchemaID(),
+									)
+									if err != nil {
+										return nil, nil, nil, 0, err
+									}
 									return nil, nil, nil, 0, pgerror.Newf(pgcode.NullValueNotAllowed,
 										"cannot cascade a null value into %q as it violates a NOT NULL constraint",
-										tree.ErrString(tree.NewUnresolvedName(database.Name, tree.PublicSchema, referencingTable.Name, column.Name)))
+										tree.ErrString(tree.NewUnresolvedName(database.Name, schema, referencingTable.Name, column.Name)))
 								}
 							}
 							continue
@@ -1050,11 +1138,11 @@ func (c *cascader) cascadeAll(
 			if err != nil {
 				return err
 			}
-			referencedIndex, err := elem.table.TableDesc().FindIndexByID(ref.LegacyReferencedIndex)
+			referencedIndex, err := sqlbase.FindFKReferencedIndex(elem.table.TableDesc(), ref.ReferencedColumnIDs)
 			if err != nil {
 				return err
 			}
-			referencingIndex, err := referencingTable.Desc.TableDesc().FindIndexByID(ref.LegacyOriginIndex)
+			referencingIndex, err := sqlbase.FindFKOriginIndex(referencingTable.Desc.TableDesc(), ref.OriginColumnIDs)
 			if err != nil {
 				return err
 			}
@@ -1099,6 +1187,7 @@ func (c *cascader) cascadeAll(
 						sqlbase.ForeignKeyReference_SIMPLE,
 						elem,
 						foundFK.OnDelete,
+						foundFK,
 						traceKV,
 					)
 					if err != nil {
@@ -1130,6 +1219,7 @@ func (c *cascader) cascadeAll(
 						sqlbase.ForeignKeyReference_SIMPLE,
 						elem,
 						foundFK.OnUpdate,
+						foundFK,
 						traceKV,
 					)
 					if err != nil {

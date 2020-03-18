@@ -11,6 +11,8 @@
 import { assert } from "chai";
 import Long from "long";
 import moment from "moment";
+import { RouteComponentProps } from "react-router-dom";
+import * as H from "history";
 
 import "src/protobufInit";
 import * as protos from "src/js/protos";
@@ -43,7 +45,7 @@ describe("selectStatements", () => {
 
     const expectedFingerprints = [stmtA, stmtB, stmtC].map(stmt => stmt.key.key_data.query);
     expectedFingerprints.sort();
-    const actualFingerprints = result.map(stmt => stmt.label);
+    const actualFingerprints = result.map((stmt: any) => stmt.label);
     actualFingerprints.sort();
     assert.deepEqual(actualFingerprints, expectedFingerprints);
   });
@@ -413,6 +415,10 @@ function makeInvalidState() {
         inFlight: true,
         valid: false,
       },
+      statementDiagnosticsReports: {
+        inFlight: true,
+        valid: false,
+      },
     },
   };
 }
@@ -431,6 +437,10 @@ function makeStateWithStatementsAndLastReset(statements: CollectedStatementStati
         inFlight: false,
         valid: true,
       },
+      statementDiagnosticsReports: {
+        inFlight: true,
+        valid: false,
+      },
     },
   };
 }
@@ -444,13 +454,31 @@ function makeStateWithLastReset(lastReset: number) {
 }
 
 function makeRoutePropsWithParams(params: { [key: string]: string }) {
+  const history = H.createHashHistory();
   return {
-    params,
+    location: history.location,
+    history,
+    match: {
+      url: "",
+      path: history.location.pathname,
+      isExact: false,
+      params,
+    },
   };
 }
 
-function makeEmptyRouteProps() {
-  return makeRoutePropsWithParams({});
+function makeEmptyRouteProps(): RouteComponentProps<any> {
+  const history = H.createHashHistory();
+  return {
+    location: history.location,
+    history,
+    match: {
+      url: "",
+      path: history.location.pathname,
+      isExact: false,
+      params: {},
+    },
+  };
 }
 
 function makeRoutePropsWithApp(app: string) {

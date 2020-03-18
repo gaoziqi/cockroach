@@ -90,7 +90,7 @@ func BenchmarkClusterRestore(b *testing.B) {
 	b.SetBytes(backup.Desc.EntryCounts.DataSize / int64(b.N))
 
 	b.ResetTimer()
-	sqlDB.Exec(b, `RESTORE data.* FROM 'nodelocal:///foo'`)
+	sqlDB.Exec(b, `RESTORE data.* FROM 'nodelocal://0/foo'`)
 	b.StopTimer()
 }
 
@@ -110,7 +110,7 @@ func BenchmarkLoadRestore(b *testing.B) {
 	b.SetBytes(int64(buf.Len() / b.N))
 	ts := hlc.Timestamp{WallTime: hlc.UnixNano()}
 	b.ResetTimer()
-	if _, err := importccl.Load(ctx, sqlDB.DB.(*gosql.DB), buf, "data", dir, ts, 0, dir); err != nil {
+	if _, err := importccl.Load(ctx, sqlDB.DB.(*gosql.DB), buf, "data", dir, ts, 0, dir, dir); err != nil {
 		b.Fatalf("%+v", err)
 	}
 	sqlDB.Exec(b, fmt.Sprintf(`RESTORE data.* FROM '%s'`, dir))

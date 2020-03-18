@@ -26,6 +26,24 @@
   version = "v0.1.8"
 
 [[projects]]
+  digest = "1:36fbfc6e2ae2274e4d9bfdf64dcfd5f4f6b085bcab8210156057b55e3b5a10c7"
+  name = "github.com/Azure/azure-sdk-for-go"
+  packages = [
+    "profiles/latest/compute/mgmt/compute",
+    "profiles/latest/network/mgmt/network",
+    "profiles/latest/resources/mgmt/resources",
+    "profiles/latest/resources/mgmt/subscriptions",
+    "services/compute/mgmt/2019-07-01/compute",
+    "services/network/mgmt/2019-07-01/network",
+    "services/resources/mgmt/2018-06-01/subscriptions",
+    "services/resources/mgmt/2019-05-01/resources",
+    "version",
+  ]
+  pruneopts = "UT"
+  revision = "088b4d484d58bba14d62f1de59a49272aecf7845"
+  version = "v33.4.0"
+
+[[projects]]
   digest = "1:b8ac7e4464ce21f7487c663aa69b1b3437740bb10ab12d4dc7aa9b02422571a1"
   name = "github.com/Azure/azure-storage-blob-go"
   packages = ["azblob"]
@@ -43,6 +61,25 @@
   ]
   pruneopts = "UT"
   revision = "d6e3b3328b783f23731bc4d058875b0371ff8109"
+
+[[projects]]
+  digest = "1:8343100c9215ddd05bd708323e4821e3ff3206fe44f3ebd2777fda1eb0246ed7"
+  name = "github.com/Azure/go-autorest"
+  packages = [
+    "autorest",
+    "autorest/adal",
+    "autorest/azure",
+    "autorest/azure/auth",
+    "autorest/azure/cli",
+    "autorest/date",
+    "autorest/to",
+    "autorest/validation",
+    "logger",
+    "tracing",
+  ]
+  pruneopts = "UT"
+  revision = "69b4126ece6b5257e2f9b0017007d2334153655f"
+  version = "v13.0.1"
 
 [[projects]]
   digest = "1:9f3b30d9f8e0d7040f729b82dcbc8f0dead820a133b3147ce355fc451f32d761"
@@ -357,7 +394,7 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:4b96d80bbf38331491295de06ba90d25ff613455d8aab268be54764cfc0a624f"
+  digest = "1:587f948690f35af901d9c7632e4b3ede47022afa38f369b1221a26c61b7801b6"
   name = "github.com/cockroachdb/crlfmt"
   packages = [
     ".",
@@ -365,18 +402,18 @@
     "internal/render",
   ]
   pruneopts = "UT"
-  revision = "3c56c65c97a11c610354ce15b9939c0d0aff5d7a"
+  revision = "a78e1c207bc03184df89a2f3f0eba3014863b919"
 
 [[projects]]
   branch = "master"
-  digest = "1:85071046e2bc80625cbd99ee5584a675f2dd8a4c56872f04a5d8b913e1c11d0d"
+  digest = "1:2a4fe07643192397583d0396b63624a437f7bea7062f2c1bd131483164e7b523"
   name = "github.com/cockroachdb/datadriven"
   packages = ["."]
   pruneopts = "UT"
-  revision = "edce558372380347c6fef147e62f5559a9f8413d"
+  revision = "aca09668cb243672cb82f3cbeec73b3871e13cc9"
 
 [[projects]]
-  digest = "1:35ff61e02c035785971ac6ec04d54428307a986412e5d0aea86b8b7f45677d09"
+  digest = "1:7cfbe9c31d82a7044c86f36c24354363da85cc0a69ee7f2a20908a620d7e9b8a"
   name = "github.com/cockroachdb/errors"
   packages = [
     ".",
@@ -399,23 +436,31 @@
     "withstack",
   ]
   pruneopts = "UT"
-  revision = "7ba395ace80575c71104187a222f77bf23c19326"
-  version = "v1.2.3"
+  revision = "9e21257b06ad938e53c24c52b393076a51b61540"
+  version = "v1.2.4"
 
 [[projects]]
-  digest = "1:cd936a7edd1897083994b6d397f9c975a5a8dc58e845f0cf3d1e5cf4717b918b"
+  digest = "1:a44e537b3e080ff297315d166956dba9607f070644a89be78b59af6c54876b64"
   name = "github.com/cockroachdb/gostdlib"
   packages = [
     "cmd/gofmt",
     "go/format",
     "go/printer",
     "x/tools/cmd/goimports",
+    "x/tools/go/ast/astutil",
+    "x/tools/go/internal/packagesdriver",
+    "x/tools/go/packages",
     "x/tools/imports",
     "x/tools/internal/fastwalk",
+    "x/tools/internal/gopathwalk",
+    "x/tools/internal/imports",
+    "x/tools/internal/module",
+    "x/tools/internal/semver",
+    "x/tools/internal/span",
   ]
   pruneopts = "UT"
-  revision = "5ba2d4bf557f3a3d4518deb271dcf93244b39363"
-  version = "v1.11.0"
+  revision = "fbdd8f0abc9baea11b7bf52b6a19d5eab5e5af10"
+  version = "v1.13.0"
 
 [[projects]]
   branch = "master"
@@ -427,7 +472,7 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:4e4242f49156024b2a0634274376fbb2db4e2c6285ce11785b19243d7ecc000e"
+  digest = "1:2c7c59766c7895bbf33a8410d2d1330729fd59c0ef1bedf4ac6e72154304f4c9"
   name = "github.com/cockroachdb/pebble"
   packages = [
     ".",
@@ -439,7 +484,10 @@
     "internal/cache",
     "internal/crc",
     "internal/humanize",
+    "internal/intern",
+    "internal/invariants",
     "internal/manifest",
+    "internal/manual",
     "internal/private",
     "internal/rangedel",
     "internal/rate",
@@ -450,7 +498,7 @@
     "vfs",
   ]
   pruneopts = "UT"
-  revision = "48901a109734411492918b9cdd1d34009fb55a23"
+  revision = "c50a7b1164d9b1a971f1729d84ff9cdb7e987496"
 
 [[projects]]
   branch = "master"
@@ -501,12 +549,28 @@
   version = "v1.1.1"
 
 [[projects]]
+  digest = "1:76dc72490af7174349349838f2fe118996381b31ea83243812a97e5a0fd5ed55"
+  name = "github.com/dgrijalva/jwt-go"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "06ea1031745cb8b3dab3f6a236daf2b0aa468b7e"
+  version = "v3.2.0"
+
+[[projects]]
   branch = "master"
   digest = "1:055e0539db2ff375e356db6961eae161858fc360bfa20c4f82ada1e271756176"
   name = "github.com/dgryski/go-metro"
   packages = ["."]
   pruneopts = "UT"
   revision = "280f6062b5bc97ee9b9afe7f2ccb361e59845baa"
+
+[[projects]]
+  digest = "1:cf0d2e435fd4ce45b789e93ef24b5f08e86be0e9807a16beb3694e2d8c9af965"
+  name = "github.com/dimchansky/utfbom"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "d2133a1ce379ef6fa992b0514a77146c60db9d1c"
+  version = "v1.1.0"
 
 [[projects]]
   digest = "1:4ddc17aeaa82cb18c5f0a25d7c253a10682f518f4b2558a82869506eec223d76"
@@ -969,7 +1033,7 @@
   version = "v1.0"
 
 [[projects]]
-  digest = "1:779e46ac0e3061d244fae759e451c98b338d73deb39fdffcc514ade0eaba0ea2"
+  digest = "1:d0fd048e36f6d46cdb8424cac7109244d73db58a07dff2cb389cb9a6c64499bb"
   name = "github.com/jackc/pgx"
   packages = [
     ".",
@@ -980,7 +1044,8 @@
     "pgtype",
   ]
   pruneopts = "UT"
-  revision = "23388fecf653ddfce2a4149acf71313b87d64e3d"
+  revision = "a413de981978e4100d5736af7aaa2b392511612f"
+  version = "v3.6.2"
 
 [[projects]]
   digest = "1:dcb3e2ad17349c0cc89ffc16692d05195e6a67b4924fe81760fba9a307a7271d"
@@ -1095,7 +1160,7 @@
   revision = "634a59d12406abc51545000deab7cf43ebc32378"
 
 [[projects]]
-  digest = "1:bdd53b87de8185da386bae179c84d4848854c6870bacacf6a154fe63e2e750f7"
+  digest = "1:e8501d7fa801be523f103178ced935b37778925c7338f0f94e50c14a4d450f4a"
   name = "github.com/lib/pq"
   packages = [
     ".",
@@ -1103,8 +1168,7 @@
     "scram",
   ]
   pruneopts = "UT"
-  revision = "bc6a3c0594130b1e34005880bc600b6d3f49fa7f"
-  version = "v1.1.1"
+  revision = "9eb3fc897d6fd97dd4aad3d0404b54e2f7cc56be"
 
 [[projects]]
   digest = "1:078d0b47a888546a9f8810d64f76792f70b2fa564ad2bbe6dddd002c032ce7cf"
@@ -1200,12 +1264,31 @@
   version = "v1.0.0"
 
 [[projects]]
+  digest = "1:5d231480e1c64a726869bc4142d270184c419749d34f167646baa21008eb0a79"
+  name = "github.com/mitchellh/go-homedir"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "af06845cf3004701891bf4fdb884bfe4920b3727"
+  version = "v1.1.0"
+
+[[projects]]
   digest = "1:bcc07ad6f62e6d8958692ff89c8ac1c64eb92de66330f98b7e9bdb72cc017a84"
   name = "github.com/mitchellh/reflectwalk"
   packages = ["."]
   pruneopts = "UT"
   revision = "eecee6c969c02c8cc2ae48e1e269843ae8590796"
   version = "v1.0.0"
+
+[[projects]]
+  branch = "master"
+  digest = "1:dc1b6347a71f538d6fc4556d3d1bab7619fa433bf81f5ebd33ac14844d6da6ae"
+  name = "github.com/mmatczuk/go_generics"
+  packages = [
+    "cmd/go_generics",
+    "globals",
+  ]
+  pruneopts = "UT"
+  revision = "0aaa050f9bab8160cf684130d0afa69ff582cbe6"
 
 [[projects]]
   branch = "master"
@@ -1235,12 +1318,13 @@
   version = "v0.4.0"
 
 [[projects]]
-  digest = "1:abcdbf03ca6ca13d3697e2186edc1f33863bbdac2b3a44dfa39015e8903f7409"
+  branch = "master"
+  digest = "1:b6e102cb76dcc7fb051e885ef5f7c2fe886d9a4cf6ac4ee6d292685e20a93c76"
   name = "github.com/olekukonko/tablewriter"
   packages = ["."]
   pruneopts = "UT"
-  revision = "e6d60cf7ba1f42d86d54cdf5508611c4aafb3970"
-  version = "v0.0.1"
+  revision = "bd15540e88470a2a7abfd3d457874fbee6702218"
+  source = "https://github.com/cockroachdb/tablewriter"
 
 [[projects]]
   digest = "1:ee4d4af67d93cc7644157882329023ce9a7bcfce956a079069a9405521c7cc8d"
@@ -1488,15 +1572,15 @@
   version = "v1.0.3"
 
 [[projects]]
-  digest = "1:5da8ce674952566deae4dbc23d07c85caafc6cfa815b0b3e03e41979cedb8750"
+  digest = "1:99d32780e5238c2621fff621123997c3e3cca96db8be13179013aea77dfab551"
   name = "github.com/stretchr/testify"
   packages = [
     "assert",
     "require",
   ]
   pruneopts = "UT"
-  revision = "ffdc059bfe9ce6a4e144ba849dbedead332c6053"
-  version = "v1.3.0"
+  revision = "221dbe5ed46703ee255b1da0dec05086f5035f62"
+  version = "v1.4.0"
 
 [[projects]]
   branch = "master"
@@ -1544,7 +1628,7 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:3454241817ada8069448d68384231cb86f2107046f2560fdcc092da8f6b5cb2b"
+  digest = "1:1a9011794066a02df25f6487bfcb745bd653b543ecec32aac1cb1216cadae1a5"
   name = "golang.org/x/crypto"
   packages = [
     "bcrypt",
@@ -1555,6 +1639,8 @@
     "internal/chacha20",
     "internal/subtle",
     "pbkdf2",
+    "pkcs12",
+    "pkcs12/internal/rc2",
     "poly1305",
     "ssh",
     "ssh/agent",
@@ -1620,13 +1706,12 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:826837a6c03df57828c1128425043fb47a6007c1ca701c8c094570563d49072d"
+  digest = "1:a73a22d151d0961c7b1b403dc7e8471f5ef96675d45a92b5360f182e8d98f48a"
   name = "golang.org/x/perf"
   packages = [
     "benchstat",
     "cmd/benchstat",
     "internal/stats",
-    "storage",
     "storage/benchfmt",
   ]
   pruneopts = "UT"
@@ -1691,7 +1776,7 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:d135e09e7eba1cee20690a3d6e193e505753b705d8b991da1087e984194cc103"
+  digest = "1:20cf3983a6c6db4b53ec9a57dc04a5185224050b607f4a2622b24e2fb6f943ad"
   name = "golang.org/x/tools"
   packages = [
     "cmd/goyacc",
@@ -1703,7 +1788,6 @@
     "go/analysis/internal/analysisflags",
     "go/analysis/internal/checker",
     "go/analysis/internal/facts",
-    "go/analysis/multichecker",
     "go/analysis/passes/asmdecl",
     "go/analysis/passes/assign",
     "go/analysis/passes/atomic",
@@ -1713,6 +1797,7 @@
     "go/analysis/passes/composite",
     "go/analysis/passes/copylock",
     "go/analysis/passes/ctrlflow",
+    "go/analysis/passes/errorsas",
     "go/analysis/passes/httpresponse",
     "go/analysis/passes/inspect",
     "go/analysis/passes/internal/analysisutil",
@@ -1911,7 +1996,15 @@
   analyzer-version = 1
   input-imports = [
     "cloud.google.com/go/storage",
+    "github.com/Azure/azure-sdk-for-go/profiles/latest/compute/mgmt/compute",
+    "github.com/Azure/azure-sdk-for-go/profiles/latest/network/mgmt/network",
+    "github.com/Azure/azure-sdk-for-go/profiles/latest/resources/mgmt/resources",
+    "github.com/Azure/azure-sdk-for-go/profiles/latest/resources/mgmt/subscriptions",
+    "github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-07-01/compute",
     "github.com/Azure/azure-storage-blob-go/azblob",
+    "github.com/Azure/go-autorest/autorest",
+    "github.com/Azure/go-autorest/autorest/azure/auth",
+    "github.com/Azure/go-autorest/autorest/to",
     "github.com/BurntSushi/toml",
     "github.com/MichaelTJones/walk",
     "github.com/PuerkitoBio/goquery",
@@ -1943,11 +2036,13 @@
     "github.com/cockroachdb/datadriven",
     "github.com/cockroachdb/errors",
     "github.com/cockroachdb/errors/errorspb",
+    "github.com/cockroachdb/errors/stdstrings",
     "github.com/cockroachdb/errors/testutils",
     "github.com/cockroachdb/gostdlib/cmd/gofmt",
     "github.com/cockroachdb/gostdlib/x/tools/cmd/goimports",
     "github.com/cockroachdb/logtags",
     "github.com/cockroachdb/pebble",
+    "github.com/cockroachdb/pebble/bloom",
     "github.com/cockroachdb/pebble/sstable",
     "github.com/cockroachdb/pebble/tool",
     "github.com/cockroachdb/pebble/vfs",
@@ -2018,6 +2113,7 @@
     "github.com/mattn/goveralls",
     "github.com/mibk/dupl",
     "github.com/mitchellh/reflectwalk",
+    "github.com/mmatczuk/go_generics/cmd/go_generics",
     "github.com/montanaflynn/stats",
     "github.com/nlopes/slack",
     "github.com/olekukonko/tablewriter",
@@ -2053,6 +2149,7 @@
     "go.etcd.io/etcd/raft/raftpb",
     "go.etcd.io/etcd/raft/tracker",
     "golang.org/x/crypto/bcrypt",
+    "golang.org/x/crypto/pbkdf2",
     "golang.org/x/crypto/ssh",
     "golang.org/x/crypto/ssh/agent",
     "golang.org/x/crypto/ssh/knownhosts",
@@ -2065,7 +2162,6 @@
     "golang.org/x/oauth2",
     "golang.org/x/oauth2/google",
     "golang.org/x/perf/cmd/benchstat",
-    "golang.org/x/perf/storage",
     "golang.org/x/sync/errgroup",
     "golang.org/x/sync/syncmap",
     "golang.org/x/sys/unix",
@@ -2079,9 +2175,32 @@
     "golang.org/x/tools/container/intsets",
     "golang.org/x/tools/go/analysis",
     "golang.org/x/tools/go/analysis/analysistest",
-    "golang.org/x/tools/go/analysis/multichecker",
+    "golang.org/x/tools/go/analysis/passes/asmdecl",
+    "golang.org/x/tools/go/analysis/passes/assign",
+    "golang.org/x/tools/go/analysis/passes/atomic",
+    "golang.org/x/tools/go/analysis/passes/bools",
+    "golang.org/x/tools/go/analysis/passes/buildtag",
+    "golang.org/x/tools/go/analysis/passes/cgocall",
+    "golang.org/x/tools/go/analysis/passes/composite",
+    "golang.org/x/tools/go/analysis/passes/copylock",
+    "golang.org/x/tools/go/analysis/passes/errorsas",
+    "golang.org/x/tools/go/analysis/passes/httpresponse",
     "golang.org/x/tools/go/analysis/passes/inspect",
+    "golang.org/x/tools/go/analysis/passes/loopclosure",
+    "golang.org/x/tools/go/analysis/passes/lostcancel",
+    "golang.org/x/tools/go/analysis/passes/nilfunc",
+    "golang.org/x/tools/go/analysis/passes/printf",
+    "golang.org/x/tools/go/analysis/passes/shadow",
     "golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow",
+    "golang.org/x/tools/go/analysis/passes/shift",
+    "golang.org/x/tools/go/analysis/passes/stdmethods",
+    "golang.org/x/tools/go/analysis/passes/structtag",
+    "golang.org/x/tools/go/analysis/passes/tests",
+    "golang.org/x/tools/go/analysis/passes/unmarshal",
+    "golang.org/x/tools/go/analysis/passes/unreachable",
+    "golang.org/x/tools/go/analysis/passes/unsafeptr",
+    "golang.org/x/tools/go/analysis/passes/unusedresult",
+    "golang.org/x/tools/go/analysis/unitchecker",
     "golang.org/x/tools/go/ast/astutil",
     "golang.org/x/tools/go/ast/inspector",
     "golang.org/x/tools/go/buildutil",

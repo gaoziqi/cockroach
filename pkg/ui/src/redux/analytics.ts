@@ -14,7 +14,7 @@ import _ from "lodash";
 import { Store } from "redux";
 
 import * as protos from "src/js/protos";
-import { versionsSelector } from "src/redux/alerts";
+import { versionsSelector } from "src/redux/nodes";
 import { store, history, AdminUIState } from "src/redux/state";
 import { COCKROACHLABS_ADDR } from "src/util/cockroachlabsAPI";
 
@@ -208,14 +208,13 @@ export class AnalyticsSync {
         let search = "";
 
         if (location.search && location.search.length > 1) {
-            const query = location.search.slice(1);
-            const params = new URLSearchParams(query);
+          const query = location.search.slice(1);
+          const params = new URLSearchParams(query);
 
-            for (const param of params) {
-                params.set(param[0], this.redact(param[1]));
-            }
-
-            search = "?" + params.toString();
+          params.forEach((value, key) => {
+            params.set(key, this.redact(value));
+          });
+          search = "?" + params.toString();
         }
 
         this.analyticsService.page({
@@ -263,7 +262,7 @@ export const analytics = new AnalyticsSync(analyticsInstance, store, defaultReda
 // Attach a listener to the history object which will track a 'page' event
 // whenever the user navigates to a new path.
 let lastPageLocation: Location;
-history.listen((location) => {
+history.listen((location: Location) => {
   // Do not log if the pathname is the same as the previous.
   // Needed because history.listen() fires twice when using hash history, this
   // bug is "won't fix" in the version of history we are using, and upgrading
@@ -280,6 +279,6 @@ history.listen((location) => {
 
 // Record the initial page that was accessed; listen won't fire for the first
 // page loaded.
-analytics.page(history.getCurrentLocation());
+analytics.page(history.location);
 // Identify the cluster.
 analytics.identify();

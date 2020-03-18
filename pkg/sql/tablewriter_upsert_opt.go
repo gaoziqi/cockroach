@@ -13,7 +13,7 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -43,7 +43,39 @@ import (
 // For more details on how the CBO compiles UPSERT statements, see the block
 // comment on Builder.buildInsert in opt/optbuilder/insert.go.
 type optTableUpserter struct {
-	tableUpserterBase
+	tableWriterBase
+
+	ri    row.Inserter
+	alloc *sqlbase.DatumAlloc
+
+	// Should we collect the rows for a RETURNING clause?
+	collectRows bool
+
+	// Rows returned if collectRows is true.
+	rowsUpserted *rowcontainer.RowContainer
+
+	// A mapping of column IDs to the return index used to shape the resulting
+	// rows to those required by the returning clause. Only required if
+	// collectRows is true.
+	colIDToReturnIndex map[sqlbase.ColumnID]int
+
+	// Do the result rows have a different order than insert rows. Only set if
+	// collectRows is true.
+	insertReorderingRequired bool
+
+	// resultCount is the number of upserts. Mirrors rowsUpserted.Len() if
+	// collectRows is set, counted separately otherwise.
+	resultCount int
+
+	// Contains all the rows to be inserted.
+	insertRows rowcontainer.RowContainer
+
+	// existingRows is used to store rows in a batch when checking for conflicts
+	// with rows earlier in the batch. Is is reused per batch.
+	existingRows *rowcontainer.RowContainer
+
+	// For allocation avoidance.
+	indexKeyPrefix []byte
 
 	// fetchCols indicate which columns need to be fetched from the target table,
 	// in order to detect whether a conflict has occurred, as well as to provide
@@ -80,12 +112,55 @@ type optTableUpserter struct {
 	tabColIdxToRetIdx []int
 }
 
+var _ tableWriter = &optTableUpserter{}
+
 // init is part of the tableWriter interface.
-func (tu *optTableUpserter) init(txn *client.Txn, evalCtx *tree.EvalContext) error {
-	err := tu.tableUpserterBase.init(txn, evalCtx)
-	if err != nil {
-		return err
+func (tu *optTableUpserter) init(
+	ctx context.Context, txn *kv.Txn, evalCtx *tree.EvalContext,
+) error {
+	tu.tableWriterBase.init(txn)
+	tableDesc := tu.tableDesc()
+
+	tu.insertRows.Init(
+		evalCtx.Mon.MakeBoundAccount(), sqlbase.ColTypeInfoFromColDescs(tu.ri.InsertCols), 0,
+	)
+
+	// collectRows, set upon initialization, indicates whether or not we want rows returned from the operation.
+	if tu.collectRows {
+		tu.rowsUpserted = rowcontainer.NewRowContainer(
+			evalCtx.Mon.MakeBoundAccount(),
+			sqlbase.ColTypeInfoFromColDescs(tableDesc.Columns),
+			tu.insertRows.Len(),
+		)
+
+		// Create the map from colIds to the expected columns.
+		// Note that this map will *not* contain any mutation columns - that's
+		// because even though we might insert values into mutation columns, we
+		// never return them back to the user.
+		tu.colIDToReturnIndex = map[sqlbase.ColumnID]int{}
+		for i := range tableDesc.Columns {
+			id := tableDesc.Columns[i].ID
+			tu.colIDToReturnIndex[id] = i
+		}
+
+		if len(tu.ri.InsertColIDtoRowIndex) == len(tu.colIDToReturnIndex) {
+			for colID, insertIndex := range tu.ri.InsertColIDtoRowIndex {
+				resultIndex, ok := tu.colIDToReturnIndex[colID]
+				if !ok || resultIndex != insertIndex {
+					tu.insertReorderingRequired = true
+					break
+				}
+			}
+		} else {
+			tu.insertReorderingRequired = true
+		}
 	}
+
+	tu.insertRows.Init(
+		evalCtx.Mon.MakeBoundAccount(), sqlbase.ColTypeInfoFromColDescs(tu.ri.InsertCols), 0,
+	)
+
+	tu.indexKeyPrefix = sqlbase.MakeIndexKeyPrefix(tableDesc.TableDesc(), tableDesc.PrimaryIndex.ID)
 
 	if tu.collectRows {
 		tu.resultRow = make(tree.Datums, len(tu.returnCols))
@@ -96,18 +171,74 @@ func (tu *optTableUpserter) init(txn *client.Txn, evalCtx *tree.EvalContext) err
 		)
 	}
 
-	tu.ru, err = row.MakeUpdater(
-		txn,
-		tu.tableDesc(),
-		tu.fkTables,
-		tu.updateCols,
-		tu.fetchCols,
-		row.UpdaterDefault,
-		row.CheckFKs,
-		evalCtx,
-		tu.alloc,
-	)
-	return err
+	return nil
+}
+
+// flushAndStartNewBatch is part of the tableWriter interface.
+func (tu *optTableUpserter) flushAndStartNewBatch(ctx context.Context) error {
+	tu.insertRows.Clear(ctx)
+	if tu.collectRows {
+		tu.rowsUpserted.Clear(ctx)
+	}
+	if tu.existingRows != nil {
+		tu.existingRows.Clear(ctx)
+	}
+	return tu.tableWriterBase.flushAndStartNewBatch(ctx, tu.tableDesc())
+}
+
+// batchedCount is part of the batchedTableWriter interface.
+func (tu *optTableUpserter) batchedCount() int { return tu.resultCount }
+
+// batchedValues is part of the batchedTableWriter interface.
+func (tu *optTableUpserter) batchedValues(rowIdx int) tree.Datums {
+	if !tu.collectRows {
+		panic("return row requested but collect rows was not set")
+	}
+	return tu.rowsUpserted.At(rowIdx)
+}
+
+func (tu *optTableUpserter) curBatchSize() int { return tu.insertRows.Len() }
+
+// close is part of the tableWriter interface.
+func (tu *optTableUpserter) close(ctx context.Context) {
+	tu.insertRows.Close(ctx)
+	if tu.existingRows != nil {
+		tu.existingRows.Close(ctx)
+	}
+	if tu.rowsUpserted != nil {
+		tu.rowsUpserted.Close(ctx)
+	}
+}
+
+// finalize is part of the tableWriter interface.
+func (tu *optTableUpserter) finalize(
+	ctx context.Context, traceKV bool,
+) (*rowcontainer.RowContainer, error) {
+	return nil, tu.tableWriterBase.finalize(ctx, tu.tableDesc())
+}
+
+// makeResultFromRow reshapes a row that was inserted or updated to a row
+// suitable for storing for a RETURNING clause, shaped by the target table's
+// descriptor.
+// There are two main examples of this reshaping:
+// 1) A row may not contain values for nullable columns, so insert those NULLs.
+// 2) Don't return values we wrote into non-public mutation columns.
+func (tu *optTableUpserter) makeResultFromRow(
+	row tree.Datums, colIDToRowIndex map[sqlbase.ColumnID]int,
+) tree.Datums {
+	resultRow := make(tree.Datums, len(tu.colIDToReturnIndex))
+	for colID, returnIndex := range tu.colIDToReturnIndex {
+		rowIndex, ok := colIDToRowIndex[colID]
+		if ok {
+			resultRow[returnIndex] = row[rowIndex]
+		} else {
+			// If the row doesn't have all columns filled out. Fill the columns that
+			// weren't included with NULLs. This will only be true for nullable
+			// columns.
+			resultRow[returnIndex] = tree.DNull
+		}
+	}
+	return resultRow
 }
 
 // desc is part of the tableWriter interface.
@@ -154,7 +285,7 @@ func (tu *optTableUpserter) row(ctx context.Context, row tree.Datums, traceKV bo
 	)
 }
 
-// atBatchEnd is part of the extendedTableWriter interface.
+// atBatchEnd is part of the tableWriter interface.
 func (tu *optTableUpserter) atBatchEnd(ctx context.Context, traceKV bool) error {
 	// Nothing to do, because the row method does everything.
 	return nil
@@ -164,7 +295,7 @@ func (tu *optTableUpserter) atBatchEnd(ctx context.Context, traceKV bool) error 
 // there was no conflict. If the RETURNING clause was specified, then the
 // inserted row is stored in the rowsUpserted collection.
 func (tu *optTableUpserter) insertNonConflictingRow(
-	ctx context.Context, b *client.Batch, insertRow tree.Datums, overwrite, traceKV bool,
+	ctx context.Context, b *kv.Batch, insertRow tree.Datums, overwrite, traceKV bool,
 ) error {
 	// Perform the insert proper.
 	if err := tu.ri.InsertRow(
@@ -210,7 +341,7 @@ func (tu *optTableUpserter) insertNonConflictingRow(
 // rowsUpserted collection.
 func (tu *optTableUpserter) updateConflictingRow(
 	ctx context.Context,
-	b *client.Batch,
+	b *kv.Batch,
 	fetchRow tree.Datums,
 	updateValues tree.Datums,
 	tableDesc *sqlbase.ImmutableTableDescriptor,

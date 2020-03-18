@@ -16,9 +16,9 @@
 #include <rocksdb/env.h>
 #include <string>
 #include <unordered_map>
-#include "protos/storage/engine/enginepb/file_registry.pb.h"
+#include "protos/storage/enginepb/file_registry.pb.h"
 
-namespace enginepb = cockroach::storage::engine::enginepb;
+namespace enginepb = cockroach::storage::enginepb;
 
 namespace cockroach {
 
@@ -92,6 +92,8 @@ class FileRegistry {
   const std::string db_dir_;
   const bool read_only_;
   const std::string registry_path_;
+
+  std::unique_ptr<rocksdb::Directory> registry_dir_;
 
   // Write 'reg' to the registry file, and swap with registry_ if successful. mu_ is held.
   rocksdb::Status PersistRegistryLocked(std::unique_ptr<enginepb::FileRegistry> reg);

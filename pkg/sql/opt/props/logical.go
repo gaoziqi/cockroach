@@ -13,8 +13,6 @@ package props
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/errors"
 )
 
 // AvailableRuleProps is a bit set that indicates when lazily-populated Rule
@@ -51,6 +49,10 @@ const (
 // Shared are properties that are shared by both relational and scalar
 // expressions.
 type Shared struct {
+	// Populated is set to true once the properties have been built for the
+	// operator.
+	Populated bool
+
 	// OuterCols is the set of columns that are referenced by variables within
 	// this sub-expression, but are not bound within the scope of the expression.
 	// For example:
@@ -168,10 +170,24 @@ type Shared struct {
 	// Rule props are lazily calculated and typically only apply to a single
 	// rule. See the comment above Relational.Rule for more details.
 	Rule struct {
-		// WithUses tracks the number of times each With expression has been
-		// referenced in the given expression.
-		WithUses map[opt.WithID]int
+		// WithUses tracks information about the WithScans inside the given
+		// expression which reference WithIDs outside of that expression.
+		WithUses WithUsesMap
 	}
+}
+
+// WithUsesMap stores information about each WithScan referencing an outside
+// WithID, grouped by each WithID.
+type WithUsesMap map[opt.WithID]WithUseInfo
+
+// WithUseInfo contains information about the usage of a specific WithID.
+type WithUseInfo struct {
+	// Count is the number of WithScan operators which reference this WithID.
+	Count int
+
+	// UsedCols is the union of columns used by all WithScan operators which
+	// reference this WithID.
+	UsedCols opt.ColSet
 }
 
 // Relational properties describe the content and characteristics of relational
@@ -339,10 +355,6 @@ type Relational struct {
 type Scalar struct {
 	Shared
 
-	// Populated is set to true once the scalar properties have been set, usually
-	// triggered by a call to the ScalarPropsExpr.ScalarProps interface.
-	Populated bool
-
 	// Constraints is the set of constraints deduced from a boolean expression.
 	// For the expression to be true, all constraints in the set must be
 	// satisfied.
@@ -424,81 +436,4 @@ func (s *Scalar) IsAvailable(p AvailableRuleProps) bool {
 // mark them as populated on this scalar properties instance.
 func (s *Scalar) SetAvailable(p AvailableRuleProps) {
 	s.Rule.Available |= p
-}
-
-// Verify runs consistency checks against the shared properties, in order to
-// ensure that they conform to several invariants:
-//
-//   1. If HasCorrelatedSubquery is true, then HasSubquery must be true as well.
-//
-func (s *Shared) Verify() {
-	if s.HasCorrelatedSubquery && !s.HasSubquery {
-		panic(errors.AssertionFailedf("HasSubquery cannot be false if HasCorrelatedSubquery is true"))
-	}
-	if s.CanMutate && !s.CanHaveSideEffects {
-		panic(errors.AssertionFailedf("CanHaveSideEffects cannot be false if CanMutate is true"))
-	}
-}
-
-// Verify runs consistency checks against the relational properties, in order to
-// ensure that they conform to several invariants:
-//
-//   1. Functional dependencies are internally consistent.
-//   2. Not null columns are a subset of output columns.
-//   3. Outer columns do not intersect output columns.
-//   4. If functional dependencies indicate that the relation can have at most
-//      one row, then the cardinality reflects that as well.
-//
-func (r *Relational) Verify() {
-	r.Shared.Verify()
-	r.FuncDeps.Verify()
-
-	if !r.NotNullCols.SubsetOf(r.OutputCols) {
-		panic(errors.AssertionFailedf("not null cols %s not a subset of output cols %s",
-			log.Safe(r.NotNullCols), log.Safe(r.OutputCols)))
-	}
-	if r.OuterCols.Intersects(r.OutputCols) {
-		panic(errors.AssertionFailedf("outer cols %s intersect output cols %s",
-			log.Safe(r.OuterCols), log.Safe(r.OutputCols)))
-	}
-	if r.FuncDeps.HasMax1Row() {
-		if r.Cardinality.Max > 1 {
-			panic(errors.AssertionFailedf(
-				"max cardinality must be <= 1 if FDs have max 1 row: %s", r.Cardinality))
-		}
-	}
-	if r.IsAvailable(PruneCols) {
-		if !r.Rule.PruneCols.SubsetOf(r.OutputCols) {
-			panic(errors.AssertionFailedf("prune cols %s must be a subset of output cols %s",
-				log.Safe(r.Rule.PruneCols), log.Safe(r.OutputCols)))
-		}
-	}
-}
-
-// VerifyAgainst checks that the two properties don't contradict each other.
-// Used for testing (e.g. to cross-check derived properties from expressions in
-// the same group).
-func (r *Relational) VerifyAgainst(other *Relational) {
-	if !r.OutputCols.Equals(other.OutputCols) {
-		panic(errors.AssertionFailedf("output cols mismatch: %s vs %s", log.Safe(r.OutputCols), log.Safe(other.OutputCols)))
-	}
-
-	if r.Cardinality.Max < other.Cardinality.Min ||
-		r.Cardinality.Min > other.Cardinality.Max {
-		panic(errors.AssertionFailedf("cardinality mismatch: %s vs %s", log.Safe(r.Cardinality), log.Safe(other.Cardinality)))
-	}
-
-	// NotNullCols, FuncDeps are best effort, so they might differ.
-	// OuterCols, CanHaveSideEffects, and HasPlaceholder might differ if a
-	// subexpression containing them was elided.
-}
-
-// Verify runs consistency checks against the relational properties, in order to
-// ensure that they conform to several invariants:
-//
-//   1. Functional dependencies are internally consistent.
-//
-func (s *Scalar) Verify() {
-	s.Shared.Verify()
-	s.FuncDeps.Verify()
 }

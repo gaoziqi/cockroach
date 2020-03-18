@@ -12,22 +12,113 @@ package sql_test
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/jackc/pgx/pgtype"
+	"github.com/lib/pq"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// TestGetAllNamesInternal tests both namespace and namespace_deprecated
+// entries.
+func TestGetAllNamesInternal(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, _ /* sqlDB */, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		batch := txn.NewBatch()
+		batch.Put(sqlbase.NewTableKey(999, 444, "bob").Key(), 9999)
+		batch.Put(sqlbase.NewDeprecatedTableKey(1000, "alice").Key(), 10000)
+		batch.Put(sqlbase.NewDeprecatedTableKey(999, "overwrite_me_old_value").Key(), 9999)
+		return txn.CommitInBatch(ctx, batch)
+	})
+	require.NoError(t, err)
+
+	names, err := sql.TestingGetAllNames(ctx, nil, s.InternalExecutor().(*sql.InternalExecutor))
+	require.NoError(t, err)
+
+	assert.Equal(t, sql.NamespaceKey{ParentID: 999, ParentSchemaID: 444, Name: "bob"}, names[9999])
+	assert.Equal(t, sql.NamespaceKey{ParentID: 1000, Name: "alice"}, names[10000])
+}
+
+// TestRangeLocalityBasedOnNodeIDs tests that the replica_localities shown in crdb_internal.ranges
+// are correct reflection of the localities of the stores in the range descriptor which
+// is in the replicas column
+func TestRangeLocalityBasedOnNodeIDs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+
+	// NodeID=1, StoreID=1
+	tc := testcluster.StartTestCluster(t, 1,
+		base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "node", Value: "1"}}},
+			},
+			ReplicationMode: base.ReplicationAuto,
+		},
+	)
+	defer tc.Stopper().Stop(ctx)
+	assert.EqualValues(t, 1, tc.Servers[len(tc.Servers)-1].GetFirstStoreID())
+
+	// Set to 2 so the the next store id will be 3.
+	assert.NoError(t, tc.Servers[0].DB().Put(ctx, keys.StoreIDGenerator, 2))
+
+	// NodeID=2, StoreID=3
+	tc.AddServer(t,
+		base.TestServerArgs{
+			Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "node", Value: "2"}}},
+		},
+	)
+	assert.EqualValues(t, 3, tc.Servers[len(tc.Servers)-1].GetFirstStoreID())
+
+	// Set to 1 so the next store id will be 2.
+	assert.NoError(t, tc.Servers[0].DB().Put(ctx, keys.StoreIDGenerator, 1))
+
+	// NodeID=3, StoreID=2
+	tc.AddServer(t,
+		base.TestServerArgs{
+			Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "node", Value: "3"}}},
+		},
+	)
+	assert.EqualValues(t, 2, tc.Servers[len(tc.Servers)-1].GetFirstStoreID())
+	assert.NoError(t, tc.WaitForFullReplication())
+
+	sqlDB := sqlutils.MakeSQLRunner(tc.Conns[0])
+	var replicas, localities string
+	sqlDB.QueryRow(t, `select replicas, replica_localities from crdb_internal.ranges limit 1`).
+		Scan(&replicas, &localities)
+
+	assert.Equal(t, "{1,2,3}", replicas)
+	// If range is represented as tuple of node ids then the result will be {node=1,node=2,node=3}.
+	// If range is represented as tuple of store ids then the result will be {node=1,node=3,node=2}.
+	assert.Equal(t, "{node=1,node=3,node=2}", localities)
+}
 
 func TestGossipAlertsTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -48,7 +139,9 @@ func TestGossipAlertsTable(t *testing.T) {
 	}
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
-	row, err := ie.QueryRow(ctx, "test", nil /* txn */, "SELECT * FROM crdb_internal.gossip_alerts WHERE store_id = 123")
+	row, err := ie.QueryRowEx(ctx, "test", nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		"SELECT * FROM crdb_internal.gossip_alerts WHERE store_id = 123")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +211,7 @@ CREATE TABLE t.test (k INT);
 	tableDesc.Columns = append(tableDesc.Columns, *col)
 
 	// Write the modified descriptor.
-	if err := kvDB.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
+	if err := kvDB.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
 		if err := txn.SetSystemConfigTrigger(); err != nil {
 			return err
 		}
@@ -198,5 +291,57 @@ SELECT column_name, character_maximum_length, numeric_precision, numeric_precisi
 	if !found {
 		t.Fatal("column disappeared")
 	}
+}
 
+// TestCrdbInternalJobsOOM verifies that the memory budget works correctly for
+// crdb_internal.jobs.
+func TestCrdbInternalJobsOOM(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// The budget needs to be large enough to establish the initial database
+	// connection, but small enough to overflow easily. It's set to be comfortably
+	// large enough that the server can start up with a bit of
+	// extra space to overflow.
+	const lowMemoryBudget = 250000
+	const fieldSize = 10000
+	const numRows = 10
+	const statement = "SELECT count(*) FROM crdb_internal.jobs"
+
+	insertRows := func(sqlDB *gosql.DB) {
+		for i := 0; i < numRows; i++ {
+			if _, err := sqlDB.Exec(`
+INSERT INTO system.jobs(id, status, payload, progress)
+VALUES ($1, 'StatusRunning', repeat('a', $2)::BYTES, repeat('a', $2)::BYTES)`, i, fieldSize); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	t.Run("over budget jobs table", func(t *testing.T) {
+		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+			SQLMemoryPoolSize: lowMemoryBudget,
+		})
+		defer s.Stopper().Stop(context.Background())
+
+		insertRows(sqlDB)
+		_, err := sqlDB.Exec(statement)
+		if err == nil {
+			t.Fatalf("Expected \"%s\" to consume too much memory, found no error", statement)
+		}
+		if pErr, ok := err.(*pq.Error); !ok || pErr.Code != pgcode.OutOfMemory {
+			t.Fatalf("Expected \"%s\" to consume too much memory, found unexpected error %+v", statement, pErr)
+		}
+	})
+
+	t.Run("under budget jobs table", func(t *testing.T) {
+		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+			SQLMemoryPoolSize: 2 * lowMemoryBudget,
+		})
+		defer s.Stopper().Stop(context.Background())
+
+		insertRows(sqlDB)
+		if _, err := sqlDB.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	})
 }

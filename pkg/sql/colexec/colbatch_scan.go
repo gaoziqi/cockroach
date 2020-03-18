@@ -48,11 +48,7 @@ type colBatchScan struct {
 	init bool
 }
 
-var _ StaticMemoryOperator = &colBatchScan{}
-
-func (s *colBatchScan) EstimateStaticMemoryUsage() int {
-	return s.rf.EstimateStaticMemoryUsage()
-}
+var _ Operator = &colBatchScan{}
 
 func (s *colBatchScan) Init() {
 	s.ctx = context.Background()
@@ -73,7 +69,9 @@ func (s *colBatchScan) Next(ctx context.Context) coldata.Batch {
 	if err != nil {
 		execerror.VectorizedInternalPanic(err)
 	}
-	bat.SetSelection(false)
+	if bat.Selection() != nil {
+		execerror.VectorizedInternalPanic("unexpectedly a selection vector is set on the batch coming from CFetcher")
+	}
 	return bat
 }
 
@@ -92,15 +90,18 @@ func (s *colBatchScan) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
 		}
 	}
-	if meta := execinfra.GetTxnCoordMeta(ctx, s.flowCtx.Txn); meta != nil {
-		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{TxnCoordMeta: meta})
+	if tfs := execinfra.GetLeafTxnFinalState(ctx, s.flowCtx.Txn); tfs != nil {
+		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}
 	return trailingMeta
 }
 
 // newColBatchScan creates a new colBatchScan operator.
 func newColBatchScan(
-	flowCtx *execinfra.FlowCtx, spec *execinfrapb.TableReaderSpec, post *execinfrapb.PostProcessSpec,
+	allocator *Allocator,
+	flowCtx *execinfra.FlowCtx,
+	spec *execinfrapb.TableReaderSpec,
+	post *execinfrapb.PostProcessSpec,
 ) (*colBatchScan, error) {
 	if flowCtx.NodeID == 0 {
 		return nil, errors.Errorf("attempting to create a colBatchScan with uninitialized NodeID")
@@ -125,8 +126,8 @@ func newColBatchScan(
 	columnIdxMap := spec.Table.ColumnIdxMapWithMutations(returnMutations)
 	fetcher := cFetcher{}
 	if _, _, err := initCRowFetcher(
-		&fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap, spec.Reverse,
-		neededColumns, spec.IsCheck, spec.Visibility,
+		allocator, &fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap, spec.Reverse,
+		neededColumns, spec.IsCheck, spec.Visibility, spec.LockingStrength,
 	); err != nil {
 		return nil, err
 	}
@@ -147,6 +148,7 @@ func newColBatchScan(
 
 // initCRowFetcher initializes a row.cFetcher. See initRowFetcher.
 func initCRowFetcher(
+	allocator *Allocator,
 	fetcher *cFetcher,
 	desc *sqlbase.TableDescriptor,
 	indexIdx int,
@@ -155,6 +157,7 @@ func initCRowFetcher(
 	valNeededForCol util.FastIntSet,
 	isCheck bool,
 	scanVisibility execinfrapb.ScanVisibility,
+	lockStr sqlbase.ScanLockingStrength,
 ) (index *sqlbase.IndexDescriptor, isSecondaryIndex bool, err error) {
 	immutDesc := sqlbase.NewImmutableTableDescriptor(*desc)
 	index, isSecondaryIndex, err = immutDesc.FindIndexByIndexIdx(indexIdx)
@@ -175,7 +178,7 @@ func initCRowFetcher(
 		ValNeededForCol:  valNeededForCol,
 	}
 	if err := fetcher.Init(
-		reverseScan, true /* returnRangeInfo */, isCheck, tableArgs,
+		allocator, reverseScan, lockStr, true /* returnRangeInfo */, isCheck, tableArgs,
 	); err != nil {
 		return nil, false, err
 	}

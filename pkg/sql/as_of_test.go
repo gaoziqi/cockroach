@@ -18,12 +18,12 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -33,9 +33,7 @@ func TestAsOfTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	params, _ := tests.CreateTestServerParams()
-	params.Knobs.SQLSchemaChanger = &sql.SchemaChangerTestingKnobs{
-		AsyncExecNotification: asyncSchemaChangerDisabled,
-	}
+	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func() { select {} }}
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
@@ -300,7 +298,7 @@ func TestAsOfRetry(t *testing.T) {
 
 			switch req := args.Req.(type) {
 			case *roachpb.ScanRequest:
-				if client.TestingIsRangeLookupRequest(req) {
+				if kv.TestingIsRangeLookupRequest(req) {
 					return nil
 				}
 				for key, count := range magicVals.restartCounts {
@@ -314,7 +312,7 @@ func TestAsOfRetry(t *testing.T) {
 						magicVals.failedValues[string(req.Key)] =
 							failureRecord{err, args.Hdr.Txn}
 						txn := args.Hdr.Txn.Clone()
-						txn.Timestamp = txn.Timestamp.Add(0, 1)
+						txn.WriteTimestamp = txn.WriteTimestamp.Add(0, 1)
 						return roachpb.NewErrorWithTxn(err, txn)
 					}
 				}

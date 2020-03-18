@@ -13,7 +13,6 @@ package main
 import (
 	"io"
 	"io/ioutil"
-	"regexp"
 	"strings"
 	"text/template"
 
@@ -37,8 +36,10 @@ type sortOverloads struct {
 // the overload representing the sort direction.
 var typesToSortOverloads map[coltypes.T]map[bool]sortOverloads
 
+const sortOpsTmpl = "pkg/sql/colexec/sort_tmpl.go"
+
 func genSortOps(wr io.Writer) error {
-	d, err := ioutil.ReadFile("pkg/sql/colexec/sort_tmpl.go")
+	d, err := ioutil.ReadFile(sortOpsTmpl)
 	if err != nil {
 		return err
 	}
@@ -55,8 +56,8 @@ func genSortOps(wr io.Writer) error {
 	s = strings.Replace(s, "_ISNULL", "{{$isNull}}", -1)
 	s = strings.Replace(s, "_HANDLES_NULLS", "{{if .Nulls}}WithNulls{{else}}{{end}}", -1)
 
-	assignLtRe := regexp.MustCompile(`_ASSIGN_LT\((.*),(.*),(.*)\)`)
-	s = assignLtRe.ReplaceAllString(s, "{{.Assign $1 $2 $3}}")
+	assignLtRe := makeFunctionRegex("_ASSIGN_LT", 3)
+	s = assignLtRe.ReplaceAllString(s, makeTemplateFunctionCall("Assign", 3))
 
 	s = replaceManipulationFuncs(".LTyp", s)
 
@@ -69,8 +70,10 @@ func genSortOps(wr io.Writer) error {
 	return tmpl.Execute(wr, typesToSortOverloads)
 }
 
+const quickSortTmpl = "pkg/sql/colexec/quicksort_tmpl.go"
+
 func genQuickSortOps(wr io.Writer) error {
-	d, err := ioutil.ReadFile("pkg/sql/colexec/quicksort_tmpl.go")
+	d, err := ioutil.ReadFile(quickSortTmpl)
 	if err != nil {
 		return err
 	}
@@ -92,8 +95,8 @@ func genQuickSortOps(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genSortOps, "sort.eg.go")
-	registerGenerator(genQuickSortOps, "quicksort.eg.go")
+	registerGenerator(genSortOps, "sort.eg.go", sortOpsTmpl)
+	registerGenerator(genQuickSortOps, "quicksort.eg.go", quickSortTmpl)
 	typesToSortOverloads = make(map[coltypes.T]map[bool]sortOverloads)
 	for _, o := range sameTypeComparisonOpToOverloads[tree.LT] {
 		typesToSortOverloads[o.LTyp] = make(map[bool]sortOverloads)

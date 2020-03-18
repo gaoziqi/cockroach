@@ -15,6 +15,9 @@ import "os"
 // drainSignals are the signals that will cause the server to drain and exit.
 var drainSignals = []os.Signal{os.Interrupt}
 
+// quitSignal is the signal to recognize to dump Go stacks.
+var quitSignal os.Signal = nil
+
 func handleSignalDuringShutdown(os.Signal) {
 	// Windows doesn't indicate whether a process exited due to a signal in the
 	// exit code, so we don't need to do anything but exit with a failing code.
@@ -24,4 +27,8 @@ func handleSignalDuringShutdown(os.Signal) {
 
 func maybeRerunBackground() (bool, error) {
 	return false, nil
+}
+
+func disableOtherPermissionBits() {
+	// No-op on windows, which does not support umask.
 }

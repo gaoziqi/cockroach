@@ -14,7 +14,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // tableDeleter handles writing kvs and forming table rows for deletes.
@@ -34,6 +34,8 @@ type tableDeleter struct {
 	alloc *sqlbase.DatumAlloc
 }
 
+var _ tableWriter = &tableDeleter{}
+
 // desc is part of the tableWriter interface.
 func (*tableDeleter) desc() string { return "deleter" }
 
@@ -41,12 +43,12 @@ func (*tableDeleter) desc() string { return "deleter" }
 func (td *tableDeleter) walkExprs(_ func(desc string, index int, expr tree.TypedExpr)) {}
 
 // init is part of the tableWriter interface.
-func (td *tableDeleter) init(txn *client.Txn, _ *tree.EvalContext) error {
+func (td *tableDeleter) init(_ context.Context, txn *kv.Txn, _ *tree.EvalContext) error {
 	td.tableWriterBase.init(txn)
 	return nil
 }
 
-// flushAndStartNewBatch is part of the extendedTableWriter interface.
+// flushAndStartNewBatch is part of the tableWriter interface.
 func (td *tableDeleter) flushAndStartNewBatch(ctx context.Context) error {
 	return td.tableWriterBase.flushAndStartNewBatch(ctx, td.rd.Helper.TableDesc)
 }
@@ -56,7 +58,7 @@ func (td *tableDeleter) finalize(ctx context.Context, _ bool) (*rowcontainer.Row
 	return nil, td.tableWriterBase.finalize(ctx, td.rd.Helper.TableDesc)
 }
 
-// atBatchEnd is part of the extendedTableWriter interface.
+// atBatchEnd is part of the tableWriter interface.
 func (td *tableDeleter) atBatchEnd(_ context.Context, _ bool) error { return nil }
 
 func (td *tableDeleter) row(ctx context.Context, values tree.Datums, traceKV bool) error {
@@ -104,6 +106,7 @@ func (td *tableDeleter) deleteAllRows(
 		log.VEvent(ctx, 2, "delete forced to scan: table is interleaved")
 		return td.deleteAllRowsScan(ctx, resume, limit, traceKV)
 	}
+	// TODO(pbardea): Is this ever called anymore?
 	return td.deleteAllRowsFast(ctx, resume, limit, traceKV)
 }
 
@@ -162,7 +165,15 @@ func (td *tableDeleter) deleteAllRowsScan(
 		ValNeededForCol: valNeededForCol,
 	}
 	if err := rf.Init(
-		false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, td.alloc, tableArgs,
+		false, /* reverse */
+		// TODO(nvanbenschoten): it might make sense to use a FOR_UPDATE locking
+		// strength here. Consider hooking this in to the same knob that will
+		// control whether we perform locking implicitly during DELETEs.
+		sqlbase.ScanLockingStrength_FOR_NONE,
+		false, /* returnRangeInfo */
+		false, /* isCheck */
+		td.alloc,
+		tableArgs,
 	); err != nil {
 		return resume, err
 	}
@@ -243,7 +254,7 @@ func (td *tableDeleter) clearIndex(ctx context.Context, idx *sqlbase.IndexDescri
 
 	// ClearRange cannot be run in a transaction, so create a
 	// non-transactional batch to send the request.
-	b := &client.Batch{}
+	b := &kv.Batch{}
 	b.AddRawRequest(&roachpb.ClearRangeRequest{
 		RequestHeader: roachpb.RequestHeader{
 			Key:    sp.Key,
@@ -274,7 +285,15 @@ func (td *tableDeleter) deleteIndexScan(
 		ValNeededForCol: valNeededForCol,
 	}
 	if err := rf.Init(
-		false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, td.alloc, tableArgs,
+		false, /* reverse */
+		// TODO(nvanbenschoten): it might make sense to use a FOR_UPDATE locking
+		// strength here. Consider hooking this in to the same knob that will
+		// control whether we perform locking implicitly during DELETEs.
+		sqlbase.ScanLockingStrength_FOR_NONE,
+		false, /* returnRangeInfo */
+		false, /* isCheck */
+		td.alloc,
+		tableArgs,
 	); err != nil {
 		return resume, err
 	}

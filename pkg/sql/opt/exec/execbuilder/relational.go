@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -140,13 +141,16 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	var ep execPlan
 	var err error
 
-	// This will set the system DB trigger for transactions containing
-	// schema-modifying statements that have no effect, such as
-	// `BEGIN; INSERT INTO ...; CREATE TABLE IF NOT EXISTS ...; COMMIT;`
-	// where the table already exists. This will generate some false schema
-	// cache refreshes, but that's expected to be quite rare in practice.
-	isDDL := opt.IsDDLOp(e)
-	if isDDL {
+	if opt.IsDDLOp(e) {
+		// Mark the statement as containing DDL for use
+		// in the SQL executor.
+		b.IsDDL = true
+
+		// This will set the system DB trigger for transactions containing
+		// schema-modifying statements that have no effect, such as
+		// `BEGIN; INSERT INTO ...; CREATE TABLE IF NOT EXISTS ...; COMMIT;`
+		// where the table already exists. This will generate some false schema
+		// cache refreshes, but that's expected to be quite rare in practice.
 		if err := b.evalCtx.Txn.SetSystemConfigTrigger(); err != nil {
 			return execPlan{}, errors.WithSecondaryError(
 				unimplemented.NewWithIssuef(26508,
@@ -178,7 +182,6 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 		}
 	}
 
-	// Handle read-only operators which never write data or modify schema.
 	switch t := e.(type) {
 	case *memo.ValuesExpr:
 		ep, err = b.buildValues(t)
@@ -198,7 +201,7 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	case *memo.GroupByExpr, *memo.ScalarGroupByExpr:
 		ep, err = b.buildGroupBy(e)
 
-	case *memo.DistinctOnExpr:
+	case *memo.DistinctOnExpr, *memo.UpsertDistinctOnExpr:
 		ep, err = b.buildDistinct(t)
 
 	case *memo.LimitExpr, *memo.OffsetExpr:
@@ -295,19 +298,19 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 		ep, err = b.buildExport(t)
 
 	default:
-		if opt.IsSetOp(e) {
+		switch {
+		case opt.IsSetOp(e):
 			ep, err = b.buildSetOp(e)
-			break
-		}
-		if opt.IsJoinNonApplyOp(e) {
+
+		case opt.IsJoinNonApplyOp(e):
 			ep, err = b.buildHashJoin(e)
-			break
-		}
-		if opt.IsJoinApplyOp(e) {
+
+		case opt.IsJoinApplyOp(e):
 			ep, err = b.buildApplyJoin(e)
-			break
+
+		default:
+			err = errors.AssertionFailedf("no execbuild for %T", t)
 		}
-		return execPlan{}, errors.AssertionFailedf("no execbuild for %T", t)
 	}
 	if err != nil {
 		return execPlan{}, err
@@ -342,6 +345,14 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 }
 
 func (b *Builder) buildValues(values *memo.ValuesExpr) (execPlan, error) {
+	rows, err := b.buildValuesRows(values)
+	if err != nil {
+		return execPlan{}, err
+	}
+	return b.constructValues(rows, values.Cols)
+}
+
+func (b *Builder) buildValuesRows(values *memo.ValuesExpr) ([][]tree.TypedExpr, error) {
 	numCols := len(values.Cols)
 
 	rows := make([][]tree.TypedExpr, len(values.Rows))
@@ -350,7 +361,7 @@ func (b *Builder) buildValues(values *memo.ValuesExpr) (execPlan, error) {
 	for i := range rows {
 		tup := values.Rows[i].(*memo.TupleExpr)
 		if len(tup.Elems) != numCols {
-			return execPlan{}, fmt.Errorf("inconsistent row length %d vs %d", len(tup.Elems), numCols)
+			return nil, fmt.Errorf("inconsistent row length %d vs %d", len(tup.Elems), numCols)
 		}
 		// Chop off prefix of rowBuf and limit its capacity.
 		rows[i] = rowBuf[:numCols:numCols]
@@ -359,11 +370,11 @@ func (b *Builder) buildValues(values *memo.ValuesExpr) (execPlan, error) {
 		for j := 0; j < numCols; j++ {
 			rows[i][j], err = b.buildScalar(&scalarCtx, tup.Elems[j])
 			if err != nil {
-				return execPlan{}, err
+				return nil, err
 			}
 		}
 	}
-	return b.constructValues(rows, values.Cols)
+	return rows, nil
 }
 
 func (b *Builder) constructValues(rows [][]tree.TypedExpr, cols opt.ColList) (execPlan, error) {
@@ -468,17 +479,37 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		sqltelemetry.IncrementPartitioningCounter(sqltelemetry.PartitionConstrainedScan)
 	}
 
+	softLimit := int64(math.Ceil(scan.RequiredPhysical().LimitHint))
+	hardLimit := scan.HardLimit.RowCount()
+
+	// At most one of hardLimit and softLimit may be defined at the same time.
+	//
+	// TODO(celine): Determine the more optimal course of action if there are
+	// competing hard and soft limits. It is currently unclear what course to
+	// take in the case of, for example, a small soft limit and a large hard
+	// limit, but always taking the soft limit is almost certainly suboptimal.
+	if softLimit != 0 {
+		hardLimit = 0
+	}
+
+	locking := scan.Locking
+	if b.forceForUpdateLocking {
+		locking = forUpdateLocking
+	}
+
 	root, err := b.factory.ConstructScan(
 		tab,
 		tab.Index(scan.Index),
 		needed,
 		scan.Constraint,
-		scan.HardLimit.RowCount(),
+		hardLimit,
+		softLimit,
 		// HardLimit.Reverse() is taken into account by ScanIsReverse.
 		ordering.ScanIsReverse(scan, &scan.RequiredPhysical().Ordering),
 		b.indexConstraintMaxResults(scan),
 		res.reqOrdering(scan),
 		rowCount,
+		locking,
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -623,7 +654,7 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 	// outer columns, so that we can figure out the output columns and various
 	// other attributes.
 	var f norm.Factory
-	f.Init(b.evalCtx)
+	f.Init(b.evalCtx, b.catalog)
 	fakeBindings := make(map[opt.ColumnID]tree.Datum)
 	rightExpr.Relational().OuterCols.ForEach(func(k opt.ColumnID) {
 		fakeBindings[k] = tree.DNull
@@ -710,9 +741,11 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 }
 
 func (b *Builder) buildHashJoin(join memo.RelExpr) (execPlan, error) {
-	if f := join.Private().(*memo.JoinPrivate).Flags; f.DisallowHashJoin {
+	if f := join.Private().(*memo.JoinPrivate).Flags; !f.Has(memo.AllowHashJoinStoreRight) {
+		// We need to do a bit of reverse engineering here to determine what the
+		// hint was.
 		hint := tree.AstLookup
-		if !f.DisallowMergeJoin {
+		if f.Has(memo.AllowMergeJoin) {
 			hint = tree.AstMerge
 		}
 
@@ -888,43 +921,51 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 	aggInfos := make([]exec.AggInfo, len(aggregations))
 	for i := range aggregations {
 		item := &aggregations[i]
-		name, overload := memo.FindAggregateOverload(item.Agg)
+		agg := item.Agg
 
-		distinct := false
-		var argIdx []exec.ColumnOrdinal
 		var filterOrd exec.ColumnOrdinal = -1
-
-		if item.Agg.ChildCount() > 0 {
-			child := item.Agg.Child(0)
-
-			if aggFilter, ok := child.(*memo.AggFilterExpr); ok {
-				filter, ok := aggFilter.Filter.(*memo.VariableExpr)
-				if !ok {
-					return execPlan{}, errors.Errorf("only VariableOp args supported")
-				}
-				filterOrd = input.getColumnOrdinal(filter.Col)
-				child = aggFilter.Input
-			}
-
-			if aggDistinct, ok := child.(*memo.AggDistinctExpr); ok {
-				distinct = true
-				child = aggDistinct.Input
-			}
-			v, ok := child.(*memo.VariableExpr)
+		if aggFilter, ok := agg.(*memo.AggFilterExpr); ok {
+			filter, ok := aggFilter.Filter.(*memo.VariableExpr)
 			if !ok {
-				return execPlan{}, errors.Errorf("only VariableOp args supported")
+				return execPlan{}, errors.AssertionFailedf("only VariableOp args supported")
 			}
-			argIdx = []exec.ColumnOrdinal{input.getColumnOrdinal(v.Col)}
+			filterOrd = input.getColumnOrdinal(filter.Col)
+			agg = aggFilter.Input
 		}
 
-		constArgs := b.extractAggregateConstArgs(item.Agg)
+		distinct := false
+		if aggDistinct, ok := agg.(*memo.AggDistinctExpr); ok {
+			distinct = true
+			agg = aggDistinct.Input
+		}
+
+		name, overload := memo.FindAggregateOverload(agg)
+
+		// Accumulate variable arguments in argCols and constant arguments in
+		// constArgs. Constant arguments must follow variable arguments.
+		var argCols []exec.ColumnOrdinal
+		var constArgs tree.Datums
+		for j, n := 0, agg.ChildCount(); j < n; j++ {
+			child := agg.Child(j)
+			if variable, ok := child.(*memo.VariableExpr); ok {
+				if len(constArgs) != 0 {
+					return execPlan{}, errors.Errorf("constant args must come after variable args")
+				}
+				argCols = append(argCols, input.getColumnOrdinal(variable.Col))
+			} else {
+				if len(argCols) == 0 {
+					return execPlan{}, errors.Errorf("a constant arg requires at least one variable arg")
+				}
+				constArgs = append(constArgs, memo.ExtractConstDatum(child))
+			}
+		}
 
 		aggInfos[i] = exec.AggInfo{
 			FuncName:   name,
 			Builtin:    overload,
 			Distinct:   distinct,
 			ResultType: item.Agg.DataType(),
-			ArgCols:    argIdx,
+			ArgCols:    argCols,
 			ConstArgs:  constArgs,
 			Filter:     filterOrd,
 		}
@@ -949,21 +990,12 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 	return ep, nil
 }
 
-// extractAggregateConstArgs returns the list of constant arguments associated with a given aggregate
-// expression.
-func (b *Builder) extractAggregateConstArgs(agg opt.ScalarExpr) tree.Datums {
-	switch agg.Op() {
-	case opt.StringAggOp:
-		return tree.Datums{memo.ExtractConstDatum(agg.Child(1))}
-	default:
-		return nil
-	}
-}
+func (b *Builder) buildDistinct(distinct memo.RelExpr) (execPlan, error) {
+	private := distinct.Private().(*memo.GroupingPrivate)
 
-func (b *Builder) buildDistinct(distinct *memo.DistinctOnExpr) (execPlan, error) {
-	if distinct.GroupingCols.Empty() {
+	if private.GroupingCols.Empty() {
 		// A DistinctOn with no grouping columns should have been converted to a
-		// LIMIT 1 by normalization rules.
+		// LIMIT 1 or Max1Row by normalization rules.
 		return execPlan{}, fmt.Errorf("cannot execute distinct on no columns")
 	}
 	input, err := b.buildGroupByInput(distinct)
@@ -971,17 +1003,32 @@ func (b *Builder) buildDistinct(distinct *memo.DistinctOnExpr) (execPlan, error)
 		return execPlan{}, err
 	}
 
-	distinctCols := input.getColumnOrdinalSet(distinct.GroupingCols)
+	distinctCols := input.getColumnOrdinalSet(private.GroupingCols)
 	var orderedCols exec.ColumnOrdinalSet
 	ordering := ordering.StreamingGroupingColOrdering(
-		&distinct.GroupingPrivate, &distinct.RequiredPhysical().Ordering,
+		private, &distinct.RequiredPhysical().Ordering,
 	)
 	for i := range ordering {
 		orderedCols.Add(int(input.getColumnOrdinal(ordering[i].ID())))
 	}
 	ep := execPlan{outputCols: input.outputCols}
+
+	// If this is UpsertDistinctOn, then treat NULL values as distinct.
+	var nullsAreDistinct bool
+	if distinct.Op() == opt.UpsertDistinctOnOp {
+		nullsAreDistinct = true
+	}
+
+	// If duplicate input rows are not allowed, raise an error at runtime if
+	// duplicates are detected.
+	var errorOnDup string
+	if private.ErrorOnDup {
+		errorOnDup = sqlbase.DuplicateUpsertErrText
+	}
+
 	reqOrdering := ep.reqOrdering(distinct)
-	ep.root, err = b.factory.ConstructDistinct(input.root, distinctCols, orderedCols, reqOrdering)
+	ep.root, err = b.factory.ConstructDistinct(
+		input.root, distinctCols, orderedCols, reqOrdering, nullsAreDistinct, errorOnDup)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1272,8 +1319,6 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 	for i := range join.KeyCols {
 		eqCols.Add(join.Table.ColumnID(idx.Column(i).Ordinal))
 	}
-	tableFDs := memo.MakeTableFuncDep(md, join.Table)
-	eqColsAreKey := tableFDs.ColsAreStrictKey(eqCols)
 
 	res.root, err = b.factory.ConstructLookupJoin(
 		joinOpToJoinType(join.JoinType),
@@ -1281,7 +1326,7 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 		tab,
 		idx,
 		keyCols,
-		eqColsAreKey,
+		join.LookupColsAreTableKey,
 		lookupOrdinals,
 		onExpr,
 		res.reqOrdering(join),
@@ -1379,12 +1424,11 @@ func (b *Builder) buildMax1Row(max1Row *memo.Max1RowExpr) (execPlan, error) {
 		return execPlan{}, err
 	}
 
-	node, err := b.factory.ConstructMax1Row(input.root)
+	node, err := b.factory.ConstructMax1Row(input.root, max1Row.ErrorText)
 	if err != nil {
 		return execPlan{}, err
 	}
 	return execPlan{root: node, outputCols: input.outputCols}, nil
-
 }
 
 func (b *Builder) buildWith(with *memo.WithExpr) (execPlan, error) {
@@ -1490,20 +1534,22 @@ func (b *Builder) buildRecursiveCTE(rec *memo.RecursiveCTEExpr) (execPlan, error
 }
 
 func (b *Builder) buildWithScan(withScan *memo.WithScanExpr) (execPlan, error) {
-	id := withScan.ID
+	withID := withScan.With
 	var e *builtWithExpr
 	for i := range b.withExprs {
-		if b.withExprs[i].id == id {
+		if b.withExprs[i].id == withID {
 			e = &b.withExprs[i]
 			break
 		}
 	}
 	if e == nil {
-		panic(errors.AssertionFailedf("couldn't find With expression with ID %d", id))
+		err := errors.Errorf("couldn't find WITH expression %q with ID %d", withScan.Name, withID)
+		return execPlan{}, errors.WithHint(
+			err, "references to WITH expressions from correlated subqueries are unsupported")
 	}
 
 	var label bytes.Buffer
-	fmt.Fprintf(&label, "buffer %d", withScan.ID)
+	fmt.Fprintf(&label, "buffer %d", withScan.With)
 	if withScan.Name != "" {
 		fmt.Fprintf(&label, " (%s)", withScan.Name)
 	}
@@ -1565,7 +1611,7 @@ func (b *Builder) buildProjectSet(projectSet *memo.ProjectSetExpr) (execPlan, er
 
 	for i := range zip {
 		item := &zip[i]
-		exprs[i], err = b.buildScalar(&scalarCtx, item.Func)
+		exprs[i], err = b.buildScalar(&scalarCtx, item.Fn)
 		if err != nil {
 			return execPlan{}, err
 		}
@@ -1669,6 +1715,9 @@ func (b *Builder) buildFrame(input execPlan, w *memo.WindowsItem) (*tree.WindowF
 		if err != nil {
 			return nil, err
 		}
+		if offset == tree.DNull {
+			return nil, pgerror.Newf(pgcode.NullValueNotAllowed, "frame starting offset must not be null")
+		}
 		newDef.Bounds.StartBound.OffsetExpr = offset
 	}
 
@@ -1679,6 +1728,9 @@ func (b *Builder) buildFrame(input execPlan, w *memo.WindowsItem) (*tree.WindowF
 		offset, err := b.buildScalar(&scalarCtx, boundExpr)
 		if err != nil {
 			return nil, err
+		}
+		if offset == tree.DNull {
+			return nil, pgerror.Newf(pgcode.NullValueNotAllowed, "frame ending offset must not be null")
 		}
 		newDef.Bounds.EndBound.OffsetExpr = offset
 	}
@@ -1744,6 +1796,9 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		item := &w.Windows[i]
 		fn := b.extractWindowFunction(item.Function)
 		name, overload := memo.FindWindowOverload(fn)
+		if !b.disableTelemetry {
+			telemetry.Inc(sqltelemetry.WindowFunctionCounter(name))
+		}
 		props, _ := builtins.GetBuiltinProperties(name)
 
 		args := make([]tree.TypedExpr, fn.ChildCount())
@@ -1820,14 +1875,20 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		outputIdxs[i] = windowStart + i
 	}
 
+	var rangeOffsetColumn exec.ColumnOrdinal
+	if ord.Empty() {
+		idx, _ := input.outputCols.Get(int(w.RangeOffsetColumn))
+		rangeOffsetColumn = exec.ColumnOrdinal(idx)
+	}
 	node, err := b.factory.ConstructWindow(input.root, exec.WindowInfo{
-		Cols:       resultCols,
-		Exprs:      exprs,
-		OutputIdxs: outputIdxs,
-		ArgIdxs:    argIdxs,
-		FilterIdxs: filterIdxs,
-		Partition:  partitionIdxs,
-		Ordering:   input.sqlOrdering(ord),
+		Cols:              resultCols,
+		Exprs:             exprs,
+		OutputIdxs:        outputIdxs,
+		ArgIdxs:           argIdxs,
+		FilterIdxs:        filterIdxs,
+		Partition:         partitionIdxs,
+		Ordering:          input.sqlOrdering(ord),
+		RangeOffsetColumn: rangeOffsetColumn,
 	})
 	if err != nil {
 		return execPlan{}, err

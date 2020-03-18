@@ -196,7 +196,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM t x JOIN t y USING(b) WHERE x.b = '3'
 ----
 ·                     distributed     false                ·                         ·
-·                     vectorized      false                ·                         ·
+·                     vectorized      true                 ·                         ·
 render                ·               ·                    (b, a, c, d, a, c, d)     ·
  │                    render 0        b                    ·                         ·
  │                    render 1        a                    ·                         ·
@@ -266,7 +266,7 @@ query TTT
 EXPLAIN SELECT * FROM t WHERE a > 1 AND a < 2
 ----
 ·       distributed  false
-·       vectorized   false
+·       vectorized   true
 norows  ·            ·
 
 statement ok
@@ -434,21 +434,21 @@ query TTT
 EXPLAIN SELECT * FROM t WHERE a = 1 AND false
 ----
 ·       distributed  false
-·       vectorized   false
+·       vectorized   true
 norows  ·            ·
 
 query TTT
 EXPLAIN SELECT * FROM t WHERE a = 1 AND NULL
 ----
 ·       distributed  false
-·       vectorized   false
+·       vectorized   true
 norows  ·            ·
 
 query TTT
 EXPLAIN SELECT * FROM t WHERE a = NULL AND a != NULL
 ----
 ·       distributed  false
-·       vectorized   false
+·       vectorized   true
 norows  ·            ·
 
 # Make sure that mixed type comparison operations are not used
@@ -628,7 +628,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT i, s FROM ab WHERE (i, s) < (1, 'c')
 ----
 ·          distributed  false              ·       ·
-·          vectorized   false              ·       ·
+·          vectorized   true               ·       ·
 render     ·            ·                  (i, s)  ·
  │         render 0     i                  ·       ·
  │         render 1     s                  ·       ·
@@ -644,7 +644,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT i, s FROM ab@baz WHERE (i, s) < (1, 'c')
 ----
 ·          distributed  false              ·       ·
-·          vectorized   false              ·       ·
+·          vectorized   true               ·       ·
 render     ·            ·                  (i, s)  ·
  │         render 0     i                  ·       ·
  │         render 1     s                  ·       ·
@@ -782,7 +782,7 @@ GROUP BY resource_key
 ORDER BY total DESC
 ----
 ·                    distributed  false
-·                    vectorized   false
+·                    vectorized   true
 sort                 ·            ·
  │                   order        -total
  └── group           ·            ·
@@ -939,7 +939,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT k, v FROM str WHERE v SIMILAR TO 'ABC_*'
 ----
 ·     distributed  false                 ·       ·
-·     vectorized   false                 ·       ·
+·     vectorized   true                  ·       ·
 scan  ·            ·                     (k, v)  ·
 ·     table        str@str_v_idx         ·       ·
 ·     spans        /"ABC"-/"ABD"         ·       ·
@@ -991,7 +991,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM xy WHERE y IS DISTINCT FROM NULL
 ----
 ·     distributed  false          ·       ·
-·     vectorized   false          ·       ·
+·     vectorized   true           ·       ·
 scan  ·            ·              (x, y)  ·
 ·     table        xy@primary     ·       ·
 ·     spans        ALL            ·       ·
@@ -1001,7 +1001,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM xy WHERE y IS DISTINCT FROM 4
 ----
 ·     distributed  false                 ·       ·
-·     vectorized   false                 ·       ·
+·     vectorized   true                  ·       ·
 scan  ·            ·                     (x, y)  ·
 ·     table        xy@primary            ·       ·
 ·     spans        ALL                   ·       ·
@@ -1110,7 +1110,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM noncover WHERE c > 0 ORDER BY c DESC
 ----
 ·          distributed  false             ·             ·
-·          vectorized   false             ·             ·
+·          vectorized   true              ·             ·
 sort       ·            ·                 (a, b, c, d)  -c
  │         order        -c                ·             ·
  └── scan  ·            ·                 (a, b, c, d)  ·
@@ -1122,7 +1122,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM noncover WHERE c > 0 ORDER BY c
 ----
 ·          distributed  false             ·             ·
-·          vectorized   false             ·             ·
+·          vectorized   true              ·             ·
 sort       ·            ·                 (a, b, c, d)  +c
  │         order        +c                ·             ·
  └── scan  ·            ·                 (a, b, c, d)  ·
@@ -1147,7 +1147,7 @@ query TTT
 EXPLAIN SELECT * FROM noncover ORDER BY c
 ----
 ·          distributed  false
-·          vectorized   false
+·          vectorized   true
 sort       ·            ·
  │         order        +c
  └── scan  ·            ·
@@ -1173,7 +1173,7 @@ EXPLAIN (VERBOSE) SELECT * FROM noncover ORDER BY c OFFSET 5
 ]
 ----
 ·               distributed  false
-·               vectorized   false
+·               vectorized   true
 limit           ·            ·
  │              offset       5
  └── sort       ·            ·
@@ -1206,7 +1206,7 @@ EXPLAIN (VERBOSE) SELECT * FROM noncover ORDER BY c LIMIT 1000000
 ]
 ----
 ·               distributed  false
-·               vectorized   false
+·               vectorized   true
 limit           ·            ·
  │              count        1000000
  └── sort       ·            ·
@@ -1262,7 +1262,7 @@ EXPLAIN (VERBOSE) SELECT * FROM t2 WHERE b = 2 AND c % 2 = 0
 ]
 ----
 ·           distributed  false
-·           vectorized   false
+·           vectorized   true
 index-join  ·            ·
  │          table        t2@primary
  │          key columns  a
@@ -1301,8 +1301,7 @@ index-join  ·            ·
  │          key columns  a
  └── scan   ·            ·
 ·           table        t2@bc
-·           spans        /2/!NULL-/3
-·           filter       c != b
+·           spans        /2/!NULL-/2/2 /2/3-/3
 
 # We do NOT look up the table row for '22'.
 statement ok
@@ -1314,7 +1313,6 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
 fetched: /t2/bc/2/1/4 -> NULL
-fetched: /t2/bc/2/2/5 -> NULL
 fetched: /t2/bc/2/3/6 -> NULL
 fetched: /t2/primary/4 -> NULL
 fetched: /t2/primary/4/b -> 2
@@ -1337,7 +1335,6 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
 fetched: /t2/bc/2/1/4 -> NULL
-fetched: /t2/bc/2/2/5 -> NULL
 fetched: /t2/bc/2/3/6 -> NULL
 fetched: /t2/primary/4 -> NULL
 fetched: /t2/primary/4/b -> 2
@@ -1519,17 +1516,19 @@ render     ·            ·
 query TTT
 EXPLAIN UPDATE t4 SET c = 30 WHERE a = 10 and b = 20
 ----
-·                    distributed  false
-·                    vectorized   false
-count                ·            ·
- └── update          ·            ·
-      │              table        t4
-      │              set          c
-      │              strategy     updater
-      └── render     ·            ·
-           └── scan  ·            ·
-·                    table        t4@primary
-·                    spans        /10/20/0-/10/20/1/2
+·                    distributed       false
+·                    vectorized        false
+count                ·                 ·
+ └── update          ·                 ·
+      │              table             t4
+      │              set               c
+      │              strategy          updater
+      │              auto commit       ·
+      └── render     ·                 ·
+           └── scan  ·                 ·
+·                    table             t4@primary
+·                    spans             /10/20/0-/10/20/1/2
+·                    locking strength  for update
 
 # Optimization should not be applied for deletes.
 query TTT
@@ -1539,6 +1538,7 @@ EXPLAIN DELETE FROM t4 WHERE a = 10 and b = 20
 ·             vectorized   false
 delete range  ·            ·
 ·             from         t4
+·             auto commit  ·
 ·             spans        /10/20-/10/20/#
 
 # Optimization should not be applied for non point lookups.

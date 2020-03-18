@@ -66,7 +66,7 @@ func TestMemoInit(t *testing.T) {
 	var o xform.Optimizer
 	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM abc WHERE $1=10")
 
-	o.Init(&evalCtx)
+	o.Init(&evalCtx, catalog)
 	if !o.Memo().IsEmpty() {
 		t.Fatal("memo should be empty")
 	}
@@ -310,7 +310,7 @@ func traverseExpr(expr memo.RelExpr, f func(memo.RelExpr)) {
 func runDataDrivenTest(t *testing.T, path string, fmtFlags memo.ExprFmtFlags) {
 	datadriven.Walk(t, path, func(t *testing.T, path string) {
 		catalog := testcat.New()
-		datadriven.RunTest(t, path, func(d *datadriven.TestData) string {
+		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			tester := opttester.New(catalog, d.Input)
 			tester.Flags.ExprFormat = fmtFlags
 			return tester.RunCommand(t, d)

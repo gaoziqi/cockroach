@@ -32,7 +32,8 @@ import (
 // {{ range .}}
 
 type _OP_LOWERProjOp struct {
-	input Operator
+	allocator *Allocator
+	input     Operator
 
 	leftProjOpChain  Operator
 	rightProjOpChain Operator
@@ -46,18 +47,20 @@ type _OP_LOWERProjOp struct {
 	// origSel is a buffer used to keep track of the original selection vector of
 	// the input batch. We need to do this because we're going to modify the
 	// selection vector in order to do the short-circuiting of logical operators.
-	origSel []uint16
+	origSel []int
 }
 
 // New_OP_TITLEProjOp returns a new projection operator that logical-_OP_TITLE's
 // the boolean columns at leftIdx and rightIdx, returning the result in
 // outputIdx.
 func New_OP_TITLEProjOp(
+	allocator *Allocator,
 	input, leftProjOpChain, rightProjOpChain Operator,
 	leftFeedOp, rightFeedOp *feedOperator,
 	leftIdx, rightIdx, outputIdx int,
 ) Operator {
 	return &_OP_LOWERProjOp{
+		allocator:        allocator,
 		input:            input,
 		leftProjOpChain:  leftProjOpChain,
 		rightProjOpChain: rightProjOpChain,
@@ -66,15 +69,15 @@ func New_OP_TITLEProjOp(
 		leftIdx:          leftIdx,
 		rightIdx:         rightIdx,
 		outputIdx:        outputIdx,
-		origSel:          make([]uint16, coldata.BatchSize()),
+		origSel:          make([]int, coldata.BatchSize()),
 	}
 }
 
-func (o *_OP_LOWERProjOp) ChildCount() int {
+func (o *_OP_LOWERProjOp) ChildCount(verbose bool) int {
 	return 3
 }
 
-func (o *_OP_LOWERProjOp) Child(nth int) execinfra.OpNode {
+func (o *_OP_LOWERProjOp) Child(nth int, verbose bool) execinfra.OpNode {
 	switch nth {
 	case 0:
 		return o.input
@@ -105,14 +108,11 @@ func (o *_OP_LOWERProjOp) Init() {
 // populates the result of the logical operation.
 func (o *_OP_LOWERProjOp) Next(ctx context.Context) coldata.Batch {
 	batch := o.input.Next(ctx)
-	if o.outputIdx == batch.Width() {
-		batch.AppendCol(coltypes.Bool)
-	}
 	origLen := batch.Length()
-	// NB: we don't short-circuit if the batch is length 0 here, because we have
-	// to make sure to run both of the projection chains. This is unfortunate.
-	// TODO(yuzefovich): add this back in once batches are right-sized by
-	// planning.
+	if origLen == 0 {
+		return coldata.ZeroBatch
+	}
+	o.allocator.MaybeAddColumn(batch, coltypes.Bool, o.outputIdx)
 	usesSel := false
 	if sel := batch.Selection(); sel != nil {
 		copy(o.origSel[:origLen], sel[:origLen])
@@ -138,16 +138,17 @@ func (o *_OP_LOWERProjOp) Next(ctx context.Context) coldata.Batch {
 	// {{ end }}
 	leftCol := batch.ColVec(o.leftIdx)
 	leftColVals := leftCol.Bool()
-	var curIdx uint16
+	var curIdx int
 	if usesSel {
 		sel := batch.Selection()
+		origSel := o.origSel[:origLen]
 		if leftCol.MaybeHasNulls() {
 			leftNulls := leftCol.Nulls()
-			for _, i := range o.origSel[:origLen] {
+			for _, i := range origSel {
 				_ADD_TUPLE_FOR_RIGHT(true)
 			}
 		} else {
-			for _, i := range o.origSel {
+			for _, i := range origSel {
 				_ADD_TUPLE_FOR_RIGHT(false)
 			}
 		}
@@ -156,20 +157,25 @@ func (o *_OP_LOWERProjOp) Next(ctx context.Context) coldata.Batch {
 		sel := batch.Selection()
 		if leftCol.MaybeHasNulls() {
 			leftNulls := leftCol.Nulls()
-			for i := uint16(0); i < origLen; i++ {
+			for i := 0; i < origLen; i++ {
 				_ADD_TUPLE_FOR_RIGHT(true)
 			}
 		} else {
-			for i := uint16(0); i < origLen; i++ {
+			for i := 0; i < origLen; i++ {
 				_ADD_TUPLE_FOR_RIGHT(false)
 			}
 		}
 	}
-	batch.SetLength(curIdx)
 
-	// Run the right-side projection on the remaining tuples.
-	o.rightFeedOp.batch = batch
-	batch = o.rightProjOpChain.Next(ctx)
+	var ranRightSide bool
+	if curIdx > 0 {
+		// We only run the right-side projection if there are non-zero number of
+		// remaining tuples.
+		batch.SetLength(curIdx)
+		o.rightFeedOp.batch = batch
+		batch = o.rightProjOpChain.Next(ctx)
+		ranRightSide = true
+	}
 
 	// Now we need to restore the original selection vector and length.
 	if usesSel {
@@ -180,27 +186,29 @@ func (o *_OP_LOWERProjOp) Next(ctx context.Context) coldata.Batch {
 	}
 	batch.SetLength(origLen)
 
-	if origLen == 0 {
-		return batch
+	var (
+		rightCol     coldata.Vec
+		rightColVals []bool
+	)
+	if ranRightSide {
+		rightCol = batch.ColVec(o.rightIdx)
+		rightColVals = rightCol.Bool()
 	}
-
-	rightCol := batch.ColVec(o.rightIdx)
 	outputCol := batch.ColVec(o.outputIdx)
-	rightColVals := rightCol.Bool()
 	outputColVals := outputCol.Bool()
 	outputNulls := outputCol.Nulls()
 	// This is where we populate the output - do the actual evaluation of the
 	// logical operation.
 	if leftCol.MaybeHasNulls() {
 		leftNulls := leftCol.Nulls()
-		if rightCol.MaybeHasNulls() {
+		if rightCol != nil && rightCol.MaybeHasNulls() {
 			rightNulls := rightCol.Nulls()
 			_SET_VALUES(_IS_OR_OP, true, true)
 		} else {
 			_SET_VALUES(_IS_OR_OP, true, false)
 		}
 	} else {
-		if rightCol.MaybeHasNulls() {
+		if rightCol != nil && rightCol.MaybeHasNulls() {
 			rightNulls := rightCol.Nulls()
 			_SET_VALUES(_IS_OR_OP, false, true)
 		} else {
@@ -243,14 +251,16 @@ func _ADD_TUPLE_FOR_RIGHT(_L_HAS_NULLS bool) { // */}}
 func _SET_VALUES(_IS_OR_OP bool, _L_HAS_NULLS bool, _R_HAS_NULLS bool) { // */}}
 	// {{ define "setValues" -}}
 	if sel := batch.Selection(); sel != nil {
-		for _, i := range sel[:origLen] {
-			_SET_SINGLE_VALUE(_IS_OR_OP, true, _L_HAS_NULLS, _R_HAS_NULLS)
+		for _, idx := range sel[:origLen] {
+			_SET_SINGLE_VALUE(_IS_OR_OP, _L_HAS_NULLS, _R_HAS_NULLS)
 		}
 	} else {
-		_ = rightColVals[origLen-1]
+		if ranRightSide {
+			_ = rightColVals[origLen-1]
+		}
 		_ = outputColVals[origLen-1]
-		for i := range leftColVals[:origLen] {
-			_SET_SINGLE_VALUE(_IS_OR_OP, false, _L_HAS_NULLS, _R_HAS_NULLS)
+		for idx := range leftColVals[:origLen] {
+			_SET_SINGLE_VALUE(_IS_OR_OP, _L_HAS_NULLS, _R_HAS_NULLS)
 		}
 	}
 	// {{ end }}
@@ -262,13 +272,8 @@ func _SET_VALUES(_IS_OR_OP bool, _L_HAS_NULLS bool, _R_HAS_NULLS bool) { // */}}
 // {{/*
 // This code snippet sets the result of applying a logical operation AND or OR
 // to two boolean values which can be null.
-func _SET_SINGLE_VALUE(_IS_OR_OP bool, _USES_SEL bool, _L_HAS_NULLS bool, _R_HAS_NULLS bool) { // */}}
+func _SET_SINGLE_VALUE(_IS_OR_OP bool, _L_HAS_NULLS bool, _R_HAS_NULLS bool) { // */}}
 	// {{ define "setSingleValue" -}}
-	// {{ if _USES_SEL }}
-	idx := i
-	// {{ else }}
-	idx := uint16(i)
-	// {{ end }}
 	// {{ if _L_HAS_NULLS }}
 	isLeftNull := leftNulls.NullAt(idx)
 	// {{ else }}

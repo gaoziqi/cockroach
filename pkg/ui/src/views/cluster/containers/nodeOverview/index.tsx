@@ -8,29 +8,44 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+import _ from "lodash";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
+import { Link, RouteComponentProps, withRouter } from "react-router-dom";
 import { createSelector } from "reselect";
-import { RouterState, Link } from "react-router";
-import _ from "lodash";
-
+import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
+import { livenessNomenclature, LivenessStatus, NodesSummary, nodesSummarySelector, selectNodesSummaryValid } from "src/redux/nodes";
+import { AdminUIState } from "src/redux/state";
+import { nodeIDAttr } from "src/util/constants";
+import { LongToMoment } from "src/util/convert";
+import { Bytes, DATE_FORMAT, Percentage } from "src/util/format";
+import { INodeStatus, MetricConstants, StatusMetrics } from "src/util/proto";
+import { getMatchParamByName } from "src/util/query";
+import { SummaryBar, SummaryLabel, SummaryValue } from "src/views/shared/components/summaryBar";
+import { Button, BackIcon } from "oss/src/components/button";
 import "./nodeOverview.styl";
 
-import {
-  livenessNomenclature, LivenessStatus, NodesSummary, nodesSummarySelector, selectNodesSummaryValid,
-} from "src/redux/nodes";
-import { nodeIDAttr } from "src/util/constants";
-import { AdminUIState } from "src/redux/state";
-import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
-import { INodeStatus, MetricConstants, StatusMetrics } from  "src/util/proto";
-import { Bytes, Percentage } from "src/util/format";
-import { LongToMoment } from "src/util/convert";
-import {
-  SummaryBar, SummaryLabel, SummaryValue,
-} from "src/views/shared/components/summaryBar";
+/**
+ * TableRow is a small stateless component that renders a single row in the node
+ * overview table. Each row renders a store metrics value, comparing the value
+ * across the different stores on the node (along with a total value for the
+ * node itself).
+ */
+function TableRow(props: { data: INodeStatus, title: string, valueFn: (s: StatusMetrics) => React.ReactNode }) {
+  return <tr className="table__row table__row--body">
+    <td className="table__cell">{ props.title }</td>
+    <td className="table__cell">{ props.valueFn(props.data.metrics) }</td>
+    {
+      _.map(props.data.store_statuses, (ss) => {
+        return <td key={ss.desc.store_id} className="table__cell">{ props.valueFn(ss.metrics) }</td>;
+      })
+    }
+    <td className="table__cell table__cell--filler" />
+  </tr>;
+}
 
-interface NodeOverviewProps extends RouterState {
+interface NodeOverviewProps extends RouteComponentProps {
   node: INodeStatus;
   nodesSummary: NodesSummary;
   refreshNodes: typeof refreshNodes;
@@ -43,7 +58,7 @@ interface NodeOverviewProps extends RouterState {
 /**
  * Renders the Node Overview page.
  */
-class NodeOverview extends React.Component<NodeOverviewProps, {}> {
+export class NodeOverview extends React.Component<NodeOverviewProps, {}> {
   componentWillMount() {
     // Refresh nodes status query when mounting.
     this.props.refreshNodes();
@@ -57,12 +72,14 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
     props.refreshLiveness();
   }
 
+  prevPage = () => this.props.history.goBack();
+
   render() {
     const { node, nodesSummary } = this.props;
     if (!node) {
       return (
         <div className="section">
-          <h1>Loading cluster status...</h1>
+          <h1 className="base-heading">Loading cluster status...</h1>
         </div>
       );
     }
@@ -72,11 +89,19 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
 
     return (
       <div>
-        <Helmet>
-          <title>{`${nodesSummary.nodeDisplayNameByID[node.desc.node_id]} | Nodes`}</title>
-        </Helmet>
+        <Helmet title={`${nodesSummary.nodeDisplayNameByID[node.desc.node_id]} | Nodes`} />
         <div className="section section--heading">
-          <h2>{`Node ${node.desc.node_id} / ${node.desc.address.address_field}`}</h2>
+          <Button
+            onClick={this.prevPage}
+            type="flat"
+            size="small"
+            className="crl-button--link-to"
+            icon={BackIcon}
+            iconPosition="left"
+          >
+            Overview
+          </Button>
+          <h2 className="base-heading">{`Node ${node.desc.node_id} / ${node.desc.address.address_field}`}</h2>
         </div>
         <section className="section l-columns">
           <div className="l-columns__left">
@@ -148,7 +173,7 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
                 value={livenessString}
                 classModifier={livenessString}
               />
-              <SummaryValue title="Last Update" value={LongToMoment(node.updated_at).fromNow()} />
+              <SummaryValue title="Last Update" value={LongToMoment(node.updated_at).format(DATE_FORMAT)} />
               <SummaryValue title="Build" value={node.build_info.tag} />
               <SummaryValue
                 title="Logs"
@@ -163,28 +188,9 @@ class NodeOverview extends React.Component<NodeOverviewProps, {}> {
   }
 }
 
-/**
- * TableRow is a small stateless component that renders a single row in the node
- * overview table. Each row renders a store metrics value, comparing the value
- * across the different stores on the node (along with a total value for the
- * node itself).
- */
-function TableRow(props: { data: INodeStatus, title: string, valueFn: (s: StatusMetrics) => React.ReactNode }) {
-  return <tr className="table__row table__row--body">
-    <td className="table__cell">{ props.title }</td>
-    <td className="table__cell">{ props.valueFn(props.data.metrics) }</td>
-    {
-      _.map(props.data.store_statuses, (ss) => {
-        return <td key={ss.desc.store_id} className="table__cell">{ props.valueFn(ss.metrics) }</td>;
-      })
-    }
-    <td className="table__cell table__cell--filler" />
-  </tr>;
-}
-
 export const currentNode = createSelector(
-  (state: AdminUIState, _props: RouterState): INodeStatus[] => state.cachedData.nodes.data,
-  (_state: AdminUIState, props: RouterState): number => parseInt(props.params[nodeIDAttr], 10),
+  (state: AdminUIState, _props: RouteComponentProps): INodeStatus[] => state.cachedData.nodes.data,
+  (_state: AdminUIState, props: RouteComponentProps): number => parseInt(getMatchParamByName(props.match, nodeIDAttr), 10),
   (nodes, id) => {
     if (!nodes || !id) {
       return undefined;
@@ -192,8 +198,8 @@ export const currentNode = createSelector(
     return _.find(nodes, (ns) => ns.desc.node_id === id);
   });
 
-export default connect(
-  (state: AdminUIState, ownProps: RouterState) => {
+export default withRouter(connect(
+  (state: AdminUIState, ownProps: RouteComponentProps) => {
     return {
       node: currentNode(state, ownProps),
       nodesSummary: nodesSummarySelector(state),
@@ -204,4 +210,4 @@ export default connect(
     refreshNodes,
     refreshLiveness,
   },
-)(NodeOverview);
+)(NodeOverview));

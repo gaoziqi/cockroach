@@ -12,9 +12,11 @@ package coldata
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // column is an interface that represents a raw array of a Go native type.
@@ -28,25 +30,22 @@ type SliceArgs struct {
 	Src Vec
 	// Sel is an optional slice specifying indices to append to the destination
 	// slice. Note that Src{Start,End}Idx apply to Sel.
-	Sel []uint16
+	Sel []int
 	// DestIdx is the first index that Append will append to.
-	DestIdx uint64
+	DestIdx int
 	// SrcStartIdx is the index of the first element in Src that Append will
 	// append.
-	SrcStartIdx uint64
+	SrcStartIdx int
 	// SrcEndIdx is the exclusive end index of Src. i.e. the element in the index
 	// before SrcEndIdx is the last element appended to the destination slice,
 	// similar to Src[SrcStartIdx:SrcEndIdx].
-	SrcEndIdx uint64
+	SrcEndIdx int
 }
 
 // CopySliceArgs represents the extension of SliceArgs that is passed in to
 // Vec.Copy.
 type CopySliceArgs struct {
 	SliceArgs
-	// Sel64 overrides Sel. Used when the amount of data being copied exceeds the
-	// representation capabilities of a []uint16.
-	Sel64 []uint64
 	// SelOnDest, if true, uses the selection vector as a lens into the
 	// destination as well as the source. Normally, when SelOnDest is false, the
 	// selection vector is applied to the source vector, but the results are
@@ -76,6 +75,10 @@ type Vec interface {
 	// TODO(jordan): should this be [][]byte?
 	// Decimal returns an apd.Decimal slice.
 	Decimal() []apd.Decimal
+	// Timestamp returns a time.Time slice.
+	Timestamp() []time.Time
+	// Interval returns a duration.Duration slice.
+	Interval() []duration.Duration
 
 	// Col returns the raw, typeless backing storage for this Vec.
 	Col() interface{}
@@ -103,13 +106,15 @@ type Vec interface {
 	// Refer to the CopySliceArgs comment for specifics and TestCopy for examples.
 	Copy(CopySliceArgs)
 
-	// Slice returns a new Vec representing a slice of the current Vec from
-	// [start, end).
-	Slice(colType coltypes.T, start uint64, end uint64) Vec
+	// Window returns a "window" into the Vec. A "window" is similar to Golang's
+	// slice of the current Vec from [start, end), but the returned object is NOT
+	// allowed to be modified (the modification might result in an undefined
+	// behavior).
+	Window(colType coltypes.T, start int, end int) Vec
 
 	// PrettyValueAt returns a "pretty"value for the idx'th value in this Vec.
 	// It uses the reflect package and is not suitable for calling in hot paths.
-	PrettyValueAt(idx uint16, colType coltypes.T) string
+	PrettyValueAt(idx int, colType coltypes.T) string
 
 	// MaybeHasNulls returns true if the column possibly has any null values, and
 	// returns false if the column definitely has no null values.
@@ -120,6 +125,19 @@ type Vec interface {
 
 	// SetNulls sets the nulls vector for this column.
 	SetNulls(*Nulls)
+
+	// Length returns the length of the slice that is underlying this Vec.
+	Length() int
+
+	// SetLength sets the length of the slice that is underlying this Vec. Note
+	// that the length of the batch which this Vec belongs to "takes priority".
+	SetLength(int)
+
+	// Capacity returns the capacity of the Golang's slice that is underlying
+	// this Vec. Note that if there is no "slice" (like in case of flat bytes),
+	// the "capacity" of such object is undefined, so is the behavior of this
+	// method.
+	Capacity() int
 }
 
 var _ Vec = &memColumn{}
@@ -151,6 +169,12 @@ func NewMemColumn(t coltypes.T, n int) Vec {
 		return &memColumn{t: t, col: make([]float64, n), nulls: nulls}
 	case coltypes.Decimal:
 		return &memColumn{t: t, col: make([]apd.Decimal, n), nulls: nulls}
+	case coltypes.Timestamp:
+		return &memColumn{t: t, col: make([]time.Time, n), nulls: nulls}
+	case coltypes.Interval:
+		return &memColumn{t: t, col: make([]duration.Duration, n), nulls: nulls}
+	case coltypes.Unhandled:
+		return unknown{}
 	default:
 		panic(fmt.Sprintf("unhandled type %s", t))
 	}
@@ -192,6 +216,14 @@ func (m *memColumn) Decimal() []apd.Decimal {
 	return m.col.([]apd.Decimal)
 }
 
+func (m *memColumn) Timestamp() []time.Time {
+	return m.col.([]time.Time)
+}
+
+func (m *memColumn) Interval() []duration.Duration {
+	return m.col.([]duration.Duration)
+}
+
 func (m *memColumn) Col() interface{} {
 	return m.col
 }
@@ -210,4 +242,79 @@ func (m *memColumn) Nulls() *Nulls {
 
 func (m *memColumn) SetNulls(n *Nulls) {
 	m.nulls = *n
+}
+
+func (m *memColumn) Length() int {
+	switch m.t {
+	case coltypes.Bool:
+		return len(m.col.([]bool))
+	case coltypes.Bytes:
+		return m.Bytes().Len()
+	case coltypes.Int16:
+		return len(m.col.([]int16))
+	case coltypes.Int32:
+		return len(m.col.([]int32))
+	case coltypes.Int64:
+		return len(m.col.([]int64))
+	case coltypes.Float64:
+		return len(m.col.([]float64))
+	case coltypes.Decimal:
+		return len(m.col.([]apd.Decimal))
+	case coltypes.Timestamp:
+		return len(m.col.([]time.Time))
+	case coltypes.Interval:
+		return len(m.col.([]duration.Duration))
+	default:
+		panic(fmt.Sprintf("unhandled type %s", m.t))
+	}
+}
+
+func (m *memColumn) SetLength(l int) {
+	switch m.t {
+	case coltypes.Bool:
+		m.col = m.col.([]bool)[:l]
+	case coltypes.Bytes:
+		m.Bytes().SetLength(l)
+	case coltypes.Int16:
+		m.col = m.col.([]int16)[:l]
+	case coltypes.Int32:
+		m.col = m.col.([]int32)[:l]
+	case coltypes.Int64:
+		m.col = m.col.([]int64)[:l]
+	case coltypes.Float64:
+		m.col = m.col.([]float64)[:l]
+	case coltypes.Decimal:
+		m.col = m.col.([]apd.Decimal)[:l]
+	case coltypes.Timestamp:
+		m.col = m.col.([]time.Time)[:l]
+	case coltypes.Interval:
+		m.col = m.col.([]duration.Duration)[:l]
+	default:
+		panic(fmt.Sprintf("unhandled type %s", m.t))
+	}
+}
+
+func (m *memColumn) Capacity() int {
+	switch m.t {
+	case coltypes.Bool:
+		return cap(m.col.([]bool))
+	case coltypes.Bytes:
+		panic("Capacity should not be called on Vec of Bytes type")
+	case coltypes.Int16:
+		return cap(m.col.([]int16))
+	case coltypes.Int32:
+		return cap(m.col.([]int32))
+	case coltypes.Int64:
+		return cap(m.col.([]int64))
+	case coltypes.Float64:
+		return cap(m.col.([]float64))
+	case coltypes.Decimal:
+		return cap(m.col.([]apd.Decimal))
+	case coltypes.Timestamp:
+		return cap(m.col.([]time.Time))
+	case coltypes.Interval:
+		return cap(m.col.([]duration.Duration))
+	default:
+		panic(fmt.Sprintf("unhandled type %s", m.t))
+	}
 }

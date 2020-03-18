@@ -15,7 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
 )
 
 // RowChannelBufSize is the default buffer size of a RowChannel.
@@ -188,6 +189,14 @@ func Run(ctx context.Context, src RowSource, dst RowReceiver) {
 	}
 }
 
+// Releasable is an interface for objects than can be Released back into a
+// memory pool when finished.
+type Releasable interface {
+	// Release allows this object to be returned to a memory pool. Objects must
+	// not be used after Release is called.
+	Release()
+}
+
 // DrainAndForwardMetadata calls src.ConsumerDone() (thus asking src for
 // draining metadata) and then forwards all the metadata to dst.
 //
@@ -197,9 +206,6 @@ func Run(ctx context.Context, src RowSource, dst RowReceiver) {
 //
 // It is OK to call DrainAndForwardMetadata() multiple times concurrently on the
 // same dst (as RowReceiver.Push() is guaranteed to be thread safe).
-//
-// TODO(andrei): errors seen while draining should be reported to the gateway,
-// but they shouldn't fail a SQL query.
 func DrainAndForwardMetadata(ctx context.Context, src RowSource, dst RowReceiver) {
 	src.ConsumerDone()
 	for {
@@ -246,22 +252,30 @@ func SendTraceData(ctx context.Context, dst RowReceiver) {
 	}
 }
 
-// GetTxnCoordMeta returns the txn metadata from a transaction if it is present
-// and the transaction is a leaf transaction, otherwise nil.
+// GetLeafTxnFinalState returns the txn metadata from a transaction if
+// it is present and the transaction is a leaf transaction. It returns
+// nil when called on a Root. This is done as a convenience allowing
+// DistSQL processors to be oblivious about whether they're running in
+// a Leaf or a Root.
 //
 // NOTE(andrei): As of 04/2018, the txn is shared by all processors scheduled on
 // a node, and so it's possible for multiple processors to send the same
-// TxnCoordMeta. The root TxnCoordSender doesn't care if it receives the same
+// LeafTxnFinalState. The root TxnCoordSender doesn't care if it receives the same
 // thing multiple times.
-func GetTxnCoordMeta(ctx context.Context, txn *client.Txn) *roachpb.TxnCoordMeta {
-	if txn.Type() == client.LeafTxn {
-		txnMeta := txn.GetTxnCoordMeta(ctx)
-		txnMeta.StripLeafToRoot()
-		if txnMeta.Txn.ID != uuid.Nil {
-			return &txnMeta
-		}
+func GetLeafTxnFinalState(ctx context.Context, txn *kv.Txn) *roachpb.LeafTxnFinalState {
+	if txn.Type() != kv.LeafTxn {
+		return nil
 	}
-	return nil
+	txnMeta, err := txn.GetLeafTxnFinalState(ctx)
+	if err != nil {
+		// TODO(knz): plumb errors through the callers.
+		panic(errors.Wrap(err, "in execinfra.GetLeafTxnFinalState"))
+	}
+
+	if txnMeta.Txn.ID == uuid.Nil {
+		return nil
+	}
+	return &txnMeta
 }
 
 // DrainAndClose is a version of DrainAndForwardMetadata that drains multiple

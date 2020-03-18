@@ -21,10 +21,12 @@ package tree
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/text/language"
@@ -107,6 +109,7 @@ type CreateIndex struct {
 	Inverted    bool
 	IfNotExists bool
 	Columns     IndexElemList
+	Sharded     *ShardedIndexDef
 	// Extra columns to be stored together with the indexed ones as an optimization
 	// for improved reading performance.
 	Storing     NameList
@@ -144,6 +147,9 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 	ctx.WriteString(" (")
 	ctx.FormatNode(&node.Columns)
 	ctx.WriteByte(')')
+	if node.Sharded != nil {
+		ctx.FormatNode(node.Sharded)
+	}
 	if len(node.Storing) > 0 {
 		ctx.WriteString(" STORING (")
 		ctx.FormatNode(&node.Storing)
@@ -209,7 +215,11 @@ type ColumnTableDef struct {
 		Nullability    Nullability
 		ConstraintName Name
 	}
-	PrimaryKey           bool
+	PrimaryKey struct {
+		IsPrimaryKey bool
+		Sharded      bool
+		ShardBuckets Expr
+	}
 	Unique               bool
 	UniqueConstraintName Name
 	DefaultExpr          struct {
@@ -305,7 +315,13 @@ func NewColumnTableDef(
 			d.Nullable.Nullability = Null
 			d.Nullable.ConstraintName = c.Name
 		case PrimaryKeyConstraint:
-			d.PrimaryKey = true
+			d.PrimaryKey.IsPrimaryKey = true
+			d.UniqueConstraintName = c.Name
+		case ShardedPrimaryKeyConstraint:
+			d.PrimaryKey.IsPrimaryKey = true
+			constraint := c.Qualification.(ShardedPrimaryKeyConstraint)
+			d.PrimaryKey.Sharded = true
+			d.PrimaryKey.ShardBuckets = constraint.ShardBuckets
 			d.UniqueConstraintName = c.Name
 		case UniqueConstraint:
 			d.Unique = true
@@ -389,13 +405,17 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	case NotNull:
 		ctx.WriteString(" NOT NULL")
 	}
-	if node.PrimaryKey || node.Unique {
+	if node.PrimaryKey.IsPrimaryKey || node.Unique {
 		if node.UniqueConstraintName != "" {
 			ctx.WriteString(" CONSTRAINT ")
 			ctx.FormatNode(&node.UniqueConstraintName)
 		}
-		if node.PrimaryKey {
+		if node.PrimaryKey.IsPrimaryKey {
 			ctx.WriteString(" PRIMARY KEY")
+			if node.PrimaryKey.Sharded {
+				ctx.WriteString(" USING HASH WITH BUCKET_COUNT=")
+				ctx.FormatNode(node.PrimaryKey.ShardBuckets)
+			}
 		} else if node.Unique {
 			ctx.WriteString(" UNIQUE")
 		}
@@ -483,16 +503,17 @@ type ColumnQualification interface {
 	columnQualification()
 }
 
-func (ColumnCollation) columnQualification()         {}
-func (*ColumnDefault) columnQualification()          {}
-func (NotNullConstraint) columnQualification()       {}
-func (NullConstraint) columnQualification()          {}
-func (PrimaryKeyConstraint) columnQualification()    {}
-func (UniqueConstraint) columnQualification()        {}
-func (*ColumnCheckConstraint) columnQualification()  {}
-func (*ColumnComputedDef) columnQualification()      {}
-func (*ColumnFKConstraint) columnQualification()     {}
-func (*ColumnFamilyConstraint) columnQualification() {}
+func (ColumnCollation) columnQualification()             {}
+func (*ColumnDefault) columnQualification()              {}
+func (NotNullConstraint) columnQualification()           {}
+func (NullConstraint) columnQualification()              {}
+func (PrimaryKeyConstraint) columnQualification()        {}
+func (ShardedPrimaryKeyConstraint) columnQualification() {}
+func (UniqueConstraint) columnQualification()            {}
+func (*ColumnCheckConstraint) columnQualification()      {}
+func (*ColumnComputedDef) columnQualification()          {}
+func (*ColumnFKConstraint) columnQualification()         {}
+func (*ColumnFamilyConstraint) columnQualification()     {}
 
 // ColumnCollation represents a COLLATE clause for a column.
 type ColumnCollation string
@@ -508,8 +529,15 @@ type NotNullConstraint struct{}
 // NullConstraint represents NULL on a column.
 type NullConstraint struct{}
 
-// PrimaryKeyConstraint represents NULL on a column.
+// PrimaryKeyConstraint represents PRIMARY KEY on a column.
 type PrimaryKeyConstraint struct{}
+
+// ShardedPrimaryKeyConstraint represents `PRIMARY KEY .. USING HASH..`
+// on a column.
+type ShardedPrimaryKeyConstraint struct {
+	Sharded      bool
+	ShardBuckets Expr
+}
 
 // UniqueConstraint represents UNIQUE on a column.
 type UniqueConstraint struct{}
@@ -544,6 +572,7 @@ type ColumnFamilyConstraint struct {
 type IndexTableDef struct {
 	Name        Name
 	Columns     IndexElemList
+	Sharded     *ShardedIndexDef
 	Storing     NameList
 	Interleave  *InterleaveDef
 	Inverted    bool
@@ -568,6 +597,9 @@ func (node *IndexTableDef) Format(ctx *FmtCtx) {
 	ctx.WriteByte('(')
 	ctx.FormatNode(&node.Columns)
 	ctx.WriteByte(')')
+	if node.Sharded != nil {
+		ctx.FormatNode(node.Sharded)
+	}
 	if node.Storing != nil {
 		ctx.WriteString(" STORING (")
 		ctx.FormatNode(&node.Storing)
@@ -616,6 +648,9 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 	ctx.WriteByte('(')
 	ctx.FormatNode(&node.Columns)
 	ctx.WriteByte(')')
+	if node.Sharded != nil {
+		ctx.FormatNode(node.Sharded)
+	}
 	if node.Storing != nil {
 		ctx.WriteString(" STORING (")
 		ctx.FormatNode(&node.Storing)
@@ -741,8 +776,9 @@ func (node *ForeignKeyConstraintTableDef) SetName(name Name) {
 // CheckConstraintTableDef represents a check constraint within a CREATE
 // TABLE statement.
 type CheckConstraintTableDef struct {
-	Name Name
-	Expr Expr
+	Name   Name
+	Expr   Expr
+	Hidden bool
 }
 
 // SetName implements the TableDef interface.
@@ -784,6 +820,36 @@ func (node *FamilyTableDef) Format(ctx *FmtCtx) {
 	ctx.WriteByte('(')
 	ctx.FormatNode(&node.Columns)
 	ctx.WriteByte(')')
+}
+
+// ShardedIndexDef represents a hash sharded secondary index definition within a CREATE
+// TABLE or CREATE INDEX statement.
+type ShardedIndexDef struct {
+	ShardBuckets Expr
+}
+
+// EvalShardBucketCount evaluates and checks the integer argument to a `USING HASH WITH
+// BUCKET_COUNT` index creation query.
+func EvalShardBucketCount(shardBuckets Expr) (int32, error) {
+	const invalidBucketCountMsg = `BUCKET_COUNT must be a strictly positive integer value`
+	cst, ok := shardBuckets.(*NumVal)
+	if !ok {
+		return 0, pgerror.New(pgcode.InvalidParameterValue, invalidBucketCountMsg)
+	}
+	buckets, err := cst.AsInt32()
+	if err != nil || buckets <= 0 {
+		if err != nil {
+			return 0, pgerror.Wrap(err, pgcode.InvalidParameterValue, invalidBucketCountMsg)
+		}
+		return 0, pgerror.New(pgcode.InvalidParameterValue, invalidBucketCountMsg)
+	}
+	return buckets, nil
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShardedIndexDef) Format(ctx *FmtCtx) {
+	ctx.WriteString(" USING HASH WITH BUCKET_COUNT = ")
+	ctx.FormatNode(node.ShardBuckets)
 }
 
 // InterleaveDef represents an interleave definition within a CREATE TABLE
@@ -900,13 +966,38 @@ func (node *RangePartition) Format(ctx *FmtCtx) {
 	}
 }
 
+// StorageParam is a key-value parameter for table storage.
+type StorageParam struct {
+	Key   Name
+	Value Expr
+}
+
+// StorageParams is a list of StorageParams.
+type StorageParams []StorageParam
+
+// Format implements the NodeFormatter interface.
+func (o *StorageParams) Format(ctx *FmtCtx) {
+	for i := range *o {
+		n := &(*o)[i]
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.FormatNode(&n.Key)
+		if n.Value != nil {
+			ctx.WriteString(` = `)
+			ctx.FormatNode(n.Value)
+		}
+	}
+}
+
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
-	IfNotExists bool
-	Table       TableName
-	Interleave  *InterleaveDef
-	PartitionBy *PartitionBy
-	Temporary   bool
+	IfNotExists   bool
+	Table         TableName
+	Interleave    *InterleaveDef
+	PartitionBy   *PartitionBy
+	Temporary     bool
+	StorageParams StorageParams
 	// In CREATE...AS queries, Defs represents a list of ColumnTableDefs, one for
 	// each column, and a ConstraintTableDef for each constraint on a subset of
 	// these columns.
@@ -927,7 +1018,7 @@ func (node *CreateTable) AsHasUserSpecifiedPrimaryKey() bool {
 		for _, def := range node.Defs {
 			if d, ok := def.(*ColumnTableDef); !ok {
 				return false
-			} else if d.PrimaryKey {
+			} else if d.PrimaryKey.IsPrimaryKey {
 				return true
 			}
 		}
@@ -970,6 +1061,8 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 		if node.PartitionBy != nil {
 			ctx.FormatNode(node.PartitionBy)
 		}
+		// No storage parameters are implemented, so we never list the storage
+		// parameters in the output format.
 	}
 }
 
@@ -1030,6 +1123,23 @@ func (node *CreateTable) HoistConstraints() {
 			}
 		}
 	}
+}
+
+// CreateSchema represents a CREATE SCHEMA statement.
+type CreateSchema struct {
+	IfNotExists bool
+	Schema      string
+}
+
+// Format implements the NodeFormatter interface.
+func (node *CreateSchema) Format(ctx *FmtCtx) {
+	ctx.WriteString("CREATE SCHEMA ")
+
+	if node.IfNotExists {
+		ctx.WriteString("IF NOT EXISTS ")
+	}
+
+	ctx.WriteString(node.Schema)
 }
 
 // CreateSequence represents a CREATE SEQUENCE statement.
@@ -1097,6 +1207,15 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 			ctx.Printf("%d", *option.IntVal)
 		case SeqOptVirtual:
 			ctx.WriteString(option.Name)
+		case SeqOptOwnedBy:
+			ctx.WriteString(option.Name)
+			ctx.WriteByte(' ')
+			switch option.ColumnItemVal {
+			case nil:
+				ctx.WriteString("NONE")
+			default:
+				ctx.FormatNode(option.ColumnItemVal)
+			}
 		default:
 			panic(errors.AssertionFailedf("unexpected SequenceOption: %v", option))
 		}
@@ -1110,6 +1229,8 @@ type SequenceOption struct {
 	IntVal *int64
 
 	OptionalWord bool
+
+	ColumnItemVal *ColumnItem
 }
 
 // Names of options on CREATE SEQUENCE.
@@ -1127,57 +1248,75 @@ const (
 
 	// Avoid unused warning for constants.
 	_ = SeqOptAs
-	_ = SeqOptOwnedBy
 )
 
-// CreateUser represents a CREATE USER statement.
-type CreateUser struct {
-	Name        Expr
-	Password    Expr // nil if no password specified
-	IfNotExists bool
-}
+// ToRoleOptions converts KVOptions to a roleoption.List using
+// typeAsString to convert exprs to strings.
+func (o KVOptions) ToRoleOptions(
+	typeAsStringOrNull func(e Expr, op string) (func() (bool, string, error), error), op string,
+) (roleoption.List, error) {
+	roleOptions := make(roleoption.List, len(o))
 
-// HasPassword returns if the CreateUser has a password.
-func (node *CreateUser) HasPassword() bool {
-	return node.Password != nil
-}
+	for i, ro := range o {
+		option, err := roleoption.ToOption(ro.Key.String())
+		if err != nil {
+			return nil, err
+		}
 
-// Format implements the NodeFormatter interface.
-func (node *CreateUser) Format(ctx *FmtCtx) {
-	ctx.WriteString("CREATE USER ")
-	if node.IfNotExists {
-		ctx.WriteString("IF NOT EXISTS ")
-	}
-	ctx.FormatNode(node.Name)
-	if node.HasPassword() {
-		ctx.WriteString(" WITH PASSWORD ")
-		if ctx.flags.HasFlags(FmtShowPasswords) {
-			ctx.FormatNode(node.Password)
+		if ro.Value != nil {
+			if ro.Value == DNull {
+				roleOptions[i] = roleoption.RoleOption{
+					Option: option, HasValue: true, Value: func() (bool, string, error) {
+						return true, "", nil
+					},
+				}
+			} else {
+				strFn, err := typeAsStringOrNull(ro.Value, op)
+				if err != nil {
+					return nil, err
+				}
+
+				if err != nil {
+					return nil, err
+				}
+				roleOptions[i] = roleoption.RoleOption{
+					Option: option, Value: strFn, HasValue: true,
+				}
+			}
 		} else {
-			ctx.WriteString("*****")
+			roleOptions[i] = roleoption.RoleOption{
+				Option: option, HasValue: false,
+			}
 		}
 	}
+
+	return roleOptions, nil
 }
 
-// AlterUserSetPassword represents an ALTER USER ... WITH PASSWORD statement.
-type AlterUserSetPassword struct {
-	Name     Expr
-	Password Expr
-	IfExists bool
-}
+func (o *KVOptions) formatAsRoleOptions(ctx *FmtCtx) {
+	for _, option := range *o {
+		ctx.WriteString(" ")
+		ctx.WriteString(
+			// "_" replaces space (" ") in YACC for handling tree.Name formatting.
+			strings.ReplaceAll(
+				strings.ToUpper(option.Key.String()), "_", " "),
+		)
 
-// Format implements the NodeFormatter interface.
-func (node *AlterUserSetPassword) Format(ctx *FmtCtx) {
-	ctx.WriteString("ALTER USER ")
-	if node.IfExists {
-		ctx.WriteString("IF EXISTS ")
-	}
-	ctx.FormatNode(node.Name)
-	ctx.WriteString(" WITH PASSWORD ")
-	if ctx.flags.HasFlags(FmtShowPasswords) {
-		ctx.FormatNode(node.Password)
-	} else {
-		ctx.WriteString("*****")
+		// Password is a special case.
+		if strings.ToUpper(option.Key.String()) == "PASSWORD" {
+			ctx.WriteString(" ")
+			if ctx.flags.HasFlags(FmtShowPasswords) {
+				ctx.FormatNode(option.Value)
+			} else {
+				ctx.WriteString("*****")
+			}
+		} else if option.Value == DNull {
+			ctx.WriteString(" ")
+			ctx.FormatNode(option.Value)
+		} else if option.Value != nil {
+			ctx.WriteString(" ")
+			ctx.FormatNode(option.Value)
+		}
 	}
 }
 
@@ -1185,15 +1324,54 @@ func (node *AlterUserSetPassword) Format(ctx *FmtCtx) {
 type CreateRole struct {
 	Name        Expr
 	IfNotExists bool
+	IsRole      bool
+	KVOptions   KVOptions
 }
 
 // Format implements the NodeFormatter interface.
 func (node *CreateRole) Format(ctx *FmtCtx) {
-	ctx.WriteString("CREATE ROLE ")
+	ctx.WriteString("CREATE")
+	if node.IsRole {
+		ctx.WriteString(" ROLE ")
+	} else {
+		ctx.WriteString(" USER ")
+	}
 	if node.IfNotExists {
 		ctx.WriteString("IF NOT EXISTS ")
 	}
 	ctx.FormatNode(node.Name)
+
+	if len(node.KVOptions) > 0 {
+		ctx.WriteString(" WITH")
+		node.KVOptions.formatAsRoleOptions(ctx)
+	}
+}
+
+// AlterRole represents an ALTER ROLE statement.
+type AlterRole struct {
+	Name      Expr
+	IfExists  bool
+	IsRole    bool
+	KVOptions KVOptions
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterRole) Format(ctx *FmtCtx) {
+	ctx.WriteString("ALTER")
+	if node.IsRole {
+		ctx.WriteString(" ROLE ")
+	} else {
+		ctx.WriteString(" USER ")
+	}
+	if node.IfExists {
+		ctx.WriteString("IF EXISTS ")
+	}
+	ctx.FormatNode(node.Name)
+
+	if len(node.KVOptions) > 0 {
+		ctx.WriteString(" WITH")
+		node.KVOptions.formatAsRoleOptions(ctx)
+	}
 }
 
 // CreateView represents a CREATE VIEW statement.
@@ -1201,6 +1379,7 @@ type CreateView struct {
 	Name        TableName
 	ColumnNames NameList
 	AsSource    *Select
+	IfNotExists bool
 	Temporary   bool
 }
 
@@ -1213,6 +1392,10 @@ func (node *CreateView) Format(ctx *FmtCtx) {
 	}
 
 	ctx.WriteString("VIEW ")
+
+	if node.IfNotExists {
+		ctx.WriteString("IF NOT EXISTS ")
+	}
 	ctx.FormatNode(&node.Name)
 
 	if len(node.ColumnNames) > 0 {

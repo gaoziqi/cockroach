@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"time"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -34,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -51,6 +53,15 @@ var _ tree.Datum
 
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
+
+// Dummy import to pull in "time" package.
+var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
+
+// Dummy import to pull in "coltypes" package.
+var _ coltypes.T
 
 // _ASSIGN is the template function for assigning the first input to the result
 // of computation an operation on the second and the third inputs.
@@ -77,19 +88,19 @@ type _OP_CONST_NAME struct {
 	// {{ end }}
 }
 
-func (p _OP_CONST_NAME) EstimateStaticMemoryUsage() int {
-	return EstimateBatchSizeBytes([]coltypes.T{coltypes._RET_TYP}, int(coldata.BatchSize()))
-}
-
 func (p _OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
+	// In order to inline the templated code of overloads, we need to have a
+	// `decimalScratch` local variable of type `decimalOverloadScratch`.
+	decimalScratch := p.decimalScratch
+	// However, the scratch is not used in all of the projection operators, so
+	// we add this to go around "unused" error.
+	_ = decimalScratch
 	batch := p.input.Next(ctx)
 	n := batch.Length()
-	if p.outputIdx == batch.Width() {
-		batch.AppendCol(coltypes._RET_TYP)
-	}
 	if n == 0 {
-		return batch
+		return coldata.ZeroBatch
 	}
+	p.allocator.MaybeAddColumn(batch, coltypes._RET_TYP, p.outputIdx)
 	vec := batch.ColVec(p.colIdx)
 	// {{if _IS_CONST_LEFT}}
 	col := vec._R_TYP()
@@ -103,6 +114,9 @@ func (p _OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
 	} else {
 		_SET_PROJECTION(false)
 	}
+	// Although we didn't change the length of the batch, it is necessary to set
+	// the length anyway (this helps maintaining the invariant of flat bytes).
+	batch.SetLength(n)
 	return batch
 }
 
@@ -127,10 +141,9 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
 		}
 	} else {
-		col = execgen.SLICE(col, 0, int(n))
-		colLen := execgen.LEN(col)
-		_ = _RET_UNSAFEGET(projCol, colLen-1)
-		for execgen.RANGE(i, col) {
+		col = execgen.SLICE(col, 0, n)
+		_ = _RET_UNSAFEGET(projCol, n-1)
+		for execgen.RANGE(i, col, 0, n) {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
 		}
 	}
@@ -151,14 +164,14 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 	// {{$hasNulls := $.HasNulls}}
 	// {{with $.Overload}}
 	// {{if _HAS_NULLS}}
-	if !colNulls.NullAt(uint16(i)) {
+	if !colNulls.NullAt(i) {
 		// We only want to perform the projection operation if the value is not null.
 		// {{end}}
-		arg := execgen.UNSAFEGET(col, int(i))
+		arg := execgen.UNSAFEGET(col, i)
 		// {{if _IS_CONST_LEFT}}
-		_ASSIGN("projCol[i]", "p.constArg", "arg")
+		_ASSIGN(projCol[i], p.constArg, arg)
 		// {{else}}
-		_ASSIGN("projCol[i]", "arg", "p.constArg")
+		_ASSIGN(projCol[i], arg, p.constArg)
 		// {{end}}
 		// {{if _HAS_NULLS }}
 	}
@@ -188,6 +201,7 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 // GetProjection_CONST_SIDEConstOperator returns the appropriate constant
 // projection operator for the given left and right column types and operation.
 func GetProjection_CONST_SIDEConstOperator(
+	allocator *Allocator,
 	leftColType *types.T,
 	rightColType *types.T,
 	op tree.Operator,
@@ -198,6 +212,7 @@ func GetProjection_CONST_SIDEConstOperator(
 ) (Operator, error) {
 	projConstOpBase := projConstOpBase{
 		OneInputNode: NewOneInputNode(input),
+		allocator:    allocator,
 		colIdx:       colIdx,
 		outputIdx:    outputIdx,
 	}

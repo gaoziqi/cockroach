@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
@@ -29,8 +29,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -207,7 +207,7 @@ func (ds *ServerImpl) setupFlow(
 	// sp will be Finish()ed by Flow.Cleanup().
 	ctx = opentracing.ContextWithSpan(ctx, sp)
 
-	// The monitor opened here are closed in Flow.Cleanup().
+	// The monitor opened here is closed in Flow.Cleanup().
 	monitor := mon.MakeMonitor(
 		"flow",
 		mon.MemoryResource,
@@ -219,12 +219,37 @@ func (ds *ServerImpl) setupFlow(
 	)
 	monitor.Start(ctx, parentMonitor, mon.BoundAccount{})
 
+	makeLeaf := func(req *execinfrapb.SetupFlowRequest) (*kv.Txn, error) {
+		tis := req.LeafTxnInputState
+		if tis == nil {
+			// This must be a flow running for some bulk-io operation that doesn't use
+			// a txn.
+			return nil, nil
+		}
+		if tis.Txn.Status != roachpb.PENDING {
+			return nil, errors.AssertionFailedf("cannot create flow in non-PENDING txn: %s",
+				tis.Txn)
+		}
+		// The flow will run in a LeafTxn because we do not want each distributed
+		// Txn to heartbeat the transaction.
+		return kv.NewLeafTxn(ctx, ds.FlowDB, req.Flow.Gateway, tis), nil
+	}
+
 	var evalCtx *tree.EvalContext
+	var leafTxn *kv.Txn
 	if localState.EvalContext != nil {
 		evalCtx = localState.EvalContext
 		evalCtx.Mon = &monitor
 	} else {
-		location, err := timeutil.TimeZoneStringToLocation(req.EvalContext.Location)
+		if localState.IsLocal {
+			return nil, nil, errors.AssertionFailedf(
+				"EvalContext expected to be populated when IsLocal is set")
+		}
+
+		location, err := timeutil.TimeZoneStringToLocation(
+			req.EvalContext.Location,
+			timeutil.TimeZoneStringToLocationISO8601Standard,
+		)
 		if err != nil {
 			tracing.FinishSpan(sp)
 			return ctx, nil, err
@@ -246,26 +271,28 @@ func (ds *ServerImpl) setupFlow(
 			ApplicationName: req.EvalContext.ApplicationName,
 			Database:        req.EvalContext.Database,
 			User:            req.EvalContext.User,
-			SearchPath:      sessiondata.MakeSearchPath(req.EvalContext.SearchPath),
+			SearchPath:      sessiondata.MakeSearchPath(req.EvalContext.SearchPath).WithTemporarySchemaName(req.EvalContext.TemporarySchemaName),
 			SequenceState:   sessiondata.NewSequenceState(),
 			DataConversion: sessiondata.DataConversionConfig{
 				Location:          location,
 				BytesEncodeFormat: be,
 				ExtraFloatDigits:  int(req.EvalContext.ExtraFloatDigits),
 			},
-		}
-		// Enable better compatibility with PostgreSQL date math.
-		if req.Version >= 22 {
-			sd.DurationAdditionMode = duration.AdditionModeCompatible
-		} else {
-			sd.DurationAdditionMode = duration.AdditionModeLegacy
+			VectorizeMode: sessiondata.VectorizeExecMode(req.EvalContext.Vectorize),
 		}
 		ie := &lazyInternalExecutor{
-			newInternalExecutor: func() tree.SessionBoundInternalExecutor {
+			newInternalExecutor: func() sqlutil.InternalExecutor {
 				return ds.SessionBoundInternalExecutorFactory(ctx, sd)
 			},
 		}
 
+		// It's important to populate evalCtx.Txn early. We'll write it again in the
+		// f.SetTxn() call below, but by then it will already have been captured by
+		// processors.
+		leafTxn, err = makeLeaf(req)
+		if err != nil {
+			return nil, nil, err
+		}
 		evalCtx = &tree.EvalContext{
 			Settings:    ds.ServerConfig.Settings,
 			SessionData: sd,
@@ -274,13 +301,16 @@ func (ds *ServerImpl) setupFlow(
 			NodeID:      nodeID,
 			ReCache:     ds.regexpCache,
 			Mon:         &monitor,
-			// TODO(andrei): This is wrong. Each processor should override Ctx with its
-			// own context.
-			Context:          ctx,
-			Planner:          &sqlbase.DummyEvalPlanner{},
-			SessionAccessor:  &sqlbase.DummySessionAccessor{},
-			Sequence:         &sqlbase.DummySequenceOperators{},
-			InternalExecutor: ie,
+			// Most processors will override this Context with their own context in
+			// ProcessorBase. StartInternal().
+			Context:            ctx,
+			Planner:            &sqlbase.DummyEvalPlanner{},
+			SessionAccessor:    &sqlbase.DummySessionAccessor{},
+			PrivilegedAccessor: &sqlbase.DummyPrivilegedAccessor{},
+			Sequence:           &sqlbase.DummySequenceOperators{},
+			ClientNoticeSender: &sqlbase.DummyClientNoticeSender{},
+			InternalExecutor:   ie,
+			Txn:                leafTxn,
 		}
 		evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
 		evalCtx.SetTxnTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
@@ -318,8 +348,12 @@ func (ds *ServerImpl) setupFlow(
 		// to use the RootTxn.
 		opt = flowinfra.FuseAggressively
 	}
-	if err := f.Setup(ctx, &req.Flow, opt); err != nil {
+	var err error
+	if ctx, err = f.Setup(ctx, &req.Flow, opt); err != nil {
 		log.Errorf(ctx, "error setting up flow: %s", err)
+		// Flow.Cleanup will not be called, so we have to close the memory monitor
+		// and finish the span manually.
+		monitor.Stop(ctx)
 		tracing.FinishSpan(sp)
 		ctx = opentracing.ContextWithSpan(ctx, nil)
 		return ctx, nil, err
@@ -336,21 +370,28 @@ func (ds *ServerImpl) setupFlow(
 	// Figure out what txn the flow needs to run in, if any. For gateway flows
 	// that have no remote flows and also no concurrency, the txn comes from
 	// localState.Txn. Otherwise, we create a txn based on the request's
-	// TxnCoordMeta.
-	var txn *client.Txn
+	// LeafTxnInputState.
+	var txn *kv.Txn
 	if localState.IsLocal && !f.ConcurrentExecution() {
 		txn = localState.Txn
 	} else {
-		if meta := req.TxnCoordMeta; meta != nil {
-			if meta.Txn.Status != roachpb.PENDING {
-				return nil, nil, errors.Errorf("cannot create flow in non-PENDING txn: %s",
-					meta.Txn)
+		// If I haven't created the leaf already, do it now.
+		if leafTxn == nil {
+			var err error
+			leafTxn, err = makeLeaf(req)
+			if err != nil {
+				return nil, nil, err
 			}
-			// The flow will run in a LeafTxn because we do not want each distributed
-			// Txn to heartbeat the transaction.
-			txn = client.NewTxnWithCoordMeta(ctx, ds.FlowDB, req.Flow.Gateway, client.LeafTxn, *meta)
 		}
+		txn = leafTxn
 	}
+	// TODO(andrei): We're about to overwrite f.EvalCtx.Txn, but the existing
+	// field has already been captured by various processors and operators that
+	// have already made a copy of the EvalCtx. In case this is not the gateway,
+	// we had already set the LeafTxn on the EvalCtx above, so it's OK. In case
+	// this is the gateway, if we're running with the RootTxn, then again it was
+	// set above so it's fine. If we're using a LeafTxn on the gateway, though,
+	// then the processors have erroneously captured the Root. See #41992.
 	f.SetTxn(txn)
 
 	return ctx, f, nil
@@ -363,7 +404,7 @@ func newFlow(
 	localProcessors []execinfra.LocalProcessor,
 	isVectorized bool,
 ) flowinfra.Flow {
-	base := flowinfra.NewFlowBase(flowCtx, flowReg, syncFlowConsumer, localProcessors, isVectorized)
+	base := flowinfra.NewFlowBase(flowCtx, flowReg, syncFlowConsumer, localProcessors)
 	if isVectorized {
 		return colflow.NewVectorizedFlow(base)
 	}
@@ -401,7 +442,7 @@ type LocalState struct {
 	// Txn is filled in on the gateway only. It is the RootTxn that the query is running in.
 	// This will be used directly by the flow if the flow has no concurrency and IsLocal is set.
 	// If there is concurrency, a LeafTxn will be created.
-	Txn *client.Txn
+	Txn *kv.Txn
 
 	/////////////////////////////////////////////
 	// Fields below are empty if IsLocal == false
@@ -523,33 +564,50 @@ func (ds *ServerImpl) flowStreamInt(
 func (ds *ServerImpl) FlowStream(stream execinfrapb.DistSQL_FlowStreamServer) error {
 	ctx := ds.AnnotateCtx(stream.Context())
 	err := ds.flowStreamInt(ctx, stream)
-	if err != nil {
-		log.Error(ctx, err)
+	if err != nil && log.V(2) {
+		// flowStreamInt may return an error during normal operation (e.g. a flow
+		// was canceled as part of a graceful teardown). Log this error at the INFO
+		// level behind a verbose flag for visibility.
+		log.Info(ctx, err)
 	}
 	return err
 }
 
-// lazyInternalExecutor is a tree.SessionBoundInternalExecutor that initializes
+// lazyInternalExecutor is a tree.InternalExecutor that initializes
 // itself only on the first call to QueryRow.
 type lazyInternalExecutor struct {
 	// Set when an internal executor has been initialized.
-	tree.SessionBoundInternalExecutor
+	sqlutil.InternalExecutor
 
 	// Used for initializing the internal executor exactly once.
 	once sync.Once
 
 	// newInternalExecutor must be set when instantiating a lazyInternalExecutor,
 	// it provides an internal executor to use when necessary.
-	newInternalExecutor func() tree.SessionBoundInternalExecutor
+	newInternalExecutor func() sqlutil.InternalExecutor
 }
 
-var _ tree.SessionBoundInternalExecutor = &lazyInternalExecutor{}
+var _ sqlutil.InternalExecutor = &lazyInternalExecutor{}
 
-func (ie *lazyInternalExecutor) QueryRow(
-	ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
+func (ie *lazyInternalExecutor) QueryRowEx(
+	ctx context.Context,
+	opName string,
+	txn *kv.Txn,
+	opts sqlbase.InternalExecutorSessionDataOverride,
+	stmt string,
+	qargs ...interface{},
 ) (tree.Datums, error) {
 	ie.once.Do(func() {
-		ie.SessionBoundInternalExecutor = ie.newInternalExecutor()
+		ie.InternalExecutor = ie.newInternalExecutor()
 	})
-	return ie.SessionBoundInternalExecutor.QueryRow(ctx, opName, txn, stmt, qargs...)
+	return ie.InternalExecutor.QueryRowEx(ctx, opName, txn, opts, stmt, qargs...)
+}
+
+func (ie *lazyInternalExecutor) QueryRow(
+	ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
+) (tree.Datums, error) {
+	ie.once.Do(func() {
+		ie.InternalExecutor = ie.newInternalExecutor()
+	})
+	return ie.InternalExecutor.QueryRow(ctx, opName, txn, stmt, qargs...)
 }

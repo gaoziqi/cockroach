@@ -13,7 +13,6 @@ package norm_test
 import (
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
@@ -39,33 +38,15 @@ import (
 //   ...
 func TestNormRules(t *testing.T) {
 	const fmtFlags = memo.ExprFmtHideStats | memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps |
-		memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars
+		memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes
 	datadriven.Walk(t, "testdata/rules", func(t *testing.T, path string) {
 		catalog := testcat.New()
-		datadriven.RunTest(t, path, func(d *datadriven.TestData) string {
+		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			tester := opttester.New(catalog, d.Input)
 			tester.Flags.ExprFormat = fmtFlags
 			return tester.RunCommand(t, d)
 		})
 	})
-}
-
-// Test the FoldNullInEmpty rule. Can't create empty tuple on right side of
-// IN/NOT IN in SQL, so do it here.
-func TestRuleFoldNullInEmpty(t *testing.T) {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-	var f norm.Factory
-	f.Init(&evalCtx)
-
-	in := f.ConstructIn(memo.NullSingleton, memo.EmptyTuple)
-	if in.Op() != opt.FalseOp {
-		t.Errorf("expected NULL IN () to fold to False")
-	}
-
-	notIn := f.ConstructNotIn(memo.NullSingleton, memo.EmptyTuple)
-	if notIn.Op() != opt.TrueOp {
-		t.Errorf("expected NULL NOT IN () to fold to True")
-	}
 }
 
 // Ensure that every binary commutative operator overload can have its operands

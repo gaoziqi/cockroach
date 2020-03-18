@@ -16,21 +16,28 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
+// validateCheckExpr verifies that the given CHECK expression returns true
+// for all the rows in the table.
+//
+// It operates entirely on the current goroutine and is thus able to
+// reuse an existing client.Txn safely.
 func validateCheckExpr(
 	ctx context.Context,
 	exprStr string,
 	tableDesc *sqlbase.TableDescriptor,
-	ie tree.SessionBoundInternalExecutor,
-	txn *client.Txn,
+	ie *InternalExecutor,
+	txn *kv.Txn,
 ) error {
 	expr, err := parser.ParseExpr(exprStr)
 	if err != nil {
@@ -39,7 +46,7 @@ func validateCheckExpr(
 	// Construct AST and then convert to a string, to avoid problems with escaping the check expression
 	tblref := tree.TableRef{TableID: int64(tableDesc.ID), As: tree.AliasClause{Alias: "t"}}
 	sel := &tree.SelectClause{
-		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns, false /* forUpdateOrDelete */),
+		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns),
 		From:  tree.From{Tables: []tree.TableExpr{&tblref}},
 		Where: &tree.Where{Type: tree.AstWhere, Expr: &tree.NotExpr{Expr: expr}},
 	}
@@ -70,14 +77,16 @@ func validateCheckExpr(
 //
 // SELECT s.a_id, s.b_id, s.pk1, s.pk2 FROM child@c_idx
 // WHERE
-//   NOT ((COALESCE(a_id, b_id) IS NULL) OR (a_id IS NOT NULL AND b_id IS NOT NULL))
+//   (a_id IS NULL OR b_id IS NULL) AND (a_id IS NOT NULL OR b_id IS NOT NULL)
 // LIMIT 1;
 func matchFullUnacceptableKeyQuery(
 	srcTbl *sqlbase.TableDescriptor, fk *sqlbase.ForeignKeyConstraint, limitResults bool,
 ) (sql string, colNames []string, _ error) {
 	nCols := len(fk.OriginColumnIDs)
 	srcCols := make([]string, nCols)
-	srcNotNullClause := make([]string, nCols)
+	srcNullExistsClause := make([]string, nCols)
+	srcNotNullExistsClause := make([]string, nCols)
+
 	returnedCols := srcCols
 	for i := 0; i < nCols; i++ {
 		col, err := srcTbl.FindColumnByID(fk.OriginColumnIDs[i])
@@ -85,7 +94,8 @@ func matchFullUnacceptableKeyQuery(
 			return "", nil, err
 		}
 		srcCols[i] = tree.NameString(col.Name)
-		srcNotNullClause[i] = fmt.Sprintf("%s IS NOT NULL", srcCols[i])
+		srcNullExistsClause[i] = fmt.Sprintf("%s IS NULL", srcCols[i])
+		srcNotNullExistsClause[i] = fmt.Sprintf("%s IS NOT NULL", srcCols[i])
 	}
 
 	for _, id := range srcTbl.PrimaryIndex.ColumnIDs {
@@ -110,12 +120,12 @@ func matchFullUnacceptableKeyQuery(
 		limit = " LIMIT 1"
 	}
 	return fmt.Sprintf(
-		`SELECT %[1]s FROM [%[2]d AS tbl] WHERE NOT ((COALESCE(%[3]s) IS NULL) OR (%[4]s)) %[5]s`,
-		strings.Join(returnedCols, ","),         // 1
-		srcTbl.ID,                               // 2
-		strings.Join(srcCols, ", "),             // 3
-		strings.Join(srcNotNullClause, " AND "), // 4
-		limit,                                   // 5
+		`SELECT %[1]s FROM [%[2]d AS tbl] WHERE (%[3]s) AND (%[4]s) %[5]s`,
+		strings.Join(returnedCols, ","),              // 1
+		srcTbl.ID,                                    // 2
+		strings.Join(srcNullExistsClause, " OR "),    // 3
+		strings.Join(srcNotNullExistsClause, " OR "), // 4
+		limit, // 5
 	), returnedCols, nil
 }
 
@@ -214,12 +224,17 @@ func nonMatchingRowQuery(
 	), originColNames, nil
 }
 
+// validateForeignKey verifies that all the rows in the srcTable
+// have a matching row in their referenced table.
+//
+// It operates entirely on the current goroutine and is thus able to
+// reuse an existing client.Txn safely.
 func validateForeignKey(
 	ctx context.Context,
 	srcTable *sqlbase.TableDescriptor,
 	fk *sqlbase.ForeignKeyConstraint,
-	ie tree.SessionBoundInternalExecutor,
-	txn *client.Txn,
+	ie *InternalExecutor,
+	txn *kv.Txn,
 ) error {
 	targetTable, err := sqlbase.GetTableDescFromID(ctx, txn, fk.ReferencedTableID)
 	if err != nil {
@@ -297,4 +312,52 @@ func formatValues(colNames []string, values tree.Datums) string {
 		pairs.WriteString(fmt.Sprintf("%s=%v", colNames[i], values[i]))
 	}
 	return pairs.String()
+}
+
+// checkSet contains a subset of checks, as ordinals into
+// ImmutableTableDescriptor.ActiveChecks. These checks have boolean columns
+// produced as input to mutations, indicating the result of evaluating the
+// check.
+//
+// It is allowed to check only a subset of the active checks (the optimizer
+// could in principle determine that some checks can't fail because they
+// statically evaluate to true for the entire input).
+type checkSet = util.FastIntSet
+
+// When executing mutations, we calculate a boolean column for each check
+// indicating if the check passed. This function verifies that each result is
+// true or null.
+//
+// It is allowed to check only a subset of the active checks (for some, we could
+// determine that they can't fail because they statically evaluate to true for
+// the entire input); checkSet contains the set of checks for which we have
+// values, as ordinals into ActiveChecks(). There must be exactly one value in
+// checkVals for each element in checkSet.
+//
+func checkMutationInput(
+	tabDesc *sqlbase.ImmutableTableDescriptor, checkOrds checkSet, checkVals tree.Datums,
+) error {
+	if len(checkVals) != checkOrds.Len() {
+		return errors.AssertionFailedf(
+			"mismatched check constraint columns: expected %d, got %d", checkOrds.Len(), len(checkVals))
+	}
+
+	checks := tabDesc.ActiveChecks()
+	colIdx := 0
+	for i := range checks {
+		if !checkOrds.Contains(i) {
+			continue
+		}
+
+		if res, err := tree.GetBool(checkVals[colIdx]); err != nil {
+			return err
+		} else if !res && checkVals[colIdx] != tree.DNull {
+			// Failed to satisfy CHECK constraint.
+			return pgerror.Newf(
+				pgcode.CheckViolation, "failed to satisfy CHECK constraint (%s)", checks[i].Expr,
+			)
+		}
+		colIdx++
+	}
+	return nil
 }

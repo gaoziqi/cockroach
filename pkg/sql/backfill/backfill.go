@@ -15,7 +15,7 @@ package backfill
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
@@ -121,7 +121,12 @@ func (cb *ColumnBackfiller) Init(
 		ValNeededForCol: valNeededForCol,
 	}
 	return cb.fetcher.Init(
-		false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, &cb.alloc, tableArgs,
+		false, /* reverse */
+		sqlbase.ScanLockingStrength_FOR_NONE,
+		false, /* returnRangeInfo */
+		false, /* isCheck */
+		&cb.alloc,
+		tableArgs,
 	)
 }
 
@@ -129,7 +134,7 @@ func (cb *ColumnBackfiller) Init(
 // the span sp provided, for all updateCols.
 func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	ctx context.Context,
-	txn *client.Txn,
+	txn *kv.Txn,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	otherTables []*sqlbase.ImmutableTableDescriptor,
 	sp roachpb.Span,
@@ -168,6 +173,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	requestedCols = append(requestedCols, tableDesc.Columns...)
 	requestedCols = append(requestedCols, cb.added...)
 	ru, err := row.MakeUpdater(
+		ctx,
 		txn,
 		tableDesc,
 		fkTables,
@@ -270,7 +276,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 
 // ConvertBackfillError returns a cleaner SQL error for a failed Batch.
 func ConvertBackfillError(
-	ctx context.Context, tableDesc *sqlbase.ImmutableTableDescriptor, b *client.Batch,
+	ctx context.Context, tableDesc *sqlbase.ImmutableTableDescriptor, b *kv.Batch,
 ) error {
 	// A backfill on a new schema element has failed and the batch contains
 	// information useful in printing a sensible error. However
@@ -332,7 +338,8 @@ func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
 			ib.added = append(ib.added, *idx)
 			for i := range cols {
 				id := cols[i].ID
-				if idx.ContainsColumnID(id) {
+				if idx.ContainsColumnID(id) ||
+					idx.GetEncodingType(desc.PrimaryIndex.ID) == sqlbase.PrimaryIndexEncoding {
 					valNeededForCol.Add(i)
 				}
 			}
@@ -357,7 +364,12 @@ func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
 		ValNeededForCol: valNeededForCol,
 	}
 	return ib.fetcher.Init(
-		false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, &ib.alloc, tableArgs,
+		false, /* reverse */
+		sqlbase.ScanLockingStrength_FOR_NONE,
+		false, /* returnRangeInfo */
+		false, /* isCheck */
+		&ib.alloc,
+		tableArgs,
 	)
 }
 
@@ -365,7 +377,7 @@ func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
 // provided, and builds all the added indexes.
 func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 	ctx context.Context,
-	txn *client.Txn,
+	txn *kv.Txn,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	sp roachpb.Span,
 	chunkSize int64,
@@ -410,11 +422,12 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 		// We're resetting the length of this slice for variable length indexes such as inverted
 		// indexes which can append entries to the end of the slice. If we don't do this, then everything
 		// EncodeSecondaryIndexes appends to secondaryIndexEntries for a row, would stay in the slice for
-		// subsequent rows and we would then have duplicates in entries on output.
-		buffer = buffer[:len(ib.added)]
+		// subsequent rows and we would then have duplicates in entries on output. Additionally, we do
+		// not want to include empty k/v pairs while backfilling.
+		buffer = buffer[:0]
 		if buffer, err = sqlbase.EncodeSecondaryIndexes(
 			tableDesc.TableDesc(), ib.added, ib.colIdxMap,
-			ib.rowVals, buffer); err != nil {
+			ib.rowVals, buffer, false /* includeEmpty */); err != nil {
 			return nil, nil, err
 		}
 		entries = append(entries, buffer...)
@@ -427,7 +440,7 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 // indexes.
 func (ib *IndexBackfiller) RunIndexBackfillChunk(
 	ctx context.Context,
-	txn *client.Txn,
+	txn *kv.Txn,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	sp roachpb.Span,
 	chunkSize int64,

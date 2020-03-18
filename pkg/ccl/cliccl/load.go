@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/cli"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -53,21 +55,18 @@ func runLoadShow(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	basepath := args[0]
 	if !strings.Contains(basepath, "://") {
-		var err error
-		basepath, err = cloud.MakeLocalStorageURI(basepath)
-		if err != nil {
-			return err
-		}
+		basepath = cloud.MakeLocalStorageURI(basepath)
 	}
 
 	externalStorageFromURI := func(ctx context.Context, uri string) (cloud.ExternalStorage, error) {
-		return cloud.ExternalStorageFromURI(ctx, uri, cluster.NoSettings)
+		return cloud.ExternalStorageFromURI(ctx, uri, base.ExternalIOConfig{},
+			cluster.NoSettings, blobs.TestEmptyBlobClientFactory)
 	}
 	// This reads the raw backup descriptor (with table descriptors possibly not
 	// upgraded from the old FK representation, or even older formats). If more
 	// fields are added to the output, the table descriptors may need to be
 	// upgraded.
-	desc, err := backupccl.ReadBackupDescriptorFromURI(ctx, basepath, externalStorageFromURI)
+	desc, err := backupccl.ReadBackupManifestFromURI(ctx, basepath, externalStorageFromURI, nil)
 	if err != nil {
 		return err
 	}
@@ -78,7 +77,6 @@ func runLoadShow(cmd *cobra.Command, args []string) error {
 	fmt.Printf("DataSize: %d (%s)\n", desc.EntryCounts.DataSize, humanizeutil.IBytes(desc.EntryCounts.DataSize))
 	fmt.Printf("Rows: %d\n", desc.EntryCounts.Rows)
 	fmt.Printf("IndexEntries: %d\n", desc.EntryCounts.IndexEntries)
-	fmt.Printf("SystemRecords: %d\n", desc.EntryCounts.SystemRecords)
 	fmt.Printf("FormatVersion: %d\n", desc.FormatVersion)
 	fmt.Printf("ClusterID: %s\n", desc.ClusterID)
 	fmt.Printf("NodeID: %s\n", desc.NodeID)
@@ -95,7 +93,6 @@ func runLoadShow(cmd *cobra.Command, args []string) error {
 		fmt.Printf("		DataSize: %d (%s)\n", f.EntryCounts.DataSize, humanizeutil.IBytes(f.EntryCounts.DataSize))
 		fmt.Printf("		Rows: %d\n", f.EntryCounts.Rows)
 		fmt.Printf("		IndexEntries: %d\n", f.EntryCounts.IndexEntries)
-		fmt.Printf("		SystemRecords: %d\n", f.EntryCounts.SystemRecords)
 	}
 	// Note that these descriptors could be from any past version of the cluster,
 	// in case more fields need to be added to the output.

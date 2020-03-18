@@ -32,6 +32,7 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 		*sqlbase.WrapDescriptor(&sqlbase.TableDescriptor{ID: 1, Name: "foo", ParentID: 0}),
 		*sqlbase.WrapDescriptor(&sqlbase.TableDescriptor{ID: 2, Name: "bar", ParentID: 0}),
 		*sqlbase.WrapDescriptor(&sqlbase.TableDescriptor{ID: 4, Name: "baz", ParentID: 3}),
+		*sqlbase.WrapDescriptor(&sqlbase.TableDescriptor{ID: 6, Name: "offline", ParentID: 0, State: sqlbase.TableDescriptor_OFFLINE}),
 		*sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{ID: 3, Name: "data"}),
 		*sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{ID: 5, Name: "empty"}),
 	}
@@ -96,13 +97,16 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 
 		{"", "TABLE SyStEm.FoO", []string{"system", "foo"}, nil, ``},
 		{"", "TABLE SyStEm.pUbLic.FoO", []string{"system", "foo"}, nil, ``},
+		{"", `TABLE system."FoO"`, nil, nil, `table "system.FoO" does not exist`},
+		{"system", `TABLE "FoO"`, nil, nil, `table "FoO" does not exist`},
 
 		{"", `TABLE system."foo"`, []string{"system", "foo"}, nil, ``},
 		{"", `TABLE system.public."foo"`, []string{"system", "foo"}, nil, ``},
 		{"system", `TABLE "foo"`, []string{"system", "foo"}, nil, ``},
-		// TODO(dan): Enable these tests once #8862 is fixed.
-		// {"", `TABLE system."FOO"`, []string{"system"}},
-		// {"system", `TABLE "FOO"`, []string{"system"}},
+
+		{"system", `TABLE offline`, nil, nil, `table "offline" does not exist`},
+		{"", `TABLE system.offline`, []string{"system", "foo"}, nil, `table "system.public.offline" does not exist`},
+		{"system", `TABLE *`, []string{"system", "foo", "bar"}, nil, ``},
 	}
 	searchPath := sessiondata.MakeSearchPath([]string{"public", "pg_catalog"})
 	for i, test := range tests {

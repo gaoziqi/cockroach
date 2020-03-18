@@ -259,27 +259,33 @@ func (b BatchedTuples) BatchRows(batchIdx int) [][]interface{} {
 
 // ColBatchToRows materializes the columnar data in a coldata.Batch into rows.
 func ColBatchToRows(cb coldata.Batch) [][]interface{} {
-	numRows, numCols := int(cb.Length()), cb.Width()
+	numRows, numCols := cb.Length(), cb.Width()
 	// Allocate all the []interface{} row slices in one go.
 	datums := make([]interface{}, numRows*numCols)
 	for colIdx, col := range cb.ColVecs() {
 		nulls := col.Nulls()
 		switch col.Type() {
 		case coltypes.Bool:
-			for rowIdx, datum := range col.Bool() {
-				if !nulls.NullAt64(uint64(rowIdx)) {
+			for rowIdx, datum := range col.Bool()[:numRows] {
+				if !nulls.NullAt(rowIdx) {
 					datums[rowIdx*numCols+colIdx] = datum
 				}
 			}
 		case coltypes.Int64:
-			for rowIdx, datum := range col.Int64() {
-				if !nulls.NullAt64(uint64(rowIdx)) {
+			for rowIdx, datum := range col.Int64()[:numRows] {
+				if !nulls.NullAt(rowIdx) {
+					datums[rowIdx*numCols+colIdx] = datum
+				}
+			}
+		case coltypes.Int16:
+			for rowIdx, datum := range col.Int16()[:numRows] {
+				if !nulls.NullAt(rowIdx) {
 					datums[rowIdx*numCols+colIdx] = datum
 				}
 			}
 		case coltypes.Float64:
-			for rowIdx, datum := range col.Float64() {
-				if !nulls.NullAt64(uint64(rowIdx)) {
+			for rowIdx, datum := range col.Float64()[:numRows] {
+				if !nulls.NullAt(rowIdx) {
 					datums[rowIdx*numCols+colIdx] = datum
 				}
 			}
@@ -298,8 +304,8 @@ func ColBatchToRows(cb coldata.Batch) [][]interface{} {
 			// complexity and the undesirable pkg/sql/parser dep, we simply treat them
 			// all as bytes and let the caller deal with the ambiguity.
 			colBytes := col.Bytes()
-			for rowIdx := 0; rowIdx < colBytes.Len(); rowIdx++ {
-				if !nulls.NullAt64(uint64(rowIdx)) {
+			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
+				if !nulls.NullAt(rowIdx) {
 					datums[rowIdx*numCols+colIdx] = colBytes.Get(rowIdx)
 				}
 			}
@@ -431,6 +437,8 @@ func ApproxDatumSize(x interface{}) int64 {
 		// infinite size batches.
 		return int64(bits.Len(uint(t))+8) / 8
 	case int64:
+		return int64(bits.Len64(uint64(t))+8) / 8
+	case int16:
 		return int64(bits.Len64(uint64(t))+8) / 8
 	case uint64:
 		return int64(bits.Len64(t)+8) / 8

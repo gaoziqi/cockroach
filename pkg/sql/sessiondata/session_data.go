@@ -15,8 +15,6 @@ import (
 	"net"
 	"strings"
 	"time"
-
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // SessionData contains session parameters. They are all user-configurable.
@@ -35,9 +33,6 @@ type SessionData struct {
 	// DistSQLMode indicates whether to run queries using the distributed
 	// execution engine.
 	DistSQLMode DistSQLExecMode
-	// ForceSplitAt indicates whether checks to prevent incorrect usage of ALTER
-	// TABLE ... SPLIT AT should be skipped.
-	ForceSplitAt bool
 	// OptimizerFKs indicates whether we should use the new paths to plan foreign
 	// key checks in the optimizer.
 	OptimizerFKs bool
@@ -61,14 +56,14 @@ type SessionData struct {
 	// ReorderJoinsLimit indicates the number of joins at which the optimizer should
 	// stop attempting to reorder.
 	ReorderJoinsLimit int
+	// RequireExplicitPrimaryKeys indicates whether CREATE TABLE statements should
+	// error out if no primary key is provided.
+	RequireExplicitPrimaryKeys bool
 	// SequenceState gives access to the SQL sequences that have been manipulated
 	// by the session.
 	SequenceState *SequenceState
 	// DataConversion gives access to the data conversion configuration.
 	DataConversion DataConversionConfig
-	// DurationAdditionMode enables math compatibility options to be enabled.
-	// TODO(bob): Remove this once the 2.2 release branch is cut.
-	DurationAdditionMode duration.AdditionMode
 	// VectorizeMode indicates which kinds of queries to use vectorized execution
 	// engine for.
 	VectorizeMode VectorizeExecMode
@@ -96,6 +91,14 @@ type SessionData struct {
 	SaveTablesPrefix string
 	// TempTablesEnabled indicates whether temporary tables can be created or not.
 	TempTablesEnabled bool
+	// HashShardedIndexesEnabled indicates whether hash sharded indexes can be created.
+	HashShardedIndexesEnabled bool
+	// ImplicitSelectForUpdate is true if FOR UPDATE locking may be used during
+	// the row-fetch phase of mutation statements.
+	ImplicitSelectForUpdate bool
+	// InsertFastPath is true if the fast path for insert (with VALUES input) may
+	// be used.
+	InsertFastPath bool
 }
 
 // DataConversionConfig contains the parameters that influence
@@ -252,31 +255,44 @@ func DistSQLExecModeFromString(val string) (_ DistSQLExecMode, ok bool) {
 
 // VectorizeExecMode controls if an when the Executor executes queries using the
 // columnar execution engine.
+// WARNING: When adding a VectorizeExecMode, note that nodes at previous
+// versions might interpret the integer value differently. To avoid this, only
+// append to the list or bump the minimum required distsql version (maybe also
+// take advantage of that to reorder the list as you see fit).
 type VectorizeExecMode int64
 
 const (
 	// VectorizeOff means that columnar execution is disabled.
 	VectorizeOff VectorizeExecMode = iota
-	// VectorizeAuto means that that any supported queries that use only
-	// streaming operators (i.e. those that do not require any buffering) will be
-	// run using the columnar execution.
-	VectorizeAuto
-	// VectorizeExperimentalOn means that any supported queries will be run using
-	// the columnar execution on.
-	VectorizeExperimentalOn
+	// Vectorize192Auto means that that any supported queries that use only
+	// streaming operators (i.e. those that do not require any buffering) will
+	// be run using the columnar execution.
+	// TODO(asubiotto): This was the auto setting for 19.2 and is kept around
+	// as an escape hatch. Remove in 20.2.
+	Vectorize192Auto
+	// VectorizeOn means that any supported queries will be run using the
+	// columnar execution.
+	VectorizeOn
 	// VectorizeExperimentalAlways means that we attempt to vectorize all
 	// queries; unsupported queries will fail. Mostly used for testing.
 	VectorizeExperimentalAlways
+	// VectorizeAuto means that any supported queries that use only streaming
+	// operators or buffering operators that can spill to disk or are marked as
+	// buffering an amount not proportional to the input size will be run using
+	// columnar execution.
+	VectorizeAuto
 )
 
 func (m VectorizeExecMode) String() string {
 	switch m {
 	case VectorizeOff:
 		return "off"
+	case Vectorize192Auto:
+		return "192auto"
 	case VectorizeAuto:
 		return "auto"
-	case VectorizeExperimentalOn:
-		return "experimental_on"
+	case VectorizeOn:
+		return "on"
 	case VectorizeExperimentalAlways:
 		return "experimental_always"
 	default:
@@ -291,10 +307,12 @@ func VectorizeExecModeFromString(val string) (VectorizeExecMode, bool) {
 	switch strings.ToUpper(val) {
 	case "OFF":
 		m = VectorizeOff
+	case "192AUTO":
+		m = Vectorize192Auto
 	case "AUTO":
 		m = VectorizeAuto
-	case "EXPERIMENTAL_ON":
-		m = VectorizeExperimentalOn
+	case "ON":
+		m = VectorizeOn
 	case "EXPERIMENTAL_ALWAYS":
 		m = VectorizeExperimentalAlways
 	default:

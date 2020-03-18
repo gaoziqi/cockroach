@@ -20,21 +20,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 	"github.com/cockroachdb/cockroach/pkg/workload/tpcc"
+	"github.com/cockroachdb/cockroach/pkg/workload/tpch"
 )
 
 func columnByteSize(col coldata.Vec) int64 {
 	switch col.Type() {
 	case coltypes.Int64:
 		return int64(len(col.Int64()) * 8)
+	case coltypes.Int16:
+		return int64(len(col.Int16()) * 2)
 	case coltypes.Float64:
 		return int64(len(col.Float64()) * 8)
 	case coltypes.Bytes:
-		var bytes int64
-		colBytes := col.Bytes()
-		for i := 0; i < colBytes.Len(); i++ {
-			bytes += int64(len(colBytes.Get(i)))
-		}
-		return bytes
+		// We subtract the overhead to be in line with Int64 and Float64 cases.
+		return int64(col.Bytes().Size() - coldata.FlatBytesOverhead)
 	default:
 		panic(fmt.Sprintf(`unhandled type %s`, col.Type().GoTypeName()))
 	}
@@ -70,5 +69,11 @@ func BenchmarkInitialData(b *testing.B) {
 	})
 	b.Run(`bank/rows=1000`, func(b *testing.B) {
 		benchmarkInitialData(b, bank.FromRows(1000))
+	})
+	b.Run(`tpch/scaleFactor=1`, func(b *testing.B) {
+		if testing.Short() {
+			b.Skip(`tpch loads a lot of data`)
+		}
+		benchmarkInitialData(b, tpch.FromScaleFactor(1))
 	})
 }

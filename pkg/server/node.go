@@ -19,12 +19,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -32,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/growstack"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -91,24 +92,17 @@ var (
 // Cluster settings.
 var (
 	// graphiteEndpoint is host:port, if any, of Graphite metrics server.
-	graphiteEndpoint = settings.RegisterStringSetting(
+	graphiteEndpoint = settings.RegisterPublicStringSetting(
 		"external.graphite.endpoint",
 		"if nonempty, push server metrics to the Graphite or Carbon server at the specified host:port",
 		"",
 	)
 	// graphiteInterval is how often metrics are pushed to Graphite, if enabled.
-	graphiteInterval = settings.RegisterValidatedDurationSetting(
+	graphiteInterval = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
 		graphiteIntervalKey,
 		"the interval at which metrics are pushed to Graphite (if enabled)",
 		10*time.Second,
-		func(v time.Duration) error {
-			if v < 0 {
-				return errors.Errorf("cannot set %s to a negative duration: %s", graphiteIntervalKey, v)
-			} else if v > maxGraphiteInterval {
-				return errors.Errorf("cannot set %s to more than %v: %s", graphiteIntervalKey, maxGraphiteInterval, v)
-			}
-			return nil
-		},
+		maxGraphiteInterval,
 	)
 )
 
@@ -155,23 +149,23 @@ type Node struct {
 	stopper     *stop.Stopper
 	clusterID   *base.ClusterIDContainer // UUID for Cockroach cluster
 	Descriptor  roachpb.NodeDescriptor   // Node ID, network/physical topology
-	storeCfg    storage.StoreConfig      // Config to use and pass to stores
+	storeCfg    kvserver.StoreConfig     // Config to use and pass to stores
 	eventLogger sql.EventLogger
-	stores      *storage.Stores // Access to node-local stores
+	stores      *kvserver.Stores // Access to node-local stores
 	metrics     nodeMetrics
 	recorder    *status.MetricsRecorder
 	startedAt   int64
 	lastUp      int64
 	initialBoot bool // True if this is the first time this node has started.
-	txnMetrics  kv.TxnMetrics
+	txnMetrics  kvcoord.TxnMetrics
 
-	perReplicaServer storage.Server
+	perReplicaServer kvserver.Server
 }
 
 // allocateNodeID increments the node id generator key to allocate
 // a new, unique node id.
-func allocateNodeID(ctx context.Context, db *client.DB) (roachpb.NodeID, error) {
-	val, err := client.IncrementValRetryable(ctx, db, keys.NodeIDGenerator, 1)
+func allocateNodeID(ctx context.Context, db *kv.DB) (roachpb.NodeID, error) {
+	val, err := kv.IncrementValRetryable(ctx, db, keys.NodeIDGenerator, 1)
 	if err != nil {
 		return 0, errors.Wrap(err, "unable to allocate node ID")
 	}
@@ -182,9 +176,9 @@ func allocateNodeID(ctx context.Context, db *client.DB) (roachpb.NodeID, error) 
 // specified node to allocate count new, unique store ids. The
 // first ID in a contiguous range is returned on success.
 func allocateStoreIDs(
-	ctx context.Context, nodeID roachpb.NodeID, count int64, db *client.DB,
+	ctx context.Context, nodeID roachpb.NodeID, count int64, db *kv.DB,
 ) (roachpb.StoreID, error) {
-	val, err := client.IncrementValRetryable(ctx, db, keys.StoreIDGenerator, count)
+	val, err := kv.IncrementValRetryable(ctx, db, keys.StoreIDGenerator, count)
 	if err != nil {
 		return 0, errors.Wrapf(err, "unable to allocate %d store IDs for node %d", count, nodeID)
 	}
@@ -209,8 +203,8 @@ func GetBootstrapSchema(
 // engines are initialized with their StoreIdent.
 func bootstrapCluster(
 	ctx context.Context,
-	engines []engine.Engine,
-	bootstrapVersion cluster.ClusterVersion,
+	engines []storage.Engine,
+	bootstrapVersion clusterversion.ClusterVersion,
 	defaultZoneConfig *zonepb.ZoneConfig,
 	defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) (uuid.UUID, error) {
@@ -226,7 +220,7 @@ func bootstrapCluster(
 
 		// Initialize the engine backing the store with the store ident and cluster
 		// version.
-		if err := storage.InitEngine(ctx, eng, sIdent, bootstrapVersion); err != nil {
+		if err := kvserver.InitEngine(ctx, eng, sIdent, bootstrapVersion); err != nil {
 			return uuid.UUID{}, err
 		}
 
@@ -235,13 +229,13 @@ func bootstrapCluster(
 		// first store.
 		if i == 0 {
 			schema := GetBootstrapSchema(defaultZoneConfig, defaultSystemZoneConfig)
-			initialValues, tableSplits := schema.GetInitialValues()
+			initialValues, tableSplits := schema.GetInitialValues(bootstrapVersion)
 			splits := append(config.StaticSplits(), tableSplits...)
 			sort.Slice(splits, func(i, j int) bool {
 				return splits[i].Less(splits[j])
 			})
 
-			if err := storage.WriteInitialClusterData(
+			if err := kvserver.WriteInitialClusterData(
 				ctx, eng, initialValues,
 				bootstrapVersion.Version, len(engines), splits,
 				hlc.UnixNano(),
@@ -259,11 +253,11 @@ func bootstrapCluster(
 // before the ExecutorConfig is initialized). In that case, InitLogger() needs
 // to be called before the Node is used.
 func NewNode(
-	cfg storage.StoreConfig,
+	cfg kvserver.StoreConfig,
 	recorder *status.MetricsRecorder,
 	reg *metric.Registry,
 	stopper *stop.Stopper,
-	txnMetrics kv.TxnMetrics,
+	txnMetrics kvcoord.TxnMetrics,
 	execCfg *sql.ExecutorConfig,
 	clusterID *base.ClusterIDContainer,
 ) *Node {
@@ -272,16 +266,19 @@ func NewNode(
 		eventLogger = sql.MakeEventLogger(execCfg)
 	}
 	n := &Node{
-		storeCfg:    cfg,
-		stopper:     stopper,
-		recorder:    recorder,
-		metrics:     makeNodeMetrics(reg, cfg.HistogramWindowInterval),
-		stores:      storage.NewStores(cfg.AmbientCtx, cfg.Clock, cfg.Settings.Version.MinSupportedVersion, cfg.Settings.Version.ServerVersion),
+		storeCfg: cfg,
+		stopper:  stopper,
+		recorder: recorder,
+		metrics:  makeNodeMetrics(reg, cfg.HistogramWindowInterval),
+		stores: kvserver.NewStores(
+			cfg.AmbientCtx, cfg.Clock,
+			cfg.Settings.Version.BinaryVersion(),
+			cfg.Settings.Version.BinaryMinSupportedVersion()),
 		txnMetrics:  txnMetrics,
 		eventLogger: eventLogger,
 		clusterID:   clusterID,
 	}
-	n.perReplicaServer = storage.MakeServer(&n.Descriptor, n.stores)
+	n.perReplicaServer = kvserver.MakeServer(&n.Descriptor, n.stores)
 	return n
 }
 
@@ -309,8 +306,8 @@ func (n *Node) AnnotateCtxWithSpan(
 
 func (n *Node) bootstrapCluster(
 	ctx context.Context,
-	engines []engine.Engine,
-	bootstrapVersion cluster.ClusterVersion,
+	engines []storage.Engine,
+	bootstrapVersion clusterversion.ClusterVersion,
 	defaultZoneConfig *zonepb.ZoneConfig,
 	defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) error {
@@ -328,8 +325,7 @@ func (n *Node) bootstrapCluster(
 	return nil
 }
 
-func (n *Node) onClusterVersionChange(cv cluster.ClusterVersion) {
-	ctx := n.AnnotateCtx(context.Background())
+func (n *Node) onClusterVersionChange(ctx context.Context, cv clusterversion.ClusterVersion) {
 	if err := n.stores.OnClusterVersionChange(ctx, cv); err != nil {
 		log.Fatal(ctx, errors.Wrapf(err, "updating cluster version to %v", cv))
 	}
@@ -343,16 +339,16 @@ func (n *Node) onClusterVersionChange(cv cluster.ClusterVersion) {
 func (n *Node) start(
 	ctx context.Context,
 	addr, sqlAddr net.Addr,
-	initializedEngines, emptyEngines []engine.Engine,
+	initializedEngines, emptyEngines []storage.Engine,
 	clusterName string,
 	attrs roachpb.Attributes,
 	locality roachpb.Locality,
-	cv cluster.ClusterVersion,
+	cv clusterversion.ClusterVersion,
 	localityAddress []roachpb.LocalityAddress,
 	nodeDescriptorCallback func(descriptor roachpb.NodeDescriptor),
 ) error {
-	if err := n.storeCfg.Settings.InitializeVersion(cv); err != nil {
-		return errors.Wrap(err, "while initializing cluster version")
+	if err := clusterversion.Initialize(ctx, cv.Version, &n.storeCfg.Settings.SV); err != nil {
+		return err
 	}
 
 	// Obtaining the NodeID requires a dance of sorts. If the node has initialized
@@ -360,7 +356,7 @@ func (n *Node) start(
 	// use the KV store to get a NodeID assigned.
 	var nodeID roachpb.NodeID
 	if len(initializedEngines) > 0 {
-		firstIdent, err := storage.ReadStoreIdent(ctx, initializedEngines[0])
+		firstIdent, err := kvserver.ReadStoreIdent(ctx, initializedEngines[0])
 		if err != nil {
 			return err
 		}
@@ -396,7 +392,7 @@ func (n *Node) start(
 		Locality:        locality,
 		LocalityAddress: localityAddress,
 		ClusterName:     clusterName,
-		ServerVersion:   n.storeCfg.Settings.Version.ServerVersion,
+		ServerVersion:   n.storeCfg.Settings.Version.BinaryVersion(),
 		BuildTag:        build.GetInfo().Tag,
 		StartedAt:       n.startedAt,
 	}
@@ -418,7 +414,7 @@ func (n *Node) start(
 
 	// Create stores from the engines that were already bootstrapped.
 	for _, e := range initializedEngines {
-		s := storage.NewStore(ctx, n.storeCfg, e, &n.Descriptor)
+		s := kvserver.NewStore(ctx, n.storeCfg, e, &n.Descriptor)
 		if err := s.Start(ctx, n.stopper); err != nil {
 			return errors.Errorf("failed to start store: %s", err)
 		}
@@ -443,7 +439,7 @@ func (n *Node) start(
 	// Compute the time this node was last up; this is done by reading the
 	// "last up time" from every store and choosing the most recent timestamp.
 	var mostRecentTimestamp hlc.Timestamp
-	if err := n.stores.VisitStores(func(s *storage.Store) error {
+	if err := n.stores.VisitStores(func(s *kvserver.Store) error {
 		timestamp, err := s.ReadLastUpTimestamp(ctx)
 		if err != nil {
 			return err
@@ -495,11 +491,14 @@ func (n *Node) start(
 
 	// Now that we've created all our stores, install the gossip version update
 	// handler to write version updates to them.
-	n.storeCfg.Settings.Version.OnChange(n.onClusterVersionChange)
+	// It's important that we persist new versions to the engines before the node
+	// starts using it, otherwise the node might regress the version after a
+	// crash.
+	clusterversion.SetBeforeChange(ctx, &n.storeCfg.Settings.SV, n.onClusterVersionChange)
 	// Invoke the callback manually once so that we persist the updated value that
 	// gossip might have already received.
-	clusterVersion := n.storeCfg.Settings.Version.Version()
-	n.onClusterVersionChange(clusterVersion)
+	clusterVersion := n.storeCfg.Settings.Version.ActiveVersion(ctx)
+	n.onClusterVersionChange(ctx, clusterVersion)
 
 	// Be careful about moving this line above `startStores`; store migrations rely
 	// on the fact that the cluster version has not been updated via Gossip (we
@@ -508,7 +507,7 @@ func (n *Node) start(
 	// bumped immediately, which would be possible if gossip got started earlier).
 	n.startGossip(ctx, n.stopper)
 
-	allEngines := append([]engine.Engine(nil), initializedEngines...)
+	allEngines := append([]storage.Engine(nil), initializedEngines...)
 	allEngines = append(allEngines, emptyEngines...)
 	log.Infof(ctx, "%s: started with %v engine(s) and attributes %v", n, allEngines, attrs.Attrs)
 	return nil
@@ -518,7 +517,7 @@ func (n *Node) start(
 // currently allowing range leases to be procured or extended.
 func (n *Node) IsDraining() bool {
 	var isDraining bool
-	if err := n.stores.VisitStores(func(s *storage.Store) error {
+	if err := n.stores.VisitStores(func(s *kvserver.Store) error {
 		isDraining = isDraining || s.IsDraining()
 		return nil
 	}); err != nil {
@@ -529,7 +528,7 @@ func (n *Node) IsDraining() bool {
 
 // SetDraining sets the draining mode on all of the node's underlying stores.
 func (n *Node) SetDraining(drain bool) error {
-	return n.stores.VisitStores(func(s *storage.Store) error {
+	return n.stores.VisitStores(func(s *kvserver.Store) error {
 		s.SetDraining(drain)
 		return nil
 	})
@@ -538,17 +537,17 @@ func (n *Node) SetDraining(drain bool) error {
 // SetHLCUpperBound sets the upper bound of the HLC wall time on all of the
 // node's underlying stores.
 func (n *Node) SetHLCUpperBound(ctx context.Context, hlcUpperBound int64) error {
-	return n.stores.VisitStores(func(s *storage.Store) error {
+	return n.stores.VisitStores(func(s *kvserver.Store) error {
 		return s.WriteHLCUpperBound(ctx, hlcUpperBound)
 	})
 }
 
-func (n *Node) addStore(store *storage.Store) {
+func (n *Node) addStore(store *kvserver.Store) {
 	cv, err := store.GetClusterVersion(context.TODO())
 	if err != nil {
 		log.Fatal(context.TODO(), err)
 	}
-	if cv == (cluster.ClusterVersion{}) {
+	if cv == (clusterversion.ClusterVersion{}) {
 		// The store should have had a version written to it during the store
 		// bootstrap process.
 		log.Fatal(context.TODO(), "attempting to add a store without a version")
@@ -561,7 +560,7 @@ func (n *Node) addStore(store *storage.Store) {
 // The node's ident is initialized based on the agreed-upon node ID. Note that
 // cluster ID consistency is checked elsewhere in inspectEngines.
 func (n *Node) validateStores(ctx context.Context) error {
-	return n.stores.VisitStores(func(s *storage.Store) error {
+	return n.stores.VisitStores(func(s *kvserver.Store) error {
 		if n.Descriptor.NodeID != s.Ident.NodeID {
 			return errors.Errorf("store %s node ID doesn't match node ID: %d", s, n.Descriptor.NodeID)
 		}
@@ -574,7 +573,7 @@ func (n *Node) validateStores(ctx context.Context) error {
 // allocated via a sequence id generator stored at a system key per
 // node. The new stores are added to n.stores.
 func (n *Node) bootstrapStores(
-	ctx context.Context, emptyEngines []engine.Engine, stopper *stop.Stopper,
+	ctx context.Context, emptyEngines []storage.Engine, stopper *stop.Stopper,
 ) error {
 	if n.clusterID.Get() == uuid.Nil {
 		return errors.New("ClusterID missing during store bootstrap of auxiliary store")
@@ -582,13 +581,13 @@ func (n *Node) bootstrapStores(
 
 	// There's a bit of an awkward dance around cluster versions here. If this node
 	// is joining an existing cluster for the first time, it doesn't have any engines
-	// set up yet, and cv below will be the MinSupportedVersion. At the same time,
-	// the Gossip update which notifies us about the real cluster version won't
-	// persist it to any engines (because we haven't installed the gossip update
-	// handler yet and also because none of the stores are bootstrapped). So we
-	// just accept that we won't use the correct version here, but
-	// post-bootstrapping will invoke the callback manually, which will
-	// disseminate the correct version to all engines.
+	// set up yet, and cv below will be the binary's minimum supported version.
+	// At the same time, the Gossip update which notifies us about the real
+	// cluster version won't persist it to any engines (because we haven't
+	// installed the gossip update handler yet and also because none of the
+	// stores are bootstrapped). So we just accept that we won't use the correct
+	// version here, but post-bootstrapping will invoke the callback manually,
+	// which will disseminate the correct version to all engines.
 	cv, err := n.stores.SynthesizeClusterVersion(ctx)
 	if err != nil {
 		return errors.Errorf("error retrieving cluster version for bootstrap: %s", err)
@@ -609,11 +608,11 @@ func (n *Node) bootstrapStores(
 			StoreID:   firstID,
 		}
 		for _, eng := range emptyEngines {
-			if err := storage.InitEngine(ctx, eng, sIdent, cv); err != nil {
+			if err := kvserver.InitEngine(ctx, eng, sIdent, cv); err != nil {
 				return err
 			}
 
-			s := storage.NewStore(ctx, n.storeCfg, eng, &n.Descriptor)
+			s := kvserver.NewStore(ctx, n.storeCfg, eng, &n.Descriptor)
 			if err := s.Start(ctx, stopper); err != nil {
 				return err
 			}
@@ -709,7 +708,7 @@ func (n *Node) startGossip(ctx context.Context, stopper *stop.Stopper) {
 
 // gossipStores broadcasts each store and dead replica to the gossip network.
 func (n *Node) gossipStores(ctx context.Context) {
-	if err := n.stores.VisitStores(func(s *storage.Store) error {
+	if err := n.stores.VisitStores(func(s *kvserver.Store) error {
 		return s.GossipStore(ctx, false /* useCached */)
 	}); err != nil {
 		log.Warning(ctx, err)
@@ -741,7 +740,7 @@ func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper, interval time.
 // computePeriodicMetrics instructs each store to compute the value of
 // complicated metrics.
 func (n *Node) computePeriodicMetrics(ctx context.Context, tick int) error {
-	return n.stores.VisitStores(func(store *storage.Store) error {
+	return n.stores.VisitStores(func(store *kvserver.Store) error {
 		if err := store.ComputeMetrics(ctx, tick); err != nil {
 			log.Warningf(ctx, "%s: unable to compute metrics: %s", store, err)
 		}
@@ -865,7 +864,7 @@ func (n *Node) recordJoinEvent() {
 		retryOpts := base.DefaultRetryOptions()
 		retryOpts.Closer = n.stopper.ShouldStop()
 		for r := retry.Start(retryOpts); r.Next(); {
-			if err := n.storeCfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+			if err := n.storeCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 				return n.eventLogger.InsertEventRecord(
 					ctx,
 					txn,

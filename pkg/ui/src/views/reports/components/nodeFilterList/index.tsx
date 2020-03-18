@@ -9,8 +9,8 @@
 // licenses/APL.txt.
 
 import _ from "lodash";
-import { Location } from "history";
 import React from "react";
+import { Location } from "history";
 
 import * as protos from "src/js/protos";
 
@@ -21,11 +21,14 @@ export interface NodeFilterListProps {
 
 export function getFilters(location: Location) {
   const filters: NodeFilterListProps = {};
+  const searchParams = new URLSearchParams(location.search);
+  const nodeIds = searchParams.get("node_ids");
+  const locality = searchParams.get("locality");
 
   // Node id list.
-  if (!_.isEmpty(location.query.node_ids)) {
+  if (!_.isEmpty(nodeIds)) {
     const nodeIDs: Set<number> = new Set();
-    _.forEach(_.split(location.query.node_ids, ","), nodeIDString => {
+    _.forEach(_.split(nodeIds, ","), nodeIDString => {
       const nodeID = parseInt(nodeIDString, 10);
       if (nodeID) {
         nodeIDs.add(nodeID);
@@ -37,9 +40,9 @@ export function getFilters(location: Location) {
   }
 
   // Locality regex filter.
-  if (!_.isEmpty(location.query.locality)) {
+  if (!_.isEmpty(locality)) {
     try {
-      filters.localityRegex = new RegExp(location.query.locality);
+      filters.localityRegex = new RegExp(locality);
     } catch (e) {
       // Ignore the error, the filter not appearing is feedback enough.
     }
@@ -71,7 +74,7 @@ export function NodeFilterList(props: NodeFilterListProps) {
 
   return (
     <div>
-      <h2>Filters</h2>
+      <h2 className="base-heading">Filters</h2>
       <ul className="node-filter-list">
         {
           _.map(filters, (filter, i) => (

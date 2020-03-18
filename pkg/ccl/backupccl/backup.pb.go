@@ -15,6 +15,9 @@ import hlc "github.com/cockroachdb/cockroach/pkg/util/hlc"
 import github_com_cockroachdb_cockroach_pkg_sql_sqlbase "github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 import github_com_cockroachdb_cockroach_pkg_util_uuid "github.com/cockroachdb/cockroach/pkg/util/uuid"
 import github_com_cockroachdb_cockroach_pkg_roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
+import github_com_cockroachdb_cockroach_pkg_sql_sem_tree "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+
+import bytes "bytes"
 
 import io "io"
 
@@ -49,16 +52,72 @@ func (x MVCCFilter) String() string {
 	return proto.EnumName(MVCCFilter_name, int32(x))
 }
 func (MVCCFilter) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor_backup_5e86acf06cc31994, []int{0}
+	return fileDescriptor_backup_c91f9318627fab4a, []int{0}
 }
 
-// BackupDescriptor represents a consistent snapshot of ranges.
+type EncryptionInfo_Scheme int32
+
+const (
+	EncryptionInfo_AES256GCM EncryptionInfo_Scheme = 0
+)
+
+var EncryptionInfo_Scheme_name = map[int32]string{
+	0: "AES256GCM",
+}
+var EncryptionInfo_Scheme_value = map[string]int32{
+	"AES256GCM": 0,
+}
+
+func (x EncryptionInfo_Scheme) String() string {
+	return proto.EnumName(EncryptionInfo_Scheme_name, int32(x))
+}
+func (EncryptionInfo_Scheme) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_backup_c91f9318627fab4a, []int{3, 0}
+}
+
+// RowCount tracks the size and row/index entry counts.
+type RowCount struct {
+	DataSize     int64 `protobuf:"varint,1,opt,name=data_size,json=dataSize,proto3" json:"data_size,omitempty"`
+	Rows         int64 `protobuf:"varint,2,opt,name=rows,proto3" json:"rows,omitempty"`
+	IndexEntries int64 `protobuf:"varint,3,opt,name=index_entries,json=indexEntries,proto3" json:"index_entries,omitempty"`
+}
+
+func (m *RowCount) Reset()         { *m = RowCount{} }
+func (m *RowCount) String() string { return proto.CompactTextString(m) }
+func (*RowCount) ProtoMessage()    {}
+func (*RowCount) Descriptor() ([]byte, []int) {
+	return fileDescriptor_backup_c91f9318627fab4a, []int{0}
+}
+func (m *RowCount) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *RowCount) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *RowCount) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_RowCount.Merge(dst, src)
+}
+func (m *RowCount) XXX_Size() int {
+	return m.Size()
+}
+func (m *RowCount) XXX_DiscardUnknown() {
+	xxx_messageInfo_RowCount.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_RowCount proto.InternalMessageInfo
+
+// BackupManifest represents a consistent snapshot of ranges.
 //
 // Each range snapshot includes a path to data that is a diff of the data in
 // that key range between a start and end timestamp. The end timestamp of all
 // ranges in a backup is the same, but the start may vary (to allow individual
 // tables to be backed up on different schedules).
-type BackupDescriptor struct {
+type BackupManifest struct {
 	StartTime  hlc.Timestamp `protobuf:"bytes,1,opt,name=start_time,json=startTime,proto3" json:"start_time"`
 	EndTime    hlc.Timestamp `protobuf:"bytes,2,opt,name=end_time,json=endTime,proto3" json:"end_time"`
 	MVCCFilter MVCCFilter    `protobuf:"varint,13,opt,name=mvcc_filter,json=mvccFilter,proto3,enum=cockroach.ccl.backupccl.MVCCFilter" json:"mvcc_filter,omitempty"`
@@ -76,35 +135,36 @@ type BackupDescriptor struct {
 	// here are covered in the interval (0, startTime], which, in conjunction with
 	// the coverage from (startTime, endTime] implied for all spans in Spans,
 	// results in coverage from [0, endTime] for these spans.
-	IntroducedSpans   []roachpb.Span                        `protobuf:"bytes,15,rep,name=introduced_spans,json=introducedSpans,proto3" json:"introduced_spans"`
-	DescriptorChanges []BackupDescriptor_DescriptorRevision `protobuf:"bytes,16,rep,name=descriptor_changes,json=descriptorChanges,proto3" json:"descriptor_changes"`
-	Files             []BackupDescriptor_File               `protobuf:"bytes,4,rep,name=files,proto3" json:"files"`
-	Descriptors       []sqlbase.Descriptor                  `protobuf:"bytes,5,rep,name=descriptors,proto3" json:"descriptors"`
+	IntroducedSpans   []roachpb.Span                      `protobuf:"bytes,15,rep,name=introduced_spans,json=introducedSpans,proto3" json:"introduced_spans"`
+	DescriptorChanges []BackupManifest_DescriptorRevision `protobuf:"bytes,16,rep,name=descriptor_changes,json=descriptorChanges,proto3" json:"descriptor_changes"`
+	Files             []BackupManifest_File               `protobuf:"bytes,4,rep,name=files,proto3" json:"files"`
+	Descriptors       []sqlbase.Descriptor                `protobuf:"bytes,5,rep,name=descriptors,proto3" json:"descriptors"`
 	// databases in descriptors that have all tables also in descriptors.
 	CompleteDbs   []github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID `protobuf:"varint,14,rep,packed,name=complete_dbs,json=completeDbs,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"complete_dbs,omitempty"`
-	EntryCounts   roachpb.BulkOpSummary                                 `protobuf:"bytes,12,opt,name=entry_counts,json=entryCounts,proto3" json:"entry_counts"`
+	EntryCounts   RowCount                                              `protobuf:"bytes,12,opt,name=entry_counts,json=entryCounts,proto3" json:"entry_counts"`
 	Dir           roachpb.ExternalStorage                               `protobuf:"bytes,7,opt,name=dir,proto3" json:"dir"`
 	FormatVersion uint32                                                `protobuf:"varint,8,opt,name=format_version,json=formatVersion,proto3" json:"format_version,omitempty"`
 	ClusterID     github_com_cockroachdb_cockroach_pkg_util_uuid.UUID   `protobuf:"bytes,9,opt,name=cluster_id,json=clusterId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"cluster_id"`
 	// node_id and build_info of the gateway node (which writes the descriptor).
-	NodeID                       github_com_cockroachdb_cockroach_pkg_roachpb.NodeID `protobuf:"varint,10,opt,name=node_id,json=nodeId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/roachpb.NodeID" json:"node_id,omitempty"`
-	BuildInfo                    build.Info                                          `protobuf:"bytes,11,opt,name=build_info,json=buildInfo,proto3" json:"build_info"`
-	ID                           github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,18,opt,name=id,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"id"`
-	PartitionDescriptorFilenames []string                                            `protobuf:"bytes,19,rep,name=partition_descriptor_filenames,json=partitionDescriptorFilenames,proto3" json:"partition_descriptor_filenames,omitempty"`
-	LocalityKVs                  []string                                            `protobuf:"bytes,20,rep,name=locality_kvs,json=localityKvs,proto3" json:"locality_kvs,omitempty"`
-	Statistics                   []*stats.TableStatisticProto                        `protobuf:"bytes,21,rep,name=statistics,proto3" json:"statistics,omitempty"`
+	NodeID                       github_com_cockroachdb_cockroach_pkg_roachpb.NodeID                  `protobuf:"varint,10,opt,name=node_id,json=nodeId,proto3,casttype=github.com/cockroachdb/cockroach/pkg/roachpb.NodeID" json:"node_id,omitempty"`
+	BuildInfo                    build.Info                                                           `protobuf:"bytes,11,opt,name=build_info,json=buildInfo,proto3" json:"build_info"`
+	ID                           github_com_cockroachdb_cockroach_pkg_util_uuid.UUID                  `protobuf:"bytes,18,opt,name=id,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"id"`
+	PartitionDescriptorFilenames []string                                                             `protobuf:"bytes,19,rep,name=partition_descriptor_filenames,json=partitionDescriptorFilenames,proto3" json:"partition_descriptor_filenames,omitempty"`
+	LocalityKVs                  []string                                                             `protobuf:"bytes,20,rep,name=locality_kvs,json=localityKvs,proto3" json:"locality_kvs,omitempty"`
+	Statistics                   []*stats.TableStatisticProto                                         `protobuf:"bytes,21,rep,name=statistics,proto3" json:"statistics,omitempty"`
+	DescriptorCoverage           github_com_cockroachdb_cockroach_pkg_sql_sem_tree.DescriptorCoverage `protobuf:"varint,22,opt,name=descriptor_coverage,json=descriptorCoverage,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sem/tree.DescriptorCoverage" json:"descriptor_coverage,omitempty"`
 }
 
-func (m *BackupDescriptor) Reset()         { *m = BackupDescriptor{} }
-func (m *BackupDescriptor) String() string { return proto.CompactTextString(m) }
-func (*BackupDescriptor) ProtoMessage()    {}
-func (*BackupDescriptor) Descriptor() ([]byte, []int) {
-	return fileDescriptor_backup_5e86acf06cc31994, []int{0}
+func (m *BackupManifest) Reset()         { *m = BackupManifest{} }
+func (m *BackupManifest) String() string { return proto.CompactTextString(m) }
+func (*BackupManifest) ProtoMessage()    {}
+func (*BackupManifest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_backup_c91f9318627fab4a, []int{1}
 }
-func (m *BackupDescriptor) XXX_Unmarshal(b []byte) error {
+func (m *BackupManifest) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *BackupDescriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *BackupManifest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	b = b[:cap(b)]
 	n, err := m.MarshalTo(b)
 	if err != nil {
@@ -112,25 +172,25 @@ func (m *BackupDescriptor) XXX_Marshal(b []byte, deterministic bool) ([]byte, er
 	}
 	return b[:n], nil
 }
-func (dst *BackupDescriptor) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_BackupDescriptor.Merge(dst, src)
+func (dst *BackupManifest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_BackupManifest.Merge(dst, src)
 }
-func (m *BackupDescriptor) XXX_Size() int {
+func (m *BackupManifest) XXX_Size() int {
 	return m.Size()
 }
-func (m *BackupDescriptor) XXX_DiscardUnknown() {
-	xxx_messageInfo_BackupDescriptor.DiscardUnknown(m)
+func (m *BackupManifest) XXX_DiscardUnknown() {
+	xxx_messageInfo_BackupManifest.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_BackupDescriptor proto.InternalMessageInfo
+var xxx_messageInfo_BackupManifest proto.InternalMessageInfo
 
-// BackupDescriptor_File represents a file that contains the diff for a key
+// BackupManifest_File represents a file that contains the diff for a key
 // range between two timestamps.
-type BackupDescriptor_File struct {
-	Span        roachpb.Span          `protobuf:"bytes,1,opt,name=span,proto3" json:"span"`
-	Path        string                `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
-	Sha512      []byte                `protobuf:"bytes,4,opt,name=sha512,proto3" json:"sha512,omitempty"`
-	EntryCounts roachpb.BulkOpSummary `protobuf:"bytes,6,opt,name=entry_counts,json=entryCounts,proto3" json:"entry_counts"`
+type BackupManifest_File struct {
+	Span        roachpb.Span `protobuf:"bytes,1,opt,name=span,proto3" json:"span"`
+	Path        string       `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	Sha512      []byte       `protobuf:"bytes,4,opt,name=sha512,proto3" json:"sha512,omitempty"`
+	EntryCounts RowCount     `protobuf:"bytes,6,opt,name=entry_counts,json=entryCounts,proto3" json:"entry_counts"`
 	// StartTime 0 is sometimes legitimately used, so it is only meaningful if
 	// EndTime is non-zero, otherwise both just inherit from containing backup.
 	StartTime  hlc.Timestamp `protobuf:"bytes,7,opt,name=start_time,json=startTime,proto3" json:"start_time"`
@@ -138,16 +198,16 @@ type BackupDescriptor_File struct {
 	LocalityKV string        `protobuf:"bytes,9,opt,name=locality_kv,json=localityKv,proto3" json:"locality_kv,omitempty"`
 }
 
-func (m *BackupDescriptor_File) Reset()         { *m = BackupDescriptor_File{} }
-func (m *BackupDescriptor_File) String() string { return proto.CompactTextString(m) }
-func (*BackupDescriptor_File) ProtoMessage()    {}
-func (*BackupDescriptor_File) Descriptor() ([]byte, []int) {
-	return fileDescriptor_backup_5e86acf06cc31994, []int{0, 0}
+func (m *BackupManifest_File) Reset()         { *m = BackupManifest_File{} }
+func (m *BackupManifest_File) String() string { return proto.CompactTextString(m) }
+func (*BackupManifest_File) ProtoMessage()    {}
+func (*BackupManifest_File) Descriptor() ([]byte, []int) {
+	return fileDescriptor_backup_c91f9318627fab4a, []int{1, 0}
 }
-func (m *BackupDescriptor_File) XXX_Unmarshal(b []byte) error {
+func (m *BackupManifest_File) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *BackupDescriptor_File) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *BackupManifest_File) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	b = b[:cap(b)]
 	n, err := m.MarshalTo(b)
 	if err != nil {
@@ -155,34 +215,34 @@ func (m *BackupDescriptor_File) XXX_Marshal(b []byte, deterministic bool) ([]byt
 	}
 	return b[:n], nil
 }
-func (dst *BackupDescriptor_File) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_BackupDescriptor_File.Merge(dst, src)
+func (dst *BackupManifest_File) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_BackupManifest_File.Merge(dst, src)
 }
-func (m *BackupDescriptor_File) XXX_Size() int {
+func (m *BackupManifest_File) XXX_Size() int {
 	return m.Size()
 }
-func (m *BackupDescriptor_File) XXX_DiscardUnknown() {
-	xxx_messageInfo_BackupDescriptor_File.DiscardUnknown(m)
+func (m *BackupManifest_File) XXX_DiscardUnknown() {
+	xxx_messageInfo_BackupManifest_File.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_BackupDescriptor_File proto.InternalMessageInfo
+var xxx_messageInfo_BackupManifest_File proto.InternalMessageInfo
 
-type BackupDescriptor_DescriptorRevision struct {
+type BackupManifest_DescriptorRevision struct {
 	Time hlc.Timestamp                                       `protobuf:"bytes,1,opt,name=time,proto3" json:"time"`
 	ID   github_com_cockroachdb_cockroach_pkg_sql_sqlbase.ID `protobuf:"varint,2,opt,name=ID,proto3,casttype=github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID" json:"ID,omitempty"`
 	Desc *sqlbase.Descriptor                                 `protobuf:"bytes,3,opt,name=desc,proto3" json:"desc,omitempty"`
 }
 
-func (m *BackupDescriptor_DescriptorRevision) Reset()         { *m = BackupDescriptor_DescriptorRevision{} }
-func (m *BackupDescriptor_DescriptorRevision) String() string { return proto.CompactTextString(m) }
-func (*BackupDescriptor_DescriptorRevision) ProtoMessage()    {}
-func (*BackupDescriptor_DescriptorRevision) Descriptor() ([]byte, []int) {
-	return fileDescriptor_backup_5e86acf06cc31994, []int{0, 1}
+func (m *BackupManifest_DescriptorRevision) Reset()         { *m = BackupManifest_DescriptorRevision{} }
+func (m *BackupManifest_DescriptorRevision) String() string { return proto.CompactTextString(m) }
+func (*BackupManifest_DescriptorRevision) ProtoMessage()    {}
+func (*BackupManifest_DescriptorRevision) Descriptor() ([]byte, []int) {
+	return fileDescriptor_backup_c91f9318627fab4a, []int{1, 1}
 }
-func (m *BackupDescriptor_DescriptorRevision) XXX_Unmarshal(b []byte) error {
+func (m *BackupManifest_DescriptorRevision) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *BackupDescriptor_DescriptorRevision) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *BackupManifest_DescriptorRevision) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	b = b[:cap(b)]
 	n, err := m.MarshalTo(b)
 	if err != nil {
@@ -190,21 +250,21 @@ func (m *BackupDescriptor_DescriptorRevision) XXX_Marshal(b []byte, deterministi
 	}
 	return b[:n], nil
 }
-func (dst *BackupDescriptor_DescriptorRevision) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_BackupDescriptor_DescriptorRevision.Merge(dst, src)
+func (dst *BackupManifest_DescriptorRevision) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_BackupManifest_DescriptorRevision.Merge(dst, src)
 }
-func (m *BackupDescriptor_DescriptorRevision) XXX_Size() int {
+func (m *BackupManifest_DescriptorRevision) XXX_Size() int {
 	return m.Size()
 }
-func (m *BackupDescriptor_DescriptorRevision) XXX_DiscardUnknown() {
-	xxx_messageInfo_BackupDescriptor_DescriptorRevision.DiscardUnknown(m)
+func (m *BackupManifest_DescriptorRevision) XXX_DiscardUnknown() {
+	xxx_messageInfo_BackupManifest_DescriptorRevision.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_BackupDescriptor_DescriptorRevision proto.InternalMessageInfo
+var xxx_messageInfo_BackupManifest_DescriptorRevision proto.InternalMessageInfo
 
 type BackupPartitionDescriptor struct {
 	LocalityKV string                                              `protobuf:"bytes,1,opt,name=locality_kv,json=localityKv,proto3" json:"locality_kv,omitempty"`
-	Files      []BackupDescriptor_File                             `protobuf:"bytes,2,rep,name=files,proto3" json:"files"`
+	Files      []BackupManifest_File                               `protobuf:"bytes,2,rep,name=files,proto3" json:"files"`
 	BackupID   github_com_cockroachdb_cockroach_pkg_util_uuid.UUID `protobuf:"bytes,3,opt,name=backup_id,json=backupId,proto3,customtype=github.com/cockroachdb/cockroach/pkg/util/uuid.UUID" json:"backup_id"`
 }
 
@@ -212,7 +272,7 @@ func (m *BackupPartitionDescriptor) Reset()         { *m = BackupPartitionDescri
 func (m *BackupPartitionDescriptor) String() string { return proto.CompactTextString(m) }
 func (*BackupPartitionDescriptor) ProtoMessage()    {}
 func (*BackupPartitionDescriptor) Descriptor() ([]byte, []int) {
-	return fileDescriptor_backup_5e86acf06cc31994, []int{1}
+	return fileDescriptor_backup_c91f9318627fab4a, []int{2}
 }
 func (m *BackupPartitionDescriptor) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
@@ -237,14 +297,80 @@ func (m *BackupPartitionDescriptor) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_BackupPartitionDescriptor proto.InternalMessageInfo
 
-func init() {
-	proto.RegisterType((*BackupDescriptor)(nil), "cockroach.ccl.backupccl.BackupDescriptor")
-	proto.RegisterType((*BackupDescriptor_File)(nil), "cockroach.ccl.backupccl.BackupDescriptor.File")
-	proto.RegisterType((*BackupDescriptor_DescriptorRevision)(nil), "cockroach.ccl.backupccl.BackupDescriptor.DescriptorRevision")
-	proto.RegisterType((*BackupPartitionDescriptor)(nil), "cockroach.ccl.backupccl.BackupPartitionDescriptor")
-	proto.RegisterEnum("cockroach.ccl.backupccl.MVCCFilter", MVCCFilter_name, MVCCFilter_value)
+// EncryptionInfo is stored IN PLAINTEXT along side collections of encrypted
+// files stored outside of cockroach, for example by BACKUP/RESTORE.
+type EncryptionInfo struct {
+	Scheme EncryptionInfo_Scheme `protobuf:"varint,1,opt,name=scheme,proto3,enum=cockroach.ccl.backupccl.EncryptionInfo_Scheme" json:"scheme,omitempty"`
+	Salt   []byte                `protobuf:"bytes,2,opt,name=salt,proto3" json:"salt,omitempty"`
 }
-func (m *BackupDescriptor) Marshal() (dAtA []byte, err error) {
+
+func (m *EncryptionInfo) Reset()         { *m = EncryptionInfo{} }
+func (m *EncryptionInfo) String() string { return proto.CompactTextString(m) }
+func (*EncryptionInfo) ProtoMessage()    {}
+func (*EncryptionInfo) Descriptor() ([]byte, []int) {
+	return fileDescriptor_backup_c91f9318627fab4a, []int{3}
+}
+func (m *EncryptionInfo) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *EncryptionInfo) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *EncryptionInfo) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_EncryptionInfo.Merge(dst, src)
+}
+func (m *EncryptionInfo) XXX_Size() int {
+	return m.Size()
+}
+func (m *EncryptionInfo) XXX_DiscardUnknown() {
+	xxx_messageInfo_EncryptionInfo.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_EncryptionInfo proto.InternalMessageInfo
+
+func init() {
+	proto.RegisterType((*RowCount)(nil), "cockroach.ccl.backupccl.RowCount")
+	proto.RegisterType((*BackupManifest)(nil), "cockroach.ccl.backupccl.BackupManifest")
+	proto.RegisterType((*BackupManifest_File)(nil), "cockroach.ccl.backupccl.BackupManifest.File")
+	proto.RegisterType((*BackupManifest_DescriptorRevision)(nil), "cockroach.ccl.backupccl.BackupManifest.DescriptorRevision")
+	proto.RegisterType((*BackupPartitionDescriptor)(nil), "cockroach.ccl.backupccl.BackupPartitionDescriptor")
+	proto.RegisterType((*EncryptionInfo)(nil), "cockroach.ccl.backupccl.EncryptionInfo")
+	proto.RegisterEnum("cockroach.ccl.backupccl.MVCCFilter", MVCCFilter_name, MVCCFilter_value)
+	proto.RegisterEnum("cockroach.ccl.backupccl.EncryptionInfo_Scheme", EncryptionInfo_Scheme_name, EncryptionInfo_Scheme_value)
+}
+func (this *EncryptionInfo) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	that1, ok := that.(*EncryptionInfo)
+	if !ok {
+		that2, ok := that.(EncryptionInfo)
+		if ok {
+			that1 = &that2
+		} else {
+			return false
+		}
+	}
+	if that1 == nil {
+		return this == nil
+	} else if this == nil {
+		return false
+	}
+	if this.Scheme != that1.Scheme {
+		return false
+	}
+	if !bytes.Equal(this.Salt, that1.Salt) {
+		return false
+	}
+	return true
+}
+func (m *RowCount) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalTo(dAtA)
@@ -254,7 +380,40 @@ func (m *BackupDescriptor) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *BackupDescriptor) MarshalTo(dAtA []byte) (int, error) {
+func (m *RowCount) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.DataSize != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintBackup(dAtA, i, uint64(m.DataSize))
+	}
+	if m.Rows != 0 {
+		dAtA[i] = 0x10
+		i++
+		i = encodeVarintBackup(dAtA, i, uint64(m.Rows))
+	}
+	if m.IndexEntries != 0 {
+		dAtA[i] = 0x18
+		i++
+		i = encodeVarintBackup(dAtA, i, uint64(m.IndexEntries))
+	}
+	return i, nil
+}
+
+func (m *BackupManifest) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *BackupManifest) MarshalTo(dAtA []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
@@ -469,10 +628,17 @@ func (m *BackupDescriptor) MarshalTo(dAtA []byte) (int, error) {
 			i += n
 		}
 	}
+	if m.DescriptorCoverage != 0 {
+		dAtA[i] = 0xb0
+		i++
+		dAtA[i] = 0x1
+		i++
+		i = encodeVarintBackup(dAtA, i, uint64(m.DescriptorCoverage))
+	}
 	return i, nil
 }
 
-func (m *BackupDescriptor_File) Marshal() (dAtA []byte, err error) {
+func (m *BackupManifest_File) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalTo(dAtA)
@@ -482,7 +648,7 @@ func (m *BackupDescriptor_File) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *BackupDescriptor_File) MarshalTo(dAtA []byte) (int, error) {
+func (m *BackupManifest_File) MarshalTo(dAtA []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
@@ -540,7 +706,7 @@ func (m *BackupDescriptor_File) MarshalTo(dAtA []byte) (int, error) {
 	return i, nil
 }
 
-func (m *BackupDescriptor_DescriptorRevision) Marshal() (dAtA []byte, err error) {
+func (m *BackupManifest_DescriptorRevision) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalTo(dAtA)
@@ -550,7 +716,7 @@ func (m *BackupDescriptor_DescriptorRevision) Marshal() (dAtA []byte, err error)
 	return dAtA[:n], nil
 }
 
-func (m *BackupDescriptor_DescriptorRevision) MarshalTo(dAtA []byte) (int, error) {
+func (m *BackupManifest_DescriptorRevision) MarshalTo(dAtA []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
@@ -625,6 +791,35 @@ func (m *BackupPartitionDescriptor) MarshalTo(dAtA []byte) (int, error) {
 	return i, nil
 }
 
+func (m *EncryptionInfo) Marshal() (dAtA []byte, err error) {
+	size := m.Size()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalTo(dAtA)
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *EncryptionInfo) MarshalTo(dAtA []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	if m.Scheme != 0 {
+		dAtA[i] = 0x8
+		i++
+		i = encodeVarintBackup(dAtA, i, uint64(m.Scheme))
+	}
+	if len(m.Salt) > 0 {
+		dAtA[i] = 0x12
+		i++
+		i = encodeVarintBackup(dAtA, i, uint64(len(m.Salt)))
+		i += copy(dAtA[i:], m.Salt)
+	}
+	return i, nil
+}
+
 func encodeVarintBackup(dAtA []byte, offset int, v uint64) int {
 	for v >= 1<<7 {
 		dAtA[offset] = uint8(v&0x7f | 0x80)
@@ -634,7 +829,25 @@ func encodeVarintBackup(dAtA []byte, offset int, v uint64) int {
 	dAtA[offset] = uint8(v)
 	return offset + 1
 }
-func (m *BackupDescriptor) Size() (n int) {
+func (m *RowCount) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.DataSize != 0 {
+		n += 1 + sovBackup(uint64(m.DataSize))
+	}
+	if m.Rows != 0 {
+		n += 1 + sovBackup(uint64(m.Rows))
+	}
+	if m.IndexEntries != 0 {
+		n += 1 + sovBackup(uint64(m.IndexEntries))
+	}
+	return n
+}
+
+func (m *BackupManifest) Size() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -720,10 +933,13 @@ func (m *BackupDescriptor) Size() (n int) {
 			n += 2 + l + sovBackup(uint64(l))
 		}
 	}
+	if m.DescriptorCoverage != 0 {
+		n += 2 + sovBackup(uint64(m.DescriptorCoverage))
+	}
 	return n
 }
 
-func (m *BackupDescriptor_File) Size() (n int) {
+func (m *BackupManifest_File) Size() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -752,7 +968,7 @@ func (m *BackupDescriptor_File) Size() (n int) {
 	return n
 }
 
-func (m *BackupDescriptor_DescriptorRevision) Size() (n int) {
+func (m *BackupManifest_DescriptorRevision) Size() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -791,6 +1007,22 @@ func (m *BackupPartitionDescriptor) Size() (n int) {
 	return n
 }
 
+func (m *EncryptionInfo) Size() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Scheme != 0 {
+		n += 1 + sovBackup(uint64(m.Scheme))
+	}
+	l = len(m.Salt)
+	if l > 0 {
+		n += 1 + l + sovBackup(uint64(l))
+	}
+	return n
+}
+
 func sovBackup(x uint64) (n int) {
 	for {
 		n++
@@ -804,7 +1036,7 @@ func sovBackup(x uint64) (n int) {
 func sozBackup(x uint64) (n int) {
 	return sovBackup(uint64((x << 1) ^ uint64((int64(x) >> 63))))
 }
-func (m *BackupDescriptor) Unmarshal(dAtA []byte) error {
+func (m *RowCount) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -827,10 +1059,117 @@ func (m *BackupDescriptor) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: BackupDescriptor: wiretype end group for non-group")
+			return fmt.Errorf("proto: RowCount: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: BackupDescriptor: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: RowCount: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DataSize", wireType)
+			}
+			m.DataSize = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowBackup
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.DataSize |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Rows", wireType)
+			}
+			m.Rows = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowBackup
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Rows |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field IndexEntries", wireType)
+			}
+			m.IndexEntries = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowBackup
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.IndexEntries |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipBackup(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthBackup
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *BackupManifest) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowBackup
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: BackupManifest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: BackupManifest: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -950,7 +1289,7 @@ func (m *BackupDescriptor) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Files = append(m.Files, BackupDescriptor_File{})
+			m.Files = append(m.Files, BackupManifest_File{})
 			if err := m.Files[len(m.Files)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -1293,7 +1632,7 @@ func (m *BackupDescriptor) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.DescriptorChanges = append(m.DescriptorChanges, BackupDescriptor_DescriptorRevision{})
+			m.DescriptorChanges = append(m.DescriptorChanges, BackupManifest_DescriptorRevision{})
 			if err := m.DescriptorChanges[len(m.DescriptorChanges)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -1447,6 +1786,25 @@ func (m *BackupDescriptor) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 22:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DescriptorCoverage", wireType)
+			}
+			m.DescriptorCoverage = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowBackup
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.DescriptorCoverage |= (github_com_cockroachdb_cockroach_pkg_sql_sem_tree.DescriptorCoverage(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipBackup(dAtA[iNdEx:])
@@ -1468,7 +1826,7 @@ func (m *BackupDescriptor) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *BackupDescriptor_File) Unmarshal(dAtA []byte) error {
+func (m *BackupManifest_File) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1727,7 +2085,7 @@ func (m *BackupDescriptor_File) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *BackupDescriptor_DescriptorRevision) Unmarshal(dAtA []byte) error {
+func (m *BackupManifest_DescriptorRevision) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1943,7 +2301,7 @@ func (m *BackupPartitionDescriptor) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Files = append(m.Files, BackupDescriptor_File{})
+			m.Files = append(m.Files, BackupManifest_File{})
 			if err := m.Files[len(m.Files)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -1976,6 +2334,106 @@ func (m *BackupPartitionDescriptor) Unmarshal(dAtA []byte) error {
 			}
 			if err := m.BackupID.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipBackup(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthBackup
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *EncryptionInfo) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowBackup
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: EncryptionInfo: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: EncryptionInfo: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Scheme", wireType)
+			}
+			m.Scheme = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowBackup
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Scheme |= (EncryptionInfo_Scheme(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Salt", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowBackup
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthBackup
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Salt = append(m.Salt[:0], dAtA[iNdEx:postIndex]...)
+			if m.Salt == nil {
+				m.Salt = []byte{}
 			}
 			iNdEx = postIndex
 		default:
@@ -2104,75 +2562,86 @@ var (
 	ErrIntOverflowBackup   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("ccl/backupccl/backup.proto", fileDescriptor_backup_5e86acf06cc31994) }
+func init() { proto.RegisterFile("ccl/backupccl/backup.proto", fileDescriptor_backup_c91f9318627fab4a) }
 
-var fileDescriptor_backup_5e86acf06cc31994 = []byte{
-	// 1072 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xa4, 0x56, 0xcb, 0x6e, 0xdb, 0x46,
-	0x17, 0x16, 0x25, 0x5a, 0x97, 0x23, 0x5f, 0xe4, 0x49, 0xf2, 0x87, 0xbf, 0x90, 0x4a, 0x8a, 0x8b,
-	0x02, 0x42, 0x0b, 0x90, 0x88, 0x8d, 0x20, 0x40, 0x50, 0x14, 0xb0, 0xac, 0x3a, 0xa1, 0x93, 0xb6,
-	0x29, 0xe5, 0x78, 0xe1, 0x0d, 0x31, 0x22, 0xc7, 0xd2, 0xc0, 0x14, 0x49, 0x73, 0x86, 0x46, 0xfd,
-	0x16, 0x7d, 0x9a, 0x3e, 0x83, 0x37, 0x05, 0xb2, 0x0c, 0xba, 0x10, 0x5a, 0xf9, 0x09, 0xba, 0xed,
-	0xa2, 0x28, 0x66, 0x48, 0x8a, 0xaa, 0x9d, 0xc0, 0x6a, 0xbc, 0x3b, 0x3a, 0xfc, 0xbe, 0x6f, 0x66,
-	0xce, 0x55, 0xd0, 0x74, 0x1c, 0xcf, 0x18, 0x62, 0xe7, 0x34, 0x0e, 0x73, 0x4b, 0x0f, 0xa3, 0x80,
-	0x07, 0xe8, 0xa1, 0x13, 0x38, 0xa7, 0x51, 0x80, 0x9d, 0xb1, 0xee, 0x38, 0x9e, 0x3e, 0x47, 0x35,
-	0x1b, 0xc3, 0x98, 0x7a, 0xae, 0x41, 0xfd, 0x93, 0x20, 0x81, 0x36, 0x37, 0x25, 0x2c, 0x1c, 0x1a,
-	0x38, 0xa4, 0xa9, 0x0b, 0x65, 0x2e, 0x17, 0x73, 0x9c, 0xfa, 0xda, 0xec, 0xcc, 0x33, 0x18, 0xc7,
-	0x9c, 0x19, 0x1c, 0x0f, 0x3d, 0x62, 0x0b, 0x9b, 0x32, 0x4e, 0x9d, 0x14, 0xf0, 0x48, 0x02, 0xce,
-	0xbc, 0x21, 0x66, 0xc4, 0x60, 0x3c, 0x8a, 0x1d, 0x1e, 0x47, 0xc4, 0x4d, 0xbf, 0x6a, 0x31, 0xa7,
-	0x9e, 0x31, 0xf6, 0x1c, 0x83, 0xd3, 0x09, 0x61, 0x1c, 0x4f, 0xd2, 0xab, 0x36, 0xef, 0x8f, 0x82,
-	0x51, 0x20, 0x4d, 0x43, 0x58, 0x89, 0x77, 0xeb, 0x97, 0x06, 0x34, 0x7a, 0xf2, 0xd6, 0x7d, 0xc2,
-	0x9c, 0x88, 0x86, 0x3c, 0x88, 0x50, 0x0f, 0x80, 0x71, 0x1c, 0x71, 0x5b, 0x68, 0x68, 0x4a, 0x47,
-	0xe9, 0xd6, 0xb7, 0x3f, 0xd3, 0xf3, 0xa7, 0x8a, 0x33, 0xf4, 0xb1, 0xe7, 0xe8, 0x87, 0xd9, 0x19,
-	0x3d, 0xf5, 0x72, 0xda, 0x2e, 0x58, 0x35, 0x49, 0x13, 0x5e, 0xf4, 0x0d, 0x54, 0x89, 0xef, 0x26,
-	0x0a, 0xc5, 0xe5, 0x15, 0x2a, 0xc4, 0x77, 0x25, 0x7f, 0x07, 0x56, 0x58, 0x88, 0x7d, 0xa6, 0x95,
-	0x3a, 0xa5, 0x6e, 0x7d, 0xfb, 0xe1, 0x02, 0x39, 0x8d, 0x9a, 0x3e, 0x08, 0xb1, 0x9f, 0xd2, 0x12,
-	0x2c, 0x3a, 0x80, 0x95, 0x13, 0xea, 0x11, 0xa6, 0xa9, 0x92, 0xa4, 0xeb, 0x1f, 0x49, 0x8f, 0x7e,
-	0xfd, 0xc9, 0xfa, 0x3e, 0xf5, 0x48, 0xa6, 0x25, 0x25, 0x90, 0x09, 0x75, 0x77, 0xfe, 0x9d, 0x69,
-	0x2b, 0x52, 0xf1, 0xf1, 0x82, 0x22, 0x3b, 0xf3, 0xf4, 0x34, 0x0f, 0x7a, 0xae, 0x94, 0x8a, 0x2c,
-	0x72, 0xd1, 0x73, 0x28, 0xb9, 0x34, 0xd2, 0x2a, 0x32, 0x0c, 0x5b, 0x1f, 0x78, 0xc9, 0xb7, 0x3f,
-	0x71, 0x12, 0xf9, 0xd8, 0x1b, 0xf0, 0x20, 0xc2, 0xa3, 0xec, 0x22, 0x82, 0x84, 0xbe, 0x80, 0xf5,
-	0x93, 0x20, 0x9a, 0x60, 0x6e, 0x9f, 0x93, 0x88, 0xd1, 0xc0, 0xd7, 0xaa, 0x1d, 0xa5, 0xbb, 0x66,
-	0xad, 0x25, 0xde, 0xa3, 0xc4, 0x89, 0x46, 0x00, 0x8e, 0x17, 0x33, 0x4e, 0x22, 0x9b, 0xba, 0x5a,
-	0xad, 0xa3, 0x74, 0x57, 0x7b, 0x2f, 0x85, 0xca, 0x6f, 0xd3, 0xf6, 0xce, 0x88, 0xf2, 0x71, 0x3c,
-	0xd4, 0x9d, 0x60, 0x62, 0xcc, 0xcf, 0x76, 0x87, 0xb9, 0x6d, 0x84, 0xa7, 0x23, 0x43, 0x16, 0x4e,
-	0x1c, 0x53, 0x57, 0x7f, 0xfb, 0xd6, 0xec, 0xcf, 0xa6, 0xed, 0xda, 0x5e, 0x22, 0x68, 0xf6, 0xad,
-	0x5a, 0xaa, 0x6d, 0xba, 0xe8, 0x18, 0x2a, 0x7e, 0xe0, 0x12, 0x71, 0x0a, 0x74, 0x94, 0xee, 0x4a,
-	0x6f, 0x77, 0x36, 0x6d, 0x97, 0xbf, 0x0f, 0x5c, 0x62, 0xf6, 0xff, 0x5a, 0xf6, 0xac, 0xec, 0xdd,
-	0x09, 0xcd, 0x2a, 0x0b, 0x45, 0xd3, 0x45, 0xcf, 0x01, 0x64, 0xdb, 0xd8, 0xa2, 0x6d, 0xb4, 0xba,
-	0x0c, 0xd7, 0x83, 0x85, 0x70, 0xc9, 0x8f, 0xba, 0xe9, 0x9f, 0x04, 0x59, 0xbd, 0x49, 0x8f, 0x70,
-	0x20, 0x13, 0x56, 0x89, 0xcf, 0xa3, 0x0b, 0xdb, 0x09, 0x62, 0x9f, 0x33, 0x6d, 0x55, 0xb2, 0x3b,
-	0x1f, 0x08, 0x76, 0x2f, 0xf6, 0x4e, 0x7f, 0x08, 0x07, 0xf1, 0x64, 0x82, 0xa3, 0x8b, 0x2c, 0x5d,
-	0x92, 0xbb, 0x27, 0xa9, 0xe8, 0x10, 0xea, 0x93, 0x73, 0xc7, 0xb1, 0x4f, 0xa8, 0xc7, 0x49, 0xa4,
-	0xad, 0x75, 0x94, 0xee, 0xfa, 0xf6, 0xe7, 0x1f, 0xad, 0xa5, 0xef, 0x8e, 0xf6, 0xf6, 0xf6, 0x25,
-	0xb4, 0xb7, 0x3e, 0x9b, 0xb6, 0x21, 0xff, 0x6d, 0x81, 0xd0, 0x49, 0x6c, 0x74, 0x0c, 0xab, 0x4e,
-	0x30, 0x09, 0x3d, 0xc2, 0x89, 0xed, 0x0e, 0x99, 0xb6, 0xde, 0x29, 0x75, 0xd7, 0x7a, 0xcf, 0x96,
-	0x8e, 0xd9, 0x42, 0xdb, 0xeb, 0x66, 0xdf, 0xaa, 0x67, 0x62, 0xfd, 0x21, 0x43, 0x2f, 0xa1, 0x41,
-	0x7d, 0x1e, 0x05, 0x6e, 0xec, 0x10, 0xd7, 0x4e, 0xfa, 0x66, 0x63, 0x99, 0xbe, 0xd9, 0xc8, 0x69,
-	0x03, 0xd9, 0x41, 0x67, 0x80, 0xf2, 0xca, 0xb5, 0x9d, 0x31, 0xf6, 0x47, 0x84, 0x69, 0x0d, 0xa9,
-	0xf5, 0xf5, 0xf2, 0xed, 0x94, 0x9b, 0x16, 0x39, 0xa7, 0xa2, 0x42, 0xd3, 0x03, 0x37, 0x73, 0xf5,
-	0xbd, 0x44, 0x1c, 0x0d, 0xe0, 0x5e, 0x94, 0x82, 0xec, 0x85, 0xb1, 0xb3, 0xb9, 0xfc, 0xd0, 0xd8,
-	0xcc, 0xf8, 0x83, 0xf9, 0xf8, 0xf9, 0x11, 0x8a, 0xd4, 0xd5, 0x90, 0xec, 0x83, 0xdd, 0xbb, 0xf5,
-	0x41, 0xd1, 0xec, 0x5b, 0x45, 0xea, 0xa2, 0x3e, 0xb4, 0x42, 0x1c, 0x71, 0xca, 0xc5, 0x45, 0x17,
-	0x82, 0x24, 0xc6, 0x85, 0x8f, 0x27, 0x84, 0x69, 0xf7, 0x3a, 0xa5, 0x6e, 0xcd, 0x7a, 0x34, 0x47,
-	0xe5, 0x51, 0xd8, 0xcf, 0x30, 0x68, 0x1b, 0x56, 0xbd, 0xc0, 0xc1, 0x1e, 0xe5, 0x17, 0xf6, 0xe9,
-	0x39, 0xd3, 0xee, 0x0b, 0x4e, 0x6f, 0x63, 0x36, 0x6d, 0xd7, 0x5f, 0xa7, 0xfe, 0x57, 0x47, 0xcc,
-	0xaa, 0x67, 0xa0, 0x57, 0xe7, 0x22, 0xbd, 0x30, 0xdf, 0x02, 0x4c, 0x7b, 0x20, 0x93, 0xd1, 0xbd,
-	0x3e, 0x89, 0xc4, 0xca, 0xd0, 0x0f, 0xc5, 0xca, 0x18, 0x64, 0xd8, 0x37, 0x62, 0xc4, 0x5b, 0x0b,
-	0xdc, 0xe6, 0x9f, 0x45, 0x50, 0xc5, 0x5d, 0xd0, 0x13, 0x50, 0x45, 0x99, 0xa4, 0xc3, 0xfd, 0x96,
-	0x2a, 0x91, 0x50, 0x84, 0x40, 0x0d, 0x31, 0x1f, 0xcb, 0x69, 0x5e, 0xb3, 0xa4, 0x8d, 0xfe, 0x07,
-	0x65, 0x36, 0xc6, 0x4f, 0x9f, 0x6c, 0x6b, 0xaa, 0x08, 0xb5, 0x95, 0xfe, 0xba, 0xd1, 0x8d, 0xe5,
-	0x4f, 0xef, 0xc6, 0x7f, 0x2f, 0xa3, 0xca, 0x9d, 0x97, 0x51, 0xf5, 0x13, 0x96, 0x91, 0x01, 0xf5,
-	0x85, 0xa4, 0xc9, 0xf1, 0x5a, 0x4b, 0x9a, 0x3d, 0xcf, 0x99, 0x05, 0x79, 0xca, 0x0e, 0xd4, 0x6a,
-	0xa9, 0xa1, 0x1e, 0xa8, 0xd5, 0x95, 0x46, 0xb9, 0xf9, 0xab, 0x02, 0xe8, 0x66, 0x3f, 0xa0, 0x67,
-	0xa0, 0xfe, 0xd7, 0xf5, 0x2a, 0x09, 0xe8, 0x05, 0x14, 0xcd, 0xbe, 0xcc, 0xc2, 0x1d, 0xc6, 0x47,
-	0xd1, 0xec, 0xa3, 0xa7, 0xa0, 0x8a, 0x32, 0xd6, 0x4a, 0xf2, 0x06, 0xb7, 0xaf, 0x36, 0x4b, 0xc2,
-	0x0f, 0xd4, 0x6a, 0xb9, 0x51, 0xd9, 0xfa, 0x5b, 0x81, 0xff, 0x27, 0x6d, 0xff, 0xe6, 0x66, 0xb9,
-	0x5f, 0x0f, 0x98, 0x72, 0x5b, 0xc0, 0xf2, 0xcd, 0x5d, 0xbc, 0xfb, 0xe6, 0x76, 0xa1, 0x96, 0xe0,
-	0xc5, 0x92, 0x2a, 0xc9, 0x11, 0xf0, 0xe2, 0x6e, 0x23, 0xa0, 0x9a, 0x9c, 0x6a, 0xf6, 0xad, 0x6a,
-	0xa2, 0x6c, 0xba, 0x5f, 0x3e, 0x86, 0x85, 0x49, 0x8f, 0x00, 0xca, 0xaf, 0x31, 0x27, 0x8c, 0x37,
-	0x0a, 0xa8, 0x02, 0xa5, 0x5d, 0xcf, 0x6b, 0x28, 0xbd, 0xaf, 0x2e, 0xff, 0x68, 0x15, 0x2e, 0x67,
-	0x2d, 0xe5, 0xdd, 0xac, 0xa5, 0xbc, 0x9f, 0xb5, 0x94, 0xdf, 0x67, 0x2d, 0xe5, 0xe7, 0xab, 0x56,
-	0xe1, 0xdd, 0x55, 0xab, 0xf0, 0xfe, 0xaa, 0x55, 0x38, 0xae, 0xcd, 0x1f, 0x36, 0x2c, 0xcb, 0x3f,
-	0x64, 0x3b, 0xff, 0x04, 0x00, 0x00, 0xff, 0xff, 0x7b, 0xd4, 0x5c, 0xa0, 0x6f, 0x0a, 0x00, 0x00,
+var fileDescriptor_backup_c91f9318627fab4a = []byte{
+	// 1239 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xa4, 0x56, 0x4d, 0x8f, 0xda, 0x46,
+	0x18, 0xc6, 0xe0, 0x65, 0xe1, 0x85, 0x25, 0xec, 0xe4, 0xcb, 0xdd, 0xa6, 0x40, 0x36, 0xaa, 0x84,
+	0xda, 0xca, 0x56, 0x88, 0xd2, 0x48, 0x7b, 0xa8, 0xb4, 0xc0, 0x6e, 0xe2, 0x4d, 0x52, 0xa5, 0x26,
+	0xc9, 0x21, 0x17, 0xcb, 0x8c, 0x07, 0x18, 0xad, 0xb1, 0x89, 0x67, 0xd8, 0x64, 0xf3, 0x17, 0x7a,
+	0xe9, 0x4f, 0xe8, 0x1f, 0xe8, 0xff, 0xc8, 0xa5, 0x52, 0x8e, 0x51, 0x0f, 0xa8, 0x25, 0x97, 0x9e,
+	0x7b, 0x8c, 0x7a, 0xa8, 0x66, 0x6c, 0x83, 0x93, 0xed, 0x2a, 0xb4, 0xdc, 0x5e, 0x5e, 0x9e, 0xe7,
+	0x99, 0x99, 0xf7, 0xd3, 0xb0, 0x83, 0xb1, 0x67, 0xf4, 0x1d, 0x7c, 0x3c, 0x9d, 0x2c, 0x2d, 0x7d,
+	0x12, 0x06, 0x3c, 0x40, 0x57, 0x71, 0x80, 0x8f, 0xc3, 0xc0, 0xc1, 0x23, 0x1d, 0x63, 0x4f, 0x5f,
+	0xa0, 0x76, 0xaa, 0xfd, 0x29, 0xf5, 0x5c, 0x83, 0xfa, 0x83, 0x20, 0x82, 0xee, 0x6c, 0x4b, 0xd8,
+	0xa4, 0x6f, 0x38, 0x13, 0x1a, 0xbb, 0x50, 0xe2, 0x72, 0x1d, 0xee, 0xc4, 0xbe, 0x3a, 0x7b, 0xee,
+	0x19, 0x8c, 0x3b, 0x9c, 0x19, 0xdc, 0xe9, 0x7b, 0xc4, 0x16, 0x36, 0x65, 0x9c, 0xe2, 0x18, 0x70,
+	0x4d, 0x02, 0x9e, 0x7b, 0x7d, 0x87, 0x11, 0x83, 0xf1, 0x70, 0x8a, 0xf9, 0x34, 0x24, 0x6e, 0xfc,
+	0xaf, 0x36, 0xe5, 0xd4, 0x33, 0x46, 0x1e, 0x36, 0x38, 0x1d, 0x13, 0xc6, 0x9d, 0x71, 0x7c, 0xd5,
+	0x9d, 0x4b, 0xc3, 0x60, 0x18, 0x48, 0xd3, 0x10, 0x56, 0xe4, 0xdd, 0x1d, 0x40, 0xc1, 0x0a, 0x5e,
+	0x74, 0x82, 0xa9, 0xcf, 0xd1, 0xe7, 0x50, 0x14, 0x17, 0xb1, 0x19, 0x7d, 0x45, 0x34, 0xa5, 0xa1,
+	0x34, 0x73, 0x56, 0x41, 0x38, 0x7a, 0xf4, 0x15, 0x41, 0x08, 0xd4, 0x30, 0x78, 0xc1, 0xb4, 0xac,
+	0xf4, 0x4b, 0x1b, 0xdd, 0x80, 0x2d, 0xea, 0xbb, 0xe4, 0xa5, 0x4d, 0x7c, 0x1e, 0x52, 0xc2, 0xb4,
+	0x9c, 0xfc, 0xb3, 0x2c, 0x9d, 0x07, 0x91, 0xef, 0x48, 0x2d, 0xa8, 0xd5, 0x8d, 0xdd, 0x5f, 0xb6,
+	0xa1, 0xd2, 0x96, 0xd1, 0x79, 0xe8, 0xf8, 0x74, 0x40, 0x18, 0x47, 0x6d, 0x00, 0xc6, 0x9d, 0x90,
+	0xdb, 0xe2, 0xa6, 0xf2, 0xbc, 0x52, 0xeb, 0x0b, 0x7d, 0x19, 0x50, 0xf1, 0x12, 0x7d, 0xe4, 0x61,
+	0xfd, 0x71, 0xf2, 0x92, 0xb6, 0xfa, 0x7a, 0x56, 0xcf, 0x58, 0x45, 0x49, 0x13, 0x5e, 0xf4, 0x1d,
+	0x14, 0x88, 0xef, 0x46, 0x0a, 0xd9, 0xd5, 0x15, 0x36, 0x89, 0xef, 0x4a, 0xfe, 0x2d, 0xd8, 0x60,
+	0x13, 0xc7, 0x17, 0x37, 0xcf, 0x35, 0x4b, 0xad, 0xab, 0x29, 0x72, 0x9c, 0x1b, 0xbd, 0x37, 0x71,
+	0xfc, 0x98, 0x16, 0x61, 0xd1, 0x3d, 0xd8, 0x18, 0x50, 0x8f, 0x30, 0x4d, 0x95, 0xa4, 0x6f, 0xf4,
+	0x73, 0x8a, 0x40, 0xff, 0xf0, 0xc1, 0xfa, 0x21, 0xf5, 0x48, 0xa2, 0x24, 0x05, 0x90, 0x09, 0x25,
+	0x97, 0x30, 0x1c, 0xd2, 0x09, 0x0f, 0x42, 0xa6, 0x6d, 0x48, 0xbd, 0xeb, 0x29, 0x3d, 0xf6, 0xdc,
+	0xd3, 0xe3, 0x5c, 0xeb, 0xdd, 0x05, 0x32, 0x16, 0x49, 0x73, 0xd1, 0x1e, 0xe4, 0x5c, 0x1a, 0x6a,
+	0x9b, 0x32, 0x08, 0xbb, 0xff, 0xf2, 0x8e, 0x83, 0x97, 0x9c, 0x84, 0xbe, 0xe3, 0xf5, 0x78, 0x10,
+	0x3a, 0xc3, 0xe4, 0x22, 0x82, 0x84, 0xbe, 0x84, 0xca, 0x20, 0x08, 0xc7, 0x0e, 0xb7, 0x4f, 0x48,
+	0xc8, 0x68, 0xe0, 0x6b, 0x85, 0x86, 0xd2, 0xdc, 0xb2, 0xb6, 0x22, 0xef, 0xd3, 0xc8, 0x89, 0x86,
+	0x00, 0xd8, 0x9b, 0x32, 0x4e, 0x42, 0x9b, 0xba, 0x5a, 0xb1, 0xa1, 0x34, 0xcb, 0xed, 0x7b, 0x42,
+	0xe5, 0xb7, 0x59, 0xfd, 0xd6, 0x90, 0xf2, 0xd1, 0xb4, 0xaf, 0xe3, 0x60, 0x6c, 0x2c, 0xce, 0x76,
+	0xfb, 0x4b, 0xdb, 0x98, 0x1c, 0x0f, 0x0d, 0x59, 0x9c, 0xd3, 0x29, 0x75, 0xf5, 0x27, 0x4f, 0xcc,
+	0xee, 0x7c, 0x56, 0x2f, 0x76, 0x22, 0x41, 0xb3, 0x6b, 0x15, 0x63, 0x6d, 0xd3, 0x45, 0xcf, 0x60,
+	0xd3, 0x0f, 0x5c, 0x22, 0x4e, 0x81, 0x86, 0xd2, 0xdc, 0x68, 0xef, 0xcf, 0x67, 0xf5, 0xfc, 0xf7,
+	0x81, 0x4b, 0xcc, 0xee, 0xfb, 0x55, 0xcf, 0x4a, 0xde, 0x1d, 0xd1, 0xac, 0xbc, 0x50, 0x34, 0x5d,
+	0xb4, 0x07, 0x20, 0x5b, 0xd3, 0x16, 0xad, 0xa9, 0x95, 0x64, 0xb8, 0x2e, 0xa7, 0xc2, 0x25, 0xff,
+	0xd4, 0x4d, 0x7f, 0x10, 0x24, 0xd5, 0x26, 0x3d, 0xc2, 0x81, 0x8e, 0xa0, 0x2c, 0x2a, 0xfd, 0xd4,
+	0xc6, 0xa2, 0x5f, 0x98, 0x56, 0x96, 0xec, 0xeb, 0xe7, 0xe6, 0x3f, 0xe9, 0xac, 0x24, 0x5f, 0x92,
+	0x2c, 0x3d, 0x0c, 0x3d, 0x86, 0xd2, 0xf8, 0x04, 0x63, 0x7b, 0x40, 0x3d, 0x4e, 0x42, 0x6d, 0xab,
+	0xa1, 0x34, 0x2b, 0xad, 0x1b, 0xe7, 0x4a, 0x3d, 0x7c, 0xda, 0xe9, 0x1c, 0x4a, 0x68, 0xbb, 0x32,
+	0x9f, 0xd5, 0x61, 0xf9, 0xdb, 0x02, 0xa1, 0x13, 0xd9, 0xe8, 0x19, 0x94, 0x71, 0x30, 0x9e, 0x78,
+	0x84, 0x13, 0xdb, 0xed, 0x33, 0xad, 0xd2, 0xc8, 0x35, 0xb7, 0xda, 0x77, 0x56, 0x0e, 0x5a, 0x6a,
+	0xb6, 0xe8, 0x66, 0xd7, 0x2a, 0x25, 0x62, 0xdd, 0xbe, 0x28, 0xfb, 0x2a, 0xf5, 0x79, 0x18, 0xb8,
+	0x53, 0x4c, 0x5c, 0x3b, 0x6a, 0x9b, 0x0b, 0xab, 0xb4, 0xcd, 0x85, 0x25, 0xad, 0x27, 0x1b, 0x28,
+	0x00, 0xb4, 0x2c, 0x5d, 0x1b, 0x8f, 0x1c, 0x7f, 0x48, 0x98, 0x56, 0x95, 0x5a, 0x7b, 0xab, 0x76,
+	0xd3, 0xb2, 0x1d, 0x2c, 0x72, 0x42, 0x45, 0x81, 0xc6, 0xc7, 0x6d, 0x2f, 0xb5, 0x3b, 0x91, 0x34,
+	0xea, 0xc1, 0xc5, 0x30, 0x06, 0xd9, 0xa9, 0x99, 0xb3, 0xbd, 0xfa, 0xc4, 0xd8, 0x4e, 0xf8, 0xbd,
+	0xc5, 0xec, 0xf9, 0x01, 0xb2, 0xd4, 0xd5, 0x90, 0x6c, 0x83, 0xfd, 0xf5, 0xda, 0x20, 0x6b, 0x76,
+	0xad, 0x2c, 0x75, 0x51, 0x17, 0x6a, 0x13, 0x27, 0xe4, 0x94, 0x8b, 0x8b, 0xa6, 0x42, 0x24, 0xa6,
+	0x85, 0xef, 0x8c, 0x09, 0xd3, 0x2e, 0x36, 0x72, 0xcd, 0xa2, 0x75, 0x6d, 0x81, 0x5a, 0x46, 0xe1,
+	0x30, 0xc1, 0xa0, 0x16, 0x94, 0xbd, 0x00, 0x3b, 0x1e, 0xe5, 0xa7, 0xf6, 0xf1, 0x09, 0xd3, 0x2e,
+	0x09, 0x4e, 0xfb, 0xc2, 0x7c, 0x56, 0x2f, 0x3d, 0x88, 0xfd, 0xf7, 0x9f, 0x32, 0xab, 0x94, 0x80,
+	0xee, 0x9f, 0x88, 0xe4, 0xc2, 0x62, 0xd1, 0x30, 0xed, 0xb2, 0x4c, 0x45, 0xf3, 0xe3, 0x41, 0x24,
+	0xb6, 0x92, 0xfe, 0x58, 0x6c, 0xa5, 0x5e, 0x82, 0x7d, 0x24, 0xb6, 0x88, 0x95, 0xe2, 0xa2, 0x53,
+	0xb8, 0x98, 0x4e, 0x6e, 0x70, 0x42, 0xc4, 0xb8, 0xd1, 0xae, 0xc8, 0x46, 0xbe, 0xf7, 0x7e, 0x56,
+	0xef, 0xae, 0x5e, 0x89, 0x64, 0x6c, 0xf0, 0x90, 0xa4, 0x47, 0x5f, 0x27, 0xd6, 0xb3, 0x52, 0x15,
+	0x94, 0xf8, 0x76, 0xfe, 0xca, 0x82, 0x2a, 0xc2, 0x80, 0x6e, 0x82, 0x2a, 0xea, 0x33, 0x5e, 0x2a,
+	0x9f, 0x28, 0x4f, 0x09, 0x15, 0xfb, 0x6d, 0xe2, 0xf0, 0x91, 0xdc, 0x22, 0x45, 0x4b, 0xda, 0xe8,
+	0x0a, 0xe4, 0xd9, 0xc8, 0xb9, 0x7d, 0xb3, 0xa5, 0xa9, 0x22, 0xcb, 0x56, 0xfc, 0xeb, 0xcc, 0x1c,
+	0xc8, 0xaf, 0x31, 0x07, 0x3e, 0xdc, 0x82, 0x9b, 0x6b, 0x6f, 0xc1, 0xc2, 0xff, 0xd8, 0x82, 0x06,
+	0x94, 0x52, 0x05, 0x23, 0x27, 0x7b, 0x31, 0x1a, 0x33, 0xcb, 0x7a, 0xb1, 0x60, 0x59, 0x2e, 0x47,
+	0x6a, 0x21, 0x57, 0x55, 0x8f, 0xd4, 0xc2, 0x46, 0x35, 0xbf, 0xf3, 0xab, 0x02, 0xe8, 0x6c, 0x2f,
+	0xa2, 0x3b, 0xa0, 0xfe, 0xd7, 0xbd, 0x2e, 0x09, 0xe8, 0x2e, 0x64, 0xcd, 0xae, 0x4c, 0xc3, 0x1a,
+	0x83, 0x2b, 0x6b, 0x76, 0xd1, 0x6d, 0x50, 0x45, 0x8d, 0xc8, 0x8f, 0x92, 0x55, 0xb6, 0xaa, 0x25,
+	0xe1, 0x47, 0x6a, 0x21, 0x5f, 0xdd, 0xdc, 0xfd, 0x5b, 0x81, 0xcf, 0xa2, 0x81, 0xf3, 0xe8, 0x6c,
+	0xab, 0x7d, 0x1c, 0x30, 0xe5, 0x53, 0x01, 0x5b, 0x7e, 0x32, 0x64, 0xd7, 0xfd, 0x64, 0x70, 0xa1,
+	0x18, 0xa1, 0xc5, 0x76, 0xcc, 0xc9, 0xe1, 0x73, 0x77, 0xbd, 0xe1, 0x53, 0x88, 0xce, 0x34, 0xbb,
+	0x56, 0x21, 0x52, 0x36, 0xdd, 0xdd, 0x1f, 0x15, 0xa8, 0x1c, 0xf8, 0x38, 0x3c, 0x9d, 0x88, 0x97,
+	0xcb, 0xe5, 0x77, 0x08, 0x79, 0x86, 0x47, 0x24, 0x4e, 0x69, 0xa5, 0xa5, 0x9f, 0xfb, 0x86, 0x0f,
+	0x89, 0x7a, 0x4f, 0xb2, 0xac, 0x98, 0x2d, 0x1a, 0x8d, 0x39, 0x1e, 0x97, 0x19, 0x2e, 0x5b, 0xd2,
+	0xde, 0xbd, 0x0a, 0xf9, 0x08, 0x85, 0xb6, 0xa0, 0xb8, 0x7f, 0xd0, 0x6b, 0xdd, 0xfe, 0xf6, 0x6e,
+	0xe7, 0x61, 0x35, 0xb3, 0xa7, 0xfe, 0xf9, 0x73, 0x5d, 0xf9, 0xea, 0x3a, 0xa4, 0xf6, 0x1d, 0x02,
+	0xc8, 0x3f, 0x70, 0x38, 0x61, 0xbc, 0x9a, 0x41, 0x9b, 0x90, 0xdb, 0xf7, 0xbc, 0xaa, 0xd2, 0xfe,
+	0xfa, 0xf5, 0x1f, 0xb5, 0xcc, 0xeb, 0x79, 0x4d, 0x79, 0x33, 0xaf, 0x29, 0x6f, 0xe7, 0x35, 0xe5,
+	0xf7, 0x79, 0x4d, 0xf9, 0xe9, 0x5d, 0x2d, 0xf3, 0xe6, 0x5d, 0x2d, 0xf3, 0xf6, 0x5d, 0x2d, 0xf3,
+	0xac, 0xb8, 0xb8, 0x60, 0x3f, 0x2f, 0xbf, 0x7d, 0x6f, 0xfd, 0x13, 0x00, 0x00, 0xff, 0xff, 0x99,
+	0x05, 0x7b, 0x00, 0xda, 0x0b, 0x00, 0x00,
 }

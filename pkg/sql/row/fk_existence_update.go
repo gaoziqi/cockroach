@@ -13,7 +13,7 @@ package row
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
@@ -62,7 +62,8 @@ type fkExistenceCheckForUpdate struct {
 
 // makeFkExistenceCheckHelperForUpdate instantiates an update helper.
 func makeFkExistenceCheckHelperForUpdate(
-	txn *client.Txn,
+	ctx context.Context,
+	txn *kv.Txn,
 	table *sqlbase.ImmutableTableDescriptor,
 	otherTables FkTableMetadata,
 	updateCols []sqlbase.ColumnDescriptor,
@@ -75,13 +76,13 @@ func makeFkExistenceCheckHelperForUpdate(
 
 	// Instantiate a helper for the referencing tables.
 	var err error
-	if ret.inbound, err = makeFkExistenceCheckHelperForDelete(txn, table, otherTables, colMap,
+	if ret.inbound, err = makeFkExistenceCheckHelperForDelete(ctx, txn, table, otherTables, colMap,
 		alloc); err != nil {
 		return ret, err
 	}
 
 	// Instantiate a helper for the referenced table(s).
-	ret.outbound, err = makeFkExistenceCheckHelperForInsert(txn, table, otherTables, colMap, alloc)
+	ret.outbound, err = makeFkExistenceCheckHelperForInsert(ctx, txn, table, otherTables, colMap, alloc)
 	ret.outbound.checker = ret.inbound.checker
 
 	// We need *some* KV batch checker to perform the checks. It doesn't

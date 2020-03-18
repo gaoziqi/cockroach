@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -62,6 +63,7 @@ var typeBuiltinsHaveUnderscore = map[oid.Oid]struct{}{
 	types.AnyArray.Oid():    {},
 	types.Date.Oid():        {},
 	types.Time.Oid():        {},
+	types.TimeTZ.Oid():      {},
 	types.Decimal.Oid():     {},
 	types.Interval.Oid():    {},
 	types.Jsonb.Oid():       {},
@@ -403,7 +405,7 @@ func getNameForArg(ctx *tree.EvalContext, arg tree.Datum, pgTable, pgCol string)
 func getTableNameForArg(ctx *tree.EvalContext, arg tree.Datum) (*tree.TableName, error) {
 	switch t := arg.(type) {
 	case *tree.DString:
-		tn, err := ctx.Planner.ParseQualifiedTableName(ctx.Ctx(), string(*t))
+		tn, err := parser.ParseQualifiedTableName(string(*t))
 		if err != nil {
 			return nil, err
 		}
@@ -568,6 +570,23 @@ var pgBuiltins = map[string]builtinDefinition{
 				return tree.DNull, nil
 			},
 			Info: notUsableInfo,
+		},
+	),
+
+	// Here getdatabaseencoding just returns UTF8 because,
+	// CockroachDB supports just UTF8 for now.
+	"getdatabaseencoding": makeBuiltin(
+		tree.FunctionProperties{Category: categorySystemInfo},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				// We only support UTF-8 right now.
+				// If we allow more encodings, we must also change the virtual schema
+				// entry for pg_catalog.pg_database.
+				return datEncodingUTF8ShortName, nil
+			},
+			Info: "Returns the current encoding name used by the database.",
 		},
 	),
 
@@ -818,9 +837,17 @@ var pgBuiltins = map[string]builtinDefinition{
 					// below to pick up the table comment by accident.
 					return tree.DNull, nil
 				}
+				// Note: the following is equivalent to:
+				//
+				// SELECT description FROM pg_catalog.pg_description
+				//  WHERE objoid=$1 AND objsubid=$2 LIMIT 1
+				//
+				// TODO(jordanlewis): Really we'd like to query this directly
+				// on pg_description and let predicate push-down do its job.
 				r, err := ctx.InternalExecutor.QueryRow(
 					ctx.Ctx(), "pg_get_coldesc",
-					ctx.Txn, `
+					ctx.Txn,
+					`
 SELECT COALESCE(c.comment, pc.comment) FROM system.comments c
 FULL OUTER JOIN crdb_internal.predefined_comments pc
 ON pc.object_id=c.object_id AND pc.sub_id=c.sub_id AND pc.type = c.type

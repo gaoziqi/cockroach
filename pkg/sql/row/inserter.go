@@ -14,7 +14,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -40,11 +40,12 @@ type Inserter struct {
 //
 // insertCols must contain every column in the primary key.
 func MakeInserter(
-	txn *client.Txn,
+	ctx context.Context,
+	txn *kv.Txn,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
-	fkTables FkTableMetadata,
 	insertCols []sqlbase.ColumnDescriptor,
 	checkFKs checkFKConstraints,
+	fkTables FkTableMetadata,
 	alloc *sqlbase.DatumAlloc,
 ) (Inserter, error) {
 	ri := Inserter{
@@ -62,7 +63,7 @@ func MakeInserter(
 
 	if checkFKs == CheckFKs {
 		var err error
-		if ri.Fks, err = makeFkExistenceCheckHelperForInsert(txn, tableDesc, fkTables,
+		if ri.Fks, err = makeFkExistenceCheckHelperForInsert(ctx, txn, tableDesc, fkTables,
 			ri.InsertColIDtoRowIndex, alloc); err != nil {
 			return ri, err
 		}
@@ -157,7 +158,20 @@ func (ri *Inserter) InsertRow(
 		}
 	}
 
-	primaryIndexKey, secondaryIndexEntries, err := ri.Helper.encodeIndexes(ri.InsertColIDtoRowIndex, values)
+	// We don't want to insert any empty k/v's, so set includeEmpty to false.
+	// Consider the following case:
+	// TABLE t (
+	//   x INT PRIMARY KEY, y INT, z INT, w INT,
+	//   INDEX (y) STORING (z, w),
+	//   FAMILY (x), FAMILY (y), FAMILY (z), FAMILY (w)
+	//)
+	// If we are to insert row (1, 2, 3, NULL), the k/v pair for
+	// index i that encodes column w would have an empty value,
+	// because w is null, and the sole resident of that family.
+	// We don't want to insert empty k/v's like this, so we
+	// set includeEmpty to false.
+	primaryIndexKey, secondaryIndexEntries, err := ri.Helper.encodeIndexes(
+		ri.InsertColIDtoRowIndex, values, false /* includeEmpty */)
 	if err != nil {
 		return err
 	}

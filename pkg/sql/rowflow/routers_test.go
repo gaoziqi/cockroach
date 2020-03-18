@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -83,7 +83,7 @@ func TestRouters(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
-	diskMonitor := execinfra.MakeTestDiskMonitor(ctx, st)
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	// Generate tables of possible values for each column; we have fewer possible
@@ -296,7 +296,7 @@ func TestConsumerStatus(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
-	diskMonitor := execinfra.MakeTestDiskMonitor(ctx, st)
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	testCases := []struct {
@@ -452,7 +452,7 @@ func TestMetadataIsForwarded(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
-	diskMonitor := execinfra.MakeTestDiskMonitor(ctx, st)
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	testCases := []struct {
@@ -610,7 +610,7 @@ func TestRouterBlocks(t *testing.T) {
 			ctx := context.TODO()
 			evalCtx := tree.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(ctx)
-			diskMonitor := execinfra.MakeTestDiskMonitor(ctx, st)
+			diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 			defer diskMonitor.Stop(ctx)
 			flowCtx := execinfra.FlowCtx{
 				Cfg: &execinfra.ServerConfig{
@@ -708,9 +708,9 @@ func TestRouterDiskSpill(t *testing.T) {
 	ctx := opentracing.ContextWithSpan(context.Background(), sp)
 
 	st := cluster.MakeTestingClusterSettings()
-	diskMonitor := execinfra.MakeTestDiskMonitor(ctx, st)
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
-	tempEngine, err := engine.NewTempEngine(engine.TestStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, storage.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -913,7 +913,7 @@ func BenchmarkRouter(b *testing.B) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
-	diskMonitor := execinfra.MakeTestDiskMonitor(ctx, st)
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(numRows, numCols))

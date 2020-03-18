@@ -25,7 +25,7 @@ type DurationSetting struct {
 	validateFn   func(time.Duration) error
 }
 
-var _ Setting = &DurationSetting{}
+var _ extendedSetting = &DurationSetting{}
 
 // Get retrieves the duration value in the setting.
 func (d *DurationSetting) Get(sv *Values) time.Duration {
@@ -95,6 +95,42 @@ func (d *DurationSetting) setToDefault(sv *Values) {
 // RegisterDurationSetting defines a new setting with type duration.
 func RegisterDurationSetting(key, desc string, defaultValue time.Duration) *DurationSetting {
 	return RegisterValidatedDurationSetting(key, desc, defaultValue, nil)
+}
+
+// RegisterPublicDurationSetting defines a new setting with type
+// duration and makes it public.
+func RegisterPublicDurationSetting(key, desc string, defaultValue time.Duration) *DurationSetting {
+	s := RegisterValidatedDurationSetting(key, desc, defaultValue, nil)
+	s.SetVisibility(Public)
+	return s
+}
+
+// RegisterPublicNonNegativeDurationSetting defines a new setting with
+// type duration and makes it public.
+func RegisterPublicNonNegativeDurationSetting(
+	key, desc string, defaultValue time.Duration,
+) *DurationSetting {
+	s := RegisterNonNegativeDurationSetting(key, desc, defaultValue)
+	s.SetVisibility(Public)
+	return s
+}
+
+// RegisterPublicNonNegativeDurationSettingWithMaximum defines a new setting with
+// type duration, makes it public, and sets a maximum value.
+func RegisterPublicNonNegativeDurationSettingWithMaximum(
+	key, desc string, defaultValue time.Duration, maxValue time.Duration,
+) *DurationSetting {
+	s := RegisterValidatedDurationSetting(key, desc, defaultValue, func(v time.Duration) error {
+		if v < 0 {
+			return errors.Errorf("cannot set %s to a negative duration: %s", key, v)
+		}
+		if v >= maxValue {
+			return errors.Errorf("cannot set %s to a value larger than %s", key, maxValue)
+		}
+		return nil
+	})
+	s.SetVisibility(Public)
+	return s
 }
 
 // RegisterNonNegativeDurationSetting defines a new setting with type duration.

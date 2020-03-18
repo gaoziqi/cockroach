@@ -21,6 +21,7 @@ option go_package = "execinfrapb";
 
 import "sql/sqlbase/structured.proto";
 import "sql/sqlbase/join_type.proto";
+import "sql/sqlbase/locking.proto";
 import "sql/execinfrapb/data.proto";
 import "sql/execinfrapb/processors_base.proto";
 import "gogoproto/gogo.proto";
@@ -116,6 +117,18 @@ message TableReaderSpec {
   // older than this value.
   //
   optional uint64 max_timestamp_age_nanos = 9 [(gogoproto.nullable) = false];
+
+  // Indicates the row-level locking strength to be used by the scan. If set to
+  // FOR_NONE, no row-level locking should be performed.
+  optional sqlbase.ScanLockingStrength locking_strength = 10 [(gogoproto.nullable) = false];
+
+  // Indicates the policy to be used by the scan when dealing with rows being
+  // locked. Always set to BLOCK when locking_stength is FOR_NONE.
+  //
+  // NOTE: this is currently set but unused because only the BLOCK wait policy
+  // makes it out of the SQL optimizer without throwing an error. If/when other
+  // wait policies are supported, this field will be plumbed further.
+  optional sqlbase.ScanLockingWaitPolicy locking_wait_policy = 11 [(gogoproto.nullable) = false];
 }
 
 // IndexSkipTableReaderSpec is the specification for a table reader that
@@ -138,6 +151,18 @@ message IndexSkipTableReaderSpec {
   optional ScanVisibility visibility = 4 [(gogoproto.nullable) = false];
 
   optional bool reverse = 5 [(gogoproto.nullable) = false];
+
+  // Indicates the row-level locking strength to be used by the scan. If set to
+  // FOR_NONE, no row-level locking should be performed.
+  optional sqlbase.ScanLockingStrength locking_strength = 6 [(gogoproto.nullable) = false];
+
+  // Indicates the policy to be used by the scan when dealing with rows being
+  // locked. Always set to BLOCK when locking_stength is FOR_NONE.
+  //
+  // NOTE: this is currently set but unused because only the BLOCK wait policy
+  // makes it out of the SQL optimizer without throwing an error. If/when other
+  // wait policies are supported, this field will be plumbed further.
+  optional sqlbase.ScanLockingWaitPolicy locking_wait_policy = 7 [(gogoproto.nullable) = false];
 }
 
 // JoinReaderSpec is the specification for a "join reader". A join reader
@@ -207,6 +232,18 @@ message JoinReaderSpec {
   // default PUBLIC state. Causes the index join to return these schema change
   // columns.
   optional ScanVisibility visibility = 7 [(gogoproto.nullable) = false];
+
+  // Indicates the row-level locking strength to be used by the join. If set to
+  // FOR_NONE, no row-level locking should be performed.
+  optional sqlbase.ScanLockingStrength locking_strength = 9 [(gogoproto.nullable) = false];
+
+  // Indicates the policy to be used by the join when dealing with rows being
+  // locked. Always set to BLOCK when locking_stength is FOR_NONE.
+  //
+  // NOTE: this is currently set but unused because only the BLOCK wait policy
+  // makes it out of the SQL optimizer without throwing an error. If/when other
+  // wait policies are supported, this field will be plumbed further.
+  optional sqlbase.ScanLockingWaitPolicy locking_wait_policy = 10 [(gogoproto.nullable) = false];
 }
 
 // SorterSpec is the specification for a "sorting aggregator". A sorting
@@ -238,6 +275,24 @@ message DistinctSpec {
   // considered, so rows A1,B1,C1,D1 and A1,B1,C1,D2 are considered equal and
   // only one of them (the first) is output.
   repeated uint32 distinct_columns = 2;
+  // If true, then NULL values are treated as not equal to one another. Each NULL
+  // value will cause a new row group to be created. For example:
+  //
+  //   c
+  //   ----
+  //   NULL
+  //   NULL
+  //
+  // A distinct operation on column "c" will result in one output row if
+  // NullsAreDistinct is false, or two output rows if true. This is set to true
+  // for UPSERT and INSERT..ON CONFLICT statements, since they must treat NULL
+  // values as distinct.
+  optional bool nulls_are_distinct = 3 [(gogoproto.nullable) = false];
+  // If not empty, then an error with this text will be raised if there are two
+  // rows with duplicate distinct column values. This is used to implement the
+  // UPSERT and INSERT..ON CONFLICT statements, both of which prohibit the same
+  // row from being changed twice.
+  optional string error_on_dup = 4 [(gogoproto.nullable) = false];
 }
 
 // The specification for a WITH ORDINALITY processor. It adds a new column to
@@ -264,7 +319,9 @@ message ZigzagJoinerSpec {
   // equal length.
   repeated Columns eq_columns = 2 [(gogoproto.nullable) = false];
 
-  repeated uint32 index_ids = 3 [packed = true];
+  // Each value indicates an index: if 0, primary index; otherwise the n-th
+  // secondary index, i.e. tables[side_idx].indexes[index_ordinals[side_idx]].
+  repeated uint32 index_ordinals = 3 [packed = true];
 
   // "ON" expression (in addition to the equality constraints captured by the
   // orderings). Assuming that the left stream has N columns and the right
@@ -429,6 +486,7 @@ message AggregatorSpec {
     STRING_AGG = 21;
     BIT_AND = 22;
     BIT_OR = 23;
+    CORR = 24;
   }
 
   enum Type {
@@ -543,6 +601,19 @@ message InterleavedReaderJoinerSpec {
   // Not used if there is a limit set in the PostProcessSpec of this processor
   // (that value will be used for sizing batches instead).
   optional int64 limit_hint = 3 [(gogoproto.nullable) = false];
+  
+  // Indicates the row-level locking strength to be used by the scan over the
+  // tables. If set to FOR_NONE, no row-level locking should be performed.
+  optional sqlbase.ScanLockingStrength locking_strength = 6 [(gogoproto.nullable) = false];
+
+  // Indicates the policy to be used by the scan over the tables when dealing
+  // with rows being locked. Always set to BLOCK when locking_stength is
+  // FOR_NONE.
+  //
+  // NOTE: this is currently set but unused because only the BLOCK wait policy
+  // makes it out of the SQL optimizer without throwing an error. If/when other
+  // wait policies are supported, this field will be plumbed further.
+  optional sqlbase.ScanLockingWaitPolicy locking_wait_policy = 7 [(gogoproto.nullable) = false];
 
   // Joiner component
 

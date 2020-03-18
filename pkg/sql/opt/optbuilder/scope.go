@@ -101,6 +101,9 @@ type scope struct {
 	// context is the current context in the SQL query (e.g., "SELECT" or
 	// "HAVING"). It is used for error messages.
 	context string
+
+	// atRoot is whether we are currently at a root context.
+	atRoot bool
 }
 
 // cteSource represents a CTE in the given query.
@@ -160,6 +163,25 @@ func (s *scope) appendColumnsFromScope(src *scope) {
 	// the new scope.
 	for i := l; i < len(s.cols); i++ {
 		s.cols[i].scalar = nil
+	}
+}
+
+// appendColumnsFromTable adds all columns from the given table metadata to this
+// scope.
+func (s *scope) appendColumnsFromTable(tabMeta *opt.TableMeta, alias *tree.TableName) {
+	tab := tabMeta.Table
+	if s.cols == nil {
+		s.cols = make([]scopeColumn, 0, tab.ColumnCount())
+	}
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		tabCol := tab.Column(i)
+		s.cols = append(s.cols, scopeColumn{
+			name:   tabCol.ColName(),
+			table:  *alias,
+			typ:    tabCol.DatumType(),
+			id:     tabMeta.MetaID.ColumnID(i),
+			hidden: tabCol.IsHidden(),
+		})
 	}
 }
 
@@ -276,6 +298,23 @@ func (s *scope) makePresentation() physical.Presentation {
 				ID:    col.id,
 			})
 		}
+	}
+	return presentation
+}
+
+// makePresentationWithHiddenCols is only used when constructing the
+// presentation for a [ ... ]-style data source.
+func (s *scope) makePresentationWithHiddenCols() physical.Presentation {
+	if len(s.cols) == 0 {
+		return nil
+	}
+	presentation := make(physical.Presentation, 0, len(s.cols))
+	for i := range s.cols {
+		col := &s.cols[i]
+		presentation = append(presentation, opt.AliasedColumn{
+			Alias: string(col.name),
+			ID:    col.id,
+		})
 	}
 	return presentation
 }
@@ -457,21 +496,35 @@ func (s *scope) setTableAlias(alias tree.Name) {
 	}
 }
 
-func (s *scope) findExistingColInList(expr tree.TypedExpr, cols []scopeColumn) *scopeColumn {
+// See (*scope).findExistingCol.
+func findExistingColInList(
+	expr tree.TypedExpr, cols []scopeColumn, allowSideEffects bool,
+) *scopeColumn {
 	exprStr := symbolicExprStr(expr)
 	for i := range cols {
 		col := &cols[i]
-		if expr == col || exprStr == col.getExprStr() {
+		if expr == col {
 			return col
+		}
+		if exprStr == col.getExprStr() {
+			if allowSideEffects || col.scalar == nil {
+				return col
+			}
+			var p props.Shared
+			memo.BuildSharedProps(col.scalar, &p)
+			if !p.CanHaveSideEffects {
+				return col
+			}
 		}
 	}
 	return nil
 }
 
-// findExistingCol finds the given expression among the bound variables
-// in this scope. Returns nil if the expression is not found.
-func (s *scope) findExistingCol(expr tree.TypedExpr) *scopeColumn {
-	return s.findExistingColInList(expr, s.cols)
+// findExistingCol finds the given expression among the bound variables in this
+// scope. Returns nil if the expression is not found (or an expression is found
+// but it has side-effects and allowSideEffects is false).
+func (s *scope) findExistingCol(expr tree.TypedExpr, allowSideEffects bool) *scopeColumn {
+	return findExistingColInList(expr, s.cols, allowSideEffects)
 }
 
 // startAggFunc is called when the builder starts building an aggregate
@@ -875,12 +928,14 @@ func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf 
 
 	srfScope := s.push()
 	var outCol *scopeColumn
-	if len(def.ReturnLabels) == 1 {
+
+	var typedFuncExpr = typedFunc.(*tree.FuncExpr)
+	if s.builder.shouldCreateDefaultColumn(typedFuncExpr) {
 		outCol = s.builder.addColumn(srfScope, def.Name, typedFunc)
 	}
-	out := s.builder.buildFunction(typedFunc.(*tree.FuncExpr), s, srfScope, outCol, nil)
+	out := s.builder.buildFunction(typedFuncExpr, s, srfScope, outCol, nil)
 	srf := &srf{
-		FuncExpr: typedFunc.(*tree.FuncExpr),
+		FuncExpr: typedFuncExpr,
 		cols:     srfScope.cols,
 		fn:       out,
 	}
@@ -1047,7 +1102,7 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 		},
 	}
 
-	if col := s.findExistingColInList(&info, s.windows); col != nil {
+	if col := findExistingColInList(&info, s.windows, false /* allowSideEffects */); col != nil {
 		return col.expr
 	}
 

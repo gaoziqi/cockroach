@@ -18,7 +18,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -30,6 +30,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
+
+type copyMachineInterface interface {
+	run(ctx context.Context) error
+}
 
 // copyMachine supports the Copy-in pgwire subprotocol (COPY...FROM STDIN). The
 // machine is created by the Executor when that statement is executed; from that
@@ -67,7 +71,7 @@ type copyMachine struct {
 
 	// resetPlanner is a function to be used to prepare the planner for inserting
 	// data.
-	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time)
+	resetPlanner func(p *planner, txn *kv.Txn, txnTS time.Time, stmtTS time.Time)
 
 	// execInsertPlan is a function to be used to execute the plan (stored in the
 	// planner) which performs an INSERT.
@@ -83,6 +87,8 @@ type copyMachine struct {
 	// parsing. Is it not correctly initialized with timestamps, transactions and
 	// other things that statements more generally need.
 	parsingEvalCtx *tree.EvalContext
+
+	processRows func(ctx context.Context) error
 }
 
 // newCopyMachine creates a new copyMachine.
@@ -92,11 +98,13 @@ func newCopyMachine(
 	n *tree.CopyFrom,
 	txnOpt copyTxnOpt,
 	execCfg *ExecutorConfig,
-	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time),
+	resetPlanner func(p *planner, txn *kv.Txn, txnTS time.Time, stmtTS time.Time),
 	execInsertPlan func(ctx context.Context, p *planner, res RestrictedCommandResult) error,
 ) (_ *copyMachine, retErr error) {
 	c := &copyMachine{
-		conn:    conn,
+		conn: conn,
+		// TODO(georgiah): Currently, insertRows depends on Table and Columns,
+		//  but that dependency can be removed by refactoring it.
 		table:   &n.Table,
 		columns: n.Columns,
 		txnOpt:  txnOpt,
@@ -131,6 +139,7 @@ func newCopyMachine(
 	}
 	c.rowsMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
 	c.bufMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
+	c.processRows = c.insertRows
 	return c, nil
 }
 
@@ -142,7 +151,7 @@ type copyTxnOpt struct {
 	// performed. Committing the txn is left to the higher layer.  If not set, the
 	// machine will split writes between multiple transactions that it will
 	// initiate.
-	txn           *client.Txn
+	txn           *kv.Txn
 	txnTimestamp  time.Time
 	stmtTimestamp time.Time
 }
@@ -262,10 +271,10 @@ func (c *copyMachine) processCopyData(
 		}
 	}
 	// Only do work if we have a full batch of rows or this is the end.
-	if ln := len(c.rows); ln == 0 || (ln < copyBatchRowSize && !final) {
+	if ln := len(c.rows); !final && (ln == 0 || ln < copyBatchRowSize) {
 		return nil
 	}
-	return c.insertRows(ctx)
+	return c.processRows(ctx)
 }
 
 // preparePlanner resets the planner so that it can be used for execution.
@@ -283,7 +292,7 @@ func (c *copyMachine) preparePlanner(ctx context.Context) func(context.Context, 
 	stmtTs := c.txnOpt.stmtTimestamp
 	autoCommit := false
 	if txn == nil {
-		txn = client.NewTxn(ctx, c.p.execCfg.DB, c.p.execCfg.NodeID.Get(), client.RootTxn)
+		txn = kv.NewTxnWithSteppingEnabled(ctx, c.p.execCfg.DB, c.p.execCfg.NodeID.Get())
 		txnTs = c.p.execCfg.Clock.PhysicalTime()
 		stmtTs = txnTs
 		autoCommit = true
@@ -308,6 +317,9 @@ func (c *copyMachine) preparePlanner(ctx context.Context) func(context.Context, 
 
 // insertRows transforms the buffered rows into an insertNode and executes it.
 func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
+	if len(c.rows) == 0 {
+		return nil
+	}
 	cleanup := c.preparePlanner(ctx)
 	defer func() {
 		retErr = cleanup(ctx, retErr)
@@ -378,7 +390,7 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 				return err
 			}
 		}
-		d, err := tree.ParseStringAs(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
+		d, err := sqlbase.ParseDatumStringAsWithRawBytes(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
 		if err != nil {
 			return err
 		}

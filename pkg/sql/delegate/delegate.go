@@ -36,8 +36,8 @@ func TryDelegate(
 		evalCtx: evalCtx,
 	}
 	switch t := stmt.(type) {
-	case *tree.ShowAllClusterSettings:
-		return d.delegateShowAllClusterSettings(t)
+	case *tree.ShowClusterSettingList:
+		return d.delegateShowClusterSettingList(t)
 
 	case *tree.ShowDatabases:
 		return d.delegateShowDatabases(t)
@@ -79,7 +79,7 @@ func TryDelegate(
 		return d.delegateShowRoleGrants(t)
 
 	case *tree.ShowRoles:
-		return d.delegateShowRoles(t)
+		return d.delegateShowRoles()
 
 	case *tree.ShowSchemas:
 		return d.delegateShowSchemas(t)
@@ -97,10 +97,13 @@ func TryDelegate(
 		return d.delegateShowTables(t)
 
 	case *tree.ShowUsers:
-		return d.delegateShowUsers(t)
+		return d.delegateShowRoles()
 
 	case *tree.ShowVar:
 		return d.delegateShowVar(t)
+
+	case *tree.ShowZoneConfig:
+		return d.delegateShowZoneConfig(t)
 
 	case *tree.ShowTransactionStatus:
 		return d.delegateShowVar(&tree.ShowVar{Name: "transaction_status"})

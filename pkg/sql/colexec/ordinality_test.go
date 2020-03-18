@@ -46,7 +46,7 @@ func TestOrdinality(t *testing.T) {
 	for _, tc := range tcs {
 		runTests(t, []tuples{tc.tuples}, tc.expected, orderedVerifier,
 			func(input []Operator) (Operator, error) {
-				return NewOrdinalityOp(input[0]), nil
+				return NewOrdinalityOp(testAllocator, input[0], len(tc.tuples[0])), nil
 			})
 	}
 }
@@ -54,14 +54,13 @@ func TestOrdinality(t *testing.T) {
 func BenchmarkOrdinality(b *testing.B) {
 	ctx := context.Background()
 
-	batch := coldata.NewMemBatch([]coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64})
+	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Int64, coltypes.Int64, coltypes.Int64})
 	batch.SetLength(coldata.BatchSize())
-	source := NewRepeatableBatchSource(batch)
-	source.Init()
+	source := NewRepeatableBatchSource(testAllocator, batch)
+	ordinality := NewOrdinalityOp(testAllocator, source, batch.Width())
+	ordinality.Init()
 
-	ordinality := NewOrdinalityOp(source)
-
-	b.SetBytes(int64(8 * int(coldata.BatchSize()) * batch.Width()))
+	b.SetBytes(int64(8 * coldata.BatchSize()))
 	for i := 0; i < b.N; i++ {
 		ordinality.Next(ctx)
 	}

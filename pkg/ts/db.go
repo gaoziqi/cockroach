@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -37,7 +37,7 @@ var (
 )
 
 // TimeseriesStorageEnabled controls whether to store timeseries data to disk.
-var TimeseriesStorageEnabled = settings.RegisterBoolSetting(
+var TimeseriesStorageEnabled = settings.RegisterPublicBoolSetting(
 	"timeseries.storage.enabled",
 	"if set, periodic timeseries data is stored within the cluster; disabling is not recommended "+
 		"unless you are storing the data elsewhere",
@@ -47,7 +47,7 @@ var TimeseriesStorageEnabled = settings.RegisterBoolSetting(
 // Resolution10sStorageTTL defines the maximum age of data that will be retained
 // at he 10 second resolution. Data older than this is subject to being "rolled
 // up" into the 30 minute resolution and then deleted.
-var Resolution10sStorageTTL = settings.RegisterDurationSetting(
+var Resolution10sStorageTTL = settings.RegisterPublicDurationSetting(
 	"timeseries.storage.resolution_10s.ttl",
 	"the maximum age of time series data stored at the 10 second resolution. Data older than this "+
 		"is subject to rollup and deletion.",
@@ -60,7 +60,7 @@ var deprecatedResolution30StoreDuration = func() *settings.DurationSetting {
 		"timeseries.storage.30m_resolution_ttl", "replaced by timeseries.storage.resolution_30m.ttl",
 		resolution30mDefaultPruneThreshold,
 	)
-	s.SetDeprecated()
+	s.SetRetired()
 	return s
 }()
 
@@ -74,7 +74,7 @@ func init() {
 // Resolution30mStorageTTL defines the maximum age of data that will be
 // retained at he 30 minute resolution. Data older than this is subject to
 // deletion.
-var Resolution30mStorageTTL = settings.RegisterDurationSetting(
+var Resolution30mStorageTTL = settings.RegisterPublicDurationSetting(
 	"timeseries.storage.resolution_30m.ttl",
 	"the maximum age of time series data stored at the 30 minute resolution. Data older than this "+
 		"is subject to deletion.",
@@ -83,7 +83,7 @@ var Resolution30mStorageTTL = settings.RegisterDurationSetting(
 
 // DB provides Cockroach's Time Series API.
 type DB struct {
-	db      *client.DB
+	db      *kv.DB
 	st      *cluster.Settings
 	metrics *TimeSeriesMetrics
 
@@ -99,7 +99,7 @@ type DB struct {
 }
 
 // NewDB creates a new DB instance.
-func NewDB(db *client.DB, settings *cluster.Settings) *DB {
+func NewDB(db *kv.DB, settings *cluster.Settings) *DB {
 	pruneThresholdByResolution := map[Resolution]func() int64{
 		Resolution10s: func() int64 {
 			return Resolution10sStorageTTL.Get(&settings.SV).Nanoseconds()
@@ -294,7 +294,7 @@ func (db *DB) tryStoreRollup(ctx context.Context, r Resolution, data []rollupDat
 }
 
 func (db *DB) storeKvs(ctx context.Context, kvs []roachpb.KeyValue) error {
-	b := &client.Batch{}
+	b := &kv.Batch{}
 	for _, kv := range kvs {
 		b.AddRawRequest(&roachpb.MergeRequest{
 			RequestHeader: roachpb.RequestHeader{

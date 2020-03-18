@@ -15,20 +15,20 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math/rand"
-	"sync/atomic"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
@@ -88,6 +88,8 @@ func descExists(sqlDB *gosql.DB, exists bool, id sqlbase.ID) error {
 	return nil
 }
 
+// Set the GC TTL to 0 for the given table ID. One must make sure to disable
+// strict GC TTL enforcement when using this.
 func addImmediateGCZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (zonepb.ZoneConfig, error) {
 	cfg := zonepb.DefaultZoneConfig()
 	cfg.GC.TTLSeconds = 0
@@ -97,6 +99,15 @@ func addImmediateGCZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (zonepb.ZoneConfig
 	}
 	_, err = sqlDB.Exec(`UPSERT INTO system.zones VALUES ($1, $2)`, id, buf)
 	return cfg, err
+}
+
+func disableGCTTLStrictEnforcement(t *testing.T, db *gosql.DB) (cleanup func()) {
+	_, err := db.Exec(`SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = false`)
+	require.NoError(t, err)
+	return func() {
+		_, err := db.Exec(`SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = DEFAULT`)
+		require.NoError(t, err)
+	}
 }
 
 func addDefaultZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (zonepb.ZoneConfig, error) {
@@ -112,13 +123,6 @@ func addDefaultZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (zonepb.ZoneConfig, er
 func TestDropDatabase(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			// Disable the asynchronous path so that the table data left
-			// behind is not cleaned up.
-			AsyncExecNotification: asyncSchemaChangerDisabled,
-		},
-	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
@@ -148,7 +152,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	}
 	dbDesc := desc.GetDatabase()
 
-	tbNameKey := sqlbase.NewTableKey(dbDesc.ID, "kv").Key()
+	tbNameKey := sqlbase.NewPublicTableKey(dbDesc.ID, "kv").Key()
 	gr, err := kvDB.Get(ctx, tbNameKey)
 	if err != nil {
 		t.Fatal(err)
@@ -227,8 +231,11 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	}
 
 	// Job still running, waiting for GC.
+	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
+	// Maybe this test API should use an offset starting from the most recent job
+	// instead.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifySystemJob(t, sqlRun, 4, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    security.RootUser,
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: sqlbase.IDs{
@@ -285,15 +292,17 @@ CREATE DATABASE t;
 // Test that a dropped database's data gets deleted properly.
 func TestDropDatabaseDeleteData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	defer gcjob.SetSmallMaxGCIntervalForTest()()
+
 	params, _ := tests.CreateTestServerParams()
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			AsyncExecQuickly: true,
-		},
-	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
+
+	// Disable strict GC TTL enforcement because we're going to shove a zero-value
+	// TTL into the system with addImmediateGCZoneConfig.
+	defer disableGCTTLStrictEnforcement(t, sqlDB)()
 
 	// Fix the column families so the key counts below don't change if the
 	// family heuristics are updated.
@@ -322,7 +331,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	}
 	dbDesc := desc.GetDatabase()
 
-	tKey := sqlbase.NewTableKey(dbDesc.ID, "kv")
+	tKey := sqlbase.NewPublicTableKey(dbDesc.ID, "kv")
 	gr, err := kvDB.Get(ctx, tKey.Key())
 	if err != nil {
 		t.Fatal(err)
@@ -337,7 +346,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	}
 	tbDesc := desc.Table(ts)
 
-	t2Key := sqlbase.NewTableKey(dbDesc.ID, "kv2")
+	t2Key := sqlbase.NewPublicTableKey(dbDesc.ID, "kv2")
 	gr2, err := kvDB.Get(ctx, t2Key.Key())
 	if err != nil {
 		t.Fatal(err)
@@ -373,8 +382,12 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	tests.CheckKeyCount(t, kvDB, tableSpan, 6)
 	tests.CheckKeyCount(t, kvDB, table2Span, 6)
 
+	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
+	// Maybe this test API should use an offset starting from the most recent job
+	// instead.
+	const migrationJobOffset = 4
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    security.RootUser,
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: sqlbase.IDs{
@@ -407,15 +420,15 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		t.Fatal(err)
 	}
 
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
-		Username:    security.RootUser,
-		Description: "DROP DATABASE t CASCADE",
-		DescriptorIDs: sqlbase.IDs{
-			tbDesc.ID, tb2Desc.ID,
-		},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	testutils.SucceedsSoon(t, func() error {
+		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusRunning, jobs.Record{
+			Username:    security.RootUser,
+			Description: "GC for DROP DATABASE t CASCADE",
+			DescriptorIDs: sqlbase.IDs{
+				tbDesc.ID, tb2Desc.ID,
+			},
+		})
+	})
 
 	if _, err := addImmediateGCZoneConfig(sqlDB, tb2Desc.ID); err != nil {
 		t.Fatal(err)
@@ -435,7 +448,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	// Table 2 data is deleted.
 	tests.CheckKeyCount(t, kvDB, table2Span, 0)
 
-	if err := jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
+	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    security.RootUser,
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: sqlbase.IDs{
@@ -460,10 +473,9 @@ func TestShowTablesAfterRecreateDatabase(t *testing.T) {
 	// get completely dropped.
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
-				tscc.ClearSchemaChangers()
+			SchemaChangeJobNoOp: func() bool {
+				return true
 			},
-			AsyncExecNotification: asyncSchemaChangerDisabled,
 		},
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -506,7 +518,6 @@ func TestDropIndex(t *testing.T) {
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: chunkSize,
-			AsyncExecQuickly:  true,
 		},
 		DistSQL: &execinfra.TestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
@@ -519,6 +530,11 @@ func TestDropIndex(t *testing.T) {
 	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
+
+	// Disable strict GC TTL enforcement because we're going to shove a zero-value
+	// TTL into the system with addImmediateGCZoneConfig.
+	defer disableGCTTLStrictEnforcement(t, sqlDB)()
+
 	numRows := 2*chunkSize + 1
 	if err := tests.CreateKVTable(sqlDB, "kv", numRows); err != nil {
 		t.Fatal(err)
@@ -543,8 +559,12 @@ func TestDropIndex(t *testing.T) {
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(), 3*numRows)
 
+	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
+	// Maybe this test API should use an offset starting from the most recent job
+	// instead.
+	const migrationJobOffset = 4
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset+1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    security.RootUser,
 		Description: `DROP INDEX t.public.kv@foo`,
 		DescriptorIDs: sqlbase.IDs{
@@ -574,9 +594,19 @@ func TestDropIndex(t *testing.T) {
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		return jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
+		return jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset+1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 			Username:    security.RootUser,
 			Description: `DROP INDEX t.public.kv@foo`,
+			DescriptorIDs: sqlbase.IDs{
+				tableDesc.ID,
+			},
+		})
+	})
+
+	testutils.SucceedsSoon(t, func() error {
+		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
+			Username:    security.RootUser,
+			Description: `GC for DROP INDEX t.public.kv@foo`,
 			DescriptorIDs: sqlbase.IDs{
 				tableDesc.ID,
 			},
@@ -661,7 +691,6 @@ func TestDropIndexInterleaved(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			AsyncExecQuickly:  true,
 			BackfillChunkSize: chunkSize,
 		},
 	}
@@ -703,7 +732,7 @@ func TestDropTable(t *testing.T) {
 	}
 
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	nameKey := sqlbase.NewTableKey(keys.MinNonPredefinedUserDescID, "kv").Key()
+	nameKey := sqlbase.NewPublicTableKey(keys.MinNonPredefinedUserDescID, "kv").Key()
 	gr, err := kvDB.Get(ctx, nameKey)
 
 	if err != nil {
@@ -747,7 +776,7 @@ func TestDropTable(t *testing.T) {
 
 	// Job still running, waiting for GC.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifySystemJob(t, sqlRun, 5, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    security.RootUser,
 		Description: `DROP TABLE t.public.kv`,
 		DescriptorIDs: sqlbase.IDs{
@@ -779,14 +808,16 @@ func TestDropTable(t *testing.T) {
 func TestDropTableDeleteData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			AsyncExecQuickly: true,
-		},
-	}
+
+	defer gcjob.SetSmallMaxGCIntervalForTest()()
+
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
+
+	// Disable strict GC TTL enforcement because we're going to shove a zero-value
+	// TTL into the system with addImmediateGCZoneConfig.
+	defer disableGCTTLStrictEnforcement(t, sqlDB)()
 
 	const numRows = 2*sql.TableTruncateChunkSize + 1
 	const numKeys = 3 * numRows
@@ -800,7 +831,7 @@ func TestDropTableDeleteData(t *testing.T) {
 
 		descs = append(descs, sqlbase.GetTableDescriptor(kvDB, "t", tableName))
 
-		nameKey := sqlbase.NewTableKey(keys.MinNonPredefinedUserDescID, tableName).Key()
+		nameKey := sqlbase.NewPublicTableKey(keys.MinNonPredefinedUserDescID, tableName).Key()
 		gr, err := kvDB.Get(ctx, nameKey)
 		if err != nil {
 			t.Fatal(err)
@@ -817,6 +848,11 @@ func TestDropTableDeleteData(t *testing.T) {
 		}
 	}
 
+	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
+	// Maybe this test API should use an offset starting from the most recent job
+	// instead.
+	const migrationJobOffset = 4
+
 	// Data hasn't been GC-ed.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	for i := 0; i < numTables; i++ {
@@ -826,7 +862,7 @@ func TestDropTableDeleteData(t *testing.T) {
 		tableSpan := descs[i].TableSpan()
 		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
 
-		if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 2*i+1, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
+		if err := jobutils.VerifySystemJob(t, sqlRun, 2*i+1+migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 			Username:    security.RootUser,
 			Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
 			DescriptorIDs: sqlbase.IDs{
@@ -856,7 +892,7 @@ func TestDropTableDeleteData(t *testing.T) {
 		tests.CheckKeyCount(t, kvDB, tableSpan, 0)
 
 		// Ensure that the job is marked as succeeded.
-		if err := jobutils.VerifySystemJob(t, sqlRun, 2*i+1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
+		if err := jobutils.VerifySystemJob(t, sqlRun, 2*i+1+migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 			Username:    security.RootUser,
 			Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
 			DescriptorIDs: sqlbase.IDs{
@@ -865,6 +901,17 @@ func TestDropTableDeleteData(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+
+		// Ensure that the job is marked as succeeded.
+		testutils.SucceedsSoon(t, func() error {
+			return jobutils.VerifySystemJob(t, sqlRun, i, jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
+				Username:    security.RootUser,
+				Description: fmt.Sprintf(`GC for DROP TABLE t.public.%s`, descs[i].GetName()),
+				DescriptorIDs: sqlbase.IDs{
+					descs[i].ID,
+				},
+			})
+		})
 	}
 
 	// Push a new zone config for a few tables with TTL=0 so the data
@@ -894,8 +941,8 @@ func TestDropTableDeleteData(t *testing.T) {
 	}
 }
 
-func writeTableDesc(ctx context.Context, db *client.DB, tableDesc *sqlbase.TableDescriptor) error {
-	return db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+func writeTableDesc(ctx context.Context, db *kv.DB, tableDesc *sqlbase.TableDescriptor) error {
+	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		if err := txn.SetSystemConfigTrigger(); err != nil {
 			return err
 		}
@@ -914,20 +961,10 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	blockSchemaChanges := make(chan struct{})
+	defer gcjob.SetSmallMaxGCIntervalForTest()()
+
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			// Block schema changes so the data is not cleaned up until we're ready.
-			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
-				tscc.ClearSchemaChangers()
-			},
-			AsyncExecNotification: func() error {
-				<-blockSchemaChanges
-				return nil
-			},
-			AsyncExecQuickly: true,
-		},
 		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
 			DisableBackfillMigrations: true,
 		},
@@ -937,11 +974,12 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(sqlDBRaw)
 
+	// Disable strict GC TTL enforcement because we're going to shove a zero-value
+	// TTL into the system with addImmediateGCZoneConfig.
+	defer disableGCTTLStrictEnforcement(t, sqlDBRaw)()
+
 	const numRows = 100
 	sqlutils.CreateTable(t, sqlDBRaw, "t", "a INT", numRows, sqlutils.ToRowFn(sqlutils.RowIdxFn))
-
-	// Set TTL so the data is deleted immediately.
-	sqlDB.Exec(t, `ALTER TABLE test.t CONFIGURE ZONE USING gc.ttlseconds = 1`)
 
 	// Give the table an old format version.
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
@@ -958,7 +996,11 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 
 	// Simulate a migration upgrading the table descriptor's format version after
 	// the table has been dropped but before the truncation has occurred.
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "test", "t")
+	var err error
+	tableDesc, err = sqlbase.GetTableDescFromID(ctx, kvDB.NewTxn(ctx, ""), tableDesc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !tableDesc.Dropped() {
 		t.Fatalf("expected descriptor to be in DROP state, but was in %s", tableDesc.State)
 	}
@@ -968,9 +1010,13 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Set TTL so the data is deleted immediately.
+	if _, err := addImmediateGCZoneConfig(sqlDBRaw, tableDesc.ID); err != nil {
+		t.Fatal(err)
+	}
+
 	// Allow the schema change to proceed and verify that the data is eventually
 	// deleted, despite the interleaved modification to the table descriptor.
-	close(blockSchemaChanges)
 	testutils.SucceedsSoon(t, func() error {
 		return descExists(sqlDBRaw, false, tableDesc.ID)
 	})
@@ -982,19 +1028,9 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 func TestDropTableInterleavedDeleteData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
-	var enableAsync uint32
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			// Turn on quick garbage collection.
-			AsyncExecQuickly: true,
-			AsyncExecNotification: func() error {
-				if atomic.LoadUint32(&enableAsync) == 0 {
-					return errors.New("async schema changes are disabled")
-				}
-				return nil
-			},
-		},
-	}
+
+	defer gcjob.SetSmallMaxGCIntervalForTest()()
+
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
@@ -1018,7 +1054,9 @@ func TestDropTableInterleavedDeleteData(t *testing.T) {
 		t.Fatalf("different error than expected: %v", err)
 	}
 
-	atomic.StoreUint32(&enableAsync, 1)
+	if _, err := addImmediateGCZoneConfig(sqlDB, tableDescInterleaved.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	testutils.SucceedsSoon(t, func() error {
 		return descExists(sqlDB, false, tableDescInterleaved.ID)
@@ -1072,10 +1110,9 @@ func TestDropDatabaseAfterDropTable(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
-				tscc.ClearSchemaChangers()
+			SchemaChangeJobNoOp: func() bool {
+				return true
 			},
-			AsyncExecNotification: asyncSchemaChangerDisabled,
 		},
 	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
@@ -1096,9 +1133,12 @@ func TestDropDatabaseAfterDropTable(t *testing.T) {
 	}
 
 	// Job still running, waiting for draining names.
+	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
+	// Maybe this test API should use an offset starting from the most recent job
+	// instead.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(
-		t, sqlRun, 1, jobspb.TypeSchemaChange, sql.RunningStatusDrainingNames,
+	if err := jobutils.VerifySystemJob(
+		t, sqlRun, 5, jobspb.TypeSchemaChange, jobs.StatusSucceeded,
 		jobs.Record{
 			Username:    security.RootUser,
 			Description: "DROP TABLE t.public.kv",
@@ -1159,10 +1199,9 @@ func TestCommandsWhileTableBeingDropped(t *testing.T) {
 	// actually dropped; it will be left in the "deleted" state.
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
-				tscc.ClearSchemaChangers()
+			SchemaChangeJobNoOp: func() bool {
+				return true
 			},
-			AsyncExecNotification: asyncSchemaChangerDisabled,
 		},
 	}
 	s, db, _ := serverutils.StartServer(t, params)
@@ -1206,18 +1245,14 @@ CREATE TABLE test.t(a INT PRIMARY KEY);
 // Tests name reuse if a DROP VIEW|TABLE succeeds but fails
 // before running the schema changer. Tests name GC via the
 // asynchrous schema change path.
+// TODO (lucy): This started as a test verifying that draining names still works
+// in the async schema changer, which no longer exists. Should the test still
+// exist?
 func TestDropNameReuse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			// Block schema changes through synchronous path.
-			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
-				tscc.ClearSchemaChangers()
-			},
-			AsyncExecQuickly: true,
-		},
 		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
 			DisableBackfillMigrations: true,
 		},

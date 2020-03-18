@@ -13,6 +13,7 @@ package cli
 import (
 	"flag"
 	"net"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -43,7 +44,7 @@ import (
 // - the underlying context parameters must receive defaults in
 //   initCLIDefaults() even when they are otherwise overridden by the
 //   flags logic, because some tests to not use the flag logic at all.
-var serverListenPort string
+var serverListenPort, serverSocketDir string
 var serverAdvertiseAddr, serverAdvertisePort string
 var serverSQLAddr, serverSQLPort string
 var serverSQLAdvertiseAddr, serverSQLAdvertisePort string
@@ -54,6 +55,7 @@ var localityAdvertiseHosts localityList
 // defined above.
 func initPreFlagsDefaults() {
 	serverListenPort = base.DefaultPort
+	serverSocketDir = ""
 	serverAdvertiseAddr = ""
 	serverAdvertisePort = ""
 
@@ -316,6 +318,11 @@ func init() {
 		VarFlag(f, addrSetter{&serverSQLAddr, &serverSQLPort}, cliflags.ListenSQLAddr)
 		VarFlag(f, addrSetter{&serverSQLAdvertiseAddr, &serverSQLAdvertisePort}, cliflags.SQLAdvertiseAddr)
 		VarFlag(f, addrSetter{&serverHTTPAddr, &serverHTTPPort}, cliflags.ListenHTTPAddr)
+		StringFlag(f, &serverSocketDir, cliflags.SocketDir, serverSocketDir)
+		// --socket is deprecated as of 20.1.
+		// TODO(knz): remove in 20.2.
+		StringFlag(f, &serverCfg.SocketFile, cliflags.Socket, serverCfg.SocketFile)
+		_ = f.MarkDeprecated(cliflags.Socket.Name, "use the --socket-dir and --listen-addr flags instead")
 
 		// Backward-compatibility flags.
 
@@ -350,13 +357,6 @@ func init() {
 		VarFlag(f, &serverCfg.StorageEngine, cliflags.StorageEngine)
 		VarFlag(f, &serverCfg.MaxOffset, cliflags.MaxOffset)
 
-		// Usage for the unix socket is odd as we use a real file, whereas
-		// postgresql and clients consider it a directory and build a filename
-		// inside it using the port.
-		// Thus, we keep it hidden and use it for testing only.
-		StringFlag(f, &serverCfg.SocketFile, cliflags.Socket, serverCfg.SocketFile)
-		_ = f.MarkHidden(cliflags.Socket.Name)
-
 		StringFlag(f, &startCtx.listeningURLFile, cliflags.ListeningURLFile, startCtx.listeningURLFile)
 
 		StringFlag(f, &startCtx.pidFile, cliflags.PIDFile, startCtx.pidFile)
@@ -365,9 +365,20 @@ func init() {
 		// We share the default with the ClientInsecure flag.
 		BoolFlag(f, &startCtx.serverInsecure, cliflags.ServerInsecure, startCtx.serverInsecure)
 
+		// Enable/disable various external storage endpoints.
+		serverCfg.ExternalIOConfig = base.ExternalIOConfig{}
+		BoolFlag(f, &serverCfg.ExternalIOConfig.DisableHTTP,
+			cliflags.ExternalIODisableHTTP, false)
+		BoolFlag(f, &serverCfg.ExternalIOConfig.DisableImplicitCredentials,
+			cliflags.ExtenralIODisableImplicitCredentials, false)
+
 		// Certificates directory. Use a server-specific flag and value to ignore environment
 		// variables, but share the same default.
 		StringFlag(f, &startCtx.serverSSLCertsDir, cliflags.ServerCertsDir, startCtx.serverSSLCertsDir)
+
+		// Certificate principal map.
+		StringSlice(f, &startCtx.serverCertPrincipalMap,
+			cliflags.CertPrincipalMap, startCtx.serverCertPrincipalMap)
 
 		// Cluster joining flags. We need to enable this both for 'start'
 		// and 'start-single-node' although the latter does not support
@@ -450,8 +461,6 @@ func init() {
 	// PKCS8 key format is only available for the client cert command.
 	BoolFlag(createClientCertCmd.Flags(), &generatePKCS8Key, cliflags.GeneratePKCS8Key, false)
 
-	BoolFlag(setUserCmd.Flags(), &password, cliflags.Password, false)
-
 	clientCmds := []*cobra.Command{
 		debugGossipValuesCmd,
 		debugTimeSeriesDumpCmd,
@@ -462,10 +471,11 @@ func init() {
 		sqlShellCmd,
 		/* StartCmds are covered above */
 	}
-	clientCmds = append(clientCmds, userCmds...)
+	clientCmds = append(clientCmds, authCmds...)
 	clientCmds = append(clientCmds, nodeCmds...)
 	clientCmds = append(clientCmds, systemBenchCmds...)
 	clientCmds = append(clientCmds, initCmd)
+	clientCmds = append(clientCmds, nodeLocalCmds...)
 	for _, cmd := range clientCmds {
 		f := cmd.PersistentFlags()
 		VarFlag(f, addrSetter{&cliCtx.clientConnHost, &cliCtx.clientConnPort}, cliflags.ClientHost)
@@ -476,6 +486,13 @@ func init() {
 
 		// Certificate flags.
 		StringFlag(f, &baseCfg.SSLCertsDir, cliflags.CertsDir, baseCfg.SSLCertsDir)
+	}
+
+	// Auth commands.
+	{
+		f := loginCmd.Flags()
+		DurationFlag(f, &authCtx.validityPeriod, cliflags.AuthTokenValidityPeriod, authCtx.validityPeriod)
+		BoolFlag(f, &authCtx.onlyCookie, cliflags.OnlyCookie, authCtx.onlyCookie)
 	}
 
 	timeoutCmds := []*cobra.Command{
@@ -530,7 +547,15 @@ func init() {
 	VarFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionWait, cliflags.Wait)
 
 	// Quit command.
-	BoolFlag(quitCmd.Flags(), &quitCtx.serverDecommission, cliflags.Decommission, quitCtx.serverDecommission)
+	{
+		f := quitCmd.Flags()
+		// The --decommission flag for quit is now deprecated.
+		// Users should use `node decommission` and then `quit` after
+		// decommission completes.
+		// TODO(knz): Remove in 20.2.
+		BoolFlag(f, &quitCtx.serverDecommission, cliflags.Decommission, quitCtx.serverDecommission)
+		_ = f.MarkDeprecated(cliflags.Decommission.Name, `use 'cockroach node decommission' then 'cockroach quit' instead`)
+	}
 
 	for _, cmd := range append([]*cobra.Command{sqlShellCmd, demoCmd}, demoCmd.Commands()...) {
 		f := cmd.Flags()
@@ -546,8 +571,9 @@ func init() {
 
 	// Commands that establish a SQL connection.
 	sqlCmds := []*cobra.Command{sqlShellCmd, dumpCmd, demoCmd}
-	sqlCmds = append(sqlCmds, userCmds...)
+	sqlCmds = append(sqlCmds, authCmds...)
 	sqlCmds = append(sqlCmds, demoCmd.Commands()...)
+	sqlCmds = append(sqlCmds, nodeLocalCmds...)
 	for _, cmd := range sqlCmds {
 		f := cmd.Flags()
 		BoolFlag(f, &sqlCtx.echo, cliflags.EchoSQL, sqlCtx.echo)
@@ -576,8 +602,8 @@ func init() {
 	tableOutputCommands := append(
 		[]*cobra.Command{sqlShellCmd, genSettingsListCmd, demoCmd},
 		demoCmd.Commands()...)
-	tableOutputCommands = append(tableOutputCommands, userCmds...)
 	tableOutputCommands = append(tableOutputCommands, nodeCmds...)
+	tableOutputCommands = append(tableOutputCommands, authCmds...)
 
 	// By default, these commands print their output as pretty-formatted
 	// tables on terminals, and TSV when redirected to a file. The user
@@ -597,9 +623,13 @@ func init() {
 	BoolFlag(demoFlags, &demoCtx.runWorkload, cliflags.RunDemoWorkload, false)
 	VarFlag(demoFlags, &demoCtx.localities, cliflags.DemoNodeLocality)
 	BoolFlag(demoFlags, &demoCtx.geoPartitionedReplicas, cliflags.DemoGeoPartitionedReplicas, false)
+	VarFlag(demoFlags, demoNodeSQLMemSizeValue, cliflags.DemoNodeSQLMemSize)
+	VarFlag(demoFlags, demoNodeCacheSizeValue, cliflags.DemoNodeCacheSize)
+	BoolFlag(demoFlags, &demoCtx.insecure, cliflags.ServerInsecure, true)
+	BoolFlag(demoFlags, &demoCtx.disableLicenseAcquisition, cliflags.DemoNoLicense, false)
 	// Mark the --global flag as hidden until we investigate it more.
 	BoolFlag(demoFlags, &demoCtx.simulateLatency, cliflags.Global, false)
-	_ = demoCmd.Flags().MarkHidden(cliflags.Global.Name)
+	_ = demoFlags.MarkHidden(cliflags.Global.Name)
 	// The --empty flag is only valid for the top level demo command,
 	// so we use the regular flag set.
 	BoolFlag(demoCmd.Flags(), &demoCtx.useEmptyDatabase, cliflags.UseEmptyDatabase, false)
@@ -686,6 +716,23 @@ func extraServerFlagInit(cmd *cobra.Command) error {
 	// Construct the main RPC listen address.
 	serverCfg.Addr = net.JoinHostPort(startCtx.serverListenAddr, serverListenPort)
 
+	fs := flagSetForCmd(cmd)
+
+	// Construct the socket name, if requested.
+	if !fs.Lookup(cliflags.Socket.Name).Changed && fs.Lookup(cliflags.SocketDir.Name).Changed {
+		// If --socket (DEPRECATED) was set, then serverCfg.SocketFile is
+		// already set and we don't want to change it.
+		// However, if --socket-dir is set, then we'll use that.
+		// There are two cases:
+		// --socket-dir is set and is empty; in this case the user is telling us "disable the socket".
+		// is set and non-empty. Then it should be used as specified.
+		if serverSocketDir == "" {
+			serverCfg.SocketFile = ""
+		} else {
+			serverCfg.SocketFile = filepath.Join(serverSocketDir, ".s.PGSQL."+serverListenPort)
+		}
+	}
+
 	// Fill in the defaults for --advertise-addr.
 	if serverAdvertiseAddr == "" {
 		serverAdvertiseAddr = startCtx.serverListenAddr
@@ -703,11 +750,11 @@ func extraServerFlagInit(cmd *cobra.Command) error {
 		serverSQLPort = serverListenPort
 	}
 	serverCfg.SQLAddr = net.JoinHostPort(serverSQLAddr, serverSQLPort)
-	serverCfg.SplitListenSQL = flagSetForCmd(cmd).Lookup(cliflags.ListenSQLAddr.Name).Changed
+	serverCfg.SplitListenSQL = fs.Lookup(cliflags.ListenSQLAddr.Name).Changed
 
 	// Fill in the defaults for --advertise-sql-addr.
-	advSpecified := flagSetForCmd(cmd).Lookup(cliflags.AdvertiseAddr.Name).Changed ||
-		flagSetForCmd(cmd).Lookup(cliflags.AdvertiseHost.Name).Changed
+	advSpecified := fs.Lookup(cliflags.AdvertiseAddr.Name).Changed ||
+		fs.Lookup(cliflags.AdvertiseHost.Name).Changed
 	if serverSQLAdvertiseAddr == "" {
 		if advSpecified {
 			serverSQLAdvertiseAddr = serverAdvertiseAddr

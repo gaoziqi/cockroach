@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -88,7 +89,7 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 		nodeID.Reset(id)
 		r := jobs.MakeRegistry(
 			ac, s.Stopper(), clock, db, s.InternalExecutor().(sqlutil.InternalExecutor),
-			nodeID, s.ClusterSettings(), server.DefaultHistogramWindowInterval, jobs.FakePHS,
+			nodeID, s.ClusterSettings(), server.DefaultHistogramWindowInterval, jobs.FakePHS, "",
 		)
 		if err := r.Start(ctx, s.Stopper(), nodeLiveness, cancelInterval, adoptInterval); err != nil {
 			t.Fatal(err)
@@ -128,16 +129,22 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 		hookCallCount++
 		lock.Unlock()
 		return jobs.FakeResumer{
-			OnResume: func() error {
+			OnResume: func(ctx context.Context, _ chan<- tree.Datums) error {
 				select {
+				case <-ctx.Done():
+					return ctx.Err()
 				case resumeCalled <- struct{}{}:
 				case <-done:
 				}
 				lock.Lock()
 				resumeCounts[*job.ID()]++
 				lock.Unlock()
-				<-done
-				return nil
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-done:
+					return nil
+				}
 			},
 		}
 	})
@@ -148,7 +155,7 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 			Details:  jobspb.BackupDetails{},
 			Progress: jobspb.BackupProgress{},
 		}
-		job, _, err := newRegistry(nodeid).StartJob(ctx, nil, rec)
+		job, _, err := newRegistry(nodeid).CreateAndStartJob(ctx, nil, rec)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -240,9 +247,13 @@ func TestRegistryResumeActiveLease(t *testing.T) {
 	defer jobs.ResetConstructors()()
 	jobs.RegisterConstructor(jobspb.TypeBackup, func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 		return jobs.FakeResumer{
-			OnResume: func() error {
-				resumeCh <- *job.ID()
-				return nil
+			OnResume: func(ctx context.Context, _ chan<- tree.Datums) error {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case resumeCh <- *job.ID():
+					return nil
+				}
 			},
 		}
 	})

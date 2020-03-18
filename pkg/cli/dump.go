@@ -609,6 +609,7 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 				}
 				var d tree.Datum
 				// TODO(knz): this approach is brittle+flawed, see #28948.
+				// TODO(mjibson): can we use tree.ParseDatumStringAs here?
 				switch t := sv.(type) {
 				case nil:
 					d = tree.DNull
@@ -663,6 +664,13 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 						if err != nil {
 							return err
 						}
+					case types.OidFamily:
+						var i *tree.DInt
+						i, err = tree.ParseDInt(string(t))
+						if err != nil {
+							return err
+						}
+						d = tree.NewDOid(*i)
 					default:
 						return errors.Errorf("unknown []byte type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]])
 					}
@@ -676,6 +684,8 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 					case types.TimeFamily:
 						// pq awkwardly represents TIME as a time.Time with date 0000-01-01.
 						d = tree.MakeDTime(timeofday.FromTime(t))
+					case types.TimeTZFamily:
+						d = tree.NewDTimeTZFromTime(t)
 					case types.TimestampFamily:
 						d = tree.MakeDTimestamp(t, time.Nanosecond)
 					case types.TimestampTZFamily:

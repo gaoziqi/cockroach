@@ -9,21 +9,21 @@
 // licenses/APL.txt.
 
 @require '~styl/base/palette.styl'
+@require '~src/components/core/index.styl'
 
 $table-cell-border = 1px solid $table-border-color
 
 $stats-table-td--fg = $body-color
 
-$stats-table-th--bg     = white
-$stats-table-tr--bg     = white
-$stats-table-tr--bg-alt = $background-color
+$stats-table-th--bg     = $colors--neutral-0
+$stats-table-tr--bg     = $colors--neutral-0
 
 $table-base
   width 100%
-  border $table-cell-border
   border-collapse collapse
-  font-family Lato-Regular
+  font-family SourceSansPro-Regular
   font-weight 300
+  line-height 22px
   font-size 14px
   vertical-align top
   color $stats-table-td--fg
@@ -32,8 +32,8 @@ $table-base
     &--body
       letter-spacing .33px
       background-color $stats-table-tr--bg
-      &:nth-child(odd)
-        background-color $stats-table-tr--bg-alt
+      &:hover
+        background-color $background-color
 
     &--header
       padding 20px
@@ -45,11 +45,26 @@ $table-base
       white-space nowrap
       background-color $stats-table-th--bg
 
+    &--summary
+      background-color $background-color
+      font-family SourceSansPro-SemiBold
+      font-size 14px
+      font-weight bold
+      line-height 1.71
+      letter-spacing 0.1px
+      color $popover-color
+      .bar-chart .label
+        font-family SourceSansPro-Regular
+        font-size 14px
+        font-weight bold
+        line-height 1.71
+        letter-spacing 0.1px
+        color $popover-color
+
   &__cell
     padding 10px 20px
-    border-right $table-cell-border
+    border none
     font-weight inherit
-    vertical-align top
 
     a
       font-weight 400

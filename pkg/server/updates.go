@@ -17,7 +17,6 @@ import (
 	"io"
 	"io/ioutil"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -31,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/cloudinfo"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -82,9 +83,9 @@ const (
 	updateCheckJitterSeconds = 120
 )
 
-var diagnosticReportFrequency = settings.RegisterNonNegativeDurationSetting(
+var diagnosticReportFrequency = settings.RegisterPublicNonNegativeDurationSetting(
 	"diagnostics.reporting.interval",
-	"interval at which diagnostics data should be reported (should be shorter than diagnostics.forced_stat_reset.interval)",
+	"interval at which diagnostics data should be reported",
 	time.Hour,
 )
 
@@ -212,8 +213,8 @@ func fillHardwareInfo(ctx context.Context, n *diagnosticspb.NodeInfo) {
 		n.Hardware.Loadavg15 = float32(l.Load15)
 	}
 
-	n.Hardware.Provider, n.Hardware.InstanceClass = cloudinfo.GetInstanceClass()
-	n.Topology.Provider, n.Topology.Region = cloudinfo.GetInstanceRegion()
+	n.Hardware.Provider, n.Hardware.InstanceClass = cloudinfo.GetInstanceClass(ctx)
+	n.Topology.Provider, n.Topology.Region = cloudinfo.GetInstanceRegion(ctx)
 }
 
 // checkForUpdates calls home to check for new versions for the current platform
@@ -231,7 +232,7 @@ func (s *Server) checkForUpdates(ctx context.Context, runningTime time.Duration)
 
 	addInfoToURL(ctx, updatesURL, s, nodeInfo)
 
-	res, err := http.Get(updatesURL.String())
+	res, err := httputil.Get(ctx, updatesURL.String())
 	if err != nil {
 		// This is probably going to be relatively common in production
 		// environments where network access is usually curtailed.
@@ -282,7 +283,7 @@ func (s *Server) maybeReportDiagnostics(
 	if log.DiagnosticsReportingEnabled.Get(&s.st.SV) {
 		s.reportDiagnostics(ctx)
 	}
-	s.pgServer.SQLServer.ResetSQLStats(ctx)
+	s.pgServer.SQLServer.ResetReportedStats(ctx)
 
 	return scheduled.Add(diagnosticReportFrequency.Get(&s.st.SV))
 }
@@ -350,22 +351,25 @@ func (s *Server) getReportingInfo(
 	// Read the system.settings table to determine the settings for which we have
 	// explicitly set values -- the in-memory SV has the set and default values
 	// flattened for quick reads, but we'd rather only report the non-defaults.
-	if datums, err := s.internalExecutor.Query(
-		ctx, "read-setting", nil /* txn */, "SELECT name FROM system.settings",
+	if datums, err := s.internalExecutor.QueryEx(
+		ctx, "read-setting", nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		"SELECT name FROM system.settings",
 	); err != nil {
 		log.Warningf(ctx, "failed to read settings: %s", err)
 	} else {
 		info.AlteredSettings = make(map[string]string, len(datums))
 		for _, row := range datums {
 			name := string(tree.MustBeDString(row[0]))
-			info.AlteredSettings[name] = settings.SanitizedValue(name, &s.st.SV)
+			info.AlteredSettings[name] = settings.RedactedValue(name, &s.st.SV)
 		}
 	}
 
-	if datums, err := s.internalExecutor.Query(
+	if datums, err := s.internalExecutor.QueryEx(
 		ctx,
 		"read-zone-configs",
 		nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		"SELECT id, config FROM system.zones",
 	); err != nil {
 		log.Warning(ctx, err)
@@ -388,7 +392,7 @@ func (s *Server) getReportingInfo(
 		}
 	}
 
-	info.SqlStats = s.pgServer.SQLServer.GetScrubbedStmtStats()
+	info.SqlStats = s.pgServer.SQLServer.GetScrubbedReportingStats()
 	return &info
 }
 
@@ -455,18 +459,7 @@ func (s *Server) reportDiagnostics(ctx context.Context) {
 	}
 	addInfoToURL(ctx, reportingURL, s, report.Node)
 
-	const timeout = 3 * time.Second
-	client := &http.Client{
-		Transport: &http.Transport{
-			// Don't leak a goroutine on OSX (the TCP level timeout is probably
-			// much higher than on linux) when the connection fails in weird ways.
-			DialContext:       (&net.Dialer{Timeout: timeout}).DialContext,
-			DisableKeepAlives: true,
-		},
-		Timeout: timeout,
-	}
-
-	res, err := client.Post(reportingURL.String(), "application/x-protobuf", bytes.NewReader(b))
+	res, err := httputil.Post(ctx, reportingURL.String(), "application/x-protobuf", bytes.NewReader(b))
 	if err != nil {
 		if log.V(2) {
 			// This is probably going to be relatively common in production

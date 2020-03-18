@@ -121,7 +121,7 @@ func TestLoadEmbeddedCerts(t *testing.T) {
 func countLoadedCertificates(certsDir string) (int, error) {
 	cl := security.NewCertificateLoader(certsDir)
 	if err := cl.Load(); err != nil {
-		return 0, nil
+		return 0, err
 	}
 	return len(cl.Certificates()), nil
 }
@@ -284,7 +284,7 @@ func TestNamingScheme(t *testing.T) {
 			},
 			certs: []security.CertInfo{
 				{FileUsage: security.ClientPem, Filename: "client.root.crt", Name: "root",
-					Error: errors.New("client certificate has Subject \"CN=notroot\", expected \"CN=root")},
+					Error: errors.New(`client certificate has principals \["notroot"\], expected "root"`)},
 				{FileUsage: security.NodePem, Filename: "node.crt", KeyFilename: "node.key",
 					FileContents: badUserNodeCert, KeyFileContents: []byte("node.key")},
 			},

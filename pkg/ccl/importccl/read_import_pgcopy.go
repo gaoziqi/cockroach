@@ -39,12 +39,13 @@ type pgCopyReader struct {
 var _ inputConverter = &pgCopyReader{}
 
 func newPgCopyReader(
+	ctx context.Context,
 	kvCh chan row.KVBatch,
 	opts roachpb.PgCopyOptions,
 	tableDesc *sqlbase.TableDescriptor,
 	evalCtx *tree.EvalContext,
 ) (*pgCopyReader, error) {
-	conv, err := row.NewDatumRowConverter(tableDesc, nil /* targetColNames */, evalCtx, kvCh)
+	conv, err := row.NewDatumRowConverter(ctx, tableDesc, nil /* targetColNames */, evalCtx, kvCh)
 	if err != nil {
 		return nil, err
 	}
@@ -57,17 +58,14 @@ func newPgCopyReader(
 func (d *pgCopyReader) start(ctx ctxgroup.Group) {
 }
 
-func (d *pgCopyReader) inputFinished(ctx context.Context) {
-	close(d.conv.KvCh)
-}
-
 func (d *pgCopyReader) readFiles(
 	ctx context.Context,
 	dataFiles map[int32]string,
+	resumePos map[int32]int64,
 	format roachpb.IOFileFormat,
 	makeExternalStorage cloud.ExternalStorageFactory,
 ) error {
-	return readInputFiles(ctx, dataFiles, format, d.readFile, makeExternalStorage)
+	return readInputFiles(ctx, dataFiles, resumePos, format, d.readFile, makeExternalStorage)
 }
 
 type postgreStreamCopy struct {
@@ -257,7 +255,7 @@ func (c copyData) String() string {
 }
 
 func (d *pgCopyReader) readFile(
-	ctx context.Context, input *fileReader, inputIdx int32, inputName string, rejected chan string,
+	ctx context.Context, input *fileReader, inputIdx int32, resumePos int64, rejected chan string,
 ) error {
 	s := bufio.NewScanner(input)
 	s.Split(bufio.ScanLines)
@@ -269,34 +267,43 @@ func (d *pgCopyReader) readFile(
 	)
 	d.conv.KvBatch.Source = inputIdx
 	d.conv.FractionFn = input.ReadFraction
+	count := int64(1)
+	d.conv.CompletedRowFn = func() int64 {
+		return count
+	}
 
-	for count := int64(1); ; count++ {
+	for ; ; count++ {
 		row, err := c.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return wrapRowErr(err, inputName, count, pgcode.Uncategorized, "")
+			return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 		}
+
+		if count <= resumePos {
+			continue
+		}
+
 		if len(row) != len(d.conv.VisibleColTypes) {
-			return makeRowErr(inputName, count, pgcode.Syntax,
+			return makeRowErr("", count, pgcode.Syntax,
 				"expected %d values, got %d", len(d.conv.VisibleColTypes), len(row))
 		}
 		for i, s := range row {
 			if s == nil {
 				d.conv.Datums[i] = tree.DNull
 			} else {
-				d.conv.Datums[i], err = tree.ParseDatumStringAs(d.conv.VisibleColTypes[i], *s, d.conv.EvalCtx)
+				d.conv.Datums[i], err = sqlbase.ParseDatumStringAs(d.conv.VisibleColTypes[i], *s, d.conv.EvalCtx)
 				if err != nil {
 					col := d.conv.VisibleCols[i]
-					return wrapRowErr(err, inputName, count, pgcode.Syntax,
+					return wrapRowErr(err, "", count, pgcode.Syntax,
 						"parse %q as %s", col.Name, col.Type.SQLString())
 				}
 			}
 		}
 
 		if err := d.conv.Row(ctx, inputIdx, count); err != nil {
-			return wrapRowErr(err, inputName, count, pgcode.Uncategorized, "")
+			return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 		}
 	}
 

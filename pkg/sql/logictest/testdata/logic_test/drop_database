@@ -34,10 +34,15 @@ postgres
 system
 test
 
+# The "updating privileges" clause in the SELECT statement is for excluding jobs
+# run by an unrelated startup migration.
+# TODO (lucy): Update this if/when we decide to change how these jobs queued by
+# the startup migration are handled.
 query TT
-SELECT status, running_status FROM [SHOW JOBS]
+SELECT job_type, status FROM [SHOW JOBS] WHERE description != 'updating privileges'
 ----
-running  waiting for GC TTL
+SCHEMA CHANGE       succeeded
+SCHEMA CHANGE GC    running
 
 statement ok
 CREATE DATABASE "foo bar"

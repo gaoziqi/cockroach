@@ -293,8 +293,8 @@ func (s *bankState) startSplitMonkey(ctx context.Context, d time.Duration, c *cl
 				zipF := accountDistribution(r)
 				key := zipF.Uint64()
 				c.l.Printf("round %d: splitting key %v\n", curRound, key)
-				_, err := client.db.ExecContext(ctx, fmt.Sprintf(
-					`SET experimental_force_split_at = true; ALTER TABLE bank.accounts SPLIT AT VALUES (%d)`, key))
+				_, err := client.db.ExecContext(ctx,
+					fmt.Sprintf(`ALTER TABLE bank.accounts SPLIT AT VALUES (%d)`, key))
 				if err != nil && !(pgerror.IsSQLRetryableError(err) || isExpectedRelocateError(err)) {
 					s.errChan <- err
 				}
@@ -342,6 +342,7 @@ func isExpectedRelocateError(err error) bool {
 		"unable to add replica .* which is already present",
 		"received invalid ChangeReplicasTrigger .* to remove self",
 		"failed to apply snapshot: raft group deleted",
+		"snapshot failed:",
 	}
 	pattern := "(" + strings.Join(whitelist, "|") + ")"
 	return testutils.IsError(err, pattern)

@@ -62,6 +62,22 @@ var (
 		"pgurl", "postgresql://localhost:26257/?sslmode=disable&user=root",
 		"the database url to connect to",
 	)
+
+	formatFlags = map[string]memo.ExprFmtFlags{
+		"miscprops":   memo.ExprFmtHideMiscProps,
+		"constraints": memo.ExprFmtHideConstraints,
+		"funcdeps":    memo.ExprFmtHideFuncDeps,
+		"ruleprops":   memo.ExprFmtHideRuleProps,
+		"stats":       memo.ExprFmtHideStats,
+		"cost":        memo.ExprFmtHideCost,
+		"qual":        memo.ExprFmtHideQualifications,
+		"scalars":     memo.ExprFmtHideScalars,
+		"physprops":   memo.ExprFmtHidePhysProps,
+		"types":       memo.ExprFmtHideTypes,
+		"notnull":     memo.ExprFmtHideNotNull,
+		"columns":     memo.ExprFmtHideColumns,
+		"all":         memo.ExprFmtHideAll,
+	}
 )
 
 // RuleSet efficiently stores an unordered set of RuleNames.
@@ -122,6 +138,10 @@ type Flags struct {
 	// ExploreTraceRule restricts the ExploreTrace output to only show the effects
 	// of a specific rule.
 	ExploreTraceRule opt.RuleName
+
+	// ExploreTraceSkipNoop hides the ExploreTrace output for instances of rules
+	// that fire but don't add any new expressions to the memo.
+	ExploreTraceSkipNoop bool
 
 	// ExpectedRules is a set of rules which must be exercised for the test to
 	// pass.
@@ -186,6 +206,7 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	ot.evalCtx.SessionData.ZigzagJoinEnabled = true
 	ot.evalCtx.SessionData.OptimizerFKs = true
 	ot.evalCtx.SessionData.ReorderJoinsLimit = opt.DefaultJoinOrderLimit
+	ot.evalCtx.SessionData.InsertFastPath = true
 
 	return ot
 }
@@ -259,15 +280,16 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    stats to the catalog. This allows commonly-used schemas such as TPC-C or
 //    TPC-H to be used by multiple test files without copying the schemas and
 //    stats multiple times. The file name must be provided with the file flag.
-//    The path of the file should be relative to testutils/opttester/testdata.
+//    The path of the file should be relative to
+//    testutils/opttester/testfixtures.
 //
 // Supported flags:
 //
 //  - format: controls the formatting of expressions for build, opt, and
-//    optsteps commands. Possible values: show-all, hide-all, or any combination
-//    of hide-cost, hide-stats, hide-constraints, hide-scalars, hide-qual.
-//    For example:
-//      build format=(hide-cost,hide-stats)
+//    optsteps commands. Format flags are of the form
+//      (show|hide)-(all|miscprops|constraints|scalars|types|...)
+//    See formatFlags for all flags. Multiple flags can be specified; each flag
+//    modifies the existing set of the flags.
 //
 //  - allow-unsupported: wrap unsupported expressions in UnsupportedOp.
 //
@@ -284,6 +306,9 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //  - rule: used with exploretrace; the value is the name of a rule. When
 //    specified, the exploretrace output is filtered to only show expression
 //    changes due to that specific rule.
+//
+//  - skip-no-op: used with exploretrace; hide instances of rules that don't
+//    generate any new expressions.
 //
 //  - colstat: requests the calculation of a column statistic on the top-level
 //    expression. The value is a column or a list of columns. The flag can
@@ -359,7 +384,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			return fmt.Sprintf("error: %s\n", text)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "norm":
 		e, err := ot.OptNorm()
@@ -376,7 +401,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			return fmt.Sprintf("error: %s\n", text)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "opt":
 		e, err := ot.Optimize()
@@ -384,7 +409,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "optsteps":
 		result, err := ot.OptSteps()
@@ -420,7 +445,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "exprnorm":
 		e, err := ot.ExprNorm()
@@ -428,7 +453,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "save-tables":
 		e, err := ot.SaveTables()
@@ -436,7 +461,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "stats":
 		result, err := ot.Stats(d)
@@ -453,6 +478,15 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		d.Fatalf(tb, "unsupported command: %s", d.Cmd)
 		return ""
 	}
+}
+
+// FormatExpr is a convenience wrapper for memo.FormatExpr.
+func (ot *OptTester) FormatExpr(e opt.Expr) string {
+	var mem *memo.Memo
+	if rel, ok := e.(memo.RelExpr); ok {
+		mem = rel.Memo()
+	}
+	return memo.FormatExpr(e, ot.Flags.ExprFormat, mem, ot.catalog)
 }
 
 func formatRuleSet(r RuleSet) string {
@@ -524,30 +558,22 @@ func ruleNamesToRuleSet(args []string) (RuleSet, error) {
 func (f *Flags) Set(arg datadriven.CmdArg) error {
 	switch arg.Key {
 	case "format":
-		f.ExprFormat = 0
 		if len(arg.Vals) == 0 {
 			return fmt.Errorf("format flag requires value(s)")
 		}
 		for _, v := range arg.Vals {
-			m := map[string]memo.ExprFmtFlags{
-				"show-all":         memo.ExprFmtShowAll,
-				"hide-miscprops":   memo.ExprFmtHideMiscProps,
-				"hide-constraints": memo.ExprFmtHideConstraints,
-				"hide-funcdeps":    memo.ExprFmtHideFuncDeps,
-				"hide-ruleprops":   memo.ExprFmtHideRuleProps,
-				"hide-stats":       memo.ExprFmtHideStats,
-				"hide-cost":        memo.ExprFmtHideCost,
-				"hide-qual":        memo.ExprFmtHideQualifications,
-				"hide-scalars":     memo.ExprFmtHideScalars,
-				"hide-orderings":   memo.ExprFmtHideOrderings,
-				"hide-types":       memo.ExprFmtHideTypes,
-				"hide-columns":     memo.ExprFmtHideColumns,
-				"hide-all":         memo.ExprFmtHideAll,
-			}
-			if val, ok := m[v]; ok {
-				f.ExprFormat |= val
-			} else {
+			// Format values are of the form (hide|show)-(flag). These flags modify
+			// the default flags for the test and multiple flags are applied in order.
+			parts := strings.SplitN(v, "-", 2)
+			if len(parts) != 2 ||
+				(parts[0] != "show" && parts[0] != "hide") ||
+				formatFlags[parts[1]] == 0 {
 				return fmt.Errorf("unknown format value %s", v)
+			}
+			if parts[0] == "hide" {
+				f.ExprFormat |= formatFlags[parts[1]]
+			} else {
+				f.ExprFormat &= ^formatFlags[parts[1]]
 			}
 		}
 
@@ -590,6 +616,9 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 		if err != nil {
 			return err
 		}
+
+	case "skip-no-op":
+		f.ExploreTraceSkipNoop = true
 
 	case "expect":
 		var err error
@@ -711,7 +740,7 @@ func (ot *OptTester) Optimize() (opt.Expr, error) {
 // by the optimizer.
 func (ot *OptTester) Memo() (string, error) {
 	var o xform.Optimizer
-	o.Init(&ot.evalCtx)
+	o.Init(&ot.evalCtx, ot.catalog)
 	if _, err := ot.optimizeExpr(&o); err != nil {
 		return "", err
 	}
@@ -721,7 +750,7 @@ func (ot *OptTester) Memo() (string, error) {
 // Expr parses the input directly into an expression; see exprgen.Build.
 func (ot *OptTester) Expr() (opt.Expr, error) {
 	var f norm.Factory
-	f.Init(&ot.evalCtx)
+	f.Init(&ot.evalCtx, ot.catalog)
 	f.DisableOptimizations()
 
 	return exprgen.Build(ot.catalog, &f, ot.sql)
@@ -731,7 +760,7 @@ func (ot *OptTester) Expr() (opt.Expr, error) {
 // normalization; see exprgen.Build.
 func (ot *OptTester) ExprNorm() (opt.Expr, error) {
 	var f norm.Factory
-	f.Init(&ot.evalCtx)
+	f.Init(&ot.evalCtx, ot.catalog)
 
 	f.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
 		// exprgen.Build doesn't run optimization, so we don't need to explicitly
@@ -880,7 +909,7 @@ func (ot *OptTester) OptSteps() (string, error) {
 			return "", err
 		}
 
-		next = memo.FormatExpr(os.Root(), ot.Flags.ExprFormat, ot.catalog)
+		next = os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat)
 
 		// This call comes after setting "next", because we want to output the
 		// final expression, even though there were no diffs from the previous
@@ -992,7 +1021,11 @@ func (ot *OptTester) ExploreTrace() (string, error) {
 
 	et := newExploreTracer(ot)
 
-	for {
+	for step := 0; ; step++ {
+		if step > 2000 {
+			ot.output("step limit reached\n")
+			break
+		}
 		err := et.Next()
 		if err != nil {
 			return "", err
@@ -1005,6 +1038,10 @@ func (ot *OptTester) ExploreTrace() (string, error) {
 			et.LastRuleName() != ot.Flags.ExploreTraceRule {
 			continue
 		}
+		newNodes := et.NewExprs()
+		if ot.Flags.ExploreTraceSkipNoop && len(newNodes) == 0 {
+			continue
+		}
 
 		if ot.builder.Len() > 0 {
 			ot.output("\n")
@@ -1013,14 +1050,13 @@ func (ot *OptTester) ExploreTrace() (string, error) {
 		ot.output("%s\n", et.LastRuleName())
 		ot.separator("=")
 		ot.output("Source expression:\n")
-		ot.indent(memo.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat, ot.catalog))
-		newNodes := et.NewExprs()
+		ot.indent(et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat))
 		if len(newNodes) == 0 {
 			ot.output("\nNo new expressions.\n")
 		}
 		for i := range newNodes {
 			ot.output("\nNew expression %d of %d:\n", i+1, len(newNodes))
-			ot.indent(memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat, ot.catalog))
+			ot.indent(memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat, et.fo.o.Memo(), ot.catalog))
 		}
 	}
 	return ot.builder.String(), nil
@@ -1045,15 +1081,15 @@ func (ot *OptTester) Stats(d *datadriven.TestData) (string, error) {
 // TPC-C or TPC-H to be used by multiple test files without copying the schemas
 // and stats multiple times.
 func (ot *OptTester) Import(tb testing.TB) {
-	// Find the file to be imported in opttester/testdata.
+	// Find the file to be imported in opttester/testfixtures.
 	_, optTesterFile, _, ok := runtime.Caller(1)
 	if !ok {
 		tb.Fatalf("unable to find file %s", ot.Flags.File)
 	}
-	path := filepath.Join(filepath.Dir(optTesterFile), "testdata", ot.Flags.File)
-	datadriven.RunTest(tb.(*testing.T), path, func(d *datadriven.TestData) string {
+	path := filepath.Join(filepath.Dir(optTesterFile), "testfixtures", ot.Flags.File)
+	datadriven.RunTest(tb.(*testing.T), path, func(t *testing.T, d *datadriven.TestData) string {
 		tester := New(ot.catalog, d.Input)
-		return tester.RunCommand(tb.(*testing.T), d)
+		return tester.RunCommand(t, d)
 	})
 }
 
@@ -1253,7 +1289,7 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 
 func (ot *OptTester) makeOptimizer() *xform.Optimizer {
 	var o xform.Optimizer
-	o.Init(&ot.evalCtx)
+	o.Init(&ot.evalCtx, ot.catalog)
 	return &o
 }
 

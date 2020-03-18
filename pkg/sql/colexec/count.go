@@ -29,25 +29,19 @@ type countOp struct {
 	count         int64
 }
 
-var _ StaticMemoryOperator = &countOp{}
+var _ Operator = &countOp{}
 
 // NewCountOp returns a new count operator that counts the rows in its input.
-func NewCountOp(input Operator) Operator {
+func NewCountOp(allocator *Allocator, input Operator) Operator {
 	c := &countOp{
 		OneInputNode: NewOneInputNode(input),
 	}
-	c.internalBatch = coldata.NewMemBatchWithSize([]coltypes.T{coltypes.Int64}, 1)
+	c.internalBatch = allocator.NewMemBatchWithSize([]coltypes.T{coltypes.Int64}, 1)
 	return c
-}
-
-func (c *countOp) EstimateStaticMemoryUsage() int {
-	return EstimateBatchSizeBytes([]coltypes.T{coltypes.Int64}, 1)
 }
 
 func (c *countOp) Init() {
 	c.input.Init()
-	// Our output is always just one row.
-	c.internalBatch.SetLength(1)
 	c.count = 0
 	c.done = false
 }
@@ -55,8 +49,7 @@ func (c *countOp) Init() {
 func (c *countOp) Next(ctx context.Context) coldata.Batch {
 	c.internalBatch.ResetInternalBatch()
 	if c.done {
-		c.internalBatch.SetLength(0)
-		return c.internalBatch
+		return coldata.ZeroBatch
 	}
 	for {
 		bat := c.input.Next(ctx)
@@ -64,6 +57,7 @@ func (c *countOp) Next(ctx context.Context) coldata.Batch {
 		if length == 0 {
 			c.done = true
 			c.internalBatch.ColVec(0).Int64()[0] = c.count
+			c.internalBatch.SetLength(1)
 			return c.internalBatch
 		}
 		c.count += int64(length)

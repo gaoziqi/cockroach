@@ -11,6 +11,7 @@
 package settings_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -23,8 +24,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
-
-const maxSettings = 256
 
 type dummy struct {
 	msg1       string
@@ -70,40 +69,60 @@ func (d *dummy) String() string {
 	return fmt.Sprintf("&{%s %s}", d.msg1, d.growsbyone)
 }
 
-var dummyTransformer = func(sv *settings.Values, old []byte, update *string) ([]byte, interface{}, error) {
+type dummyTransformer struct{}
+
+var _ settings.StateMachineSettingImpl = &dummyTransformer{}
+
+func (d *dummyTransformer) Decode(val []byte) (interface{}, error) {
 	var oldD dummy
-
-	// If no old value supplied, fill in the default.
-	if old == nil {
-		oldD.msg1 = "default"
-		oldD.growsbyone = "-"
-		var err error
-		old, err = oldD.Marshal()
-		if err != nil {
-			return nil, nil, err
-		}
+	if err := protoutil.Unmarshal(val, &oldD); err != nil {
+		return nil, err
 	}
+	return oldD, nil
+}
+
+func (d *dummyTransformer) DecodeToString(val []byte) (string, error) {
+	dum, err := d.Decode(val)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%v", dum), nil
+}
+
+func (d *dummyTransformer) ValidateLogical(
+	ctx context.Context, sv *settings.Values, old []byte, newV string,
+) ([]byte, error) {
+	var oldD dummy
 	if err := protoutil.Unmarshal(old, &oldD); err != nil {
-		return nil, nil, err
-	}
-
-	if update == nil {
-		// Round-trip the existing value, but only if it passes sanity checks.
-		b, err := oldD.Marshal()
-		if err != nil {
-			return nil, nil, err
-		}
-		return b, &oldD, err
+		return nil, err
 	}
 
 	// We have a new proposed update to the value, validate it.
-	if len(*update) != len(oldD.growsbyone)+1 {
-		return nil, nil, errors.New("dashes component must grow by exactly one")
+	if len(newV) != len(oldD.growsbyone)+1 {
+		return nil, errors.New("dashes component must grow by exactly one")
 	}
 	newD := oldD
-	newD.growsbyone = *update
+	newD.growsbyone = newV
 	b, err := newD.Marshal()
-	return b, &newD, err
+	return b, err
+}
+
+func (d *dummyTransformer) ValidateGossipUpdate(
+	ctx context.Context, sv *settings.Values, val []byte,
+) error {
+	var updateVal dummy
+	return protoutil.Unmarshal(val, &updateVal)
+}
+
+func (d *dummyTransformer) SettingsListDefault() string {
+	panic("unimplemented")
+}
+
+// BeforeChange is part of the StateMachineSettingImpl interface.
+func (d *dummyTransformer) BeforeChange(
+	ctx context.Context, encodedVal []byte, sv *settings.Values,
+) {
+	// noop
 }
 
 const mb = int64(1024 * 1024)
@@ -129,10 +148,11 @@ var fA = settings.RegisterFloatSetting("f", "desc", 5.4)
 var dA = settings.RegisterDurationSetting("d", "desc", time.Second)
 var eA = settings.RegisterEnumSetting("e", "desc", "foo", map[int64]string{1: "foo", 2: "bar", 3: "baz"})
 var byteSize = settings.RegisterByteSizeSetting("zzz", "desc", mb)
-var mA = settings.RegisterStateMachineSetting("statemachine", "foo", dummyTransformer)
+var mA = settings.RegisterStateMachineSettingImpl("statemachine", "foo", &dummyTransformer{})
 
 func init() {
-	settings.RegisterBoolSetting("sekretz", "desc", false).SetConfidential()
+	settings.RegisterBoolSetting("sekretz", "desc", false).SetReportable(false)
+	settings.RegisterBoolSetting("rezervedz", "desc", false).SetVisibility(settings.Reserved)
 }
 
 var strVal = settings.RegisterValidatedStringSetting(
@@ -162,6 +182,7 @@ var iVal = settings.RegisterValidatedIntSetting(
 	})
 
 func TestCache(t *testing.T) {
+	ctx := context.Background()
 	sv := &settings.Values{}
 	sv.Init(settings.TestOpaque)
 
@@ -175,35 +196,49 @@ func TestCache(t *testing.T) {
 	mA.SetOnChange(sv, func() { changes.mA++ })
 
 	t.Run("StateMachineSetting", func(t *testing.T) {
-		mB := settings.RegisterStateMachineSetting("local.m", "foo", dummyTransformer)
-		if exp, act := "&{default -}", mB.String(sv); exp != act {
+		u := settings.NewUpdater(sv)
+		mB := settings.RegisterStateMachineSettingImpl("local.m", "foo", &dummyTransformer{})
+		// State-machine settings don't have defaults, so we need to start by
+		// setting it to something.
+		if err := u.Set("local.m", "default.X", "m"); err != nil {
+			t.Fatal(err)
+		}
+
+		if exp, act := "{default X}", mB.String(sv); exp != act {
 			t.Fatalf("wanted %q, got %q", exp, act)
 		}
+
 		growsTooFast := "grows too fast"
-		if _, _, err := mB.Validate(sv, nil, &growsTooFast); !testutils.IsError(err, "must grow by exactly one") {
+		curVal := []byte(mB.Get(sv))
+		if _, err := mB.Validate(ctx, sv, curVal, growsTooFast); !testutils.IsError(err,
+			"must grow by exactly one") {
 			t.Fatal(err)
 		}
+
 		hasDots := "a."
-		if _, _, err := mB.Validate(sv, nil, &hasDots); !testutils.IsError(err, "must not contain dots") {
+		if _, err := mB.Validate(ctx, sv, curVal, hasDots); !testutils.IsError(err,
+			"must not contain dots") {
 			t.Fatal(err)
 		}
+
 		ab := "ab"
-		if _, _, err := mB.Validate(sv, nil, &ab); err != nil {
+		if _, err := mB.Validate(ctx, sv, curVal, ab); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := mB.Validate(sv, []byte("takes.precedence"), &ab); !testutils.IsError(err, "must grow by exactly one") {
+
+		if _, err := mB.Validate(ctx, sv, []byte("takes.precedence"), ab); !testutils.IsError(err,
+			"must grow by exactly one") {
 			t.Fatal(err)
 		}
 		precedenceX := "precedencex"
-		if _, _, err := mB.Validate(sv, []byte("takes.precedence"), &precedenceX); err != nil {
+		if _, err := mB.Validate(ctx, sv, []byte("takes.precedence"), precedenceX); err != nil {
 			t.Fatal(err)
 		}
-		u := settings.NewUpdater(sv)
 		if err := u.Set("local.m", "default.XX", "m"); err != nil {
 			t.Fatal(err)
 		}
 		u.ResetRemaining()
-		if exp, act := "&{default XX}", mB.String(sv); exp != act {
+		if exp, act := "{default XX}", mB.String(sv); exp != act {
 			t.Fatalf("wanted %q, got %q", exp, act)
 		}
 	})
@@ -254,37 +289,36 @@ func TestCache(t *testing.T) {
 		if expected, actual := int64(1), eA.Get(sv); expected != actual {
 			t.Fatalf("expected %v, got %v", expected, actual)
 		}
-		if expected, actual := "default.-", mA.Get(sv); expected != actual {
-			t.Fatalf("expected %v, got %v", expected, actual)
-		}
+		// Note that we don't test the state-machine setting for a default, since it
+		// doesn't have one and it would crash.
 	})
 
 	t.Run("lookup", func(t *testing.T) {
-		if actual, ok := settings.Lookup("i.1"); !ok || i1A != actual {
+		if actual, ok := settings.Lookup("i.1", settings.LookupForLocalAccess); !ok || i1A != actual {
 			t.Fatalf("expected %v, got %v (exists: %v)", i1A, actual, ok)
 		}
-		if actual, ok := settings.Lookup("i.Val"); !ok || iVal != actual {
+		if actual, ok := settings.Lookup("i.Val", settings.LookupForLocalAccess); !ok || iVal != actual {
 			t.Fatalf("expected %v, got %v (exists: %v)", iVal, actual, ok)
 		}
-		if actual, ok := settings.Lookup("f"); !ok || fA != actual {
+		if actual, ok := settings.Lookup("f", settings.LookupForLocalAccess); !ok || fA != actual {
 			t.Fatalf("expected %v, got %v (exists: %v)", fA, actual, ok)
 		}
-		if actual, ok := settings.Lookup("fVal"); !ok || fVal != actual {
+		if actual, ok := settings.Lookup("fVal", settings.LookupForLocalAccess); !ok || fVal != actual {
 			t.Fatalf("expected %v, got %v (exists: %v)", fVal, actual, ok)
 		}
-		if actual, ok := settings.Lookup("d"); !ok || dA != actual {
+		if actual, ok := settings.Lookup("d", settings.LookupForLocalAccess); !ok || dA != actual {
 			t.Fatalf("expected %v, got %v (exists: %v)", dA, actual, ok)
 		}
-		if actual, ok := settings.Lookup("dVal"); !ok || dVal != actual {
+		if actual, ok := settings.Lookup("dVal", settings.LookupForLocalAccess); !ok || dVal != actual {
 			t.Fatalf("expected %v, got %v (exists: %v)", dVal, actual, ok)
 		}
-		if actual, ok := settings.Lookup("e"); !ok || eA != actual {
+		if actual, ok := settings.Lookup("e", settings.LookupForLocalAccess); !ok || eA != actual {
 			t.Fatalf("expected %v, got %v (exists: %v)", eA, actual, ok)
 		}
-		if actual, ok := settings.Lookup("statemachine"); !ok || mA != actual {
+		if actual, ok := settings.Lookup("statemachine", settings.LookupForLocalAccess); !ok || mA != actual {
 			t.Fatalf("expected %v, got %v (exists: %v)", mA, actual, ok)
 		}
-		if actual, ok := settings.Lookup("dne"); ok {
+		if actual, ok := settings.Lookup("dne", settings.LookupForLocalAccess); ok {
 			t.Fatalf("expected nothing, got %v", actual)
 		}
 	})
@@ -603,33 +637,33 @@ func TestCache(t *testing.T) {
 
 }
 
-func TestHide(t *testing.T) {
-	keys := make(map[string]struct{})
-	for _, k := range settings.Keys() {
-		keys[k] = struct{}{}
+func TestIsReportable(t *testing.T) {
+	if v, ok := settings.Lookup("bool.t", settings.LookupForLocalAccess); !ok || !settings.TestingIsReportable(v) {
+		t.Errorf("expected 'bool.t' to be marked as isReportable() = true")
 	}
-	if _, ok := keys["bool.t"]; !ok {
-		t.Errorf("expected 'bool.t' to be unhidden")
-	}
-	if _, ok := keys["sekretz"]; ok {
-		t.Errorf("expected 'sekretz' to be hidden")
+	if v, ok := settings.Lookup("sekretz", settings.LookupForLocalAccess); !ok || settings.TestingIsReportable(v) {
+		t.Errorf("expected 'sekretz' to be marked as isReportable() = false")
 	}
 }
 
 func TestOnChangeWithMaxSettings(t *testing.T) {
-	// Register maxSettings settings to ensure that no errors occur.
-	maxName, err := batchRegisterSettings(t, t.Name(), maxSettings-1-len(settings.Keys()))
+	// Register MaxSettings settings to ensure that no errors occur.
+	maxName, err := batchRegisterSettings(t, t.Name(), settings.MaxSettings-settings.NumRegisteredSettings())
 	if err != nil {
-		t.Errorf("expected no error to register 128 settings, but get error : %s", err)
+		t.Fatalf("expected no error to register %d settings, but get error: %v", settings.MaxSettings, err)
 	}
 
 	// Change the max slotIdx setting to ensure that no errors occur.
 	sv := &settings.Values{}
 	sv.Init(settings.TestOpaque)
 	var changes int
-	intSetting, ok := settings.Lookup(maxName)
+	s, ok := settings.Lookup(maxName, settings.LookupForLocalAccess)
 	if !ok {
-		t.Errorf("expected lookup of %s to succeed", maxName)
+		t.Fatalf("expected lookup of %s to succeed", maxName)
+	}
+	intSetting, ok := s.(*settings.IntSetting)
+	if !ok {
+		t.Fatalf("expected int setting, got %T", s)
 	}
 	intSetting.SetOnChange(sv, func() { changes++ })
 
@@ -644,18 +678,13 @@ func TestOnChangeWithMaxSettings(t *testing.T) {
 }
 
 func TestMaxSettingsPanics(t *testing.T) {
-	var origRegistry = make(map[string]settings.Setting)
-	for k, v := range settings.Registry {
-		origRegistry[k] = v
-	}
-	defer func() {
-		settings.Registry = origRegistry
-	}()
+	defer settings.TestingSaveRegistry()()
 
 	// Register too many settings which will cause a panic which is caught and converted to an error.
-	_, err := batchRegisterSettings(t, t.Name(), maxSettings-len(settings.Keys()))
-	expectedErr := "too many settings; increase maxSettings"
-	if err == nil || err.Error() != expectedErr {
+	_, err := batchRegisterSettings(t, t.Name(),
+		settings.MaxSettings-settings.NumRegisteredSettings()+1)
+	expectedErr := "too many settings; increase MaxSettings"
+	if !testutils.IsError(err, expectedErr) {
 		t.Errorf("expected error %v, but got %v", expectedErr, err)
 	}
 

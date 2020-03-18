@@ -15,8 +15,11 @@ package execinfra
 import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -25,11 +28,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
-	"github.com/cockroachdb/cockroach/pkg/storage/diskmap"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/marusama/semaphore"
 )
 
 // Version identifies the distsql protocol version.
@@ -58,27 +61,29 @@ import (
 //
 // ATTENTION: When updating these fields, add to version_history.txt explaining
 // what changed.
-const Version execinfrapb.DistSQLVersion = 24
+const Version execinfrapb.DistSQLVersion = 28
 
 // MinAcceptedVersion is the oldest version that the server is
 // compatible with; see above.
-const MinAcceptedVersion execinfrapb.DistSQLVersion = 24
+const MinAcceptedVersion execinfrapb.DistSQLVersion = 27
 
 // SettingUseTempStorageJoins is a cluster setting that configures whether
 // joins are allowed to spill to disk.
 // TODO(yuzefovich): remove this setting.
-var SettingUseTempStorageJoins = settings.RegisterBoolSetting(
+var SettingUseTempStorageJoins = settings.RegisterPublicBoolSetting(
 	"sql.distsql.temp_storage.joins",
-	"set to true to enable use of disk for distributed sql joins",
+	"set to true to enable use of disk for distributed sql joins. "+
+		"Note that disabling this can have negative impact on memory usage and performance.",
 	true,
 )
 
 // SettingUseTempStorageSorts is a cluster setting that configures whether
 // sorts are allowed to spill to disk.
 // TODO(yuzefovich): remove this setting.
-var SettingUseTempStorageSorts = settings.RegisterBoolSetting(
+var SettingUseTempStorageSorts = settings.RegisterPublicBoolSetting(
 	"sql.distsql.temp_storage.sorts",
-	"set to true to enable use of disk for distributed sql sorts",
+	"set to true to enable use of disk for distributed sql sorts. "+
+		"Note that disabling this can have negative impact on memory usage and performance.",
 	true,
 )
 
@@ -99,7 +104,7 @@ type ServerConfig struct {
 	RuntimeStats RuntimeStats
 
 	// DB is a handle to the cluster.
-	DB *client.DB
+	DB *kv.DB
 	// Executor can be used to run "internal queries". Note that Flows also have
 	// access to an executor in the EvalContext. That one is "session bound"
 	// whereas this one isn't.
@@ -109,7 +114,7 @@ type ServerConfig struct {
 	// This DB has to be set such that it bypasses the local TxnCoordSender. We
 	// want only the TxnCoordSender on the gateway to be involved with requests
 	// performed by DistSQL.
-	FlowDB       *client.DB
+	FlowDB       *kv.DB
 	RPCContext   *rpc.Context
 	Stopper      *stop.Stopper
 	TestingKnobs TestingKnobs
@@ -121,6 +126,18 @@ type ServerConfig struct {
 	// TempStorage is used by some DistSQL processors to store rows when the
 	// working set is larger than can be stored in memory.
 	TempStorage diskmap.Factory
+
+	// TempStoragePath is the path where the vectorized execution engine should
+	// create files using TempFS.
+	TempStoragePath string
+
+	// TempFS is used by the vectorized execution engine to store columns when the
+	// working set is larger than can be stored in memory.
+	TempFS fs.FS
+
+	// VecFDSemaphore is a weighted semaphore that restricts the number of open
+	// file descriptors in the vectorized engine.
+	VecFDSemaphore semaphore.Semaphore
 
 	// BulkAdder is used by some processors to bulk-ingest data as SSTs.
 	BulkAdder storagebase.BulkAdderFactory
@@ -157,6 +174,11 @@ type ServerConfig struct {
 
 	ExternalStorage        cloud.ExternalStorageFactory
 	ExternalStorageFromURI cloud.ExternalStorageFromURIFactory
+
+	// ProtectedTimestampProvider maintains the state of the protected timestamp
+	// subsystem. It is queried during the GC process and in the handling of
+	// AdminVerifyProtectedTimestampRequest.
+	ProtectedTimestampProvider protectedts.Provider
 }
 
 // RuntimeStats is an interface through which the rowexec layer can get
@@ -183,10 +205,16 @@ type TestingKnobs struct {
 	// function returns an error, or if the table has already been dropped.
 	RunAfterBackfillChunk func()
 
+	// ForceDiskSpill forces any processors/operators that can fall back to disk
+	// to fall back to disk immediately.
+	ForceDiskSpill bool
+
 	// MemoryLimitBytes specifies a maximum amount of working memory that a
 	// processor that supports falling back to disk can use. Must be >= 1 to
-	// enable. Once this limit is hit, processors employ their on-disk
-	// implementation regardless of applicable cluster settings.
+	// enable. This is a more fine-grained knob than ForceDiskSpill when the
+	// available memory needs to be controlled. Once this limit is hit, processors
+	// employ their on-disk implementation regardless of applicable cluster
+	// settings.
 	MemoryLimitBytes int64
 
 	// DrainFast, if enabled, causes the server to not wait for any currently
@@ -205,6 +233,13 @@ type TestingKnobs struct {
 
 	// Changefeed contains testing knobs specific to the changefeed system.
 	Changefeed base.ModuleTestingKnobs
+
+	// EnableVectorizedInvariantsChecker, if enabled, will allow for planning
+	// the invariant checkers between all columnar operators.
+	EnableVectorizedInvariantsChecker bool
+
+	// Forces bulk adder flush every time a KV batch is processed.
+	BulkAdderFlushesEveryBatch bool
 }
 
 // MetadataTestLevel represents the types of queries where metadata test
@@ -223,3 +258,13 @@ const (
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
 func (*TestingKnobs) ModuleTestingKnobs() {}
+
+// GetWorkMemLimit returns the number of bytes determining the amount of RAM
+// available to a single processor or operator.
+func GetWorkMemLimit(config *ServerConfig) int64 {
+	limit := config.TestingKnobs.MemoryLimitBytes
+	if limit <= 0 {
+		limit = SettingWorkMemBytes.Get(&config.Settings.SV)
+	}
+	return limit
+}

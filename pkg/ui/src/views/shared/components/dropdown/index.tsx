@@ -18,6 +18,7 @@ import "./dropdown.styl";
 import {leftArrow, rightArrow} from "src/views/shared/components/icons";
 import { trustIcon } from "src/util/trust";
 import ReactSelectClass from "react-select";
+import { Icon } from "antd";
 
 export interface DropdownOption {
   value: string;
@@ -25,7 +26,7 @@ export interface DropdownOption {
 }
 
 export enum ArrowDirection {
-  LEFT, RIGHT,
+  LEFT, RIGHT, CENTER,
 }
 
 interface DropdownOwnProps {
@@ -38,6 +39,9 @@ interface DropdownOwnProps {
   onArrowClick?: (direction: ArrowDirection) => void;
   // Disable any arrows in the arrow direction array.
   disabledArrows?: ArrowDirection[];
+  content?: any;
+  isTimeRange?: boolean;
+  className?: string;
 }
 
 /**
@@ -67,12 +71,16 @@ export default class Dropdown extends React.Component<DropdownOwnProps, {}> {
     }
   }
 
+  arrowRenderer = () => <span className="active"><Icon type="caret-up" /></span>;
+
   render() {
-    const {selected, options, onChange, onArrowClick, disabledArrows} = this.props;
+    const { selected, options, onChange, onArrowClick, disabledArrows, content, isTimeRange } = this.props;
 
     const className = classNames(
       "dropdown",
+      isTimeRange ? "_range" : "",
       { "dropdown--side-arrows": !_.isNil(onArrowClick) },
+      this.props.className,
     );
     const leftClassName = classNames(
       "dropdown__side-arrow",
@@ -91,19 +99,20 @@ export default class Dropdown extends React.Component<DropdownOwnProps, {}> {
         onClick={() => this.props.onArrowClick(ArrowDirection.LEFT)}>
       </span>
       <span
-        className="dropdown__title"
+        className={isTimeRange ? "dropdown__range-title" : "dropdown__title"}
         ref={this.titleRef}>
-          {this.props.title}{this.props.title ? ":" : ""}
+          {this.props.title}{this.props.title && !isTimeRange ? ":" : ""}
       </span>
-      <Select
+      {content ? content : <Select
         className="dropdown__select"
+        arrowRenderer={this.arrowRenderer}
         clearable={false}
         searchable={false}
         options={options}
         value={selected}
         onChange={onChange}
         ref={this.selectRef}
-      />
+      />}
       <span
         className={rightClassName}
         dangerouslySetInnerHTML={trustIcon(rightArrow)}

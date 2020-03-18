@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -42,6 +42,7 @@ type tableSSTable struct {
 }
 
 func BenchmarkImportWorkload(b *testing.B) {
+	b.Skip("#41932: broken due to adding keys out-of-order to an sstable")
 	if testing.Short() {
 		b.Skip("skipping long benchmark")
 	}
@@ -90,14 +91,16 @@ func benchmarkWriteAndLink(b *testing.B, dir string, tables []tableSSTable) {
 	b.SetBytes(bytes)
 
 	ctx := context.Background()
-	cache := engine.NewRocksDBCache(server.DefaultCacheSize)
+	cache := storage.NewRocksDBCache(server.DefaultCacheSize)
 	defer cache.Release()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		cfg := engine.RocksDBConfig{Dir: filepath.Join(dir, `rocksdb`, timeutil.Now().String())}
-		db, err := engine.NewRocksDB(cfg, cache)
+		cfg := storage.RocksDBConfig{
+			StorageConfig: base.StorageConfig{
+				Dir: filepath.Join(dir, `rocksdb`, timeutil.Now().String())}}
+		db, err := storage.NewRocksDB(cfg, cache)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -106,8 +109,7 @@ func benchmarkWriteAndLink(b *testing.B, dir string, tables []tableSSTable) {
 		for i, table := range tables {
 			require.NoError(b, ioutil.WriteFile(paths[i], table.sstData, 0644))
 		}
-		const skipSeqNo, canModify = true, true
-		require.NoError(b, db.IngestExternalFiles(ctx, paths, skipSeqNo, canModify))
+		require.NoError(b, db.IngestExternalFiles(ctx, paths))
 		b.StopTimer()
 
 		db.Close()
@@ -135,7 +137,9 @@ func benchmarkAddSSTable(b *testing.B, dir string, tables []tableSSTable) {
 		b.StartTimer()
 		for _, t := range tables {
 			totalBytes += int64(len(t.sstData))
-			require.NoError(b, kvDB.AddSSTable(ctx, t.span.Key, t.span.EndKey, t.sstData, true /* disallowShadowing */, nil /* stats */))
+			require.NoError(b, kvDB.AddSSTable(
+				ctx, t.span.Key, t.span.EndKey, t.sstData, true /* disallowShadowing */, nil /* stats */, false, /*ingestAsWrites */
+			))
 		}
 		b.StopTimer()
 

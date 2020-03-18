@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
@@ -104,13 +105,30 @@ func init() {
 // used. Otherwise, the update value is used (or the existing value if there is
 // no update value for that column).
 //
+// In addition, upsert cases have another complication that arises from the
+// requirement that no mutation statement updates the same row more than once.
+// Primary key violations prevent INSERT statements from inserting the same row
+// twice. DELETE statements do not encounter a problem because their input never
+// contains duplicate rows. And UPDATE statements are equivalent to DELETE
+// followed by an INSERT, so they're safe as well. By contrast, UPSERT and
+// INSERT..ON CONFLICT statements can have duplicate input rows that trigger
+// updates of the same row after insertion conflicts.
+//
+// Detecting (and raising an error) or ignoring (in case of DO NOTHING)
+// duplicate rows requires wrapping the input with one or more DISTINCT ON
+// operators that ensure the input is distinct on at least one unique index.
+// Because the input is distinct on a unique index of the target table, the
+// statement will never attempt to update the same row twice.
+//
 // Putting it all together, if this is the schema and INSERT..ON CONFLICT
 // statement:
 //
 //   CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
-//   INSERT INTO abc VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b=10
+//   INSERT INTO abc VALUES (1, 2), (1, 3) ON CONFLICT (a) DO UPDATE SET b=10
 //
-// Then an input expression equivalent to this would be built:
+// Then an input expression roughly equivalent to this would be built (note that
+// the DISTINCT ON is really the UpsertDistinctOn operator, which behaves a bit
+// differently than the DistinctOn operator):
 //
 //   SELECT
 //     fetch_a,
@@ -119,30 +137,33 @@ func init() {
 //     CASE WHEN fetch_a IS NULL ins_a ELSE fetch_a END AS ups_a,
 //     CASE WHEN fetch_a IS NULL ins_b ELSE 10 END AS ups_b,
 //     CASE WHEN fetch_a IS NULL ins_c ELSE fetch_c END AS ups_c,
-//   FROM (VALUES (1, 2, NULL)) AS ins(ins_a, ins_b, ins_c)
+//   FROM (
+//     SELECT DISTINCT ON (ins_a) *
+//     FROM (VALUES (1, 2, NULL), (1, 3, NULL)) AS ins(ins_a, ins_b, ins_c)
+//   )
 //   LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
 //   ON ins_a = fetch_a
 //
 // Here, the fetch_a column has been designated as the canary column, since it
 // is NOT NULL in the schema. It is used as the CASE condition to decide between
-// the insert and update values for each row.
-//
-// The CASE expressions will often prevent the unnecessary evaluation of the
-// update expression in the case where an insertion needs to occur. In addition,
-// it simplifies logical property calculation, since a 1:1 mapping to each
-// target table column from a corresponding input column is maintained.
+// the insert and update values for each row. The CASE expressions will often
+// prevent the unnecessary evaluation of the update expression in the case where
+// an insertion needs to occur. In addition, it simplifies logical property
+// calculation, since a 1:1 mapping to each target table column from a
+// corresponding input column is maintained.
 //
 // If the ON CONFLICT clause contains a DO NOTHING clause, then each UNIQUE
-// index on the target table requires its own LEFT OUTER JOIN to check whether a
+// index on the target table requires its own DISTINCT ON to ensure that the
+// input has no duplicates, and its own LEFT OUTER JOIN to check whether a
 // conflict exists. For example:
 //
 //   CREATE TABLE ab (a INT PRIMARY KEY, b INT)
-//   INSERT INTO ab (a, b) VALUES (1, 2) ON CONFLICT DO NOTHING
+//   INSERT INTO ab (a, b) VALUES (1, 2), (1, 3) ON CONFLICT DO NOTHING
 //
-// Then an input expression equivalent to this would be built:
+// Then an input expression roughly equivalent to this would be built:
 //
 //   SELECT x, y
-//   FROM (VALUES (1, 2)) AS input(x, y)
+//   FROM (SELECT DISTINCT ON (x) * FROM (VALUES (1, 2), (1, 3))) AS input(x, y)
 //   LEFT OUTER JOIN ab
 //   ON input.x = ab.a
 //   WHERE ab.a IS NULL
@@ -154,39 +175,43 @@ func init() {
 // ON CONFLICT clause is present, since it joins a new set of rows to the input
 // and thereby scrambles the input ordering.
 func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope) {
-	var ctes []cteSource
-	if ins.With != nil {
-		inScope, ctes = b.buildCTEs(ins.With, inScope)
-	}
-
-	// INSERT INTO xx AS yy - we want to know about xx (tn) because
-	// that's what we get the descriptor with, and yy (alias) because
-	// that's what RETURNING will use.
-	tn, alias := getAliasedTableName(ins.Table)
-
 	// Find which table we're working on, check the permissions.
-	tab, resName := b.resolveTable(tn, privilege.INSERT)
-	if alias == nil {
-		alias = &resName
+	tab, depName, alias, refColumns := b.resolveTableForMutation(ins.Table, privilege.INSERT)
+
+	// It is possible to insert into specific columns using table reference
+	// syntax:
+	// INSERT INTO [<table_id>(<col1_id>,<col2_id>) AS <alias>] ...
+	// is equivalent to
+	// INSERT INTO [<table_id> AS <alias>] (col1_name, col2_name) ...
+	if refColumns != nil {
+		if len(ins.Columns) != 0 {
+			panic(pgerror.Newf(pgcode.Syntax,
+				"cannot specify both a list of column IDs and a list of column names"))
+		}
+
+		ins.Columns = make(tree.NameList, len(refColumns))
+		for i, ord := range cat.ConvertColumnIDsToOrdinals(tab, refColumns) {
+			ins.Columns[i] = tab.Column(ord).ColName()
+		}
 	}
 
 	if ins.OnConflict != nil {
 		// UPSERT and INDEX ON CONFLICT will read from the table to check for
 		// duplicates.
-		b.checkPrivilege(opt.DepByName(tn), tab, privilege.SELECT)
+		b.checkPrivilege(depName, tab, privilege.SELECT)
 
 		if !ins.OnConflict.DoNothing {
 			// UPSERT and INDEX ON CONFLICT DO UPDATE may modify rows if the
 			// DO NOTHING clause is not present.
-			b.checkPrivilege(opt.DepByName(tn), tab, privilege.UPDATE)
+			b.checkPrivilege(depName, tab, privilege.UPDATE)
 		}
 	}
 
 	var mb mutationBuilder
 	if ins.OnConflict != nil && ins.OnConflict.IsUpsertAlias() {
-		mb.init(b, "upsert", tab, *alias)
+		mb.init(b, "upsert", tab, alias)
 	} else {
-		mb.init(b, "insert", tab, *alias)
+		mb.init(b, "insert", tab, alias)
 	}
 
 	// Compute target columns in two cases:
@@ -268,7 +293,8 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		// Wrap the input in one LEFT OUTER JOIN per UNIQUE index, and filter out
 		// rows that have conflicts. See the buildInputForDoNothing comment for
 		// more details.
-		mb.buildInputForDoNothing(inScope, ins.OnConflict)
+		conflictOrds := mb.mapColumnNamesToOrdinals(ins.OnConflict.Columns)
+		mb.buildInputForDoNothing(inScope, conflictOrds)
 
 		// Since buildInputForDoNothing filters out rows with conflicts, always
 		// insert rows that are not filtered.
@@ -285,7 +311,8 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		if mb.needExistingRows() {
 			// Left-join each input row to the target table, using conflict columns
 			// derived from the primary index as the join condition.
-			mb.buildInputForUpsert(inScope, mb.getPrimaryKeyColumnNames(), nil /* whereClause */)
+			primaryOrds := getIndexLaxKeyOrdinals(mb.tab.Index(cat.PrimaryIndex))
+			mb.buildInputForUpsert(inScope, primaryOrds, nil /* whereClause */)
 
 			// Add additional columns for computed expressions that may depend on any
 			// updated columns.
@@ -299,7 +326,8 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	default:
 		// Left-join each input row to the target table, using the conflict columns
 		// as the join condition.
-		mb.buildInputForUpsert(inScope, ins.OnConflict.Columns, ins.OnConflict.Where)
+		conflictOrds := mb.mapColumnNamesToOrdinals(ins.OnConflict.Columns)
+		mb.buildInputForUpsert(inScope, conflictOrds, ins.OnConflict.Where)
 
 		// Derive the columns that will be updated from the SET expressions.
 		mb.addTargetColsForUpdate(ins.OnConflict.Exprs)
@@ -310,8 +338,6 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		// Build the final upsert statement, including any returned expressions.
 		mb.buildUpsert(returning)
 	}
-
-	mb.outScope.expr = b.wrapWithCTEs(mb.outScope.expr, ctes)
 
 	return mb.outScope
 }
@@ -327,6 +353,9 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 //      values specified for them.
 //   3. Each update value is the same as the corresponding insert value.
 //
+// TODO(radu): once FKs no longer require indexes, this function will have to
+// take FKs into account explicitly.
+//
 // TODO(andyk): The fast path is currently only enabled when the UPSERT alias
 // is explicitly selected by the user. It's possible to fast path some queries
 // of the form INSERT ... ON CONFLICT, but the utility is low and there are lots
@@ -341,12 +370,7 @@ func (mb *mutationBuilder) needExistingRows() bool {
 	// values.
 	// TODO(andyk): This is not true in the case of composite key encodings. See
 	// issue #34518.
-	primary := mb.tab.Index(cat.PrimaryIndex)
-	var keyOrds util.FastIntSet
-	for i, n := 0, primary.LaxKeyColumnCount(); i < n; i++ {
-		keyOrds.Add(primary.Column(i).Ordinal)
-	}
-
+	keyOrds := getIndexLaxKeyOrdinals(mb.tab.Index(cat.PrimaryIndex))
 	for i, n := 0, mb.tab.DeletableColumnCount(); i < n; i++ {
 		if keyOrds.Contains(i) {
 			// #1: Don't consider key columns.
@@ -516,7 +540,7 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 		mb.outScope = inScope.push()
 		mb.outScope.expr = mb.b.factory.ConstructValues(memo.ScalarListWithEmptyTuple, &memo.ValuesPrivate{
 			Cols: opt.ColList{},
-			ID:   mb.md.NextValuesID(),
+			ID:   mb.md.NextUniqueID(),
 		})
 		return
 	}
@@ -550,7 +574,7 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 		}
 	}
 
-	mb.outScope = mb.b.buildSelect(inputRows, desiredTypes, inScope)
+	mb.outScope = mb.b.buildStmt(inputRows, desiredTypes, inScope)
 
 	if len(mb.targetColList) != 0 {
 		// Target columns already exist, so ensure that the number of input
@@ -628,21 +652,25 @@ func (mb *mutationBuilder) buildInsert(returning tree.ReturningExprs) {
 // filter that discards rows that have a conflict (by checking a not-null table
 // column to see if it was null-extended by the left join). See the comment
 // header for Builder.buildInsert for an example.
-func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tree.OnConflict) {
+func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, conflictOrds util.FastIntSet) {
 	// DO NOTHING clause does not require ON CONFLICT columns.
 	var conflictIndex cat.Index
-	if len(onConflict.Columns) != 0 {
+	if !conflictOrds.Empty() {
 		// Check that the ON CONFLICT columns reference at most one target row by
 		// ensuring they match columns of a UNIQUE index. Using LEFT OUTER JOIN
 		// to detect conflicts relies upon this being true (otherwise result
 		// cardinality could increase). This is also a Postgres requirement.
-		conflictIndex = mb.ensureUniqueConflictCols(onConflict.Columns)
+		conflictIndex = mb.ensureUniqueConflictCols(conflictOrds)
 	}
 
 	insertColSet := mb.outScope.expr.Relational().OutputCols
 
-	// Loop over each UNIQUE index, potentially creating a left join + filter for
-	// each one.
+	// Ignore any ordering requested by the input.
+	// TODO(andyk): do we need to do more here?
+	mb.outScope.ordering = nil
+
+	// Loop again over each UNIQUE index, potentially creating a left join +
+	// filter for each one.
 	for idx, idxCount := 0, mb.tab.IndexCount(); idx < idxCount; idx++ {
 		index := mb.tab.Index(idx)
 		if !index.IsUnique() {
@@ -662,6 +690,7 @@ func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tr
 			mb.b.addTable(mb.tab, &mb.alias),
 			nil, /* ordinals */
 			nil, /* indexFlags */
+			noRowLocking,
 			excludeMutations,
 			inScope,
 		)
@@ -686,7 +715,7 @@ func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tr
 				mb.b.factory.ConstructVariable(mb.insertColID(indexCol.Ordinal)),
 				mb.b.factory.ConstructVariable(scanColID),
 			)
-			on = append(on, memo.FiltersItem{Condition: condition})
+			on = append(on, mb.b.factory.ConstructFiltersItem(condition))
 		}
 
 		// Construct the left join + filter.
@@ -700,16 +729,30 @@ func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tr
 					on,
 					memo.EmptyJoinPrivate,
 				),
-				memo.FiltersExpr{memo.FiltersItem{
-					Condition: mb.b.factory.ConstructIs(
+				memo.FiltersExpr{mb.b.factory.ConstructFiltersItem(
+					mb.b.factory.ConstructIs(
 						mb.b.factory.ConstructVariable(notNullColID),
 						memo.NullSingleton,
 					),
-				}},
+				)},
 			),
 			memo.EmptyProjectionsExpr,
 			insertColSet,
 		)
+
+		// Add an UpsertDistinctOn operator to ensure there are no duplicate input
+		// rows for this unique index. Duplicate rows can trigger conflict errors
+		// at runtime, which DO NOTHING is not supposed to do. See issue #37880.
+		var conflictCols opt.ColSet
+		for i, n := 0, index.LaxKeyColumnCount(); i < n; i++ {
+			indexCol := index.Column(i)
+			conflictCols.Add(mb.outScope.cols[mb.insertOrds[indexCol.Ordinal]].id)
+		}
+
+		// Treat NULL values as distinct from one another. And if duplicates are
+		// detected, remove them rather than raising an error.
+		mb.outScope = mb.b.buildDistinctOn(
+			conflictCols, mb.outScope, true /* nullsAreDistinct */, false /* errorOnDup */)
 	}
 
 	mb.targetColList = make(opt.ColList, 0, mb.tab.DeletableColumnCount())
@@ -723,13 +766,29 @@ func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tr
 // given insert row conflicts with an existing row in the table. If it is null,
 // then there is no conflict.
 func (mb *mutationBuilder) buildInputForUpsert(
-	inScope *scope, conflictCols tree.NameList, whereClause *tree.Where,
+	inScope *scope, conflictOrds util.FastIntSet, whereClause *tree.Where,
 ) {
 	// Check that the ON CONFLICT columns reference at most one target row.
 	// Using LEFT OUTER JOIN to detect conflicts relies upon this being true
 	// (otherwise result cardinality could increase). This is also a Postgres
 	// requirement.
-	mb.ensureUniqueConflictCols(conflictCols)
+	mb.ensureUniqueConflictCols(conflictOrds)
+
+	// Ensure that input is distinct on the conflict columns. Otherwise, the
+	// Upsert could affect the same row more than once, which can lead to index
+	// corruption. See issue #44466 for more context.
+	//
+	// Ignore any ordering requested by the input. Since the UpsertDistinctOn
+	// operator does not allow multiple rows in distinct groupings, the internal
+	// ordering is meaningless (and can trigger a misleading error in
+	// buildDistinctOn if present).
+	var conflictCols opt.ColSet
+	for ord, ok := conflictOrds.Next(0); ok; ord, ok = conflictOrds.Next(ord + 1) {
+		conflictCols.Add(mb.outScope.cols[mb.insertOrds[ord]].id)
+	}
+	mb.outScope.ordering = nil
+	mb.outScope = mb.b.buildDistinctOn(
+		conflictCols, mb.outScope, true /* nullsAreDistinct */, true /* errorOnDup */)
 
 	// Re-alias all INSERT columns so that they are accessible as if they were
 	// part of a special data source named "crdb_internal.excluded".
@@ -744,6 +803,7 @@ func (mb *mutationBuilder) buildInputForUpsert(
 		mb.b.addTable(mb.tab, &mb.alias),
 		nil, /* ordinals */
 		nil, /* indexFlags */
+		noRowLocking,
 		includeMutations,
 		inScope,
 	)
@@ -771,17 +831,14 @@ func (mb *mutationBuilder) buildInputForUpsert(
 	//   ON ins.x = scan.a AND ins.y = scan.b
 	//
 	var on memo.FiltersExpr
-	for _, name := range conflictCols {
-		for i := range fetchScope.cols {
-			fetchCol := &fetchScope.cols[i]
-			if fetchCol.name == name {
-				condition := mb.b.factory.ConstructEq(
-					mb.b.factory.ConstructVariable(mb.insertColID(i)),
-					mb.b.factory.ConstructVariable(fetchCol.id),
-				)
-				on = append(on, memo.FiltersItem{Condition: condition})
-				break
-			}
+	for i := range fetchScope.cols {
+		// Include fetch columns with ordinal positions in conflictOrds.
+		if conflictOrds.Contains(i) {
+			condition := mb.b.factory.ConstructEq(
+				mb.b.factory.ConstructVariable(mb.insertColID(i)),
+				mb.b.factory.ConstructVariable(fetchScope.cols[i].id),
+			)
+			on = append(on, mb.b.factory.ConstructFiltersItem(condition))
 		}
 	}
 
@@ -868,6 +925,8 @@ func (mb *mutationBuilder) buildUpsert(returning tree.ReturningExprs) {
 	// Add any check constraint boolean columns to the input.
 	mb.addCheckConstraintCols()
 
+	mb.buildFKChecksForUpsert()
+
 	private := mb.makeMutationPrivate(returning != nil)
 	mb.outScope.expr = mb.b.factory.ConstructUpsert(mb.outScope.expr, mb.checks, private)
 
@@ -953,11 +1012,11 @@ func (mb *mutationBuilder) projectUpsertColumns() {
 	mb.outScope = projectionsScope
 }
 
-// ensureUniqueConflictCols tries to prove that the given list of column names
+// ensureUniqueConflictCols tries to prove that the given set of column ordinals
 // correspond to the columns of at least one UNIQUE index on the target table.
 // If true, then ensureUniqueConflictCols returns the matching index. Otherwise,
 // it reports an error.
-func (mb *mutationBuilder) ensureUniqueConflictCols(cols tree.NameList) cat.Index {
+func (mb *mutationBuilder) ensureUniqueConflictCols(conflictOrds util.FastIntSet) cat.Index {
 	for idx, idxCount := 0, mb.tab.IndexCount(); idx < idxCount; idx++ {
 		index := mb.tab.Index(idx)
 
@@ -965,19 +1024,13 @@ func (mb *mutationBuilder) ensureUniqueConflictCols(cols tree.NameList) cat.Inde
 		// the minimum columns that ensure uniqueness. Null values are considered
 		// to be *not* equal, but that's OK because the join condition rejects
 		// nulls anyway.
-		if !index.IsUnique() || index.LaxKeyColumnCount() != len(cols) {
+		if !index.IsUnique() || index.LaxKeyColumnCount() != conflictOrds.Len() {
 			continue
 		}
 
-		found := true
-		for col, colCount := 0, index.LaxKeyColumnCount(); col < colCount; col++ {
-			if cols[col] != index.Column(col).ColName() {
-				found = false
-				break
-			}
-		}
-
-		if found {
+		// Determine whether the conflict columns match the columns in the lax key.
+		indexOrds := getIndexLaxKeyOrdinals(index)
+		if indexOrds.Equals(conflictOrds) {
 			return index
 		}
 	}
@@ -985,13 +1038,24 @@ func (mb *mutationBuilder) ensureUniqueConflictCols(cols tree.NameList) cat.Inde
 		"there is no unique or exclusion constraint matching the ON CONFLICT specification"))
 }
 
-// getPrimaryKeyColumnNames returns the names of all primary key columns in the
-// target table.
-func (mb *mutationBuilder) getPrimaryKeyColumnNames() tree.NameList {
-	pkIndex := mb.tab.Index(cat.PrimaryIndex)
-	names := make(tree.NameList, pkIndex.KeyColumnCount())
-	for i, n := 0, pkIndex.KeyColumnCount(); i < n; i++ {
-		names[i] = pkIndex.Column(i).ColName()
+// mapColumnNamesToOrdinals returns the set of ordinal positions within the
+// target table that correspond to the given names.
+func (mb *mutationBuilder) mapColumnNamesToOrdinals(names tree.NameList) util.FastIntSet {
+	var ords util.FastIntSet
+	for _, name := range names {
+		found := false
+		for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
+			tabCol := mb.tab.Column(i)
+			if tabCol.ColName() == name {
+				ords.Add(i)
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			panic(sqlbase.NewUndefinedColumnError(string(name)))
+		}
 	}
-	return names
+	return ords
 }

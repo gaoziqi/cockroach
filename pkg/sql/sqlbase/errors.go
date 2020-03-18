@@ -19,6 +19,10 @@ import (
 )
 
 const (
+	// DuplicateUpsertErrText is error text used when a row is modified twice by
+	// an upsert statement.
+	DuplicateUpsertErrText = "UPSERT or INSERT...ON CONFLICT command cannot affect row a second time"
+
 	txnAbortedMsg = "current transaction is aborted, commands ignored " +
 		"until end of transaction block"
 	txnCommittedMsg = "current transaction is committed, commands ignored " +
@@ -26,7 +30,8 @@ const (
 )
 
 // NewTransactionAbortedError creates an error for trying to run a command in
-// the context of transaction that's already aborted.
+// the context of transaction that's in the aborted state. Any statement other
+// than ROLLBACK TO SAVEPOINT will return this error.
 func NewTransactionAbortedError(customMsg string) error {
 	if customMsg != "" {
 		return pgerror.Newf(
@@ -49,7 +54,7 @@ func NewNonNullViolationError(columnName string) error {
 // NewInvalidSchemaDefinitionError creates an error for an invalid schema
 // definition such as a schema definition that doesn't parse.
 func NewInvalidSchemaDefinitionError(err error) error {
-	return pgerror.New(pgcode.InvalidSchemaDefinition, err.Error())
+	return pgerror.WithCandidateCode(err, pgcode.InvalidSchemaDefinition)
 }
 
 // NewUnsupportedSchemaUsageError creates an error for an invalid
@@ -110,8 +115,13 @@ func NewRelationAlreadyExistsError(name string) error {
 	return pgerror.Newf(pgcode.DuplicateRelation, "relation %q already exists", name)
 }
 
+// IsRelationAlreadyExistsError checks whether this is an error for a preexisting relation.
+func IsRelationAlreadyExistsError(err error) bool {
+	return errHasCode(err, pgcode.DuplicateRelation)
+}
+
 // NewWrongObjectTypeError creates a wrong object type error.
-func NewWrongObjectTypeError(name *tree.TableName, desiredObjType string) error {
+func NewWrongObjectTypeError(name tree.NodeFormatter, desiredObjType string) error {
 	return pgerror.Newf(pgcode.WrongObjectType, "%q is not a %s",
 		tree.ErrString(name), desiredObjType)
 }
@@ -165,6 +175,11 @@ var QueryTimeoutError = pgerror.New(
 // IsOutOfMemoryError checks whether this is an out of memory error.
 func IsOutOfMemoryError(err error) bool {
 	return errHasCode(err, pgcode.OutOfMemory)
+}
+
+// IsUndefinedColumnError checks whether this is an undefined column error.
+func IsUndefinedColumnError(err error) bool {
+	return errHasCode(err, pgcode.UndefinedColumn)
 }
 
 func errHasCode(err error, code ...string) bool {

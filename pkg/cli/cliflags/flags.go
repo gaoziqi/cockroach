@@ -143,7 +143,7 @@ Maximum memory capacity available to store temporary data for SQL clients,
 including prepared queries and intermediate data rows during query execution.
 Accepts numbers interpreted as bytes, size suffixes (e.g. 1GB and 1GiB) or a
 percentage of physical memory (e.g. .25).
-If left unspecified, defaults to 128MiB.
+If left unspecified, defaults to 25% of physical memory.
 `,
 	}
 
@@ -176,6 +176,19 @@ data is also kept in-memory. A percentage value is interpreted as a percentage
 of the available internal memory. If not specified, the default shifts to 100MiB
 when the first store is in-memory.
 `,
+	}
+
+	AuthTokenValidityPeriod = FlagInfo{
+		Name: "expire-after",
+		Description: `
+Duration after which the newly created session token expires.`,
+	}
+
+	OnlyCookie = FlagInfo{
+		Name: "only-cookie",
+		Description: `
+Display only the newly created cookie on the standard output
+without additional details and decoration.`,
 	}
 
 	Cache = FlagInfo{
@@ -535,9 +548,23 @@ write its process ID to the specified file.`,
 		Name:   "socket",
 		EnvVar: "COCKROACH_SOCKET",
 		Description: `
-Unix socket file, postgresql protocol only.
-Note: when given a path to a unix socket, most postgres clients will
-open "<given path>/.s.PGSQL.<server port>"`,
+Accept client connections using a Unix domain socket with the
+given name.
+
+Note: for compatibility with PostgreSQL clients and drivers,
+ensure that the socket name has the form "/path/to/.s.PGSQL.NNNN",
+where NNNN is a number. PostgreSQL clients only take a port
+number and directory as input and construct the socket name
+programmatically.
+
+To use, for example: psql -h /path/to -p NNNN ...
+`,
+	}
+
+	SocketDir = FlagInfo{
+		Name:        "socket-dir",
+		EnvVar:      "COCKROACH_SOCKET_DIR",
+		Description: `Deprecated in favor of --socket-dir.`,
 	}
 
 	ClientInsecure = FlagInfo{
@@ -556,6 +583,18 @@ listening on all IP addresses (unless --listen-addr is provided) and
 disabling password authentication for all database users. This is
 strongly discouraged for production usage and should never be used on
 a public network without combining it with --listen-addr.`,
+	}
+
+	ExternalIODisableHTTP = FlagInfo{
+		Name:        "external-io-disable-http",
+		Description: `Disable use of HTTP when accessing external data.`,
+	}
+
+	ExtenralIODisableImplicitCredentials = FlagInfo{
+		Name: "external-io-disable-implicit-credentials",
+		Description: `
+Disable use of implicit credentials when accessing external data.  
+Instead, require the user to always specify access keys.`,
 	}
 
 	// KeySize, CertificateLifetime, AllowKeyReuse, and OverwriteFiles are used for
@@ -602,19 +641,29 @@ a public network without combining it with --listen-addr.`,
 		Description: CertsDir.Description,
 	}
 
+	CertPrincipalMap = FlagInfo{
+		Name: "cert-principal-map",
+		Description: `
+A comma separated list of <cert-principal>:<db-principal> mappings. This allows
+mapping the principal in a cert to a DB principal such as "node" or "root" or
+any SQL user. This is intended for use in situations where the certificate
+management system places restrictions on the Subject.CommonName or
+SubjectAlternateName fields in the certificate (e.g. disallowing a CommonName
+such as "node" or "root"). If multiple mappings are provided for the same
+<cert-principal>, the last one specified in the list takes precedence. A
+principal not specified in the map is passed through as-is via the identity
+function. A cert is allowed to authenticate a DB principal if the DB principal
+name is contained in the mapped CommonName or DNS-type SubjectAlternateName
+fields.
+`,
+	}
+
 	CAKey = FlagInfo{
 		Name:        "ca-key",
 		EnvVar:      "COCKROACH_CA_KEY",
 		Description: `Path to the CA key.`,
 	}
 
-	// TODO(tschottdorf): once clockless mode becomes non-experimental, explain it here:
-	// <PRE>
-	//
-	// </PRE>
-	// Specifying the string value 'experimental-clockless' instead of a duration runs the cluster
-	// in clockless reads mode. In that mode, reads are routed through Raft and subsequently
-	// performance is reduced, but clock synchronization is not relied upon for correctness.
 	MaxOffset = FlagInfo{
 		Name: "max-offset",
 		Description: `
@@ -696,9 +745,12 @@ Also, if you use equal signs in the file path to a store, you must use the
 	StorageEngine = FlagInfo{
 		Name: "storage-engine",
 		Description: `
-Storage engine to use for all stores on this cockroach node. Options are rocksdb
-(default), or pebble.
-`,
+Storage engine to use for all stores on this cockroach node. Options are default,
+rocksdb, or pebble.
+
+If default is specified, the storage engine last used to write to the first
+store directory is used (see --store). If the store directory is uninitialized
+and default is specified, rocksdb is used as the default storage engine.`,
 	}
 
 	Size = FlagInfo{
@@ -824,10 +876,8 @@ long and not particularly human-readable.`,
 	}
 
 	Decommission = FlagInfo{
-		Name: "decommission",
-		Description: `
-If specified, decommissions the node and waits for it to rebalance before
-shutting down the node.`,
+		Name:        "decommission",
+		Description: `Deprecated: use 'node decommission' instead.`,
 	}
 
 	Wait = FlagInfo{
@@ -905,6 +955,25 @@ The line length where sqlfmt will try to wrap.`,
 		Description: `How many in-memory nodes to create for the demo.`,
 	}
 
+	DemoNodeSQLMemSize = FlagInfo{
+		Name: "max-sql-memory",
+		Description: `
+Maximum memory capacity available for each node to store temporary data for SQL clients,
+including prepared queries and intermediate data rows during query execution.
+Accepts numbers interpreted as bytes, size suffixes (e.g. 1GB and 1GiB) or a
+percentage of physical memory (e.g. .25).
+If left unspecified, defaults to 128MiB.
+`,
+	}
+	DemoNodeCacheSize = FlagInfo{
+		Name: "cache",
+		Description: `
+Total size in bytes for caches per node, shared evenly if there are multiple
+storage devices. Size suffixes are supported (e.g. 1GB and 1GiB).
+If left unspecified, defaults to 64MiB. A percentage of physical memory
+can also be specified (e.g. .25).`,
+	}
+
 	RunDemoWorkload = FlagInfo{
 		Name:        "with-load",
 		Description: `Run a demo workload against the pre-loaded database.`,
@@ -936,6 +1005,12 @@ be acquired, or if the Movr dataset is not used. More information about the geo-
 replicas topology can be found at this URL: 
 https://www.cockroachlabs.com/docs/v19.1/topology-geo-partitioned-replicas.html
 		`,
+	}
+
+	DemoNoLicense = FlagInfo{
+		Name: "disable-demo-license",
+		Description: `
+If set, disable cockroach demo from attempting to obtain a temporary license.`,
 	}
 
 	UseEmptyDatabase = FlagInfo{

@@ -34,7 +34,7 @@ func TestColumnarizerResetsInternalBatch(t *testing.T) {
 	typs := []types.T{*types.Int}
 	// There will be at least two batches of rows so that we can see whether the
 	// internal batch is reset.
-	nRows := int(coldata.BatchSize()) * 2
+	nRows := coldata.BatchSize() * 2
 	nCols := len(typs)
 	rows := sqlbase.MakeIntRows(nRows, nCols)
 	input := execinfra.NewRepeatableRowSource(typs, rows)
@@ -48,7 +48,7 @@ func TestColumnarizerResetsInternalBatch(t *testing.T) {
 		EvalCtx: &evalCtx,
 	}
 
-	c, err := NewColumnarizer(ctx, flowCtx, 0, input)
+	c, err := NewColumnarizer(ctx, testAllocator, flowCtx, 0, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestColumnarizerResetsInternalBatch(t *testing.T) {
 		if batch.Length() == 0 {
 			break
 		}
-		foundRows += int(batch.Length())
+		foundRows += batch.Length()
 		// The "meat" of the test - we're updating the batch that the Columnarizer
 		// owns.
 		batch.SetSelection(true)
@@ -81,7 +81,7 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 
 	const errMsg = "artificial error"
 	rb.Push(nil, &execinfrapb.ProducerMetadata{Err: errors.New(errMsg)})
-	c, err := NewColumnarizer(ctx, flowCtx, 0 /* processorID */, rb)
+	c, err := NewColumnarizer(ctx, testAllocator, flowCtx, 0 /* processorID */, rb)
 	require.NoError(t, err)
 
 	// Calling DrainMeta from the vectorized execution engine should propagate to
@@ -111,7 +111,7 @@ func BenchmarkColumnarize(b *testing.B) {
 
 	b.SetBytes(int64(nRows * nCols * int(unsafe.Sizeof(int64(0)))))
 
-	c, err := NewColumnarizer(ctx, flowCtx, 0, input)
+	c, err := NewColumnarizer(ctx, testAllocator, flowCtx, 0, input)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func BenchmarkColumnarize(b *testing.B) {
 			if batch.Length() == 0 {
 				break
 			}
-			foundRows += int(batch.Length())
+			foundRows += batch.Length()
 		}
 		if foundRows != nRows {
 			b.Fatalf("found %d rows, expected %d", foundRows, nRows)

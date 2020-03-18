@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 var queryCacheEnabled = settings.RegisterBoolSetting(
@@ -35,23 +36,16 @@ var queryCacheEnabled = settings.RegisterBoolSetting(
 // the following stmt.Prepared fields:
 //  - Columns
 //  - Types
-//  - AnonymizedStmt
+//  - AnonymizedStr
 //  - Memo (for reuse during exec, if appropriate).
-//
-// On success, the returned flags always have planFlagOptUsed set.
 func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) {
 	stmt := p.stmt
 
 	opc := &p.optPlanningCtx
 	opc.reset()
 
-	// These statements do not have result columns and do not support placeholders
-	// so there is no need to do anything during prepare.
-	//
-	// Some of these statements (like BeginTransaction) aren't supported by the
-	// optbuilder so they would error out. Others (like CreateIndex) have planning
-	// code that can introduce unnecessary txn retries (because of looking up
-	// descriptors and such).
+	stmt.Prepared.AnonymizedStr = anonymizeStmt(stmt.AST)
+
 	switch stmt.AST.(type) {
 	case *tree.AlterIndex, *tree.AlterTable, *tree.AlterSequence,
 		*tree.BeginTransaction,
@@ -61,7 +55,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		*tree.CreateSequence,
 		*tree.CreateStats,
 		*tree.Deallocate, *tree.Discard, *tree.DropDatabase, *tree.DropIndex,
-		*tree.DropTable, *tree.DropView, *tree.DropSequence, *tree.DropRole,
+		*tree.DropTable, *tree.DropView, *tree.DropSequence,
 		*tree.Execute,
 		*tree.Grant, *tree.GrantRole,
 		*tree.Prepare,
@@ -70,6 +64,22 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		*tree.RollbackToSavepoint, *tree.RollbackTransaction,
 		*tree.Savepoint, *tree.SetTransaction, *tree.SetTracing, *tree.SetSessionAuthorizationDefault,
 		*tree.SetSessionCharacteristics:
+		// These statements do not have result columns and do not support placeholders
+		// so there is no need to do anything during prepare.
+		//
+		// Some of these statements (like BeginTransaction) aren't supported by the
+		// optbuilder so they would error out. Others (like CreateIndex) have planning
+		// code that can introduce unnecessary txn retries (because of looking up
+		// descriptors and such).
+		return opc.flags, nil
+
+	case *tree.ExplainBundle:
+		// This statement returns result columns but does not support placeholders,
+		// and we don't want to do anything during prepare.
+		if len(p.semaCtx.Placeholders.Types) != 0 {
+			return 0, errors.Errorf("%s does not support placeholders", stmt.AST.StatementTag())
+		}
+		stmt.Prepared.Columns = sqlbase.ExplainBundleColumns
 		return opc.flags, nil
 	}
 
@@ -103,8 +113,6 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		}
 		opc.flags.Set(planFlagOptCacheMiss)
 	}
-
-	stmt.Prepared.AnonymizedStr = anonymizeStmt(stmt.AST)
 
 	memo, err := opc.buildReusableMemo(ctx)
 	if err != nil {
@@ -151,8 +159,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 }
 
 // makeOptimizerPlan generates a plan using the cost-based optimizer.
-// On success, it populates p.curPlan (and the flags always have
-// planFlagOptUsed set).
+// On success, it populates p.curPlan.
 func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	stmt := p.stmt
 
@@ -167,14 +174,20 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	// Build the plan tree.
 	root := execMemo.RootExpr()
 	execFactory := makeExecFactory(p)
-	plan, err := execbuilder.New(&execFactory, execMemo, &opc.catalog, root, p.EvalContext()).Build()
+	bld := execbuilder.New(&execFactory, execMemo, &opc.catalog, root, p.EvalContext())
+	plan, err := bld.Build()
 	if err != nil {
 		return err
 	}
 
 	result := plan.(*planTop)
-	result.AST = stmt.AST
+	result.mem = execMemo
+	result.catalog = &opc.catalog
+	result.stmt = stmt
 	result.flags = opc.flags
+	if bld.IsDDL {
+		result.flags.Set(planFlagIsDDL)
+	}
 
 	cols := planColumns(result.plan)
 	if stmt.ExpectedTypes != nil {
@@ -220,8 +233,8 @@ func (opc *optPlanningCtx) init(p *planner) {
 func (opc *optPlanningCtx) reset() {
 	p := opc.p
 	opc.catalog.reset()
-	opc.optimizer.Init(p.EvalContext())
-	opc.flags = planFlagOptUsed
+	opc.optimizer.Init(p.EvalContext(), &opc.catalog)
+	opc.flags = 0
 
 	// We only allow memo caching for SELECT/INSERT/UPDATE/DELETE. We could
 	// support it for all statements in principle, but it would increase the

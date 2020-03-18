@@ -12,7 +12,6 @@ import classNames from "classnames";
 import d3 from "d3";
 import React from "react";
 import { Helmet } from "react-helmet";
-import { RouterState } from "react-router";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 
@@ -23,6 +22,7 @@ import createChartComponent from "src/views/shared/util/d3-react";
 import capacityChart from "./capacity";
 import spinner from "assets/spinner.gif";
 import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
+import EmailSubscription from "src/views/dashboard/emailSubscription";
 import "./cluster.styl";
 
 // tslint:disable-next-line:variable-name
@@ -75,13 +75,19 @@ function renderNodeLiveness(props: NodeLivenessProps) {
     "node-liveness",
     "cluster-summary__metric",
     "suspect-nodes",
-    { "warning": suspectNodes > 0 },
+    {
+      "warning": suspectNodes > 0,
+      "disabled": suspectNodes === 0,
+    },
   );
   const deadClasses = classNames(
     "node-liveness",
     "cluster-summary__metric",
     "dead-nodes",
-    { "alert": deadNodes > 0 },
+    {
+      "alert": deadNodes > 0,
+      "disabled": deadNodes === 0,
+    },
   );
   return [
     <h3 className="node-liveness cluster-summary__title">Node Status</h3>,
@@ -118,13 +124,19 @@ function renderReplicationStatus(props: ReplicationStatusProps) {
     "replication-status",
     "cluster-summary__metric",
     "under-replicated-ranges",
-    { "warning": underReplicatedRanges > 0 },
+    {
+      "warning": underReplicatedRanges > 0,
+      "disabled": underReplicatedRanges === 0,
+    },
   );
   const unavailableClasses = classNames(
     "replication-status",
     "cluster-summary__metric",
     "unavailable-ranges",
-    { "alert": unavailableRanges > 0 },
+    {
+      "alert": unavailableRanges > 0,
+      "disabled": unavailableRanges === 0,
+    },
   );
   return [
     <h3 className="replication-status cluster-summary__title">Replication Status</h3>,
@@ -149,14 +161,18 @@ const mapStateToReplicationStatusProps = createSelector(
   },
 );
 
-interface ClusterSummaryProps {
+interface ClusterSummaryStateProps {
   capacityUsage: CapacityUsageProps;
   nodeLiveness: NodeLivenessProps;
   replicationStatus: ReplicationStatusProps;
   loading: boolean;
-  refreshLiveness: typeof refreshLiveness;
-  refreshNodes: typeof refreshNodes;
 }
+interface ClusterSummaryActionsProps {
+  refreshLiveness: () => void;
+  refreshNodes: () => void;
+}
+
+type ClusterSummaryProps = ClusterSummaryStateProps & ClusterSummaryActionsProps;
 
 class ClusterSummary extends React.Component<ClusterSummaryProps, {}> {
   componentWillMount() {
@@ -185,7 +201,7 @@ class ClusterSummary extends React.Component<ClusterSummaryProps, {}> {
       );
     }
 
-    return <section className="cluster-summary" children={children} />;
+    return <section className="cluster-summary" children={React.Children.toArray(children)} />;
   }
 }
 
@@ -209,32 +225,19 @@ const ClusterSummaryConnected = connect(mapStateToClusterSummaryProps, actions)(
 /**
  * Renders the main content of the cluster visualization page.
  */
-class ClusterOverview extends React.Component<RouterState, {}> {
+export default class ClusterOverview extends React.Component<any, any> {
   render() {
     return (
-      <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-        <Helmet>
-          <title>Cluster Overview</title>
-        </Helmet>
-        <section className="section"><h1>Cluster Overview</h1></section>
-        <section className="cluster-overview">
+      <div className="cluster-page">
+        <Helmet title="Cluster Overview" />
+        <EmailSubscription />
+        <section className="section cluster-overview">
           <ClusterSummaryConnected />
         </section>
-        <div style={{
-          flexGrow: 1,
-          position: "relative",
-          margin: "18px 24px",
-          border: "1px solid #EDEDED",
-          borderRadius: 3,
-          backgroundColor: "white",
-        }}>
-          <div style={{ position: "absolute", width: "100%", height: "100%" }}>
-            { this.props.children }
-          </div>
-        </div>
+        <section className="cluster-overview--fixed">
+          { this.props.children }
+        </section>
       </div>
     );
   }
 }
-
-export { ClusterOverview as default };

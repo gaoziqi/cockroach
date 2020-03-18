@@ -20,10 +20,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/exprgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/opttester"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -57,9 +57,8 @@ func TestBuilder(t *testing.T) {
 	datadriven.Walk(t, "testdata", func(t *testing.T, path string) {
 		catalog := testcat.New()
 
-		datadriven.RunTest(t, path, func(d *datadriven.TestData) string {
+		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			var varTypes []*types.T
-			var iVarHelper tree.IndexedVarHelper
 			var err error
 
 			tester := opttester.New(catalog, d.Input)
@@ -69,10 +68,14 @@ func TestBuilder(t *testing.T) {
 				memo.ExprFmtHideRuleProps |
 				memo.ExprFmtHideStats |
 				memo.ExprFmtHideCost |
-				memo.ExprFmtHideQualifications
+				memo.ExprFmtHideQualifications |
+				memo.ExprFmtHideScalars |
+				memo.ExprFmtHideTypes
 
 			switch d.Cmd {
 			case "build-scalar":
+				// Remove the HideScalars, HideTypes flag for build-scalars.
+				tester.Flags.ExprFormat &= ^(memo.ExprFmtHideScalars | memo.ExprFmtHideTypes)
 				for _, arg := range d.CmdArgs {
 					key, vals := arg.Key, arg.Vals
 					switch key {
@@ -82,8 +85,6 @@ func TestBuilder(t *testing.T) {
 							d.Fatalf(t, "%v", err)
 						}
 
-						iVarHelper = tree.MakeTypesOnlyIndexedVarHelper(varTypes)
-
 					default:
 						if err := tester.Flags.Set(arg); err != nil {
 							d.Fatalf(t, "%s", err)
@@ -91,7 +92,7 @@ func TestBuilder(t *testing.T) {
 					}
 				}
 
-				typedExpr, err := testutils.ParseScalarExpr(d.Input, iVarHelper.Container())
+				expr, err := parser.ParseExpr(d.Input)
 				if err != nil {
 					d.Fatalf(t, "%v", err)
 				}
@@ -102,7 +103,7 @@ func TestBuilder(t *testing.T) {
 				evalCtx.SessionData.OptimizerFKs = true
 
 				var o xform.Optimizer
-				o.Init(&evalCtx)
+				o.Init(&evalCtx, catalog)
 				for i, typ := range varTypes {
 					o.Memo().Metadata().AddColumn(fmt.Sprintf("@%d", i+1), typ)
 				}
@@ -111,7 +112,7 @@ func TestBuilder(t *testing.T) {
 				o.DisableOptimizations()
 				b := optbuilder.NewScalar(ctx, &semaCtx, &evalCtx, o.Factory())
 				b.AllowUnsupportedExpr = tester.Flags.AllowUnsupportedExpr
-				err = b.Build(typedExpr)
+				err = b.Build(expr)
 				if err != nil {
 					return fmt.Sprintf("error: %s\n", strings.TrimSpace(err.Error()))
 				}

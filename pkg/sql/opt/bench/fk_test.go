@@ -27,13 +27,15 @@ func runFKBench(
 	run func(b *testing.B, r *sqlutils.SQLRunner),
 ) {
 	configs := []struct {
-		name     string
-		setupFKs bool
-		optFKOn  bool
+		name           string
+		setupFKs       bool
+		optFKOn        bool
+		insertFastPath bool
 	}{
 		{name: "None", setupFKs: false},
 		{name: "Old", setupFKs: true, optFKOn: false},
-		{name: "New", setupFKs: true, optFKOn: true},
+		{name: "New", setupFKs: true, optFKOn: true, insertFastPath: false},
+		{name: "FastPath", setupFKs: true, optFKOn: true, insertFastPath: true},
 	}
 
 	for _, cfg := range configs {
@@ -44,7 +46,8 @@ func runFKBench(
 			// Don't let auto stats interfere with the test. Stock stats are
 			// sufficient to get the right plans (i.e. lookup join).
 			r.Exec(b, "SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false")
-			r.Exec(b, fmt.Sprintf("SET experimental_optimizer_foreign_keys = %v", cfg.optFKOn))
+			r.Exec(b, fmt.Sprintf("SET optimizer_foreign_keys = %v", cfg.optFKOn))
+			r.Exec(b, fmt.Sprintf("SET enable_insert_fast_path = %v", cfg.insertFastPath))
 			setup(b, r, cfg.setupFKs)
 			b.ResetTimer()
 			run(b, r)

@@ -30,13 +30,31 @@ const (
 	Locality
 	// Create represents the SHOW CREATE command.
 	Create
+	// RangeForRow represents the SHOW RANGE FOR ROW command.
+	RangeForRow
+	// Queries represents the SHOW QUERIES command.
+	Queries
+	// Indexes represents the SHOW INDEXES command.
+	Indexes
+	// Constraints represents the SHOW CONSTRAINTS command.
+	Constraints
+	// Jobs represents the SHOW JOBS command.
+	Jobs
+	// Roles represents the SHOW ROLES command.
+	Roles
 )
 
 var showTelemetryNameMap = map[ShowTelemetryType]string{
-	Ranges:     "ranges",
-	Partitions: "partitions",
-	Locality:   "locality",
-	Create:     "create",
+	Ranges:      "ranges",
+	Partitions:  "partitions",
+	Locality:    "locality",
+	Create:      "create",
+	RangeForRow: "rangeforrow",
+	Queries:     "queries",
+	Indexes:     "indexes",
+	Constraints: "constraints",
+	Jobs:        "jobs",
+	Roles:       "roles",
 }
 
 func (s ShowTelemetryType) String() string {

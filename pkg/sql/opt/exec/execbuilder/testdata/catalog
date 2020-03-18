@@ -52,6 +52,13 @@ TABLE abcdef
  └── INDEX primary
       └── rowid int not null default (unique_rowid()) [hidden]
 scan abcdef
+ ├── check constraint expressions
+ │    └── f > 2
+ └── computed column expressions
+      ├── d
+      │    └── (b + c) + 1
+      └── e
+           └── a
 
 statement ok
 CREATE TABLE uvwxy (

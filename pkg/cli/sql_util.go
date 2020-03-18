@@ -18,6 +18,7 @@ import (
 	"io"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -50,6 +52,15 @@ type sqlConn struct {
 	url          string
 	conn         sqlConnI
 	reconnecting bool
+
+	pendingNotices []*pq.Error
+
+	// delayNotices, if set, makes notices accumulate for printing
+	// when the SQL execution completes. The default (false)
+	// indicates that notices must be printed as soon as they are received.
+	// This is used by the Query() interface to avoid interleaving
+	// notices with result rows.
+	delayNotices bool
 
 	// dbName is the last known current database, to be reconfigured in
 	// case of automatic reconnects.
@@ -102,13 +113,39 @@ func wrapConnError(err error) error {
 	return err
 }
 
+func (c *sqlConn) flushNotices() {
+	for _, notice := range c.pendingNotices {
+		cliOutputError(stderr, notice, true /*showSeverity*/, false /*verbose*/)
+	}
+	c.pendingNotices = nil
+	c.delayNotices = false
+}
+
+func (c *sqlConn) handleNotice(notice *pq.Error) {
+	c.pendingNotices = append(c.pendingNotices, notice)
+	if !c.delayNotices {
+		c.flushNotices()
+	}
+}
+
 func (c *sqlConn) ensureConn() error {
 	if c.conn == nil {
 		if c.reconnecting && cliCtx.isInteractive {
 			fmt.Fprintf(stderr, "warning: connection lost!\n"+
 				"opening new connection: all session settings will be lost\n")
 		}
-		conn, err := pq.Open(c.url)
+		base, err := pq.NewConnector(c.url)
+		if err != nil {
+			return wrapConnError(err)
+		}
+		// Add a notice handler - re-use the cliOutputError function in this case.
+		connector := pq.ConnectorWithNoticeHandler(base, func(notice *pq.Error) {
+			c.handleNotice(notice)
+		})
+		// TODO(cli): we can't thread ctx through ensureConn usages, as it needs
+		// to follow the gosql.DB interface. We should probably look at initializing
+		// connections only once instead. The context is only used for dialing.
+		conn, err := connector.Connect(context.TODO())
 		if err != nil {
 			return wrapConnError(err)
 		}
@@ -130,21 +167,25 @@ func (c *sqlConn) ensureConn() error {
 	return nil
 }
 
-func (c *sqlConn) getServerMetadata() (version, clusterID string, err error) {
+func (c *sqlConn) getServerMetadata() (
+	nodeID roachpb.NodeID,
+	version, clusterID string,
+	err error,
+) {
 	// Retrieve the node ID and server build info.
 	rows, err := c.Query("SELECT * FROM crdb_internal.node_build_info", nil)
 	if err == driver.ErrBadConn {
-		return "", "", err
+		return 0, "", "", err
 	}
 	if err != nil {
-		return "", "", err
+		return 0, "", "", err
 	}
 	defer func() { _ = rows.Close() }()
 
 	// Read the node_build_info table as an array of strings.
 	rowVals, err := getAllRowStrings(rows, true /* showMoreChars */)
 	if err != nil || len(rowVals) == 0 || len(rowVals[0]) != 3 {
-		return "", "", errors.New("incorrect data while retrieving the server version")
+		return 0, "", "", errors.New("incorrect data while retrieving the server version")
 	}
 
 	// Extract the version fields from the query results.
@@ -159,6 +200,11 @@ func (c *sqlConn) getServerMetadata() (version, clusterID string, err error) {
 			c.serverBuild = row[2]
 		case "Organization":
 			c.clusterOrganization = row[2]
+			id, err := strconv.Atoi(row[0])
+			if err != nil {
+				return 0, "", "", errors.New("incorrect data while retrieving node id")
+			}
+			nodeID = roachpb.NodeID(id)
 
 			// Fields for v1.0 compatibility.
 		case "Distribution":
@@ -181,7 +227,7 @@ func (c *sqlConn) getServerMetadata() (version, clusterID string, err error) {
 		c.serverBuild = fmt.Sprintf("CockroachDB %s %s (%s, built %s, %s)",
 			v10fields[0], version, v10fields[2], v10fields[3], v10fields[4])
 	}
-	return version, clusterID, nil
+	return nodeID, version, clusterID, nil
 }
 
 // checkServerMetadata reports the server version and cluster ID
@@ -195,7 +241,7 @@ func (c *sqlConn) checkServerMetadata() error {
 		return nil
 	}
 
-	newServerVersion, newClusterID, err := c.getServerMetadata()
+	_, newServerVersion, newClusterID, err := c.getServerMetadata()
 	if err == driver.ErrBadConn {
 		return err
 	}
@@ -257,7 +303,7 @@ func (c *sqlConn) checkServerMetadata() error {
 // requireServerVersion returns an error if the version of the connected server
 // is not at least the given version.
 func (c *sqlConn) requireServerVersion(required *version.Version) error {
-	versionString, _, err := c.getServerMetadata()
+	_, versionString, _, err := c.getServerMetadata()
 	if err != nil {
 		return err
 	}
@@ -348,6 +394,7 @@ func (c *sqlConn) Exec(query string, args []driver.Value) error {
 		fmt.Fprintln(stderr, ">", query)
 	}
 	_, err := c.conn.Exec(query, args)
+	c.flushNotices()
 	if err == driver.ErrBadConn {
 		c.reconnecting = true
 		c.Close()
@@ -398,6 +445,7 @@ func (c *sqlConn) QueryRow(query string, args []driver.Value) ([]driver.Value, e
 }
 
 func (c *sqlConn) Close() {
+	c.flushNotices()
 	if c.conn != nil {
 		err := c.conn.Close()
 		if err != nil && err != driver.ErrBadConn {
@@ -436,6 +484,7 @@ func (r *sqlRows) Tag() string {
 }
 
 func (r *sqlRows) Close() error {
+	r.conn.flushNotices()
 	err := r.rows.Close()
 	if err == driver.ErrBadConn {
 		r.conn.reconnecting = true
@@ -459,6 +508,9 @@ func (r *sqlRows) Next(values []driver.Value) error {
 			values[i] = append([]byte{}, b...)
 		}
 	}
+	// After the first row was received, we want to delay all
+	// further notices until the end of execution.
+	r.conn.delayNotices = true
 	return err
 }
 
@@ -480,7 +532,11 @@ func makeSQLConn(url string) *sqlConn {
 	}
 }
 
-var sqlConnTimeout = envutil.EnvOrDefaultString("COCKROACH_CONNECT_TIMEOUT", "5")
+// sqlConnTimeout is the default SQL connect timeout. This can also be
+// set using `connect_timeout` in the connection URL. The default of
+// 15 seconds is chosen to exceed the default password retrieval
+// timeout (system.user_login.timeout).
+var sqlConnTimeout = envutil.EnvOrDefaultString("COCKROACH_CONNECT_TIMEOUT", "15")
 
 // defaultSQLDb describes how a missing database part in the SQL
 // connection string is processed when creating a client connection.
@@ -537,15 +593,7 @@ func makeSQLClient(appName string, defaultMode defaultSQLDb) (*sqlConn, error) {
 			return nil, errors.Errorf("cannot specify a password in URL with an insecure connection")
 		}
 	} else {
-		if baseURL.User.Username() == security.RootUser {
-			// Disallow password login for root.
-			if options.Get("sslcert") == "" || options.Get("sslkey") == "" {
-				return nil, errors.Errorf("connections with user %s must use a client certificate",
-					baseURL.User.Username())
-			}
-			// If we can go on (we have a certificate spec), clear the password.
-			baseURL.User = url.User(security.RootUser)
-		} else if options.Get("sslcert") == "" || options.Get("sslkey") == "" {
+		if options.Get("sslcert") == "" || options.Get("sslkey") == "" {
 			// If there's no password in the URL yet and we don't have a client
 			// certificate, ask for it and populate it in the URL.
 			if _, pwdSet := baseURL.User.Password(); !pwdSet {

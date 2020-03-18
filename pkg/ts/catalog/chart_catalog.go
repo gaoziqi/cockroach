@@ -496,6 +496,25 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{KVTransactionLayer, "Protected Timestamps", "Reconciliation"}},
+		Charts: []chartDescription{
+			{
+				Title: "Records Processed",
+				Metrics: []string{
+					"kv.protectedts.reconciliation.errors",
+					"kv.protectedts.reconciliation.records_processed",
+					"kv.protectedts.reconciliation.records_removed",
+				},
+			},
+			{
+				Title: "Reconciliation Runs",
+				Metrics: []string{
+					"kv.protectedts.reconciliation.num_runs",
+				},
+			},
+		},
+	},
+	{
 		Organization: [][]string{{KVTransactionLayer, "Garbage Collection (GC)", "Keys"}},
 		Charts: []chartDescription{
 			{
@@ -674,15 +693,13 @@ var charts = []sectionDescription{
 			{
 				Title: "Page Counts",
 				Metrics: []string{
-					"tscache.skl.read.pages",
-					"tscache.skl.write.pages",
+					"tscache.skl.pages",
 				},
 			},
 			{
 				Title: "Page Rotations",
 				Metrics: []string{
-					"tscache.skl.read.rotations",
-					"tscache.skl.write.rotations",
+					"tscache.skl.rotations",
 				},
 			},
 		},
@@ -702,35 +719,6 @@ var charts = []sectionDescription{
 					"intents.abort-attempts",
 					"intents.poison-attempts",
 					"intents.resolve-attempts",
-				},
-			},
-		},
-	},
-	{
-		Organization: [][]string{{KVTransactionLayer, "Transactions", "Savepoints"}},
-		Charts: []chartDescription{
-			{
-				Title: "Count",
-				Metrics: []string{
-					"sql.savepoint.count",
-					"sql.savepoint.count.internal",
-				},
-				AxisLabel: "SQL Statements",
-			},
-			{
-				Title: "Restarts (Internal)",
-				Metrics: []string{
-					"sql.restart_savepoint.count.internal",
-					"sql.restart_savepoint.release.count.internal",
-					"sql.restart_savepoint.rollback.count.internal",
-				},
-			},
-			{
-				Title: "Restarts",
-				Metrics: []string{
-					"sql.restart_savepoint.count",
-					"sql.restart_savepoint.release.count",
-					"sql.restart_savepoint.rollback.count",
 				},
 			},
 		},
@@ -781,6 +769,10 @@ var charts = []sectionDescription{
 				Metrics: []string{"txn.autoretries"},
 			},
 			{
+				Title:   "Refresh Span Bytes Exceeded",
+				Metrics: []string{"txn.refreshspanbytesexceeded"},
+			},
+			{
 				Title: "Commits",
 				Metrics: []string{
 					"txn.commits",
@@ -795,7 +787,6 @@ var charts = []sectionDescription{
 			{
 				Title: "Restart Cause Mix",
 				Metrics: []string{
-					"txn.restarts.possiblereplay",
 					"txn.restarts.serializable",
 					"txn.restarts.writetooold",
 					"txn.restarts.asyncwritefailure",
@@ -1379,6 +1370,18 @@ var charts = []sectionDescription{
 				Title:   "Total Queries",
 				Metrics: []string{"sql.distsql.queries.total"},
 			},
+			{
+				Title:   "Vectorized Temporary Storage Open File Descriptors",
+				Metrics: []string{"sql.distsql.vec.openfds"},
+			},
+			{
+				Title:   "Current Disk Usage",
+				Metrics: []string{"sql.disk.distsql.current"},
+			},
+			{
+				Title:   "Disk Usage per Statement",
+				Metrics: []string{"sql.disk.distsql.max"},
+			},
 		},
 	},
 	{
@@ -1560,6 +1563,23 @@ var charts = []sectionDescription{
 		},
 	},
 	{
+		Organization: [][]string{{SQLLayer, "Temporary Objects Cleanup"}},
+		Charts: []chartDescription{
+			{
+				Title:   "Active Cleaners",
+				Metrics: []string{"sql.temp_object_cleaner.active_cleaners"},
+			},
+			{
+				Title: "Deletion Rate",
+				Metrics: []string{
+					"sql.temp_object_cleaner.schemas_to_delete",
+					"sql.temp_object_cleaner.schemas_deletion_success",
+					"sql.temp_object_cleaner.schemas_deletion_error",
+				},
+			},
+		},
+	},
+	{
 		Organization: [][]string{{SQLLayer, "SQL"}},
 		Charts: []chartDescription{
 			{
@@ -1717,6 +1737,14 @@ var charts = []sectionDescription{
 					"sql.savepoint.count.internal",
 					"sql.savepoint.started.count",
 					"sql.savepoint.started.count.internal",
+					"sql.savepoint.rollback.count",
+					"sql.savepoint.rollback.count.internal",
+					"sql.savepoint.rollback.started.count",
+					"sql.savepoint.rollback.started.count.internal",
+					"sql.savepoint.release.count",
+					"sql.savepoint.release.count.internal",
+					"sql.savepoint.release.started.count",
+					"sql.savepoint.release.started.count.internal",
 				},
 				AxisLabel: "SQL Statements",
 			},

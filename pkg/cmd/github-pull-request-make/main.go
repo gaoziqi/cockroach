@@ -256,18 +256,20 @@ func main() {
 			log.Fatal(err)
 		}
 		if len(pkgs) > 0 {
-			// 5 minutes total seems OK, but at least a minute per test.
-			duration := (5 * time.Minute) / time.Duration(len(pkgs))
-			if duration < time.Minute {
-				duration = time.Minute
-			}
-			// Use a timeout shorter than the duration so that hanging tests don't
-			// get a free pass.
-			timeout := (3 * duration) / 4
 			for name, pkg := range pkgs {
+				// 10 minutes total seems OK, but at least a minute per test.
+				duration := (10 * time.Minute) / time.Duration(len(pkgs))
+				minDuration := time.Minute * time.Duration(len(pkg.tests))
+				if duration < minDuration {
+					duration = minDuration
+				}
+				// Use a timeout shorter than the duration so that hanging tests don't
+				// get a free pass.
+				timeout := (3 * duration) / 4
+
 				tests := "-"
 				if len(pkg.tests) > 0 {
-					tests = "(" + strings.Join(pkg.tests, "|") + ")"
+					tests = "(" + strings.Join(pkg.tests, "$$|") + "$$)"
 				}
 
 				cmd := exec.Command(
@@ -276,6 +278,7 @@ func main() {
 					fmt.Sprintf("PKG=./%s", name),
 					fmt.Sprintf("TESTS=%s", tests),
 					fmt.Sprintf("TESTTIMEOUT=%s", timeout),
+					fmt.Sprintf("GOTESTFLAGS=-json"), // allow TeamCity to parse failures
 					fmt.Sprintf("STRESSFLAGS=-stderr -maxfails 1 -maxtime %s", duration),
 				)
 				cmd.Env = append(os.Environ(), "COCKROACH_NIGHTLY_STRESS=true")

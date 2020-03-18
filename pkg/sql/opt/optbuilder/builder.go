@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/errors"
 )
 
 // Builder holds the context needed for building a memo structure from a SQL
@@ -91,6 +92,7 @@ type Builder struct {
 	evalCtx    *tree.EvalContext
 	catalog    cat.Catalog
 	scopeAlloc []scope
+	cteStack   [][]cteSource
 
 	// If set, the planner will skip checking for the SELECT privilege when
 	// resolving data sources (tables, views, etc). This is used when compiling
@@ -179,9 +181,17 @@ func (b *Builder) Build() (err error) {
 		return err
 	}
 
+	b.pushWithFrame()
+
 	// Build the memo, and call SetRoot on the memo to indicate the root group
 	// and physical properties.
-	outScope := b.buildStmt(b.stmt, nil /* desiredTypes */, b.allocScope())
+	outScope := b.buildStmtAtRoot(b.stmt, nil /* desiredTypes */, b.allocScope())
+
+	b.popWithFrame(outScope)
+	if len(b.cteStack) > 0 {
+		panic(errors.AssertionFailedf("dangling CTE stack frames"))
+	}
+
 	physical := outScope.makePhysicalProps()
 	b.factory.Memo().SetRoot(outScope.expr, physical)
 	return nil
@@ -192,6 +202,19 @@ func (b *Builder) Build() (err error) {
 // pg code FeatureNotSupported.
 func unimplementedWithIssueDetailf(issue int, detail, format string, args ...interface{}) error {
 	return unimplemented.NewWithIssueDetailf(issue, detail, format, args...)
+}
+
+// buildStmtAtRoot builds a statement, beginning a new conceptual query
+// "context".
+func (b *Builder) buildStmtAtRoot(
+	stmt tree.Statement, desiredTypes []*types.T, inScope *scope,
+) (outScope *scope) {
+	defer func(prevAtRoot bool) {
+		inScope.atRoot = prevAtRoot
+	}(inScope.atRoot)
+	inScope.atRoot = true
+
+	return b.buildStmt(stmt, desiredTypes, inScope)
 }
 
 // buildStmt builds a set of memo groups that represent the given SQL
@@ -225,22 +248,27 @@ func (b *Builder) buildStmt(
 		}
 	}
 
-	// NB: The case statements are sorted lexicographically.
 	switch stmt := stmt.(type) {
-	case *tree.Delete:
-		return b.buildDelete(stmt, inScope)
-
-	case *tree.Insert:
-		return b.buildInsert(stmt, inScope)
+	case *tree.Select:
+		return b.buildSelect(stmt, noRowLocking, desiredTypes, inScope)
 
 	case *tree.ParenSelect:
-		return b.buildSelect(stmt.Select, desiredTypes, inScope)
+		return b.buildSelect(stmt.Select, noRowLocking, desiredTypes, inScope)
 
-	case *tree.Select:
-		return b.buildSelect(stmt, desiredTypes, inScope)
+	case *tree.Delete:
+		return b.processWiths(stmt.With, inScope, func(inScope *scope) *scope {
+			return b.buildDelete(stmt, inScope)
+		})
+
+	case *tree.Insert:
+		return b.processWiths(stmt.With, inScope, func(inScope *scope) *scope {
+			return b.buildInsert(stmt, inScope)
+		})
 
 	case *tree.Update:
-		return b.buildUpdate(stmt, inScope)
+		return b.processWiths(stmt.With, inScope, func(inScope *scope) *scope {
+			return b.buildUpdate(stmt, inScope)
+		})
 
 	case *tree.CreateTable:
 		return b.buildCreateTable(stmt, inScope)
@@ -275,6 +303,10 @@ func (b *Builder) buildStmt(
 	case *tree.Export:
 		return b.buildExport(stmt, inScope)
 
+	case *tree.ExplainBundle:
+		// This statement should have been handled by the executor.
+		panic(errors.Errorf("%s can only be used as a top-level statement", stmt.StatementTag()))
+
 	default:
 		// See if this statement can be rewritten to another statement using the
 		// delegate functionality.
@@ -297,7 +329,7 @@ func (b *Builder) buildStmt(
 			b.DisableMemoReuse = true
 			return outScope
 		}
-		panic(unimplementedWithIssueDetailf(34848, stmt.StatementTag(), "unsupported statement: %T", stmt))
+		panic(errors.AssertionFailedf("unexpected statement: %T", stmt))
 	}
 }
 

@@ -17,11 +17,15 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -33,6 +37,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	crdberrors "github.com/cockroachdb/errors"
 	"github.com/pkg/errors"
 )
 
@@ -44,52 +50,6 @@ func init() {
 			return &changefeedResumer{job: job}
 		},
 	)
-}
-
-type envelopeType string
-type formatType string
-
-const (
-	optConfluentSchemaRegistry = `confluent_schema_registry`
-	optCursor                  = `cursor`
-	optEnvelope                = `envelope`
-	optFormat                  = `format`
-	optKeyInValue              = `key_in_value`
-	optResolvedTimestamps      = `resolved`
-	optUpdatedTimestamps       = `updated`
-
-	optEnvelopeKeyOnly       envelopeType = `key_only`
-	optEnvelopeRow           envelopeType = `row`
-	optEnvelopeDeprecatedRow envelopeType = `deprecated_row`
-	optEnvelopeWrapped       envelopeType = `wrapped`
-
-	optFormatJSON formatType = `json`
-	optFormatAvro formatType = `experimental_avro`
-
-	sinkParamCACert           = `ca_cert`
-	sinkParamClientCert       = `client_cert`
-	sinkParamClientKey        = `client_key`
-	sinkParamFileSize         = `file_size`
-	sinkParamSchemaTopic      = `schema_topic`
-	sinkParamTLSEnabled       = `tls_enabled`
-	sinkParamTopicPrefix      = `topic_prefix`
-	sinkSchemeBuffer          = ``
-	sinkSchemeExperimentalSQL = `experimental-sql`
-	sinkSchemeKafka           = `kafka`
-	sinkParamSASLEnabled      = `sasl_enabled`
-	sinkParamSASLHandshake    = `sasl_handshake`
-	sinkParamSASLUser         = `sasl_user`
-	sinkParamSASLPassword     = `sasl_password`
-)
-
-var changefeedOptionExpectValues = map[string]sql.KVStringOptValidate{
-	optConfluentSchemaRegistry: sql.KVStringOptRequireValue,
-	optCursor:                  sql.KVStringOptRequireValue,
-	optEnvelope:                sql.KVStringOptRequireValue,
-	optFormat:                  sql.KVStringOptRequireValue,
-	optKeyInValue:              sql.KVStringOptRequireNoValue,
-	optResolvedTimestamps:      sql.KVStringOptAny,
-	optUpdatedTimestamps:       sql.KVStringOptRequireNoValue,
 }
 
 // changefeedPlanHook implements sql.PlanHookFn.
@@ -131,7 +91,7 @@ func changefeedPlanHook(
 		}
 	}
 
-	optsFn, err := p.TypeAsStringOpts(changefeedStmt.Options, changefeedOptionExpectValues)
+	optsFn, err := p.TypeAsStringOpts(changefeedStmt.Options, changefeedbase.ChangefeedOptionExpectValues)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -168,7 +128,7 @@ func changefeedPlanHook(
 			WallTime: p.ExtendedEvalContext().GetStmtTimestamp().UnixNano(),
 		}
 		var initialHighWater hlc.Timestamp
-		if cursor, ok := opts[optCursor]; ok {
+		if cursor, ok := opts[changefeedbase.OptCursor]; ok {
 			asOf := tree.AsOfClause{Expr: tree.NewStrVal(cursor)}
 			var err error
 			if initialHighWater, err = p.EvalAsOfTimestamp(asOf); err != nil {
@@ -196,7 +156,7 @@ func changefeedPlanHook(
 
 		// This grabs table descriptors once to get their ids.
 		targetDescs, _, err := backupccl.ResolveTargetsToDescriptors(
-			ctx, p, statementTime, changefeedStmt.Targets)
+			ctx, p, statementTime, changefeedStmt.Targets, tree.RequestedDescriptors)
 		if err != nil {
 			return err
 		}
@@ -219,7 +179,7 @@ func changefeedPlanHook(
 			StatementTime: statementTime,
 		}
 		progress := jobspb.Progress{
-			Progress: &jobspb.Progress_HighWater{HighWater: &initialHighWater},
+			Progress: &jobspb.Progress_HighWater{},
 			Details: &jobspb.Progress_Changefeed{
 				Changefeed: &jobspb.ChangefeedProgress{},
 			},
@@ -232,7 +192,7 @@ func changefeedPlanHook(
 		// - `validateDetails` has to run first to fill in defaults for `envelope`
 		//   and `format` if the user didn't specify them.
 		// - Then `getEncoder` is run to return any configuration errors.
-		// - Then the changefeed is opted in to `optKeyInValue` for any cloud
+		// - Then the changefeed is opted in to `OptKeyInValue` for any cloud
 		//   storage sink. Kafka etc have a key and value field in each message but
 		//   cloud storage sinks don't have anywhere to put the key. So if the key
 		//   is not in the value, then for DELETEs there is no way to recover which
@@ -262,7 +222,7 @@ func changefeedPlanHook(
 			return err
 		}
 		if isCloudStorageSink(parsedSink) {
-			details.Opts[optKeyInValue] = ``
+			details.Opts[changefeedbase.OptKeyInValue] = ``
 		}
 
 		// Feature telemetry
@@ -271,7 +231,7 @@ func changefeedPlanHook(
 			telemetrySink = `sinkless`
 		}
 		telemetry.Count(`changefeed.create.sink.` + telemetrySink)
-		telemetry.Count(`changefeed.create.format.` + details.Opts[optFormat])
+		telemetry.Count(`changefeed.create.format.` + details.Opts[changefeedbase.OptFormat])
 		telemetry.CountBucketed(`changefeed.create.num_tables`, int64(len(targets)))
 
 		if details.SinkURI == `` {
@@ -295,7 +255,7 @@ func changefeedPlanHook(
 			nodeID := p.ExtendedEvalContext().NodeID
 			var nilOracle timestampLowerBoundOracle
 			canarySink, err := getSink(
-				details.SinkURI, nodeID, details.Opts, details.Targets,
+				ctx, details.SinkURI, nodeID, details.Opts, details.Targets,
 				settings, nilOracle, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI,
 			)
 			if err != nil {
@@ -310,18 +270,74 @@ func changefeedPlanHook(
 		// been setup okay. This intentionally abuses what would normally be
 		// hooked up to resultsCh to avoid a bunch of extra plumbing.
 		startedCh := make(chan tree.Datums)
-		job, errCh, err := p.ExecCfg().JobRegistry.StartJob(ctx, startedCh, jobs.Record{
-			Description: jobDescription,
-			Username:    p.User(),
-			DescriptorIDs: func() (sqlDescIDs []sqlbase.ID) {
-				for _, desc := range targetDescs {
-					sqlDescIDs = append(sqlDescIDs, desc.GetID())
+
+		// The below block creates the job and if there's an initial scan, protects
+		// the data required for that scan. We protect the data here rather than in
+		// Resume to shorten the window that data may be GC'd. The protected
+		// timestamps are removed and created during the execution of the changefeed
+		// by the changeFrontier when checkpointing progress. Additionally protected
+		// timestamps are removed in OnFailOrCancel. See the comment on
+		// changeFrontier.manageProtectedTimestamps for more details on the handling of
+		// protected timestamps.
+		var sj *jobs.StartableJob
+		{
+			var protectedTimestampID uuid.UUID
+			var spansToProtect []roachpb.Span
+			if hasInitialScan := initialScanFromOptions(details.Opts); hasInitialScan {
+				protectedTimestampID = uuid.MakeV4()
+				spansToProtect = makeSpansToProtect(details.Targets)
+				progress.GetChangefeed().ProtectedTimestampRecord = protectedTimestampID
+			}
+
+			jr := jobs.Record{
+				Description: jobDescription,
+				Username:    p.User(),
+				DescriptorIDs: func() (sqlDescIDs []sqlbase.ID) {
+					for _, desc := range targetDescs {
+						sqlDescIDs = append(sqlDescIDs, desc.GetID())
+					}
+					return sqlDescIDs
+				}(),
+				Details:  details,
+				Progress: *progress.GetChangefeed(),
+			}
+			createJobAndProtectedTS := func(ctx context.Context, txn *kv.Txn) (err error) {
+				sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, startedCh)
+				if err != nil {
+					return err
 				}
-				return sqlDescIDs
-			}(),
-			Details:  details,
-			Progress: *progress.GetChangefeed(),
-		})
+				if protectedTimestampID == uuid.Nil {
+					return nil
+				}
+				ptr := jobsprotectedts.MakeRecord(protectedTimestampID, *sj.ID(),
+					statementTime, spansToProtect)
+				return p.ExecCfg().ProtectedTimestampProvider.Protect(ctx, txn, ptr)
+			}
+			if err := p.ExecCfg().DB.Txn(ctx, createJobAndProtectedTS); err != nil {
+				if sj != nil {
+					if err := sj.CleanupOnRollback(ctx); err != nil {
+						log.Warningf(ctx, "failed to cleanup aborted job: %v", err)
+					}
+				}
+				return err
+			}
+			// If we created a protected timestamp for an initial scan, verify it.
+			// Doing this synchronously here rather than asynchronously later provides
+			// a nice UX win in the case that the data isn't actually available.
+			if protectedTimestampID != uuid.Nil {
+				if err := p.ExecCfg().ProtectedTimestampProvider.Verify(ctx, protectedTimestampID); err != nil {
+					if cancelErr := sj.Cancel(ctx); cancelErr != nil {
+						if ctx.Err() == nil {
+							log.Warningf(ctx, "failed to cancel job: %v", cancelErr)
+						}
+					}
+					return err
+				}
+			}
+		}
+
+		// Start the job and wait for it to signal on startedCh.
+		errCh, err := sj.Start(ctx)
 		if err != nil {
 			return err
 		}
@@ -333,9 +349,8 @@ func changefeedPlanHook(
 		case <-startedCh:
 			// The feed set up without error, return control to the user.
 		}
-
 		resultsCh <- tree.Datums{
-			tree.NewDInt(tree.DInt(*job.ID())),
+			tree.NewDInt(tree.DInt(*sj.ID())),
 		}
 		return nil
 	}
@@ -345,7 +360,7 @@ func changefeedPlanHook(
 func changefeedJobDescription(
 	p sql.PlanHookState, changefeed *tree.CreateChangefeed, sinkURI string, opts map[string]string,
 ) (string, error) {
-	cleanedSinkURI, err := cloud.SanitizeExternalStorageURI(sinkURI)
+	cleanedSinkURI, err := cloud.SanitizeExternalStorageURI(sinkURI, []string{changefeedbase.SinkParamSASLPassword})
 	if err != nil {
 		return "", err
 	}
@@ -372,39 +387,78 @@ func validateDetails(details jobspb.ChangefeedDetails) (jobspb.ChangefeedDetails
 		// the job gets restarted.
 		details.Opts = map[string]string{}
 	}
-
-	if r, ok := details.Opts[optResolvedTimestamps]; ok && r != `` {
-		if d, err := time.ParseDuration(r); err != nil {
-			return jobspb.ChangefeedDetails{}, err
-		} else if d < 0 {
-			return jobspb.ChangefeedDetails{}, errors.Errorf(
-				`negative durations are not accepted: %s='%s'`,
-				optResolvedTimestamps, details.Opts[optResolvedTimestamps])
+	{
+		const opt = changefeedbase.OptResolvedTimestamps
+		if o, ok := details.Opts[opt]; ok && o != `` {
+			if d, err := time.ParseDuration(o); err != nil {
+				return jobspb.ChangefeedDetails{}, err
+			} else if d < 0 {
+				return jobspb.ChangefeedDetails{}, errors.Errorf(
+					`negative durations are not accepted: %s='%s'`, opt, o)
+			}
 		}
 	}
-
-	switch envelopeType(details.Opts[optEnvelope]) {
-	case optEnvelopeRow, optEnvelopeDeprecatedRow:
-		details.Opts[optEnvelope] = string(optEnvelopeRow)
-	case optEnvelopeKeyOnly:
-		details.Opts[optEnvelope] = string(optEnvelopeKeyOnly)
-	case ``, optEnvelopeWrapped:
-		details.Opts[optEnvelope] = string(optEnvelopeWrapped)
-	default:
-		return jobspb.ChangefeedDetails{}, errors.Errorf(
-			`unknown %s: %s`, optEnvelope, details.Opts[optEnvelope])
+	{
+		const opt = changefeedbase.OptSchemaChangeEvents
+		switch v := changefeedbase.SchemaChangeEventClass(details.Opts[opt]); v {
+		case ``, changefeedbase.OptSchemaChangeEventClassDefault:
+			details.Opts[opt] = string(changefeedbase.OptSchemaChangeEventClassDefault)
+		case changefeedbase.OptSchemaChangeEventClassColumnChange:
+			// No-op
+		default:
+			return jobspb.ChangefeedDetails{}, errors.Errorf(
+				`unknown %s: %s`, opt, v)
+		}
 	}
-
-	switch formatType(details.Opts[optFormat]) {
-	case ``, optFormatJSON:
-		details.Opts[optFormat] = string(optFormatJSON)
-	case optFormatAvro:
-		// No-op.
-	default:
-		return jobspb.ChangefeedDetails{}, errors.Errorf(
-			`unknown %s: %s`, optFormat, details.Opts[optFormat])
+	{
+		const opt = changefeedbase.OptSchemaChangePolicy
+		switch v := changefeedbase.SchemaChangePolicy(details.Opts[opt]); v {
+		case ``, changefeedbase.OptSchemaChangePolicyBackfill:
+			details.Opts[opt] = string(changefeedbase.OptSchemaChangePolicyBackfill)
+		case changefeedbase.OptSchemaChangePolicyNoBackfill:
+			// No-op
+		case changefeedbase.OptSchemaChangePolicyStop:
+			// No-op
+		default:
+			return jobspb.ChangefeedDetails{}, errors.Errorf(
+				`unknown %s: %s`, opt, v)
+		}
 	}
-
+	{
+		_, withInitialScan := details.Opts[changefeedbase.OptInitialScan]
+		_, noInitialScan := details.Opts[changefeedbase.OptNoInitialScan]
+		if withInitialScan && noInitialScan {
+			return jobspb.ChangefeedDetails{}, errors.Errorf(
+				`cannot specify both %s and %s`, changefeedbase.OptInitialScan,
+				changefeedbase.OptNoInitialScan)
+		}
+	}
+	{
+		const opt = changefeedbase.OptEnvelope
+		switch v := changefeedbase.EnvelopeType(details.Opts[opt]); v {
+		case changefeedbase.OptEnvelopeRow, changefeedbase.OptEnvelopeDeprecatedRow:
+			details.Opts[opt] = string(changefeedbase.OptEnvelopeRow)
+		case changefeedbase.OptEnvelopeKeyOnly:
+			details.Opts[opt] = string(changefeedbase.OptEnvelopeKeyOnly)
+		case ``, changefeedbase.OptEnvelopeWrapped:
+			details.Opts[opt] = string(changefeedbase.OptEnvelopeWrapped)
+		default:
+			return jobspb.ChangefeedDetails{}, errors.Errorf(
+				`unknown %s: %s`, opt, v)
+		}
+	}
+	{
+		const opt = changefeedbase.OptFormat
+		switch v := changefeedbase.FormatType(details.Opts[opt]); v {
+		case ``, changefeedbase.OptFormatJSON:
+			details.Opts[opt] = string(changefeedbase.OptFormatJSON)
+		case changefeedbase.OptFormatAvro:
+			// No-op.
+		default:
+			return jobspb.ChangefeedDetails{}, errors.Errorf(
+				`unknown %s: %s`, opt, v)
+		}
+	}
 	return details, nil
 }
 
@@ -496,16 +550,6 @@ func (b *changefeedResumer) Resume(
 	details := b.job.Details().(jobspb.ChangefeedDetails)
 	progress := b.job.Progress()
 
-	// TODO(dan): This is a workaround for not being able to set an initial
-	// progress high-water when creating a job (currently only the progress
-	// details can be set). I didn't want to pick off the refactor to get this
-	// fix in, but it'd be nice to remove this hack.
-	if _, ok := details.Opts[optCursor]; ok {
-		if h := progress.GetHighWater(); h == nil || *h == (hlc.Timestamp{}) {
-			progress.Progress = &jobspb.Progress_HighWater{HighWater: &details.StatementTime}
-		}
-	}
-
 	// We'd like to avoid failing a changefeed unnecessarily, so when an error
 	// bubbles up to this level, we'd like to "retry" the flow if possible. This
 	// could be because the sink is down or because a cockroach node has crashed
@@ -552,10 +596,28 @@ func (b *changefeedResumer) Resume(
 }
 
 // OnFailOrCancel is part of the jobs.Resumer interface.
-func (b *changefeedResumer) OnFailOrCancel(context.Context, *client.Txn) error { return nil }
+func (b *changefeedResumer) OnFailOrCancel(ctx context.Context, planHookState interface{}) error {
+	phs := planHookState.(sql.PlanHookState)
+	execCfg := phs.ExecCfg()
+	progress := b.job.Progress()
+	b.maybeCleanUpProtectedTimestamp(ctx, execCfg.DB, execCfg.ProtectedTimestampProvider,
+		progress.GetChangefeed().ProtectedTimestampRecord)
+	return nil
+}
 
-// OnSuccess is part of the jobs.Resumer interface.
-func (b *changefeedResumer) OnSuccess(context.Context, *client.Txn) error { return nil }
-
-// OnTerminal is part of the jobs.Resumer interface.
-func (b *changefeedResumer) OnTerminal(context.Context, jobs.Status, chan<- tree.Datums) {}
+// Try to clean up a protected timestamp created by the changefeed.
+func (b *changefeedResumer) maybeCleanUpProtectedTimestamp(
+	ctx context.Context, db *kv.DB, pts protectedts.Storage, ptsID uuid.UUID,
+) {
+	if ptsID == uuid.Nil {
+		return
+	}
+	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		return pts.Release(ctx, txn, ptsID)
+	}); err != nil && !crdberrors.Is(err, protectedts.ErrNotExists) {
+		// NB: The record should get cleaned up by the reconciliation loop.
+		// No good reason to cause more trouble by returning an error here.
+		// Log and move on.
+		log.Warningf(ctx, "failed to remove protected timestamp record %v: %v", ptsID, err)
+	}
+}

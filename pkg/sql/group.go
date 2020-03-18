@@ -26,10 +26,6 @@ type groupNode struct {
 	// The schema for this groupNode.
 	columns sqlbase.ResultColumns
 
-	// needOnlyOneRow determines whether aggregation should stop as soon
-	// as one result row can be computed.
-	needOnlyOneRow bool
-
 	// The source node (which returns values that feed into the aggregation).
 	plan planNode
 
@@ -75,8 +71,10 @@ func (n *groupNode) Close(ctx context.Context) {
 func (n *groupNode) aggIsGroupingColumn(aggIdx int) (colIdx int, ok bool) {
 	if holder := n.funcs[aggIdx]; holder.funcName == builtins.AnyNotNull {
 		for _, c := range n.groupCols {
-			if c == holder.argRenderIdx {
-				return c, true
+			for _, renderIdx := range holder.argRenderIdxs {
+				if c == renderIdx {
+					return c, true
+				}
 			}
 		}
 	}
@@ -91,9 +89,8 @@ type aggregateFuncHolder struct {
 	resultType *types.T
 
 	// The argument of the function is a single value produced by the renderNode
-	// underneath. If the function has no argument (COUNT_ROWS), it is set to
-	// noRenderIdx.
-	argRenderIdx int
+	// underneath. If the function has no argument (COUNT_ROWS), it is empty.
+	argRenderIdxs []int
 	// If there is a filter, the result is a single value produced by the
 	// renderNode underneath. If there is no filter, it is set to noRenderIdx.
 	filterRenderIdx int
@@ -129,7 +126,7 @@ const noRenderIdx = -1
 func (n *groupNode) newAggregateFuncHolder(
 	funcName string,
 	resultType *types.T,
-	argRenderIdx int,
+	argRenderIdxs []int,
 	create func(*tree.EvalContext, tree.Datums) tree.AggregateFunc,
 	arguments tree.Datums,
 	acc mon.BoundAccount,
@@ -137,7 +134,7 @@ func (n *groupNode) newAggregateFuncHolder(
 	res := &aggregateFuncHolder{
 		funcName:        funcName,
 		resultType:      resultType,
-		argRenderIdx:    argRenderIdx,
+		argRenderIdxs:   argRenderIdxs,
 		filterRenderIdx: noRenderIdx,
 		create:          create,
 		arguments:       arguments,

@@ -42,16 +42,8 @@ func registerHotSpotSplits(r *testRegistry) {
 		m.Go(func() error {
 			t.l.Printf("starting load generator\n")
 
-			quietL, err := t.l.ChildLogger("kv-0", quietStdout)
-			if err != nil {
-				return err
-			}
-			defer quietL.close()
-
-			// TODO(rytaft): reset this to 1 << 19 (512 KB) once we can dynamically
-			// size kv batches.
-			const blockSize = 1 << 18 // 256 KB
-			return c.RunL(ctx, quietL, appNode, fmt.Sprintf(
+			const blockSize = 1 << 19 // 512 KB
+			return c.RunE(ctx, appNode, fmt.Sprintf(
 				"./workload run kv --read-percent=0 --tolerate-errors --concurrency=%d "+
 					"--min-block-bytes=%d --max-block-bytes=%d --duration=%s {pgurl:1-3}",
 				concurrency, blockSize, blockSize, duration.String()))
@@ -59,7 +51,7 @@ func registerHotSpotSplits(r *testRegistry) {
 
 		m.Go(func() error {
 			t.Status(fmt.Sprintf("starting checks for range sizes"))
-			const sizeLimit = 3 * (1 << 26) // 192 MB
+			const sizeLimit = 3 * (1 << 29) // 3*512 MB (512 mb is default size)
 
 			db := c.Conn(ctx, 1)
 			defer db.Close()
@@ -97,8 +89,13 @@ func registerHotSpotSplits(r *testRegistry) {
 	concurrency := 128
 
 	r.Add(testSpec{
-		Name:    fmt.Sprintf("hotspotsplits/nodes=%d", numNodes),
-		Cluster: makeClusterSpec(numNodes),
+		Name:  fmt.Sprintf("hotspotsplits/nodes=%d", numNodes),
+		Owner: OwnerKV,
+		// Test OOMs below this version because of scans over the large rows.
+		// No problem in 20.1 thanks to:
+		// https://github.com/cockroachdb/cockroach/pull/45323.
+		MinVersion: "v20.1.0",
+		Cluster:    makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			if local {
 				concurrency = 32

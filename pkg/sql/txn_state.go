@@ -14,7 +14,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -49,7 +49,7 @@ type txnState struct {
 	mu struct {
 		syncutil.RWMutex
 
-		txn *client.Txn
+		txn *kv.Txn
 	}
 
 	// connCtx is the connection's context. This is the parent of Ctx.
@@ -91,9 +91,6 @@ type txnState struct {
 	// planNode in the midst of performing a computation.
 	mon *mon.BytesMonitor
 
-	// The schema change closures to run when this txn is done.
-	schemaChangers schemaChangerCollection
-
 	// adv is overwritten after every transition. It represents instructions for
 	// for moving the cursor over the stream of input statements to the next
 	// statement to be executed.
@@ -104,10 +101,6 @@ type txnState struct {
 	// txnAbortCount is incremented whenever the state transitions to
 	// stateAborted.
 	txnAbortCount *metric.Counter
-
-	// activeSavepointName stores the name of the active savepoint,
-	// or is empty if no savepoint is active.
-	activeSavepointName tree.Name
 }
 
 // txnType represents the type of a SQL transaction.
@@ -145,7 +138,7 @@ func (ts *txnState) resetForNewSQLTxn(
 	historicalTimestamp *hlc.Timestamp,
 	priority roachpb.UserPriority,
 	readOnly tree.ReadWriteMode,
-	txn *client.Txn,
+	txn *kv.Txn,
 	tranCtx transitionCtx,
 ) {
 	// Reset state vars to defaults.
@@ -203,7 +196,7 @@ func (ts *txnState) resetForNewSQLTxn(
 	ts.mon.Start(ts.Ctx, tranCtx.connMon, mon.BoundAccount{} /* reserved */)
 	ts.mu.Lock()
 	if txn == nil {
-		ts.mu.txn = client.NewTxn(ts.Ctx, tranCtx.db, tranCtx.nodeID, client.RootTxn)
+		ts.mu.txn = kv.NewTxnWithSteppingEnabled(ts.Ctx, tranCtx.db, tranCtx.nodeID)
 		ts.mu.txn.SetDebugName(opName)
 	} else {
 		ts.mu.txn = txn
@@ -218,9 +211,6 @@ func (ts *txnState) resetForNewSQLTxn(
 	if err := ts.setReadOnlyMode(readOnly); err != nil {
 		panic(err)
 	}
-
-	// Discard the old schemaChangers, if any.
-	ts.schemaChangers = schemaChangerCollection{}
 }
 
 // finishSQLTxn finalizes a transaction's results and closes the root span for
@@ -290,10 +280,11 @@ func (ts *txnState) setHistoricalTimestamp(ctx context.Context, historicalTimest
 	ts.isHistorical = true
 }
 
-func (ts *txnState) getOrigTimestamp() hlc.Timestamp {
+// getReadTimestamp returns the transaction's current read timestamp.
+func (ts *txnState) getReadTimestamp() hlc.Timestamp {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	return ts.mu.txn.OrigTimestamp()
+	return ts.mu.txn.ReadTimestamp()
 }
 
 func (ts *txnState) setPriority(userPriority roachpb.UserPriority) error {
@@ -368,16 +359,15 @@ const (
 	// This event is produced both when entering the CommitWait state and also
 	// when leaving it.
 	txnCommit
-	// txnAborted means that the transaction will not commit. This doesn't mean
-	// that the SQL txn is necessarily "finished" - the connection might be in the
-	// Aborted state.
-	// This event is produced both when entering the Aborted state and sometimes
-	// when leaving it.
-	txnAborted
-	// txnRestart means that the transaction is expecting a retry. The iteration
-	// of the txn just finished will not commit.
-	// This event is produced both when entering the RetryWait state and sometimes
-	// when exiting it.
+	// txnRollback means that the SQL transaction has been rolled back (completely
+	// rolled back, not to a savepoint). It is generated when an implicit
+	// transaction fails and when an explicit transaction runs a ROLLBACK.
+	txnRollback
+	// txnRestart means that the transaction is restarting. The iteration of the
+	// txn just finished will not commit. It is generated when we're about to
+	// auto-retry a txn and after a rollback to a savepoint placed at the start of
+	// the transaction. This allows such savepoints to reset more state than other
+	// savepoints.
 	txnRestart
 )
 
@@ -404,7 +394,7 @@ type advanceInfo struct {
 
 // transitionCtx is a bag of fields needed by some state machine events.
 type transitionCtx struct {
-	db     *client.DB
+	db     *kv.DB
 	nodeID roachpb.NodeID
 	clock  *hlc.Clock
 	// connMon is the connExecutor's monitor. New transactions will create a child

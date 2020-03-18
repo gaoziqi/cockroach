@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // KVInserter implements the putter interface.
@@ -171,7 +171,7 @@ type KVBatch struct {
 	// Source is where the row data in the batch came from.
 	Source int32
 	// LastRow is the index of the last converted row in source in this batch.
-	LastRow uint64
+	LastRow int64
 	// Progress represents the fraction of the input that generated this row.
 	Progress float32
 	// KVs is the actual converted KV data.
@@ -207,7 +207,7 @@ type DatumRowConverter struct {
 	computedIVarContainer sqlbase.RowIndexedVarContainer
 
 	// FractionFn is used to set the progress header in KVBatches.
-	CompletedRowFn func() uint64
+	CompletedRowFn func() int64
 	FractionFn     func() float32
 }
 
@@ -224,6 +224,7 @@ func TestingSetDatumRowConverterBatchSize(newSize int) func() {
 
 // NewDatumRowConverter returns an instance of a DatumRowConverter.
 func NewDatumRowConverter(
+	ctx context.Context,
 	tableDesc *sqlbase.TableDescriptor,
 	targetColNames tree.NameList,
 	evalCtx *tree.EvalContext,
@@ -256,7 +257,7 @@ func NewDatumRowConverter(
 	}
 
 	c.IsTargetCol = make(map[int]struct{})
-	for i, col := range immutDesc.VisibleColumns() {
+	for i, col := range targetColDescriptors {
 		if _, ok := isTargetColID[col.ID]; !ok {
 			continue
 		}
@@ -273,8 +274,15 @@ func NewDatumRowConverter(
 		return nil, errors.Wrap(err, "process default columns")
 	}
 
-	ri, err := MakeInserter(nil /* txn */, immutDesc, nil, /* fkTables */
-		cols, false /* checkFKs */, &sqlbase.DatumAlloc{})
+	ri, err := MakeInserter(
+		ctx,
+		nil, /* txn */
+		immutDesc,
+		cols,
+		SkipFKs,
+		nil, /* fkTables */
+		&sqlbase.DatumAlloc{},
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "make row inserter")
 	}
@@ -283,7 +291,7 @@ func NewDatumRowConverter(
 	c.cols = cols
 	c.defaultExprs = defaultExprs
 
-	c.VisibleCols = immutDesc.VisibleColumns()
+	c.VisibleCols = targetColDescriptors
 	c.VisibleColTypes = make([]*types.T, len(c.VisibleCols))
 	for i := range c.VisibleCols {
 		c.VisibleColTypes[i] = c.VisibleCols[i].DatumType()

@@ -13,47 +13,29 @@ package norm
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
-// CanReduceGroupingCols is true if the given GroupBy operator has one or more
-// redundant grouping columns. A grouping column is redundant if it is
-// functionally determined by the other grouping columns.
-func (c *CustomFuncs) CanReduceGroupingCols(
-	input memo.RelExpr, private *memo.GroupingPrivate,
-) bool {
-	fdset := input.Relational().FuncDeps
-	return !fdset.ReduceCols(private.GroupingCols).Equals(private.GroupingCols)
+// NullsAreDistinct returns true if the given distinct operator treats NULL
+// values as not equal to one another (i.e. distinct). UpsertDistinctOp treats
+// NULL values as distinct, whereas DistinctOp does not.
+func (c *CustomFuncs) NullsAreDistinct(distinctOp opt.Operator) bool {
+	return distinctOp == opt.UpsertDistinctOnOp
 }
 
-// ReduceGroupingCols constructs a new GroupByDef private, based on an existing
-// definition. The new GroupByDef will not retain any grouping column that is
-// functionally determined by other grouping columns. CanReduceGroupingCols
-// should be called before calling this method, to ensure it has work to do.
-func (c *CustomFuncs) ReduceGroupingCols(
-	input memo.RelExpr, private *memo.GroupingPrivate,
+// RemoveGroupingCols returns a new grouping private struct with the given
+// columns removed from the grouping column set.
+func (c *CustomFuncs) RemoveGroupingCols(
+	private *memo.GroupingPrivate, cols opt.ColSet,
 ) *memo.GroupingPrivate {
-	fdset := input.Relational().FuncDeps
-	return &memo.GroupingPrivate{
-		GroupingCols: fdset.ReduceCols(private.GroupingCols),
-		Ordering:     private.Ordering,
-	}
-}
-
-// AppendReducedGroupingCols will take columns discarded by ReduceGroupingCols
-// and append them to the end of the given aggregate function list, wrapped in
-// ConstAgg aggregate functions. AppendReducedGroupingCols returns a new
-// Aggregations operator containing the combined set of existing aggregate
-// functions and the new ConstAgg aggregate functions.
-func (c *CustomFuncs) AppendReducedGroupingCols(
-	input memo.RelExpr, aggs memo.AggregationsExpr, private *memo.GroupingPrivate,
-) memo.AggregationsExpr {
-	fdset := input.Relational().FuncDeps
-	appendCols := private.GroupingCols.Difference(fdset.ReduceCols(private.GroupingCols))
-	return c.AppendAggCols(aggs, opt.ConstAggOp, appendCols)
+	p := *private
+	p.GroupingCols = private.GroupingCols.Difference(cols)
+	return &p
 }
 
 // AppendAggCols constructs a new Aggregations operator containing the aggregate
@@ -126,101 +108,44 @@ func (c *CustomFuncs) makeAggCols(
 			panic(errors.AssertionFailedf("unrecognized aggregate operator type: %v", log.Safe(aggOp)))
 		}
 
-		outAggs[i].Agg = outAgg
-		outAggs[i].Col = id
+		outAggs[i] = c.f.ConstructAggregationsItem(outAgg, id)
 		i++
 	}
 }
 
-// CanRemoveAggDistinctForKeys returns true if the given aggregations contain an
-// aggregation with AggDistinct where the input column together with the
-// grouping columns form a key. In this case, the respective AggDistinct can be
-// removed.
+// CanRemoveAggDistinctForKeys returns true if the given aggregate function
+// where its input column, together with the grouping columns, form a key. In
+// this case, the wrapper AggDistinct can be removed.
 func (c *CustomFuncs) CanRemoveAggDistinctForKeys(
-	aggs memo.AggregationsExpr, private *memo.GroupingPrivate, input memo.RelExpr,
+	input memo.RelExpr, private *memo.GroupingPrivate, agg opt.ScalarExpr,
 ) bool {
-	inputFDs := &input.Relational().FuncDeps
-	if _, hasKey := inputFDs.StrictKey(); !hasKey {
-		// Fast-path for the case when the input has no keys.
+	if agg.ChildCount() == 0 {
 		return false
 	}
-
-	for i := range aggs {
-		if ok, _ := c.hasRemovableAggDistinct(aggs[i].Agg, private.GroupingCols, inputFDs); ok {
-			return true
-		}
-	}
-	return false
-}
-
-// RemoveAggDistinctForKeys rewrites aggregations to remove AggDistinct when
-// the input column together with the grouping columns form a key. Returns the
-// new Aggregation expression.
-func (c *CustomFuncs) RemoveAggDistinctForKeys(
-	aggs memo.AggregationsExpr, private *memo.GroupingPrivate, input memo.RelExpr,
-) memo.AggregationsExpr {
 	inputFDs := &input.Relational().FuncDeps
+	variable := agg.Child(0).(*memo.VariableExpr)
+	cols := c.AddColToSet(private.GroupingCols, variable.Col)
+	return inputFDs.ColsAreStrictKey(cols)
+}
 
-	newAggs := make(memo.AggregationsExpr, len(aggs))
+// ReplaceAggregationsItem returns a new list that is a copy of the given list,
+// except that the given search item has been replaced by the given replace
+// item. If the list contains the search item multiple times, then only the
+// first instance is replaced. If the list does not contain the item, then the
+// method panics.
+func (c *CustomFuncs) ReplaceAggregationsItem(
+	aggs memo.AggregationsExpr, search *memo.AggregationsItem, replace opt.ScalarExpr,
+) memo.AggregationsExpr {
+	newAggs := make([]memo.AggregationsItem, len(aggs))
 	for i := range aggs {
-		item := &aggs[i]
-		if ok, v := c.hasRemovableAggDistinct(item.Agg, private.GroupingCols, inputFDs); ok {
-			// Remove AggDistinct. We rely on the fact that AggDistinct must be
-			// directly "under" the Aggregate.
-			// TODO(radu): this will need to be revisited when we add more modifiers.
-			newAggs[i].Agg = c.replaceAggInputVar(item.Agg, v)
-			newAggs[i].Col = aggs[i].Col
-		} else {
-			newAggs[i] = *item
+		if search == &aggs[i] {
+			copy(newAggs, aggs[:i])
+			newAggs[i] = c.f.ConstructAggregationsItem(replace, search.Col)
+			copy(newAggs[i+1:], aggs[i+1:])
+			return newAggs
 		}
 	}
-
-	return newAggs
-}
-
-// replaceAggInputVar swaps out the aggregated variable in an aggregate with v. In
-// the case of aggregates with multiple arguments (like string_agg) the other arguments
-// are kept the same.
-func (c *CustomFuncs) replaceAggInputVar(agg opt.ScalarExpr, v opt.ScalarExpr) opt.ScalarExpr {
-	switch agg.ChildCount() {
-	case 1:
-		return c.f.DynamicConstruct(agg.Op(), v).(opt.ScalarExpr)
-	case 2:
-		return c.f.DynamicConstruct(agg.Op(), v, agg.Child(1)).(opt.ScalarExpr)
-	default:
-		panic(errors.AssertionFailedf("unhandled number of aggregate children"))
-	}
-}
-
-// hasRemovableAggDistinct is called with an aggregation element and returns
-// true if the aggregation has AggDistinct and the grouping columns along with
-// the aggregation input column form a key in the input (in which case
-// AggDistinct can be elided).
-// On success, the input expression to AggDistinct is also returned.
-func (c *CustomFuncs) hasRemovableAggDistinct(
-	agg opt.ScalarExpr, groupingCols opt.ColSet, inputFDs *props.FuncDepSet,
-) (ok bool, aggDistinctVar *memo.VariableExpr) {
-	if agg.ChildCount() == 0 {
-		return false, nil
-	}
-
-	distinct, ok := agg.Child(0).(*memo.AggDistinctExpr)
-	if !ok {
-		return false, nil
-	}
-
-	v, ok := distinct.Input.(*memo.VariableExpr)
-	if !ok {
-		return false, nil
-	}
-
-	cols := groupingCols.Copy()
-	cols.Add(v.Col)
-	if !inputFDs.ColsAreStrictKey(cols) {
-		return false, nil
-	}
-
-	return true, v
+	panic(errors.AssertionFailedf("item to replace is not in the list: %v", search))
 }
 
 // HasNoGroupingCols returns true if the GroupingCols in the private are empty.
@@ -234,26 +159,159 @@ func (c *CustomFuncs) GroupingInputOrdering(private *memo.GroupingPrivate) physi
 }
 
 // ConstructProjectionFromDistinctOn converts a DistinctOn to a projection; this
-// is correct when the input has at most one row. Note that DistinctOn can only
-// have aggregations of type FirstAgg or ConstAgg.
+// is correct when input groupings have at most one row (i.e. the input is
+// already distinct). Note that DistinctOn can only have aggregations of type
+// FirstAgg or ConstAgg.
 func (c *CustomFuncs) ConstructProjectionFromDistinctOn(
-	input memo.RelExpr, aggs memo.AggregationsExpr,
+	input memo.RelExpr, groupingCols opt.ColSet, aggs memo.AggregationsExpr,
 ) memo.RelExpr {
-	var passthrough opt.ColSet
+	// Always pass through grouping columns.
+	passthrough := groupingCols.Copy()
+
 	var projections memo.ProjectionsExpr
 	for i := range aggs {
-		varExpr := memo.ExtractVarFromAggInput(aggs[i].Agg.Child(0).(opt.ScalarExpr))
+		varExpr := memo.ExtractAggFirstVar(aggs[i].Agg)
 		inputCol := varExpr.Col
 		outputCol := aggs[i].Col
 		if inputCol == outputCol {
 			passthrough.Add(inputCol)
 		} else {
-			projections = append(projections, memo.ProjectionsItem{
-				Element:    varExpr,
-				ColPrivate: aggs[i].ColPrivate,
-				Typ:        aggs[i].Typ,
-			})
+			projections = append(projections, c.f.ConstructProjectionsItem(varExpr, aggs[i].Col))
 		}
 	}
 	return c.f.ConstructProject(input, projections, passthrough)
+}
+
+// DuplicateUpsertErrText returns the error text used when duplicate input rows
+// to the Upsert operator are detected.
+func (c *CustomFuncs) DuplicateUpsertErrText() string {
+	return sqlbase.DuplicateUpsertErrText
+}
+
+// AreValuesDistinct returns true if a constant Values operator input contains
+// only rows that are already distinct with respect to the given grouping
+// columns. The Values operator can be wrapped by Select, Project, and/or
+// LeftJoin operators.
+//
+// If nullsAreDistinct is true, then NULL values are treated as not equal to one
+// another, and therefore rows containing a NULL value in any grouping column
+// are always distinct.
+func (c *CustomFuncs) AreValuesDistinct(
+	input memo.RelExpr, groupingCols opt.ColSet, nullsAreDistinct bool,
+) bool {
+	switch t := input.(type) {
+	case *memo.ValuesExpr:
+		return c.areRowsDistinct(t.Rows, t.Cols, groupingCols, nullsAreDistinct)
+
+	case *memo.SelectExpr:
+		return c.AreValuesDistinct(t.Input, groupingCols, nullsAreDistinct)
+
+	case *memo.ProjectExpr:
+		// Pass through call to input if grouping on passthrough columns.
+		if groupingCols.SubsetOf(t.Input.Relational().OutputCols) {
+			return c.AreValuesDistinct(t.Input, groupingCols, nullsAreDistinct)
+		}
+
+	case *memo.LeftJoinExpr:
+		// Pass through call to left input if grouping on its columns. Also,
+		// ensure that the left join does not cause duplication of left rows.
+		leftCols := t.Left.Relational().OutputCols
+		rightCols := t.Right.Relational().OutputCols
+		if !groupingCols.SubsetOf(leftCols) {
+			break
+		}
+
+		// If any set of key columns (lax or strict) from the right input are
+		// equality joined to columns in the left input, then the left join will
+		// never cause duplication of left rows.
+		var eqCols opt.ColSet
+		for i := range t.On {
+			condition := t.On[i].Condition
+			ok, _, rightColID := memo.ExtractJoinEquality(leftCols, rightCols, condition)
+			if ok {
+				eqCols.Add(rightColID)
+			}
+		}
+		if !t.Right.Relational().FuncDeps.ColsAreLaxKey(eqCols) {
+			// Not joining on a right input key.
+			break
+		}
+
+		return c.AreValuesDistinct(t.Left, groupingCols, nullsAreDistinct)
+
+	case *memo.UpsertDistinctOnExpr:
+		// Pass through call to input if grouping on passthrough columns.
+		if groupingCols.SubsetOf(t.Input.Relational().OutputCols) {
+			return c.AreValuesDistinct(t.Input, groupingCols, nullsAreDistinct)
+		}
+	}
+	return false
+}
+
+// areRowsDistinct returns true if the given rows are unique on the given
+// grouping columns. If nullsAreDistinct is true, then NULL values are treated
+// as unique, and therefore a row containing a NULL value in any grouping column
+// is always distinct from every other row.
+func (c *CustomFuncs) areRowsDistinct(
+	rows memo.ScalarListExpr, cols opt.ColList, groupingCols opt.ColSet, nullsAreDistinct bool,
+) bool {
+	var seen map[string]bool
+	var encoded []byte
+	for _, scalar := range rows {
+		row := scalar.(*memo.TupleExpr)
+
+		// Reset scratch bytes.
+		encoded = encoded[:0]
+
+		forceDistinct := false
+		for i, colID := range cols {
+			if !groupingCols.Contains(colID) {
+				// This is not a grouping column, so ignore.
+				continue
+			}
+
+			// Try to extract constant value from column. Call IsConstValueOp first,
+			// since this code doesn't handle the tuples and arrays that
+			// ExtractConstDatum can return.
+			col := row.Elems[i]
+			if !opt.IsConstValueOp(col) {
+				// At least one grouping column in at least one row is not constant,
+				// so can't determine whether the rows are distinct.
+				return false
+			}
+			datum := memo.ExtractConstDatum(col)
+
+			// If this is an UpsertDistinctOn operator, then treat NULL values as
+			// always distinct.
+			if nullsAreDistinct && datum == tree.DNull {
+				forceDistinct = true
+				break
+			}
+
+			// Encode the datum using the key encoding format. The encodings for
+			// multiple column datums are simply appended to one another.
+			var err error
+			encoded, err = sqlbase.EncodeTableKey(encoded, datum, encoding.Ascending)
+			if err != nil {
+				// Assume rows are not distinct if an encoding error occurs.
+				return false
+			}
+		}
+
+		if seen == nil {
+			seen = make(map[string]bool, len(rows))
+		}
+
+		// Determine whether key has already been seen.
+		key := string(encoded)
+		if _, ok := seen[key]; ok && !forceDistinct {
+			// Found duplicate.
+			return false
+		}
+
+		// Add the key to the seen map.
+		seen[key] = true
+	}
+
+	return true
 }

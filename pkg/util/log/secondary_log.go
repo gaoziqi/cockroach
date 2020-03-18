@@ -44,6 +44,9 @@ var secondaryLogRegistry struct {
 // in which case it specifies the directory for that new logger.
 //
 // The logger's GC daemon stops when the provided context is canceled.
+//
+// The caller is responsible for ensuring the Close() method is
+// eventually called.
 func NewSecondaryLogger(
 	ctx context.Context,
 	dirName *DirName,
@@ -76,8 +79,8 @@ func NewSecondaryLogger(
 
 	// Ensure the registry knows about this logger.
 	secondaryLogRegistry.mu.Lock()
-	defer secondaryLogRegistry.mu.Unlock()
 	secondaryLogRegistry.mu.loggers = append(secondaryLogRegistry.mu.loggers, l)
+	secondaryLogRegistry.mu.Unlock()
 
 	if enableGc {
 		// Start the log file GC for the secondary logger.
@@ -87,10 +90,26 @@ func NewSecondaryLogger(
 	return l
 }
 
+// Close implements the stopper.Closer interface.
+func (l *SecondaryLogger) Close() {
+	// Make the registry forget about this logger. This avoids
+	// stacking many secondary loggers together when there are
+	// subsequent tests starting servers in the same package.
+	secondaryLogRegistry.mu.Lock()
+	defer secondaryLogRegistry.mu.Unlock()
+	for i, thatLogger := range secondaryLogRegistry.mu.loggers {
+		if thatLogger != l {
+			continue
+		}
+		secondaryLogRegistry.mu.loggers = append(secondaryLogRegistry.mu.loggers[:i], secondaryLogRegistry.mu.loggers[i+1:]...)
+		return
+	}
+}
+
 func (l *SecondaryLogger) output(
-	ctx context.Context, sev Severity, format string, args ...interface{},
+	ctx context.Context, depth int, sev Severity, format string, args ...interface{},
 ) {
-	file, line, _ := caller.Lookup(2)
+	file, line, _ := caller.Lookup(depth + 1)
 	var buf strings.Builder
 	formatTags(ctx, &buf)
 
@@ -110,10 +129,18 @@ func (l *SecondaryLogger) output(
 
 // Logf logs an event on a secondary logger.
 func (l *SecondaryLogger) Logf(ctx context.Context, format string, args ...interface{}) {
-	l.output(ctx, Severity_INFO, format, args...)
+	l.output(ctx, 1, Severity_INFO, format, args...)
+}
+
+// LogfDepth logs an event on a secondary logger, offsetting the caller's stack
+// frame by 'depth'
+func (l *SecondaryLogger) LogfDepth(
+	ctx context.Context, depth int, format string, args ...interface{},
+) {
+	l.output(ctx, depth+1, Severity_INFO, format, args...)
 }
 
 // LogSev logs an event at the specified severity on a secondary logger.
 func (l *SecondaryLogger) LogSev(ctx context.Context, sev Severity, args ...interface{}) {
-	l.output(ctx, Severity_INFO, "", args...)
+	l.output(ctx, 1, Severity_INFO, "", args...)
 }

@@ -13,18 +13,33 @@ package row
 import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // spanForValues produce access spans for a single FK constraint and a
 // tuple of columns.
 func (f fkExistenceCheckBaseHelper) spanForValues(values tree.Datums) (roachpb.Span, error) {
-	var key roachpb.Key
-	if values != nil {
-		span, _, err := sqlbase.EncodePartialIndexSpan(
-			f.searchTable.TableDesc(), f.searchIdx, f.prefixLen, f.ids, values, f.searchPrefix)
-		return span, err
+	if values == nil {
+		key := roachpb.Key(f.spanBuilder.KeyPrefix)
+		return roachpb.Span{Key: key, EndKey: key.PrefixEnd()}, nil
 	}
-	key = roachpb.Key(f.searchPrefix)
-	return roachpb.Span{Key: key, EndKey: key.PrefixEnd()}, nil
+	return FKCheckSpan(f.spanBuilder, values, f.ids, f.prefixLen)
+}
+
+// FKCheckSpan returns a span that can be scanned to ascertain existence of a
+// specific row in a given index.
+func FKCheckSpan(
+	s *span.Builder, values []tree.Datum, colMap map[sqlbase.ColumnID]int, numCols int,
+) (roachpb.Span, error) {
+	span, containsNull, err := s.SpanFromDatumRow(values, numCols, colMap)
+	if err != nil {
+		return roachpb.Span{}, err
+	}
+	// If it is safe to split this lookup into multiple families, generate a point lookup for
+	// family 0. Because we are just checking for existence, we only need family 0.
+	if s.CanSplitSpanIntoSeparateFamilies(1 /* numNeededFamilies */, numCols, containsNull) {
+		return s.SpanToPointSpan(span, 0), nil
+	}
+	return span, nil
 }

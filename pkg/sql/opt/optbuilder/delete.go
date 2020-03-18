@@ -11,7 +11,6 @@
 package optbuilder
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -39,27 +38,19 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 			"DELETE statement requires LIMIT when ORDER BY is used"))
 	}
 
-	var ctes []cteSource
-	if del.With != nil {
-		inScope, ctes = b.buildCTEs(del.With, inScope)
-	}
-
-	// DELETE FROM xx AS yy - we want to know about xx (tn) because
-	// that's what we get the descriptor with, and yy (alias) because
-	// that's what RETURNING will use.
-	tn, alias := getAliasedTableName(del.Table)
-
 	// Find which table we're working on, check the permissions.
-	tab, resName := b.resolveTable(tn, privilege.DELETE)
-	if alias == nil {
-		alias = &resName
+	tab, depName, alias, refColumns := b.resolveTableForMutation(del.Table, privilege.DELETE)
+
+	if refColumns != nil {
+		panic(pgerror.Newf(pgcode.Syntax,
+			"cannot specify a list of column IDs with DELETE"))
 	}
 
 	// Check Select permission as well, since existing values must be read.
-	b.checkPrivilege(opt.DepByName(tn), tab, privilege.SELECT)
+	b.checkPrivilege(depName, tab, privilege.SELECT)
 
 	var mb mutationBuilder
-	mb.init(b, "delete", tab, *alias)
+	mb.init(b, "delete", tab, alias)
 
 	// Build the input expression that selects the rows that will be deleted:
 	//
@@ -76,8 +67,6 @@ func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope
 	} else {
 		mb.buildDelete(nil /* returning */)
 	}
-
-	mb.outScope.expr = b.wrapWithCTEs(mb.outScope.expr, ctes)
 
 	return mb.outScope
 }

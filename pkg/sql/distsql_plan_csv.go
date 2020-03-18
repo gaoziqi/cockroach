@@ -17,9 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -143,6 +143,8 @@ func makeImportReaderSpecs(
 
 	// For each input file, assign it to a node.
 	inputSpecs := make([]*execinfrapb.ReadImportDataSpec, 0, len(nodes))
+	progress := job.Progress()
+	importProgress := progress.GetImport()
 	for i, input := range from {
 		// Round robin assign CSV files to nodes. Files 0 through len(nodes)-1
 		// creates the spec. Future files just add themselves to the Uris.
@@ -156,11 +158,15 @@ func makeImportReaderSpecs(
 				},
 				WalltimeNanos: walltime,
 				Uri:           make(map[int32]string),
+				ResumePos:     make(map[int32]int64),
 			}
 			inputSpecs = append(inputSpecs, spec)
 		}
 		n := i % len(nodes)
 		inputSpecs[n].Uri[int32(i)] = input
+		if importProgress.ResumePos != nil {
+			inputSpecs[n].ResumePos[int32(i)] = importProgress.ResumePos[int32(i)]
+		}
 	}
 
 	for i := range inputSpecs {
@@ -187,7 +193,7 @@ func presplitTableBoundaries(
 			scatterReq := &roachpb.AdminScatterRequest{
 				RequestHeader: roachpb.RequestHeaderFromSpan(span),
 			}
-			if _, pErr := client.SendWrapped(ctx, cfg.DB.NonTransactionalSender(), scatterReq); pErr != nil {
+			if _, pErr := kv.SendWrapped(ctx, cfg.DB.NonTransactionalSender(), scatterReq); pErr != nil {
 				log.Errorf(ctx, "failed to scatter span %s: %s", span.Key, pErr)
 			}
 		}
@@ -207,6 +213,7 @@ func DistIngest(
 	from []string,
 	format roachpb.IOFileFormat,
 	walltime int64,
+	alwaysFlushProgress bool,
 ) (roachpb.BulkOpSummary, error) {
 	ctx = logtags.AddTag(ctx, "import-distsql-ingest", nil)
 
@@ -248,24 +255,48 @@ func DistIngest(
 		func(ctx context.Context, details jobspb.ProgressDetails) float32 {
 			prog := details.(*jobspb.Progress_Import).Import
 			prog.ReadProgress = make([]float32, len(from))
-			prog.CompletedRow = make([]uint64, len(from))
+			prog.ResumePos = make([]int64, len(from))
 			return 0.0
 		},
 	); err != nil {
 		return roachpb.BulkOpSummary{}, err
 	}
 
-	rowProgress := make([]uint64, len(from))
+	rowProgress := make([]int64, len(from))
 	fractionProgress := make([]uint32, len(from))
-	metaFn := func(_ context.Context, meta *execinfrapb.ProducerMetadata) {
+
+	updateJobProgress := func() error {
+		return job.FractionProgressed(ctx,
+			func(ctx context.Context, details jobspb.ProgressDetails) float32 {
+				var overall float32
+				prog := details.(*jobspb.Progress_Import).Import
+				for i := range rowProgress {
+					prog.ResumePos[i] = atomic.LoadInt64(&rowProgress[i])
+				}
+				for i := range fractionProgress {
+					fileProgress := math.Float32frombits(atomic.LoadUint32(&fractionProgress[i]))
+					prog.ReadProgress[i] = fileProgress
+					overall += fileProgress
+				}
+				return overall / float32(len(from))
+			},
+		)
+	}
+
+	metaFn := func(_ context.Context, meta *execinfrapb.ProducerMetadata) error {
 		if meta.BulkProcessorProgress != nil {
-			for i, v := range meta.BulkProcessorProgress.CompletedRow {
-				atomic.StoreUint64(&rowProgress[i], v)
+			for i, v := range meta.BulkProcessorProgress.ResumePos {
+				atomic.StoreInt64(&rowProgress[i], v)
 			}
 			for i, v := range meta.BulkProcessorProgress.CompletedFraction {
 				atomic.StoreUint32(&fractionProgress[i], math.Float32bits(v))
 			}
+
+			if alwaysFlushProgress {
+				return updateJobProgress()
+			}
 		}
+		return nil
 	}
 
 	var res roachpb.BulkOpSummary
@@ -307,21 +338,7 @@ func DistIngest(
 			case <-done:
 				return ctx.Err()
 			case <-tick.C:
-				if err := job.FractionProgressed(ctx,
-					func(ctx context.Context, details jobspb.ProgressDetails) float32 {
-						var overall float32
-						prog := details.(*jobspb.Progress_Import).Import
-						for i := range rowProgress {
-							prog.CompletedRow[i] = atomic.LoadUint64(&rowProgress[i])
-						}
-						for i := range fractionProgress {
-							fileProgress := math.Float32frombits(atomic.LoadUint32(&fractionProgress[i]))
-							prog.ReadProgress[i] = fileProgress
-							overall += fileProgress
-						}
-						return overall / float32(len(from))
-					},
-				); err != nil {
+				if err := updateJobProgress(); err != nil {
 					return err
 				}
 			}

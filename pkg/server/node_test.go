@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math"
 	"net"
 	"reflect"
 	"sort"
@@ -22,22 +21,21 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/closedts/container"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -57,15 +55,15 @@ import (
 // of engines. The server, clock and node are returned. If gossipBS is
 // not nil, the gossip bootstrap address is set to gossipBS.
 func createTestNode(
-	addr net.Addr, engines []engine.Engine, gossipBS net.Addr, t *testing.T,
-) (*grpc.Server, net.Addr, storage.StoreConfig, *Node, *stop.Stopper) {
-	cfg := storage.TestStoreConfig(nil)
+	addr net.Addr, engines []storage.Engine, gossipBS net.Addr, t *testing.T,
+) (*grpc.Server, net.Addr, kvserver.StoreConfig, *Node, *stop.Stopper) {
+	cfg := kvserver.TestStoreConfig(nil /* clock */)
 	st := cfg.Settings
 
 	stopper := stop.NewStopper()
 	nodeRPCContext := rpc.NewContext(
 		log.AmbientContext{Tracer: cfg.Settings.Tracer}, nodeTestBaseContext, cfg.Clock, stopper,
-		&cfg.Settings.Version)
+		cfg.Settings)
 	cfg.RPCContext = nodeRPCContext
 	cfg.ScanInterval = 10 * time.Hour
 	grpcServer := rpc.NewServer(nodeRPCContext)
@@ -80,7 +78,7 @@ func createTestNode(
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.Closer = stopper.ShouldQuiesce()
 	cfg.AmbientCtx.Tracer = st.Tracer
-	distSender := kv.NewDistSender(kv.DistSenderConfig{
+	distSender := kvcoord.NewDistSender(kvcoord.DistSenderConfig{
 		AmbientCtx:      cfg.AmbientCtx,
 		Settings:        st,
 		Clock:           cfg.Clock,
@@ -88,8 +86,8 @@ func createTestNode(
 		RPCRetryOptions: &retryOpts,
 		NodeDialer:      nodedialer.New(nodeRPCContext, gossip.AddressResolver(cfg.Gossip)),
 	}, cfg.Gossip)
-	tsf := kv.NewTxnCoordSenderFactory(
-		kv.TxnCoordSenderFactoryConfig{
+	tsf := kvcoord.NewTxnCoordSenderFactory(
+		kvcoord.TxnCoordSenderFactoryConfig{
 			AmbientCtx: cfg.AmbientCtx,
 			Settings:   st,
 			Clock:      cfg.Clock,
@@ -97,11 +95,11 @@ func createTestNode(
 		},
 		distSender,
 	)
-	cfg.DB = client.NewDB(cfg.AmbientCtx, tsf, cfg.Clock)
-	cfg.Transport = storage.NewDummyRaftTransport(st)
+	cfg.DB = kv.NewDB(cfg.AmbientCtx, tsf, cfg.Clock)
+	cfg.Transport = kvserver.NewDummyRaftTransport(st)
 	active, renewal := cfg.NodeLivenessDurations()
 	cfg.HistogramWindowInterval = metric.TestSampleInterval
-	cfg.NodeLiveness = storage.NewNodeLiveness(
+	cfg.NodeLiveness = kvserver.NewNodeLiveness(
 		cfg.AmbientCtx,
 		cfg.Clock,
 		cfg.DB,
@@ -112,21 +110,20 @@ func createTestNode(
 		cfg.Settings,
 		cfg.HistogramWindowInterval,
 	)
-	cfg.ClosedTimestamp = container.NoopContainer()
 
-	storage.TimeUntilStoreDead.Override(&cfg.Settings.SV, 10*time.Millisecond)
-	cfg.StorePool = storage.NewStorePool(
+	kvserver.TimeUntilStoreDead.Override(&cfg.Settings.SV, 10*time.Millisecond)
+	cfg.StorePool = kvserver.NewStorePool(
 		cfg.AmbientCtx,
 		st,
 		cfg.Gossip,
 		cfg.Clock,
 		cfg.NodeLiveness.GetNodeCount,
-		storage.MakeStorePoolNodeLivenessFunc(cfg.NodeLiveness),
+		kvserver.MakeStorePoolNodeLivenessFunc(cfg.NodeLiveness),
 		/* deterministic */ false,
 	)
 	metricsRecorder := status.NewMetricsRecorder(cfg.Clock, cfg.NodeLiveness, nodeRPCContext, cfg.Gossip, st)
 	node := NewNode(cfg, metricsRecorder, metric.NewRegistry(), stopper,
-		kv.MakeTxnMetrics(metric.TestSampleInterval), nil, /* execCfg */
+		kvcoord.MakeTxnMetrics(metric.TestSampleInterval), nil, /* execCfg */
 		&nodeRPCContext.ClusterID)
 	roachpb.RegisterInternalServer(grpcServer, node)
 	node.storeCfg.ClosedTimestamp.RegisterClosedTimestampServer(grpcServer)
@@ -157,15 +154,17 @@ func createTestNode(
 func createAndStartTestNode(
 	ctx context.Context,
 	addr net.Addr,
-	engines []engine.Engine,
+	engines []storage.Engine,
 	gossipBS net.Addr,
 	locality roachpb.Locality,
 	t *testing.T,
 ) (*grpc.Server, net.Addr, *Node, *stop.Stopper) {
 	grpcServer, addr, cfg, node, stopper := createTestNode(addr, engines, gossipBS, t)
 	bootstrappedEngines, newEngines, cv, err := inspectEngines(
-		ctx, engines, cfg.Settings.Version.MinSupportedVersion,
-		cfg.Settings.Version.ServerVersion, node.clusterID)
+		ctx, engines,
+		cfg.Settings.Version.BinaryVersion(),
+		cfg.Settings.Version.BinaryMinSupportedVersion(),
+		node.clusterID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +179,7 @@ func createAndStartTestNode(
 		roachpb.Attributes{}, locality, cv, []roachpb.LocalityAddress{},
 		nil, /*nodeDescriptorCallback */
 	); err != nil {
+		stopper.Stop(ctx)
 		t.Fatal(err)
 	}
 
@@ -206,21 +206,21 @@ func (s keySlice) Less(i, j int) bool { return bytes.Compare(s[i], s[j]) < 0 }
 func TestBootstrapCluster(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
-	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
+	e := storage.NewDefaultInMem()
 	defer e.Close()
 	if _, err := bootstrapCluster(
-		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
+		ctx, []storage.Engine{e}, clusterversion.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
 
 	// Scan the complete contents of the local database directly from the engine.
-	rows, _, _, err := engine.MVCCScan(ctx, e, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{})
+	res, err := storage.MVCCScan(ctx, e, keys.LocalMax, roachpb.KeyMax, hlc.MaxTimestamp, storage.MVCCScanOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var foundKeys keySlice
-	for _, kv := range rows {
+	for _, kv := range res.KVs {
 		foundKeys = append(foundKeys, kv.Key)
 	}
 	var expectedKeys = keySlice{
@@ -237,7 +237,7 @@ func TestBootstrapCluster(t *testing.T) {
 	}
 
 	// Add the initial keys for sql.
-	kvs, tableSplits := GetBootstrapSchema(zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef()).GetInitialValues()
+	kvs, tableSplits := GetBootstrapSchema(zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef()).GetInitialValues(clusterversion.TestingClusterVersion)
 	for _, kv := range kvs {
 		expectedKeys = append(expectedKeys, kv.Key)
 	}
@@ -262,18 +262,18 @@ func TestBootstrapCluster(t *testing.T) {
 func TestBootstrapNewStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
-	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
+	e := storage.NewDefaultInMem()
 	if _, err := bootstrapCluster(
-		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
+		ctx, []storage.Engine{e}, clusterversion.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
 
 	// Start a new node with two new stores which will require bootstrapping.
-	engines := Engines([]engine.Engine{
+	engines := Engines([]storage.Engine{
 		e,
-		engine.NewInMem(roachpb.Attributes{}, 1<<20),
-		engine.NewInMem(roachpb.Attributes{}, 1<<20),
+		storage.NewDefaultInMem(),
+		storage.NewDefaultInMem(),
 	})
 	defer engines.Close()
 	_, _, node, stopper := createAndStartTestNode(
@@ -298,7 +298,7 @@ func TestBootstrapNewStore(t *testing.T) {
 	})
 
 	// Check whether all stores are started properly.
-	if err := node.stores.VisitStores(func(s *storage.Store) error {
+	if err := node.stores.VisitStores(func(s *kvserver.Store) error {
 		if !s.IsStarted() {
 			return errors.Errorf("fail to start store: %s", s)
 		}
@@ -315,17 +315,17 @@ func TestNodeJoin(t *testing.T) {
 	ctx := context.Background()
 	engineStopper := stop.NewStopper()
 	defer engineStopper.Stop(ctx)
-	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
+	e := storage.NewDefaultInMem()
 	engineStopper.AddCloser(e)
 
 	if _, err := bootstrapCluster(
-		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
+		ctx, []storage.Engine{e}, clusterversion.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
 
 	// Start the bootstrap node.
-	engines1 := []engine.Engine{e}
+	engines1 := []storage.Engine{e}
 	_, server1Addr, node1, stopper1 := createAndStartTestNode(
 		ctx,
 		util.TestAddr,
@@ -337,9 +337,9 @@ func TestNodeJoin(t *testing.T) {
 	defer stopper1.Stop(ctx)
 
 	// Create a new node.
-	e2 := engine.NewInMem(roachpb.Attributes{}, 1<<20)
+	e2 := storage.NewDefaultInMem()
 	engineStopper.AddCloser(e2)
-	engines2 := []engine.Engine{e2}
+	engines2 := []storage.Engine{e2}
 	_, server2Addr, node2, stopper2 := createAndStartTestNode(
 		ctx,
 		util.TestAddr,
@@ -386,11 +386,11 @@ func TestCorruptedClusterID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
+	e := storage.NewDefaultInMem()
 	defer e.Close()
 
 	if _, err := bootstrapCluster(
-		ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
+		ctx, []storage.Engine{e}, clusterversion.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -401,18 +401,20 @@ func TestCorruptedClusterID(t *testing.T) {
 		NodeID:    1,
 		StoreID:   1,
 	}
-	if err := engine.MVCCPutProto(
+	if err := storage.MVCCPutProto(
 		ctx, e, nil /* ms */, keys.StoreIdentKey(), hlc.Timestamp{}, nil /* txn */, &sIdent,
 	); err != nil {
 		t.Fatal(err)
 	}
 
-	engines := []engine.Engine{e}
-	_, serverAddr, cfg, node, stopper := createTestNode(util.TestAddr, engines, nil, t)
+	engines := []storage.Engine{e}
+	_, serverAddr, _, node, stopper := createTestNode(util.TestAddr, engines, nil, t)
 	defer stopper.Stop(ctx)
 	bootstrappedEngines, newEngines, cv, err := inspectEngines(
-		ctx, engines, cfg.Settings.Version.MinSupportedVersion,
-		cfg.Settings.Version.ServerVersion, node.clusterID)
+		ctx, engines,
+		clusterversion.TestingBinaryVersion,
+		clusterversion.TestingBinaryMinSupportedVersion,
+		node.clusterID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +607,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	}
 
 	expectedStoreStatuses := make(map[roachpb.StoreID]statuspb.StoreStatus)
-	if err := ts.node.stores.VisitStores(func(s *storage.Store) error {
+	if err := ts.node.stores.VisitStores(func(s *kvserver.Store) error {
 		desc, err := s.Descriptor(false /* useCached */)
 		if err != nil {
 			t.Fatal(err)
@@ -731,17 +733,17 @@ func TestStartNodeWithLocality(t *testing.T) {
 	ctx := context.Background()
 
 	testLocalityWithNewNode := func(locality roachpb.Locality) {
-		e := engine.NewInMem(roachpb.Attributes{}, 1<<20)
+		e := storage.NewDefaultInMem()
 		defer e.Close()
 		if _, err := bootstrapCluster(
-			ctx, []engine.Engine{e}, cluster.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
+			ctx, []storage.Engine{e}, clusterversion.TestingClusterVersion, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
 		); err != nil {
 			t.Fatal(err)
 		}
 		_, _, node, stopper := createAndStartTestNode(
 			ctx,
 			util.TestAddr,
-			[]engine.Engine{e},
+			[]storage.Engine{e},
 			util.TestAddr,
 			locality,
 			t,
@@ -756,7 +758,7 @@ func TestStartNodeWithLocality(t *testing.T) {
 
 		// Check the store to make sure the locality was propagated to its
 		// nodeDescriptor.
-		if err := node.stores.VisitStores(func(store *storage.Store) error {
+		if err := node.stores.VisitStores(func(store *kvserver.Store) error {
 			desc, err := store.Descriptor(false /* useCached */)
 			if err != nil {
 				t.Fatal(err)

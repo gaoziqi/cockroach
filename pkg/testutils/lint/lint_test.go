@@ -330,6 +330,47 @@ func TestLint(t *testing.T) {
 		}
 	})
 
+	t.Run("TestHttputil", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			re       string
+			excludes []string
+		}{
+			{re: `\bhttp\.(Get|Put|Head)\(`},
+		} {
+			cmd, stderr, filter, err := dirCmd(
+				pkgDir,
+				"git",
+				append([]string{
+					"grep",
+					"-nE",
+					tc.re,
+					"--",
+					"*.go",
+				}, tc.excludes...)...,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := stream.ForEach(filter, func(s string) {
+				t.Errorf("\n%s <- forbidden; use 'httputil' instead", s)
+			}); err != nil {
+				t.Error(err)
+			}
+
+			if err := cmd.Wait(); err != nil {
+				if out := stderr.String(); len(out) > 0 {
+					t.Fatalf("err=%s, stderr=%s", err, out)
+				}
+			}
+		}
+	})
+
 	t.Run("TestEnvutil", func(t *testing.T) {
 		t.Parallel()
 		for _, tc := range []struct {
@@ -343,7 +384,7 @@ func TestLint(t *testing.T) {
 					":!acceptance",
 					":!ccl/acceptanceccl/backup_test.go",
 					":!ccl/backupccl/backup_cloud_test.go",
-					":!storage/cloud/external_storage_test.go",
+					":!storage/cloud",
 					":!ccl/workloadccl/fixture_test.go",
 					":!cmd",
 					":!nightly",
@@ -875,6 +916,8 @@ func TestLint(t *testing.T) {
 			"*.go",
 			":!*.pb.go",
 			":!*.pb.gw.go",
+			":!sql/pgwire/pgerror/with_candidate_code.go",
+			":!sql/colexec/execerror/error.go",
 			":!util/protoutil/jsonpb_marshal.go",
 			":!util/protoutil/marshal.go",
 			":!util/protoutil/marshaler.go",
@@ -976,7 +1019,7 @@ func TestLint(t *testing.T) {
 		if err := stream.ForEach(stream.Sequence(
 			filter,
 			stream.GrepNot(`.*\.lock`),
-			stream.GrepNot(`^storage\/engine\/rocksdb_error_dict\.go$`),
+			stream.GrepNot(`^storage\/rocksdb_error_dict\.go$`),
 			stream.GrepNot(`^workload/tpcds/tpcds.go$`),
 			stream.Map(func(s string) string {
 				return filepath.Join(pkgDir, s)
@@ -1118,7 +1161,6 @@ func TestLint(t *testing.T) {
 		forbiddenImports := map[string]string{
 			"golang.org/x/net/context":                    "context",
 			"log":                                         "util/log",
-			"path":                                        "path/filepath",
 			"github.com/golang/protobuf/proto":            "github.com/gogo/protobuf/proto",
 			"github.com/satori/go.uuid":                   "util/uuid",
 			"golang.org/x/sync/singleflight":              "github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight",
@@ -1189,10 +1231,7 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`cockroach/pkg/util/sysutil: syscall$`),
 			stream.GrepNot(`cockroach/pkg/(base|security|util/(log|randutil|stop)): log$`),
 			stream.GrepNot(`cockroach/pkg/(server/serverpb|ts/tspb): github\.com/golang/protobuf/proto$`),
-			stream.GrepNot(`cockroach/pkg/server/debug/pprofui: path$`),
-			stream.GrepNot(`cockroach/pkg/util/caller: path$`),
-			stream.GrepNot(`cockroach/pkg/ccl/storageccl: path$`),
-			stream.GrepNot(`cockroach/pkg/ccl/workloadccl: path$`),
+
 			stream.GrepNot(`cockroach/pkg/util/uuid: github\.com/satori/go\.uuid$`),
 		), func(s string) {
 			pkgStr := strings.Split(s, ": ")
@@ -1218,78 +1257,6 @@ func TestLint(t *testing.T) {
 		}); err != nil {
 			t.Error(err)
 		}
-	})
-
-	t.Run("TestVet", func(t *testing.T) {
-		t.Parallel()
-		runVet := func(t *testing.T, args ...string) {
-			args = append(append([]string{"vet"}, args...), pkgScope)
-			vetCmd(t, crdb.Dir, "go", args, []stream.Filter{
-				stream.GrepNot(`declaration of "?(pE|e)rr"? shadows`),
-				stream.GrepNot(`\.pb\.gw\.go:[0-9:]+: declaration of "?ctx"? shadows`),
-				stream.GrepNot(`\.[eo]g\.go:[0-9:]+: declaration of ".*" shadows`),
-				// This exception is for hash.go, which re-implements runtime.noescape
-				// for efficient hashing.
-				stream.GrepNot(`pkg/sql/colexec/hash.go:[0-9:]+: possible misuse of unsafe.Pointer`),
-				stream.GrepNot(`^#`), // comment line
-			})
-		}
-		printfuncs := strings.Join([]string{
-			"ErrEvent",
-			"ErrEventf",
-			"Error",
-			"Errorf",
-			"ErrorfDepth",
-			"Event",
-			"Eventf",
-			"Fatal",
-			"Fatalf",
-			"FatalfDepth",
-			"Info",
-			"Infof",
-			"InfofDepth",
-			"AssertionFailedf",
-			"AssertionFailedWithDepthf",
-			"NewAssertionErrorWithWrappedErrf",
-			"DangerousStatementf",
-			"pgerror.New",
-			"pgerror.NewWithDepthf",
-			"pgerror.Newf",
-			"SetDetailf",
-			"SetHintf",
-			"Unimplemented",
-			"Unimplementedf",
-			"UnimplementedWithDepthf",
-			"UnimplementedWithIssueDetailf",
-			"UnimplementedWithIssuef",
-			"VEvent",
-			"VEventf",
-			"Warning",
-			"Warningf",
-			"WarningfDepth",
-			"Wrapf",
-			"WrapWithDepthf",
-		}, ",")
-
-		// Unfortunately if an analyzer is passed via -vettool like shadow, it seems
-		// we cannot also run the core analyzers (or at least cannot pass them flags
-		// like -printfuncs).
-		t.Run("shadow", func(t *testing.T) { runVet(t, "-vettool=bin/shadow") })
-		// The -printfuncs functionality is interesting and
-		// under-documented. It checks two things:
-		//
-		// - that functions that accept formatting specifiers are given
-		//   arguments of the proper type.
-		// - that functions that don't accept formatting specifiers
-		//   are not given any.
-		//
-		// Whether a function takes a format string or not is determined
-		// as follows: (comment taken from the source of `go vet`)
-		//
-		//    A function may be a Printf or Print wrapper if its last argument is ...interface{}.
-		//    If the next-to-last argument is a string, then this may be a Printf wrapper.
-		//    Otherwise it may be a Print wrapper.
-		runVet(t, "-all", "-printfuncs", printfuncs)
 	})
 
 	// TODO(tamird): replace this with errcheck.NewChecker() when
@@ -1421,6 +1388,8 @@ func TestLint(t *testing.T) {
 				stream.GrepNot(`pkg/sql/pgwire/pgcode/codes.go:.* const .* is unused`),
 				// The methods in exprgen.customFuncs are used via reflection.
 				stream.GrepNot(`pkg/sql/opt/optgen/exprgen/custom_funcs.go:.* func .* is unused`),
+				// Using deprecated method to COPY.
+				stream.GrepNot(`pkg/cli/nodelocal.go:.* stmt.Exec is deprecated: .*`),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -1434,27 +1403,6 @@ func TestLint(t *testing.T) {
 		}
 	})
 
-	t.Run("TestRoachLint", func(t *testing.T) {
-		t.Parallel()
-
-		vetCmd(t, crdb.Dir, "roachlint", []string{pkgScope}, []stream.Filter{
-			// Ignore generated files.
-			stream.GrepNot(`pkg/.*\.pb\.go:`),
-			stream.GrepNot(`pkg/col/coldata/.*\.eg\.go:`),
-			stream.GrepNot(`pkg/col/colserde/arrowserde/.*_generated\.go:`),
-			stream.GrepNot(`pkg/sql/colexec/.*\.eg\.go:`),
-			stream.GrepNot(`pkg/sql/colexec/.*_generated\.go:`),
-			stream.GrepNot(`pkg/sql/pgwire/hba/conf.go:`),
-
-			// Ignore types that can change by system.
-			stream.GrepNot(`pkg/util/sysutil/sysutil_unix.go:`),
-
-			// Ignore tests.
-			// TODO(mjibson): remove this ignore.
-			stream.GrepNot(`pkg/.*_test\.go:`),
-		})
-	})
-
 	t.Run("TestVectorizedPanics", func(t *testing.T) {
 		t.Parallel()
 		cmd, stderr, filter, err := dirCmd(
@@ -1466,6 +1414,7 @@ func TestLint(t *testing.T) {
 			"--",
 			"sql/colexec",
 			"sql/colflow",
+			"sql/colcontainer",
 			":!sql/colexec/execerror/error.go",
 			":!sql/colexec/execpb/stats.pb.go",
 			":!sql/colflow/vectorized_panic_propagation_test.go",
@@ -1489,5 +1438,136 @@ func TestLint(t *testing.T) {
 				t.Fatalf("err=%s, stderr=%s", err, out)
 			}
 		}
+	})
+
+	t.Run("TestVectorizedAllocator", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			// We prohibit usage of:
+			// - coldata.NewMemBatch
+			// - coldata.NewMemBatchWithSize
+			// - coldata.NewMemColumn
+			// - coldata.Batch.AppendCol
+			// TODO(yuzefovich): prohibit call to coldata.NewMemBatchNoCols.
+			fmt.Sprintf(`(coldata\.NewMem(Batch|BatchWithSize|Column)|\.AppendCol)\(`),
+			"--",
+			"sql/colexec",
+			"sql/colflow",
+			":!sql/colexec/allocator.go",
+			":!sql/colexec/simple_project.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use colexec.Allocator object instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+	// RoachVet is expensive memory-wise and thus should not run with t.Parallel().
+	// RoachVet includes all of the passes of `go vet` plus first-party additions.
+	// See pkg/cmd/roachvet.
+	t.Run("TestRoachVet", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("short flag")
+		}
+		// The -printfuncs functionality is interesting and
+		// under-documented. It checks two things:
+		//
+		// - that functions that accept formatting specifiers are given
+		//   arguments of the proper type.
+		// - that functions that don't accept formatting specifiers
+		//   are not given any.
+		//
+		// Whether a function takes a format string or not is determined
+		// as follows: (comment taken from the source of `go vet`)
+		//
+		//    A function may be a Printf or Print wrapper if its last argument is ...interface{}.
+		//    If the next-to-last argument is a string, then this may be a Printf wrapper.
+		//    Otherwise it may be a Print wrapper.
+		printfuncs := strings.Join([]string{
+			"ErrEvent",
+			"ErrEventf",
+			"Error",
+			"Errorf",
+			"ErrorfDepth",
+			"Event",
+			"Eventf",
+			"Fatal",
+			"Fatalf",
+			"FatalfDepth",
+			"Info",
+			"Infof",
+			"InfofDepth",
+			"AssertionFailedf",
+			"AssertionFailedWithDepthf",
+			"NewAssertionErrorWithWrappedErrf",
+			"DangerousStatementf",
+			"pgerror.New",
+			"pgerror.NewWithDepthf",
+			"pgerror.Newf",
+			"SetDetailf",
+			"SetHintf",
+			"Unimplemented",
+			"Unimplementedf",
+			"UnimplementedWithDepthf",
+			"UnimplementedWithIssueDetailf",
+			"UnimplementedWithIssuef",
+			"VEvent",
+			"VEventf",
+			"Warning",
+			"Warningf",
+			"WarningfDepth",
+			"Wrapf",
+			"WrapWithDepthf",
+		}, ",")
+
+		filters := []stream.Filter{
+			// Ignore generated files.
+			stream.GrepNot(`pkg/.*\.pb\.go:`),
+			stream.GrepNot(`pkg/col/coldata/.*\.eg\.go:`),
+			stream.GrepNot(`pkg/col/colserde/arrowserde/.*_generated\.go:`),
+			stream.GrepNot(`pkg/sql/colexec/.*\.eg\.go:`),
+			stream.GrepNot(`pkg/sql/colexec/.*_generated\.go:`),
+			stream.GrepNot(`pkg/sql/pgwire/hba/conf.go:`),
+
+			// Ignore types that can change by system.
+			stream.GrepNot(`pkg/util/sysutil/sysutil_unix.go:`),
+
+			stream.GrepNot(`declaration of "?(pE|e)rr"? shadows`),
+			stream.GrepNot(`\.pb\.gw\.go:[0-9:]+: declaration of "?ctx"? shadows`),
+			stream.GrepNot(`\.[eo]g\.go:[0-9:]+: declaration of ".*" shadows`),
+			// This exception is for hash.go, which re-implements runtime.noescape
+			// for efficient hashing.
+			stream.GrepNot(`pkg/sql/colexec/hash.go:[0-9:]+: possible misuse of unsafe.Pointer`),
+			stream.GrepNot(`^#`), // comment line
+			// This exception is for the colexec generated files.
+			stream.GrepNot(`pkg/sql/colexec/.*\.eg.go:[0-9:]+: self-assignment of .* to .*`),
+		}
+
+		roachlint, err := exec.LookPath("roachvet")
+		if err != nil {
+			t.Fatalf("failed to find roachvet: %v", err)
+		}
+		vetCmd(t, crdb.Dir, "go",
+			[]string{"vet", "-vettool", roachlint, "-all", "-printf.funcs", printfuncs, pkgScope},
+			filters)
+
 	})
 }

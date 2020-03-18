@@ -63,8 +63,10 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER SEQUENCE blah RENAME ??`, `ALTER SEQUENCE`},
 		{`ALTER SEQUENCE blah RENAME TO blih ??`, `ALTER SEQUENCE`},
 
-		{`ALTER USER IF ??`, `ALTER USER`},
-		{`ALTER USER foo WITH PASSWORD ??`, `ALTER USER`},
+		{`ALTER USER IF ??`, `ALTER ROLE`},
+		{`ALTER USER foo WITH PASSWORD ??`, `ALTER ROLE`},
+
+		{`ALTER ROLE bleh ?? WITH NOCREATEROLE`, `ALTER ROLE`},
 
 		{`ALTER RANGE foo CONFIGURE ??`, `ALTER RANGE`},
 		{`ALTER RANGE ??`, `ALTER RANGE`},
@@ -100,10 +102,11 @@ func TestContextualHelp(t *testing.T) {
 		{`CREATE DATABASE IF NOT ??`, `CREATE DATABASE`},
 		{`CREATE DATABASE blih ??`, `CREATE DATABASE`},
 
-		{`CREATE USER blih ??`, `CREATE USER`},
-		{`CREATE USER blih WITH ??`, `CREATE USER`},
+		{`CREATE USER blih ??`, `CREATE ROLE`},
+		{`CREATE USER blih WITH ??`, `CREATE ROLE`},
 
 		{`CREATE ROLE bleh ??`, `CREATE ROLE`},
+		{`CREATE ROLE bleh ?? WITH CREATEROLE`, `CREATE ROLE`},
 
 		{`CREATE VIEW blah (??`, `CREATE VIEW`},
 		{`CREATE VIEW blah AS (SELECT c FROM x) ??`, `CREATE VIEW`},
@@ -122,6 +125,10 @@ func TestContextualHelp(t *testing.T) {
 		{`CREATE TABLE blah AS (SELECT 1) ??`, `CREATE TABLE`},
 		{`CREATE TABLE blah AS SELECT 1 ??`, `SELECT`},
 
+		{`CREATE SCHEMA IF ??`, `CREATE SCHEMA`},
+		{`CREATE SCHEMA IF NOT ??`, `CREATE SCHEMA`},
+		{`CREATE SCHEMA bli ??`, `CREATE SCHEMA`},
+
 		{`DELETE FROM ??`, `DELETE`},
 		{`DELETE FROM blah ??`, `DELETE`},
 		{`DELETE FROM blah WHERE ??`, `DELETE`},
@@ -138,6 +145,10 @@ func TestContextualHelp(t *testing.T) {
 		{`DROP INDEX blah, ??`, `DROP INDEX`},
 		{`DROP INDEX blah@blih ??`, `DROP INDEX`},
 
+		{`DROP USER ??`, `DROP ROLE`},
+		{`DROP USER IF ??`, `DROP ROLE`},
+		{`DROP USER IF EXISTS bluh ??`, `DROP ROLE`},
+
 		{`DROP ROLE ??`, `DROP ROLE`},
 		{`DROP ROLE IF ??`, `DROP ROLE`},
 		{`DROP ROLE IF EXISTS bluh ??`, `DROP ROLE`},
@@ -153,10 +164,6 @@ func TestContextualHelp(t *testing.T) {
 		{`DROP VIEW blah ??`, `DROP VIEW`},
 		{`DROP VIEW IF ??`, `DROP VIEW`},
 		{`DROP VIEW IF EXISTS blih, bloh ??`, `DROP VIEW`},
-
-		{`DROP USER ??`, `DROP USER`},
-		{`DROP USER IF ??`, `DROP USER`},
-		{`DROP USER IF EXISTS bloh ??`, `DROP USER`},
 
 		{`EXPLAIN (??`, `EXPLAIN`},
 		{`EXPLAIN SELECT 1 ??`, `SELECT`},
@@ -298,6 +305,7 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW TRANSACTION ISOLATION LEVEL ??`, `SHOW TRANSACTION`},
 		{`SHOW SYNTAX ??`, `SHOW SYNTAX`},
 		{`SHOW SYNTAX 'foo' ??`, `SHOW SYNTAX`},
+		{`SHOW SAVEPOINT STATUS ??`, `SHOW SAVEPOINT`},
 
 		{`SHOW RANGE ??`, `SHOW RANGE`},
 

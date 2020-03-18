@@ -44,6 +44,8 @@ func registerPgjdbc(r *testRegistry) {
 		}
 
 		t.Status("cloning pgjdbc and installing prerequisites")
+		// Report the latest tag, but do not use it. The newest versions produces output that breaks our xml parser,
+		// and we want to pin to the working version for now.
 		latestTag, err := repeatGetLatestTag(
 			ctx, c, "pgjdbc", "pgjdbc", pgjdbcReleaseTagRegex,
 		)
@@ -80,7 +82,7 @@ func registerPgjdbc(r *testRegistry) {
 			c,
 			"https://github.com/pgjdbc/pgjdbc.git",
 			"/mnt/data1/pgjdbc",
-			latestTag,
+			"REL42.2.9",
 			node,
 		); err != nil {
 			t.Fatal(err)
@@ -115,11 +117,16 @@ func registerPgjdbc(r *testRegistry) {
 			t.Fatal(err)
 		}
 
-		blacklistName, expectedFailures, _, _ := pgjdbcBlacklists.getLists(version)
+		blacklistName, expectedFailures, ignorelistName, ignorelist := pgjdbcBlacklists.getLists(version)
 		if expectedFailures == nil {
 			t.Fatalf("No pgjdbc blacklist defined for cockroach version %s", version)
 		}
-		c.l.Printf("Running cockroach version %s, using blacklist %s", version, blacklistName)
+		status := fmt.Sprintf("Running cockroach version %s, using blacklist %s", version, blacklistName)
+		if ignorelist != nil {
+			status = fmt.Sprintf("Running cockroach version %s, using blacklist %s, using ignorelist %s",
+				version, blacklistName, ignorelistName)
+		}
+		c.l.Printf("%s", status)
 
 		t.Status("running pgjdbc test suite")
 		// Note that this is expected to return an error, since the test suite
@@ -166,13 +173,15 @@ func registerPgjdbc(r *testRegistry) {
 
 		parseAndSummarizeJavaORMTestsResults(
 			ctx, t, c, node, "pgjdbc" /* ormName */, output,
-			blacklistName, expectedFailures, version, latestTag,
+			blacklistName, expectedFailures, ignorelist, version, latestTag,
 		)
 	}
 
 	r.Add(testSpec{
 		Name:    "pgjdbc",
+		Owner:   OwnerAppDev,
 		Cluster: makeClusterSpec(1),
+		Tags:    []string{`default`, `driver`},
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runPgjdbc(ctx, t, c)
 		},

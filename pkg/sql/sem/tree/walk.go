@@ -620,6 +620,9 @@ func (expr *DDate) Walk(_ Visitor) Expr { return expr }
 func (expr *DTime) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
+func (expr *DTimeTZ) Walk(_ Visitor) Expr { return expr }
+
+// Walk implements the Expr interface.
 func (expr *DFloat) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
@@ -811,6 +814,22 @@ func (stmt *Explain) copyNode() *Explain {
 
 // walkStmt is part of the walkableStmt interface.
 func (stmt *Explain) walkStmt(v Visitor) Statement {
+	s, changed := walkStmt(v, stmt.Statement)
+	if changed {
+		stmt = stmt.copyNode()
+		stmt.Statement = s
+	}
+	return stmt
+}
+
+// copyNode makes a copy of this Statement without recursing in any child Statements.
+func (stmt *ExplainBundle) copyNode() *ExplainBundle {
+	stmtCopy := *stmt
+	return &stmtCopy
+}
+
+// walkStmt is part of the walkableStmt interface.
+func (stmt *ExplainBundle) walkStmt(v Visitor) Statement {
 	s, changed := walkStmt(v, stmt.Statement)
 	if changed {
 		stmt = stmt.copyNode()

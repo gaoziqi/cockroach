@@ -2,7 +2,7 @@
 #
 # Prepare the commit message by adding a release note.
 
-require_justification=0
+require_justification=1
 set -euo pipefail
 
 if [[ "${2-}" = "message" ]]; then
@@ -38,7 +38,7 @@ sed_script=''
 # true, all the template recommendations will be commented out as
 # opposed to be filled in.
 tchar=''
-tdisable=$(git config --bool --default false --get cockroachdb.disable-commit-template)
+tdisable=$(git config --bool --get cockroachdb.disable-commit-template || echo false)
 if test x"$tdisable" != xfalse; then
 	tchar="$cchar "
 fi
@@ -93,7 +93,7 @@ $cchar     <pkg>: <short description>\\
 
 if [ "$require_justification" = 1 ]; then
   sed_script+="$cchar\\
-$cchar     Release justification (category): <release justification>\\
+$cchar     Release justification: <release justification>\\
 "
 fi
 sed_script+="$cchar\\
@@ -126,9 +126,12 @@ $cchar\\
 $cchar Things to keep in mind for release notes:\\
 $cchar   - past tense (this was changed...) or present tense (now possible to...)\\
 $cchar   - what has changed: narrow down the product area / feature\\
+$cchar     Note: for bug fixes, indicate since when the bug was present\\
 $cchar   - show what changed: how a user can see the change for themselves\\
 $cchar     Note: for bug fixes, show the symptom(s) to recognize the bug\\
 $cchar   - why the change: who does this impact, how and why should they care\\
+$cchar\\
+$cchar See also: https://wiki.crdb.io/wiki/spaces/CRDB/pages/73072807/Release+notes\\
 $cchar\\
 $cchar Example release notes:\\
 $cchar\\
@@ -139,12 +142,13 @@ $cchar   or more.\\
 $cchar\\
 $cchar   Release note (bug fix): The system.replication_stats report no longer\\
 $cchar   erroneously considers some ranges belonging to table partitions to be\\
-$cchar   over-replicated.\\
+$cchar   over-replicated. This bug was present since version 19.2.\\
 $cchar\\
 $cchar Categories for release notes:\\
 $cchar   - cli change\\
 $cchar   - sql change\\
 $cchar   - admin ui change\\
+$cchar   - security update\\
 $cchar   - general change (e.g., change of required Go version)\\
 $cchar   - build change (e.g., compatibility with older CPUs)\\
 $cchar   - enterprise change (e.g., change to backup/restore)\\

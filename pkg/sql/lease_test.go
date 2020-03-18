@@ -24,8 +24,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -42,13 +42,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 type leaseTest struct {
 	testing.TB
 	server                   serverutils.TestServerInterface
 	db                       *gosql.DB
-	kvDB                     *client.DB
+	kvDB                     *kv.DB
 	nodes                    map[uint32]*sql.LeaseManager
 	leaseManagerTestingKnobs sql.LeaseManagerTestingKnobs
 	cfg                      *base.LeaseManagerConfig
@@ -520,15 +521,14 @@ func TestCantLeaseDeletedTable(testingT *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
+			SchemaChangeJobNoOp: func() bool {
 				mu.Lock()
 				defer mu.Unlock()
-				if clearSchemaChangers {
-					tscc.ClearSchemaChangers()
-				}
+				return clearSchemaChangers
 			},
-			AsyncExecNotification: asyncSchemaChangerDisabled,
 		},
+		// Disable GC job.
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func() { select {} }},
 	}
 
 	t := newLeaseTest(testingT, params)
@@ -612,15 +612,14 @@ func TestLeasesOnDeletedTableAreReleasedImmediately(t *testing.T) {
 			},
 		},
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
+			SchemaChangeJobNoOp: func() bool {
 				mu.Lock()
 				defer mu.Unlock()
-				if clearSchemaChangers {
-					tscc.ClearSchemaChangers()
-				}
+				return clearSchemaChangers
 			},
-			AsyncExecNotification: asyncSchemaChangerDisabled,
 		},
+		// Disable GC job.
+		GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func() { select {} }},
 	}
 	s, db, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
@@ -868,7 +867,10 @@ CREATE TABLE t.foo (v INT);
 		t.Fatal(err)
 	}
 
-	// This select can be retried in which case the descriptor gets reacquired.
+	_, err = tx.Exec("SAVEPOINT cockroach_restart")
+	require.NoError(t, err)
+
+	// This will acquire a descriptor. We'll check that it gets released before we retry.
 	if _, err := tx.Exec(`
 		SELECT * FROM t.foo;
 		`); err != nil {
@@ -882,18 +884,17 @@ CREATE TABLE t.foo (v INT);
 	}
 
 	if _, err := tx.Exec(
-		"SELECT crdb_internal.force_retry('1s':::INTERVAL)"); !testutils.IsError(
+		"SELECT crdb_internal.force_retry('100s':::INTERVAL)"); !testutils.IsError(
 		err, `forced by crdb_internal\.force_retry\(\)`) {
 		t.Fatal(err)
 	}
 
-	if cnt := atomic.LoadInt32(&fooAcquiredCount); cnt != aCount {
-		t.Fatalf("descriptor reacquired, %d != %d", cnt, aCount)
-	}
+	_, err = tx.Exec("ROLLBACK TO SAVEPOINT cockroach_restart")
+	require.NoError(t, err)
 
 	testutils.SucceedsSoon(t, func() error {
-		if cnt := atomic.LoadInt32(&fooReleaseCount); cnt != aCount {
-			return errors.Errorf("didnt release descriptor, %d != %d", cnt, aCount)
+		if rCount = atomic.LoadInt32(&fooReleaseCount); rCount != aCount {
+			return errors.Errorf("didnt release descriptor, %d != %d", rCount, aCount)
 		}
 		return nil
 	})
@@ -909,13 +910,12 @@ CREATE TABLE t.foo (v INT);
 func TestTxnObeysTableModificationTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			AsyncExecQuickly: true,
-		},
-	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
+
+	// Disable strict GC TTL enforcement because we're going to shove a zero-value
+	// TTL into the system with addImmediateGCZoneConfig.
+	defer disableGCTTLStrictEnforcement(t, sqlDB)()
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -1210,7 +1210,13 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	leaseManager := t.node(1)
 
 	// Acquire the lease so it is put into the tableNameCache.
-	_, _, err := leaseManager.AcquireByName(context.TODO(), t.server.Clock().Now(), dbID, tableName)
+	_, _, err := leaseManager.AcquireByName(
+		context.TODO(),
+		t.server.Clock().Now(),
+		dbID,
+		tableDesc.GetParentSchemaID(),
+		tableName,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1223,6 +1229,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 				context.TODO(),
 				t.server.Clock().Now(),
 				dbID,
+				tableDesc.GetParentSchemaID(),
 				tableName,
 			)
 			if err != nil {
@@ -1281,11 +1288,18 @@ CREATE TABLE t.test2 ();
 		t.Fatal(err)
 	}
 
+	test1Desc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test1")
 	test2Desc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test2")
 	dbID := test2Desc.ParentID
 
 	// Acquire a lease on test1 by name.
-	ts1, eo1, err := t.node(1).AcquireByName(ctx, t.server.Clock().Now(), dbID, "test1")
+	ts1, eo1, err := t.node(1).AcquireByName(
+		ctx,
+		t.server.Clock().Now(),
+		dbID,
+		test1Desc.GetParentSchemaID(),
+		"test1",
+	)
 	if err != nil {
 		t.Fatal(err)
 	} else if err := t.release(1, ts1); err != nil {
@@ -1313,7 +1327,13 @@ CREATE TABLE t.test2 ();
 		// Acquire another lease by name on test1. At first this will be the
 		// same lease, but eventually we will asynchronously renew a lease and
 		// our acquire will get a newer lease.
-		ts1, en1, err := t.node(1).AcquireByName(ctx, t.server.Clock().Now(), dbID, "test1")
+		ts1, en1, err := t.node(1).AcquireByName(
+			ctx,
+			t.server.Clock().Now(),
+			dbID,
+			test1Desc.GetParentSchemaID(),
+			"test1",
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1384,8 +1404,8 @@ func TestIncrementTableVersion(t *testing.T) {
 		// transaction until the new version has been published to the
 		// entire cluster.
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
-				tscc.ClearSchemaChangers()
+			SchemaChangeJobNoOp: func() bool {
+				return true
 			},
 			TwoVersionLeaseViolation: func() {
 				atomic.AddInt64(&violations, 1)
@@ -1486,8 +1506,8 @@ func TestTwoVersionInvariantRetryError(t *testing.T) {
 		// transaction until the new version has been published to the
 		// entire cluster.
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
-				tscc.ClearSchemaChangers()
+			SchemaChangeJobNoOp: func() bool {
+				return true
 			},
 			TwoVersionLeaseViolation: func() {
 				atomic.AddInt64(&violations, 1)
@@ -1639,7 +1659,7 @@ CREATE TABLE t.test0 (k CHAR PRIMARY KEY, v CHAR);
 			// the transaction commit time (and that the txn commit time wasn't
 			// bumped past it).
 			log.Infof(ctx, "checking version %d", table.Version)
-			txn := client.NewTxn(ctx, t.kvDB, roachpb.NodeID(0), client.RootTxn)
+			txn := kv.NewTxn(ctx, t.kvDB, roachpb.NodeID(0))
 			// Make the txn look back at the known modification timestamp.
 			txn.SetFixedTimestamp(ctx, table.ModificationTime)
 
@@ -1725,6 +1745,7 @@ CREATE TABLE t.test2 ();
 		t.Fatal(err)
 	}
 
+	test1Desc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test2")
 	test2Desc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test2")
 	dbID := test2Desc.ParentID
 
@@ -1740,7 +1761,13 @@ CREATE TABLE t.test2 ();
 	}
 
 	// Acquire a lease on test1 by name.
-	ts1, _, err := t.node(1).AcquireByName(ctx, t.server.Clock().Now(), dbID, "test1")
+	ts1, _, err := t.node(1).AcquireByName(
+		ctx,
+		t.server.Clock().Now(),
+		dbID,
+		test1Desc.GetParentSchemaID(),
+		"test1",
+	)
 	if err != nil {
 		t.Fatal(err)
 	} else if err := t.release(1, ts1); err != nil {
@@ -1920,7 +1947,13 @@ CREATE TABLE t.after (k CHAR PRIMARY KEY, v CHAR);
 	dbID := beforeDesc.ParentID
 
 	// Acquire a lease on "before" by name.
-	beforeTable, _, err := t.node(1).AcquireByName(ctx, t.server.Clock().Now(), dbID, "before")
+	beforeTable, _, err := t.node(1).AcquireByName(
+		ctx,
+		t.server.Clock().Now(),
+		dbID,
+		beforeDesc.GetParentSchemaID(),
+		"before",
+	)
 	if err != nil {
 		t.Fatal(err)
 	} else if err := t.release(1, beforeTable); err != nil {
@@ -1932,7 +1965,13 @@ CREATE TABLE t.after (k CHAR PRIMARY KEY, v CHAR);
 	now := timeutil.Now().UnixNano()
 
 	// Acquire a lease on "after" by name after server startup.
-	afterTable, _, err := t.node(1).AcquireByName(ctx, t.server.Clock().Now(), dbID, "after")
+	afterTable, _, err := t.node(1).AcquireByName(
+		ctx,
+		t.server.Clock().Now(),
+		dbID,
+		afterDesc.GetParentSchemaID(),
+		"after",
+	)
 	if err != nil {
 		t.Fatal(err)
 	} else if err := t.release(1, afterTable); err != nil {
@@ -1946,4 +1985,101 @@ CREATE TABLE t.after (k CHAR PRIMARY KEY, v CHAR);
 	// Orphaned lease is gone.
 	t.expectLeases(beforeDesc.ID, "")
 	t.expectLeases(afterDesc.ID, "/1/1")
+}
+
+// Test that acquiring a lease doesn't block on other transactions performing
+// schema changes. Lease acquisitions run in high-priority transactions, thereby
+// pushing any locks held by schema-changing transactions out of their ways.
+func TestLeaseAcquisitionDoesntBlock(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	_, err := db.Exec(`CREATE DATABASE t; CREATE TABLE t.test(k CHAR PRIMARY KEY, v CHAR);`)
+	require.NoError(t, err)
+
+	// Figure out the table ID.
+	row := db.QueryRow("SELECT id FROM system.namespace WHERE name='test'")
+	var descID sqlbase.ID
+	require.NoError(t, row.Scan(&descID))
+
+	// Spin up another goroutine performing a schema change. We'll suspend its
+	// execution until the main goroutine is able to acquire its lease.
+	schemaCh := make(chan error)
+	schemaUnblock := make(chan struct{})
+	go func() {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			schemaCh <- err
+			return
+		}
+		_, err = tx.Exec("ALTER TABLE t.test ADD COLUMN v2 CHAR")
+		schemaCh <- err
+		if err != nil {
+			return
+		}
+
+		<-schemaUnblock
+		schemaCh <- tx.Commit()
+	}()
+
+	require.NoError(t, <-schemaCh)
+	lease, _, err := s.LeaseManager().(*sql.LeaseManager).Acquire(ctx, s.Clock().Now(), descID)
+	require.NoError(t, err)
+
+	// Release the lease so that the schema change can proceed.
+	require.NoError(t, s.LeaseManager().(*sql.LeaseManager).Release(lease))
+	// Unblock the schema change.
+	close(schemaUnblock)
+
+	// Wait for the schema change to finish.
+	require.NoError(t, <-schemaCh)
+}
+
+// Test that acquiring a lease doesn't block on other transactions performing
+// schema changes. This is similar to the previous test, except it acquires a
+// lease by table name instead of ID, and correspondingly the schema change
+// touches the namespace table.
+func TestLeaseAcquisitionByNameDoesntBlock(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	_, err := db.Exec(`CREATE DATABASE t`)
+	require.NoError(t, err)
+
+	// Spin up another goroutine performing a schema change - creating a table.
+	// We'll suspend its execution until the main goroutine is able to acquire its
+	// lease. The idea is that, before being suspended, this transaction has put
+	// down locks on the system.namespace table. The point of the test is to check
+	// that a lease acquisition pushes these locks out of its way.
+	schemaCh := make(chan error)
+	schemaUnblock := make(chan struct{})
+	go func() {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			schemaCh <- err
+			return
+		}
+		_, err = tx.Exec("CREATE TABLE t.test()")
+		schemaCh <- err
+		if err != nil {
+			return
+		}
+
+		<-schemaUnblock
+		schemaCh <- tx.Commit()
+	}()
+
+	require.NoError(t, <-schemaCh)
+	_, err = db.Exec("SELECT * from t.test")
+	require.Error(t, err, `pq: relation "t.test" does not exist`)
+	close(schemaUnblock)
+
+	// Wait for the schema change to finish.
+	require.NoError(t, <-schemaCh)
 }

@@ -24,14 +24,18 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	// {{/*
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
+	// */}}
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // {{/*
@@ -43,6 +47,12 @@ var _ bytes.Buffer
 
 // Dummy import to pull in "apd" package.
 var _ apd.Decimal
+
+// Dummy import to pull in "time" package.
+var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // Dummy import to pull in "tree" package.
 var _ tree.Datum
@@ -70,9 +80,6 @@ func _ASSIGN_LT(_, _, _ string) bool {
 }
 
 // */}}
-
-// Use execgen package to remove unused import warning.
-var _ interface{} = execgen.UNSAFEGET
 
 func isSorterSupported(t coltypes.T, dir execinfrapb.Ordering_Column_Direction) bool {
 	switch t {
@@ -128,11 +135,11 @@ func newSingleSorter(
 type sort_TYPE_DIR_HANDLES_NULLSOp struct {
 	sortCol       _GOTYPESLICE
 	nulls         *coldata.Nulls
-	order         []uint64
+	order         []int
 	cancelChecker CancelChecker
 }
 
-func (s *sort_TYPE_DIR_HANDLES_NULLSOp) init(col coldata.Vec, order []uint64) {
+func (s *sort_TYPE_DIR_HANDLES_NULLSOp) init(col coldata.Vec, order []int) {
 	s.sortCol = col._TemplateType()
 	s.nulls = col.Nulls()
 	s.order = order
@@ -143,28 +150,28 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sort(ctx context.Context) {
 	s.quickSort(ctx, 0, n, maxDepth(n))
 }
 
-func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sortPartitions(ctx context.Context, partitions []uint64) {
+func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sortPartitions(ctx context.Context, partitions []int) {
 	if len(partitions) < 1 {
 		execerror.VectorizedInternalPanic(fmt.Sprintf("invalid partitions list %v", partitions))
 	}
 	order := s.order
 	for i, partitionStart := range partitions {
-		var partitionEnd uint64
+		var partitionEnd int
 		if i == len(partitions)-1 {
-			partitionEnd = uint64(len(order))
+			partitionEnd = len(order)
 		} else {
 			partitionEnd = partitions[i+1]
 		}
 		s.order = order[partitionStart:partitionEnd]
-		n := int(partitionEnd - partitionStart)
+		n := partitionEnd - partitionStart
 		s.quickSort(ctx, 0, n, maxDepth(n))
 	}
 }
 
 func (s *sort_TYPE_DIR_HANDLES_NULLSOp) Less(i, j int) bool {
 	// {{ if eq .Nulls true }}
-	n1 := s.nulls.MaybeHasNulls() && s.nulls.NullAt64(s.order[i])
-	n2 := s.nulls.MaybeHasNulls() && s.nulls.NullAt64(s.order[j])
+	n1 := s.nulls.MaybeHasNulls() && s.nulls.NullAt(s.order[i])
+	n2 := s.nulls.MaybeHasNulls() && s.nulls.NullAt(s.order[j])
 	// {{ if eq .DirString "Asc" }}
 	// If ascending, nulls always sort first, so we encode that logic here.
 	if n1 && n2 {
@@ -187,9 +194,9 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) Less(i, j int) bool {
 	// {{end}}
 	var lt bool
 	// We always indirect via the order vector.
-	arg1 := execgen.UNSAFEGET(s.sortCol, int(s.order[i]))
-	arg2 := execgen.UNSAFEGET(s.sortCol, int(s.order[j]))
-	_ASSIGN_LT("lt", "arg1", "arg2")
+	arg1 := execgen.UNSAFEGET(s.sortCol, s.order[i])
+	arg2 := execgen.UNSAFEGET(s.sortCol, s.order[j])
+	_ASSIGN_LT(lt, arg1, arg2)
 	return lt
 }
 

@@ -50,8 +50,14 @@ func (b *Builder) constructDistinct(inScope *scope) memo.RelExpr {
 }
 
 // buildDistinctOn builds a set of memo groups that represent a DISTINCT ON
-// expression.
-func (b *Builder) buildDistinctOn(distinctOnCols opt.ColSet, inScope *scope) (outScope *scope) {
+// expression. If nullsAreDistinct is true, then construct the UpsertDistinctOn
+// operator rather than the DistinctOn operator (see the UpsertDistinctOn
+// operator comment for details on the differences). The errorOnDup parameter
+// controls whether multiple rows in the same distinct group trigger an error.
+// This can only be set to true in the UpsertDistinctOn case.
+func (b *Builder) buildDistinctOn(
+	distinctOnCols opt.ColSet, inScope *scope, nullsAreDistinct, errorOnDup bool,
+) (outScope *scope) {
 	// When there is a DISTINCT ON clause, the ORDER BY clause is restricted to either:
 	//  1. Contain a subset of columns from the ON list, or
 	//  2. Start with a permutation of all columns from the ON list.
@@ -89,7 +95,7 @@ func (b *Builder) buildDistinctOn(distinctOnCols opt.ColSet, inScope *scope) (ou
 		}
 	}
 
-	private := memo.GroupingPrivate{GroupingCols: distinctOnCols.Copy()}
+	private := memo.GroupingPrivate{GroupingCols: distinctOnCols.Copy(), ErrorOnDup: errorOnDup}
 
 	// The ordering is used for intra-group ordering. Ordering with respect to the
 	// DISTINCT ON columns doesn't affect intra-group ordering, so we add these
@@ -140,15 +146,19 @@ func (b *Builder) buildDistinctOn(distinctOnCols opt.ColSet, inScope *scope) (ou
 	for i := range outScope.cols {
 		if id := outScope.cols[i].id; !excluded.Contains(id) {
 			excluded.Add(id)
-			aggs = append(aggs, memo.AggregationsItem{
-				Agg:        b.factory.ConstructFirstAgg(b.factory.ConstructVariable(id)),
-				ColPrivate: memo.ColPrivate{Col: id},
-			})
+			aggs = append(aggs, b.factory.ConstructAggregationsItem(
+				b.factory.ConstructFirstAgg(b.factory.ConstructVariable(id)),
+				id,
+			))
 		}
 	}
 
 	input := inScope.expr.(memo.RelExpr)
-	outScope.expr = b.factory.ConstructDistinctOn(input, aggs, &private)
+	if nullsAreDistinct {
+		outScope.expr = b.factory.ConstructUpsertDistinctOn(input, aggs, &private)
+	} else {
+		outScope.expr = b.factory.ConstructDistinctOn(input, aggs, &private)
+	}
 	return outScope
 }
 
@@ -186,7 +196,9 @@ func (b *Builder) buildDistinctOnArgs(inScope, projectionsScope, distinctOnScope
 	}
 
 	for i := range distinctOnScope.cols {
-		b.addExtraColumn(inScope, projectionsScope, distinctOnScope, &distinctOnScope.cols[i])
+		b.addOrderByOrDistinctOnColumn(
+			inScope, projectionsScope, distinctOnScope, &distinctOnScope.cols[i],
+		)
 	}
 	projectionsScope.addExtraColumns(distinctOnScope.cols)
 	projectionsScope.distinctOnCols = distinctOnScope.colSet()

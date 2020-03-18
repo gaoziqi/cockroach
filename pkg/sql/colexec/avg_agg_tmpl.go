@@ -11,7 +11,7 @@
 // {{/*
 // +build execgen_template
 //
-// This file is the execgen template for sum_agg.eg.go. It's formatted in a
+// This file is the execgen template for avg_agg.eg.go. It's formatted in a
 // special way, so it's both valid Go and a valid text/template input. This
 // permits editing this file with editor support.
 //
@@ -98,9 +98,8 @@ func (a *avg_TYPEAgg) Init(groups []bool, v coldata.Vec) {
 }
 
 func (a *avg_TYPEAgg) Reset() {
-	copy(a.scratch.vec, zero_TYPEColumn)
 	a.scratch.curIdx = -1
-	a.scratch.curSum = zero_TYPEColumn[0]
+	a.scratch.curSum = zero_TYPEValue
 	a.scratch.curCount = 0
 	a.scratch.foundNonNullForCurrentGroup = false
 	a.scratch.nulls.UnsetNulls()
@@ -114,8 +113,7 @@ func (a *avg_TYPEAgg) CurrentOutputIndex() int {
 func (a *avg_TYPEAgg) SetOutputIndex(idx int) {
 	if a.scratch.curIdx != -1 {
 		a.scratch.curIdx = idx
-		a.scratch.nulls.UnsetNullsAfter(uint16(idx + 1))
-		copy(a.scratch.vec[idx+1:], zero_TYPEColumn)
+		a.scratch.nulls.UnsetNullsAfter(idx + 1)
 	}
 }
 
@@ -129,9 +127,9 @@ func (a *avg_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 		// any non-nulls for this group so far, the output for this group should be
 		// NULL.
 		if !a.scratch.foundNonNullForCurrentGroup {
-			a.scratch.nulls.SetNull(uint16(a.scratch.curIdx))
+			a.scratch.nulls.SetNull(a.scratch.curIdx)
 		} else {
-			_ASSIGN_DIV_INT64("a.scratch.vec[a.scratch.curIdx]", "a.scratch.curSum", "a.scratch.curCount")
+			_ASSIGN_DIV_INT64(a.scratch.vec[a.scratch.curIdx], a.scratch.curSum, a.scratch.curCount)
 		}
 		a.scratch.curIdx++
 		a.done = true
@@ -186,14 +184,18 @@ func _ACCUMULATE_AVG(a *_AGG_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS bo
 		// a.scratch.curIdx is negative, it means that this is the first group.
 		if a.scratch.curIdx >= 0 {
 			if !a.scratch.foundNonNullForCurrentGroup {
-				a.scratch.nulls.SetNull(uint16(a.scratch.curIdx))
+				a.scratch.nulls.SetNull(a.scratch.curIdx)
 			} else {
 				// {{with .Global}}
-				_ASSIGN_DIV_INT64("a.scratch.vec[a.scratch.curIdx]", "a.scratch.curSum", "a.scratch.curCount")
+				_ASSIGN_DIV_INT64(a.scratch.vec[a.scratch.curIdx], a.scratch.curSum, a.scratch.curCount)
 				// {{end}}
 			}
 		}
 		a.scratch.curIdx++
+		// {{with .Global}}
+		a.scratch.curSum = zero_TYPEValue
+		// {{end}}
+		a.scratch.curCount = 0
 
 		// {{/*
 		// We only need to reset this flag if there are nulls. If there are no
@@ -202,21 +204,15 @@ func _ACCUMULATE_AVG(a *_AGG_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS bo
 		// {{ if .HasNulls }}
 		a.scratch.foundNonNullForCurrentGroup = false
 		// {{ end }}
-
-		// The next element of vec is guaranteed  to be initialized to the zero
-		// value. We can't use zero_TYPEColumn here because this is outside of
-		// the earlier template block.
-		a.scratch.curSum = a.scratch.vec[a.scratch.curIdx]
-		a.scratch.curCount = 0
 	}
 	var isNull bool
 	// {{ if .HasNulls }}
-	isNull = nulls.NullAt(uint16(i))
+	isNull = nulls.NullAt(i)
 	// {{ else }}
 	isNull = false
 	// {{ end }}
 	if !isNull {
-		_ASSIGN_ADD("a.scratch.curSum", "a.scratch.curSum", "col[i]")
+		_ASSIGN_ADD(a.scratch.curSum, a.scratch.curSum, col[i])
 		a.scratch.curCount++
 		a.scratch.foundNonNullForCurrentGroup = true
 	}

@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -48,9 +48,9 @@ func TestWindowerAccountingForResults(t *testing.T) {
 	)
 	evalCtx := tree.MakeTestingEvalContextWithMon(st, &monitor)
 	defer evalCtx.Stop(ctx)
-	diskMonitor := execinfra.MakeTestDiskMonitor(ctx, st)
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
-	tempEngine, err := engine.NewTempEngine(engine.TestStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, storage.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestWindowerAccountingForResults(t *testing.T) {
 
 	post := &execinfrapb.PostProcessSpec{}
 	input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(1000, 1))
-	aggSpec := execinfrapb.AggregatorSpec_Func(execinfrapb.AggregatorSpec_ARRAY_AGG)
+	aggSpec := execinfrapb.AggregatorSpec_ARRAY_AGG
 	spec := execinfrapb.WindowerSpec{
 		PartitionBy: []uint32{},
 		WindowFns: []execinfrapb.WindowerSpec_WindowFn{{
@@ -199,7 +199,7 @@ func BenchmarkWindower(b *testing.B) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
-	diskMonitor := execinfra.MakeTestDiskMonitor(ctx, st)
+	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{

@@ -18,8 +18,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -47,13 +47,13 @@ func TestRegistryCancelation(t *testing.T) {
 	// of a dep cycle.
 	const histogramWindowInterval = 60 * time.Second
 
-	var db *client.DB
+	var db *kv.DB
 	// Insulate this test from wall time.
 	mClock := hlc.NewManualClock(hlc.UnixNano())
 	clock := hlc.NewClock(mClock.UnixNano, time.Nanosecond)
 	registry := MakeRegistry(
 		log.AmbientContext{}, stopper, clock, db, nil /* ex */, FakeNodeID, cluster.NoSettings,
-		histogramWindowInterval, FakePHS)
+		histogramWindowInterval, FakePHS, "")
 
 	const nodeCount = 1
 	nodeLiveness := NewFakeNodeLiveness(nodeCount)
@@ -84,7 +84,9 @@ func TestRegistryCancelation(t *testing.T) {
 	register := func() {
 		didRegister = true
 		jobID++
-		registry.register(jobID, func() { cancelCount++ })
+		if err := registry.register(jobID, func() { cancelCount++ }); err != nil {
+			t.Fatal(err)
+		}
 	}
 	unregister := func() {
 		registry.unregister(jobID)
@@ -181,12 +183,24 @@ func TestRegistryCancelation(t *testing.T) {
 
 func TestRegistryGC(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	t.Skip("")
+	// TODO (lucy): This test probably shouldn't continue to exist in its current
+	// form if GCMutations will cease to be used. Refactor or get rid of it.
 
 	ctx := context.Background()
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	db := sqlutils.MakeSQLRunner(sqlDB)
+
+	type mutationOptions struct {
+		// Set if the desc should have any mutations of any sort.
+		hasMutation bool
+		// Set if the mutation being inserted is a GCMutation.
+		hasGCMutation bool
+		// Set if the desc should have a job that is dropping it.
+		hasDropJob bool
+	}
 
 	ts := timeutil.Now()
 	earlier := ts.Add(-1 * time.Hour)
@@ -205,17 +219,59 @@ func TestRegistryGC(t *testing.T) {
 		return desc.GetID()
 	}
 
-	writeJob := func(name string, created, finished time.Time, status Status) string {
+	setGCMutations := func(gcMutations []sqlbase.TableDescriptor_GCDescriptorMutation) sqlbase.ID {
+		desc := sqlbase.GetTableDescriptor(kvDB, "t", "to_be_mutated")
+		desc.GCMutations = gcMutations
+		if err := kvDB.Put(
+			context.TODO(),
+			sqlbase.MakeDescMetadataKey(desc.GetID()),
+			sqlbase.WrapDescriptor(desc),
+		); err != nil {
+			t.Fatal(err)
+		}
+		return desc.GetID()
+	}
+
+	setDropJob := func(shouldDrop bool) sqlbase.ID {
+		desc := sqlbase.GetTableDescriptor(kvDB, "t", "to_be_mutated")
+		if shouldDrop {
+			desc.DropJobID = 123
+		} else {
+			// Set it back to the default val.
+			desc.DropJobID = 0
+		}
+		if err := kvDB.Put(
+			context.TODO(),
+			sqlbase.MakeDescMetadataKey(desc.GetID()),
+			sqlbase.WrapDescriptor(desc),
+		); err != nil {
+			t.Fatal(err)
+		}
+		return desc.GetID()
+	}
+
+	writeJob := func(name string, created, finished time.Time, status Status, mutOptions mutationOptions) string {
 		if _, err := sqlDB.Exec(`
 CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.to_be_mutated AS SELECT 1`); err != nil {
 			t.Fatal(err)
 		}
+		descriptorID := setDropJob(mutOptions.hasDropJob)
+		if mutOptions.hasMutation {
+			descriptorID = setMutations([]sqlbase.DescriptorMutation{{}})
+		}
+		if mutOptions.hasGCMutation {
+			descriptorID = setGCMutations([]sqlbase.TableDescriptor_GCDescriptorMutation{{}})
+		}
+
 		payload, err := protoutil.Marshal(&jobspb.Payload{
 			Description: name,
 			Lease:       &jobspb.Lease{NodeID: 1, Epoch: 1},
 			// register a mutation on the table so that jobs that reference
 			// the table are not considered orphaned
-			DescriptorIDs:  []sqlbase.ID{setMutations([]sqlbase.DescriptorMutation{{}})},
+			DescriptorIDs: []sqlbase.ID{
+				descriptorID,
+				sqlbase.InvalidID, // invalid id to test handling of missing descriptors.
+			},
 			Details:        jobspb.WrapPayloadDetails(jobspb.SchemaChangeDetails{}),
 			StartedMicros:  timeutil.ToUnixMicros(created),
 			FinishedMicros: timeutil.ToUnixMicros(finished),
@@ -237,37 +293,57 @@ CREATE DATABASE IF NOT EXISTS t; CREATE TABLE IF NOT EXISTS t.to_be_mutated AS S
 		return strconv.Itoa(int(id))
 	}
 
-	oldRunningJob := writeJob("old_running", muchEarlier, time.Time{}, StatusRunning)
-	oldSucceededJob := writeJob("old_succeeded", muchEarlier, muchEarlier.Add(time.Minute), StatusSucceeded)
-	oldSucceededJob2 := writeJob("old_succeeded2", muchEarlier, muchEarlier.Add(time.Minute), StatusSucceeded)
-	newRunningJob := writeJob("new_running", earlier, time.Time{}, StatusRunning)
-	newSucceededJob := writeJob("new_succeeded", earlier, earlier.Add(time.Minute), StatusSucceeded)
+	// Test the descriptor when any of the following are set.
+	// 1. Mutations
+	// 2. GC Mutations
+	// 3. A drop job
+	for _, hasMutation := range []bool{true, false} {
+		for _, hasGCMutation := range []bool{true, false} {
+			for _, hasDropJob := range []bool{true, false} {
+				if !hasMutation && !hasGCMutation && !hasDropJob {
+					continue
+				}
+				mutOptions := mutationOptions{
+					hasMutation:   hasMutation,
+					hasGCMutation: hasGCMutation,
+					hasDropJob:    hasDropJob,
+				}
+				oldRunningJob := writeJob("old_running", muchEarlier, time.Time{}, StatusRunning, mutOptions)
+				oldSucceededJob := writeJob("old_succeeded", muchEarlier, muchEarlier.Add(time.Minute), StatusSucceeded, mutOptions)
+				oldSucceededJob2 := writeJob("old_succeeded2", muchEarlier, muchEarlier.Add(time.Minute), StatusSucceeded, mutOptions)
+				newRunningJob := writeJob("new_running", earlier, time.Time{}, StatusRunning, mutOptions)
+				newSucceededJob := writeJob("new_succeeded", earlier, earlier.Add(time.Minute), StatusSucceeded, mutOptions)
 
-	db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-		{oldRunningJob}, {oldSucceededJob}, {oldSucceededJob2}, {newRunningJob}, {newSucceededJob}})
+				db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
+					{oldRunningJob}, {oldSucceededJob}, {oldSucceededJob2}, {newRunningJob}, {newSucceededJob}})
 
-	if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, earlier); err != nil {
-		t.Fatal(err)
+				if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, earlier); err != nil {
+					t.Fatal(err)
+				}
+				db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
+					{oldRunningJob}, {newRunningJob}, {newSucceededJob}})
+
+				if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, earlier); err != nil {
+					t.Fatal(err)
+				}
+				db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
+					{oldRunningJob}, {newRunningJob}, {newSucceededJob}})
+
+				if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, ts.Add(time.Minute*-10)); err != nil {
+					t.Fatal(err)
+				}
+				db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
+					{oldRunningJob}, {newRunningJob}})
+
+				// force the running jobs to become orphaned
+				_ = setMutations(nil)
+				_ = setGCMutations(nil)
+				_ = setDropJob(false)
+				if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, ts.Add(time.Minute*-10)); err != nil {
+					t.Fatal(err)
+				}
+				db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{})
+			}
+		}
 	}
-	db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-		{oldRunningJob}, {newRunningJob}, {newSucceededJob}})
-
-	if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, earlier); err != nil {
-		t.Fatal(err)
-	}
-	db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-		{oldRunningJob}, {newRunningJob}, {newSucceededJob}})
-
-	if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, ts.Add(time.Minute*-10)); err != nil {
-		t.Fatal(err)
-	}
-	db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-		{oldRunningJob}, {newRunningJob}})
-
-	// force the running jobs to become orphaned
-	_ = setMutations(nil)
-	if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, ts.Add(time.Minute*-10)); err != nil {
-		t.Fatal(err)
-	}
-	db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{})
 }

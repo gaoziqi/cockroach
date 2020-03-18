@@ -13,14 +13,19 @@ package sqlbase
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"math"
+	"math/big"
+	"math/bits"
 	"math/rand"
 	"sort"
+	"strings"
 	"time"
 	"unicode"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -33,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/lib/pq/oid"
 	"github.com/pkg/errors"
@@ -41,8 +47,9 @@ import (
 // This file contains utility functions for tests (in other packages).
 
 // GetTableDescriptor retrieves a table descriptor directly from the KV layer.
-func GetTableDescriptor(kvDB *client.DB, database string, table string) *TableDescriptor {
+func GetTableDescriptor(kvDB *kv.DB, database string, table string) *TableDescriptor {
 	// log.VEventf(context.TODO(), 2, "GetTableDescriptor %q %q", database, table)
+	// testutil, so we pass settings as nil for both database and table name keys.
 	dKey := NewDatabaseKey(database)
 	ctx := context.TODO()
 	gr, err := kvDB.Get(ctx, dKey.Key())
@@ -54,7 +61,7 @@ func GetTableDescriptor(kvDB *client.DB, database string, table string) *TableDe
 	}
 	dbDescID := ID(gr.ValueInt())
 
-	tKey := NewTableKey(dbDescID, table)
+	tKey := NewPublicTableKey(dbDescID, table)
 	gr, err = kvDB.Get(ctx, tKey.Key())
 	if err != nil {
 		panic(err)
@@ -82,7 +89,7 @@ func GetTableDescriptor(kvDB *client.DB, database string, table string) *TableDe
 
 // GetImmutableTableDescriptor retrieves an immutable table descriptor directly from the KV layer.
 func GetImmutableTableDescriptor(
-	kvDB *client.DB, database string, table string,
+	kvDB *kv.DB, database string, table string,
 ) *ImmutableTableDescriptor {
 	return NewImmutableTableDescriptor(*GetTableDescriptor(kvDB, database, table))
 }
@@ -157,9 +164,18 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 		}
 		return tree.NewDDate(d)
 	case types.TimeFamily:
-		return tree.MakeDTime(timeofday.Random(rng))
+		return tree.MakeDTime(timeofday.Random(rng)).Round(tree.TimeFamilyPrecisionToRoundDuration(typ.Precision()))
+	case types.TimeTZFamily:
+		return tree.NewDTimeTZFromOffset(
+			timeofday.Random(rng),
+			// We cannot randomize seconds, because lib/pq does NOT print the
+			// second offsets making some tests break when comparing
+			// results in == results out using string comparison.
+			(rng.Int31n(28*60+59)-(14*60+59))*60,
+		).Round(tree.TimeFamilyPrecisionToRoundDuration(typ.Precision()))
 	case types.TimestampFamily:
-		return &tree.DTimestamp{Time: timeutil.Unix(rng.Int63n(1000000), rng.Int63n(1000000))}
+		return tree.MakeDTimestamp(timeutil.Unix(rng.Int63n(1000000), rng.Int63n(1000000)),
+			tree.TimeFamilyPrecisionToRoundDuration(typ.Precision()))
 	case types.IntervalFamily:
 		sign := 1 - rng.Int63n(2)*2
 		return &tree.DInterval{Duration: duration.MakeDuration(
@@ -207,7 +223,8 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 		_, _ = rng.Read(p)
 		return tree.NewDBytes(tree.DBytes(p))
 	case types.TimestampTZFamily:
-		return &tree.DTimestampTZ{Time: timeutil.Unix(rng.Int63n(1000000), rng.Int63n(1000000))}
+		return tree.MakeDTimestampTZ(timeutil.Unix(rng.Int63n(1000000), rng.Int63n(1000000)),
+			tree.TimeFamilyPrecisionToRoundDuration(typ.Precision()))
 	case types.CollatedStringFamily:
 		// Generate a random Unicode string.
 		var buf bytes.Buffer
@@ -222,7 +239,11 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 			}
 			buf.WriteRune(r)
 		}
-		return tree.NewDCollatedString(buf.String(), typ.Locale(), &tree.CollationEnvironment{})
+		d, err := tree.NewDCollatedString(buf.String(), typ.Locale(), &tree.CollationEnvironment{})
+		if err != nil {
+			panic(err)
+		}
+		return d
 	case types.OidFamily:
 		return tree.NewDOid(tree.DInt(rng.Uint32()))
 	case types.UnknownFamily:
@@ -246,10 +267,169 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 	}
 }
 
+const simpleRange = 10
+
+// RandDatumSimple generates a random Datum of the given type. The generated
+// datums will be simple (i.e., only one character or an integer between 0
+// and 9), such that repeated calls to this function will regularly return a
+// previously generated datum.
+func RandDatumSimple(rng *rand.Rand, typ *types.T) tree.Datum {
+	datum := tree.DNull
+	switch typ.Family() {
+	case types.BitFamily:
+		datum, _ = tree.NewDBitArrayFromInt(rng.Int63n(simpleRange), uint(bits.Len(simpleRange)))
+	case types.BoolFamily:
+		if rng.Intn(2) == 1 {
+			datum = tree.DBoolTrue
+		} else {
+			datum = tree.DBoolFalse
+		}
+	case types.BytesFamily:
+		datum = tree.NewDBytes(tree.DBytes(randStringSimple(rng)))
+	case types.DateFamily:
+		date, _ := pgdate.MakeDateFromPGEpoch(rng.Int31n(simpleRange))
+		datum = tree.NewDDate(date)
+	case types.DecimalFamily:
+		datum = &tree.DDecimal{
+			Decimal: apd.Decimal{
+				Coeff: *big.NewInt(rng.Int63n(simpleRange)),
+			},
+		}
+	case types.IntFamily:
+		datum = tree.NewDInt(tree.DInt(rng.Intn(simpleRange)))
+	case types.IntervalFamily:
+		datum = &tree.DInterval{Duration: duration.MakeDuration(
+			rng.Int63n(simpleRange)*1e9,
+			0,
+			0,
+		)}
+	case types.FloatFamily:
+		datum = tree.NewDFloat(tree.DFloat(rng.Intn(simpleRange)))
+	case types.INetFamily:
+		datum = tree.NewDIPAddr(tree.DIPAddr{
+			IPAddr: ipaddr.IPAddr{
+				Addr: ipaddr.Addr(uint128.FromInts(0, uint64(rng.Intn(simpleRange)))),
+			},
+		})
+	case types.JsonFamily:
+		datum = tree.NewDJSON(randJSONSimple(rng))
+	case types.OidFamily:
+		datum = tree.NewDOid(tree.DInt(rng.Intn(simpleRange)))
+	case types.StringFamily:
+		datum = tree.NewDString(randStringSimple(rng))
+	case types.TimeFamily:
+		datum = tree.MakeDTime(timeofday.New(0, rng.Intn(simpleRange), 0, 0))
+	case types.TimestampFamily:
+		datum = tree.MakeDTimestamp(time.Date(2000, 1, 1, rng.Intn(simpleRange), 0, 0, 0, time.UTC), time.Microsecond)
+	case types.TimestampTZFamily:
+		datum = tree.MakeDTimestampTZ(time.Date(2000, 1, 1, rng.Intn(simpleRange), 0, 0, 0, time.UTC), time.Microsecond)
+	case types.UuidFamily:
+		datum = tree.NewDUuid(tree.DUuid{
+			UUID: uuid.FromUint128(uint128.FromInts(0, uint64(rng.Intn(simpleRange)))),
+		})
+	}
+	return datum
+}
+
+func randStringSimple(rng *rand.Rand) string {
+	return string('A' + rng.Intn(simpleRange))
+}
+
+func randJSONSimple(rng *rand.Rand) json.JSON {
+	switch rng.Intn(10) {
+	case 0:
+		return json.NullJSONValue
+	case 1:
+		return json.FalseJSONValue
+	case 2:
+		return json.TrueJSONValue
+	case 3:
+		return json.FromInt(rng.Intn(simpleRange))
+	case 4:
+		return json.FromString(randStringSimple(rng))
+	case 5:
+		a := json.NewArrayBuilder(0)
+		for i := rng.Intn(3); i >= 0; i-- {
+			a.Add(randJSONSimple(rng))
+		}
+		return a.Build()
+	default:
+		a := json.NewObjectBuilder(0)
+		for i := rng.Intn(3); i >= 0; i-- {
+			a.Add(randStringSimple(rng), randJSONSimple(rng))
+		}
+		return a.Build()
+	}
+}
+
+// GenerateRandInterestingTable takes a gosql.DB connection and creates
+// a table with all the types in randInterestingDatums and rows of the
+// interesting datums.
+func GenerateRandInterestingTable(db *gosql.DB, dbName, tableName string) error {
+	var (
+		randTypes []*types.T
+		colNames  []string
+	)
+	numRows := 0
+	for _, v := range randInterestingDatums {
+		colTyp := v[0].ResolvedType()
+		randTypes = append(randTypes, colTyp)
+		colNames = append(colNames, colTyp.Name())
+		if len(v) > numRows {
+			numRows = len(v)
+		}
+	}
+
+	var columns strings.Builder
+	comma := ""
+	for i, typ := range randTypes {
+		columns.WriteString(comma)
+		columns.WriteString(colNames[i])
+		columns.WriteString(" ")
+		columns.WriteString(typ.SQLString())
+		comma = ", "
+	}
+
+	createStatement := fmt.Sprintf("CREATE TABLE %s.%s (%s)", dbName, tableName, columns.String())
+	if _, err := db.Exec(createStatement); err != nil {
+		return err
+	}
+
+	row := make([]string, len(randTypes))
+	for i := 0; i < numRows; i++ {
+		for j, typ := range randTypes {
+			datums := randInterestingDatums[typ.Family()]
+			var d tree.Datum
+			if i < len(datums) {
+				d = datums[i]
+			} else {
+				d = tree.DNull
+			}
+			row[j] = tree.AsStringWithFlags(d, tree.FmtParsable)
+		}
+		var builder strings.Builder
+		comma := ""
+		for _, d := range row {
+			builder.WriteString(comma)
+			builder.WriteString(d)
+			comma = ", "
+		}
+		insertStmt := fmt.Sprintf("INSERT INTO %s.%s VALUES (%s)", dbName, tableName, builder.String())
+		if _, err := db.Exec(insertStmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 var (
 	// randInterestingDatums is a collection of interesting datums that can be
 	// used for random testing.
 	randInterestingDatums = map[types.Family][]tree.Datum{
+		types.BoolFamily: {
+			tree.DBoolTrue,
+			tree.DBoolFalse,
+		},
 		types.IntFamily: {
 			tree.NewDInt(tree.DInt(0)),
 			tree.NewDInt(tree.DInt(-1)),
@@ -306,6 +486,11 @@ var (
 			tree.MakeDTime(timeofday.Min),
 			tree.MakeDTime(timeofday.Max),
 		},
+		types.TimeTZFamily: {
+			tree.DMinTimeTZ,
+			// Uncomment this once #44548 has been resolved.
+			// tree.DMaxTimeTZ,
+		},
 		types.TimestampFamily: func() []tree.Datum {
 			res := make([]tree.Datum, len(randTimestampSpecials))
 			for i, t := range randTimestampSpecials {
@@ -345,6 +530,46 @@ var (
 			tree.NewDBytes("\u2603"), // unicode snowman
 			tree.NewDBytes("\xFF"),   // invalid utf-8 sequence, but a valid bytes
 		},
+		types.OidFamily: {
+			tree.NewDOid(0),
+		},
+		types.UuidFamily: {
+			tree.DMinUUID,
+			tree.DMaxUUID,
+		},
+		types.INetFamily: {
+			tree.DMinIPAddr,
+			tree.DMaxIPAddr,
+		},
+		types.JsonFamily: func() []tree.Datum {
+			var res []tree.Datum
+			for _, s := range []string{
+				`{}`,
+				`1`,
+				`{"test": "json"}`,
+			} {
+				d, err := tree.ParseDJSON(s)
+				if err != nil {
+					panic(err)
+				}
+				res = append(res, d)
+			}
+			return res
+		}(),
+		types.BitFamily: func() []tree.Datum {
+			var res []tree.Datum
+			for _, i := range []int64{
+				0,
+				1<<63 - 1,
+			} {
+				d, err := tree.NewDBitArrayFromInt(i, 64)
+				if err != nil {
+					panic(err)
+				}
+				res = append(res, d)
+			}
+			return res
+		}(),
 	}
 	randTimestampSpecials = []time.Time{
 		{},
@@ -399,16 +624,32 @@ func init() {
 
 		arrayContentsTypes = append(arrayContentsTypes, typ)
 	}
+
+	// Sort these so randomly chosen indexes always point to the same element.
+	sort.Slice(seedTypes, func(i, j int) bool {
+		return seedTypes[i].String() < seedTypes[j].String()
+	})
+	sort.Slice(arrayContentsTypes, func(i, j int) bool {
+		return arrayContentsTypes[i].String() < arrayContentsTypes[j].String()
+	})
 }
 
-// randInterestingDatum returns an interesting Datum of type typ. If there are
-// no such Datums, it returns nil. Note that it pays attention to the width of
-// the requested type for Int and Float type families.
+// randInterestingDatum returns an interesting Datum of type typ.
+// If there are no such Datums for a scalar type, it panics. Otherwise,
+// it returns nil if there are no such Datums. Note that it pays attention
+// to the width of the requested type for Int and Float type families.
 func randInterestingDatum(rng *rand.Rand, typ *types.T) tree.Datum {
-	specials := randInterestingDatums[typ.Family()]
-	if len(specials) == 0 {
+	specials, ok := randInterestingDatums[typ.Family()]
+	if !ok || len(specials) == 0 {
+		for _, sc := range types.Scalar {
+			// Panic if a scalar type doesn't have an interesting datum.
+			if sc == typ {
+				panic(fmt.Sprintf("no interesting datum for type %s found", typ.String()))
+			}
+		}
 		return nil
 	}
+
 	special := specials[rng.Intn(len(specials))]
 	switch typ.Family() {
 	case types.IntFamily:
@@ -703,93 +944,147 @@ func TestingMakePrimaryIndexKey(desc *TableDescriptor, vals ...interface{}) (roa
 	return roachpb.Key(key), nil
 }
 
+// Mutator defines a method that can mutate or add SQL statements. See the
+// sql/mutations package. This interface is defined here to avoid cyclic
+// dependencies.
+type Mutator interface {
+	Mutate(rng *rand.Rand, stmts []tree.Statement) (mutated []tree.Statement, changed bool)
+}
+
+// RandCreateTables creates random table definitions.
+func RandCreateTables(
+	rng *rand.Rand, prefix string, num int, mutators ...Mutator,
+) []tree.Statement {
+	if num < 1 {
+		panic("at least one table required")
+	}
+
+	// Make some random tables.
+	tables := make([]tree.Statement, num)
+	for i := 0; i < num; i++ {
+		var interleave *tree.CreateTable
+		// 50% chance of interleaving past the first table. Interleaving doesn't
+		// make anything harder to do for tests - so prefer to do it a lot.
+		if i > 0 && rng.Intn(2) == 0 {
+			interleave = tables[rng.Intn(i)].(*tree.CreateTable)
+		}
+		t := RandCreateTableWithInterleave(rng, prefix, i+1, interleave)
+		tables[i] = t
+	}
+
+	for _, m := range mutators {
+		tables, _ = m.Mutate(rng, tables)
+	}
+
+	return tables
+}
+
 // RandCreateTable creates a random CreateTable definition.
-func RandCreateTable(rng *rand.Rand, tableIdx int) *tree.CreateTable {
+func RandCreateTable(rng *rand.Rand, prefix string, tableIdx int) *tree.CreateTable {
+	return RandCreateTableWithInterleave(rng, prefix, tableIdx, nil)
+}
+
+// RandCreateTableWithInterleave creates a random CreateTable definition,
+// interleaved into the given other CreateTable definition.
+func RandCreateTableWithInterleave(
+	rng *rand.Rand, prefix string, tableIdx int, interleaveInto *tree.CreateTable,
+) *tree.CreateTable {
 	// columnDefs contains the list of Columns we'll add to our table.
-	columnDefs := make([]*tree.ColumnTableDef, randutil.RandIntInRange(rng, 1, 20))
+	nColumns := randutil.RandIntInRange(rng, 1, 20)
+	columnDefs := make([]*tree.ColumnTableDef, 0, nColumns)
 	// defs contains the list of Columns and other attributes (indexes, column
 	// families, etc) we'll add to our table.
-	defs := make(tree.TableDefs, len(columnDefs))
+	defs := make(tree.TableDefs, 0, len(columnDefs))
 
-	for i := range columnDefs {
-		columnDef := randColumnTableDef(rng, i)
-		columnDefs[i] = columnDef
-		defs[i] = columnDef
-	}
-
-	// Shuffle our column definitions in preparation for random partitioning into
-	// column families.
-	rng.Shuffle(len(columnDefs), func(i, j int) {
-		columnDefs[i], columnDefs[j] = columnDefs[j], columnDefs[i]
-	})
-
-	// Partition into column families.
-	numColFams := randNumColFams(rng, len(columnDefs))
-
-	// Create a slice of indexes into the columnDefs slice. We'll use this to make
-	// the random partitioning by picking some indexes at random to use as
-	// partitions boundaries.
-	indexes := make([]int, len(columnDefs)-1)
-	for i := range indexes {
-		indexes[i] = i + 1
-	}
-	rng.Shuffle(len(indexes), func(i, j int) {
-		indexes[i], indexes[j] = indexes[j], indexes[i]
-	})
-
-	// Grab our random partition boundaries, and re-sort back into sorted index
-	// order.
-	numSeparators := numColFams - 1
-	indexes = indexes[:numSeparators]
-	sort.Slice(indexes, func(i, j int) bool {
-		return indexes[i] < indexes[j]
-	})
-
-	indexesWithZero := make([]int, len(indexes)+2)
-	copy(indexesWithZero[1:], indexes)
-	indexesWithZero[len(indexesWithZero)-1] = len(columnDefs)
-	indexes = indexesWithZero
-
-	// Now (finally), indexes is the list of partitions we're going to slice the
-	// column def list into. Create our column families by grabbing the slice of
-	// columns from the column list bounded by each partition index at the end.
-	// Also, save column family 0 for later as all primary keys have to be part of
-	// that column family.
-	var colFamZero []*tree.ColumnTableDef
-	for i := 0; i+1 < len(indexes); i++ {
-		start, end := indexes[i], indexes[i+1]
-
-		names := make(tree.NameList, end-start)
-		for j := start; j < end; j++ {
-			names[j-start] = columnDefs[j].Name
-		}
-		if colFamZero == nil {
-			for j := start; j < end; j++ {
-				colFamZero = append(colFamZero, columnDefs[j])
+	// Find columnDefs from previous create table.
+	interleaveIntoColumnDefs := make(map[tree.Name]*tree.ColumnTableDef)
+	var interleaveIntoPK *tree.UniqueConstraintTableDef
+	if interleaveInto != nil {
+		for i := range interleaveInto.Defs {
+			switch d := interleaveInto.Defs[i].(type) {
+			case *tree.ColumnTableDef:
+				interleaveIntoColumnDefs[d.Name] = d
+			case *tree.UniqueConstraintTableDef:
+				if d.PrimaryKey {
+					interleaveIntoPK = d
+				}
 			}
 		}
-
-		famDef := &tree.FamilyTableDef{
-			Name:    tree.Name(fmt.Sprintf("fam%d", i)),
-			Columns: names,
-		}
-		defs = append(defs, famDef)
 	}
+	var interleaveDef *tree.InterleaveDef
+	if interleaveIntoPK != nil && len(interleaveIntoPK.Columns) > 0 {
+		// Make the interleave prefix, which has to be exactly the columns in the
+		// parent's primary index.
+		prefixLength := len(interleaveIntoPK.Columns)
+		fields := make(tree.NameList, prefixLength)
+		for i := range interleaveIntoPK.Columns[:prefixLength] {
+			def := interleaveIntoColumnDefs[interleaveIntoPK.Columns[i].Column]
+			columnDefs = append(columnDefs, def)
+			defs = append(defs, def)
+			fields[i] = def.Name
+		}
 
-	// Make a random primary key with high likelihood.
-	if rng.Intn(8) != 0 {
-		indexDef := randIndexTableDefFromCols(rng, colFamZero)
-		if len(indexDef.Columns) > 0 {
-			defs = append(defs, &tree.UniqueConstraintTableDef{
-				PrimaryKey:    true,
-				IndexTableDef: indexDef,
+		extraCols := make([]*tree.ColumnTableDef, nColumns)
+		// Add more columns to the table.
+		for i := range extraCols {
+			extraCol := randColumnTableDef(rng, tableIdx, i+prefixLength)
+			extraCols[i] = extraCol
+			columnDefs = append(columnDefs, extraCol)
+			defs = append(defs, extraCol)
+		}
+
+		rng.Shuffle(nColumns, func(i, j int) {
+			extraCols[i], extraCols[j] = extraCols[j], extraCols[i]
+		})
+
+		// Create the primary key to interleave, maybe add some new columns to the
+		// one we're interleaving.
+		pk := &tree.UniqueConstraintTableDef{
+			PrimaryKey: true,
+			IndexTableDef: tree.IndexTableDef{
+				Columns: interleaveIntoPK.Columns[:prefixLength:prefixLength],
+			},
+		}
+		for i := range extraCols[:rng.Intn(len(extraCols))] {
+			pk.Columns = append(pk.Columns, tree.IndexElem{
+				Column:    extraCols[i].Name,
+				Direction: tree.Direction(rng.Intn(int(tree.Descending) + 1)),
 			})
 		}
-	}
+		defs = append(defs, pk)
+		interleaveDef = &tree.InterleaveDef{
+			Parent: interleaveInto.Table,
+			Fields: fields,
+		}
+	} else {
+		// Make new defs from scratch.
+		for i := 0; i < nColumns; i++ {
+			columnDef := randColumnTableDef(rng, tableIdx, i)
+			columnDefs = append(columnDefs, columnDef)
+			defs = append(defs, columnDef)
+		}
 
-	colNames := make(tree.NameList, len(columnDefs))
-	for i := range columnDefs {
-		colNames[i] = columnDefs[i].Name
+		// Make a random primary key with high likelihood.
+		if rng.Intn(8) != 0 {
+			indexDef := randIndexTableDefFromCols(rng, columnDefs)
+			if len(indexDef.Columns) > 0 {
+				defs = append(defs, &tree.UniqueConstraintTableDef{
+					PrimaryKey:    true,
+					IndexTableDef: indexDef,
+				})
+			}
+			// Although not necessary for Cockroach to function correctly,
+			// but for ease of use for any code that introspects on the
+			// AST data structure (instead of the descriptor which doesn't
+			// exist yet), explicitly set all PK cols as NOT NULL.
+			for _, col := range columnDefs {
+				for _, elem := range indexDef.Columns {
+					if col.Name == elem.Column {
+						col.Nullable.Nullability = tree.NotNull
+					}
+				}
+			}
+		}
 	}
 
 	// Make indexes.
@@ -809,19 +1104,181 @@ func RandCreateTable(rng *rand.Rand, tableIdx int) *tree.CreateTable {
 		}
 	}
 
-	// We're done! Return a new table with all of the attributes we've made.
 	ret := &tree.CreateTable{
-		Table: tree.MakeUnqualifiedTableName(tree.Name(fmt.Sprintf("table%d", tableIdx))),
-		Defs:  defs,
+		Table:      tree.MakeUnqualifiedTableName(tree.Name(fmt.Sprintf("%s%d", prefix, tableIdx))),
+		Defs:       defs,
+		Interleave: interleaveDef,
 	}
-	return ret
+
+	// Create some random column families.
+	if rng.Intn(2) == 0 {
+		ColumnFamilyMutator(rng, ret)
+	}
+
+	// Maybe add some storing columns.
+	res, _ := IndexStoringMutator(rng, []tree.Statement{ret})
+	return res[0].(*tree.CreateTable)
+}
+
+// ColumnFamilyMutator is mutations.StatementMutator, but lives here to prevent
+// dependency cycles with RandCreateTable.
+func ColumnFamilyMutator(rng *rand.Rand, stmt tree.Statement) (changed bool) {
+	ast, ok := stmt.(*tree.CreateTable)
+	if !ok {
+		return false
+	}
+
+	var columns []tree.Name
+	for _, def := range ast.Defs {
+		switch def := def.(type) {
+		case *tree.FamilyTableDef:
+			return false
+		case *tree.ColumnTableDef:
+			if def.HasColumnFamily() {
+				return false
+			}
+			columns = append(columns, def.Name)
+		}
+	}
+
+	if len(columns) <= 1 {
+		return false
+	}
+
+	// Any columns not specified in column families
+	// are auto assigned to the first family, so
+	// there's no requirement to exhaust columns here.
+
+	rng.Shuffle(len(columns), func(i, j int) {
+		columns[i], columns[j] = columns[j], columns[i]
+	})
+	fd := &tree.FamilyTableDef{}
+	for {
+		if len(columns) == 0 {
+			if len(fd.Columns) > 0 {
+				ast.Defs = append(ast.Defs, fd)
+			}
+			break
+		}
+		fd.Columns = append(fd.Columns, columns[0])
+		columns = columns[1:]
+		// 50% chance to make a new column family.
+		if rng.Intn(2) != 0 {
+			ast.Defs = append(ast.Defs, fd)
+			fd = &tree.FamilyTableDef{}
+		}
+	}
+	return true
+}
+
+type tableInfo struct {
+	columnNames []tree.Name
+	pkCols      []tree.Name
+}
+
+// IndexStoringMutator is mutations.StatementMutator, but lives here to prevent
+// dependency cycles with RandCreateTable.
+func IndexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Statement, bool) {
+	changed := false
+	tables := map[tree.Name]tableInfo{}
+	getTableInfoFromCreateStatement := func(ct *tree.CreateTable) tableInfo {
+		var columnNames []tree.Name
+		var pkCols []tree.Name
+		for _, def := range ct.Defs {
+			switch ast := def.(type) {
+			case *tree.ColumnTableDef:
+				columnNames = append(columnNames, ast.Name)
+				if ast.PrimaryKey.IsPrimaryKey {
+					pkCols = []tree.Name{ast.Name}
+				}
+			case *tree.UniqueConstraintTableDef:
+				if ast.PrimaryKey {
+					for _, elem := range ast.Columns {
+						pkCols = append(pkCols, elem.Column)
+					}
+				}
+			}
+		}
+		return tableInfo{columnNames: columnNames, pkCols: pkCols}
+	}
+	mapFromIndexCols := func(cols []tree.Name) map[tree.Name]struct{} {
+		colMap := map[tree.Name]struct{}{}
+		for _, col := range cols {
+			colMap[col] = struct{}{}
+		}
+		return colMap
+	}
+	generateStoringCols := func(rng *rand.Rand, tableCols []tree.Name, indexCols map[tree.Name]struct{}) []tree.Name {
+		var storingCols []tree.Name
+		for _, col := range tableCols {
+			_, ok := indexCols[col]
+			if ok {
+				continue
+			}
+			if rng.Intn(2) == 0 {
+				storingCols = append(storingCols, col)
+			}
+		}
+		return storingCols
+	}
+	for _, stmt := range stmts {
+		switch ast := stmt.(type) {
+		case *tree.CreateIndex:
+			if ast.Inverted {
+				continue
+			}
+			tableInfo, ok := tables[ast.Table.TableName]
+			if !ok {
+				continue
+			}
+			// If we don't have a storing list, make one with 50% chance.
+			if ast.Storing == nil && rng.Intn(2) == 0 {
+				indexCols := mapFromIndexCols(tableInfo.pkCols)
+				for _, elem := range ast.Columns {
+					indexCols[elem.Column] = struct{}{}
+				}
+				ast.Storing = generateStoringCols(rng, tableInfo.columnNames, indexCols)
+				changed = true
+			}
+		case *tree.CreateTable:
+			// Write down this table for later.
+			tableInfo := getTableInfoFromCreateStatement(ast)
+			tables[ast.Table.TableName] = tableInfo
+			for _, def := range ast.Defs {
+				var idx *tree.IndexTableDef
+				switch defType := def.(type) {
+				case *tree.IndexTableDef:
+					idx = defType
+				case *tree.UniqueConstraintTableDef:
+					if !defType.PrimaryKey {
+						idx = &defType.IndexTableDef
+					}
+				}
+				if idx == nil || idx.Inverted {
+					continue
+				}
+				// If we don't have a storing list, make one with 50% chance.
+				if idx.Storing == nil && rng.Intn(2) == 0 {
+					indexCols := mapFromIndexCols(tableInfo.pkCols)
+					for _, elem := range idx.Columns {
+						indexCols[elem.Column] = struct{}{}
+					}
+					idx.Storing = generateStoringCols(rng, tableInfo.columnNames, indexCols)
+					changed = true
+				}
+			}
+		}
+	}
+	return stmts, changed
 }
 
 // randColumnTableDef produces a random ColumnTableDef, with a random type and
 // nullability.
-func randColumnTableDef(rand *rand.Rand, colIdx int) *tree.ColumnTableDef {
+func randColumnTableDef(rand *rand.Rand, tableIdx int, colIdx int) *tree.ColumnTableDef {
 	columnDef := &tree.ColumnTableDef{
-		Name: tree.Name(fmt.Sprintf("col%d", colIdx)),
+		// We make a unique name for all columns by prefixing them with the table
+		// index to make it easier to reference columns from different tables.
+		Name: tree.Name(fmt.Sprintf("col%d_%d", tableIdx, colIdx)),
 		Type: RandSortingType(rand),
 	}
 	columnDef.Nullable.Nullability = tree.Nullability(rand.Intn(int(tree.SilentNull) + 1))
@@ -850,13 +1307,6 @@ func randIndexTableDefFromCols(
 		})
 	}
 	return tree.IndexTableDef{Columns: indexElemList}
-}
-
-func randNumColFams(rng *rand.Rand, nCols int) int {
-	if rng.Intn(3) == 0 {
-		return 1
-	}
-	return rng.Intn(nCols) + 1
 }
 
 // The following variables are useful for testing.

@@ -66,7 +66,7 @@ void RowCounter::EnsureSafeSplitKey(rocksdb::Slice* key) {
 
 // Count examines each key passed to it and increments the running count when it
 // sees a key that belongs to a new row.
-bool RowCounter::Count(const rocksdb::Slice& key, cockroach::roachpb::BulkOpSummary* summary) {
+bool RowCounter::Count(const rocksdb::Slice& key) {
   // EnsureSafeSplitKey is usually used to avoid splitting a row across ranges,
   // by returning the row's key prefix.
   // We reuse it here to count "rows" by counting when it changes.
@@ -88,27 +88,30 @@ bool RowCounter::Count(const rocksdb::Slice& key, cockroach::roachpb::BulkOpSumm
   }
 
   // no change key prefix => no new row.
-  if (decoded_key.data() == prev_key.data) {
+  if (decoded_key == prev_key) {
     return true;
   }
-  prev_key = ToDBString(decoded_key);
+
+  prev_key.assign(decoded_key.data(), decoded_key.size());
 
   uint64_t tbl;
   if (!DecodeTablePrefix(&decoded_key, &tbl)) {
     return false;
   }
 
-  if (tbl < MaxReservedDescID) {
-    summary->set_system_records(summary->system_records() + 1);
+  uint64_t index_id;
+  if (!DecodeUvarint64(&decoded_key, &index_id)) {
+    return false;
+  }
+
+  // This mirrors logic of the go function roachpb.BulkOpSummaryID.
+  uint64_t bulk_op_summary_id = (tbl << 32) | index_id;
+  (*summary->mutable_entry_counts())[bulk_op_summary_id]++;
+
+  if (index_id == 1) {
+    summary->set_deprecated_rows(summary->deprecated_rows() + 1);
   } else {
-    uint64_t index_id;
-    if (!DecodeUvarint64(&decoded_key, &index_id)) {
-      return false;
-    } else if (index_id == 1) {
-      summary->set_rows(summary->rows() + 1);
-    } else {
-      summary->set_index_entries(summary->index_entries() + 1);
-    }
+    summary->set_deprecated_index_entries(summary->deprecated_index_entries() + 1);
   }
 
   return true;

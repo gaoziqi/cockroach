@@ -43,6 +43,30 @@ func alterZoneConfigAndClusterSettings(
 		return err
 	}
 
+	if _, err := db.ExecContext(
+		ctx, `ALTER TABLE system.public.jobs CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.ExecContext(
+		ctx, `ALTER RANGE meta CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.ExecContext(
+		ctx, `ALTER RANGE system CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.ExecContext(
+		ctx, `ALTER RANGE liveness CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+	); err != nil {
+		return err
+	}
+
 	// TODO(rafi): remove this check once we stop testing against 2.0 and 2.1
 	if strings.HasPrefix(version, "v2.0") || strings.HasPrefix(version, "v2.1") {
 		return nil
@@ -52,6 +76,15 @@ func alterZoneConfigAndClusterSettings(
 		ctx, `SET CLUSTER SETTING jobs.retention_time = '180s';`,
 	); err != nil {
 		return err
+	}
+
+	// Enable temp tables for v20.1
+	if strings.HasPrefix(version, "v20.") {
+		if _, err := db.ExecContext(
+			ctx, `SET CLUSTER SETTING sql.defaults.experimental_temporary_tables.enabled = 'true';`,
+		); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -146,6 +179,13 @@ func (r *ormTestsResults) summarizeFailed(
 	p("failed unexpectedly", r.failUnexpectedCount)
 	p("expected failed but skipped", r.unexpectedSkipCount)
 	p("expected failed but not run", notRunCount)
+
+	fmt.Fprintf(&bResults, "---\n")
+	for _, result := range r.results {
+		if strings.Contains(result, "unexpected") {
+			fmt.Fprintf(&bResults, "%s\n", result)
+		}
+	}
 
 	fmt.Fprintf(&bResults, "For a full summary look at the %s artifacts \n", ormName)
 	t.l.Printf("%s\n", bResults.String())

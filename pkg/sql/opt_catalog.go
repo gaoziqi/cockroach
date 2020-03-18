@@ -91,6 +91,11 @@ func (os *optSchema) ID() cat.StableID {
 	return cat.StableID(os.desc.ID)
 }
 
+// PostgresDescriptorID is part of the cat.Object interface.
+func (os *optSchema) PostgresDescriptorID() cat.StableID {
+	return cat.StableID(os.desc.ID)
+}
+
 // Equals is part of the cat.Object interface.
 func (os *optSchema) Equals(other cat.Object) bool {
 	otherSchema, ok := other.(*optSchema)
@@ -105,7 +110,9 @@ func (os *optSchema) Name() *cat.SchemaName {
 // GetDataSourceNames is part of the cat.Schema interface.
 func (os *optSchema) GetDataSourceNames(ctx context.Context) ([]cat.DataSourceName, error) {
 	return GetObjectNames(
-		ctx, os.planner.Txn(), os.planner, os.desc,
+		ctx, os.planner.Txn(),
+		os.planner,
+		os.desc,
 		os.name.Schema(),
 		true, /* explicitPrefix */
 	)
@@ -129,6 +136,7 @@ func (oc *optCatalog) ResolveSchema(
 	// more general error.
 	oc.tn.TableName = ""
 	oc.tn.TableNamePrefix = *name
+
 	found, desc, err := oc.tn.ResolveTarget(
 		ctx,
 		oc.planner,
@@ -410,6 +418,11 @@ func (ov *optView) ID() cat.StableID {
 	return cat.StableID(ov.desc.ID)
 }
 
+// PostgresDescriptorID is part of the cat.Object interface.
+func (ov *optView) PostgresDescriptorID() cat.StableID {
+	return cat.StableID(ov.desc.ID)
+}
+
 // Equals is part of the cat.Object interface.
 func (ov *optView) Equals(other cat.Object) bool {
 	otherView, ok := other.(*optView)
@@ -459,6 +472,11 @@ func newOptSequence(desc *sqlbase.ImmutableTableDescriptor) *optSequence {
 
 // ID is part of the cat.Object interface.
 func (os *optSequence) ID() cat.StableID {
+	return cat.StableID(os.desc.ID)
+}
+
+// PostgresDescriptorID is part of the cat.Object interface.
+func (os *optSequence) PostgresDescriptorID() cat.StableID {
 	return cat.StableID(os.desc.ID)
 }
 
@@ -615,6 +633,11 @@ func newOptTable(
 
 // ID is part of the cat.Object interface.
 func (ot *optTable) ID() cat.StableID {
+	return cat.StableID(ot.desc.ID)
+}
+
+// PostgresDescriptorID is part of the cat.Object interface.
+func (ot *optTable) PostgresDescriptorID() cat.StableID {
 	return cat.StableID(ot.desc.ID)
 }
 
@@ -1277,6 +1300,11 @@ func newOptVirtualTable(
 // ID is part of the cat.Object interface.
 func (ot *optVirtualTable) ID() cat.StableID {
 	return ot.id
+}
+
+// PostgresDescriptorID is part of the cat.Object interface.
+func (ot *optVirtualTable) PostgresDescriptorID() cat.StableID {
+	return cat.StableID(ot.desc.ID)
 }
 
 // Equals is part of the cat.Object interface.

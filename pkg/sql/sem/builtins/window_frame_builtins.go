@@ -107,7 +107,7 @@ func (w *slidingWindowFunc) Compute(
 		return nil, err
 	}
 
-	if !wfr.DefaultFrameExclusion() {
+	if !wfr.Frame.DefaultFrameExclusion() {
 		// We cannot use a sliding window approach because we have a frame
 		// exclusion clause - some rows will be in and out of the frame which
 		// breaks the necessary assumption, so we fallback to a naive quadratic
@@ -272,7 +272,7 @@ func (w *slidingWindowSumFunc) Compute(
 	if err != nil {
 		return nil, err
 	}
-	if !wfr.DefaultFrameExclusion() {
+	if !wfr.Frame.DefaultFrameExclusion() {
 		// We cannot use a sliding window approach because we have a frame
 		// exclusion clause - some rows will be in and out of the frame which
 		// breaks the necessary assumption, so we fallback to a naive quadratic
@@ -408,6 +408,8 @@ func (w *avgWindowFunc) Compute(
 		count := apd.New(int64(frameSize), 0)
 		_, err := tree.DecimalCtx.Quo(&avg.Decimal, &dd.Decimal, count)
 		return &avg, err
+	case *tree.DInterval:
+		return &tree.DInterval{Duration: t.Duration.Div(int64(frameSize))}, nil
 	default:
 		return nil, errors.AssertionFailedf("unexpected SUM result type: %s", t)
 	}

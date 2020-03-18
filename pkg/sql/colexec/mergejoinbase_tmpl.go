@@ -11,7 +11,7 @@
 // {{/*
 // +build execgen_template
 //
-// This file is the execgen template for mergejoinerbase.eg.go. It's formatted
+// This file is the execgen template for mergejoinbase.eg.go. It's formatted
 // in a special way, so it's both valid Go and a valid text/template input.
 // This permits editing this file with editor support.
 //
@@ -23,13 +23,17 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	// {{/*
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
+	// */}}
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // {{/*
@@ -43,6 +47,12 @@ var _ tree.Datum
 
 // Dummy import to pull in "apd" package.
 var _ apd.Decimal
+
+// Dummy import to pull in "time" package.
+var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
@@ -58,14 +68,11 @@ type _GOTYPE interface{}
 
 // _ASSIGN_EQ is the template equality function for assigning the first input
 // to the result of the the second input == the third input.
-func _ASSIGN_EQ(_, _, _ interface{}) uint64 {
+func _ASSIGN_EQ(_, _, _ interface{}) int {
 	execerror.VectorizedInternalPanic("")
 }
 
 // */}}
-
-// Use execgen package to remove unused import warning.
-var _ interface{} = execgen.UNSAFEGET
 
 // isBufferedGroupFinished checks to see whether or not the buffered group
 // corresponding to input continues in batch.
@@ -79,11 +86,10 @@ func (o *mergeJoinBase) isBufferedGroupFinished(
 	if input == &o.right {
 		bufferedGroup = o.proberState.rBufferedGroup
 	}
-	lastBufferedTupleIdx := bufferedGroup.length - 1
-	tupleToLookAtIdx := uint64(rowIdx)
+	tupleToLookAtIdx := rowIdx
 	sel := batch.Selection()
 	if sel != nil {
-		tupleToLookAtIdx = uint64(sel[rowIdx])
+		tupleToLookAtIdx = sel[rowIdx]
 	}
 
 	// Check all equality columns in the first row of batch to make sure we're in
@@ -92,26 +98,26 @@ func (o *mergeJoinBase) isBufferedGroupFinished(
 		colTyp := input.sourceTypes[colIdx]
 
 		switch colTyp {
-		// {{ range $.MJOverloads }}
+		// {{ range . }}
 		case _TYPES_T:
-			// We perform this null check on every equality column of the last
+			// We perform this null check on every equality column of the first
 			// buffered tuple regardless of the join type since it is done only once
 			// per batch. In some cases (like INNER JOIN, or LEFT OUTER JOIN with the
 			// right side being an input) this check will always return false since
 			// nulls couldn't be buffered up though.
-			if bufferedGroup.ColVec(int(colIdx)).Nulls().NullAt64(uint64(lastBufferedTupleIdx)) {
+			if bufferedGroup.firstTuple[colIdx].Nulls().NullAt(0) {
 				return true
 			}
-			bufferedCol := bufferedGroup.ColVec(int(colIdx))._TemplateType()
-			prevVal := execgen.UNSAFEGET(bufferedCol, int(lastBufferedTupleIdx))
+			bufferedCol := bufferedGroup.firstTuple[colIdx]._TemplateType()
+			prevVal := execgen.UNSAFEGET(bufferedCol, 0)
 			var curVal _GOTYPE
-			if batch.ColVec(int(colIdx)).MaybeHasNulls() && batch.ColVec(int(colIdx)).Nulls().NullAt64(tupleToLookAtIdx) {
+			if batch.ColVec(int(colIdx)).MaybeHasNulls() && batch.ColVec(int(colIdx)).Nulls().NullAt(tupleToLookAtIdx) {
 				return true
 			}
 			col := batch.ColVec(int(colIdx))._TemplateType()
-			curVal = execgen.UNSAFEGET(col, int(tupleToLookAtIdx))
+			curVal = execgen.UNSAFEGET(col, tupleToLookAtIdx)
 			var match bool
-			_ASSIGN_EQ("match", "prevVal", "curVal")
+			_ASSIGN_EQ(match, prevVal, curVal)
 			if !match {
 				return true
 			}

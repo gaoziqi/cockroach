@@ -176,6 +176,7 @@ func registerKV(r *testRegistry) {
 
 		r.Add(testSpec{
 			Name:       strings.Join(nameParts, "/"),
+			Owner:      OwnerKV,
 			MinVersion: minVersion,
 			Cluster:    makeClusterSpec(opts.nodes+1, cpu(opts.cpus)),
 			Run: func(ctx context.Context, t *test, c *cluster) {
@@ -190,6 +191,7 @@ func registerKVContention(r *testRegistry) {
 	const nodes = 4
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("kv/contention/nodes=%d", nodes),
+		Owner:      OwnerKV,
 		MinVersion: "v19.2.0",
 		Cluster:    makeClusterSpec(nodes + 1),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -198,15 +200,33 @@ func registerKVContention(r *testRegistry) {
 
 			// Start the cluster with an extremely high txn liveness threshold.
 			// If requests ever get stuck on a transaction that was abandoned
-			// then it will take 2m for them to get unstuck, at which point the
-			// QPS threshold check in the test is likely to fail.
-			args := startArgs("--env=COCKROACH_TXN_LIVENESS_HEARTBEAT_MULTIPLIER=120")
+			// then it will take 10m for them to get unstuck, at which point the
+			// QPS threshold check in the test is guaranteed to fail.
+			//
+			// Additionally, ensure that even transactions that issue a 1PC
+			// batch begin heartbeating. This ensures that if they end up in
+			// part of a dependency cycle, they can never be expire without
+			// being actively aborted.
+			args := startArgs(
+				"--env=COCKROACH_TXN_LIVENESS_HEARTBEAT_MULTIPLIER=600 COCKROACH_TXN_HEARTBEAT_DURING_1PC=true",
+			)
 			c.Start(ctx, t, args, c.Range(1, nodes))
 
+			conn := c.Conn(ctx, 1)
 			// Enable request tracing, which is a good tool for understanding
 			// how different transactions are interacting.
-			c.Run(ctx, c.Node(1),
-				`./cockroach sql --insecure -e "SET CLUSTER SETTING trace.debug.enable = true"`)
+			if _, err := conn.Exec(`
+				SET CLUSTER SETTING trace.debug.enable = true;
+			`); err != nil {
+				t.Fatal(err)
+			}
+			// Drop the deadlock detection delay because the test creates a
+			// large number transaction deadlocks.
+			if _, err := conn.Exec(`
+				SET CLUSTER SETTING kv.lock_table.deadlock_detection_push_delay = '5ms'
+			`); err != nil && !strings.Contains(err.Error(), "unknown cluster setting") {
+				t.Fatal(err)
+			}
 
 			t.Status("running workload")
 			m := newMonitor(ctx, c, c.Range(1, nodes))
@@ -247,6 +267,7 @@ func registerKVContention(r *testRegistry) {
 func registerKVQuiescenceDead(r *testRegistry) {
 	r.Add(testSpec{
 		Name:       "kv/quiescence/nodes=3",
+		Owner:      OwnerKV,
 		Cluster:    makeClusterSpec(4),
 		MinVersion: "v2.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -329,6 +350,7 @@ func registerKVGracefulDraining(r *testRegistry) {
 	r.Add(testSpec{
 		Skip:    "https://github.com/cockroachdb/cockroach/issues/33501",
 		Name:    "kv/gracefuldraining/nodes=3",
+		Owner:   OwnerKV,
 		Cluster: makeClusterSpec(4),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			nodes := c.spec.NodeCount - 1
@@ -456,6 +478,7 @@ func registerKVSplits(r *testRegistry) {
 		item := item // for use in closure below
 		r.Add(testSpec{
 			Name:    fmt.Sprintf("kv/splits/nodes=3/quiesce=%t", item.quiesce),
+			Owner:   OwnerKV,
 			Timeout: item.timeout,
 			Cluster: makeClusterSpec(4),
 			Run: func(ctx context.Context, t *test, c *cluster) {
@@ -509,13 +532,7 @@ func registerKVScalability(r *testRegistry) {
 					" {pgurl:1-%d}",
 					percent, nodes)
 
-				l, err := t.l.ChildLogger(fmt.Sprint(i))
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer l.close()
-
-				return c.RunL(ctx, l, c.Node(nodes+1), cmd)
+				return c.RunE(ctx, c.Node(nodes+1), cmd)
 			})
 			m.Wait()
 		}
@@ -527,6 +544,7 @@ func registerKVScalability(r *testRegistry) {
 			p := p
 			r.Add(testSpec{
 				Name:    fmt.Sprintf("kv%d/scale/nodes=6", p),
+				Owner:   OwnerKV,
 				Cluster: makeClusterSpec(7, cpu(8)),
 				Run: func(ctx context.Context, t *test, c *cluster) {
 					runScalability(ctx, t, c, p)
@@ -660,6 +678,7 @@ func registerKVRangeLookups(r *testRegistry) {
 		}
 		r.Add(testSpec{
 			Name:       fmt.Sprintf("kv50/rangelookups/%s/nodes=%d", workloadName, nodes),
+			Owner:      OwnerKV,
 			MinVersion: "v19.2.0",
 			Cluster:    makeClusterSpec(nodes+1, cpu(cpus)),
 			Run: func(ctx context.Context, t *test, c *cluster) {

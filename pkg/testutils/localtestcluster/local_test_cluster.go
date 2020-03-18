@@ -17,17 +17,18 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/tscache"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -48,16 +49,16 @@ import (
 // Note that the LocalTestCluster is different from server.TestCluster
 // in that although it uses a distributed sender, there is no RPC traffic.
 type LocalTestCluster struct {
-	Cfg               storage.StoreConfig
+	Cfg               kvserver.StoreConfig
 	Manual            *hlc.ManualClock
 	Clock             *hlc.Clock
 	Gossip            *gossip.Gossip
-	Eng               engine.Engine
-	Store             *storage.Store
-	StoreTestingKnobs *storage.StoreTestingKnobs
-	DBContext         *client.DBContext
-	DB                *client.DB
-	Stores            *storage.Stores
+	Eng               storage.Engine
+	Store             *kvserver.Store
+	StoreTestingKnobs *kvserver.StoreTestingKnobs
+	DBContext         *kv.DBContext
+	DB                *kv.DB
+	Stores            *kvserver.Stores
 	Stopper           *stop.Stopper
 	Latency           time.Duration // sleep for each RPC sent
 	tester            testing.TB
@@ -86,10 +87,10 @@ type InitFactoryFn func(
 	tracer opentracing.Tracer,
 	clock *hlc.Clock,
 	latency time.Duration,
-	stores client.Sender,
+	stores kv.Sender,
 	stopper *stop.Stopper,
 	gossip *gossip.Gossip,
-) client.TxnSenderFactory
+) kv.TxnSenderFactory
 
 // Start starts the test cluster by bootstrapping an in-memory store
 // (defaults to maximum of 50M). The server is started, launching the
@@ -99,7 +100,7 @@ type InitFactoryFn func(
 func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFactory InitFactoryFn) {
 	ltc.Manual = hlc.NewManualClock(123)
 	ltc.Clock = hlc.NewClock(ltc.Manual.UnixNano, 50*time.Millisecond)
-	cfg := storage.TestStoreConfig(ltc.Clock)
+	cfg := kvserver.TestStoreConfig(ltc.Clock)
 	ambient := log.AmbientContext{Tracer: cfg.Settings.Tracer}
 	nc := &base.NodeIDContainer{}
 	ambient.AddLogTag("n", nc)
@@ -112,25 +113,26 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 
 	ltc.tester = t
 	ltc.Stopper = stop.NewStopper()
-	cfg.RPCContext = rpc.NewContext(ambient, baseCtx, ltc.Clock, ltc.Stopper, &cfg.Settings.Version)
+	cfg.RPCContext = rpc.NewContext(ambient, baseCtx, ltc.Clock, ltc.Stopper, cfg.Settings)
 	cfg.RPCContext.NodeID.Set(ambient.AnnotateCtx(context.Background()), nodeID)
 	c := &cfg.RPCContext.ClusterID
 	server := rpc.NewServer(cfg.RPCContext) // never started
 	ltc.Gossip = gossip.New(ambient, c, nc, cfg.RPCContext, server, ltc.Stopper, metric.NewRegistry(), roachpb.Locality{}, zonepb.DefaultZoneConfigRef())
-	ltc.Eng = engine.NewInMem(roachpb.Attributes{}, 50<<20)
+	ltc.Eng = storage.NewInMem(ambient.AnnotateCtx(context.Background()),
+		storage.DefaultStorageEngine, roachpb.Attributes{}, 50<<20)
 	ltc.Stopper.AddCloser(ltc.Eng)
 
-	ltc.Stores = storage.NewStores(ambient, ltc.Clock, cfg.Settings.Version.MinSupportedVersion, cfg.Settings.Version.ServerVersion)
+	ltc.Stores = kvserver.NewStores(ambient, ltc.Clock, clusterversion.TestingBinaryVersion, clusterversion.TestingBinaryMinSupportedVersion)
 
 	factory := initFactory(cfg.Settings, nodeDesc, ambient.Tracer, ltc.Clock, ltc.Latency, ltc.Stores, ltc.Stopper, ltc.Gossip)
 	if ltc.DBContext == nil {
-		dbCtx := client.DefaultDBContext()
+		dbCtx := kv.DefaultDBContext()
 		dbCtx.Stopper = ltc.Stopper
 		ltc.DBContext = &dbCtx
 	}
 	ltc.DBContext.NodeID.Set(context.Background(), nodeID)
-	ltc.DB = client.NewDBWithContext(cfg.AmbientCtx, factory, ltc.Clock, *ltc.DBContext)
-	transport := storage.NewDummyRaftTransport(cfg.Settings)
+	ltc.DB = kv.NewDBWithContext(cfg.AmbientCtx, factory, ltc.Clock, *ltc.DBContext)
+	transport := kvserver.NewDummyRaftTransport(cfg.Settings)
 	// By default, disable the replica scanner and split queue, which
 	// confuse tests using LocalTestCluster.
 	if ltc.StoreTestingKnobs == nil {
@@ -144,53 +146,56 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	cfg.Gossip = ltc.Gossip
 	cfg.HistogramWindowInterval = metric.TestSampleInterval
 	active, renewal := cfg.NodeLivenessDurations()
-	cfg.NodeLiveness = storage.NewNodeLiveness(
+	cfg.NodeLiveness = kvserver.NewNodeLiveness(
 		cfg.AmbientCtx,
 		cfg.Clock,
 		cfg.DB,
-		[]engine.Engine{ltc.Eng},
+		[]storage.Engine{ltc.Eng},
 		cfg.Gossip,
 		active,
 		renewal,
 		cfg.Settings,
 		cfg.HistogramWindowInterval,
 	)
-	storage.TimeUntilStoreDead.Override(&cfg.Settings.SV, storage.TestTimeUntilStoreDead)
-	cfg.StorePool = storage.NewStorePool(
+	kvserver.TimeUntilStoreDead.Override(&cfg.Settings.SV, kvserver.TestTimeUntilStoreDead)
+	cfg.StorePool = kvserver.NewStorePool(
 		cfg.AmbientCtx,
 		cfg.Settings,
 		cfg.Gossip,
 		cfg.Clock,
 		cfg.NodeLiveness.GetNodeCount,
-		storage.MakeStorePoolNodeLivenessFunc(cfg.NodeLiveness),
+		kvserver.MakeStorePoolNodeLivenessFunc(cfg.NodeLiveness),
 		/* deterministic */ false,
 	)
 	cfg.Transport = transport
 	cfg.TimestampCachePageSize = tscache.TestSklPageSize
 	ctx := context.TODO()
 
-	if err := storage.InitEngine(ctx, ltc.Eng, roachpb.StoreIdent{NodeID: nodeID, StoreID: 1}, cfg.Settings.Version.BootstrapVersion()); err != nil {
+	if err := kvserver.InitEngine(
+		ctx, ltc.Eng, roachpb.StoreIdent{NodeID: nodeID, StoreID: 1}, clusterversion.TestingClusterVersion,
+	); err != nil {
 		t.Fatalf("unable to start local test cluster: %s", err)
 	}
-	ltc.Store = storage.NewStore(ctx, cfg, ltc.Eng, nodeDesc)
+	ltc.Store = kvserver.NewStore(ctx, cfg, ltc.Eng, nodeDesc)
 
 	var initialValues []roachpb.KeyValue
 	var splits []roachpb.RKey
 	if !ltc.DontCreateSystemRanges {
 		schema := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig)
 		var tableSplits []roachpb.RKey
-		initialValues, tableSplits = schema.GetInitialValues()
+		bootstrapVersion := clusterversion.TestingClusterVersion
+		initialValues, tableSplits = schema.GetInitialValues(bootstrapVersion)
 		splits = append(config.StaticSplits(), tableSplits...)
 		sort.Slice(splits, func(i, j int) bool {
 			return splits[i].Less(splits[j])
 		})
 	}
 
-	if err := storage.WriteInitialClusterData(
+	if err := kvserver.WriteInitialClusterData(
 		ctx,
 		ltc.Eng,
 		initialValues,
-		cfg.Settings.Version.ServerVersion,
+		clusterversion.TestingBinaryVersion,
 		1, /* numStores */
 		splits,
 		ltc.Clock.PhysicalNow(),

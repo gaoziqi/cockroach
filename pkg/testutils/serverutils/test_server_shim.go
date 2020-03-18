@@ -25,7 +25,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -65,7 +65,7 @@ type TestServerInterface interface {
 	SQLAddr() string
 
 	// DB returns a *client.DB instance for talking to this KV server.
-	DB() *client.DB
+	DB() *kv.DB
 
 	// RPCContext returns the rpc context used by the test server.
 	RPCContext() *rpc.Context
@@ -92,6 +92,9 @@ type TestServerInterface interface {
 	// The real return type is *kv.DistSender.
 	DistSenderI() interface{}
 
+	// SQLServer returns the *sql.Server as an interface{}.
+	SQLServer() interface{}
+
 	// DistSQLServer returns the *distsql.ServerImpl as an interface{}.
 	DistSQLServer() interface{}
 
@@ -116,9 +119,13 @@ type TestServerInterface interface {
 	// GetHTTPClient returns an http client configured with the client TLS
 	// config required by the TestServer's configuration.
 	GetHTTPClient() (http.Client, error)
+	// GetAdminAuthenticatedHTTPClient returns an http client which has been
+	// authenticated to access Admin API methods (via a cookie).
+	// The user has admin privileges.
+	GetAdminAuthenticatedHTTPClient() (http.Client, error)
 	// GetAuthenticatedHTTPClient returns an http client which has been
 	// authenticated to access Admin API methods (via a cookie).
-	GetAuthenticatedHTTPClient() (http.Client, error)
+	GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, error)
 
 	// MustGetSQLCounter returns the value of a counter metric from the server's
 	// SQL Executor. Runs in O(# of metrics) time, which is fine for test code.
@@ -159,6 +166,9 @@ type TestServerInterface interface {
 	ExpectedInitialRangeCount() (int, error)
 
 	// ForceTableGC sends a GCRequest for the ranges corresponding to a table.
+	//
+	// An error will be returned if the same table name exists in multiple schemas
+	// inside the specified database.
 	ForceTableGC(ctx context.Context, database, table string, timestamp hlc.Timestamp) error
 }
 
@@ -182,7 +192,7 @@ func InitTestServerFactory(impl TestServerFactory) {
 // The server should be stopped by calling server.Stopper().Stop().
 func StartServer(
 	t testing.TB, params base.TestServerArgs,
-) (TestServerInterface, *gosql.DB, *client.DB) {
+) (TestServerInterface, *gosql.DB, *kv.DB) {
 	server, err := StartServerRaw(params)
 	if err != nil {
 		t.Fatal(err)
@@ -224,17 +234,34 @@ func StartServerRaw(args base.TestServerArgs) (TestServerInterface, error) {
 // GetJSONProto uses the supplied client to GET the URL specified by the parameters
 // and unmarshals the result into response.
 func GetJSONProto(ts TestServerInterface, path string, response protoutil.Message) error {
-	httpClient, err := ts.GetAuthenticatedHTTPClient()
+	return GetJSONProtoWithAdminOption(ts, path, response, true)
+}
+
+// GetJSONProtoWithAdminOption is like GetJSONProto but the caller can customize
+// whether the request is performed with admin privilege
+func GetJSONProtoWithAdminOption(
+	ts TestServerInterface, path string, response protoutil.Message, isAdmin bool,
+) error {
+	httpClient, err := ts.GetAuthenticatedHTTPClient(isAdmin)
 	if err != nil {
 		return err
 	}
 	return httputil.GetJSON(httpClient, ts.AdminURL()+path, response)
 }
 
-// PostJSONProto uses the supplied client to POST request to the URL specified by
-// the parameters and unmarshals the result into response.
+// PostJSONProto uses the supplied client to POST the URL specified by the parameters
+// and unmarshals the result into response.
 func PostJSONProto(ts TestServerInterface, path string, request, response protoutil.Message) error {
-	httpClient, err := ts.GetAuthenticatedHTTPClient()
+	return PostJSONProtoWithAdminOption(ts, path, request, response, true)
+}
+
+// PostJSONProtoWithAdminOption is like PostJSONProto but the caller
+// can customize whether the request is performed with admin
+// privilege.
+func PostJSONProtoWithAdminOption(
+	ts TestServerInterface, path string, request, response protoutil.Message, isAdmin bool,
+) error {
+	httpClient, err := ts.GetAuthenticatedHTTPClient(isAdmin)
 	if err != nil {
 		return err
 	}

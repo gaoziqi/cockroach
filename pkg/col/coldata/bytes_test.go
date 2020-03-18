@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -27,7 +28,7 @@ type bytesMethod int
 
 const (
 	set bytesMethod = iota
-	slice
+	window
 	copySlice
 	appendSlice
 	appendVal
@@ -37,8 +38,8 @@ func (m bytesMethod) String() string {
 	switch m {
 	case set:
 		return "Set"
-	case slice:
-		return "Slice"
+	case window:
+		return "Window"
 	case copySlice:
 		return "CopySlice"
 	case appendSlice:
@@ -50,17 +51,17 @@ func (m bytesMethod) String() string {
 	}
 }
 
-var bytesMethods = []bytesMethod{set, slice, copySlice, appendSlice, appendVal}
+var bytesMethods = []bytesMethod{set, window, copySlice, appendSlice, appendVal}
 
 // applyMethodsAndVerify applies the given methods on b1 and a reference
 // [][]byte implementation and checks if the results are equal. If
 // selfReferencingSources is true, this is an indication by the caller that we
 // are testing an edge case where the source for copies/appends refers to the
-// destination. In cases where *flatBytes updates itself under the hood, we also
+// destination. In cases where *Bytes updates itself under the hood, we also
 // update the corresponding b2Source to mirror the behavior.
 func applyMethodsAndVerify(
 	rng *rand.Rand,
-	b1, b1Source *flatBytes,
+	b1, b1Source *Bytes,
 	b2, b2Source [][]byte,
 	methods []bytesMethod,
 	selfReferencingSources bool,
@@ -71,7 +72,7 @@ func applyMethodsAndVerify(
 	if err := verifyEqual(b1Source, b2Source); err != nil {
 		return errors.Wrap(err, "argument sources should start as equal")
 	}
-	var debugString string
+	debugString := fmt.Sprintf("\ninitial:\n%s\n", b1)
 	for _, m := range methods {
 		n := b1.Len()
 		if n != len(b2) {
@@ -84,30 +85,30 @@ func applyMethodsAndVerify(
 		debugString += m.String()
 		switch m {
 		case set:
-			// Can only Set the last index.
-			i := b1.Len() - 1
+			// Can only Set starting from maxSetIndex.
+			i := b1.maxSetIndex + rng.Intn(b1.Len()-b1.maxSetIndex)
 			new := make([]byte, rng.Intn(16))
 			rng.Read(new)
 			debugString += fmt.Sprintf("(%d, %v)", i, new)
 			b1.Set(i, new)
 			b2[i] = new
-		case slice:
+		case window:
 			start := rng.Intn(n)
 			end := rng.Intn(n + 1)
 			if start > end {
 				end = start + 1
-			} else if start == end {
-				// If start == end, do a noop Slice, otherwise the rest of the methods
-				// won't do much (and rng.Intn will panic with an n of 0).
-				start = 0
-				end = n
 			}
 			debugString += fmt.Sprintf("(%d, %d)", start, end)
-			b1 = b1.Slice(start, end)
-			b2 = b2[start:end]
-			if selfReferencingSources {
-				b2Source = b2
+			b1Window := b1.Window(start, end)
+			b2Window := b2[start:end]
+			// b1Window is not allowed to be modified, so we check explicitly whether
+			// it equals the reference, and we do not update b1 and b2.
+			b1Window.AssertOffsetsAreNonDecreasing(b1Window.Len())
+			debugString += fmt.Sprintf("\n%s\n", b1Window)
+			if err := verifyEqual(b1Window, b2Window); err != nil {
+				return errors.Wrap(err, fmt.Sprintf("\ndebugString:\n%sflat:\n%sreference:\n%s", debugString, b1Window.String(), prettyByteSlice(b2Window)))
 			}
+			continue
 		case copySlice, appendSlice:
 			// Generate a length-inclusive destIdx.
 			destIdx := rng.Intn(n + 1)
@@ -129,6 +130,7 @@ func applyMethodsAndVerify(
 				b1.AppendSlice(b1Source, destIdx, srcStartIdx, srcEndIdx)
 				b2 = append(b2[:destIdx], b2Source[srcStartIdx:srcEndIdx]...)
 				if selfReferencingSources {
+					b1Source = b1
 					b2Source = b2
 				}
 				numNewVals = srcEndIdx - srcStartIdx
@@ -145,12 +147,14 @@ func applyMethodsAndVerify(
 			b1.AppendVal(v)
 			b2 = append(b2, v)
 			if selfReferencingSources {
+				b1Source = b1
 				b2Source = b2
 			}
 		default:
 			return errors.Errorf("unknown method name: %s", m)
 		}
-		debugString += "\n"
+		b1.AssertOffsetsAreNonDecreasing(b1.Len())
+		debugString += fmt.Sprintf("\n%s\n", b1)
 		if err := verifyEqual(b1, b2); err != nil {
 			return errors.Wrap(err, fmt.Sprintf("\ndebugString:\n%sflat (maxSetIdx=%d):\n%sreference:\n%s", debugString, b1.maxSetIndex, b1.String(), prettyByteSlice(b2)))
 		}
@@ -158,7 +162,7 @@ func applyMethodsAndVerify(
 	return nil
 }
 
-func verifyEqual(flat *flatBytes, b [][]byte) error {
+func verifyEqual(flat *Bytes, b [][]byte) error {
 	if flat.Len() != len(b) {
 		return errors.Errorf("mismatched lengths %d != %d", flat.Len(), len(b))
 	}
@@ -180,7 +184,7 @@ func prettyByteSlice(b [][]byte) string {
 	return builder.String()
 }
 
-func TestFlatBytesRefImpl(t *testing.T) {
+func TestBytesRefImpl(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	rng, _ := randutil.NewPseudoRand()
@@ -188,61 +192,61 @@ func TestFlatBytesRefImpl(t *testing.T) {
 	const (
 		maxNumberOfCalls = 64
 		maxLength        = 16
+		nRuns            = 100
 	)
 
-	n := 1 + rng.Intn(maxLength)
+	for nRun := 0; nRun < nRuns; nRun++ {
+		n := 1 + rng.Intn(maxLength)
 
-	flat := newFlatBytes(n)
-	reference := make([][]byte, n)
-	for i := 0; i < n; i++ {
-		v := make([]byte, rng.Intn(16))
-		rng.Read(v)
-		flat.Set(i, append([]byte(nil), v...))
-		reference[i] = append([]byte(nil), v...)
-	}
-
-	// Make a pair of sources to copy/append from. Use the destination variables
-	// with a certain probability.
-	sourceN := n
-	flatSource := flat
-	referenceSource := reference
-	selfReferencingSources := true
-	if rng.Float64() < 0.5 {
-		selfReferencingSources = false
-		sourceN = 1 + rng.Intn(maxLength)
-		flatSource = newFlatBytes(sourceN)
-		referenceSource = make([][]byte, sourceN)
-		for i := 0; i < sourceN; i++ {
+		flat := NewBytes(n)
+		reference := make([][]byte, n)
+		for i := 0; i < n; i++ {
 			v := make([]byte, rng.Intn(16))
 			rng.Read(v)
-			flatSource.Set(i, append([]byte(nil), v...))
-			referenceSource[i] = append([]byte(nil), v...)
+			flat.Set(i, append([]byte(nil), v...))
+			reference[i] = append([]byte(nil), v...)
 		}
-	}
 
-	if err := verifyEqual(flat, reference); err != nil {
-		t.Fatalf("not equal: %v\nflat:\n%sreference:\n%s", err, flat, prettyByteSlice(reference))
-	}
+		// Make a pair of sources to copy/append from. Use the destination variables
+		// with a certain probability.
+		sourceN := n
+		flatSource := flat
+		referenceSource := reference
+		selfReferencingSources := true
+		if rng.Float64() < 0.5 {
+			selfReferencingSources = false
+			sourceN = 1 + rng.Intn(maxLength)
+			flatSource = NewBytes(sourceN)
+			referenceSource = make([][]byte, sourceN)
+			for i := 0; i < sourceN; i++ {
+				v := make([]byte, rng.Intn(16))
+				rng.Read(v)
+				flatSource.Set(i, append([]byte(nil), v...))
+				referenceSource[i] = append([]byte(nil), v...)
+			}
+		}
 
-	if err := verifyEqual(flatSource, referenceSource); err != nil {
-		t.Fatalf("sources not equal: %v\nflat:\n%sreference:\n%s", err, flat, prettyByteSlice(reference))
-	}
+		if err := verifyEqual(flat, reference); err != nil {
+			t.Fatalf("not equal: %v\nflat:\n%sreference:\n%s", err, flat, prettyByteSlice(reference))
+		}
 
-	numCalls := 1 + rng.Intn(maxNumberOfCalls)
-	methods := make([]bytesMethod, 0, numCalls)
-	for i := 0; i < numCalls; i++ {
-		methods = append(methods, bytesMethods[rng.Intn(len(bytesMethods))])
-	}
-	if err := applyMethodsAndVerify(rng, flat, flatSource, reference, referenceSource, methods, selfReferencingSources); err != nil {
-		t.Fatal(err)
+		numCalls := 1 + rng.Intn(maxNumberOfCalls)
+		methods := make([]bytesMethod, 0, numCalls)
+		for i := 0; i < numCalls; i++ {
+			methods = append(methods, bytesMethods[rng.Intn(len(bytesMethods))])
+		}
+		if err := applyMethodsAndVerify(rng, flat, flatSource, reference, referenceSource, methods, selfReferencingSources); err != nil {
+			t.Logf("nRun = %d\n", nRun)
+			t.Fatal(err)
+		}
 	}
 }
 
-func TestFlatBytes(t *testing.T) {
+func TestBytes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	t.Run("Simple", func(t *testing.T) {
-		b1 := newFlatBytes(0)
+		b1 := NewBytes(0)
 		b1.AppendVal([]byte("hello"))
 		require.Equal(t, "hello", string(b1.Get(0)))
 		b1.AppendVal(nil)
@@ -258,8 +262,8 @@ func TestFlatBytes(t *testing.T) {
 		// However, it is legal to overwrite the last value.
 		b1.Set(1, []byte("ok"))
 
-		// If we Zero the flatBytes, we can Set any index.
-		b1.Zero()
+		// If we Reset the Bytes, we can Set any index.
+		b1.Reset()
 		b1.Set(1, []byte("new usage"))
 		// But not an index before that.
 		require.Panics(
@@ -274,8 +278,8 @@ func TestFlatBytes(t *testing.T) {
 	})
 
 	t.Run("Append", func(t *testing.T) {
-		b1 := newFlatBytes(0)
-		b2 := newFlatBytes(0)
+		b1 := NewBytes(0)
+		b2 := NewBytes(0)
 		b2.AppendVal([]byte("source bytes value"))
 		b1.AppendVal([]byte("one"))
 		b1.AppendVal([]byte("two"))
@@ -296,7 +300,7 @@ func TestFlatBytes(t *testing.T) {
 			}
 		}
 
-		b2 = newFlatBytes(0)
+		b2 = NewBytes(0)
 		b2.AppendVal([]byte("hello again"))
 		b2.AppendVal([]byte("hello again"))
 		b2.AppendVal([]byte("hello again"))
@@ -309,8 +313,8 @@ func TestFlatBytes(t *testing.T) {
 	})
 
 	t.Run("Copy", func(t *testing.T) {
-		b1 := newFlatBytes(0)
-		b2 := newFlatBytes(0)
+		b1 := NewBytes(0)
+		b2 := NewBytes(0)
 		b1.AppendVal([]byte("one"))
 		b1.AppendVal([]byte("two"))
 		b1.AppendVal([]byte("three"))
@@ -334,9 +338,9 @@ func TestFlatBytes(t *testing.T) {
 		require.Equal(t, "source two", string(b1.Get(1)))
 		require.Equal(t, "source one", string(b1.Get(2)))
 
-		// Slice b1 to test slicing logic and follow it with testing a full
-		// overwrite of only one element.
-		b1 = b1.Slice(0, 1)
+		// Set the length to 1 and  follow it with testing a full overwrite of only
+		// one element.
+		b1.SetLength(1)
 		require.Equal(t, 1, b1.Len())
 		b1.CopySlice(b2, 0, 0, b2.Len())
 		require.Equal(t, 1, b1.Len())
@@ -346,5 +350,65 @@ func TestFlatBytes(t *testing.T) {
 		b1.CopySlice(b2, 0, 1, b2.Len())
 		require.Equal(t, 1, b1.Len())
 		require.Equal(t, "source two", string(b1.Get(0)))
+	})
+
+	t.Run("Window", func(t *testing.T) {
+		b1 := NewBytes(0)
+		b1.AppendVal([]byte("one"))
+		b1.AppendVal([]byte("two"))
+		b1.AppendVal([]byte("three"))
+
+		w := b1.Window(0, 3)
+		require.NotEqual(t, unsafe.Pointer(b1), unsafe.Pointer(w), "Bytes.Window should create a new object")
+		b2 := b1.Window(1, 2)
+		require.Equal(t, "one", string(b1.Get(0)))
+		require.Equal(t, "two", string(b1.Get(1)))
+		require.Equal(t, "two", string(b2.Get(0)))
+
+		require.Panics(t, func() { b2.AppendVal([]byte("four")) }, "appending to the window into b1 should have panicked")
+	})
+
+	t.Run("String", func(t *testing.T) {
+		b1 := NewBytes(0)
+		vals := [][]byte{
+			[]byte("one"),
+			[]byte("two"),
+			[]byte("three"),
+		}
+		for i := range vals {
+			b1.AppendVal(vals[i])
+		}
+
+		// The values should be printed using the String function.
+		b1String := b1.String()
+		require.True(
+			t,
+			strings.Contains(b1String, fmt.Sprint(vals[0])) &&
+				strings.Contains(b1String, fmt.Sprint(vals[1])) &&
+				strings.Contains(b1String, fmt.Sprint(vals[2])),
+		)
+
+		// A window on the bytes should only print the values included in the
+		// window.
+		b2String := b1.Window(1, 3).String()
+		require.True(
+			t,
+			!strings.Contains(b2String, fmt.Sprint(vals[0])) &&
+				strings.Contains(b2String, fmt.Sprint(vals[1])) &&
+				strings.Contains(b2String, fmt.Sprint(vals[2])),
+		)
+	})
+
+	t.Run("InvariantSimple", func(t *testing.T) {
+		b1 := NewBytes(8)
+		b1.Set(0, []byte("zero"))
+		other := b1.Window(0, 2)
+		other.AssertOffsetsAreNonDecreasing(2)
+
+		b2 := NewBytes(8)
+		b2.Set(0, []byte("zero"))
+		b2.Set(2, []byte("two"))
+		other = b2.Window(0, 4)
+		other.AssertOffsetsAreNonDecreasing(4)
 	})
 }

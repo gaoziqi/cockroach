@@ -24,7 +24,6 @@ import (
 	"context"
 	"math"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
@@ -34,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -43,14 +43,17 @@ import (
 // Dummy import to pull in "bytes" package.
 var _ bytes.Buffer
 
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
 // Dummy import to pull in "tree" package.
 var _ tree.Datum
 
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
+
+// Dummy import to pull in "coltypes" package.
+var _ coltypes.T
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // _ASSIGN is the template function for assigning the first input to the result
 // of computation an operation on the second and the third inputs.
@@ -78,25 +81,48 @@ func _RET_UNSAFEGET(_, _ interface{}) interface{} {
 
 // */}}
 
+// projConstOpBase contains all of the fields for binary projections with a
+// constant, except for the constant itself.
+// NOTE: this struct should be declared in proj_const_ops_tmpl.go, but if we do
+// so, it'll be redeclared because we execute that template twice. To go
+// around the problem we specify it here.
+type projConstOpBase struct {
+	OneInputNode
+	allocator      *Allocator
+	colIdx         int
+	outputIdx      int
+	decimalScratch decimalOverloadScratch
+}
+
+// projOpBase contains all of the fields for non-constant binary projections.
+type projOpBase struct {
+	OneInputNode
+	allocator      *Allocator
+	col1Idx        int
+	col2Idx        int
+	outputIdx      int
+	decimalScratch decimalOverloadScratch
+}
+
 // {{define "projOp"}}
 
 type _OP_NAME struct {
 	projOpBase
 }
 
-func (p _OP_NAME) EstimateStaticMemoryUsage() int {
-	return EstimateBatchSizeBytes([]coltypes.T{coltypes._RET_TYP}, int(coldata.BatchSize()))
-}
-
 func (p _OP_NAME) Next(ctx context.Context) coldata.Batch {
+	// In order to inline the templated code of overloads, we need to have a
+	// `decimalScratch` local variable of type `decimalOverloadScratch`.
+	decimalScratch := p.decimalScratch
+	// However, the scratch is not used in all of the projection operators, so
+	// we add this to go around "unused" error.
+	_ = decimalScratch
 	batch := p.input.Next(ctx)
 	n := batch.Length()
-	if p.outputIdx == batch.Width() {
-		batch.AppendCol(coltypes._RET_TYP)
-	}
 	if n == 0 {
-		return batch
+		return coldata.ZeroBatch
 	}
+	p.allocator.MaybeAddColumn(batch, coltypes._RET_TYP, p.outputIdx)
 	projVec := batch.ColVec(p.outputIdx)
 	projCol := projVec._RET_TYP()
 	vec1 := batch.ColVec(p.col1Idx)
@@ -109,6 +135,9 @@ func (p _OP_NAME) Next(ctx context.Context) coldata.Batch {
 		_SET_PROJECTION(false)
 	}
 
+	// Although we didn't change the length of the batch, it is necessary to set
+	// the length anyway (this helps maintaining the invariant of flat bytes).
+	batch.SetLength(n)
 	return batch
 }
 
@@ -134,11 +163,16 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
 		}
 	} else {
-		col1 = execgen.SLICE(col1, 0, int(n))
+		// {{if not (eq .LTyp.String "Bytes")}}
+		// {{/* Slice is a noop for Bytes type, so colLen below might contain an
+		// incorrect value. In order to keep bounds check elimination for all other
+		// types, we simply omit this code snippet for Bytes. */}}
+		col1 = execgen.SLICE(col1, 0, n)
 		colLen := execgen.LEN(col1)
 		_ = _RET_UNSAFEGET(projCol, colLen-1)
 		_ = _R_UNSAFEGET(col2, colLen-1)
-		for execgen.RANGE(i, col1) {
+		// {{end}}
+		for execgen.RANGE(i, col1, 0, n) {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
 		}
 	}
@@ -158,13 +192,13 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 	// {{$hasNulls := $.HasNulls}}
 	// {{with $.Overload}}
 	// {{if _HAS_NULLS}}
-	if !col1Nulls.NullAt(uint16(i)) && !col2Nulls.NullAt(uint16(i)) {
+	if !col1Nulls.NullAt(i) && !col2Nulls.NullAt(i) {
 		// We only want to perform the projection operation if both values are not
 		// null.
 		// {{end}}
-		arg1 := _L_UNSAFEGET(col1, int(i))
-		arg2 := _R_UNSAFEGET(col2, int(i))
-		_ASSIGN("projCol[i]", "arg1", "arg2")
+		arg1 := _L_UNSAFEGET(col1, i)
+		arg2 := _R_UNSAFEGET(col2, i)
+		_ASSIGN(projCol[i], arg1, arg2)
 		// {{if _HAS_NULLS }}
 	}
 	// {{end}}
@@ -193,6 +227,7 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 // GetProjectionOperator returns the appropriate projection operator for the
 // given left and right column types and operation.
 func GetProjectionOperator(
+	allocator *Allocator,
 	leftColType *types.T,
 	rightColType *types.T,
 	op tree.Operator,
@@ -201,7 +236,13 @@ func GetProjectionOperator(
 	col2Idx int,
 	outputIdx int,
 ) (Operator, error) {
-	projOpBase := projOpBase{OneInputNode: NewOneInputNode(input), col1Idx: col1Idx, col2Idx: col2Idx, outputIdx: outputIdx}
+	projOpBase := projOpBase{
+		OneInputNode: NewOneInputNode(input),
+		allocator:    allocator,
+		col1Idx:      col1Idx,
+		col2Idx:      col2Idx,
+		outputIdx:    outputIdx,
+	}
 	switch leftType := typeconv.FromColumnType(leftColType); leftType {
 	// {{range $lTyp, $rTypToOverloads := .}}
 	case coltypes._L_TYP_VAR:

@@ -34,9 +34,8 @@ type IndexedVarContainer interface {
 // represents a dynamic value. It defers calls to TypeCheck, Eval, String to an
 // IndexedVarContainer.
 type IndexedVar struct {
-	Idx         int
-	Used        bool
-	bindInPlace bool
+	Idx  int
+	Used bool
 
 	col NodeFormatter
 
@@ -141,13 +140,6 @@ func (h *IndexedVarHelper) BindIfUnbound(ivar *IndexedVar) (*IndexedVar, error) 
 	}
 
 	if !ivar.Used {
-		if ivar.bindInPlace {
-			// This container must also remember it has "seen" the variable
-			// so that IndexedVarUsed() below returns the right results.
-			// The IndexedVar() method ensures this.
-			*ivar = *h.IndexedVar(ivar.Idx)
-			return ivar, nil
-		}
 		return h.IndexedVar(ivar.Idx), nil
 	}
 	return ivar, nil
@@ -155,7 +147,10 @@ func (h *IndexedVarHelper) BindIfUnbound(ivar *IndexedVar) (*IndexedVar, error) 
 
 // MakeIndexedVarHelper initializes an IndexedVarHelper structure.
 func MakeIndexedVarHelper(container IndexedVarContainer, numVars int) IndexedVarHelper {
-	return IndexedVarHelper{vars: make([]IndexedVar, numVars), container: container}
+	return IndexedVarHelper{
+		vars:      make([]IndexedVar, numVars),
+		container: container,
+	}
 }
 
 // AppendSlot expands the capacity of this IndexedVarHelper by one and returns

@@ -21,7 +21,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
@@ -389,33 +390,11 @@ func TestTransactionBumpEpoch(t *testing.T) {
 	origNow := makeTS(10, 1)
 	txn := MakeTransaction("test", Key("a"), 1, origNow, 0)
 	// Advance the txn timestamp.
-	txn.Timestamp = txn.Timestamp.Add(10, 2)
+	txn.WriteTimestamp = txn.WriteTimestamp.Add(10, 2)
 	txn.BumpEpoch()
 	if a, e := txn.Epoch, enginepb.TxnEpoch(1); a != e {
 		t.Errorf("expected epoch %d; got %d", e, a)
 	}
-	if txn.DeprecatedMinTimestamp == (hlc.Timestamp{}) {
-		t.Errorf("expected non-nil deprecated min timestamp")
-	} else if txn.DeprecatedMinTimestamp != origNow {
-		t.Errorf("expected deprecated min timestamp == origNow; %s != %s", txn.DeprecatedMinTimestamp, origNow)
-	}
-}
-
-func TestTransactionInclusiveTimeBounds(t *testing.T) {
-	verify := func(txn Transaction, expMin, expMax hlc.Timestamp) {
-		if min, max := txn.InclusiveTimeBounds(); min != expMin || max != expMax {
-			t.Errorf("expected (%s-%s); got (%s-%s)", expMin, expMax, min, max)
-		}
-	}
-	origNow := makeTS(1, 1)
-	txn := MakeTransaction("test", Key("a"), 1, origNow, 0)
-	verify(txn, origNow, origNow)
-	txn.Timestamp.Forward(makeTS(1, 2))
-	verify(txn, origNow, makeTS(1, 2))
-	txn.Restart(1, 1, makeTS(2, 1))
-	verify(txn, origNow, makeTS(2, 1))
-	txn.Timestamp.Forward(makeTS(3, 1))
-	verify(txn, origNow, makeTS(3, 1))
 }
 
 // TestTransactionObservedTimestamp verifies that txn.{Get,Update}ObservedTimestamp work as
@@ -476,26 +455,26 @@ func TestFastPathObservedTimestamp(t *testing.T) {
 
 var nonZeroTxn = Transaction{
 	TxnMeta: enginepb.TxnMeta{
-		Key:          Key("foo"),
-		ID:           uuid.MakeV4(),
-		Epoch:        2,
-		Timestamp:    makeTS(20, 21),
-		MinTimestamp: makeTS(10, 11),
-		Priority:     957356782,
-		Sequence:     123,
+		Key:            Key("foo"),
+		ID:             uuid.MakeV4(),
+		Epoch:          2,
+		WriteTimestamp: makeTS(20, 21),
+		MinTimestamp:   makeTS(10, 11),
+		Priority:       957356782,
+		Sequence:       123,
 	},
-	Name:                     "name",
-	Status:                   COMMITTED,
-	LastHeartbeat:            makeTS(1, 2),
-	OrigTimestamp:            makeTS(30, 31),
-	RefreshedTimestamp:       makeTS(20, 22),
-	MaxTimestamp:             makeTS(40, 41),
-	ObservedTimestamps:       []ObservedTimestamp{{NodeID: 1, Timestamp: makeTS(1, 2)}},
-	WriteTooOld:              true,
-	IntentSpans:              []Span{{Key: []byte("a"), EndKey: []byte("b")}},
-	InFlightWrites:           []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
-	DeprecatedMinTimestamp:   makeTS(1, 1),
-	OrigTimestampWasObserved: true,
+	Name:                    "name",
+	Status:                  COMMITTED,
+	LastHeartbeat:           makeTS(1, 2),
+	DeprecatedOrigTimestamp: makeTS(30, 31),
+	ReadTimestamp:           makeTS(20, 22),
+	MaxTimestamp:            makeTS(40, 41),
+	ObservedTimestamps:      []ObservedTimestamp{{NodeID: 1, Timestamp: makeTS(1, 2)}},
+	WriteTooOld:             true,
+	LockSpans:               []Span{{Key: []byte("a"), EndKey: []byte("b")}},
+	InFlightWrites:          []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
+	CommitTimestampFixed:    true,
+	IgnoredSeqNums:          []enginepb.IgnoredSeqNumRange{{Start: 888, End: 999}},
 }
 
 func TestTransactionUpdate(t *testing.T) {
@@ -539,6 +518,30 @@ func TestTransactionUpdate(t *testing.T) {
 	expTxn4.Sequence = txn.Sequence + 10
 	require.Equal(t, expTxn4, txn4)
 
+	// Test the updates to the WriteTooOld field. The WriteTooOld field is
+	// supposed to be dictated by the transaction with the higher ReadTimestamp,
+	// or it's cumulative when the ReadTimestamps are equal.
+	{
+		txn2 := txn
+		txn2.ReadTimestamp = txn2.ReadTimestamp.Add(-1, 0)
+		txn2.WriteTooOld = false
+		txn2.Update(&txn)
+		require.True(t, txn2.WriteTooOld)
+	}
+	{
+		txn2 := txn
+		txn2.WriteTooOld = false
+		txn2.Update(&txn)
+		require.True(t, txn2.WriteTooOld)
+	}
+	{
+		txn2 := txn
+		txn2.ReadTimestamp = txn2.ReadTimestamp.Add(1, 0)
+		txn2.WriteTooOld = false
+		txn2.Update(&txn)
+		require.False(t, txn2.WriteTooOld)
+	}
+
 	// Updating a Transaction at a future epoch ignores all epoch-scoped fields.
 	var txn5 Transaction
 	txn5.ID = txn.ID
@@ -554,10 +557,11 @@ func TestTransactionUpdate(t *testing.T) {
 	expTxn5.Epoch = txn.Epoch + 1
 	expTxn5.Status = PENDING
 	expTxn5.Sequence = txn.Sequence - 10
-	expTxn5.IntentSpans = nil
+	expTxn5.LockSpans = nil
 	expTxn5.InFlightWrites = nil
+	expTxn5.IgnoredSeqNums = nil
 	expTxn5.WriteTooOld = false
-	expTxn5.OrigTimestampWasObserved = false
+	expTxn5.CommitTimestampFixed = false
 	require.Equal(t, expTxn5, txn5)
 
 	// Updating a different transaction fatals.
@@ -582,20 +586,13 @@ func TestTransactionUpdateMinTimestamp(t *testing.T) {
 	if a, e := txn2.MinTimestamp, txn.MinTimestamp; a != e {
 		t.Errorf("expected min timestamp %s; got %s", e, a)
 	}
-	if a, e := txn2.DeprecatedMinTimestamp, txn.DeprecatedMinTimestamp; a != e {
-		t.Errorf("expected deprecated min timestamp %s; got %s", e, a)
-	}
 
 	txn3 := nonZeroTxn
 	txn3.MinTimestamp = nonZeroTxn.MinTimestamp.Prev()
-	txn3.DeprecatedMinTimestamp = nonZeroTxn.DeprecatedMinTimestamp.Prev()
 	txn.Update(&txn3)
 
 	if a, e := txn.MinTimestamp, txn3.MinTimestamp; a != e {
 		t.Errorf("expected min timestamp %s; got %s", e, a)
-	}
-	if a, e := txn.DeprecatedMinTimestamp, txn3.DeprecatedMinTimestamp; a != e {
-		t.Errorf("expected deprecated min timestamp %s; got %s", e, a)
 	}
 }
 
@@ -638,6 +635,25 @@ func TestTransactionUpdateStaging(t *testing.T) {
 	}
 }
 
+// TestTransactionUpdateAbortedOldEpoch tests that Transaction.Update propagates
+// an ABORTED status even when that status comes from a proto with an old epoch.
+// Once a transaction is ABORTED, it will stay aborted, even if its coordinator
+// doesn't know this at the time that it increments its epoch and retries.
+func TestTransactionUpdateAbortedOldEpoch(t *testing.T) {
+	txn := nonZeroTxn
+	txn.Status = ABORTED
+
+	txnRestart := txn
+	txnRestart.Epoch++
+	txnRestart.Status = PENDING
+	txnRestart.Update(&txn)
+
+	expTxn := txn
+	expTxn.Epoch++
+	expTxn.Status = ABORTED
+	require.Equal(t, expTxn, txnRestart)
+}
+
 func TestTransactionClone(t *testing.T) {
 	txnPtr := nonZeroTxn.Clone()
 	txn := *txnPtr
@@ -649,11 +665,12 @@ func TestTransactionClone(t *testing.T) {
 	// listed below. If this test fails, please update the list below and/or
 	// Transaction.Clone().
 	expFields := []string{
+		"IgnoredSeqNums",
 		"InFlightWrites",
 		"InFlightWrites.Key",
-		"IntentSpans",
-		"IntentSpans.EndKey",
-		"IntentSpans.Key",
+		"LockSpans",
+		"LockSpans.EndKey",
+		"LockSpans.Key",
 		"ObservedTimestamps",
 		"TxnMeta.Key",
 	}
@@ -672,12 +689,14 @@ func TestTransactionRestart(t *testing.T) {
 	expTxn := nonZeroTxn
 	expTxn.Epoch++
 	expTxn.Sequence = 0
-	expTxn.Timestamp = makeTS(25, 1)
-	expTxn.OrigTimestamp = makeTS(25, 1)
+	expTxn.WriteTimestamp = makeTS(25, 1)
+	expTxn.ReadTimestamp = makeTS(25, 1)
+	expTxn.DeprecatedOrigTimestamp = expTxn.ReadTimestamp
 	expTxn.WriteTooOld = false
-	expTxn.OrigTimestampWasObserved = false
-	expTxn.IntentSpans = nil
+	expTxn.CommitTimestampFixed = false
+	expTxn.LockSpans = nil
 	expTxn.InFlightWrites = nil
+	expTxn.IgnoredSeqNums = nil
 	require.Equal(t, expTxn, txn)
 }
 
@@ -700,19 +719,25 @@ func TestTransactionRecordRoundtrips(t *testing.T) {
 	txn := nonZeroTxn
 	txnRecord := txn.AsRecord()
 	if err := zerofields.NoZeroField(txnRecord); err != nil {
-		t.Fatal(err)
+		t.Error(err)
 	}
 	if !reflect.DeepEqual(txnRecord.TxnMeta, txn.TxnMeta) {
-		t.Fatalf("txnRecord.TxnMeta = %v, txn.TxnMeta = %v", txnRecord.TxnMeta, txn.TxnMeta)
+		t.Errorf("txnRecord.TxnMeta = %v, txn.TxnMeta = %v", txnRecord.TxnMeta, txn.TxnMeta)
 	}
 	if !reflect.DeepEqual(txnRecord.Status, txn.Status) {
-		t.Fatalf("txnRecord.Status = %v, txn.Status = %v", txnRecord.Status, txn.Status)
+		t.Errorf("txnRecord.Status = %v, txn.Status = %v", txnRecord.Status, txn.Status)
 	}
 	if !reflect.DeepEqual(txnRecord.LastHeartbeat, txn.LastHeartbeat) {
-		t.Fatalf("txnRecord.LastHeartbeat = %v, txn.LastHeartbeat = %v", txnRecord.LastHeartbeat, txn.LastHeartbeat)
+		t.Errorf("txnRecord.LastHeartbeat = %v, txn.LastHeartbeat = %v", txnRecord.LastHeartbeat, txn.LastHeartbeat)
 	}
-	if !reflect.DeepEqual(txnRecord.IntentSpans, txn.IntentSpans) {
-		t.Fatalf("txnRecord.IntentSpans = %v, txn.IntentSpans = %v", txnRecord.IntentSpans, txn.IntentSpans)
+	if !reflect.DeepEqual(txnRecord.LockSpans, txn.LockSpans) {
+		t.Errorf("txnRecord.LockSpans = %v, txn.LockSpans = %v", txnRecord.LockSpans, txn.LockSpans)
+	}
+	if !reflect.DeepEqual(txnRecord.InFlightWrites, txn.InFlightWrites) {
+		t.Errorf("txnRecord.InFlightWrites = %v, txn.InFlightWrites = %v", txnRecord.InFlightWrites, txn.InFlightWrites)
+	}
+	if !reflect.DeepEqual(txnRecord.IgnoredSeqNums, txn.IgnoredSeqNums) {
+		t.Errorf("txnRecord.IgnoredSeqNums = %v, txn.IgnoredSeqNums = %v", txnRecord.IgnoredSeqNums, txn.IgnoredSeqNums)
 	}
 
 	// Verify that converting through a Transaction message and back
@@ -720,7 +745,7 @@ func TestTransactionRecordRoundtrips(t *testing.T) {
 	txn2 := txnRecord.AsTransaction()
 	txnRecord2 := txn2.AsRecord()
 	if !reflect.DeepEqual(txnRecord, txnRecord2) {
-		t.Fatalf("txnRecord = %v, txnRecord2 = %v", txnRecord, txnRecord2)
+		t.Errorf("txnRecord = %v, txnRecord2 = %v", txnRecord, txnRecord2)
 	}
 
 	// Verify that encoded Transaction messages can be decoded as
@@ -734,7 +759,7 @@ func TestTransactionRecordRoundtrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(txnRecord, txnRecord3) {
-		t.Fatalf("txnRecord = %v, txnRecord3 = %v", txnRecord, txnRecord3)
+		t.Errorf("txnRecord = %v, txnRecord3 = %v", txnRecord, txnRecord3)
 	}
 
 	// Verify that encoded TransactionRecord messages can be decoded
@@ -748,7 +773,7 @@ func TestTransactionRecordRoundtrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(txn2, txn3) {
-		t.Fatalf("txn2 = %v, txn3 = %v", txn2, txn3)
+		t.Errorf("txn2 = %v, txn3 = %v", txn2, txn3)
 	}
 }
 
@@ -1638,13 +1663,15 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 
 	vi := VOTER_INCOMING
 	vo := VOTER_OUTGOING
+	vd := VOTER_DEMOTING
 	l := LEARNER
 	repl1 := ReplicaDescriptor{NodeID: 1, StoreID: 2, ReplicaID: 3, Type: &vi}
 	repl2 := ReplicaDescriptor{NodeID: 4, StoreID: 5, ReplicaID: 6, Type: &vo}
 	learner := ReplicaDescriptor{NodeID: 7, StoreID: 8, ReplicaID: 9, Type: &l}
+	repl3 := ReplicaDescriptor{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: &vd}
 	crt := ChangeReplicasTrigger{
 		InternalAddedReplicas:   []ReplicaDescriptor{repl1},
-		InternalRemovedReplicas: []ReplicaDescriptor{repl2},
+		InternalRemovedReplicas: []ReplicaDescriptor{repl2, repl3},
 		Desc: &RangeDescriptor{
 			RangeID:  1,
 			StartKey: RKey("a"),
@@ -1653,6 +1680,7 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 				repl1,
 				repl2,
 				learner,
+				repl3,
 			},
 			NextReplicaID:        10,
 			Generation:           proto.Int64(5),
@@ -1660,7 +1688,10 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 		},
 	}
 	act := crt.String()
-	exp := "ENTER_JOINT ADD_REPLICA[(n1,s2):3VOTER_INCOMING], REMOVE_REPLICA[(n4,s5):6VOTER_OUTGOING]: after=[(n1,s2):3VOTER_INCOMING (n4,s5):6VOTER_OUTGOING (n7,s8):9LEARNER] next=10"
+	exp := "ENTER_JOINT(r6 r12 l12 v3) ADD_REPLICA[(n1,s2):3VOTER_INCOMING], " +
+		"REMOVE_REPLICA[(n4,s5):6VOTER_OUTGOING (n10,s11):12VOTER_DEMOTING]: " +
+		"after=[(n1,s2):3VOTER_INCOMING (n4,s5):6VOTER_OUTGOING (n7,s8):9LEARNER " +
+		"(n10,s11):12VOTER_DEMOTING] next=10"
 	require.Equal(t, exp, act)
 
 	crt.InternalRemovedReplicas = nil
@@ -1829,14 +1860,14 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			),
 			del: sl(
 				// Removals.
-				LEARNER, 2, VOTER_OUTGOING, 8, VOTER_OUTGOING, 9,
+				LEARNER, 2, VOTER_OUTGOING, 8, VOTER_DEMOTING, 9,
 			),
 			repls: sl(
 				// Replicas.
 				VOTER_FULL, 1,
 				VOTER_INCOMING, 6, // added
 				VOTER_INCOMING, 3, // added
-				VOTER_OUTGOING, 9, // removing
+				VOTER_DEMOTING, 9, // removing
 				LEARNER, 4, // added
 				VOTER_OUTGOING, 8, // removing
 				VOTER_FULL, 10,
@@ -1844,12 +1875,13 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			exp: raftpb.ConfChangeV2{
 				Transition: raftpb.ConfChangeTransitionJointExplicit,
 				Changes: []raftpb.ConfChangeSingle{
-					{NodeID: 6, Type: raftpb.ConfChangeAddNode},
-					{NodeID: 4, Type: raftpb.ConfChangeAddLearnerNode},
-					{NodeID: 3, Type: raftpb.ConfChangeAddNode},
 					{NodeID: 2, Type: raftpb.ConfChangeRemoveNode},
 					{NodeID: 8, Type: raftpb.ConfChangeRemoveNode},
 					{NodeID: 9, Type: raftpb.ConfChangeRemoveNode},
+					{NodeID: 9, Type: raftpb.ConfChangeAddLearnerNode},
+					{NodeID: 6, Type: raftpb.ConfChangeAddNode},
+					{NodeID: 4, Type: raftpb.ConfChangeAddLearnerNode},
+					{NodeID: 3, Type: raftpb.ConfChangeAddNode},
 				}},
 		},
 
@@ -1880,5 +1912,74 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 				require.EqualError(t, err, test.err)
 			}
 		})
+	}
+}
+
+// TestAsLockUpdates verifies that AsLockUpdates propagates all the important
+// fields from a txn to each intent.
+func TestAsLockUpdates(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ts := hlc.Timestamp{WallTime: 1}
+	txn := MakeTransaction("hello", Key("k"), 0, ts, 0)
+
+	txn.Status = COMMITTED
+	txn.IgnoredSeqNums = []enginepb.IgnoredSeqNumRange{{Start: 0, End: 0}}
+
+	dur := lock.Unreplicated
+	spans := []Span{{Key: Key("a"), EndKey: Key("b")}}
+	for _, intent := range AsLockUpdates(&txn, spans, dur) {
+		require.Equal(t, txn.Status, intent.Status)
+		require.Equal(t, txn.IgnoredSeqNums, intent.IgnoredSeqNums)
+		require.Equal(t, txn.TxnMeta, intent.Txn)
+		require.Equal(t, dur, intent.Durability)
+	}
+}
+
+func TestAddIgnoredSeqNumRange(t *testing.T) {
+	type r = enginepb.IgnoredSeqNumRange
+
+	mr := func(a, b enginepb.TxnSeq) r {
+		return r{Start: a, End: b}
+	}
+
+	testData := []struct {
+		list     []r
+		newRange r
+		exp      []r
+	}{
+		{
+			[]r{},
+			mr(1, 2),
+			[]r{mr(1, 2)},
+		},
+		{
+			[]r{mr(1, 2)},
+			mr(1, 4),
+			[]r{mr(1, 4)},
+		},
+		{
+			[]r{mr(1, 2), mr(3, 6)},
+			mr(8, 10),
+			[]r{mr(1, 2), mr(3, 6), mr(8, 10)},
+		},
+		{
+			[]r{mr(1, 2), mr(5, 6)},
+			mr(3, 8),
+			[]r{mr(1, 2), mr(3, 8)},
+		},
+		{
+			[]r{mr(1, 2), mr(5, 6)},
+			mr(1, 8),
+			[]r{mr(1, 8)},
+		},
+	}
+
+	for _, tc := range testData {
+		txn := Transaction{
+			IgnoredSeqNums: tc.list,
+		}
+		txn.AddIgnoredSeqNumRange(tc.newRange)
+		require.Equal(t, tc.exp, txn.IgnoredSeqNums)
 	}
 }

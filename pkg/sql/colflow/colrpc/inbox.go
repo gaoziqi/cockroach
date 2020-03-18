@@ -48,8 +48,6 @@ type Inbox struct {
 	colexec.ZeroInputNode
 	typs []coltypes.T
 
-	zeroBatch coldata.Batch
-
 	converter  *colserde.ArrowBatchConverter
 	serializer *colserde.RecordBatchSerializer
 
@@ -115,10 +113,12 @@ type Inbox struct {
 	}
 }
 
-var _ colexec.StaticMemoryOperator = &Inbox{}
+var _ colexec.Operator = &Inbox{}
 
 // NewInbox creates a new Inbox.
-func NewInbox(typs []coltypes.T, streamID execinfrapb.StreamID) (*Inbox, error) {
+func NewInbox(
+	allocator *colexec.Allocator, typs []coltypes.T, streamID execinfrapb.StreamID,
+) (*Inbox, error) {
 	c, err := colserde.NewArrowBatchConverter(typs)
 	if err != nil {
 		return nil, err
@@ -129,7 +129,6 @@ func NewInbox(typs []coltypes.T, streamID execinfrapb.StreamID) (*Inbox, error) 
 	}
 	i := &Inbox{
 		typs:       typs,
-		zeroBatch:  coldata.NewMemBatchWithSize(typs, 0),
 		converter:  c,
 		serializer: s,
 		streamID:   streamID,
@@ -138,17 +137,11 @@ func NewInbox(typs []coltypes.T, streamID execinfrapb.StreamID) (*Inbox, error) 
 		timeoutCh:  make(chan error, 1),
 		errCh:      make(chan error, 1),
 	}
-	i.zeroBatch.SetLength(0)
 	i.scratch.data = make([]*array.Data, len(typs))
-	i.scratch.b = coldata.NewMemBatch(typs)
+	i.scratch.b = allocator.NewMemBatch(typs)
 	i.stateMu.bufferedMeta = make([]execinfrapb.ProducerMetadata, 0)
 	i.stateMu.nextExited = sync.NewCond(&i.stateMu)
 	return i, nil
-}
-
-// EstimateStaticMemoryUsage implements the StaticMemoryOperator interface.
-func (i *Inbox) EstimateStaticMemoryUsage() int {
-	return colexec.EstimateBatchSizeBytes(i.typs, int(coldata.BatchSize()))
 }
 
 // maybeInitLocked calls Inbox.initLocked if the inbox is not initialized and
@@ -261,9 +254,7 @@ func (i *Inbox) Next(ctx context.Context) coldata.Batch {
 		i.stateMu.Unlock()
 	}()
 	if i.stateMu.done {
-		// TODO(yuzefovich): do we want to be on the safe side and explicitly set
-		// the length here (and below) to 0?
-		return i.zeroBatch
+		return coldata.ZeroBatch
 	}
 
 	ctx = logtags.AddTag(ctx, "streamID", i.streamID)
@@ -289,14 +280,16 @@ func (i *Inbox) Next(ctx context.Context) coldata.Batch {
 	// termination). DrainMeta will use the stream to read any remaining metadata
 	// after Next returns a zero-length batch during normal execution.
 	if err := i.maybeInitLocked(ctx); err != nil {
-		execerror.VectorizedInternalPanic(err)
+		// An error occurred while initializing the Inbox and is likely caused by
+		// the connection issues. It is expected that such an error can occur.
+		execerror.VectorizedExpectedInternalPanic(err)
 	}
 
 	for {
 		// DrainMeta goroutine indicated to us that we should exit. We do so
 		// without closing errCh since DrainMeta still needs the stream.
 		if i.stateMu.nextShouldExit {
-			return i.zeroBatch
+			return coldata.ZeroBatch
 		}
 
 		i.stateMu.Unlock()
@@ -310,7 +303,7 @@ func (i *Inbox) Next(ctx context.Context) coldata.Batch {
 			if err == io.EOF {
 				// Done.
 				i.closeLocked()
-				return i.zeroBatch
+				return coldata.ZeroBatch
 			}
 			i.errCh <- err
 			execerror.VectorizedInternalPanic(err)

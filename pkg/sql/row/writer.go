@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -41,6 +42,34 @@ func ColIDtoRowIndexFromCols(cols []sqlbase.ColumnDescriptor) map[sqlbase.Column
 		colIDtoRowIndex[cols[i].ID] = i
 	}
 	return colIDtoRowIndex
+}
+
+// ColMapping returns a map from ordinals in the fromCols list to ordinals in
+// the toCols list. More precisely, for 0 <= i < fromCols:
+//
+//   result[i] = j such that fromCols[i].ID == toCols[j].ID, or
+//                -1 if the column is not part of toCols.
+func ColMapping(fromCols, toCols []sqlbase.ColumnDescriptor) []int {
+	// colMap is a map from ColumnID to ordinal into fromCols.
+	var colMap util.FastIntMap
+	for i := range fromCols {
+		colMap.Set(int(fromCols[i].ID), i)
+	}
+
+	result := make([]int, len(fromCols))
+	for i := range result {
+		// -1 value indicates that this column is not being returned.
+		result[i] = -1
+	}
+
+	// Set the appropriate index values for the returning columns.
+	for toOrd := range toCols {
+		if fromOrd, ok := colMap.Get(int(toCols[toOrd].ID)); ok {
+			result[fromOrd] = toOrd
+		}
+	}
+
+	return result
 }
 
 // prepareInsertOrUpdateBatch constructs a KV batch that inserts or
@@ -92,7 +121,12 @@ func prepareInsertOrUpdateBatch(
 				break
 			}
 		}
-		if !update {
+		// We can have an empty family.ColumnIDs in the following case:
+		// * A table is created with the primary key not in family 0, and another column in family 0.
+		// * The column in family 0 is dropped, leaving the 0'th family empty.
+		// In this case, we must keep the empty 0'th column family in order to ensure that column family 0
+		// is always encoded as the sentinel k/v for a row.
+		if !update && len(family.ColumnIDs) != 0 {
 			continue
 		}
 
@@ -104,7 +138,10 @@ func prepareInsertOrUpdateBatch(
 		}
 
 		*kvKey = keys.MakeFamilyKey(primaryIndexKey, uint32(family.ID))
-		if len(family.ColumnIDs) == 1 && family.ColumnIDs[0] == family.DefaultColumnID {
+		// We need to ensure that column family 0 contains extra metadata, like composite primary key values.
+		// Additionally, the decoders expect that column family 0 is encoded with a TUPLE value tag, so we
+		// don't want to use the untagged value encoding.
+		if len(family.ColumnIDs) == 1 && family.ColumnIDs[0] == family.DefaultColumnID && family.ID != 0 {
 			// Storage optimization to store DefaultColumnID directly as a value. Also
 			// backwards compatible with the original BaseFormatVersion.
 

@@ -21,6 +21,10 @@ cmake_minimum_required(VERSION 3.3 FATAL_ERROR)
 
 project(roachlib)
 
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+  add_definitions(-DOS_LINUX)
+endif()
+
 add_library(roach
   batch.cc
   cache.cc
@@ -42,22 +46,24 @@ add_library(roach
   options.cc
   snapshot.cc
   sst_dump.cc
+  stack_trace.cc
   table_props.cc
   utils.cc
+  protos/kv/kvserver/concurrency/lock/locking.pb.cc
+  protos/roachpb/api.pb.cc
   protos/roachpb/data.pb.cc
   protos/roachpb/errors.pb.cc
   protos/roachpb/internal.pb.cc
   protos/roachpb/metadata.pb.cc
-  protos/storage/engine/enginepb/mvcc.pb.cc
-  protos/storage/engine/enginepb/mvcc3.pb.cc
-  protos/storage/engine/enginepb/file_registry.pb.cc
-  protos/storage/engine/enginepb/rocksdb.pb.cc
+  protos/storage/enginepb/mvcc.pb.cc
+  protos/storage/enginepb/mvcc3.pb.cc
+  protos/storage/enginepb/file_registry.pb.cc
+  protos/storage/enginepb/rocksdb.pb.cc
   protos/util/hlc/legacy_timestamp.pb.cc
   protos/util/hlc/timestamp.pb.cc
   protos/util/log/log.pb.cc
-  protos/util/unresolved_addr.pb.cc
-  protos/roachpb/api.pb.cc
   protos/util/tracing/recorded_span.pb.cc
+  protos/util/unresolved_addr.pb.cc
   rocksdbutils/env_encryption.cc
 )
 target_include_directories(roach
@@ -100,6 +106,7 @@ enable_testing()
 set(tests
   chunked_buffer_test.cc
   db_test.cc
+  comparator_test.cc
   encoding_test.cc
   file_registry_test.cc
   merge_test.cc

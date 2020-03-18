@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -522,7 +521,7 @@ func (node *ComparisonExpr) memoizeFn() {
 		}
 	}
 
-	fn, ok := CmpOps[fOp].lookupImpl(leftRet, rightRet)
+	fn, ok := CmpOps[fOp].LookupImpl(leftRet, rightRet)
 	if !ok {
 		panic(errors.AssertionFailedf("lookup for ComparisonExpr %s's CmpOp failed",
 			AsStringWithFlags(node, FmtShowTypes)))
@@ -548,6 +547,12 @@ type RangeCond struct {
 	Left      Expr
 	From, To  Expr
 
+	// Typed version of Left for the comparison with To (where it may be
+	// type-checked differently). After type-checking, Left is set to the typed
+	// version for the comparison with From, and leftTo is set to the typed
+	// version for the comparison with To.
+	leftTo TypedExpr
+
 	typeAnnotation
 }
 
@@ -567,14 +572,21 @@ func (node *RangeCond) Format(ctx *FmtCtx) {
 	binExprFmtWithParen(ctx, node.From, "AND", node.To, true)
 }
 
-// TypedLeft returns the RangeCond's left expression as a TypedExpr.
-func (node *RangeCond) TypedLeft() TypedExpr {
+// TypedLeftFrom returns the RangeCond's left expression as a TypedExpr, in the
+// context of a comparison with TypedFrom().
+func (node *RangeCond) TypedLeftFrom() TypedExpr {
 	return node.Left.(TypedExpr)
 }
 
 // TypedFrom returns the RangeCond's from expression as a TypedExpr.
 func (node *RangeCond) TypedFrom() TypedExpr {
 	return node.From.(TypedExpr)
+}
+
+// TypedLeftTo returns the RangeCond's left expression as a TypedExpr, in the
+// context of a comparison with TypedTo().
+func (node *RangeCond) TypedLeftTo() TypedExpr {
+	return node.leftTo
 }
 
 // TypedTo returns the RangeCond's to expression as a TypedExpr.
@@ -856,36 +868,6 @@ func (node *Tuple) Format(ctx *FmtCtx) {
 // ResolvedType implements the TypedExpr interface.
 func (node *Tuple) ResolvedType() *types.T {
 	return node.typ
-}
-
-// Truncate returns a new Tuple that contains only a prefix of the original
-// expressions. E.g.
-//   Tuple:       (1, 2, 3)
-//   Truncate(2): (1, 2)
-func (node *Tuple) Truncate(prefix int) *Tuple {
-	return &Tuple{
-		Exprs: append(Exprs(nil), node.Exprs[:prefix]...),
-		Row:   node.Row,
-		typ:   types.MakeTuple(append([]types.T(nil), node.typ.TupleContents()[:prefix]...)),
-	}
-}
-
-// Project returns a new Tuple that contains a subset of the original
-// expressions. E.g.
-//  Tuple:           (1, 2, 3)
-//  Project({0, 2}): (1, 3)
-func (node *Tuple) Project(set util.FastIntSet) *Tuple {
-	exprs := make(Exprs, 0, set.Len())
-	contents := make([]types.T, 0, set.Len())
-	for i, ok := set.Next(0); ok; i, ok = set.Next(i + 1) {
-		exprs = append(exprs, node.Exprs[i])
-		contents = append(contents, node.typ.TupleContents()[i])
-	}
-	return &Tuple{
-		Exprs: exprs,
-		Row:   node.Row,
-		typ:   types.MakeTuple(contents),
-	}
 }
 
 // Array represents an array constructor.
@@ -1284,26 +1266,6 @@ func (node *FuncExpr) ResolvedOverload() *Overload {
 	return node.fn
 }
 
-// GetAggregateConstructor exposes the AggregateFunc field for use by
-// the group node in package sql.
-func (node *FuncExpr) GetAggregateConstructor() func(*EvalContext, Datums) AggregateFunc {
-	if node.fn == nil || node.fn.AggregateFunc == nil {
-		return nil
-	}
-	return func(evalCtx *EvalContext, arguments Datums) AggregateFunc {
-		types := typesOfExprs(node.Exprs)
-		return node.fn.AggregateFunc(types, evalCtx, arguments)
-	}
-}
-
-func typesOfExprs(exprs Exprs) []*types.T {
-	types := make([]*types.T, len(exprs))
-	for i, expr := range exprs {
-		types[i] = expr.(TypedExpr).ResolvedType()
-	}
-	return types
-}
-
 // IsGeneratorApplication returns true iff the function applied is a generator (SRF).
 func (node *FuncExpr) IsGeneratorApplication() bool {
 	return node.fn != nil && node.fn.Generator != nil
@@ -1528,11 +1490,12 @@ var (
 	stringCastTypes = annotateCast(types.String, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
 		types.VarBit,
 		types.AnyArray, types.AnyTuple,
-		types.Bytes, types.Timestamp, types.TimestampTZ, types.Interval, types.Uuid, types.Date, types.Time, types.Oid, types.INet, types.Jsonb})
+		types.Bytes, types.Timestamp, types.TimestampTZ, types.Interval, types.Uuid, types.Date, types.Time, types.TimeTZ, types.Oid, types.INet, types.Jsonb})
 	bytesCastTypes = annotateCast(types.Bytes, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Bytes, types.Uuid})
 	dateCastTypes  = annotateCast(types.Date, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int})
-	timeCastTypes  = annotateCast(types.Time, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Time,
+	timeCastTypes  = annotateCast(types.Time, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Time, types.TimeTZ,
 		types.Timestamp, types.TimestampTZ, types.Interval})
+	timeTZCastTypes    = annotateCast(types.TimeTZ, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Time, types.TimeTZ, types.TimestampTZ})
 	timestampCastTypes = annotateCast(types.Timestamp, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int})
 	intervalCastTypes  = annotateCast(types.Interval, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Int, types.Time, types.Interval, types.Float, types.Decimal})
 	oidCastTypes       = annotateCast(types.Oid, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Int, types.Oid})
@@ -1563,6 +1526,8 @@ func validCastTypes(t *types.T) []castInfo {
 		return dateCastTypes
 	case types.TimeFamily:
 		return timeCastTypes
+	case types.TimeTZFamily:
+		return timeTZCastTypes
 	case types.TimestampFamily, types.TimestampTZFamily:
 		return timestampCastTypes
 	case types.IntervalFamily:
@@ -1688,23 +1653,37 @@ func (node *TupleStar) Format(ctx *FmtCtx) {
 }
 
 // ColumnAccessExpr represents (E).x expressions. Specifically, it
-// allows accessing the column(s) from a Set Retruning Function.
+// allows accessing the column(s) from a Set Returning Function.
 type ColumnAccessExpr struct {
-	Expr    Expr
+	Expr Expr
+
+	// ByIndex, if set, indicates that the access is using a numeric
+	// column reference and ColIndex below is already set.
+	ByIndex bool
+
+	// ColName is the name of the column to access. Empty if ByIndex is
+	// set.
 	ColName string
 
 	// ColIndex indicates the index of the column in the tuple. This is
-	// set during type checking based on the label in ColName.
+	// either:
+	// - set during type checking based on the label in ColName if
+	//   ByIndex is false,
+	// - or checked for validity during type checking if ByIndex is true.
+	// The first column in the tuple is at index 0. The input
+	// syntax (E).@N populates N-1 in this field.
 	ColIndex int
 
 	typeAnnotation
 }
 
 // NewTypedColumnAccessExpr creates a pre-typed ColumnAccessExpr.
+// A by-index ColumnAccessExpr can be specified by passing an empty string as colName.
 func NewTypedColumnAccessExpr(expr TypedExpr, colName string, colIdx int) *ColumnAccessExpr {
 	return &ColumnAccessExpr{
 		Expr:           expr,
 		ColName:        colName,
+		ByIndex:        colName == "",
 		ColIndex:       colIdx,
 		typeAnnotation: typeAnnotation{typ: &expr.ResolvedType().TupleContents()[colIdx]},
 	}
@@ -1715,7 +1694,11 @@ func (node *ColumnAccessExpr) Format(ctx *FmtCtx) {
 	ctx.WriteByte('(')
 	ctx.FormatNode(node.Expr)
 	ctx.WriteString(").")
-	ctx.WriteString(node.ColName)
+	if node.ByIndex {
+		fmt.Fprintf(ctx, "@%d", node.ColIndex+1)
+	} else {
+		ctx.WriteString(node.ColName)
+	}
 }
 
 func (node *AliasedTableExpr) String() string { return AsString(node) }
@@ -1736,6 +1719,7 @@ func (node *DBool) String() string            { return AsString(node) }
 func (node *DBytes) String() string           { return AsString(node) }
 func (node *DDate) String() string            { return AsString(node) }
 func (node *DTime) String() string            { return AsString(node) }
+func (node *DTimeTZ) String() string          { return AsString(node) }
 func (node *DDecimal) String() string         { return AsString(node) }
 func (node *DFloat) String() string           { return AsString(node) }
 func (node *DInt) String() string             { return AsString(node) }

@@ -51,13 +51,21 @@ func (node *ShowClusterSetting) Format(ctx *FmtCtx) {
 	})
 }
 
-// ShowAllClusterSettings represents a SHOW CLUSTER SETTING statement.
-type ShowAllClusterSettings struct {
+// ShowClusterSettingList represents a SHOW [ALL|PUBLIC] CLUSTER SETTINGS statement.
+type ShowClusterSettingList struct {
+	// All indicates whether to include non-public settings in the output.
+	All bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *ShowAllClusterSettings) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW ALL CLUSTER SETTINGS")
+func (node *ShowClusterSettingList) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW ")
+	qual := "PUBLIC"
+	if node.All {
+		qual = "ALL"
+	}
+	ctx.WriteString(qual)
+	ctx.WriteString(" CLUSTER SETTINGS")
 }
 
 // BackupDetails represents the type of details to display for a SHOW BACKUP
@@ -78,6 +86,7 @@ type ShowBackup struct {
 	Path                 Expr
 	Details              BackupDetails
 	ShouldIncludeSchemas bool
+	Options              KVOptions
 }
 
 // Format implements the NodeFormatter interface.
@@ -92,6 +101,10 @@ func (node *ShowBackup) Format(ctx *FmtCtx) {
 		ctx.WriteString("SCHEMAS ")
 	}
 	ctx.FormatNode(node.Path)
+	if len(node.Options) > 0 {
+		ctx.WriteString(" WITH ")
+		ctx.FormatNode(&node.Options)
+	}
 }
 
 // ShowColumns represents a SHOW COLUMNS statement.
@@ -380,6 +393,15 @@ type ShowTransactionStatus struct {
 // Format implements the NodeFormatter interface.
 func (node *ShowTransactionStatus) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW TRANSACTION STATUS")
+}
+
+// ShowSavepointStatus represents a SHOW SAVEPOINT STATUS statement.
+type ShowSavepointStatus struct {
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowSavepointStatus) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW SAVEPOINT STATUS")
 }
 
 // ShowUsers represents a SHOW USERS statement.

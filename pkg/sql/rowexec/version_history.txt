@@ -98,3 +98,14 @@
       was derived from ArgIdxStart during execution).
 - Version: 24 (MinAcceptedVersion: 24)
     - Remove the unused index filter expression field from the lookup join spec.
+- Version: 25 (MinAcceptedVersion: 24)
+    - Add locking strength and wait policy fields to TableReader, JoinReader,
+      IndexSkipTableReader, and InterleavedReaderJoiner spec.
+- Version: 26 (MinAcceptedVersion: 24)
+    - Add the numeric tuple field accessor and the ByIndex field to ColumnAccessExpr.
+- Version: 27 (MinAcceptedVersion: 27)
+    - Change how DArray datums are hashed for distinct and aggregation operations.
+- Version: 28 (MinAcceptedVersion: 28)
+    - The CORR aggregate function has been added which will not be recognized
+      by older nodes. However, new nodes can process plans from older nodes,
+      so MinAcceptedVersion is unchanged.

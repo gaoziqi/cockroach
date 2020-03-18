@@ -14,7 +14,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -49,7 +50,11 @@ func (ex *connExecutor) execPrepare(
 	}
 
 	ps, err := ex.addPreparedStmt(
-		ctx, parseCmd.Name, Statement{Statement: parseCmd.Statement}, parseCmd.TypeHints,
+		ctx,
+		parseCmd.Name,
+		Statement{Statement: parseCmd.Statement},
+		parseCmd.TypeHints,
+		PreparedStatementOriginWire,
 	)
 	if err != nil {
 		return retErr(err)
@@ -87,14 +92,18 @@ func (ex *connExecutor) execPrepare(
 //
 // placeholderHints are used to assist in inferring placeholder types.
 func (ex *connExecutor) addPreparedStmt(
-	ctx context.Context, name string, stmt Statement, placeholderHints tree.PlaceholderTypes,
+	ctx context.Context,
+	name string,
+	stmt Statement,
+	placeholderHints tree.PlaceholderTypes,
+	origin PreparedStatementOrigin,
 ) (*PreparedStatement, error) {
 	if _, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[name]; ok {
 		panic(fmt.Sprintf("prepared statement already exists: %q", name))
 	}
 
 	// Prepare the query. This completes the typing of placeholders.
-	prepared, err := ex.prepare(ctx, stmt, placeholderHints)
+	prepared, err := ex.prepare(ctx, stmt, placeholderHints, origin)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +123,10 @@ func (ex *connExecutor) addPreparedStmt(
 // The PreparedStatement is returned (or nil if there are no results). The
 // returned PreparedStatement needs to be close()d once its no longer in use.
 func (ex *connExecutor) prepare(
-	ctx context.Context, stmt Statement, placeholderHints tree.PlaceholderTypes,
+	ctx context.Context,
+	stmt Statement,
+	placeholderHints tree.PlaceholderTypes,
+	origin PreparedStatementOrigin,
 ) (*PreparedStatement, error) {
 	if placeholderHints == nil {
 		placeholderHints = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
@@ -128,6 +140,9 @@ func (ex *connExecutor) prepare(
 		},
 		memAcc:   ex.sessionMon.MakeBoundAccount(),
 		refCount: 1,
+
+		createdAt: timeutil.Now(),
+		origin:    origin,
 	}
 	// NB: if we start caching the plan, we'll want to keep around the memory
 	// account used for the plan, rather than clearing it.
@@ -150,12 +165,13 @@ func (ex *connExecutor) prepare(
 	// TODO(andrei): Needing a transaction for preparing seems non-sensical, as
 	// the prepared statement outlives the txn. I hope that it's not used for
 	// anything other than getting a timestamp.
-	txn := client.NewTxn(ctx, ex.server.cfg.DB, ex.server.cfg.NodeID.Get(), client.RootTxn)
+	txn := kv.NewTxn(ctx, ex.server.cfg.DB, ex.server.cfg.NodeID.Get())
 
 	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
 	p := &ex.planner
-	ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */, stmt.NumAnnotations)
+	ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */)
 	p.stmt = &stmt
+	p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
 	flags, err := ex.populatePrepared(ctx, txn, placeholderHints, p)
 	if err != nil {
 		txn.CleanupOnError(ctx, err)
@@ -176,7 +192,7 @@ func (ex *connExecutor) prepare(
 // populatePrepared analyzes and type-checks the query and populates
 // stmt.Prepared.
 func (ex *connExecutor) populatePrepared(
-	ctx context.Context, txn *client.Txn, placeholderHints tree.PlaceholderTypes, p *planner,
+	ctx context.Context, txn *kv.Txn, placeholderHints tree.PlaceholderTypes, p *planner,
 ) (planFlags, error) {
 	stmt := p.stmt
 	if err := p.semaCtx.Placeholders.Init(stmt.NumPlaceholders, placeholderHints); err != nil {
@@ -289,8 +305,7 @@ func (ex *connExecutor) execBind(
 					"expected %d arguments, got %d", numQArgs, len(bindCmd.Args)))
 		}
 
-		ptCtx := tree.NewParseTimeContext(ex.sessionData.DurationAdditionMode,
-			ex.state.sqlTimestamp.In(ex.sessionData.DataConversion.Location))
+		ptCtx := tree.NewParseTimeContext(ex.state.sqlTimestamp.In(ex.sessionData.DataConversion.Location))
 
 		for i, arg := range bindCmd.Args {
 			k := tree.PlaceholderIdx(i)

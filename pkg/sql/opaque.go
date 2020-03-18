@@ -51,10 +51,10 @@ func buildOpaque(
 		plan, err = p.AlterIndex(ctx, n)
 	case *tree.AlterTable:
 		plan, err = p.AlterTable(ctx, n)
+	case *tree.AlterRole:
+		plan, err = p.AlterRole(ctx, n)
 	case *tree.AlterSequence:
 		plan, err = p.AlterSequence(ctx, n)
-	case *tree.AlterUserSetPassword:
-		plan, err = p.AlterUserSetPassword(ctx, n)
 	case *tree.CommentOnColumn:
 		plan, err = p.CommentOnColumn(ctx, n)
 	case *tree.CommentOnDatabase:
@@ -67,8 +67,10 @@ func buildOpaque(
 		plan, err = p.CreateDatabase(ctx, n)
 	case *tree.CreateIndex:
 		plan, err = p.CreateIndex(ctx, n)
-	case *tree.CreateUser:
-		plan, err = p.CreateUser(ctx, n)
+	case *tree.CreateSchema:
+		plan, err = p.CreateSchema(ctx, n)
+	case *tree.CreateRole:
+		plan, err = p.CreateRole(ctx, n)
 	case *tree.CreateSequence:
 		plan, err = p.CreateSequence(ctx, n)
 	case *tree.CreateStats:
@@ -81,16 +83,18 @@ func buildOpaque(
 		plan, err = p.DropDatabase(ctx, n)
 	case *tree.DropIndex:
 		plan, err = p.DropIndex(ctx, n)
+	case *tree.DropRole:
+		plan, err = p.DropRole(ctx, n)
 	case *tree.DropTable:
 		plan, err = p.DropTable(ctx, n)
 	case *tree.DropView:
 		plan, err = p.DropView(ctx, n)
 	case *tree.DropSequence:
 		plan, err = p.DropSequence(ctx, n)
-	case *tree.DropUser:
-		plan, err = p.DropUser(ctx, n)
 	case *tree.Grant:
 		plan, err = p.Grant(ctx, n)
+	case *tree.GrantRole:
+		plan, err = p.GrantRole(ctx, n)
 	case *tree.RenameColumn:
 		plan, err = p.RenameColumn(ctx, n)
 	case *tree.RenameDatabase:
@@ -101,6 +105,8 @@ func buildOpaque(
 		plan, err = p.RenameTable(ctx, n)
 	case *tree.Revoke:
 		plan, err = p.Revoke(ctx, n)
+	case *tree.RevokeRole:
+		plan, err = p.RevokeRole(ctx, n)
 	case *tree.Scatter:
 		plan, err = p.Scatter(ctx, n)
 	case *tree.Scrub:
@@ -152,33 +158,36 @@ func buildOpaque(
 
 func init() {
 	for _, stmt := range []tree.Statement{
-		&tree.AlterUserSetPassword{},
 		&tree.AlterIndex{},
 		&tree.AlterTable{},
 		&tree.AlterSequence{},
+		&tree.AlterRole{},
 		&tree.CommentOnColumn{},
 		&tree.CommentOnDatabase{},
 		&tree.CommentOnIndex{},
 		&tree.CommentOnTable{},
 		&tree.CreateDatabase{},
 		&tree.CreateIndex{},
-		&tree.CreateUser{},
+		&tree.CreateSchema{},
 		&tree.CreateSequence{},
 		&tree.CreateStats{},
+		&tree.CreateRole{},
 		&tree.Deallocate{},
 		&tree.Discard{},
 		&tree.DropDatabase{},
 		&tree.DropIndex{},
 		&tree.DropTable{},
 		&tree.DropView{},
+		&tree.DropRole{},
 		&tree.DropSequence{},
-		&tree.DropUser{},
 		&tree.Grant{},
+		&tree.GrantRole{},
 		&tree.RenameColumn{},
 		&tree.RenameDatabase{},
 		&tree.RenameIndex{},
 		&tree.RenameTable{},
 		&tree.Revoke{},
+		&tree.RevokeRole{},
 		&tree.Scatter{},
 		&tree.Scrub{},
 		&tree.SetClusterSetting{},
@@ -200,10 +209,6 @@ func init() {
 		&tree.ShowBackup{},
 		&tree.Restore{},
 		&tree.CreateChangefeed{},
-		&tree.CreateRole{},
-		&tree.DropRole{},
-		&tree.GrantRole{},
-		&tree.RevokeRole{},
 		&tree.Import{},
 	} {
 		typ := optbuilder.OpaqueReadOnly

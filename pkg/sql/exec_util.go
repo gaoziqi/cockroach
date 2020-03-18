@@ -28,9 +28,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -48,8 +49,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
@@ -58,7 +57,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -67,34 +65,42 @@ import (
 )
 
 // ClusterOrganization is the organization name.
-var ClusterOrganization = settings.RegisterStringSetting(
+var ClusterOrganization = settings.RegisterPublicStringSetting(
 	"cluster.organization",
 	"organization name",
 	"",
 )
 
-// ClusterSecret is a cluster specific secret. This setting is hidden.
+// ClusterSecret is a cluster specific secret. This setting is
+// non-reportable.
 var ClusterSecret = func() *settings.StringSetting {
 	s := settings.RegisterStringSetting(
 		"cluster.secret",
 		"cluster specific secret",
 		"",
 	)
-	s.SetConfidential()
+	// Even though string settings are non-reportable by default, we
+	// still mark them explicitly in case a future code change flips the
+	// default.
+	s.SetReportable(false)
 	return s
 }()
 
 // defaultIntSize controls how a "naked" INT type will be parsed.
 // TODO(bob): Change this to 4 in v2.3; https://github.com/cockroachdb/cockroach/issues/32534
 // TODO(bob): Remove or n-op this in v2.4: https://github.com/cockroachdb/cockroach/issues/32844
-var defaultIntSize = settings.RegisterValidatedIntSetting(
-	"sql.defaults.default_int_size",
-	"the size, in bytes, of an INT type", 8, func(i int64) error {
-		if i != 4 && i != 8 {
-			return errors.New("only 4 or 8 are valid values")
-		}
-		return nil
-	})
+var defaultIntSize = func() *settings.IntSetting {
+	s := settings.RegisterValidatedIntSetting(
+		"sql.defaults.default_int_size",
+		"the size, in bytes, of an INT type", 8, func(i int64) error {
+			if i != 4 && i != 8 {
+				return errors.New("only 4 or 8 are valid values")
+			}
+			return nil
+		})
+	s.SetVisibility(settings.Public)
+	return s
+}()
 
 // traceTxnThreshold can be used to log SQL transactions that take
 // longer than duration to complete. For example, traceTxnThreshold=1s
@@ -103,7 +109,7 @@ var defaultIntSize = settings.RegisterValidatedIntSetting(
 // that any positive duration will enable tracing and will slow down
 // all execution because traces are gathered for all transactions even
 // if they are not output.
-var traceTxnThreshold = settings.RegisterDurationSetting(
+var traceTxnThreshold = settings.RegisterPublicDurationSetting(
 	"sql.trace.txn.enable_threshold",
 	"duration beyond which all transactions are traced (set to 0 to disable)", 0,
 )
@@ -112,9 +118,11 @@ var traceTxnThreshold = settings.RegisterDurationSetting(
 // that is normally kept for every SQL connection. The event log has a
 // non-trivial performance impact and also reveals SQL statements
 // which may be a privacy concern.
-var traceSessionEventLogEnabled = settings.RegisterBoolSetting(
+var traceSessionEventLogEnabled = settings.RegisterPublicBoolSetting(
 	"sql.trace.session_eventlog.enabled",
-	"set to true to enable session tracing", false,
+	"set to true to enable session tracing. "+
+		"Note that enabling this may have a non-trivial negative performance impact.",
+	false,
 )
 
 // ReorderJoinsLimitClusterSettingName is the name of the cluster setting for
@@ -136,10 +144,46 @@ var ReorderJoinsLimitClusterValue = settings.RegisterValidatedIntSetting(
 	},
 )
 
-var optDrivenFKClusterMode = settings.RegisterBoolSetting(
-	"sql.defaults.experimental_optimizer_foreign_keys.enabled",
-	"enables optimizer-driven foreign key checks by default",
+var requireExplicitPrimaryKeysClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.require_explicit_primary_keys.enabled",
+	"default value for requiring explicit primary keys in CREATE TABLE statements",
 	false,
+)
+
+var temporaryTablesEnabledClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.experimental_temporary_tables.enabled",
+	"default value for experimental_enable_temp_tables; allows for use of temporary tables by default",
+	false,
+)
+
+var hashShardedIndexesEnabledClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.experimental_hash_sharded_indexes.enabled",
+	"default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default",
+	false,
+)
+
+var zigzagJoinClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.zigzag_join.enabled",
+	"default value for enable_zigzag_join session setting; allows use of zig-zag join by default",
+	true,
+)
+
+var optDrivenFKClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.optimizer_foreign_keys.enabled",
+	"default value for optimizer_foreign_keys session setting; enables optimizer-driven foreign key checks by default",
+	true,
+)
+
+var implicitSelectForUpdateClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.implicit_select_for_update.enabled",
+	"default value for enable_implicit_select_for_update session setting; enables FOR UPDATE locking during the row-fetch phase of mutation statements",
+	true,
+)
+
+var insertFastPathClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.insert_fast_path.enabled",
+	"default value for enable_insert_fast_path session setting; enables a specialized insert path",
+	true,
 )
 
 // VectorizeClusterMode controls the cluster default for when automatic
@@ -149,9 +193,10 @@ var VectorizeClusterMode = settings.RegisterEnumSetting(
 	"default vectorize mode",
 	"auto",
 	map[int64]string{
-		int64(sessiondata.VectorizeOff):            "off",
-		int64(sessiondata.VectorizeAuto):           "auto",
-		int64(sessiondata.VectorizeExperimentalOn): "experimental_on",
+		int64(sessiondata.VectorizeOff):     "off",
+		int64(sessiondata.Vectorize192Auto): "192auto",
+		int64(sessiondata.VectorizeAuto):    "auto",
+		int64(sessiondata.VectorizeOn):      "on",
 	},
 )
 
@@ -185,7 +230,7 @@ var DistSQLClusterExecMode = settings.RegisterEnumSetting(
 
 // SerialNormalizationMode controls how the SERIAL type is interpreted in table
 // definitions.
-var SerialNormalizationMode = settings.RegisterEnumSetting(
+var SerialNormalizationMode = settings.RegisterPublicEnumSetting(
 	"sql.defaults.serial_normalization",
 	"default handling of SERIAL in table definitions",
 	"rowid",
@@ -215,12 +260,6 @@ var (
 		Help:        "Latency of SQL request execution",
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
-	}
-	MetaSQLOpt = metric.Metadata{
-		Name:        "sql.optimizer.count",
-		Help:        "Number of statements which ran with the cost-based optimizer",
-		Measurement: "SQL Statements",
-		Unit:        metric.Unit_COUNT,
 	}
 	MetaSQLOptFallback = metric.Metadata{
 		Name:        "sql.optimizer.fallback.count",
@@ -333,6 +372,18 @@ var (
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
+	MetaReleaseSavepointStarted = metric.Metadata{
+		Name:        "sql.savepoint.release.started.count",
+		Help:        "Number of `RELEASE SAVEPOINT` statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaRollbackToSavepointStarted = metric.Metadata{
+		Name:        "sql.savepoint.rollback.started.count",
+		Help:        "Number of `ROLLBACK TO SAVEPOINT` statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
 	MetaRestartSavepointStarted = metric.Metadata{
 		Name:        "sql.restart_savepoint.started.count",
 		Help:        "Number of `SAVEPOINT cockroach_restart` statements started",
@@ -419,6 +470,18 @@ var (
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
+	MetaReleaseSavepointExecuted = metric.Metadata{
+		Name:        "sql.savepoint.release.count",
+		Help:        "Number of `RELEASE SAVEPOINT` statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaRollbackToSavepointExecuted = metric.Metadata{
+		Name:        "sql.savepoint.rollback.count",
+		Help:        "Number of `ROLLBACK TO SAVEPOINT` statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
 	MetaRestartSavepointExecuted = metric.Metadata{
 		Name:        "sql.restart_savepoint.count",
 		Help:        "Number of `SAVEPOINT cockroach_restart` statements successfully executed",
@@ -484,9 +547,9 @@ type ExecutorConfig struct {
 	DefaultZoneConfig *zonepb.ZoneConfig
 	Locality          roachpb.Locality
 	AmbientCtx        log.AmbientContext
-	DB                *client.DB
+	DB                *kv.DB
 	Gossip            *gossip.Gossip
-	DistSender        *kv.DistSender
+	DistSender        *kvcoord.DistSender
 	RPCContext        *rpc.Context
 	LeaseManager      *LeaseManager
 	Clock             *hlc.Clock
@@ -501,25 +564,47 @@ type ExecutorConfig struct {
 	StatsRefresher    *stats.Refresher
 	ExecLogger        *log.SecondaryLogger
 	AuditLogger       *log.SecondaryLogger
+	SlowQueryLogger   *log.SecondaryLogger
+	AuthLogger        *log.SecondaryLogger
 	InternalExecutor  *InternalExecutor
 	QueryCache        *querycache.C
 
 	TestingKnobs              ExecutorTestingKnobs
 	PGWireTestingKnobs        *PGWireTestingKnobs
 	SchemaChangerTestingKnobs *SchemaChangerTestingKnobs
+	GCJobTestingKnobs         *GCJobTestingKnobs
 	DistSQLRunTestingKnobs    *execinfra.TestingKnobs
 	EvalContextTestingKnobs   tree.EvalContextTestingKnobs
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval.
 	HistogramWindowInterval time.Duration
 
 	// Caches updated by DistSQL.
-	RangeDescriptorCache *kv.RangeDescriptorCache
-	LeaseHolderCache     *kv.LeaseHolderCache
+	RangeDescriptorCache *kvcoord.RangeDescriptorCache
+	LeaseHolderCache     *kvcoord.LeaseHolderCache
+
+	// Role membership cache.
+	RoleMemberCache *MembershipCache
+
+	// ProtectedTimestampProvider encapsulates the protected timestamp subsystem.
+	ProtectedTimestampProvider protectedts.Provider
+
+	stmtInfoRequestRegistry *stmtDiagnosticsRequestRegistry
 }
 
 // Organization returns the value of cluster.organization.
-func (ec *ExecutorConfig) Organization() string {
-	return ClusterOrganization.Get(&ec.Settings.SV)
+func (cfg *ExecutorConfig) Organization() string {
+	return ClusterOrganization.Get(&cfg.Settings.SV)
+}
+
+// NewStmtDiagnosticsRequestRegistry initializes cfg.stmtInfoRequestRegistry and
+// returns it as the publicly-accessible StmtDiagnosticsRequester.
+func (cfg *ExecutorConfig) NewStmtDiagnosticsRequestRegistry() StmtDiagnosticsRequester {
+	if cfg.InternalExecutor == nil {
+		panic("cfg.InternalExecutor not initialized")
+	}
+	cfg.stmtInfoRequestRegistry = newStmtDiagnosticsRequestRegistry(
+		cfg.InternalExecutor, cfg.DB, cfg.Gossip, cfg.NodeID.Get())
+	return cfg.stmtInfoRequestRegistry
 }
 
 var _ base.ModuleTestingKnobs = &ExecutorTestingKnobs{}
@@ -568,6 +653,17 @@ type ExecutorTestingKnobs struct {
 	// optimization). This is only called when the Executor is the one doing the
 	// committing.
 	BeforeAutoCommit func(ctx context.Context, stmt string) error
+
+	// DisableTempObjectsCleanupOnSessionExit disables cleaning up temporary schemas
+	// and tables when a session is closed.
+	DisableTempObjectsCleanupOnSessionExit bool
+	// TempObjectsCleanupCh replaces the time.Ticker.C channel used for scheduling
+	// a cleanup on every temp object in the cluster. If this is set, the job
+	// will now trigger when items come into this channel.
+	TempObjectsCleanupCh chan time.Time
+	// OnTempObjectsCleanupDone will trigger when the temporary objects cleanup
+	// job is done.
+	OnTempObjectsCleanupDone func()
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -764,6 +860,7 @@ func checkResultType(typ *types.T) error {
 	case types.DateFamily:
 	case types.TimestampFamily:
 	case types.TimeFamily:
+	case types.TimeTZFamily:
 	case types.TimestampTZFamily:
 	case types.IntervalFamily:
 	case types.JsonFamily:
@@ -805,6 +902,18 @@ func (p *planner) EvalAsOfTimestamp(asOf tree.AsOfClause) (_ hlc.Timestamp, err 
 }
 
 // ParseHLC parses a string representation of an `hlc.Timestamp`.
+// This differs from hlc.ParseTimestamp in that it parses the decimal
+// serialization of an hlc timestamp as opposed to the string serialization
+// performed by hlc.Timestamp.String().
+//
+// This function is used to parse:
+//
+//   1580361670629466905.0000000001
+//
+// hlc.ParseTimestamp() would be used to parse:
+//
+//   1580361670.629466905,1
+//
 func ParseHLC(s string) (hlc.Timestamp, error) {
 	dec, _, err := apd.NewFromString(s)
 	if err != nil {
@@ -850,6 +959,8 @@ func (p *planner) isAsOf(stmt tree.Statement) (*hlc.Timestamp, error) {
 			return nil, nil
 		}
 		asOf = s.Options.AsOf
+	case *tree.Explain:
+		return p.isAsOf(s.Statement)
 	default:
 		return nil, nil
 	}
@@ -886,8 +997,10 @@ type queryMeta struct {
 	// The timestamp when this query began execution.
 	start time.Time
 
-	// AST of the SQL statement - converted to query string only when necessary.
-	stmt tree.Statement
+	// The string of the SQL statement being executed. This string may
+	// contain sensitive information, so it must be converted back into
+	// an AST and dumped before use in logging.
+	rawStmt string
 
 	// States whether this query is distributed. Note that all queries,
 	// including those that are distributed, have this field set to false until
@@ -905,12 +1018,24 @@ type queryMeta struct {
 	// If set, this query will not be reported as part of SHOW QUERIES. This is
 	// set based on the statement implementing tree.HiddenFromShowQueries.
 	hidden bool
+
+	progressAtomic uint64
 }
 
 // cancel cancels the query associated with this queryMeta, by closing the associated
 // txn context.
 func (q *queryMeta) cancel() {
 	q.ctxCancel()
+}
+
+// getStatement returns a cleaned version of the query associated
+// with this queryMeta.
+func (q *queryMeta) getStatement() string {
+	parsed, err := parser.ParseOne(q.rawStmt)
+	if err != nil {
+		return fmt.Sprintf("error retrieving statement: %+v", err)
+	}
+	return parsed.AST.String()
 }
 
 // SessionDefaults mirrors fields in Session, for restoring default
@@ -926,12 +1051,6 @@ type SessionArgs struct {
 	RemoteAddr            net.Addr
 	ConnResultsBufferSize int64
 }
-
-// isDefined returns true iff the SessionArgs is well-defined.
-// This method exists because SessionArgs is passed by value but it
-// matters to the functions using it whether the value was explicitly
-// specified or left empty.
-func (s SessionArgs) isDefined() bool { return len(s.User) != 0 }
 
 // SessionRegistry stores a set of all sessions on this node.
 // Use register() and deregister() to modify this registry.
@@ -1045,80 +1164,7 @@ func newSchemaInterface(tables *TableCollection, vt VirtualTabler) *schemaInterf
 // into a serverpb.Session. Exported for testing.
 const MaxSQLBytes = 1000
 
-type schemaChangerCollection struct {
-	schemaChangers []SchemaChanger
-}
-
-func (scc *schemaChangerCollection) queueSchemaChanger(schemaChanger SchemaChanger) {
-	scc.schemaChangers = append(scc.schemaChangers, schemaChanger)
-}
-
-func (scc *schemaChangerCollection) reset() {
-	scc.schemaChangers = nil
-}
-
-// execSchemaChanges releases schema leases and runs the queued
-// schema changers. This needs to be run after the transaction
-// scheduling the schema change has finished.
-//
-// The list of closures is cleared after (attempting) execution.
-func (scc *schemaChangerCollection) execSchemaChanges(
-	ctx context.Context,
-	cfg *ExecutorConfig,
-	tracing *SessionTracing,
-	ieFactory sqlutil.SessionBoundInternalExecutorFactory,
-) error {
-	if len(scc.schemaChangers) == 0 {
-		return nil
-	}
-	if fn := cfg.SchemaChangerTestingKnobs.SyncFilter; fn != nil {
-		fn(TestingSchemaChangerCollection{scc})
-	}
-	// Execute any schema changes that were scheduled, in the order of the
-	// statements that scheduled them.
-	var firstError error
-	for _, sc := range scc.schemaChangers {
-		sc.db = cfg.DB
-		sc.testingKnobs = cfg.SchemaChangerTestingKnobs
-		sc.distSQLPlanner = cfg.DistSQLPlanner
-		sc.settings = cfg.Settings
-		sc.ieFactory = ieFactory
-		for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
-			evalCtx := createSchemaChangeEvalCtx(ctx, cfg.Clock.Now(), tracing, ieFactory)
-			if err := sc.exec(ctx, true /* inSession */, &evalCtx); err != nil {
-				if onError := cfg.SchemaChangerTestingKnobs.OnError; onError != nil {
-					onError(err)
-				}
-				if shouldLogSchemaChangeError(err) {
-					log.Warningf(ctx, "error executing schema change: %s", err)
-				}
-
-				if err == sqlbase.ErrDescriptorNotFound || err == ctx.Err() {
-					// 1. If the descriptor is dropped while the schema change
-					// is executing, the schema change is considered completed.
-					// 2. If the context is canceled the schema changer quits here
-					// letting the asynchronous code path complete the schema
-					// change.
-				} else if isPermanentSchemaChangeError(err) {
-					// All constraint violations can be reported; we report it as the result
-					// corresponding to the statement that enqueued this changer.
-					// There's some sketchiness here: we assume there's a single result
-					// per statement and we clobber the result/error of the corresponding
-					// statement.
-					if firstError == nil {
-						firstError = err
-					}
-				} else {
-					// retryable error.
-					continue
-				}
-			}
-			break
-		}
-	}
-	scc.schemaChangers = nil
-	return firstError
-}
+type jobsCollection []int64
 
 const panicLogOutputCutoffChars = 10000
 
@@ -1424,7 +1470,7 @@ func (st *SessionTracing) TraceExecEnd(ctx context.Context, err error, count int
 
 // extractMsgFromRecord extracts the message of the event, which is either in an
 // "event" or "error" field.
-func extractMsgFromRecord(rec tracing.RecordedSpan_LogRecord) string {
+func extractMsgFromRecord(rec tracing.LogRecord) string {
 	for _, f := range rec.Fields {
 		key := f.Key
 		if key == "event" {
@@ -1723,26 +1769,57 @@ type spanWithIndex struct {
 	index int
 }
 
+// paramStatusUpdater is a subset of RestrictedCommandResult which allows sending
+// status updates.
+type paramStatusUpdater interface {
+	AppendParamStatusUpdate(string, string)
+}
+
+// noopParamStatusUpdater implements paramStatusUpdater by performing a no-op.
+type noopParamStatusUpdater struct{}
+
+var _ paramStatusUpdater = (*noopParamStatusUpdater)(nil)
+
+func (noopParamStatusUpdater) AppendParamStatusUpdate(string, string) {}
+
 // sessionDataMutator is the interface used by sessionVars to change the session
 // state. It mostly mutates the Session's SessionData, but not exclusively (e.g.
 // see curTxnReadOnly).
 type sessionDataMutator struct {
-	data     *sessiondata.SessionData
-	defaults SessionDefaults
-	settings *cluster.Settings
+	data               *sessiondata.SessionData
+	defaults           SessionDefaults
+	settings           *cluster.Settings
+	paramStatusUpdater paramStatusUpdater
 	// setCurTxnReadOnly is called when we execute SET transaction_read_only = ...
 	setCurTxnReadOnly func(val bool)
-	// applicationNamedChanged, if set, is called when the "application name"
-	// variable is updated.
-	applicationNameChanged func(newName string)
+	// onTempSchemaCreation is called when the temporary schema is set
+	// on the search path (the first and only time).
+	onTempSchemaCreation func()
+	// onSessionDataChangeListeners stores all the observers to execute when
+	// session data is modified, keyed by the value to change on.
+	onSessionDataChangeListeners map[string][]func(val string)
+}
+
+// RegisterOnSessionDataChange adds a listener to execute when a change on the
+// given key is made using the mutator object.
+func (m *sessionDataMutator) RegisterOnSessionDataChange(key string, f func(val string)) {
+	if m.onSessionDataChangeListeners == nil {
+		m.onSessionDataChangeListeners = make(map[string][]func(val string))
+	}
+	m.onSessionDataChangeListeners[key] = append(m.onSessionDataChangeListeners[key], f)
+}
+
+func (m *sessionDataMutator) notifyOnDataChangeListeners(key string, val string) {
+	for _, f := range m.onSessionDataChangeListeners[key] {
+		f(val)
+	}
 }
 
 // SetApplicationName sets the application name.
 func (m *sessionDataMutator) SetApplicationName(appName string) {
 	m.data.ApplicationName = appName
-	if m.applicationNameChanged != nil {
-		m.applicationNameChanged(appName)
-	}
+	m.notifyOnDataChangeListeners("application_name", appName)
+	m.paramStatusUpdater.AppendParamStatusUpdate("application_name", appName)
 }
 
 func (m *sessionDataMutator) SetBytesEncodeFormat(val sessiondata.BytesEncodeFormat) {
@@ -1755,6 +1832,11 @@ func (m *sessionDataMutator) SetExtraFloatDigits(val int) {
 
 func (m *sessionDataMutator) SetDatabase(dbName string) {
 	m.data.Database = dbName
+}
+
+func (m *sessionDataMutator) SetTemporarySchemaName(scName string) {
+	m.onTempSchemaCreation()
+	m.data.SearchPath = m.data.SearchPath.WithTemporarySchemaName(scName)
 }
 
 func (m *sessionDataMutator) SetDefaultIntSize(size int) {
@@ -1773,12 +1855,12 @@ func (m *sessionDataMutator) SetForceSavepointRestart(val bool) {
 	m.data.ForceSavepointRestart = val
 }
 
-func (m *sessionDataMutator) SetForceSplitAt(val bool) {
-	m.data.ForceSplitAt = val
-}
-
 func (m *sessionDataMutator) SetZigzagJoinEnabled(val bool) {
 	m.data.ZigzagJoinEnabled = val
+}
+
+func (m *sessionDataMutator) SetRequireExplicitPrimaryKeys(val bool) {
+	m.data.RequireExplicitPrimaryKeys = val
 }
 
 func (m *sessionDataMutator) SetReorderJoinsLimit(val int) {
@@ -1797,6 +1879,14 @@ func (m *sessionDataMutator) SetOptimizerFKs(val bool) {
 	m.data.OptimizerFKs = val
 }
 
+func (m *sessionDataMutator) SetImplicitSelectForUpdate(val bool) {
+	m.data.ImplicitSelectForUpdate = val
+}
+
+func (m *sessionDataMutator) SetInsertFastPath(val bool) {
+	m.data.InsertFastPath = val
+}
+
 func (m *sessionDataMutator) SetSerialNormalizationMode(val sessiondata.SerialNormalizationMode) {
 	m.data.SerialNormalizationMode = val
 }
@@ -1805,12 +1895,13 @@ func (m *sessionDataMutator) SetSafeUpdates(val bool) {
 	m.data.SafeUpdates = val
 }
 
-func (m *sessionDataMutator) SetSearchPath(val sessiondata.SearchPath) {
-	m.data.SearchPath = val
+func (m *sessionDataMutator) UpdateSearchPath(paths []string) {
+	m.data.SearchPath = m.data.SearchPath.UpdatePaths(paths)
 }
 
 func (m *sessionDataMutator) SetLocation(loc *time.Location) {
 	m.data.DataConversion.Location = loc
+	m.paramStatusUpdater.AppendParamStatusUpdate("TimeZone", sessionDataTimeZoneFormat(loc))
 }
 
 func (m *sessionDataMutator) SetReadOnly(val bool) {
@@ -1831,6 +1922,10 @@ func (m *sessionDataMutator) SetSaveTablesPrefix(prefix string) {
 
 func (m *sessionDataMutator) SetTempTablesEnabled(val bool) {
 	m.data.TempTablesEnabled = val
+}
+
+func (m *sessionDataMutator) SetHashShardedIndexesEnabled(val bool) {
+	m.data.HashShardedIndexesEnabled = val
 }
 
 // RecordLatestSequenceValue records that value to which the session incremented
@@ -1868,7 +1963,6 @@ func (s *sqlStatsCollector) recordStatement(
 	stmt *Statement,
 	samplePlanDescription *roachpb.ExplainTreePlanNode,
 	distSQLUsed bool,
-	optUsed bool,
 	implicitTxn bool,
 	automaticRetryCount int,
 	numRows int,
@@ -1877,7 +1971,7 @@ func (s *sqlStatsCollector) recordStatement(
 	bytesRead, rowsRead int64,
 ) {
 	s.appStats.recordStatement(
-		stmt, samplePlanDescription, distSQLUsed, optUsed, implicitTxn, automaticRetryCount, numRows, err,
+		stmt, samplePlanDescription, distSQLUsed, implicitTxn, automaticRetryCount, numRows, err,
 		parseLat, planLat, runLat, svcLat, ovhLat, bytesRead, rowsRead)
 }
 

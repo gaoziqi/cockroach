@@ -15,7 +15,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -66,7 +67,7 @@ type extendedEvalContext struct {
 
 	TxnModesSetter txnModesSetter
 
-	SchemaChangers *schemaChangerCollection
+	Jobs *jobsCollection
 
 	schemaAccessors *schemaInterface
 
@@ -78,6 +79,21 @@ func (ctx *extendedEvalContext) copy() *extendedEvalContext {
 	cpy := *ctx
 	cpy.EvalContext = *ctx.EvalContext.Copy()
 	return &cpy
+}
+
+// QueueJob creates a new job from record and queues it for execution after
+// the transaction commits.
+func (ctx *extendedEvalContext) QueueJob(record jobs.Record) (*jobs.Job, error) {
+	job, err := ctx.ExecCfg.JobRegistry.CreateJobWithTxn(
+		ctx.Context,
+		record,
+		ctx.Txn,
+	)
+	if err != nil {
+		return nil, err
+	}
+	*ctx.Jobs = append(*ctx.Jobs, *job.ID())
+	return job, nil
 }
 
 // schemaInterface provides access to the database and table descriptors.
@@ -96,7 +112,7 @@ type schemaInterface struct {
 // planners are usually created by using the newPlanner method on a Session.
 // If one needs to be created outside of a Session, use makeInternalPlanner().
 type planner struct {
-	txn *client.Txn
+	txn *kv.Txn
 
 	// Reference to the corresponding sql Statement for this query.
 	stmt *Statement
@@ -146,6 +162,10 @@ type planner struct {
 	// query.
 	cancelChecker *sqlbase.CancelChecker
 
+	// collectBundle is set when we are collecting a diagnostics bundle for a
+	// statement; it triggers saving of extra information like the plan string.
+	collectBundle bool
+
 	// isPreparing is true if this planner is currently preparing.
 	isPreparing bool
 
@@ -168,6 +188,11 @@ type planner struct {
 	// data structures that can be reused between queries (for efficiency).
 	optPlanningCtx optPlanningCtx
 
+	// noticeSender allows the sending of notices.
+	// Do not use this object directly; use the SendClientNotice() method
+	// instead.
+	noticeSender noticeSender
+
 	queryCacheSession querycache.Session
 }
 
@@ -183,7 +208,7 @@ var noteworthyInternalMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NO
 // NewInternalPlanner is an exported version of newInternalPlanner. It
 // returns an interface{} so it can be used outside of the sql package.
 func NewInternalPlanner(
-	opName string, txn *client.Txn, user string, memMetrics *MemoryMetrics, execCfg *ExecutorConfig,
+	opName string, txn *kv.Txn, user string, memMetrics *MemoryMetrics, execCfg *ExecutorConfig,
 ) (interface{}, func()) {
 	return newInternalPlanner(opName, txn, user, memMetrics, execCfg)
 }
@@ -197,7 +222,7 @@ func NewInternalPlanner(
 // Returns a cleanup function that must be called once the caller is done with
 // the planner.
 func newInternalPlanner(
-	opName string, txn *client.Txn, user string, memMetrics *MemoryMetrics, execCfg *ExecutorConfig,
+	opName string, txn *kv.Txn, user string, memMetrics *MemoryMetrics, execCfg *ExecutorConfig,
 ) (*planner, func()) {
 	// We need a context that outlives all the uses of the planner (since the
 	// planner captures it in the EvalCtx, and so does the cleanup function that
@@ -222,6 +247,7 @@ func newInternalPlanner(
 	// leave it uninitialized.
 	tables := &TableCollection{
 		leaseMgr: execCfg.LeaseManager,
+		settings: execCfg.Settings,
 	}
 	dataMutator := &sessionDataMutator{
 		data: sd,
@@ -229,17 +255,18 @@ func newInternalPlanner(
 			"application_name": "crdb-internal",
 			"database":         "system",
 		}),
-		settings:          execCfg.Settings,
-		setCurTxnReadOnly: func(bool) {},
+		settings:           execCfg.Settings,
+		paramStatusUpdater: &noopParamStatusUpdater{},
+		setCurTxnReadOnly:  func(bool) {},
 	}
 
 	var ts time.Time
 	if txn != nil {
-		origTimestamp := txn.OrigTimestamp()
-		if origTimestamp == (hlc.Timestamp{}) {
+		readTimestamp := txn.ReadTimestamp()
+		if readTimestamp == (hlc.Timestamp{}) {
 			panic("makeInternalPlanner called with a transaction without timestamps")
 		}
-		ts = origTimestamp.GoTime()
+		ts = readTimestamp.GoTime()
 	}
 
 	p := &planner{execCfg: execCfg}
@@ -262,7 +289,9 @@ func newInternalPlanner(
 		ctx, sd, dataMutator, tables, txn, ts, ts, execCfg, &plannerMon,
 	)
 	p.extendedEvalCtx.Planner = p
+	p.extendedEvalCtx.PrivilegedAccessor = p
 	p.extendedEvalCtx.SessionAccessor = p
+	p.extendedEvalCtx.ClientNoticeSender = p
 	p.extendedEvalCtx.Sequence = p
 	p.extendedEvalCtx.ClusterID = execCfg.ClusterID()
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
@@ -297,7 +326,7 @@ func internalExtendedEvalCtx(
 	sd *sessiondata.SessionData,
 	dataMutator *sessionDataMutator,
 	tables *TableCollection,
-	txn *client.Txn,
+	txn *kv.Txn,
 	txnTimestamp time.Time,
 	stmtTimestamp time.Time,
 	execCfg *ExecutorConfig,
@@ -310,16 +339,17 @@ func internalExtendedEvalCtx(
 
 	return extendedEvalContext{
 		EvalContext: tree.EvalContext{
-			Txn:           txn,
-			SessionData:   sd,
-			TxnReadOnly:   false,
-			TxnImplicit:   true,
-			Settings:      execCfg.Settings,
-			Context:       ctx,
-			Mon:           plannerMon,
-			TestingKnobs:  evalContextTestingKnobs,
-			StmtTimestamp: stmtTimestamp,
-			TxnTimestamp:  txnTimestamp,
+			Txn:              txn,
+			SessionData:      sd,
+			TxnReadOnly:      false,
+			TxnImplicit:      true,
+			Settings:         execCfg.Settings,
+			Context:          ctx,
+			Mon:              plannerMon,
+			TestingKnobs:     evalContextTestingKnobs,
+			StmtTimestamp:    stmtTimestamp,
+			TxnTimestamp:     txnTimestamp,
+			InternalExecutor: execCfg.InternalExecutor,
 		},
 		SessionMutator:  dataMutator,
 		VirtualSchemas:  execCfg.VirtualSchemas,
@@ -375,12 +405,16 @@ func (p *planner) LeaseMgr() *LeaseManager {
 	return p.Tables().leaseMgr
 }
 
-func (p *planner) Txn() *client.Txn {
+func (p *planner) Txn() *kv.Txn {
 	return p.txn
 }
 
 func (p *planner) User() string {
 	return p.SessionData().User
+}
+
+func (p *planner) TemporarySchemaName() string {
+	return temporarySchemaName(p.ExtendedEvalContext().SessionID)
 }
 
 // DistSQLPlanner returns the DistSQLPlanner
@@ -395,15 +429,12 @@ func (p *planner) ParseType(sql string) (*types.T, error) {
 }
 
 // ParseQualifiedTableName implements the tree.EvalDatabase interface.
-func (p *planner) ParseQualifiedTableName(
-	ctx context.Context, sql string,
-) (*tree.TableName, error) {
-	name, err := parser.ParseTableName(sql)
-	if err != nil {
-		return nil, err
-	}
-	tn := name.ToTableName()
-	return &tn, nil
+// This exists to get around a circular dependency between sql/sem/tree and
+// sql/parser. sql/parser depends on tree to make objects, so tree cannot import
+// ParseQualifiedTableName even though some builtins need that function.
+// TODO(jordan): remove this once builtins can be moved outside of sql/sem/tree.
+func (p *planner) ParseQualifiedTableName(sql string) (*tree.TableName, error) {
+	return parser.ParseQualifiedTableName(sql)
 }
 
 // ResolveTableName implements the tree.EvalDatabase interface.
@@ -433,23 +464,49 @@ func (p *planner) LookupTableByID(ctx context.Context, tableID sqlbase.ID) (row.
 // TypeAsString enforces (not hints) that the given expression typechecks as a
 // string and returns a function that can be called to get the string value
 // during (planNode).Start.
+// To also allow NULLs to be returned, use TypeAsStringOrNull() instead.
 func (p *planner) TypeAsString(e tree.Expr, op string) (func() (string, error), error) {
 	typedE, err := tree.TypeCheckAndRequire(e, &p.semaCtx, types.String, op)
 	if err != nil {
 		return nil, err
 	}
-	fn := func() (string, error) {
-		d, err := typedE.Eval(p.EvalContext())
+	evalFn := p.makeStringEvalFn(typedE)
+	return func() (string, error) {
+		isNull, str, err := evalFn()
 		if err != nil {
 			return "", err
 		}
+		if isNull {
+			return "", errors.Errorf("expected string, got NULL")
+		}
+		return str, nil
+	}, nil
+}
+
+// TypeAsStringOrNull is like TypeAsString but allows NULLs.
+func (p *planner) TypeAsStringOrNull(e tree.Expr, op string) (func() (bool, string, error), error) {
+	typedE, err := tree.TypeCheckAndRequire(e, &p.semaCtx, types.String, op)
+	if err != nil {
+		return nil, err
+	}
+	return p.makeStringEvalFn(typedE), nil
+}
+
+func (p *planner) makeStringEvalFn(typedE tree.TypedExpr) func() (bool, string, error) {
+	return func() (bool, string, error) {
+		d, err := typedE.Eval(p.EvalContext())
+		if err != nil {
+			return false, "", err
+		}
+		if d == tree.DNull {
+			return true, "", nil
+		}
 		str, ok := d.(*tree.DString)
 		if !ok {
-			return "", errors.Errorf("failed to cast %T to string", d)
+			return false, "", errors.Errorf("failed to cast %T to string", d)
 		}
-		return string(*str), nil
+		return false, string(*str), nil
 	}
-	return fn, nil
 }
 
 // KVStringOptValidate indicates the requested validation of a TypeAsStringOpts
@@ -583,13 +640,6 @@ func (p *planner) TypeAsStringArray(exprs tree.Exprs, op string) (func() ([]stri
 // SessionData is part of the PlanHookState interface.
 func (p *planner) SessionData() *sessiondata.SessionData {
 	return p.EvalContext().SessionData
-}
-
-// prepareForDistSQLSupportCheck prepares p.curPlan.plan for a distSQL support
-// check and does additional verification of the planner state.
-func (p *planner) prepareForDistSQLSupportCheck() {
-	// Trigger limit propagation.
-	p.setUnlimited(p.curPlan.plan)
 }
 
 // txnModesSetter is an interface used by SQL execution to influence the current

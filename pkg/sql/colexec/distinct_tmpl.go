@@ -23,13 +23,17 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"time"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	// {{/*
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
+	// */}}
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -60,24 +64,16 @@ func OrderedDistinctColsToOperators(
 		execerror.VectorizedInternalPanic("unexpectedly an ordered distinct is not a resetter")
 	}
 	distinctChain := &distinctChainOps{
-		resettableOperator:         r,
-		estimatedStaticMemoryUsage: EstimateBatchSizeBytes([]coltypes.T{coltypes.Bool}, int(coldata.BatchSize())),
+		resettableOperator: r,
 	}
 	return distinctChain, distinctCol, nil
 }
 
 type distinctChainOps struct {
 	resettableOperator
-
-	estimatedStaticMemoryUsage int
 }
 
-var _ StaticMemoryOperator = &distinctChainOps{}
 var _ resettableOperator = &distinctChainOps{}
-
-func (d *distinctChainOps) EstimateStaticMemoryUsage() int {
-	return d.estimatedStaticMemoryUsage
-}
 
 // NewOrderedDistinct creates a new ordered distinct operator on the given
 // input columns with the given coltypes.
@@ -103,6 +99,12 @@ var _ bytes.Buffer
 
 // Dummy import to pull in "apd" package.
 var _ apd.Decimal
+
+// Dummy import to pull in "time" package.
+var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // Dummy import to pull in "tree" package.
 var _ tree.Datum
@@ -132,9 +134,6 @@ func _ASSIGN_NE(_ bool, _, _ _GOTYPE) bool {
 
 // */}}
 
-// Use execgen package to remove unused import warning.
-var _ interface{} = execgen.UNSAFEGET
-
 func newSingleOrderedDistinct(
 	input Operator, distinctColIdx int, outputCol []bool, t coltypes.T,
 ) (Operator, error) {
@@ -157,7 +156,7 @@ func newSingleOrderedDistinct(
 type partitioner interface {
 	// partition partitions the input colVec of size n, writing true to the
 	// outputCol for every value that differs from the previous one.
-	partition(colVec coldata.Vec, outputCol []bool, n uint64)
+	partition(colVec coldata.Vec, outputCol []bool, n int)
 
 	// partitionWithOrder is like partition, except it performs the partitioning
 	// on the input Vec as if it were ordered via the input order vector, which is
@@ -166,7 +165,7 @@ type partitioner interface {
 	// implies a reordered input vector [b,b,a], the resultant outputCol would be
 	// [true, false, true], indicating a distinct value at the 0th and 2nd
 	// elements.
-	partitionWithOrder(colVec coldata.Vec, order []uint64, outputCol []bool, n uint64)
+	partitionWithOrder(colVec coldata.Vec, order []int, outputCol []bool, n int)
 }
 
 // newPartitioner returns a new partitioner on type t.
@@ -214,11 +213,11 @@ func (p *sortedDistinct_TYPEOp) Init() {
 	p.input.Init()
 }
 
-func (p *sortedDistinct_TYPEOp) reset() {
+func (p *sortedDistinct_TYPEOp) reset(ctx context.Context) {
 	p.foundFirstRow = false
 	p.lastValNull = false
 	if resetter, ok := p.input.(resetter); ok {
-		resetter.reset()
+		resetter.reset(ctx)
 	}
 }
 
@@ -239,7 +238,7 @@ func (p *sortedDistinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
 	lastVal := p.lastVal
 	lastValNull := p.lastValNull
 	sel := batch.Selection()
-	firstIdx := uint16(0)
+	firstIdx := 0
 	if sel != nil {
 		firstIdx = sel[0]
 	}
@@ -260,26 +259,26 @@ func (p *sortedDistinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
 		if nulls != nil {
 			for _, checkIdx := range sel {
 				outputIdx := checkIdx
-				_CHECK_DISTINCT_WITH_NULLS(int(checkIdx), outputIdx, lastVal, nulls, lastValNull, col, outputCol)
+				_CHECK_DISTINCT_WITH_NULLS(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
 			}
 		} else {
 			for _, checkIdx := range sel {
 				outputIdx := checkIdx
-				_CHECK_DISTINCT(int(checkIdx), outputIdx, lastVal, col, outputCol)
+				_CHECK_DISTINCT(checkIdx, outputIdx, lastVal, col, outputCol)
 			}
 		}
 	} else {
 		// Bounds check elimination.
-		col = execgen.SLICE(col, 0, int(n))
+		col = execgen.SLICE(col, 0, n)
 		outputCol = outputCol[:n]
-		_ = outputCol[execgen.LEN(col)-1]
+		_ = outputCol[n-1]
 		if nulls != nil {
-			for execgen.RANGE(checkIdx, col) {
+			for execgen.RANGE(checkIdx, col, 0, n) {
 				outputIdx := checkIdx
 				_CHECK_DISTINCT_WITH_NULLS(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
 			}
 		} else {
-			for execgen.RANGE(checkIdx, col) {
+			for execgen.RANGE(checkIdx, col, 0, n) {
 				outputIdx := checkIdx
 				_CHECK_DISTINCT(checkIdx, outputIdx, lastVal, col, outputCol)
 			}
@@ -299,7 +298,7 @@ func (p *sortedDistinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
 type partitioner_TYPE struct{}
 
 func (p partitioner_TYPE) partitionWithOrder(
-	colVec coldata.Vec, order []uint64, outputCol []bool, n uint64,
+	colVec coldata.Vec, order []int, outputCol []bool, n int,
 ) {
 	var lastVal _GOTYPE
 	var lastValNull bool
@@ -309,7 +308,7 @@ func (p partitioner_TYPE) partitionWithOrder(
 	}
 
 	col := colVec._TemplateType()
-	col = execgen.SLICE(col, 0, int(n))
+	col = execgen.SLICE(col, 0, n)
 	outputCol = outputCol[:n]
 	outputCol[0] = true
 	if nulls != nil {
@@ -323,7 +322,7 @@ func (p partitioner_TYPE) partitionWithOrder(
 	}
 }
 
-func (p partitioner_TYPE) partition(colVec coldata.Vec, outputCol []bool, n uint64) {
+func (p partitioner_TYPE) partition(colVec coldata.Vec, outputCol []bool, n int) {
 	var (
 		lastVal     _GOTYPE
 		lastValNull bool
@@ -334,16 +333,16 @@ func (p partitioner_TYPE) partition(colVec coldata.Vec, outputCol []bool, n uint
 	}
 
 	col := colVec._TemplateType()
-	col = execgen.SLICE(col, 0, int(n))
+	col = execgen.SLICE(col, 0, n)
 	outputCol = outputCol[:n]
 	outputCol[0] = true
 	if nulls != nil {
-		for execgen.RANGE(checkIdx, col) {
+		for execgen.RANGE(checkIdx, col, 0, n) {
 			outputIdx := checkIdx
 			_CHECK_DISTINCT_WITH_NULLS(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
 		}
 	} else {
-		for execgen.RANGE(checkIdx, col) {
+		for execgen.RANGE(checkIdx, col, 0, n) {
 			outputIdx := checkIdx
 			_CHECK_DISTINCT(checkIdx, outputIdx, lastVal, col, outputCol)
 		}
@@ -361,8 +360,8 @@ func _CHECK_DISTINCT(
 	checkIdx int, outputIdx int, lastVal _GOTYPE, col []_GOTYPE, outputCol []bool,
 ) { // */}}
 
-	// {{define "checkDistinct"}}
-	v := execgen.UNSAFEGET(col, int(checkIdx))
+	// {{define "checkDistinct" -}}
+	v := execgen.UNSAFEGET(col, checkIdx)
 	var unique bool
 	_ASSIGN_NE(unique, v, lastVal)
 	outputCol[outputIdx] = outputCol[outputIdx] || unique
@@ -386,19 +385,26 @@ func _CHECK_DISTINCT_WITH_NULLS(
 	outputCol []bool,
 ) { // */}}
 
-	// {{define "checkDistinctWithNulls"}}
-	null := nulls.NullAt(uint16(checkIdx))
-	v := execgen.UNSAFEGET(col, int(checkIdx))
-	if null != lastValNull {
-		// Either the current value is null and the previous was not or vice-versa.
-		outputCol[outputIdx] = true
-	} else if !null {
-		// Neither value is null, so we must compare.
-		var unique bool
-		_ASSIGN_NE(unique, v, lastVal)
-		outputCol[outputIdx] = outputCol[outputIdx] || unique
+	// {{define "checkDistinctWithNulls" -}}
+	null := nulls.NullAt(checkIdx)
+	if null {
+		if !lastValNull {
+			// The current value is null while the previous was not.
+			outputCol[outputIdx] = true
+		}
+	} else {
+		v := execgen.UNSAFEGET(col, checkIdx)
+		if lastValNull {
+			// The previous value was null while the current is not.
+			outputCol[outputIdx] = true
+		} else {
+			// Neither value is null, so we must compare.
+			var unique bool
+			_ASSIGN_NE(unique, v, lastVal)
+			outputCol[outputIdx] = outputCol[outputIdx] || unique
+		}
+		execgen.COPYVAL(lastVal, v)
 	}
-	execgen.COPYVAL(lastVal, v)
 	lastValNull = null
 	// {{end}}
 

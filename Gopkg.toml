@@ -11,6 +11,7 @@ required = [
  "github.com/kisielk/errcheck",
  "github.com/mattn/goveralls",
  "github.com/mibk/dupl",
+ "github.com/mmatczuk/go_generics/cmd/go_generics",
  "github.com/wadey/gocovmerge",
  "golang.org/x/lint/golint",
  "golang.org/x/perf/cmd/benchstat",
@@ -85,6 +86,12 @@ ignored = [
   source = "https://github.com/cockroachdb/yaml"
   branch = "v2-encoding-style"
 
+# We want https://github.com/olekukonko/tablewriter/pull/148
+[[constraint]]
+  name = "github.com/olekukonko/tablewriter"
+  source = "https://github.com/cockroachdb/tablewriter"
+  branch = "master"
+
 [[constraint]]
   name = "github.com/abourget/teamcity"
   source = "https://github.com/cockroachdb/teamcity"
@@ -122,6 +129,11 @@ ignored = [
   name = "github.com/cockroachdb/pebble"
   branch = "master"
 
+# github.com/lib/pq has a newer revision that has notices, which we want
+[[override]]
+  name = "github.com/lib/pq"
+  revision = "9eb3fc897d6fd97dd4aad3d0404b54e2f7cc56be"
+
 # github.com/openzipkin-contrib/zipkin-go-opentracing requires a newer
 # version of thrift than is currently present in a release.
 [[override]]
@@ -136,12 +148,6 @@ ignored = [
 [[constraint]]
   name = "google.golang.org/grpc"
   version = "=v1.21.2"
-
-# Pin until 48c3df3f8bccdfa2bed83f6e4936cdf9e4c68d15 is in a release.
-# Also investigate switching to v4 branch.
-[[constraint]]
-  name = "github.com/jackc/pgx"
-  revision = "23388fecf653ddfce2a4149acf71313b87d64e3d"
 
 [prune]
   go-tests = true
@@ -165,3 +171,7 @@ ignored = [
   [[prune.project]]
     name = "github.com/knz/go-libedit"
     unused-packages = false
+
+[[constraint]]
+  name = "github.com/Azure/azure-sdk-for-go"
+  version = "33.0.0"

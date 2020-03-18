@@ -8,31 +8,22 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+import tableIcon from "!!raw-loader!assets/tableIcon.svg";
 import _ from "lodash";
+import { SummaryCard } from "oss/src/views/shared/components/summaryCard";
 import React from "react";
 import { connect } from "react-redux";
-import { Link } from "react-router";
-
-import { SummaryBar, SummaryHeadlineStat } from "src/views/shared/components/summaryBar";
-import { SortSetting } from "src/views/shared/components/sortabletable";
-import { SortedTable } from "src/views/shared/components/sortedtable";
-
-import { AdminUIState } from "src/redux/state";
+import { Link } from "react-router-dom";
+import { refreshDatabaseDetails, refreshTableDetails, refreshTableStats } from "src/redux/apiReducers";
 import { LocalSetting } from "src/redux/localsettings";
-import {
-    refreshDatabaseDetails, refreshTableDetails, refreshTableStats,
-} from "src/redux/apiReducers";
-
+import { AdminUIState } from "src/redux/state";
 import { Bytes } from "src/util/format";
 import { trustIcon } from "src/util/trust";
-
+import { databaseDetails, DatabaseSummaryBase, DatabaseSummaryExplicitData, grants, tableInfos as selectTableInfos } from "src/views/databases/containers/databaseSummary";
 import { TableInfo } from "src/views/databases/data/tableInfo";
-
-import {
-    DatabaseSummaryBase, DatabaseSummaryExplicitData, databaseDetails, tableInfos as selectTableInfos, grants,
-} from "src/views/databases/containers/databaseSummary";
-
-import tableIcon from "!!raw-loader!assets/tableIcon.svg";
+import { SortSetting } from "src/views/shared/components/sortabletable";
+import { SortedTable } from "src/views/shared/components/sortedtable";
+import { SummaryBar, SummaryHeadlineStat } from "src/views/shared/components/summaryBar";
 import "./databaseTables.styl";
 
 const databaseTablesSortSetting = new LocalSetting<AdminUIState, SortSetting>(
@@ -102,92 +93,96 @@ class DatabaseSummaryTables extends DatabaseSummaryBase {
 
     return (
       <div className="database-summary">
-        <div className="database-summary-title">
-          <h2>{dbID}</h2>
-        </div>
-        <div className="l-columns">
-          <div className="l-columns__left">
-            <div className="database-summary-table sql-table">
-              {
-                (numTables === 0) ? <DatabaseTableListEmpty /> :
-                  <DatabaseTableListSortedTable
-                    data={tableInfos}
-                    sortSetting={sortSetting}
-                    onChangeSortSetting={(setting) => this.props.setSort(setting)}
-                    columns={[
-                      {
-                        title: "Table Name",
-                        cell: (tableInfo) => {
-                          return (
-                            <div className="sort-table__unbounded-column">
-                              <Link to={`/database/${dbID}/table/${tableInfo.name}`}>{tableInfo.name}</Link>
-                            </div>
-                          );
+        <SummaryCard>
+          <div className="database-summary-title">
+            <h2 className="base-heading">{dbID}</h2>
+          </div>
+          <div className="l-columns">
+            <div className="l-columns__left">
+              <div className="database-summary-table sql-table">
+                {
+                  (numTables === 0) ? <DatabaseTableListEmpty /> :
+                    <DatabaseTableListSortedTable
+                      data={tableInfos}
+                      sortSetting={sortSetting}
+                      onChangeSortSetting={(setting) => this.props.setSort(setting)}
+                      columns={[
+                        {
+                          title: "Table Name",
+                          cell: (tableInfo) => {
+                            return (
+                              <div className="sort-table__unbounded-column">
+                                <Link to={`/database/${dbID}/table/${tableInfo.name}`}>{tableInfo.name}</Link>
+                              </div>
+                            );
+                          },
+                          sort: (tableInfo) => tableInfo.name,
+                          className: "expand-link", // don't pad the td element to allow the link to expand
                         },
-                        sort: (tableInfo) => tableInfo.name,
-                        className: "expand-link", // don't pad the td element to allow the link to expand
-                      },
-                      {
-                        title: "Size",
-                        cell: (tableInfo) => Bytes(tableInfo.physicalSize),
-                        sort: (tableInfo) => tableInfo.physicalSize,
-                      },
-                      {
-                        title: "Ranges",
-                        cell: (tableInfo) => tableInfo.rangeCount,
-                        sort: (tableInfo) => tableInfo.rangeCount,
-                      },
-                      {
-                        title: "# of Columns",
-                        cell: (tableInfo) => tableInfo.numColumns,
-                        sort: (tableInfo) => tableInfo.numColumns,
-                      },
-                      {
-                        title: "# of Indices",
-                        cell: (tableInfo) => tableInfo.numIndices,
-                        sort: (tableInfo) => tableInfo.numIndices,
-                      },
-                    ]} />
-              }
+                        {
+                          title: "Size",
+                          cell: (tableInfo) => Bytes(tableInfo.physicalSize),
+                          sort: (tableInfo) => tableInfo.physicalSize,
+                        },
+                        {
+                          title: "Ranges",
+                          cell: (tableInfo) => tableInfo.rangeCount,
+                          sort: (tableInfo) => tableInfo.rangeCount,
+                        },
+                        {
+                          title: "# of Columns",
+                          cell: (tableInfo) => tableInfo.numColumns,
+                          sort: (tableInfo) => tableInfo.numColumns,
+                        },
+                        {
+                          title: "# of Indices",
+                          cell: (tableInfo) => tableInfo.numIndices,
+                          sort: (tableInfo) => tableInfo.numIndices,
+                        },
+                      ]} />
+                }
+              </div>
+            </div>
+            <div className="l-columns__right">
+              <SummaryBar>
+                <SummaryHeadlineStat
+                  title="Database Size"
+                  tooltip="Approximate total disk size of this database across all replicas."
+                  value={this.totalSize()}
+                  format={Bytes} />
+                <SummaryHeadlineStat
+                  title={(numTables === 1) ? "Table" : "Tables"}
+                  tooltip="The total number of tables in this database."
+                  value={numTables} />
+                <SummaryHeadlineStat
+                  title="Total Range Count"
+                  tooltip="The total ranges across all tables in this database."
+                  value={this.totalRangeCount()} />
+              </SummaryBar>
             </div>
           </div>
-          <div className="l-columns__right">
-            <SummaryBar>
-              <SummaryHeadlineStat
-                title="Database Size"
-                tooltip="Approximate total disk size of this database across all replicas."
-                value={this.totalSize()}
-                format={Bytes} />
-              <SummaryHeadlineStat
-                title={(numTables === 1) ? "Table" : "Tables"}
-                tooltip="The total number of tables in this database."
-                value={numTables} />
-              <SummaryHeadlineStat
-                title="Total Range Count"
-                tooltip="The total ranges across all tables in this database."
-                value={this.totalRangeCount()} />
-            </SummaryBar>
-          </div>
-        </div>
+        </SummaryCard>
       </div>
     );
   }
 }
 
+const mapStateToProps = (state: AdminUIState, ownProps: DatabaseSummaryExplicitData) => ({ // RootState contains declaration for whole state
+  tableInfos: selectTableInfos(state, ownProps.name),
+  sortSetting: databaseTablesSortSetting.selector(state),
+  dbResponse: databaseDetails(state)[ownProps.name] && databaseDetails(state)[ownProps.name].data,
+  grants: grants(state, ownProps.name),
+});
+
+const mapDispatchToProps = {
+  setSort: databaseTablesSortSetting.set,
+  refreshDatabaseDetails,
+  refreshTableDetails,
+  refreshTableStats,
+};
+
 // Connect the DatabaseSummaryTables class with redux store.
 export default connect(
-  (state: AdminUIState, ownProps: DatabaseSummaryExplicitData) => {
-    return {
-      tableInfos: selectTableInfos(state, ownProps.name),
-      sortSetting: databaseTablesSortSetting.selector(state),
-      dbResponse: databaseDetails(state)[ownProps.name] && databaseDetails(state)[ownProps.name].data,
-      grants: grants(state, ownProps.name),
-    };
-  },
-  {
-    setSort: databaseTablesSortSetting.set,
-    refreshDatabaseDetails,
-    refreshTableDetails,
-    refreshTableStats,
-  },
-)(DatabaseSummaryTables);
+  mapStateToProps,
+  mapDispatchToProps,
+)(DatabaseSummaryTables as any);

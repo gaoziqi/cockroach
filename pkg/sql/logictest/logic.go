@@ -36,11 +36,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/mutations"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -48,7 +50,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/physicalplanutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -56,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/lib/pq"
@@ -163,6 +165,14 @@ import (
 //            testutils.SucceedsSoon for more information. If run with the
 //            -rewrite flag, inserts a 500ms sleep before executing the query
 //            once.
+//      - kvtrace: runs the query and compares against the results of the
+//            kv operations trace of the query. kvtrace optionally accepts
+//            arguments of the form kvtrace(op,op,...). Op is one of
+//            the accepted k/v arguments such as 'CPut', 'Scan' etc. It
+//            also accepts arguments of the form 'prefix=...'. For example,
+//            if kvtrace(CPut,Del,prefix=/Table/54,prefix=/Table/55), the
+//            results will be filtered to contain messages starting with
+//            CPut /Table/54, CPut /Table/55, Del /Table/54, Del /Table/55.
 //
 //    The label is optional. If specified, the test runner stores a hash
 //    of the results of the query under the given label. If the label is
@@ -380,27 +390,26 @@ type testClusterConfig struct {
 	name                string
 	numNodes            int
 	useFakeSpanResolver bool
-	// if non-empty, overrides the default optimizer mode.
+	// if non-empty, overrides the default distsql mode.
 	overrideDistSQLMode string
 	// if non-empty, overrides the default vectorize mode.
 	overrideVectorize string
 	// if non-empty, overrides the default automatic statistics mode.
 	overrideAutoStats string
-	// if set, queries using distSQL processors that can fall back to disk do
-	// so immediately, using only their disk-based implementation.
-	distSQLUseDisk bool
+	// if set, queries using distSQL processors or vectorized operators that can
+	// fall back to disk do so immediately, using only their disk-based
+	// implementation.
+	sqlExecUseDisk bool
 	// if set, enables DistSQL metadata propagation tests.
 	distSQLMetadataTestEnabled bool
 	// if set and the -test.short flag is passed, skip this config.
 	skipShort bool
 	// If not empty, bootstrapVersion controls what version the cluster will be
 	// bootstrapped at.
-	bootstrapVersion cluster.ClusterVersion
-	// If not empty, serverVersion is used to set what the Server will consider to
-	// be "the server version".
-	// TODO(andrei): clarify this comment and many others around the "server
-	// version".
-	serverVersion  roachpb.Version
+	bootstrapVersion roachpb.Version
+	// If not empty, binaryVersion is used to set what the Server will consider
+	// to be the binary version.
+	binaryVersion  roachpb.Version
 	disableUpgrade bool
 }
 
@@ -425,30 +434,19 @@ var logicTestConfigs = []testClusterConfig{
 		overrideVectorize:   "off",
 	},
 	{
-		name:                "local-mixed-19.1-19.2",
-		numNodes:            1,
-		overrideDistSQLMode: "off",
-		overrideAutoStats:   "false",
-		bootstrapVersion:    cluster.ClusterVersion{Version: roachpb.Version{Major: 19, Minor: 1}},
-		serverVersion:       roachpb.Version{Major: 19, Minor: 2},
-		disableUpgrade:      true,
-	},
-	{
 		name:                "local-v1.1@v1.0-noupgrade",
 		numNodes:            1,
 		overrideDistSQLMode: "off",
 		overrideAutoStats:   "false",
-		bootstrapVersion: cluster.ClusterVersion{
-			Version: roachpb.Version{Major: 1},
-		},
-		serverVersion:  roachpb.Version{Major: 1, Minor: 1},
-		disableUpgrade: true,
+		bootstrapVersion:    roachpb.Version{Major: 1},
+		binaryVersion:       roachpb.Version{Major: 1, Minor: 1},
+		disableUpgrade:      true,
 	},
 	{
 		name:              "local-vec",
 		numNodes:          1,
 		overrideAutoStats: "false",
-		overrideVectorize: "experimental_on",
+		overrideVectorize: "on",
 	},
 	{
 		name:                "fakedist",
@@ -456,6 +454,15 @@ var logicTestConfigs = []testClusterConfig{
 		useFakeSpanResolver: true,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
+	},
+	{
+		name:                "local-mixed-19.2-20.1",
+		numNodes:            1,
+		overrideDistSQLMode: "off",
+		overrideAutoStats:   "false",
+		bootstrapVersion:    roachpb.Version{Major: 19, Minor: 2},
+		binaryVersion:       roachpb.Version{Major: 20, Minor: 1},
+		disableUpgrade:      true,
 	},
 	{
 		name:                "fakedist-vec-off",
@@ -471,7 +478,17 @@ var logicTestConfigs = []testClusterConfig{
 		useFakeSpanResolver: true,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
-		overrideVectorize:   "experimental_on",
+		overrideVectorize:   "on",
+	},
+	{
+		name:                "fakedist-vec-disk",
+		numNodes:            3,
+		useFakeSpanResolver: true,
+		overrideDistSQLMode: "on",
+		overrideAutoStats:   "false",
+		overrideVectorize:   "on",
+		sqlExecUseDisk:      true,
+		skipShort:           true,
 	},
 	{
 		name:                       "fakedist-metadata",
@@ -488,7 +505,7 @@ var logicTestConfigs = []testClusterConfig{
 		useFakeSpanResolver: true,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
-		distSQLUseDisk:      true,
+		sqlExecUseDisk:      true,
 		skipShort:           true,
 	},
 	{
@@ -507,7 +524,7 @@ var logicTestConfigs = []testClusterConfig{
 		name:                "5node-dist-vec",
 		numNodes:            5,
 		overrideDistSQLMode: "on",
-		overrideVectorize:   "experimental_on",
+		overrideVectorize:   "on",
 		overrideAutoStats:   "false",
 	},
 	{
@@ -522,7 +539,7 @@ var logicTestConfigs = []testClusterConfig{
 		name:                "5node-dist-disk",
 		numNodes:            5,
 		overrideDistSQLMode: "on",
-		distSQLUseDisk:      true,
+		sqlExecUseDisk:      true,
 		skipShort:           true,
 		overrideAutoStats:   "false",
 	},
@@ -544,9 +561,11 @@ var (
 	defaultConfigNames = []string{
 		"local",
 		"local-vec-off",
-		"local-mixed-19.1-19.2",
+		"local-vec",
 		"fakedist",
 		"fakedist-vec-off",
+		"fakedist-vec",
+		"fakedist-vec-disk",
 		"fakedist-metadata",
 		"fakedist-disk",
 	}
@@ -852,9 +871,37 @@ type logicQuery struct {
 	// expectedHash is set.
 	expectedValues int
 
+	// kvtrace indicates that we're comparing the output of a kv trace.
+	kvtrace bool
+	// kvOpTypes can be used only when kvtrace is true. It contains
+	// the particular operation types to filter on, such as CPut or Del.
+	kvOpTypes        []string
+	keyPrefixFilters []string
+
 	// rawOpts are the query options, before parsing. Used to display in error
 	// messages.
 	rawOpts string
+}
+
+var allowedKVOpTypes = []string{
+	"CPut",
+	"Put",
+	"InitPut",
+	"Del",
+	"ClearRange",
+	"Get",
+	"Scan",
+	"FKScan",
+	"CascadeScan",
+}
+
+func isAllowedKVOp(op string) bool {
+	for _, s := range allowedKVOpTypes {
+		if op == s {
+			return true
+		}
+	}
+	return false
 }
 
 // logicTest executes the test cases specified in a file. The file format is
@@ -866,6 +913,7 @@ type logicQuery struct {
 type logicTest struct {
 	rootT    *testing.T
 	subtestT *testing.T
+	rng      *rand.Rand
 	cfg      testClusterConfig
 	// the number of nodes in the cluster.
 	cluster serverutils.TestClusterInterface
@@ -1047,7 +1095,7 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 			// don't want those to take long on large machines).
 			SQLMemoryPoolSize: 192 * 1024 * 1024,
 			Knobs: base.TestingKnobs{
-				Store: &storage.StoreTestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
 					// The consistency queue makes a lot of noisy logs during logic tests.
 					DisableConsistencyQueue: true,
 				},
@@ -1070,15 +1118,21 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 	distSQLKnobs := &execinfra.TestingKnobs{
 		MetadataTestLevel: execinfra.Off, DeterministicStats: true,
 	}
-	if cfg.distSQLUseDisk {
-		distSQLKnobs.MemoryLimitBytes = 1
+	if cfg.sqlExecUseDisk {
+		distSQLKnobs.ForceDiskSpill = true
 	}
 	if cfg.distSQLMetadataTestEnabled {
 		distSQLKnobs.MetadataTestLevel = execinfra.On
 	}
+	if strings.Compare(cfg.overrideVectorize, "off") != 0 {
+		distSQLKnobs.EnableVectorizedInvariantsChecker = true
+	}
 	params.ServerArgs.Knobs.DistSQL = distSQLKnobs
-	if cfg.bootstrapVersion != (cluster.ClusterVersion{}) {
-		params.ServerArgs.Knobs.Store.(*storage.StoreTestingKnobs).BootstrapVersion = &cfg.bootstrapVersion
+	if cfg.bootstrapVersion != (roachpb.Version{}) {
+		if params.ServerArgs.Knobs.Server == nil {
+			params.ServerArgs.Knobs.Server = &server.TestingKnobs{}
+		}
+		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BootstrapVersionOverride = cfg.bootstrapVersion
 	}
 	if cfg.disableUpgrade {
 		if params.ServerArgs.Knobs.Server == nil {
@@ -1087,17 +1141,18 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).DisableAutomaticVersionUpgrade = 1
 	}
 
-	if cfg.serverVersion != (roachpb.Version{}) {
+	if cfg.binaryVersion != (roachpb.Version{}) {
 		// If we want to run a specific server version, we assume that it
 		// supports at least the bootstrap version.
 		paramsPerNode := map[int]base.TestServerArgs{}
-		minVersion := cfg.serverVersion
-		if cfg.bootstrapVersion != (cluster.ClusterVersion{}) {
-			minVersion = cfg.bootstrapVersion.Version
+		binaryMinSupportedVersion := cfg.binaryVersion
+		if cfg.bootstrapVersion != (roachpb.Version{}) {
+			binaryMinSupportedVersion = cfg.bootstrapVersion
 		}
 		for i := 0; i < cfg.numNodes; i++ {
 			nodeParams := params.ServerArgs
-			nodeParams.Settings = cluster.MakeClusterSettings(minVersion, cfg.serverVersion)
+			nodeParams.Settings = cluster.MakeTestingClusterSettingsWithVersions(
+				cfg.binaryVersion, binaryMinSupportedVersion, false /* initializeVersion */)
 			paramsPerNode[i] = nodeParams
 		}
 		params.ServerArgsPerNode = paramsPerNode
@@ -1501,19 +1556,24 @@ func (t *logicTest) processSubtest(
 
 					tokens := strings.Split(query.rawOpts, ",")
 
-					// One of the options can be partialSort(1,2,3); we want this to be
-					// a single token.
-					for i := 0; i < len(tokens)-1; i++ {
-						if strings.HasPrefix(tokens[i], "partialsort(") && !strings.HasSuffix(tokens[i], ")") {
-							// Merge this token with the next.
-							tokens[i] = tokens[i] + "," + tokens[i+1]
-							// Delete tokens[i+1].
-							copy(tokens[i+1:], tokens[i+2:])
-							tokens = tokens[:len(tokens)-1]
-							// Look at the new token again.
-							i--
+					// For tokens of the form tok(arg1, arg2, arg3), we want to collapse
+					// these split tokens into one.
+					buildArgumentTokens := func(argToken string) {
+						for i := 0; i < len(tokens)-1; i++ {
+							if strings.HasPrefix(tokens[i], argToken+"(") && !strings.HasSuffix(tokens[i], ")") {
+								// Merge this token with the next.
+								tokens[i] = tokens[i] + "," + tokens[i+1]
+								// Delete tokens[i+1].
+								copy(tokens[i+1:], tokens[i+2:])
+								tokens = tokens[:len(tokens)-1]
+								// Look at the new token again.
+								i--
+							}
 						}
 					}
+
+					buildArgumentTokens("partialsort")
+					buildArgumentTokens("kvtrace")
 
 					for _, opt := range tokens {
 						if strings.HasPrefix(opt, "partialsort(") && strings.HasSuffix(opt, ")") {
@@ -1538,6 +1598,31 @@ func (t *logicTest) processSubtest(
 							continue
 						}
 
+						if strings.HasPrefix(opt, "kvtrace(") && strings.HasSuffix(opt, ")") {
+							s := opt
+							s = strings.TrimPrefix(s, "kvtrace(")
+							s = strings.TrimSuffix(s, ")")
+
+							query.kvtrace = true
+							query.kvOpTypes = nil
+							query.keyPrefixFilters = nil
+							for _, c := range strings.Split(s, ",") {
+								if strings.HasPrefix(c, "prefix=") {
+									matched := strings.TrimPrefix(c, "prefix=")
+									query.keyPrefixFilters = append(query.keyPrefixFilters, matched)
+								} else if isAllowedKVOp(c) {
+									query.kvOpTypes = append(query.kvOpTypes, c)
+								} else {
+									return errors.Errorf(
+										"invalid filter '%s' provided. Expected one of %v or a prefix of the form 'prefix=x'",
+										c,
+										allowedKVOpTypes,
+									)
+								}
+							}
+							continue
+						}
+
 						switch opt {
 						case "nosort":
 							query.sorter = nil
@@ -1553,6 +1638,14 @@ func (t *logicTest) processSubtest(
 
 						case "retry":
 							query.retry = true
+
+						case "kvtrace":
+							// kvtrace without any arguments doesn't perform any additional
+							// filtering of results. So it displays kv's from all tables
+							// and all operation types.
+							query.kvtrace = true
+							query.kvOpTypes = nil
+							query.keyPrefixFilters = nil
 
 						default:
 							return errors.Errorf("%s: unknown sort mode: %s", query.pos, opt)
@@ -1638,6 +1731,48 @@ func (t *logicTest) processSubtest(
 			}
 
 			if !s.skip {
+				if query.kvtrace {
+					_, err := t.db.Exec("SET TRACING=on,kv")
+					if err != nil {
+						return err
+					}
+					_, err = t.db.Exec(query.sql)
+					if err != nil {
+						t.Error(err)
+					}
+					_, err = t.db.Exec("SET TRACING=off")
+					if err != nil {
+						return err
+					}
+
+					queryPrefix := `SELECT message FROM [SHOW KV TRACE FOR SESSION] `
+					buildQuery := func(ops []string, keyFilters []string) string {
+						var sb strings.Builder
+						sb.WriteString(queryPrefix)
+						if len(keyFilters) == 0 {
+							keyFilters = []string{""}
+						}
+						for i, c := range ops {
+							for j, f := range keyFilters {
+								if i+j == 0 {
+									sb.WriteString("WHERE ")
+								} else {
+									sb.WriteString("OR ")
+								}
+								sb.WriteString(fmt.Sprintf("message like '%s %s%%'", c, f))
+							}
+						}
+						return sb.String()
+					}
+
+					query.colTypes = "T"
+					if len(query.kvOpTypes) == 0 {
+						query.sql = buildQuery(allowedKVOpTypes, query.keyPrefixFilters)
+					} else {
+						query.sql = buildQuery(query.kvOpTypes, query.keyPrefixFilters)
+					}
+				}
+
 				for i := 0; i < repeat; i++ {
 					if query.retry && !*rewriteResultsInTestfiles {
 						testutils.SucceedsSoon(t.rootT, func() error {
@@ -1693,6 +1828,7 @@ func (t *logicTest) processSubtest(
 			if rows.Next() {
 				return errors.Errorf("%s: more than one row returned by query  %s", stmt.pos, stmt.sql)
 			}
+			t.t().Logf("let %s = %s\n", varName, val)
 			t.varMap[varName] = val
 
 		case "halt", "hash-threshold":
@@ -1706,6 +1842,13 @@ func (t *logicTest) processSubtest(
 			}
 			cleanupUserFunc := t.setUser(fields[1])
 			defer cleanupUserFunc()
+
+		case "skip":
+			reason := "skipped"
+			if len(fields) > 1 {
+				reason = fields[1]
+			}
+			t.t().Skip(reason)
 
 		case "skipif":
 			if len(fields) < 2 {
@@ -1766,7 +1909,7 @@ func (t *logicTest) processSubtest(
 				return errors.Errorf("kv-batch-size needs an integer argument; %s", err)
 			}
 			t.outf("Setting kv batch size %d", batchSize)
-			defer row.SetKVBatchSize(int64(batchSize))()
+			defer row.TestingSetKVBatchSize(int64(batchSize))()
 
 		default:
 			return errors.Errorf("%s:%d: unknown command: %s",
@@ -1898,7 +2041,10 @@ func (t *logicTest) execStatement(stmt logicStatement) (bool, error) {
 	if *showSQL {
 		t.outf("%s;", stmt.sql)
 	}
-	execSQL := t.assignRandomFamily(stmt.sql)
+	execSQL, changed := mutations.ApplyString(t.rng, stmt.sql, mutations.ColumnFamilyMutator)
+	if changed {
+		t.outf("rewrote:\n%s\n", execSQL)
+	}
 	res, err := t.db.Exec(execSQL)
 	if err == nil {
 		sqlutils.VerifyStatementPrettyRoundtrip(t.t(), stmt.sql)
@@ -1928,106 +2074,6 @@ func (t *logicTest) execStatement(stmt logicStatement) (bool, error) {
 	return cont, err
 }
 
-// assignRandomFamily modifies any CREATE TABLE statement without any FAMILY
-// definitions to have random FAMILY definitions. Any error encountered will
-// return the original sql string unchanged.
-func (t *logicTest) assignRandomFamily(sql string) string {
-	stmts, err := parser.Parse(sql)
-	if err != nil {
-		return sql
-	}
-	delim := ""
-	var sb strings.Builder
-	for _, stmt := range stmts {
-		sb.WriteString(delim)
-		delim = "\n"
-		ast, ok := stmt.AST.(*tree.CreateTable)
-		if !ok {
-			sb.WriteString(stmt.SQL)
-			sb.WriteString(";")
-			continue
-		}
-
-		hasFamily := false
-		var columns []tree.Name
-		isPKCol := map[tree.Name]bool{}
-		// Only mutate stmt.SQL if something changed.
-		create := stmt.SQL
-		for _, def := range ast.Defs {
-			switch def := def.(type) {
-			case *tree.FamilyTableDef:
-				hasFamily = true
-			case *tree.ColumnTableDef:
-				if def.HasColumnFamily() {
-					hasFamily = true
-					continue
-				}
-				// Primary keys must be in the first
-				// column family, so don't add them to
-				// the list.
-				if def.PrimaryKey {
-					continue
-				}
-				columns = append(columns, def.Name)
-			case *tree.UniqueConstraintTableDef:
-				// If there's an explicit PK index
-				// definition, save the columns from it
-				// and remove them later.
-				if def.PrimaryKey {
-					for _, col := range def.Columns {
-						isPKCol[col.Column] = true
-					}
-				}
-			}
-		}
-		// If there's no family definitions, randomly assign some.
-		if !hasFamily && len(columns) > 1 {
-			// Any columns not specified in column families
-			// are auto assigned to the first family, so
-			// there's no requirement to exhaust columns here.
-
-			// Remove columns specified in PK index
-			// definitions. We need to do this here because
-			// index defs and columns can appear in any
-			// order in the CREATE TABLE.
-			{
-				n := 0
-				for _, x := range columns {
-					if !isPKCol[x] {
-						columns[n] = x
-						n++
-					}
-				}
-				columns = columns[:n]
-			}
-			rand.Shuffle(len(columns), func(i, j int) {
-				columns[i], columns[j] = columns[j], columns[i]
-			})
-			fd := &tree.FamilyTableDef{}
-			for {
-				if len(columns) == 0 {
-					if len(fd.Columns) > 0 {
-						ast.Defs = append(ast.Defs, fd)
-					}
-					break
-				}
-				fd.Columns = append(fd.Columns, columns[0])
-				columns = columns[1:]
-				// 50% chance to make a new column family.
-				if rand.Intn(2) != 0 {
-					ast.Defs = append(ast.Defs, fd)
-					fd = &tree.FamilyTableDef{}
-				}
-			}
-			create = ast.String()
-			t.outf("rewrote: %s;", create)
-		}
-		sb.WriteString(create)
-		sb.WriteString(";")
-	}
-	return sb.String()
-}
-
 func (t *logicTest) hashResults(results []string) (string, error) {
 	// Hash the values using MD5. This hashing precisely matches the hashing in
 	// sqllogictest.c.
@@ -2054,6 +2100,7 @@ func (t *logicTest) execQuery(query logicQuery) error {
 	if err != nil {
 		// An error occurred, but it was expected.
 		t.finishOne("XFAIL")
+		//nolint:returnerrcheck
 		return nil
 	}
 	defer rows.Close()
@@ -2405,10 +2452,12 @@ func RunLogicTest(t *testing.T, globs ...string) {
 							t.Parallel() // SAFE FOR TESTING (this comments satisfies the linter)
 						}
 					}
+					rng, _ := randutil.NewPseudoRand()
 					lt := logicTest{
 						rootT:           t,
 						verbose:         verbose,
 						perErrorSummary: make(map[string][]string),
+						rng:             rng,
 					}
 					if *printErrorSummary {
 						defer lt.printErrorSummary()

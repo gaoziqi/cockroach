@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -584,12 +585,8 @@ func (hr *hashRouter) computeDestination(row sqlbase.EncDatumRow) (int, error) {
 			err := errors.Errorf("hash column %d, row with only %d columns", col, len(row))
 			return -1, err
 		}
-		// TODO(radu): we should choose an encoding that is already available as
-		// much as possible. However, we cannot decide this locally as multiple
-		// nodes may be doing the same hashing and the encodings need to match. The
-		// encoding needs to be determined at planning time. #13829
 		var err error
-		hr.buffer, err = row[col].Encode(&hr.types[col], &hr.alloc, flowinfra.PreferredEncoding, hr.buffer)
+		hr.buffer, err = row[col].Fingerprint(&hr.types[col], &hr.alloc, hr.buffer)
 		if err != nil {
 			return -1, err
 		}
@@ -706,8 +703,8 @@ const routerOutputTagPrefix = "routeroutput."
 func (ros *RouterOutputStats) Stats() map[string]string {
 	statsMap := make(map[string]string)
 	statsMap[routerOutputTagPrefix+"rows_routed"] = strconv.FormatInt(ros.NumRows, 10)
-	statsMap[routerOutputTagPrefix+execinfra.MaxMemoryTagSuffix] = strconv.FormatInt(ros.MaxAllocatedMem, 10)
-	statsMap[routerOutputTagPrefix+execinfra.MaxDiskTagSuffix] = strconv.FormatInt(ros.MaxAllocatedDisk, 10)
+	statsMap[routerOutputTagPrefix+rowexec.MaxMemoryTagSuffix] = strconv.FormatInt(ros.MaxAllocatedMem, 10)
+	statsMap[routerOutputTagPrefix+rowexec.MaxDiskTagSuffix] = strconv.FormatInt(ros.MaxAllocatedDisk, 10)
 	return statsMap
 }
 
@@ -715,7 +712,7 @@ func (ros *RouterOutputStats) Stats() map[string]string {
 func (ros *RouterOutputStats) StatsForQueryPlan() []string {
 	return []string{
 		fmt.Sprintf("rows routed: %d", ros.NumRows),
-		fmt.Sprintf("%s: %d", execinfra.MaxMemoryQueryPlanSuffix, ros.MaxAllocatedMem),
-		fmt.Sprintf("%s: %d", execinfra.MaxDiskQueryPlanSuffix, ros.MaxAllocatedDisk),
+		fmt.Sprintf("%s: %d", rowexec.MaxMemoryQueryPlanSuffix, ros.MaxAllocatedMem),
+		fmt.Sprintf("%s: %d", rowexec.MaxDiskQueryPlanSuffix, ros.MaxAllocatedDisk),
 	}
 }

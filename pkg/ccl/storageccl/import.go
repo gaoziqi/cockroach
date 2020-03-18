@@ -15,13 +15,13 @@ import (
 	"io/ioutil"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/batcheval"
-	"github.com/cockroachdb/cockroach/pkg/storage/bulk"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -89,14 +89,14 @@ var importBufferIncrementSize = func() *settings.ByteSizeSetting {
 const commandMetadataEstimate = 1 << 20 // 1 MB
 
 func init() {
-	storage.SetImportCmd(evalImport)
+	kvserver.SetImportCmd(evalImport)
 
 	// Ensure that the user cannot set the maximum raft command size so low that
 	// more than half of an Import or AddSSTable command will be taken up by Raft
 	// metadata.
-	if commandMetadataEstimate > storage.MaxCommandSizeFloor/2 {
+	if commandMetadataEstimate > kvserver.MaxCommandSizeFloor/2 {
 		panic(fmt.Sprintf("raft command size floor (%s) is too small for import commands",
-			humanizeutil.IBytes(storage.MaxCommandSizeFloor)))
+			humanizeutil.IBytes(kvserver.MaxCommandSizeFloor)))
 	}
 }
 
@@ -106,7 +106,7 @@ func init() {
 // returns the maximum batch size that will fit within a Raft command.
 func MaxImportBatchSize(st *cluster.Settings) int64 {
 	desiredSize := importBatchSize.Get(&st.SV)
-	maxCommandSize := storage.MaxCommandSize.Get(&st.SV)
+	maxCommandSize := kvserver.MaxCommandSize.Get(&st.SV)
 	if desiredSize+commandMetadataEstimate > maxCommandSize {
 		return maxCommandSize - commandMetadataEstimate
 	}
@@ -115,14 +115,14 @@ func MaxImportBatchSize(st *cluster.Settings) int64 {
 
 // ImportBufferConfigSizes determines the minimum, maximum and step size for the
 // BulkAdder buffer used in import.
-func ImportBufferConfigSizes(st *cluster.Settings, isPKAdder bool) (int64, int64, int64) {
+func ImportBufferConfigSizes(st *cluster.Settings, isPKAdder bool) (int64, func() int64, int64) {
 	if isPKAdder {
 		return importPKAdderBufferSize.Get(&st.SV),
-			importPKAdderMaxBufferSize.Get(&st.SV),
+			func() int64 { return importPKAdderMaxBufferSize.Get(&st.SV) },
 			importBufferIncrementSize.Get(&st.SV)
 	}
 	return importIndexAdderBufferSize.Get(&st.SV),
-		importIndexAdderMaxBufferSize.Get(&st.SV),
+		func() int64 { return importIndexAdderMaxBufferSize.Get(&st.SV) },
 		importBufferIncrementSize.Get(&st.SV)
 }
 
@@ -142,7 +142,7 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 	}
 	defer cArgs.EvalCtx.GetLimiters().ConcurrentImportRequests.Finish()
 
-	var iters []engine.SimpleIterator
+	var iters []storage.SimpleIterator
 	for _, file := range args.Files {
 		log.VEventf(ctx, 2, "import file %s %s", file.Path, args.Key)
 
@@ -172,6 +172,13 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 		dataSize := int64(len(fileContents))
 		log.Eventf(ctx, "fetched file (%s)", humanizeutil.IBytes(dataSize))
 
+		if args.Encryption != nil {
+			fileContents, err = DecryptFile(fileContents, args.Encryption.Key)
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		if len(file.Sha512) > 0 {
 			checksum, err := SHA512ChecksumData(fileContents)
 			if err != nil {
@@ -182,7 +189,7 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 			}
 		}
 
-		iter, err := engine.NewMemSSTIterator(fileContents, false)
+		iter, err := storage.NewMemSSTIterator(fileContents, false)
 		if err != nil {
 			return nil, err
 		}
@@ -191,18 +198,18 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 		iters = append(iters, iter)
 	}
 
-	batcher, err := bulk.MakeSSTBatcher(ctx, db, uint64(MaxImportBatchSize(cArgs.EvalCtx.ClusterSettings())))
+	batcher, err := bulk.MakeSSTBatcher(ctx, db, cArgs.EvalCtx.ClusterSettings(), func() int64 { return MaxImportBatchSize(cArgs.EvalCtx.ClusterSettings()) })
 	if err != nil {
 		return nil, err
 	}
 	defer batcher.Close()
 
-	startKeyMVCC, endKeyMVCC := engine.MVCCKey{Key: args.DataSpan.Key}, engine.MVCCKey{Key: args.DataSpan.EndKey}
-	iter := engine.MakeMultiIterator(iters)
+	startKeyMVCC, endKeyMVCC := storage.MVCCKey{Key: args.DataSpan.Key}, storage.MVCCKey{Key: args.DataSpan.EndKey}
+	iter := storage.MakeMultiIterator(iters)
 	defer iter.Close()
 	var keyScratch, valueScratch []byte
 
-	for iter.Seek(startKeyMVCC); ; {
+	for iter.SeekGE(startKeyMVCC); ; {
 		ok, err := iter.Valid()
 		if err != nil {
 			return nil, err
@@ -231,7 +238,7 @@ func evalImport(ctx context.Context, cArgs batcheval.CommandArgs) (*roachpb.Impo
 
 		keyScratch = append(keyScratch[:0], iter.UnsafeKey().Key...)
 		valueScratch = append(valueScratch[:0], iter.UnsafeValue()...)
-		key := engine.MVCCKey{Key: keyScratch, Timestamp: iter.UnsafeKey().Timestamp}
+		key := storage.MVCCKey{Key: keyScratch, Timestamp: iter.UnsafeKey().Timestamp}
 		value := roachpb.Value{RawBytes: valueScratch}
 		iter.NextKey()
 

@@ -15,13 +15,14 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -85,6 +86,10 @@ func (p *planner) DropTable(ctx context.Context, n *tree.DropTable) (planNode, e
 				}
 			}
 		}
+		if err := p.canRemoveAllTableOwnedSequences(ctx, droppedDesc, n.DropBehavior); err != nil {
+			return nil, err
+		}
+
 	}
 
 	if len(td) == 0 {
@@ -93,7 +98,14 @@ func (p *planner) DropTable(ctx context.Context, n *tree.DropTable) (planNode, e
 	return &dropTableNode{n: n, td: td}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because DROP TABLE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *dropTableNode) ReadingOwnWrites() {}
+
 func (n *dropTableNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeDropCounter("table"))
+
 	ctx := params.ctx
 	for _, toDel := range n.td {
 		droppedDesc := toDel.desc
@@ -101,18 +113,7 @@ func (n *dropTableNode) startExec(params runParams) error {
 			continue
 		}
 
-		droppedDetails := jobspb.DroppedTableDetails{Name: toDel.tn.FQString(), ID: toDel.desc.ID}
-		if _, err := params.p.createDropTablesJob(
-			ctx,
-			[]*sqlbase.MutableTableDescriptor{droppedDesc},
-			[]jobspb.DroppedTableDetails{droppedDetails},
-			tree.AsStringWithFQNames(n.n, params.Ann()),
-			true, /* drainNames */
-			sqlbase.InvalidID /* droppedDatabaseID */); err != nil {
-			return err
-		}
-
-		droppedViews, err := params.p.dropTableImpl(params, droppedDesc)
+		droppedViews, err := params.p.dropTableImpl(ctx, droppedDesc, true /* queueJob */, tree.AsStringWithFQNames(n.n, params.Ann()))
 		if err != nil {
 			return err
 		}
@@ -223,17 +224,16 @@ func (p *planner) removeInterleave(ctx context.Context, ref sqlbase.ForeignKeyRe
 		return err
 	}
 	idx.Interleave.Ancestors = nil
-	return p.writeSchemaChange(ctx, table, sqlbase.InvalidMutationID)
+	// No job description, since this is presumably part of some larger schema change.
+	return p.writeSchemaChange(ctx, table, sqlbase.InvalidMutationID, "")
 }
 
 // dropTableImpl does the work of dropping a table (and everything that depends
 // on it if `cascade` is enabled). It returns a list of view names that were
 // dropped due to `cascade` behavior.
 func (p *planner) dropTableImpl(
-	params runParams, tableDesc *sqlbase.MutableTableDescriptor,
+	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, queueJob bool, jobDesc string,
 ) ([]string, error) {
-	ctx := params.ctx
-
 	var droppedViews []string
 
 	// Remove foreign key back references from tables that this table has foreign
@@ -272,7 +272,14 @@ func (p *planner) dropTableImpl(
 
 	// Remove sequence dependencies.
 	for i := range tableDesc.Columns {
-		if err := removeSequenceDependencies(tableDesc, &tableDesc.Columns[i], params); err != nil {
+		if err := p.removeSequenceDependencies(ctx, tableDesc, &tableDesc.Columns[i]); err != nil {
+			return droppedViews, err
+		}
+	}
+
+	// Drop sequences that the columns of the table own
+	for _, col := range tableDesc.Columns {
+		if err := p.dropSequencesOwnedByCol(ctx, &col); err != nil {
 			return droppedViews, err
 		}
 	}
@@ -290,7 +297,8 @@ func (p *planner) dropTableImpl(
 		if viewDesc.Dropped() {
 			continue
 		}
-		cascadedViews, err := p.dropViewImpl(ctx, viewDesc, tree.DropCascade)
+		// TODO (lucy): Have more consistent/informative names for dependent jobs.
+		cascadedViews, err := p.dropViewImpl(ctx, viewDesc, queueJob, "dropping dependent view", tree.DropCascade)
 		if err != nil {
 			return droppedViews, err
 		}
@@ -303,7 +311,7 @@ func (p *planner) dropTableImpl(
 		return droppedViews, err
 	}
 
-	err = p.initiateDropTable(ctx, tableDesc, true /* drain name */)
+	err = p.initiateDropTable(ctx, tableDesc, queueJob, jobDesc, true /* drain name */)
 	return droppedViews, err
 }
 
@@ -312,7 +320,11 @@ func (p *planner) dropTableImpl(
 // TRUNCATE which directly deletes the old name to id map and doesn't need
 // drain the old map.
 func (p *planner) initiateDropTable(
-	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor, drainName bool,
+	ctx context.Context,
+	tableDesc *sqlbase.MutableTableDescriptor,
+	queueJob bool,
+	jobDesc string,
+	drainName bool,
 ) error {
 	if tableDesc.Dropped() {
 		return fmt.Errorf("table %q is being dropped", tableDesc.Name)
@@ -362,10 +374,13 @@ func (p *planner) initiateDropTable(
 
 	tableDesc.State = sqlbase.TableDescriptor_DROP
 	if drainName {
+		parentSchemaID := tableDesc.GetParentSchemaID()
+
 		// Queue up name for draining.
 		nameDetails := sqlbase.TableDescriptor_NameInfo{
-			ParentID: tableDesc.ParentID,
-			Name:     tableDesc.Name}
+			ParentID:       tableDesc.ParentID,
+			ParentSchemaID: parentSchemaID,
+			Name:           tableDesc.Name}
 		tableDesc.DrainingNames = append(tableDesc.DrainingNames, nameDetails)
 	}
 
@@ -382,28 +397,24 @@ func (p *planner) initiateDropTable(
 			jobIDs[jobID] = struct{}{}
 		}
 	}
-	for _, gcm := range tableDesc.GCMutations {
-		jobIDs[gcm.JobID] = struct{}{}
-	}
 	for jobID := range jobIDs {
 		job, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.txn)
 		if err != nil {
 			return err
 		}
 
-		if err := job.WithTxn(p.txn).Succeeded(ctx, jobs.NoopFn); err != nil {
+		if err := job.WithTxn(p.txn).Succeeded(ctx, nil); err != nil {
 			return errors.Wrapf(err,
 				"failed to mark job %d as as successful", errors.Safe(jobID))
 		}
 	}
-
 	// Initiate an immediate schema change. When dropping a table
 	// in a session, the data and the descriptor are not deleted.
 	// Instead, that is taken care of asynchronously by the schema
 	// change manager, which is notified via a system config gossip.
 	// The schema change manager will properly schedule deletion of
 	// the underlying data when the GC deadline expires.
-	return p.writeDropTable(ctx, tableDesc)
+	return p.writeDropTable(ctx, tableDesc, queueJob, jobDesc)
 }
 
 func (p *planner) removeFKForBackReference(
@@ -428,7 +439,8 @@ func (p *planner) removeFKForBackReference(
 	if err := removeFKForBackReferenceFromTable(originTableDesc, ref, tableDesc.TableDesc()); err != nil {
 		return err
 	}
-	return p.writeSchemaChange(ctx, originTableDesc, sqlbase.InvalidMutationID)
+	// No job description, since this is presumably part of some larger schema change.
+	return p.writeSchemaChange(ctx, originTableDesc, sqlbase.InvalidMutationID, "")
 }
 
 // removeFKBackReferenceFromTable edits the supplied originTableDesc to
@@ -485,7 +497,8 @@ func (p *planner) removeFKBackReference(
 	if err := removeFKBackReferenceFromTable(referencedTableDesc, ref.Name, tableDesc.TableDesc()); err != nil {
 		return err
 	}
-	return p.writeSchemaChange(ctx, referencedTableDesc, sqlbase.InvalidMutationID)
+	// No job description, since this is presumably part of some larger schema change.
+	return p.writeSchemaChange(ctx, referencedTableDesc, sqlbase.InvalidMutationID, "")
 }
 
 // removeFKBackReferenceFromTable edits the supplied referencedTableDesc to
@@ -541,13 +554,22 @@ func (p *planner) removeInterleaveBackReference(
 	if err != nil {
 		return err
 	}
+	foundAncestor := false
 	for k, ref := range targetIdx.InterleavedBy {
 		if ref.Table == tableDesc.ID && ref.Index == idx.ID {
+			if foundAncestor {
+				return errors.AssertionFailedf(
+					"ancestor entry in %s for %s@%s found more than once", t.Name, tableDesc.Name, idx.Name)
+			}
 			targetIdx.InterleavedBy = append(targetIdx.InterleavedBy[:k], targetIdx.InterleavedBy[k+1:]...)
+			foundAncestor = true
 		}
 	}
 	if t != tableDesc {
-		return p.writeSchemaChange(ctx, t, sqlbase.InvalidMutationID)
+		// TODO (lucy): Have more consistent/informative names for dependent jobs.
+		return p.writeSchemaChange(
+			ctx, t, sqlbase.InvalidMutationID, "removing reference for interleaved table",
+		)
 	}
 	return nil
 }
@@ -569,10 +591,11 @@ func removeMatchingReferences(
 func (p *planner) removeTableComment(
 	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor,
 ) error {
-	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+	_, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 		ctx,
 		"delete-table-comment",
 		p.txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
 		keys.TableCommentType,
 		tableDesc.ID)
@@ -580,10 +603,11 @@ func (p *planner) removeTableComment(
 		return err
 	}
 
-	_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+	_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 		ctx,
 		"delete-comment",
 		p.txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2",
 		keys.ColumnCommentType,
 		tableDesc.ID)

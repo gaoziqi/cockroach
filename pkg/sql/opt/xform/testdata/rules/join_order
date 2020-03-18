@@ -32,19 +32,21 @@ opt join-limit=3
 SELECT * FROM abc, bx, cy WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
 inner-join (lookup bx)
- ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(int) b:5(int!null) x:6(int) c:7(int!null) y:8(int)
+ ├── columns: a:1!null b:2!null c:3!null d:4 b:5!null x:6 c:7!null y:8
  ├── key columns: [2] = [5]
+ ├── lookup columns are key
  ├── cardinality: [0 - 1]
  ├── key: ()
  ├── fd: ()-->(1-8)
  ├── inner-join (lookup cy)
- │    ├── columns: a:1(int!null) abc.b:2(int) abc.c:3(int!null) d:4(int) cy.c:7(int!null) y:8(int)
+ │    ├── columns: a:1!null abc.b:2 abc.c:3!null d:4 cy.c:7!null y:8
  │    ├── key columns: [3] = [7]
+ │    ├── lookup columns are key
  │    ├── cardinality: [0 - 1]
  │    ├── key: ()
  │    ├── fd: ()-->(1-4,7,8)
  │    ├── scan abc
- │    │    ├── columns: a:1(int!null) abc.b:2(int) abc.c:3(int) d:4(int)
+ │    │    ├── columns: a:1!null abc.b:2 abc.c:3 d:4
  │    │    ├── constraint: /1: [/1 - /1]
  │    │    ├── cardinality: [0 - 1]
  │    │    ├── key: ()
@@ -56,19 +58,21 @@ opt join-limit=3
 SELECT * FROM bx, abc, cy WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
 inner-join (lookup bx)
- ├── columns: b:1(int!null) x:2(int) a:3(int!null) b:4(int!null) c:5(int!null) d:6(int) c:7(int!null) y:8(int)
+ ├── columns: b:1!null x:2 a:3!null b:4!null c:5!null d:6 c:7!null y:8
  ├── key columns: [4] = [1]
+ ├── lookup columns are key
  ├── cardinality: [0 - 1]
  ├── key: ()
  ├── fd: ()-->(1-8)
  ├── inner-join (lookup cy)
- │    ├── columns: a:3(int!null) abc.b:4(int) abc.c:5(int!null) d:6(int) cy.c:7(int!null) y:8(int)
+ │    ├── columns: a:3!null abc.b:4 abc.c:5!null d:6 cy.c:7!null y:8
  │    ├── key columns: [5] = [7]
+ │    ├── lookup columns are key
  │    ├── cardinality: [0 - 1]
  │    ├── key: ()
  │    ├── fd: ()-->(3-8)
  │    ├── scan abc
- │    │    ├── columns: a:3(int!null) abc.b:4(int) abc.c:5(int) d:6(int)
+ │    │    ├── columns: a:3!null abc.b:4 abc.c:5 d:6
  │    │    ├── constraint: /3: [/1 - /1]
  │    │    ├── cardinality: [0 - 1]
  │    │    ├── key: ()
@@ -80,19 +84,21 @@ opt join-limit=3
 SELECT * FROM bx, cy, abc WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
 inner-join (lookup bx)
- ├── columns: b:1(int!null) x:2(int) c:3(int!null) y:4(int) a:5(int!null) b:6(int!null) c:7(int!null) d:8(int)
+ ├── columns: b:1!null x:2 c:3!null y:4 a:5!null b:6!null c:7!null d:8
  ├── key columns: [6] = [1]
+ ├── lookup columns are key
  ├── cardinality: [0 - 1]
  ├── key: ()
  ├── fd: ()-->(1-8)
  ├── inner-join (lookup cy)
- │    ├── columns: cy.c:3(int!null) y:4(int) a:5(int!null) abc.b:6(int) abc.c:7(int!null) d:8(int)
+ │    ├── columns: cy.c:3!null y:4 a:5!null abc.b:6 abc.c:7!null d:8
  │    ├── key columns: [7] = [3]
+ │    ├── lookup columns are key
  │    ├── cardinality: [0 - 1]
  │    ├── key: ()
  │    ├── fd: ()-->(3-8)
  │    ├── scan abc
- │    │    ├── columns: a:5(int!null) abc.b:6(int) abc.c:7(int) d:8(int)
+ │    │    ├── columns: a:5!null abc.b:6 abc.c:7 d:8
  │    │    ├── constraint: /5: [/1 - /1]
  │    │    ├── cardinality: [0 - 1]
  │    │    ├── key: ()
@@ -104,19 +110,21 @@ opt join-limit=2 expect-not=AssociateJoin
 SELECT * FROM bx, cy, abc WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
 inner-join (lookup bx)
- ├── columns: b:1(int!null) x:2(int) c:3(int!null) y:4(int) a:5(int!null) b:6(int!null) c:7(int!null) d:8(int)
+ ├── columns: b:1!null x:2 c:3!null y:4 a:5!null b:6!null c:7!null d:8
  ├── key columns: [6] = [1]
+ ├── lookup columns are key
  ├── cardinality: [0 - 1]
  ├── key: ()
  ├── fd: ()-->(1-8)
  ├── inner-join (lookup cy)
- │    ├── columns: cy.c:3(int!null) y:4(int) a:5(int!null) abc.b:6(int) abc.c:7(int!null) d:8(int)
+ │    ├── columns: cy.c:3!null y:4 a:5!null abc.b:6 abc.c:7!null d:8
  │    ├── key columns: [7] = [3]
+ │    ├── lookup columns are key
  │    ├── cardinality: [0 - 1]
  │    ├── key: ()
  │    ├── fd: ()-->(3-8)
  │    ├── scan abc
- │    │    ├── columns: a:5(int!null) abc.b:6(int) abc.c:7(int) d:8(int)
+ │    │    ├── columns: a:5!null abc.b:6 abc.c:7 d:8
  │    │    ├── constraint: /5: [/1 - /1]
  │    │    ├── cardinality: [0 - 1]
  │    │    ├── key: ()
@@ -127,7 +135,7 @@ inner-join (lookup bx)
 memo join-limit=3
 SELECT * FROM bx, cy, abc WHERE a = 1 AND abc.b = bx.b AND abc.c = cy.c
 ----
-memo (optimized, ~31KB, required=[presentation: b:1,x:2,c:3,y:4,a:5,b:6,c:7,d:8])
+memo (optimized, ~32KB, required=[presentation: b:1,x:2,c:3,y:4,a:5,b:6,c:7,d:8])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (merge-join G2 G3 G5 inner-join,+1,+6) (lookup-join G3 G5 bx,keyCols=[6],outCols=(1-8)) (inner-join G6 G7 G8) (inner-join G9 G10 G11) (inner-join G7 G6 G8) (merge-join G6 G7 G5 inner-join,+3,+7) (inner-join G10 G9 G11) (lookup-join G7 G5 cy,keyCols=[7],outCols=(1-8)) (lookup-join G12 G11 abc,keyCols=[11],outCols=(1-8))
  │    └── [presentation: b:1,x:2,c:3,y:4,a:5,b:6,c:7,d:8]
  │         ├── best: (lookup-join G3 G5 bx,keyCols=[6],outCols=(1-8))
@@ -197,28 +205,28 @@ memo (optimized, ~31KB, required=[presentation: b:1,x:2,c:3,y:4,a:5,b:6,c:7,d:8]
 opt join-limit=4
 SELECT * FROM bx, cy, dz, abc WHERE a = 1
 ----
-inner-join (hash)
- ├── columns: b:1(int!null) x:2(int) c:3(int!null) y:4(int) d:5(int!null) z:6(int) a:7(int!null) b:8(int) c:9(int) d:10(int)
+inner-join (cross)
+ ├── columns: b:1!null x:2 c:3!null y:4 d:5!null z:6 a:7!null b:8 c:9 d:10
  ├── key: (1,3,5)
  ├── fd: ()-->(7-10), (1)-->(2), (3)-->(4), (5)-->(6)
- ├── inner-join (hash)
- │    ├── columns: cy.c:3(int!null) y:4(int) dz.d:5(int!null) z:6(int) a:7(int!null) abc.b:8(int) abc.c:9(int) abc.d:10(int)
+ ├── inner-join (cross)
+ │    ├── columns: cy.c:3!null y:4 dz.d:5!null z:6 a:7!null abc.b:8 abc.c:9 abc.d:10
  │    ├── key: (3,5)
  │    ├── fd: ()-->(7-10), (3)-->(4), (5)-->(6)
  │    ├── scan cy
- │    │    ├── columns: cy.c:3(int!null) y:4(int)
+ │    │    ├── columns: cy.c:3!null y:4
  │    │    ├── key: (3)
  │    │    └── fd: (3)-->(4)
- │    ├── inner-join (hash)
- │    │    ├── columns: dz.d:5(int!null) z:6(int) a:7(int!null) abc.b:8(int) abc.c:9(int) abc.d:10(int)
+ │    ├── inner-join (cross)
+ │    │    ├── columns: dz.d:5!null z:6 a:7!null abc.b:8 abc.c:9 abc.d:10
  │    │    ├── key: (5)
  │    │    ├── fd: ()-->(7-10), (5)-->(6)
  │    │    ├── scan dz
- │    │    │    ├── columns: dz.d:5(int!null) z:6(int)
+ │    │    │    ├── columns: dz.d:5!null z:6
  │    │    │    ├── key: (5)
  │    │    │    └── fd: (5)-->(6)
  │    │    ├── scan abc
- │    │    │    ├── columns: a:7(int!null) abc.b:8(int) abc.c:9(int) abc.d:10(int)
+ │    │    │    ├── columns: a:7!null abc.b:8 abc.c:9 abc.d:10
  │    │    │    ├── constraint: /7: [/1 - /1]
  │    │    │    ├── cardinality: [0 - 1]
  │    │    │    ├── key: ()
@@ -226,7 +234,7 @@ inner-join (hash)
  │    │    └── filters (true)
  │    └── filters (true)
  ├── scan bx
- │    ├── columns: bx.b:1(int!null) x:2(int)
+ │    ├── columns: bx.b:1!null x:2
  │    ├── key: (1)
  │    └── fd: (1)-->(2)
  └── filters (true)
@@ -234,7 +242,7 @@ inner-join (hash)
 opt join-limit=3 format=show-all
 SELECT * FROM abc, bx, cy, dz WHERE a = 1
 ----
-inner-join (hash)
+inner-join (cross)
  ├── columns: a:1(int!null) b:2(int) c:3(int) d:4(int) b:5(int!null) x:6(int) c:7(int!null) y:8(int) d:9(int!null) z:10(int)
  ├── stats: [rows=1e+09]
  ├── cost: 32525668.7
@@ -242,7 +250,7 @@ inner-join (hash)
  ├── fd: ()-->(1-4), (5)-->(6), (7)-->(8), (9)-->(10)
  ├── prune: (2-10)
  ├── interesting orderings: (+7) (+9) (+5) (+1)
- ├── inner-join (hash)
+ ├── inner-join (cross)
  │    ├── columns: t.public.bx.b:5(int!null) t.public.bx.x:6(int) t.public.cy.c:7(int!null) t.public.cy.y:8(int) t.public.dz.d:9(int!null) t.public.dz.z:10(int)
  │    ├── stats: [rows=1e+09]
  │    ├── cost: 10025667.6
@@ -251,7 +259,7 @@ inner-join (hash)
  │    ├── prune: (5-10)
  │    ├── interesting orderings: (+7) (+9) (+5)
  │    ├── join-size: 3
- │    ├── inner-join (hash)
+ │    ├── inner-join (cross)
  │    │    ├── columns: t.public.cy.c:7(int!null) t.public.cy.y:8(int) t.public.dz.d:9(int!null) t.public.dz.z:10(int)
  │    │    ├── stats: [rows=1000000]
  │    │    ├── cost: 12110.05
@@ -346,7 +354,7 @@ memo (optimized, ~12KB, required=[presentation: b:1,x:2,c:3,y:4,d:5,z:6,a:7,b:8,
 memo join-limit=4
 SELECT * FROM bx, cy, dz, abc WHERE a = 1
 ----
-memo (optimized, ~27KB, required=[presentation: b:1,x:2,c:3,y:4,d:5,z:6,a:7,b:8,c:9,d:10])
+memo (optimized, ~28KB, required=[presentation: b:1,x:2,c:3,y:4,d:5,z:6,a:7,b:8,c:9,d:10])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (inner-join G5 G6 G4) (inner-join G7 G8 G4) (inner-join G9 G10 G4) (inner-join G11 G12 G4) (inner-join G13 G14 G4) (inner-join G15 G16 G4) (inner-join G6 G5 G4) (inner-join G8 G7 G4) (inner-join G10 G9 G4) (inner-join G12 G11 G4) (inner-join G14 G13 G4) (inner-join G16 G15 G4)
  │    └── [presentation: b:1,x:2,c:3,y:4,d:5,z:6,a:7,b:8,c:9,d:10]
  │         ├── best: (inner-join G3 G2 G4)
@@ -434,58 +442,59 @@ WHERE
     a4.id = 1 AND (SELECT true FROM a WHERE a1.id = 1)
 ----
 project
- ├── columns: "?column?":7(int!null)
+ ├── columns: "?column?":7!null
  ├── fd: ()-->(7)
  ├── inner-join (hash)
- │    ├── columns: a1.id:1(int!null) a2.id:2(int!null) a3.id:3(int!null) a4.id:4(int!null) bool:6(bool!null)
+ │    ├── columns: a1.id:1!null a2.id:2!null a3.id:3!null a4.id:4!null bool:6!null
  │    ├── key: (3)
  │    ├── fd: ()-->(2,4,6), (1)==(3), (3)==(1)
  │    ├── scan a3
- │    │    ├── columns: a3.id:3(int!null)
+ │    │    ├── columns: a3.id:3!null
  │    │    └── key: (3)
- │    ├── inner-join (hash)
- │    │    ├── columns: a1.id:1(int!null) a2.id:2(int!null) a4.id:4(int!null) bool:6(bool!null)
+ │    ├── inner-join (cross)
+ │    │    ├── columns: a1.id:1!null a2.id:2!null a4.id:4!null bool:6!null
  │    │    ├── key: (1)
  │    │    ├── fd: ()-->(2,4,6)
  │    │    ├── inner-join-apply
- │    │    │    ├── columns: a1.id:1(int!null) bool:6(bool!null)
+ │    │    │    ├── columns: a1.id:1!null bool:6!null
  │    │    │    ├── key: (1)
  │    │    │    ├── fd: ()-->(6)
  │    │    │    ├── scan a1
- │    │    │    │    ├── columns: a1.id:1(int!null)
+ │    │    │    │    ├── columns: a1.id:1!null
  │    │    │    │    └── key: (1)
  │    │    │    ├── max1-row
- │    │    │    │    ├── columns: bool:6(bool!null)
+ │    │    │    │    ├── columns: bool:6!null
+ │    │    │    │    ├── error: "more than one row returned by a subquery used as an expression"
  │    │    │    │    ├── outer: (1)
  │    │    │    │    ├── cardinality: [0 - 1]
  │    │    │    │    ├── key: ()
  │    │    │    │    ├── fd: ()-->(6)
  │    │    │    │    └── project
- │    │    │    │         ├── columns: bool:6(bool!null)
+ │    │    │    │         ├── columns: bool:6!null
  │    │    │    │         ├── outer: (1)
  │    │    │    │         ├── fd: ()-->(6)
  │    │    │    │         ├── select
  │    │    │    │         │    ├── outer: (1)
  │    │    │    │         │    ├── scan a
  │    │    │    │         │    └── filters
- │    │    │    │         │         └── a1.id = 1 [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
+ │    │    │    │         │         └── a1.id:1 = 1 [outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
  │    │    │    │         └── projections
- │    │    │    │              └── true [type=bool]
+ │    │    │    │              └── true [as=bool:6]
  │    │    │    └── filters
- │    │    │         └── variable: bool [type=bool, outer=(6), constraints=(/6: [/true - /true]; tight), fd=()-->(6)]
- │    │    ├── inner-join (hash)
- │    │    │    ├── columns: a2.id:2(int!null) a4.id:4(int!null)
+ │    │    │         └── bool:6 [outer=(6), constraints=(/6: [/true - /true]; tight), fd=()-->(6)]
+ │    │    ├── inner-join (cross)
+ │    │    │    ├── columns: a2.id:2!null a4.id:4!null
  │    │    │    ├── cardinality: [0 - 1]
  │    │    │    ├── key: ()
  │    │    │    ├── fd: ()-->(2,4)
  │    │    │    ├── scan a2
- │    │    │    │    ├── columns: a2.id:2(int!null)
+ │    │    │    │    ├── columns: a2.id:2!null
  │    │    │    │    ├── constraint: /2: [/1 - /1]
  │    │    │    │    ├── cardinality: [0 - 1]
  │    │    │    │    ├── key: ()
  │    │    │    │    └── fd: ()-->(2)
  │    │    │    ├── scan a4
- │    │    │    │    ├── columns: a4.id:4(int!null)
+ │    │    │    │    ├── columns: a4.id:4!null
  │    │    │    │    ├── constraint: /4: [/1 - /1]
  │    │    │    │    ├── cardinality: [0 - 1]
  │    │    │    │    ├── key: ()
@@ -493,176 +502,6 @@ project
  │    │    │    └── filters (true)
  │    │    └── filters (true)
  │    └── filters
- │         └── a1.id = a3.id [type=bool, outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
+ │         └── a1.id:1 = a3.id:3 [outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
  └── projections
-      └── const: 1 [type=int]
-
-# Regression test for #35253.
-
-exec-ddl
-CREATE TABLE x (a INT8 PRIMARY KEY)
-----
-
-memo join-limit=4
-SELECT
-    *
-FROM
-    x AS y
-    JOIN [INSERT INTO x (a) SELECT NULL FROM x RETURNING 1] ON false
-    JOIN x ON true
-    JOIN [UPDATE x SET a = 1 RETURNING 1] ON true
-----
-memo (optimized, ~59KB, required=[presentation: a:1,?column?:5,a:6,?column?:10])
- ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4) (inner-join G5 G6 G4) (inner-join G7 G8 G4) (inner-join G9 G10 G4) (inner-join G11 G12 G4) (inner-join G13 G14 G4) (inner-join G15 G16 G4) (inner-join G11 G17 G4) (inner-join G18 G16 G4) (inner-join G6 G5 G4) (inner-join G11 G19 G4) (inner-join G8 G7 G4) (inner-join G10 G9 G4) (inner-join G12 G11 G4) (inner-join G14 G13 G4) (inner-join G11 G20 G4) (inner-join G16 G15 G4) (inner-join G17 G11 G4) (inner-join G16 G18 G4) (inner-join G19 G11 G4) (inner-join G16 G21 G4) (inner-join G16 G22 G4) (inner-join G20 G11 G4) (inner-join G3 G23 G4) (inner-join G24 G16 G4) (inner-join G21 G16 G4) (inner-join G11 G25 G4) (inner-join G3 G26 G4) (inner-join G22 G16 G4) (inner-join G11 G27 G4) (inner-join G3 G28 G4) (inner-join G3 G29 G4) (inner-join G30 G16 G4) (inner-join G23 G3 G4) (inner-join G16 G24 G4) (inner-join G25 G11 G4) (inner-join G26 G3 G4) (inner-join G27 G11 G4) (inner-join G28 G3 G4) (inner-join G29 G3 G4) (inner-join G16 G30 G4)
- │    └── [presentation: a:1,?column?:5,a:6,?column?:10]
- │         ├── best: (inner-join G3 G2 G4)
- │         └── cost: 2112.64
- ├── G2: (inner-join G5 G7 G4) (inner-join G7 G5 G4) (inner-join G9 G13 G4) (inner-join G11 G15 G4) (inner-join G13 G9 G4) (inner-join G15 G11 G4) (inner-join G11 G18 G4) (inner-join G18 G11 G4)
- │    └── []
- │         ├── best: (inner-join G11 G15 G4)
- │         └── cost: 1040.08
- ├── G3: (project G31 G32)
- │    └── []
- │         ├── best: (project G31 G32)
- │         └── cost: 1060.05
- ├── G4: (filters)
- ├── G5: (inner-join G9 G11 G4) (inner-join G11 G9 G4)
- │    └── []
- │         ├── best: (inner-join G9 G11 G4)
- │         └── cost: 1040.08
- ├── G6: (inner-join G7 G3 G4) (inner-join G3 G7 G4)
- │    └── []
- │         ├── best: (inner-join G7 G3 G4)
- │         └── cost: 12110.08
- ├── G7: (scan x)
- │    └── []
- │         ├── best: (scan x)
- │         └── cost: 1020.02
- ├── G8: (inner-join G5 G3 G4) (inner-join G3 G5 G4) (inner-join G9 G16 G4) (inner-join G11 G14 G4) (inner-join G16 G9 G4) (inner-join G14 G11 G4)
- │    └── []
- │         ├── best: (inner-join G3 G5 G4)
- │         └── cost: 2112.64
- ├── G9: (values G33 id=v1)
- │    └── []
- │         ├── best: (values G33 id=v1)
- │         └── cost: 0.01
- ├── G10: (inner-join G13 G3 G4) (inner-join G3 G13 G4) (inner-join G11 G6 G4) (inner-join G7 G16 G4) (inner-join G6 G11 G4) (inner-join G16 G7 G4)
- │    └── []
- │         ├── best: (inner-join G3 G13 G4)
- │         └── cost: 3145.15
- ├── G11: (project G34 G32)
- │    └── []
- │         ├── best: (project G34 G32)
- │         └── cost: 1040.06
- ├── G12: (inner-join G15 G3 G4) (inner-join G3 G15 G4)
- │    └── []
- │         ├── best: (inner-join G3 G15 G4)
- │         └── cost: 1072.57
- ├── G13: (inner-join G11 G7 G4) (inner-join G7 G11 G4)
- │    └── []
- │         ├── best: (inner-join G7 G11 G4)
- │         └── cost: 2072.59
- ├── G14: (inner-join G9 G3 G4) (inner-join G3 G9 G4)
- │    └── []
- │         ├── best: (inner-join G3 G9 G4)
- │         └── cost: 1072.57
- ├── G15: (values G33 id=v2)
- │    └── []
- │         ├── best: (values G33 id=v2)
- │         └── cost: 0.01
- ├── G16: (inner-join G11 G3 G4) (inner-join G3 G11 G4)
- │    └── []
- │         ├── best: (inner-join G3 G11 G4)
- │         └── cost: 2112.62
- ├── G17: (inner-join G18 G3 G4) (inner-join G3 G18 G4)
- │    └── []
- │         ├── best: (inner-join G3 G18 G4)
- │         └── cost: 1072.57
- ├── G18: (values G33 id=v3)
- │    └── []
- │         ├── best: (values G33 id=v3)
- │         └── cost: 0.01
- ├── G19: (inner-join G9 G6 G4) (inner-join G6 G9 G4) (inner-join G3 G24 G4) (inner-join G24 G3 G4)
- │    └── []
- │         ├── best: (inner-join G3 G24 G4)
- │         └── cost: 1072.57
- ├── G20: (inner-join G7 G14 G4) (inner-join G14 G7 G4) (inner-join G3 G30 G4) (inner-join G30 G3 G4)
- │    └── []
- │         ├── best: (inner-join G3 G30 G4)
- │         └── cost: 1072.57
- ├── G21: (values G33 id=v6)
- │    └── []
- │         ├── best: (values G33 id=v6)
- │         └── cost: 0.01
- ├── G22: (values G33 id=v7)
- │    └── []
- │         ├── best: (values G33 id=v7)
- │         └── cost: 0.01
- ├── G23: (inner-join G24 G11 G4) (inner-join G11 G24 G4)
- │    └── []
- │         ├── best: (inner-join G24 G11 G4)
- │         └── cost: 1040.08
- ├── G24: (values G33 id=v4)
- │    └── []
- │         ├── best: (values G33 id=v4)
- │         └── cost: 0.01
- ├── G25: (inner-join G3 G21 G4) (inner-join G21 G3 G4)
- │    └── []
- │         ├── best: (inner-join G3 G21 G4)
- │         └── cost: 1072.57
- ├── G26: (inner-join G11 G21 G4) (inner-join G21 G11 G4)
- │    └── []
- │         ├── best: (inner-join G11 G21 G4)
- │         └── cost: 1040.08
- ├── G27: (inner-join G3 G22 G4) (inner-join G22 G3 G4)
- │    └── []
- │         ├── best: (inner-join G3 G22 G4)
- │         └── cost: 1072.57
- ├── G28: (inner-join G11 G22 G4) (inner-join G22 G11 G4)
- │    └── []
- │         ├── best: (inner-join G11 G22 G4)
- │         └── cost: 1040.08
- ├── G29: (inner-join G30 G11 G4) (inner-join G11 G30 G4)
- │    └── []
- │         ├── best: (inner-join G30 G11 G4)
- │         └── cost: 1040.08
- ├── G30: (values G33 id=v5)
- │    └── []
- │         ├── best: (values G33 id=v5)
- │         └── cost: 0.01
- ├── G31: (update G35 G36 x)
- │    └── []
- │         ├── best: (update G35 G36 x)
- │         └── cost: 1040.04
- ├── G32: (projections G37)
- ├── G33: (scalar-list)
- ├── G34: (select G38 G39)
- │    └── []
- │         ├── best: (select G38 G39)
- │         └── cost: 1040.05
- ├── G35: (project G40 G32 a)
- │    └── []
- │         ├── best: (project G40 G32 a)
- │         └── cost: 1040.03
- ├── G36: (f-k-checks)
- ├── G37: (const 1)
- ├── G38: (insert G41 G36 x)
- │    └── []
- │         ├── best: (insert G41 G36 x)
- │         └── cost: 1030.04
- ├── G39: (filters G42)
- ├── G40: (scan x)
- │    └── []
- │         ├── best: (scan x)
- │         └── cost: 1020.02
- ├── G41: (project G43 G44)
- │    └── []
- │         ├── best: (project G43 G44)
- │         └── cost: 1030.03
- ├── G42: (false)
- ├── G43: (scan x,cols=())
- │    └── []
- │         ├── best: (scan x,cols=())
- │         └── cost: 1010.02
- ├── G44: (projections G45)
- └── G45: (null)
+      └── 1 [as="?column?":7]

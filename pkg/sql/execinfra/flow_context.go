@@ -13,12 +13,11 @@
 package execinfra
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
@@ -49,7 +48,7 @@ type FlowCtx struct {
 	// must be performed. Processors in the Flow will use this txn concurrently.
 	// This field is generally not nil, except for flows that don't run in a
 	// higher-level txn (like backfills).
-	Txn *client.Txn
+	Txn *kv.Txn
 
 	// nodeID is the ID of the node on which the processors using this FlowCtx
 	// run.
@@ -60,8 +59,6 @@ type FlowCtx struct {
 
 	// Local is true if this flow is being run as part of a local-only query.
 	Local bool
-
-	VectorizedBoundAccount *mon.BoundAccount
 }
 
 // NewEvalCtx returns a modifiable copy of the FlowCtx's EvalContext.

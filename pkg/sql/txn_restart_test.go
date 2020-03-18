@@ -24,15 +24,15 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 type failureRecord struct {
@@ -125,7 +126,7 @@ func injectErrors(
 			{counts: magicVals.restartCounts, errFn: func() error {
 				// Note we use a retry error that cannot be automatically retried
 				// by the transaction coord sender.
-				return roachpb.NewTransactionRetryError(roachpb.RETRY_POSSIBLE_REPLAY, "injected err")
+				return roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "injected err")
 			}},
 			{counts: magicVals.abortCounts, errFn: func() error {
 				return roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_ABORTED_RECORD_FOUND)
@@ -612,10 +613,7 @@ BEGIN;
 
 	// Continue the txn in a new request, which is not retriable.
 	_, err = sqlDB.Exec("INSERT INTO t.public.test(k, v, t) VALUES (4, 'hooly', cluster_logical_timestamp())")
-	if !testutils.IsError(
-		err, "RETRY_POSSIBLE_REPLAY") {
-		t.Errorf("didn't get expected injected error. Got: %v", err)
-	}
+	require.Error(t, err, "RETRY_REASON_UNKNOWN - injected err")
 }
 
 // Test that aborted txn are only retried once.
@@ -765,7 +763,7 @@ func TestTxnUserRestart(t *testing.T) {
 			magicVals: createFilterVals(
 				map[string]int{"boulanger": 2}, // restartCounts
 				nil),
-			expectedErr: "RETRY_POSSIBLE_REPLAY",
+			expectedErr: "RETRY_REASON_UNKNOWN",
 		},
 		{
 			magicVals: createFilterVals(
@@ -1067,13 +1065,12 @@ func TestUnexpectedStatementInRestartWait(t *testing.T) {
 	if err := tx.QueryRow("SHOW TRANSACTION STATUS").Scan(&state); err != nil {
 		t.Fatal(err)
 	}
-	if state != "RestartWait" {
-		t.Fatalf("expected state %s, got: %s", "RestartWait", state)
+	if state != "Aborted" {
+		t.Fatalf("expected state %s, got: %s", "Aborted", state)
 	}
 
 	if _, err := tx.Exec("SELECT 1"); !testutils.IsError(err,
-		`pq: Expected "ROLLBACK TO SAVEPOINT COCKROACH_RESTART": `+
-			"current transaction is aborted, commands ignored until end of transaction block") {
+		`pq: current transaction is aborted, commands ignored until end of transaction block`) {
 		t.Fatal(err)
 	}
 	if err := tx.QueryRow("SHOW TRANSACTION STATUS").Scan(&state); err != nil {
@@ -1100,7 +1097,7 @@ func TestNonRetryableError(t *testing.T) {
 	cleanupFilter := cmdFilters.AppendFilter(
 		func(args storagebase.FilterArgs) *roachpb.Error {
 			if req, ok := args.Req.(*roachpb.ScanRequest); ok {
-				if bytes.Contains(req.Key, testKey) && !client.TestingIsRangeLookupRequest(req) {
+				if bytes.Contains(req.Key, testKey) && !kv.TestingIsRangeLookupRequest(req) {
 					hitError = true
 					return roachpb.NewErrorWithTxn(fmt.Errorf("testError"), args.Hdr.Txn)
 				}
@@ -1125,22 +1122,23 @@ SELECT * from t.test WHERE k = 'test_key';
 	}
 }
 
-// Verifies that an expired lease is released and a new lease is acquired on transaction
-// restart.
+// Verifies that an expired lease is released and a new lease is acquired on
+// transaction restart.
 //
-// This test triggers the above scenario by making ReadWithinUncertaintyIntervalError advance
-// the clock, so that the transaction timestamp exceeds the deadline of the EndTransactionRequest.
+// This test triggers the above scenario by making
+// ReadWithinUncertaintyIntervalError advance the clock, so that the transaction
+// timestamp exceeds the deadline of the EndTxnRequest.
 func TestReacquireLeaseOnRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	advancement := 2 * base.DefaultTableDescriptorLeaseDuration
 
 	var cmdFilters tests.CommandFilters
-	cmdFilters.AppendFilter(tests.CheckEndTransactionTrigger, true)
+	cmdFilters.AppendFilter(tests.CheckEndTxnTrigger, true)
 
 	var clockUpdate int32
 	testKey := []byte("test_key")
-	storeTestingKnobs := &storage.StoreTestingKnobs{
+	storeTestingKnobs := &kvserver.StoreTestingKnobs{
 		EvalKnobs: storagebase.BatchEvalTestingKnobs{
 			TestingEvalFilter: cmdFilters.RunFilters,
 		},
@@ -1153,7 +1151,7 @@ func TestReacquireLeaseOnRestart(t *testing.T) {
 			// Hack to advance the transaction timestamp on a transaction restart.
 			for _, union := range ba.Requests {
 				if req, ok := union.GetInner().(*roachpb.ScanRequest); ok {
-					if bytes.Contains(req.Key, testKey) && !client.TestingIsRangeLookupRequest(req) {
+					if bytes.Contains(req.Key, testKey) && !kv.TestingIsRangeLookupRequest(req) {
 						atomic.AddInt32(&clockUpdate, 1)
 						now := c.Now()
 						now.WallTime += advancement.Nanoseconds()
@@ -1166,7 +1164,7 @@ func TestReacquireLeaseOnRestart(t *testing.T) {
 	}
 
 	const refreshAttempts = 3
-	clientTestingKnobs := &kv.ClientTestingKnobs{
+	clientTestingKnobs := &kvcoord.ClientTestingKnobs{
 		MaxTxnRefreshAttempts: refreshAttempts,
 	}
 
@@ -1186,7 +1184,7 @@ func TestReacquireLeaseOnRestart(t *testing.T) {
 			}
 
 			if req, ok := args.Req.(*roachpb.ScanRequest); ok {
-				if bytes.Contains(req.Key, testKey) && !client.TestingIsRangeLookupRequest(req) {
+				if bytes.Contains(req.Key, testKey) && !kv.TestingIsRangeLookupRequest(req) {
 					atomic.AddInt32(&restartDone, 1)
 					// Return ReadWithinUncertaintyIntervalError to update the transaction timestamp on retry.
 					txn := args.Hdr.Txn
@@ -1235,9 +1233,9 @@ func TestFlushUncommitedDescriptorCacheOnRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	var cmdFilters tests.CommandFilters
-	cmdFilters.AppendFilter(tests.CheckEndTransactionTrigger, true)
+	cmdFilters.AppendFilter(tests.CheckEndTxnTrigger, true)
 	testKey := []byte("test_key")
-	testingKnobs := &storage.StoreTestingKnobs{
+	testingKnobs := &kvserver.StoreTestingKnobs{
 		EvalKnobs: storagebase.BatchEvalTestingKnobs{
 			TestingEvalFilter: cmdFilters.RunFilters,
 		},
@@ -1256,7 +1254,7 @@ func TestFlushUncommitedDescriptorCacheOnRestart(t *testing.T) {
 			}
 
 			if req, ok := args.Req.(*roachpb.ScanRequest); ok {
-				if bytes.Contains(req.Key, testKey) && !client.TestingIsRangeLookupRequest(req) {
+				if bytes.Contains(req.Key, testKey) && !kv.TestingIsRangeLookupRequest(req) {
 					atomic.AddInt32(&restartDone, 1)
 					// Return ReadWithinUncertaintyIntervalError.
 					txn := args.Hdr.Txn
@@ -1311,7 +1309,7 @@ func TestDistSQLRetryableError(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				UseDatabase: "test",
 				Knobs: base.TestingKnobs{
-					Store: &storage.StoreTestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
 						EvalKnobs: storagebase.BatchEvalTestingKnobs{
 							TestingEvalFilter: func(fArgs storagebase.FilterArgs) *roachpb.Error {
 								_, ok := fArgs.Req.(*roachpb.ScanRequest)
@@ -1450,12 +1448,6 @@ func TestRollbackToSavepointFromUnusualStates(t *testing.T) {
 		}
 	}
 
-	// ROLLBACK TO SAVEPOINT with a wrong name
-	_, err := sqlDB.Exec("ROLLBACK TO SAVEPOINT foo")
-	if !testutils.IsError(err, "SAVEPOINT not supported except for cockroach_restart") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
 	tx, err := sqlDB.Begin()
 	if err != nil {
 		t.Fatal(err)
@@ -1514,7 +1506,7 @@ func TestTxnAutoRetriesDisabledAfterResultsHaveBeenSentToClient(t *testing.T) {
 		{
 			name:                              "client_directed_retries",
 			clientDirectedRetry:               true,
-			expectedTxnStateAfterRetriableErr: "RestartWait",
+			expectedTxnStateAfterRetriableErr: "Aborted",
 		},
 		{
 			name:                              "no_client_directed_retries",

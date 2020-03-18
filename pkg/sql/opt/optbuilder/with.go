@@ -20,6 +20,17 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+func (b *Builder) processWiths(
+	with *tree.With, inScope *scope, buildStmt func(inScope *scope) *scope,
+) *scope {
+	inScope = b.buildCTEs(with, inScope)
+	prevAtRoot := inScope.atRoot
+	inScope.atRoot = false
+	outScope := buildStmt(inScope)
+	inScope.atRoot = prevAtRoot
+	return outScope
+}
+
 func (b *Builder) buildCTE(
 	cte *tree.CTE, inScope *scope, isRecursive bool,
 ) (memo.RelExpr, physical.Presentation) {
@@ -86,7 +97,11 @@ func (b *Builder) buildCTE(
 			cte.Name.Alias,
 		))
 	}
+	// If the initial statement contains CTEs, we don't want the Withs hoisted
+	// above the recursive CTE.
+	b.pushWithFrame()
 	initialScope := b.buildStmt(initial, nil /* desiredTypes */, cteScope)
+	b.popWithFrame(initialScope)
 
 	initialScope.removeHiddenCols()
 	b.dropOrderingAndExtraCols(initialScope)
@@ -128,7 +143,11 @@ func (b *Builder) buildCTE(
 		numRefs++
 	}
 
-	recursiveScope := b.buildSelect(recursive, initialTypes /* desiredTypes */, cteScope)
+	// If the recursive statement contains CTEs, we don't want the Withs hoisted
+	// above the recursive CTE.
+	b.pushWithFrame()
+	recursiveScope := b.buildStmt(recursive, initialTypes /* desiredTypes */, cteScope)
+	b.popWithFrame(recursiveScope)
 
 	if numRefs == 0 {
 		// Build this as a non-recursive CTE.

@@ -16,16 +16,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan/replicaoracle"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/closedts"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -34,25 +34,20 @@ import (
 // followerReadMultiple is the multiple of kv.closed_timestmap.target_duration
 // which the implementation of the follower read capable replica policy ought
 // to use to determine if a request can be used for reading.
-// FollowerReadMultiple is a hidden setting.
-var followerReadMultiple = func() *settings.FloatSetting {
-	s := settings.RegisterValidatedFloatSetting(
-		"kv.follower_read.target_multiple",
-		"if above 1, encourages the distsender to perform a read against the "+
-			"closest replica if a request is older than kv.closed_timestamp.target_duration"+
-			" * (1 + kv.closed_timestamp.close_fraction * this) less a clock uncertainty "+
-			"interval. This value also is used to create follower_timestamp().",
-		3,
-		func(v float64) error {
-			if v < 1 {
-				return fmt.Errorf("%v is not >= 1", v)
-			}
-			return nil
-		},
-	)
-	s.SetSensitive()
-	return s
-}()
+var followerReadMultiple = settings.RegisterValidatedFloatSetting(
+	"kv.follower_read.target_multiple",
+	"if above 1, encourages the distsender to perform a read against the "+
+		"closest replica if a request is older than kv.closed_timestamp.target_duration"+
+		" * (1 + kv.closed_timestamp.close_fraction * this) less a clock uncertainty "+
+		"interval. This value also is used to create follower_timestamp().",
+	3,
+	func(v float64) error {
+		if v < 1 {
+			return fmt.Errorf("%v is not >= 1", v)
+		}
+		return nil
+	},
+)
 
 // getFollowerReadOffset returns the offset duration which should be used to as
 // the offset from now to request a follower read. The same value less the clock
@@ -81,18 +76,22 @@ func evalFollowerReadOffset(clusterID uuid.UUID, st *cluster.Settings) (time.Dur
 // batchCanBeEvaluatedOnFollower determines if a batch consists exclusively of
 // requests that can be evaluated on a follower replica.
 func batchCanBeEvaluatedOnFollower(ba roachpb.BatchRequest) bool {
-	return ba.IsReadOnly() && ba.IsAllTransactional()
+	return !ba.IsLocking() && ba.IsAllTransactional()
 }
 
 // txnCanPerformFollowerRead determines if the provided transaction can perform
 // follower reads.
 func txnCanPerformFollowerRead(txn *roachpb.Transaction) bool {
-	return txn != nil && !txn.IsWriting()
+	// If the request is transactional and that transaction has acquired any
+	// locks then that request should not perform follower reads. Doing so could
+	// allow the request to miss its own writes or observe state that conflicts
+	// with its locks.
+	return txn != nil && !txn.IsLocking()
 }
 
 // canUseFollowerRead determines if a query can be sent to a follower.
 func canUseFollowerRead(clusterID uuid.UUID, st *cluster.Settings, ts hlc.Timestamp) bool {
-	if !storage.FollowerReadsEnabled.Get(&st.SV) {
+	if !kvserver.FollowerReadsEnabled.Get(&st.SV) {
 		return false
 	}
 	threshold := (-1 * getFollowerReadDuration(st)) - 1*base.DefaultMaxClockOffset
@@ -107,7 +106,7 @@ func canUseFollowerRead(clusterID uuid.UUID, st *cluster.Settings, ts hlc.Timest
 func canSendToFollower(clusterID uuid.UUID, st *cluster.Settings, ba roachpb.BatchRequest) bool {
 	return batchCanBeEvaluatedOnFollower(ba) &&
 		txnCanPerformFollowerRead(ba.Txn) &&
-		canUseFollowerRead(clusterID, st, forward(ba.Txn.OrigTimestamp, ba.Txn.MaxTimestamp))
+		canUseFollowerRead(clusterID, st, forward(ba.Txn.ReadTimestamp, ba.Txn.MaxTimestamp))
 }
 
 func forward(ts hlc.Timestamp, to hlc.Timestamp) hlc.Timestamp {
@@ -132,8 +131,8 @@ func newOracleFactory(cfg replicaoracle.Config) replicaoracle.OracleFactory {
 	}
 }
 
-func (f oracleFactory) Oracle(txn *client.Txn) replicaoracle.Oracle {
-	if txn != nil && canUseFollowerRead(f.clusterID.Get(), f.st, txn.OrigTimestamp()) {
+func (f oracleFactory) Oracle(txn *kv.Txn) replicaoracle.Oracle {
+	if txn != nil && canUseFollowerRead(f.clusterID.Get(), f.st, txn.ReadTimestamp()) {
 		return f.closest.Oracle(txn)
 	}
 	return f.binPacking.Oracle(txn)
@@ -146,5 +145,5 @@ var followerReadAwareChoice = replicaoracle.RegisterPolicy(newOracleFactory)
 func init() {
 	sql.ReplicaOraclePolicy = followerReadAwareChoice
 	builtins.EvalFollowerReadOffset = evalFollowerReadOffset
-	kv.CanSendToFollower = canSendToFollower
+	kvcoord.CanSendToFollower = canSendToFollower
 }

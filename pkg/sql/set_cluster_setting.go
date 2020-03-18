@@ -16,25 +16,27 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // setClusterSettingNode represents a SET CLUSTER SETTING statement.
 type setClusterSettingNode struct {
 	name    string
 	st      *cluster.Settings
-	setting settings.Setting
+	setting settings.WritableSetting
 	// If value is nil, the setting should be reset.
 	value tree.TypedExpr
 }
@@ -50,9 +52,14 @@ func (p *planner) SetClusterSetting(
 
 	name := strings.ToLower(n.Name)
 	st := p.EvalContext().Settings
-	setting, ok := settings.Lookup(name)
+	v, ok := settings.Lookup(name, settings.LookupForLocalAccess)
 	if !ok {
 		return nil, errors.Errorf("unknown cluster setting '%s'", name)
+	}
+
+	setting, ok := v.(settings.WritableSetting)
+	if !ok {
+		return nil, errors.AssertionFailedf("expected writable setting, got %T", v)
 	}
 
 	var value tree.TypedExpr
@@ -103,13 +110,14 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 
 	execCfg := params.extendedEvalCtx.ExecCfg
 	var expectedEncodedValue string
-	if err := execCfg.DB.Txn(params.ctx, func(ctx context.Context, txn *client.Txn) error {
+	if err := execCfg.DB.Txn(params.ctx, func(ctx context.Context, txn *kv.Txn) error {
 		var reportedValue string
 		if n.value == nil {
 			reportedValue = "DEFAULT"
 			expectedEncodedValue = n.setting.EncodedDefault()
-			if _, err := execCfg.InternalExecutor.Exec(
+			if _, err := execCfg.InternalExecutor.ExecEx(
 				ctx, "reset-setting", txn,
+				sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 				"DELETE FROM system.settings WHERE name = $1", n.name,
 			); err != nil {
 				return err
@@ -122,8 +130,10 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			reportedValue = tree.AsStringWithFlags(value, tree.FmtBareStrings)
 			var prev tree.Datum
 			if _, ok := n.setting.(*settings.StateMachineSetting); ok {
-				datums, err := execCfg.InternalExecutor.QueryRow(
-					ctx, "retrieve-prev-setting", txn, "SELECT value FROM system.settings WHERE name = $1", n.name,
+				datums, err := execCfg.InternalExecutor.QueryRowEx(
+					ctx, "retrieve-prev-setting", txn,
+					sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+					"SELECT value FROM system.settings WHERE name = $1", n.name,
 				)
 				if err != nil {
 					return err
@@ -142,8 +152,9 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			if err != nil {
 				return err
 			}
-			if _, err = execCfg.InternalExecutor.Exec(
+			if _, err = execCfg.InternalExecutor.ExecEx(
 				ctx, "update-setting", txn,
+				sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 				`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
 				n.name, encoded, n.setting.Typ(),
 			); err != nil {
@@ -208,6 +219,13 @@ func (n *setClusterSettingNode) Next(_ runParams) (bool, error) { return false, 
 func (n *setClusterSettingNode) Values() tree.Datums            { return nil }
 func (n *setClusterSettingNode) Close(_ context.Context)        {}
 
+// toSettingString takes in a datum that's supposed to become the value for a
+// Setting and validates it, returning the string representation of the new
+// value as it needs to be inserted into the system.settings table.
+//
+// Args:
+// prev: Only specified if the setting is a StateMachineSetting. Represents the
+//   current value of the setting, read from the system.settings table.
 func toSettingString(
 	ctx context.Context, st *cluster.Settings, name string, s settings.Setting, d, prev tree.Datum,
 ) (string, error) {
@@ -227,7 +245,7 @@ func toSettingString(
 				return "", errors.New("the existing value is not a string")
 			}
 			prevRawVal := []byte(string(*dStr))
-			newBytes, _, err := setting.Validate(&st.SV, prevRawVal, (*string)(s))
+			newBytes, err := setting.Validate(ctx, &st.SV, prevRawVal, string(*s))
 			if err != nil {
 				return "", err
 			}

@@ -12,11 +12,13 @@ package types
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/lib/pq/oid"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestTypes(t *testing.T) {
@@ -155,9 +157,107 @@ func TestTypes(t *testing.T) {
 		{Int2, MakeScalar(IntFamily, oid.T_int2, 0, 16, emptyLocale)},
 
 		// INTERVAL
-		{Interval, &T{InternalType: InternalType{
-			Family: IntervalFamily, Oid: oid.T_interval, Locale: &emptyLocale}}},
-		{Interval, MakeScalar(IntervalFamily, oid.T_interval, 0, 0, emptyLocale)},
+		{
+			Interval,
+			&T{
+				InternalType: InternalType{
+					Family:                IntervalFamily,
+					Oid:                   oid.T_interval,
+					Locale:                &emptyLocale,
+					IntervalDurationField: &IntervalDurationField{},
+					// Precision and PrecisionIsSet is not set.
+				},
+			},
+		},
+		{
+			MakeInterval(IntervalTypeMetadata{Precision: 0, PrecisionIsSet: true}),
+			MakeScalar(IntervalFamily, oid.T_interval, 0, 0, emptyLocale),
+		},
+		{
+			MakeInterval(IntervalTypeMetadata{Precision: 0, PrecisionIsSet: true}),
+			&T{
+				InternalType: InternalType{
+					Family:                IntervalFamily,
+					Precision:             0,
+					TimePrecisionIsSet:    true,
+					Oid:                   oid.T_interval,
+					Locale:                &emptyLocale,
+					IntervalDurationField: &IntervalDurationField{},
+				},
+			},
+		},
+		{
+			MakeInterval(IntervalTypeMetadata{Precision: 3, PrecisionIsSet: true}),
+			&T{
+				InternalType: InternalType{
+					Family:                IntervalFamily,
+					Oid:                   oid.T_interval,
+					Precision:             3,
+					TimePrecisionIsSet:    true,
+					Locale:                &emptyLocale,
+					IntervalDurationField: &IntervalDurationField{},
+				},
+			},
+		},
+		{
+			MakeInterval(IntervalTypeMetadata{Precision: 3, PrecisionIsSet: true}),
+			MakeScalar(IntervalFamily, oid.T_interval, 3, 0, emptyLocale),
+		},
+		{
+			MakeInterval(IntervalTypeMetadata{Precision: 6, PrecisionIsSet: true}),
+			&T{
+				InternalType: InternalType{
+					Family:                IntervalFamily,
+					Oid:                   oid.T_interval,
+					Precision:             6,
+					TimePrecisionIsSet:    true,
+					Locale:                &emptyLocale,
+					IntervalDurationField: &IntervalDurationField{},
+				},
+			},
+		},
+		{
+			MakeInterval(IntervalTypeMetadata{Precision: 6, PrecisionIsSet: true}),
+			MakeScalar(IntervalFamily, oid.T_interval, 6, 0, emptyLocale)},
+		{
+			MakeInterval(IntervalTypeMetadata{
+				DurationField: IntervalDurationField{
+					DurationType: IntervalDurationType_SECOND,
+				},
+			}),
+			&T{
+				InternalType: InternalType{
+					Family: IntervalFamily,
+					Oid:    oid.T_interval,
+					Locale: &emptyLocale,
+					IntervalDurationField: &IntervalDurationField{
+						DurationType: IntervalDurationType_SECOND,
+					},
+				},
+			},
+		},
+		{
+			MakeInterval(IntervalTypeMetadata{
+				DurationField: IntervalDurationField{
+					DurationType:     IntervalDurationType_SECOND,
+					FromDurationType: IntervalDurationType_MONTH,
+				},
+				Precision:      3,
+				PrecisionIsSet: true,
+			}),
+			&T{
+				InternalType: InternalType{
+					Family: IntervalFamily,
+					Oid:    oid.T_interval,
+					Locale: &emptyLocale,
+					IntervalDurationField: &IntervalDurationField{
+						DurationType:     IntervalDurationType_SECOND,
+						FromDurationType: IntervalDurationType_MONTH,
+					},
+					Precision:          3,
+					TimePrecisionIsSet: true,
+				}},
+		},
 
 		// JSON
 		{Jsonb, &T{InternalType: InternalType{
@@ -214,25 +314,91 @@ func TestTypes(t *testing.T) {
 		{Name, MakeScalar(StringFamily, oid.T_name, 0, 0, emptyLocale)},
 
 		// TIME
-		{MakeTime(0), Time},
+		{Time, &T{InternalType: InternalType{
+			Family: TimeFamily,
+			Oid:    oid.T_time,
+			Locale: &emptyLocale,
+			// Precision and PrecisionIsSet is not set.
+		}}},
+		{MakeTime(0), MakeScalar(TimeFamily, oid.T_time, 0, 0, emptyLocale)},
 		{MakeTime(0), &T{InternalType: InternalType{
-			Family: TimeFamily, Oid: oid.T_time, Locale: &emptyLocale}}},
+			Family:             TimeFamily,
+			Precision:          0,
+			TimePrecisionIsSet: true,
+			Oid:                oid.T_time,
+			Locale:             &emptyLocale,
+		}}},
+		{MakeTime(3), &T{InternalType: InternalType{
+			Family: TimeFamily, Oid: oid.T_time, Precision: 3, TimePrecisionIsSet: true, Locale: &emptyLocale}}},
+		{MakeTime(3), MakeScalar(TimeFamily, oid.T_time, 3, 0, emptyLocale)},
 		{MakeTime(6), &T{InternalType: InternalType{
-			Family: TimeFamily, Oid: oid.T_time, Precision: 6, Locale: &emptyLocale}}},
+			Family: TimeFamily, Oid: oid.T_time, Precision: 6, TimePrecisionIsSet: true, Locale: &emptyLocale}}},
 		{MakeTime(6), MakeScalar(TimeFamily, oid.T_time, 6, 0, emptyLocale)},
 
+		// TIMETZ
+		{TimeTZ, &T{InternalType: InternalType{
+			Family: TimeTZFamily,
+			Oid:    oid.T_timetz,
+			Locale: &emptyLocale,
+			// Precision and PrecisionIsSet is not set.
+		}}},
+		{MakeTimeTZ(0), MakeScalar(TimeTZFamily, oid.T_timetz, 0, 0, emptyLocale)},
+		{MakeTimeTZ(0), &T{InternalType: InternalType{
+			Family:             TimeTZFamily,
+			Precision:          0,
+			TimePrecisionIsSet: true,
+			Oid:                oid.T_timetz,
+			Locale:             &emptyLocale,
+		}}},
+		{MakeTimeTZ(3), &T{InternalType: InternalType{
+			Family: TimeTZFamily, Oid: oid.T_timetz, Precision: 3, TimePrecisionIsSet: true, Locale: &emptyLocale}}},
+		{MakeTimeTZ(3), MakeScalar(TimeTZFamily, oid.T_timetz, 3, 0, emptyLocale)},
+		{MakeTimeTZ(6), &T{InternalType: InternalType{
+			Family: TimeTZFamily, Oid: oid.T_timetz, Precision: 6, TimePrecisionIsSet: true, Locale: &emptyLocale}}},
+		{MakeTimeTZ(6), MakeScalar(TimeTZFamily, oid.T_timetz, 6, 0, emptyLocale)},
+
 		// TIMESTAMP
+		{Timestamp, &T{InternalType: InternalType{
+			Family: TimestampFamily,
+			Oid:    oid.T_timestamp,
+			Locale: &emptyLocale,
+			// Precision and PrecisionIsSet is not set.
+		}}},
+		{MakeTimestamp(0), MakeScalar(TimestampFamily, oid.T_timestamp, 0, 0, emptyLocale)},
 		{MakeTimestamp(0), &T{InternalType: InternalType{
-			Family: TimestampFamily, Precision: 0, Oid: oid.T_timestamp, Locale: &emptyLocale}}},
+			Family:             TimestampFamily,
+			Precision:          0,
+			TimePrecisionIsSet: true,
+			Oid:                oid.T_timestamp,
+			Locale:             &emptyLocale,
+		}}},
+		{MakeTimestamp(3), &T{InternalType: InternalType{
+			Family: TimestampFamily, Oid: oid.T_timestamp, Precision: 3, TimePrecisionIsSet: true, Locale: &emptyLocale}}},
+		{MakeTimestamp(3), MakeScalar(TimestampFamily, oid.T_timestamp, 3, 0, emptyLocale)},
 		{MakeTimestamp(6), &T{InternalType: InternalType{
-			Family: TimestampFamily, Oid: oid.T_timestamp, Precision: 6, Locale: &emptyLocale}}},
+			Family: TimestampFamily, Oid: oid.T_timestamp, Precision: 6, TimePrecisionIsSet: true, Locale: &emptyLocale}}},
 		{MakeTimestamp(6), MakeScalar(TimestampFamily, oid.T_timestamp, 6, 0, emptyLocale)},
 
 		// TIMESTAMPTZ
+		{TimestampTZ, &T{InternalType: InternalType{
+			Family: TimestampTZFamily,
+			Oid:    oid.T_timestamptz,
+			Locale: &emptyLocale,
+			// Precision and PrecisionIsSet is not set.
+		}}},
+		{MakeTimestampTZ(0), MakeScalar(TimestampTZFamily, oid.T_timestamptz, 0, 0, emptyLocale)},
 		{MakeTimestampTZ(0), &T{InternalType: InternalType{
-			Family: TimestampTZFamily, Precision: 0, Oid: oid.T_timestamptz, Locale: &emptyLocale}}},
+			Family:             TimestampTZFamily,
+			Precision:          0,
+			TimePrecisionIsSet: true,
+			Oid:                oid.T_timestamptz,
+			Locale:             &emptyLocale,
+		}}},
+		{MakeTimestampTZ(3), &T{InternalType: InternalType{
+			Family: TimestampTZFamily, Oid: oid.T_timestamptz, Precision: 3, TimePrecisionIsSet: true, Locale: &emptyLocale}}},
+		{MakeTimestampTZ(3), MakeScalar(TimestampTZFamily, oid.T_timestamptz, 3, 0, emptyLocale)},
 		{MakeTimestampTZ(6), &T{InternalType: InternalType{
-			Family: TimestampTZFamily, Oid: oid.T_timestamptz, Precision: 6, Locale: &emptyLocale}}},
+			Family: TimestampTZFamily, Oid: oid.T_timestamptz, Precision: 6, TimePrecisionIsSet: true, Locale: &emptyLocale}}},
 		{MakeTimestampTZ(6), MakeScalar(TimestampTZFamily, oid.T_timestamptz, 6, 0, emptyLocale)},
 
 		// TUPLE
@@ -258,50 +424,52 @@ func TestTypes(t *testing.T) {
 		{Uuid, MakeScalar(UuidFamily, oid.T_uuid, 0, 0, emptyLocale)},
 	}
 
-	for _, tc := range testCases {
-		// Test that actual, expected types are identical.
-		if !tc.actual.Identical(tc.expected) {
-			t.Errorf("expected <%v>, got <%v>", tc.expected.DebugString(), tc.actual.DebugString())
-		}
-		if !reflect.DeepEqual(tc.actual, tc.expected) {
-			t.Errorf("expected <%v>, got <%v>", tc.expected.DebugString(), tc.actual.DebugString())
-		}
+	for i, tc := range testCases {
+		t.Run(fmt.Sprintf("#%d: %s", i, tc.actual.String()), func(t *testing.T) {
+			// Test that actual, expected types are identical.
+			if !tc.actual.Identical(tc.expected) {
+				t.Errorf("expected <%v>, got <%v>", tc.expected.DebugString(), tc.actual.DebugString())
+			}
+			if !reflect.DeepEqual(tc.actual, tc.expected) {
+				t.Errorf("expected <%v>, got <%v>", tc.expected.DebugString(), tc.actual.DebugString())
+			}
 
-		// Roundtrip type by marshaling, then unmarshaling. Only do this for non-
-		// nested array types (since we don't yet support marshaling/ummarshaling
-		// nested arrays).
-		if tc.actual.Family() == ArrayFamily && tc.actual.ArrayContents().Family() == ArrayFamily {
-			continue
-		}
+			// Roundtrip type by marshaling, then unmarshaling. Only do this for non-
+			// nested array types (since we don't yet support marshaling/ummarshaling
+			// nested arrays).
+			if tc.actual.Family() == ArrayFamily && tc.actual.ArrayContents().Family() == ArrayFamily {
+				return
+			}
 
-		data, err := protoutil.Marshal(tc.actual)
-		if err != nil {
-			t.Errorf("error during marshal of type <%v>: %v", tc.actual.DebugString(), err)
-		}
-		if len(data) != tc.actual.Size() {
-			t.Errorf("expected %d bytes, got %d bytes", len(data), tc.actual.Size())
-		}
+			data, err := protoutil.Marshal(tc.actual)
+			if err != nil {
+				t.Errorf("error during marshal of type <%v>: %v", tc.actual.DebugString(), err)
+			}
+			if len(data) != tc.actual.Size() {
+				t.Errorf("expected %d bytes, got %d bytes", len(data), tc.actual.Size())
+			}
 
-		data2 := make([]byte, len(data))
-		i, err := tc.actual.MarshalTo(data2)
-		if err != nil {
-			t.Errorf("error during marshal of type <%v>: %v", tc.actual.DebugString(), err)
-		}
-		if i != len(data) {
-			t.Errorf("expected %d bytes, got %d bytes", len(data), i)
-		}
-		if !bytes.Equal(data, data2) {
-			t.Error("Marshal and MarshalTo bytes are not equal")
-		}
+			data2 := make([]byte, len(data))
+			i, err := tc.actual.MarshalTo(data2)
+			if err != nil {
+				t.Errorf("error during marshal of type <%v>: %v", tc.actual.DebugString(), err)
+			}
+			if i != len(data) {
+				t.Errorf("expected %d bytes, got %d bytes", len(data), i)
+			}
+			if !bytes.Equal(data, data2) {
+				t.Error("Marshal and MarshalTo bytes are not equal")
+			}
 
-		var roundtrip T
-		err = protoutil.Unmarshal(data, &roundtrip)
-		if err != nil {
-			t.Errorf("error during unmarshal of type <%v>: %v", tc.actual.DebugString(), err)
-		}
-		if !tc.actual.Identical(&roundtrip) {
-			t.Errorf("expected <%v>, got <%v>", tc.actual.DebugString(), roundtrip.DebugString())
-		}
+			var roundtrip T
+			err = protoutil.Unmarshal(data, &roundtrip)
+			if err != nil {
+				t.Errorf("error during unmarshal of type <%v>: %v", tc.actual.DebugString(), err)
+			}
+			if !tc.actual.Identical(&roundtrip) {
+				t.Errorf("expected <%v>, got <%v>", tc.actual.DebugString(), roundtrip.DebugString())
+			}
+		})
 	}
 }
 
@@ -520,5 +688,159 @@ func TestOids(t *testing.T) {
 		if typ.Family() != ArrayFamily {
 			t.Errorf("expected ARRAY type, got %s", typ.Family())
 		}
+	}
+}
+
+func TestUpgradeType(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		input    *T
+		expected *T
+	}{
+		{
+			desc: "upgrading -1 timestamp precision to default precision for time",
+			input: &T{InternalType: InternalType{
+				Family:    TimestampFamily,
+				Precision: -1,
+				Oid:       oid.T_timestamp,
+				Locale:    &emptyLocale,
+			}},
+			expected: &T{InternalType: InternalType{
+				Family:    TimestampFamily,
+				Precision: 0,
+				Oid:       oid.T_timestamp,
+				Locale:    &emptyLocale,
+			}},
+		},
+		{
+			desc: "upgrading default timestamp precision pre-20.1 to default precision",
+			input: &T{InternalType: InternalType{
+				Family:    TimestampFamily,
+				Precision: 0,
+				Oid:       oid.T_timestamp,
+				Locale:    &emptyLocale,
+			}},
+			expected: &T{InternalType: InternalType{
+				Family:             TimestampFamily,
+				Precision:          0,
+				TimePrecisionIsSet: false,
+				Oid:                oid.T_timestamp,
+				Locale:             &emptyLocale,
+			}},
+		},
+		{
+			desc: "upgrading 6 timestamp precision pre-20.1 to default precision",
+			input: &T{InternalType: InternalType{
+				Family:    TimestampFamily,
+				Precision: 6,
+				Oid:       oid.T_timestamp,
+				Locale:    &emptyLocale,
+			}},
+			expected: &T{InternalType: InternalType{
+				Family:             TimestampFamily,
+				Precision:          6,
+				TimePrecisionIsSet: true,
+				Oid:                oid.T_timestamp,
+				Locale:             &emptyLocale,
+			}},
+		},
+		{
+			desc: "idempotent for timestamp precision(3) set objects",
+			input: &T{InternalType: InternalType{
+				Family:             TimestampFamily,
+				Precision:          3,
+				TimePrecisionIsSet: true,
+				Oid:                oid.T_timestamp,
+				Locale:             &emptyLocale,
+			}},
+			expected: &T{InternalType: InternalType{
+				Family:             TimestampFamily,
+				Precision:          3,
+				TimePrecisionIsSet: true,
+				Oid:                oid.T_timestamp,
+				Locale:             &emptyLocale,
+			}},
+		},
+		{
+			desc: "idempotent for timestamp precision(0) set objects",
+			input: &T{InternalType: InternalType{
+				Family:             TimestampFamily,
+				Precision:          0,
+				TimePrecisionIsSet: true,
+				Oid:                oid.T_timestamp,
+				Locale:             &emptyLocale,
+			}},
+			expected: &T{InternalType: InternalType{
+				Family:             TimestampFamily,
+				Precision:          0,
+				TimePrecisionIsSet: true,
+				Oid:                oid.T_timestamp,
+				Locale:             &emptyLocale,
+			}},
+		},
+		{
+			desc: "idempotent for timestamp precision unset objects",
+			input: &T{InternalType: InternalType{
+				Family:             TimestampFamily,
+				Precision:          0,
+				TimePrecisionIsSet: false,
+				Oid:                oid.T_timestamp,
+				Locale:             &emptyLocale,
+			}},
+			expected: &T{InternalType: InternalType{
+				Family:             TimestampFamily,
+				Precision:          0,
+				TimePrecisionIsSet: false,
+				Oid:                oid.T_timestamp,
+				Locale:             &emptyLocale,
+			}},
+		},
+		{
+			desc: "intervals upgrading from 19.2 to 20.1 with no precision set",
+			input: &T{InternalType: InternalType{
+				Family: IntervalFamily,
+				Oid:    oid.T_interval,
+				Locale: &emptyLocale,
+			}},
+			expected: &T{InternalType: InternalType{
+				Family:                IntervalFamily,
+				Precision:             0,
+				TimePrecisionIsSet:    false,
+				Oid:                   oid.T_interval,
+				Locale:                &emptyLocale,
+				IntervalDurationField: &IntervalDurationField{},
+			}},
+		},
+		{
+			desc: "intervals are idempotent after 20.1",
+			input: &T{InternalType: InternalType{
+				Family:             IntervalFamily,
+				Oid:                oid.T_interval,
+				Locale:             &emptyLocale,
+				Precision:          4,
+				TimePrecisionIsSet: true,
+				IntervalDurationField: &IntervalDurationField{
+					DurationType: IntervalDurationType_SECOND,
+				},
+			}},
+			expected: &T{InternalType: InternalType{
+				Family:             IntervalFamily,
+				Oid:                oid.T_interval,
+				Locale:             &emptyLocale,
+				Precision:          4,
+				TimePrecisionIsSet: true,
+				IntervalDurationField: &IntervalDurationField{
+					DurationType: IntervalDurationType_SECOND,
+				},
+			}},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			err := tc.input.upgradeType()
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, tc.input)
+		})
 	}
 }

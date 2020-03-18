@@ -15,10 +15,10 @@ import (
 	"context"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -121,12 +121,7 @@ func encodeColumnsOfRow(
 		if row[colIdx].IsNull() && !encodeNull {
 			return nil, true, nil
 		}
-		// Note: we cannot compare VALUE encodings because they contain column IDs
-		// which can vary.
-		// TODO(radu): we should figure out what encoding is readily available and
-		// use that (though it needs to be consistent across all rows). We could add
-		// functionality to compare VALUE encodings ignoring the column ID.
-		appendTo, err = row[colIdx].Encode(&colTypes[i], da, sqlbase.DatumEncoding_ASCENDING_KEY, appendTo)
+		appendTo, err = row[colIdx].Fingerprint(&colTypes[i], da, appendTo)
 		if err != nil {
 			return appendTo, false, err
 		}
@@ -427,7 +422,7 @@ func (i *hashMemRowIterator) computeKey() error {
 	i.curKey = i.curKey[:0]
 	for _, col := range i.storedEqCols {
 		var err error
-		i.curKey, err = row[col].Encode(&i.types[col], &i.columnEncoder.datumAlloc, sqlbase.DatumEncoding_ASCENDING_KEY, i.curKey)
+		i.curKey, err = row[col].Fingerprint(&i.types[col], &i.columnEncoder.datumAlloc, i.curKey)
 		if err != nil {
 			return err
 		}
@@ -553,6 +548,8 @@ type hashDiskRowBucketIterator struct {
 	// encodedEqCols is the encoding of the equality columns of the rows in the
 	// bucket that this iterator iterates over.
 	encodedEqCols []byte
+	// Temporary buffer used for constructed marked values.
+	tmpBuf []byte
 }
 
 var _ RowMarkerIterator = &hashDiskRowBucketIterator{}
@@ -575,7 +572,7 @@ func (h *HashDiskRowContainer) NewBucketIterator(
 
 // Rewind implements the RowIterator interface.
 func (i *hashDiskRowBucketIterator) Rewind() {
-	i.Seek(i.encodedEqCols)
+	i.SeekGE(i.encodedEqCols)
 }
 
 // Valid implements the RowIterator interface.
@@ -586,10 +583,7 @@ func (i *hashDiskRowBucketIterator) Valid() (bool, error) {
 	}
 	// Since the underlying map is sorted, once the key prefix does not equal
 	// the encoded equality columns, we have gone past the end of the bucket.
-	// TODO(asubiotto): Make UnsafeKey() and UnsafeValue() part of the
-	// SortedDiskMapIterator interface to avoid allocation here, in Mark(), and
-	// isRowMarked().
-	return bytes.HasPrefix(i.Key(), i.encodedEqCols), nil
+	return bytes.HasPrefix(i.UnsafeKey(), i.encodedEqCols), nil
 }
 
 // Row implements the RowIterator interface.
@@ -632,7 +626,7 @@ func (i *hashDiskRowBucketIterator) IsMarked(ctx context.Context) bool {
 		return false
 	}
 
-	rowVal := i.Value()
+	rowVal := i.UnsafeValue()
 	return bytes.Equal(rowVal[len(rowVal)-len(encodedTrue):], encodedTrue)
 }
 
@@ -648,7 +642,7 @@ func (i *hashDiskRowBucketIterator) Mark(ctx context.Context, mark bool) error {
 	}
 	// rowVal are the non-equality encoded columns, the last of which is the
 	// column we use to mark a row.
-	rowVal := i.Value()
+	rowVal := append(i.tmpBuf[:0], i.UnsafeValue()...)
 	originalLen := len(rowVal)
 	rowVal = append(rowVal, markBytes...)
 
@@ -656,11 +650,12 @@ func (i *hashDiskRowBucketIterator) Mark(ctx context.Context, mark bool) error {
 	// the extra bytes.
 	copy(rowVal[originalLen-len(markBytes):], rowVal[originalLen:])
 	rowVal = rowVal[:originalLen]
+	i.tmpBuf = rowVal
 
 	// These marks only matter when using a hashDiskRowIterator to iterate over
 	// unmarked rows. The writes are flushed when creating a NewIterator() in
 	// NewUnmarkedIterator().
-	return i.HashDiskRowContainer.bufferedRows.Put(i.Key(), rowVal)
+	return i.HashDiskRowContainer.bufferedRows.Put(i.UnsafeKey(), rowVal)
 }
 
 // hashDiskRowIterator iterates over all unmarked rows in a
@@ -720,7 +715,7 @@ func (i *hashDiskRowIterator) isRowMarked() bool {
 		return false
 	}
 
-	rowVal := i.Value()
+	rowVal := i.UnsafeValue()
 	return bytes.Equal(rowVal[len(rowVal)-len(encodedTrue):], encodedTrue)
 }
 
@@ -1034,7 +1029,7 @@ func (h *HashDiskBackedRowContainer) recreateAllRowsIterators(ctx context.Contex
 			return errors.Errorf("the iterator is unexpectedly not hashMemRowIterator")
 		}
 		newIterator := h.NewUnmarkedIterator(ctx)
-		newIterator.(*diskRowIterator).Seek(oldIterator.curKey)
+		newIterator.(*diskRowIterator).SeekGE(oldIterator.curKey)
 		(*iterator).RowIterator.Close()
 		iterator.RowIterator = newIterator
 	}

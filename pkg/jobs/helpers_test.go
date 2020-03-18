@@ -13,7 +13,6 @@ package jobs
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
@@ -28,37 +27,30 @@ func ResetConstructors() func() {
 
 // FakeResumer calls optional callbacks during the job lifecycle.
 type FakeResumer struct {
-	OnResume func() error
-	Fail     func() error
-	Success  func() error
-	Terminal func()
+	OnResume     func(context.Context, chan<- tree.Datums) error
+	FailOrCancel func(context.Context) error
+	Success      func() error
 }
 
-func (d FakeResumer) Resume(_ context.Context, _ interface{}, _ chan<- tree.Datums) error {
+func (d FakeResumer) Resume(
+	ctx context.Context, _ interface{}, resultsCh chan<- tree.Datums,
+) error {
 	if d.OnResume != nil {
-		return d.OnResume()
+		if err := d.OnResume(ctx, resultsCh); err != nil {
+			return err
+		}
 	}
-	return nil
-}
-
-func (d FakeResumer) OnFailOrCancel(_ context.Context, _ *client.Txn) error {
-	if d.Fail != nil {
-		return d.Fail()
-	}
-	return nil
-}
-
-func (d FakeResumer) OnSuccess(_ context.Context, _ *client.Txn) error {
 	if d.Success != nil {
 		return d.Success()
 	}
 	return nil
 }
 
-func (d FakeResumer) OnTerminal(_ context.Context, _ Status, _ chan<- tree.Datums) {
-	if d.Terminal != nil {
-		d.Terminal()
+func (d FakeResumer) OnFailOrCancel(ctx context.Context, _ interface{}) error {
+	if d.FailOrCancel != nil {
+		return d.FailOrCancel(ctx)
 	}
+	return nil
 }
 
 var _ Resumer = FakeResumer{}

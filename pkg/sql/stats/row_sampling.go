@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
@@ -47,15 +48,23 @@ type SampleReservoir struct {
 	da       sqlbase.DatumAlloc
 	ra       sqlbase.EncDatumRowAlloc
 	memAcc   *mon.BoundAccount
+
+	// sampleCols contains the ordinals of columns that should be sampled from
+	// each row. Note that the sampled rows still contain all columns, but
+	// any columns not part of this set are given a null value.
+	sampleCols util.FastIntSet
 }
 
 var _ heap.Interface = &SampleReservoir{}
 
 // Init initializes a SampleReservoir.
-func (sr *SampleReservoir) Init(numSamples int, colTypes []types.T, memAcc *mon.BoundAccount) {
+func (sr *SampleReservoir) Init(
+	numSamples int, colTypes []types.T, memAcc *mon.BoundAccount, sampleCols util.FastIntSet,
+) {
 	sr.samples = make([]SampledRow, 0, numSamples)
 	sr.colTypes = colTypes
 	sr.memAcc = memAcc
+	sr.sampleCols = sampleCols
 }
 
 // Disable releases the memory of this SampleReservoir and sets its capacity
@@ -131,6 +140,10 @@ func (sr *SampleReservoir) copyRow(
 	ctx context.Context, evalCtx *tree.EvalContext, dst, src sqlbase.EncDatumRow,
 ) error {
 	for i := range src {
+		if !sr.sampleCols.Contains(i) {
+			dst[i].Datum = tree.DNull
+			continue
+		}
 		// Copy only the decoded datum to ensure that we remove any reference to
 		// the encoded bytes. The encoded bytes would have been scanned in a batch
 		// of ~10000 rows, so we must delete the reference to allow the garbage
@@ -141,9 +154,17 @@ func (sr *SampleReservoir) copyRow(
 		beforeSize := dst[i].Size()
 		dst[i] = sqlbase.DatumToEncDatum(&sr.colTypes[i], src[i].Datum)
 		afterSize := dst[i].Size()
+
+		// If the datum is too large, truncate it (this also performs a copy).
+		// Otherwise, just perform a copy.
 		if afterSize > uintptr(maxBytesPerSample) {
 			dst[i].Datum = truncateDatum(evalCtx, dst[i].Datum, maxBytesPerSample)
 			afterSize = dst[i].Size()
+		} else {
+			if enc, ok := src[i].Encoding(); ok && enc != sqlbase.DatumEncoding_VALUE {
+				// Only datums that were key-encoded might reference the kv batch.
+				dst[i].Datum = deepCopyDatum(evalCtx, dst[i].Datum)
+			}
 		}
 
 		// Perform memory accounting.
@@ -152,7 +173,6 @@ func (sr *SampleReservoir) copyRow(
 				return err
 			}
 		}
-
 	}
 	return nil
 }
@@ -186,7 +206,17 @@ func truncateDatum(evalCtx *tree.EvalContext, d tree.Datum, maxBytes int) tree.D
 
 		// Note: this will end up being larger than maxBytes due to the key and
 		// locale, so this is just a best-effort attempt to limit the size.
-		return tree.NewDCollatedString(contents, t.Locale, &evalCtx.CollationEnv)
+		res, err := tree.NewDCollatedString(contents, t.Locale, &evalCtx.CollationEnv)
+		if err != nil {
+			return d
+		}
+		return res
+
+	case *tree.DOidWrapper:
+		return &tree.DOidWrapper{
+			Wrapped: truncateDatum(evalCtx, t.Wrapped, maxBytes),
+			Oid:     t.Oid,
+		}
 
 	default:
 		// It's not easy to truncate other types (e.g. Decimal).
@@ -211,6 +241,43 @@ func truncateString(s string, maxBytes int) string {
 	// Copy the truncated string so that the memory from the longer string can
 	// be garbage collected.
 	b := make([]byte, last)
+	copy(b, s)
+	return string(b)
+}
+
+// deepCopyDatum performs a deep copy for datums such as DString to remove any
+// references to the kv batch and allow the batch to be garbage collected.
+// Note: this function is currently only called for key-encoded datums. Update
+// the calling function if there is a need to call this for value-encoded
+// datums as well.
+func deepCopyDatum(evalCtx *tree.EvalContext, d tree.Datum) tree.Datum {
+	switch t := d.(type) {
+	case *tree.DString:
+		return tree.NewDString(deepCopyString(string(*t)))
+
+	case *tree.DCollatedString:
+		return &tree.DCollatedString{
+			Contents: deepCopyString(t.Contents),
+			Locale:   t.Locale,
+			Key:      t.Key,
+		}
+
+	case *tree.DOidWrapper:
+		return &tree.DOidWrapper{
+			Wrapped: deepCopyDatum(evalCtx, t.Wrapped),
+			Oid:     t.Oid,
+		}
+
+	default:
+		// We do not collect stats on JSON, and other types do not require a deep
+		// copy (or they are already copied during decoding).
+		return d
+	}
+}
+
+// deepCopyString performs a deep copy of a string.
+func deepCopyString(s string) string {
+	b := make([]byte, len(s))
 	copy(b, s)
 	return string(b)
 }

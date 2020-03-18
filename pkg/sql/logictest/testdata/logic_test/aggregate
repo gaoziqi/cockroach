@@ -5,7 +5,8 @@ CREATE TABLE kv (
   k INT PRIMARY KEY,
   v INT,
   w INT,
-  s STRING
+  s STRING,
+  i INTERVAL
 )
 
 # Aggregate functions return NULL if there are no rows.
@@ -35,6 +36,11 @@ query T
 SELECT jsonb_agg(1) FROM kv
 ----
 NULL
+
+query TTTT
+SELECT min(i), avg(i), max(i), sum(i) FROM kv
+----
+NULL NULL NULL NULL
 
 query IIIIRRRRBBT
 SELECT min(v), max(v), count(v), sum_int(1), avg(v), sum(v), stddev(v), variance(v), bool_and(v = 1), bool_and(v = 1), xor_agg(s::bytes) FROM kv
@@ -147,12 +153,12 @@ SELECT (SELECT COALESCE(max(1), 0) FROM generate_series(1,0))
 
 statement OK
 INSERT INTO kv VALUES
-(1, 2, 3, 'a'),
-(3, 4, 5, 'a'),
-(5, NULL, 5, NULL),
-(6, 2, 3, 'b'),
-(7, 2, 2, 'b'),
-(8, 4, 2, 'A')
+(1, 2, 3, 'a', '1min'),
+(3, 4, 5, 'a', '2sec'),
+(5, NULL, 5, NULL, NULL),
+(6, 2, 3, 'b', '1ms'),
+(7, 2, 2, 'b', '4 days'),
+(8, 4, 2, 'A', '3 years')
 
 # Aggregate functions triggers aggregation and computation for every row even when applied to a constant.
 # NB: The XOR result is 00 because \x01 is XOR'd an even number of times.
@@ -595,6 +601,11 @@ SELECT avg(k), avg(v), sum(k), sum(v) FROM kv
 ----
 5 2.8 30 14
 
+query TTTT
+SELECT min(i), avg(i), max(i), sum(i) FROM kv
+----
+00:00:00.001  7 mons 6 days 19:12:12.4002  3 years  3 years 4 days 00:01:02.001
+
 query RRRR
 SELECT avg(k::decimal), avg(v::decimal), sum(k::decimal), sum(v::decimal) FROM kv
 ----
@@ -787,6 +798,15 @@ SELECT stddev(x) FROM xyz WHERE x = 1
 ----
 NULL
 
+# Ensure subqueries don't trigger aggregation.
+query B
+SELECT x > (SELECT avg(0)) FROM xyz LIMIT 1
+----
+true
+
+statement ok
+DROP TABLE xyz
+
 # Numerical stability test for VARIANCE/STDDEV.
 # See https://www.johndcook.com/blog/2008/09/28/theoretical-explanation-for-numerical-results.
 # Avoid using random() since we do not have the deterministic option to specify a pseudo-random seed yet.
@@ -842,12 +862,6 @@ query RRR
 SELECT stddev(1::int), stddev(1::float), stddev(1::decimal)
 ----
 NULL NULL NULL
-
-# Ensure subqueries don't trigger aggregation.
-query B
-SELECT x > (SELECT avg(0)) FROM xyz LIMIT 1
-----
-true
 
 statement ok
 CREATE TABLE bits (b INT)
@@ -1209,6 +1223,94 @@ SELECT 123 FROM kv ORDER BY max(v)
 ----
 123
 
+subtest statistics
+
+statement OK
+CREATE TABLE statistics_agg_test (
+  y float,
+  x float,
+  int_y int,
+  int_x int
+)
+
+statement OK
+INSERT INTO statistics_agg_test (y, x, int_y, int_x) VALUES
+  (1.0,   10.0,    1,   10),
+  (2.0,   25.0,    2,   25),
+  (2.0,   25.0,    2,   25),
+  (3.0,   40.0,    3,   40),
+  (3.0,   40.0,    3,   40),
+  (3.0,   40.0,    3,   40),
+  (4.0,  100.0,    4,  100),
+  (4.0,  100.0,    4,  100),
+  (4.0,  100.0,    4,  100),
+  (4.0,  100.0,    4,  100),
+  (NULL,  NULL, NULL, NULL)
+
+query RRRR
+SELECT corr(y, x)::decimal, corr(int_y, int_x)::decimal, corr(y, int_x)::decimal, corr(int_y, x)::decimal FROM statistics_agg_test
+----
+0.933007822647968 0.933007822647968 0.933007822647968 0.933007822647968
+
+query R
+SELECT corr(DISTINCT y, x)::decimal FROM statistics_agg_test
+----
+0.9326733179802503
+
+query R
+SELECT CAST(corr(DISTINCT y, x) FILTER (WHERE x > 3 AND y < 30) AS decimal) FROM statistics_agg_test
+----
+0.9326733179802503
+
+query error pq: unknown signature: corr\(string, string\)
+SELECT corr(y::string, x::string) FROM statistics_agg_test
+
+statement OK
+INSERT INTO statistics_agg_test (y, x, int_y, int_x) VALUES
+  (1.797693134862315708145274237317043567981e+308, 0, 0, 0)
+
+query error float out of range
+SELECT corr(y, x)::decimal, corr(int_y, int_x)::decimal FROM statistics_agg_test
+
+statement OK
+TRUNCATE statistics_agg_test
+
+statement OK
+INSERT INTO statistics_agg_test (y, x, int_y, int_x) VALUES
+  (1.0,  10.0, 1, 10),
+  (2.0,  20.0, 2, 20)
+
+query RR
+SELECT corr(y, x)::decimal, corr(int_y, int_x)::decimal FROM statistics_agg_test
+----
+1 1
+
+statement OK
+TRUNCATE statistics_agg_test
+
+statement OK
+INSERT INTO statistics_agg_test (y, x, int_y, int_x) VALUES
+  (1.0,  10.0, 1,  10),
+  (2.0, -20.0, 2, -20)
+
+query RR
+SELECT corr(y, x)::decimal, corr(int_y, int_x)::decimal FROM statistics_agg_test
+----
+-1 -1
+
+statement OK
+TRUNCATE statistics_agg_test
+
+statement OK
+INSERT INTO statistics_agg_test (y, x, int_y, int_x) VALUES
+  (1.0, -1.0, 1, -1),
+  (1.0,  1.0, 1,  1)
+
+query RR
+SELECT corr(y, x)::decimal, corr(int_y, int_x)::decimal FROM statistics_agg_test
+----
+NULL NULL
+
 subtest string_agg
 
 statement OK
@@ -1263,10 +1365,16 @@ INSERT INTO string_agg_test VALUES
   (9, 3, 'C'),
   (10, 2, 'B')
 
-query error pq: unimplemented: aggregate functions with multiple non-constant expressions are not supported
+# This is a bit strange but the same behavior as PostgreSQL.
+query IT rowsort
 SELECT company_id, string_agg(employee, employee)
 FROM string_agg_test
 GROUP BY company_id;
+----
+1           A
+2           BBB
+3           CCCCC
+4           DDDDDDD
 
 query IT colnames
 SELECT company_id, string_agg(employee, ',')
@@ -1678,6 +1786,12 @@ OVER (PARTITION BY company_id)
 FROM string_agg_test
 ORDER BY company_id, id;
 
+query error pq: unknown signature: string_agg\(string, string, string, string\)
+SELECT company_id, string_agg(employee, 'foo', employee, 'bar')
+OVER (PARTITION BY company_id)
+FROM string_agg_test
+ORDER BY company_id, id;
+
 statement OK
 TRUNCATE string_agg_test
 
@@ -1967,3 +2081,145 @@ SELECT a, b, count(*) FROM ab RIGHT JOIN tab ON b=col2 GROUP BY a
 ----
 NULL  NULL  4
 4     7     2
+
+# Additional tests for MIN/MAX aggregates with indexes.
+statement ok
+CREATE TABLE xyz (
+  x INT PRIMARY KEY,
+  y INT,
+  z INT,
+  INDEX yz (y, z)
+)
+
+statement ok
+INSERT INTO xyz VALUES (1, 2, 3), (2, 2, 7), (3, 2, 1), (4, 2, NULL), (5, 3, -1)
+
+query I
+SELECT min(z) FROM xyz WHERE y = 2 GROUP BY y
+----
+1
+
+query I
+SELECT min(z) FROM xyz WHERE y = 2 AND z IS NOT NULL GROUP BY y
+----
+1
+
+query I
+SELECT min(z) FROM xyz WHERE y = 2 AND z IS NULL GROUP BY y
+----
+NULL
+
+query I
+SELECT min(z) FROM xyz WHERE y = 100 AND z IS NULL GROUP BY y
+----
+
+query I
+SELECT max(z) FROM xyz WHERE y = 2 GROUP BY y
+----
+7
+
+query I
+SELECT max(z) FROM xyz WHERE y = 2 AND z IS NOT NULL GROUP BY y
+----
+7
+
+query I
+SELECT max(z) FROM xyz WHERE y = 2 AND z IS NULL GROUP BY y
+----
+NULL
+
+query I
+SELECT max(z) FROM xyz WHERE y = 100 GROUP BY y
+----
+
+statement ok
+DROP TABLE xyz
+
+# Regression test for #44469 (DistinctOn needs to remap the provided ordering).
+statement ok
+CREATE TABLE t44469_a (a INT, INDEX (a))
+
+statement ok
+CREATE TABLE t44469_b (b INT, INDEX (b))
+
+statement ok
+CREATE TABLE t44469_cd (c INT, d INT, INDEX (c, d));
+
+statement ok
+SELECT DISTINCT ON (b) b
+FROM t44469_a INNER LOOKUP JOIN t44469_b ON a = b INNER LOOKUP JOIN t44469_cd ON c = 1 AND d = a
+ORDER BY b
+
+statement ok
+DROP TABLE IF EXISTS t;
+CREATE TABLE t (x JSONB, y INT);
+INSERT INTO t VALUES
+  ('{"foo": "bar"}', 5),
+  ('{"foo": "bar"}', 10),
+  ('[1, 2]', 5),
+  ('[1, 2]', 20),
+  ('{"foo": "bar", "bar": "baz"}', 5),
+  ('{"foo": "bar", "bar": "baz"}', 30),
+  ('{"foo": {"bar" : "baz"}}', 5),
+  ('{"foo": {"bar" : "baz"}}', 40)
+
+query TT
+SELECT x, SUM (y) FROM t GROUP BY (x) ORDER BY SUM (y)
+----
+{"foo": "bar"}                15
+[1, 2]                        25
+{"bar": "baz", "foo": "bar"}  35
+{"foo": {"bar": "baz"}}       45
+
+# Tests for the 'every' aggregate function.
+subtest every
+
+statement ok
+CREATE TABLE t_every (x BOOL)
+
+query B
+SELECT every (x) FROM t_every
+----
+NULL
+
+statement ok
+INSERT INTO t_every VALUES (true), (true)
+
+query B
+SELECT every (x) FROM t_every
+----
+true
+
+statement ok
+INSERT INTO t_every VALUES (NULL), (true)
+
+query B
+SELECT every (x) FROM t_every
+----
+true
+
+statement ok
+INSERT INTO t_every VALUES (false), (NULL)
+
+query B
+SELECT every (x) FROM t_every
+----
+false
+
+statement ok
+TRUNCATE t_every;
+INSERT INTO t_every VALUES (false)
+
+query B
+SELECT every (x) FROM t_every
+----
+false
+
+statement ok
+TRUNCATE t_every;
+INSERT INTO t_every VALUES (NULL), (NULL), (NULL)
+
+query B
+SELECT every (x) FROM t_every
+----
+NULL

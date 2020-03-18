@@ -207,7 +207,13 @@ func TestAndOrOps(t *testing.T) {
 								RenderExprs: []execinfrapb.Expression{{Expr: fmt.Sprintf("@1 %s @2", test.operation)}},
 							},
 						}
-						result, err := NewColOperator(ctx, flowCtx, spec, input)
+						args := NewColOperatorArgs{
+							Spec:                spec,
+							Inputs:              input,
+							StreamingMemAccount: testMemAcc,
+						}
+						args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+						result, err := NewColOperator(ctx, flowCtx, args)
 						if err != nil {
 							return nil, err
 						}
@@ -233,22 +239,22 @@ func benchmarkLogicalProjOp(
 	}
 	rng, _ := randutil.NewPseudoRand()
 
-	batch := coldata.NewMemBatch([]coltypes.T{coltypes.Bool, coltypes.Bool})
+	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Bool, coltypes.Bool})
 	col1 := batch.ColVec(0).Bool()
 	col2 := batch.ColVec(0).Bool()
-	for i := 0; i < int(coldata.BatchSize()); i++ {
+	for i := 0; i < coldata.BatchSize(); i++ {
 		col1[i] = rng.Float64() < 0.5
 		col2[i] = rng.Float64() < 0.5
 	}
 	if hasNulls {
 		nulls1 := batch.ColVec(0).Nulls()
 		nulls2 := batch.ColVec(0).Nulls()
-		for i := 0; i < int(coldata.BatchSize()); i++ {
+		for i := 0; i < coldata.BatchSize(); i++ {
 			if rng.Float64() < nullProbability {
-				nulls1.SetNull(uint16(i))
+				nulls1.SetNull(i)
 			}
 			if rng.Float64() < nullProbability {
-				nulls2.SetNull(uint16(i))
+				nulls2.SetNull(i)
 			}
 		}
 	}
@@ -256,11 +262,11 @@ func benchmarkLogicalProjOp(
 	if useSelectionVector {
 		batch.SetSelection(true)
 		sel := batch.Selection()
-		for i := 0; i < int(coldata.BatchSize()); i++ {
-			sel[i] = uint16(i)
+		for i := 0; i < coldata.BatchSize(); i++ {
+			sel[i] = i
 		}
 	}
-	input := NewRepeatableBatchSource(batch)
+	input := NewRepeatableBatchSource(testAllocator, batch)
 
 	spec := &execinfrapb.ProcessorSpec{
 		Input: []execinfrapb.InputSyncSpec{{ColumnTypes: []types.T{*types.Bool, *types.Bool}}},
@@ -272,7 +278,13 @@ func benchmarkLogicalProjOp(
 		},
 	}
 
-	result, err := NewColOperator(ctx, flowCtx, spec, []Operator{input})
+	args := NewColOperatorArgs{
+		Spec:                spec,
+		Inputs:              []Operator{input},
+		StreamingMemAccount: testMemAcc,
+	}
+	args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+	result, err := NewColOperator(ctx, flowCtx, args)
 	if err != nil {
 		b.Fatal(err)
 	}

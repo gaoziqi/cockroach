@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -47,7 +48,7 @@ type HeartbeatService struct {
 
 	clusterID *base.ClusterIDContainer
 	nodeID    *base.NodeIDContainer
-	version   *cluster.ExposedClusterVersion
+	settings  *cluster.Settings
 
 	clusterName                    string
 	disableClusterNameVerification bool
@@ -77,19 +78,17 @@ func checkClusterName(clusterName string, peerName string) error {
 	return nil
 }
 
-func checkVersion(
-	clusterVersion *cluster.ExposedClusterVersion, peerVersion roachpb.Version,
-) error {
-	if !clusterVersion.IsInitialized() {
+func checkVersion(ctx context.Context, st *cluster.Settings, peerVersion roachpb.Version) error {
+	activeVersion := st.Version.ActiveVersionOrEmpty(ctx)
+	if activeVersion == (clusterversion.ClusterVersion{}) {
 		// Cluster version has not yet been determined.
 		return nil
 	}
-	activeVersion := clusterVersion.Version().Version
 	if peerVersion == (roachpb.Version{}) {
 		return errors.Errorf(
 			"cluster requires at least version %s, but peer did not provide a version", activeVersion)
 	}
-	if peerVersion.Less(activeVersion) {
+	if peerVersion.Less(activeVersion.Version) {
 		return errors.Errorf(
 			"cluster requires at least version %s, but peer has version %s", activeVersion, peerVersion)
 	}
@@ -138,7 +137,7 @@ func (hs *HeartbeatService) Ping(ctx context.Context, args *PingRequest) (*PingR
 	}
 
 	// Check version compatibility.
-	if err := checkVersion(hs.version, args.ServerVersion); err != nil {
+	if err := checkVersion(ctx, hs.settings, args.ServerVersion); err != nil {
 		return nil, errors.Wrap(err, "version compatibility check failed on ping request")
 	}
 
@@ -148,10 +147,7 @@ func (hs *HeartbeatService) Ping(ctx context.Context, args *PingRequest) (*PingR
 	// Note that we validated this connection already. Different clusters
 	// could very well have different max offsets.
 	mo, amo := hs.clock.MaxOffset(), time.Duration(args.MaxOffsetNanos)
-	if mo != 0 && amo != 0 &&
-		mo != timeutil.ClocklessMaxOffset && amo != timeutil.ClocklessMaxOffset &&
-		mo != amo {
-
+	if mo != 0 && amo != 0 && mo != amo {
 		panic(fmt.Sprintf("locally configured maximum clock offset (%s) "+
 			"does not match that of node %s (%s)", mo, args.Addr, amo))
 	}
@@ -163,7 +159,7 @@ func (hs *HeartbeatService) Ping(ctx context.Context, args *PingRequest) (*PingR
 	return &PingResponse{
 		Pong:                           args.Ping,
 		ServerTime:                     hs.clock.PhysicalNow(),
-		ServerVersion:                  hs.version.ServerVersion,
+		ServerVersion:                  hs.settings.Version.BinaryVersion(),
 		ClusterName:                    hs.clusterName,
 		DisableClusterNameVerification: hs.disableClusterNameVerification,
 	}, nil

@@ -13,10 +13,13 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
 type dropSequenceNode struct {
@@ -54,11 +57,20 @@ func (p *planner) DropSequence(ctx context.Context, n *tree.DropSequence) (planN
 	}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because DROP SEQUENCE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *dropSequenceNode) ReadingOwnWrites() {}
+
 func (n *dropSequenceNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeDropCounter("sequence"))
+
 	ctx := params.ctx
 	for _, toDel := range n.td {
 		droppedDesc := toDel.desc
-		err := params.p.dropSequenceImpl(ctx, droppedDesc, n.n.DropBehavior)
+		err := params.p.dropSequenceImpl(
+			ctx, droppedDesc, true /* queueJob */, tree.AsStringWithFQNames(n.n, params.Ann()), n.n.DropBehavior,
+		)
 		if err != nil {
 			return err
 		}
@@ -88,9 +100,13 @@ func (*dropSequenceNode) Values() tree.Datums          { return tree.Datums{} }
 func (*dropSequenceNode) Close(context.Context)        {}
 
 func (p *planner) dropSequenceImpl(
-	ctx context.Context, seqDesc *sqlbase.MutableTableDescriptor, behavior tree.DropBehavior,
+	ctx context.Context,
+	seqDesc *sqlbase.MutableTableDescriptor,
+	queueJob bool,
+	jobDesc string,
+	behavior tree.DropBehavior,
 ) error {
-	return p.initiateDropTable(ctx, seqDesc, true /* drainName */)
+	return p.initiateDropTable(ctx, seqDesc, queueJob, jobDesc, true /* drainName */)
 }
 
 // sequenceDependency error returns an error if the given sequence cannot be dropped because
@@ -105,6 +121,70 @@ func (p *planner) sequenceDependencyError(
 			"cannot drop sequence %s because other objects depend on it",
 			droppedDesc.Name,
 		)
+	}
+	return nil
+}
+
+func (p *planner) canRemoveAllTableOwnedSequences(
+	ctx context.Context, desc *sqlbase.MutableTableDescriptor, behavior tree.DropBehavior,
+) error {
+	for _, col := range desc.Columns {
+		err := p.canRemoveOwnedSequencesImpl(ctx, desc, &col, behavior, false /* isColumnDrop */)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *planner) canRemoveAllColumnOwnedSequences(
+	ctx context.Context,
+	desc *sqlbase.MutableTableDescriptor,
+	col *sqlbase.ColumnDescriptor,
+	behavior tree.DropBehavior,
+) error {
+	return p.canRemoveOwnedSequencesImpl(ctx, desc, col, behavior, true /* isColumnDrop */)
+}
+
+func (p *planner) canRemoveOwnedSequencesImpl(
+	ctx context.Context,
+	desc *sqlbase.MutableTableDescriptor,
+	col *sqlbase.ColumnDescriptor,
+	behavior tree.DropBehavior,
+	isColumnDrop bool,
+) error {
+	for _, sequenceID := range col.OwnsSequenceIds {
+		seqLookup, err := p.LookupTableByID(ctx, sequenceID)
+		if err != nil {
+			return err
+		}
+		seqDesc := seqLookup.Desc
+		affectsNoColumns := len(seqDesc.DependedOnBy) == 0
+		// It is okay if the sequence is depended on by columns that are being
+		// dropped in the same transaction
+		canBeSafelyRemoved := len(seqDesc.DependedOnBy) == 1 && seqDesc.DependedOnBy[0].ID == desc.ID
+		// If only the column is being dropped, no other columns of the table can
+		// depend on that sequence either
+		if isColumnDrop {
+			canBeSafelyRemoved = canBeSafelyRemoved && len(seqDesc.DependedOnBy[0].ColumnIDs) == 1 &&
+				seqDesc.DependedOnBy[0].ColumnIDs[0] == col.ID
+		}
+
+		canRemove := affectsNoColumns || canBeSafelyRemoved
+
+		// Once Drop Sequence Cascade actually respects the drop behavior, this
+		// check should go away.
+		if behavior == tree.DropCascade && !canRemove {
+			return unimplemented.NewWithIssue(20965, "DROP SEQUENCE CASCADE is currently unimplemented")
+		}
+		// If Cascade is not enabled, and more than 1 columns depend on it, and the
+		if behavior != tree.DropCascade && !canRemove {
+			return pgerror.Newf(
+				pgcode.DependentObjectsStillExist,
+				"cannot drop table %s because other objects depend on it",
+				desc.Name,
+			)
+		}
 	}
 	return nil
 }

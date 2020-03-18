@@ -14,14 +14,15 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
@@ -54,11 +55,6 @@ func (t *truncateNode) startExec(params runParams) error {
 	// while constructing the list of tables that should be truncated.
 	toTraverse := make([]sqlbase.MutableTableDescriptor, 0, len(n.Tables))
 
-	// This is the list of descriptors of truncated tables in the statement. These tables will have a mutationID and
-	// MutationJob related to the created job of the TRUNCATE statement.
-	stmtTableDescs := make([]*sqlbase.MutableTableDescriptor, 0, len(n.Tables))
-	droppedTableDetails := make([]jobspb.DroppedTableDetails, 0, len(n.Tables))
-
 	for i := range n.Tables {
 		tn := &n.Tables[i]
 		tableDesc, err := p.ResolveMutableTableDescriptor(
@@ -73,23 +69,6 @@ func (t *truncateNode) startExec(params runParams) error {
 
 		toTruncate[tableDesc.ID] = tn.FQString()
 		toTraverse = append(toTraverse, *tableDesc)
-
-		stmtTableDescs = append(stmtTableDescs, tableDesc)
-		droppedTableDetails = append(droppedTableDetails, jobspb.DroppedTableDetails{
-			Name: tn.FQString(),
-			ID:   tableDesc.ID,
-		})
-	}
-
-	dropJobID, err := p.createDropTablesJob(
-		ctx,
-		stmtTableDescs,
-		droppedTableDetails,
-		tree.AsStringWithFQNames(n, params.Ann()),
-		false, /* drainNames */
-		sqlbase.InvalidID /* droppedDatabaseID */)
-	if err != nil {
-		return err
 	}
 
 	// Check that any referencing tables are contained in the set, or, if CASCADE
@@ -147,7 +126,7 @@ func (t *truncateNode) startExec(params runParams) error {
 
 	traceKV := p.extendedEvalCtx.Tracing.KVTracingEnabled()
 	for id, name := range toTruncate {
-		if err := p.truncateTable(ctx, id, dropJobID, traceKV); err != nil {
+		if err := p.truncateTable(ctx, id, tree.AsStringWithFQNames(t.n, params.Ann()), traceKV); err != nil {
 			return err
 		}
 
@@ -179,7 +158,7 @@ func (t *truncateNode) Close(context.Context)        {}
 // drops the table and recreates it with a new ID. The dropped table is
 // GC-ed later through an asynchronous schema change.
 func (p *planner) truncateTable(
-	ctx context.Context, id sqlbase.ID, dropJobID int64, traceKV bool,
+	ctx context.Context, id sqlbase.ID, jobDesc string, traceKV bool,
 ) error {
 	// Read the table descriptor because it might have changed
 	// while another table in the truncation list was truncated.
@@ -187,10 +166,13 @@ func (p *planner) truncateTable(
 	if err != nil {
 		return err
 	}
-	tableDesc.DropJobID = dropJobID
+	// tableDesc.DropJobID = dropJobID
 	newTableDesc := sqlbase.NewMutableCreatedTableDescriptor(tableDesc.TableDescriptor)
 	newTableDesc.ReplacementOf = sqlbase.TableDescriptor_Replacement{
-		ID: id, Time: p.txn.CommitTimestamp(),
+		ID: id,
+		// NB: Time is just used for debugging purposes. See the comment on the
+		// field for more details.
+		Time: p.txn.ReadTimestamp(),
 	}
 	newTableDesc.SetID(0)
 	newTableDesc.Version = 1
@@ -208,8 +190,10 @@ func (p *planner) truncateTable(
 	//
 	// TODO(vivek): Fix properly along with #12123.
 	zoneKey := config.MakeZoneKey(uint32(tableDesc.ID))
-	nameKey := sqlbase.NewTableKey(tableDesc.ParentID, tableDesc.GetName()).Key()
-	b := &client.Batch{}
+	nameKey := sqlbase.MakePublicTableNameKey(ctx, p.ExecCfg().Settings, tableDesc.ParentID, tableDesc.GetName()).Key()
+	key := sqlbase.MakePublicTableNameKey(ctx, p.ExecCfg().Settings, newTableDesc.ParentID, newTableDesc.Name).Key()
+
+	b := &kv.Batch{}
 	// Use CPut because we want to remove a specific name -> id map.
 	if traceKV {
 		log.VEventf(ctx, 2, "CPut %s -> nil", nameKey)
@@ -222,7 +206,7 @@ func (p *planner) truncateTable(
 	}
 
 	// Drop table.
-	if err := p.initiateDropTable(ctx, tableDesc, false /* drainName */); err != nil {
+	if err := p.initiateDropTable(ctx, tableDesc, true /* queueJob */, jobDesc, false /* drainName */); err != nil {
 		return err
 	}
 
@@ -243,7 +227,10 @@ func (p *planner) truncateTable(
 	}
 
 	for _, table := range tables {
-		if err := p.writeSchemaChange(ctx, table, sqlbase.InvalidMutationID); err != nil {
+		// TODO (lucy): Have more consistent/informative names for dependent jobs.
+		if err := p.writeSchemaChange(
+			ctx, table, sqlbase.InvalidMutationID, "updating reference for truncated table",
+		); err != nil {
 			return err
 		}
 	}
@@ -266,10 +253,15 @@ func (p *planner) truncateTable(
 	}
 	newTableDesc.Mutations = nil
 	newTableDesc.GCMutations = nil
-	newTableDesc.ModificationTime = p.txn.CommitTimestamp()
-	key := sqlbase.NewTableKey(newTableDesc.ParentID, newTableDesc.Name).Key()
+	// NB: Set the modification time to a zero value so that it is interpreted
+	// as the commit timestamp for the new descriptor. See the comment on
+	// sqlbase.Descriptor.Table().
+	newTableDesc.ModificationTime = hlc.Timestamp{}
+	// TODO (lucy): Have more consistent/informative names for dependent jobs.
 	if err := p.createDescriptorWithID(
-		ctx, key, newID, newTableDesc, p.ExtendedEvalContext().Settings); err != nil {
+		ctx, key, newID, newTableDesc, p.ExtendedEvalContext().Settings,
+		"creating new descriptor for truncated table",
+	); err != nil {
 		return err
 	}
 
@@ -279,7 +271,7 @@ func (p *planner) truncateTable(
 	}
 
 	// Copy the zone config.
-	b = &client.Batch{}
+	b = &kv.Batch{}
 	b.Get(zoneKey)
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
@@ -348,7 +340,6 @@ func reassignReferencedTables(
 			fk := &table.OutboundFKs[i]
 			if fk.ReferencedTableID == oldID {
 				fk.ReferencedTableID = newID
-				fk.LegacyUpgradedFromOriginReference.Table = newID
 				changed = true
 			}
 		}
@@ -356,7 +347,6 @@ func reassignReferencedTables(
 			fk := &table.InboundFKs[i]
 			if fk.OriginTableID == oldID {
 				fk.OriginTableID = newID
-				fk.LegacyUpgradedFromReferencedReference.Table = newID
 				changed = true
 			}
 		}
@@ -384,10 +374,11 @@ func reassignReferencedTables(
 func reassignComment(
 	ctx context.Context, p *planner, oldTableDesc, newTableDesc *sqlbase.MutableTableDescriptor,
 ) error {
-	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
 		ctx,
 		"select-table-comment",
 		p.txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		`SELECT comment FROM system.comments WHERE type=$1 AND object_id=$2`,
 		keys.TableCommentType,
 		oldTableDesc.ID)
@@ -396,10 +387,11 @@ func reassignComment(
 	}
 
 	if comment != nil {
-		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 			ctx,
 			"set-table-comment",
 			p.txn,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 			"UPSERT INTO system.comments VALUES ($1, $2, 0, $3)",
 			keys.TableCommentType,
 			newTableDesc.ID,
@@ -408,10 +400,11 @@ func reassignComment(
 			return err
 		}
 
-		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 			ctx,
 			"delete-comment",
 			p.txn,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 			"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
 			keys.TableCommentType,
 			oldTableDesc.ID)
@@ -442,10 +435,11 @@ func reassignComment(
 func reassignColumnComment(
 	ctx context.Context, p *planner, oldID sqlbase.ID, newID sqlbase.ID, columnID sqlbase.ColumnID,
 ) error {
-	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
 		ctx,
 		"select-column-comment",
 		p.txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		`SELECT comment FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3`,
 		keys.ColumnCommentType,
 		oldID,
@@ -455,10 +449,11 @@ func reassignColumnComment(
 	}
 
 	if comment != nil {
-		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 			ctx,
 			"set-column-comment",
 			p.txn,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 			"UPSERT INTO system.comments VALUES ($1, $2, $3, $4)",
 			keys.ColumnCommentType,
 			newID,
@@ -468,10 +463,11 @@ func reassignColumnComment(
 			return err
 		}
 
-		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 			ctx,
 			"delete-column-comment",
 			p.txn,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 			"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3",
 			keys.ColumnCommentType,
 			oldID,
@@ -488,10 +484,11 @@ func reassignColumnComment(
 func reassignIndexComment(
 	ctx context.Context, p *planner, oldTableID, newTableID sqlbase.ID, indexID sqlbase.IndexID,
 ) error {
-	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
 		ctx,
 		"select-index-comment",
 		p.txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		`SELECT comment FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3`,
 		keys.IndexCommentType,
 		oldTableID,
@@ -519,7 +516,7 @@ func reassignIndexComment(
 	return nil
 }
 
-// truncateTableInChunks truncates the data of a table in chunks. It deletes a
+// ClearTableDataInChunks truncates the data of a table in chunks. It deletes a
 // range of data for the table, which includes the PK and all indexes.
 // The table has already been marked for deletion and has been purged from the
 // descriptor cache on all nodes.
@@ -528,8 +525,8 @@ func reassignIndexComment(
 // therefore the entire table can be deleted with no concern for conflicts (we
 // can even eliminate the need to use a transaction for each chunk at a later
 // stage if it proves inefficient).
-func truncateTableInChunks(
-	ctx context.Context, tableDesc *sqlbase.TableDescriptor, db *client.DB, traceKV bool,
+func ClearTableDataInChunks(
+	ctx context.Context, tableDesc *sqlbase.TableDescriptor, db *kv.DB, traceKV bool,
 ) error {
 	const chunkSize = TableTruncateChunkSize
 	var resume roachpb.Span
@@ -539,8 +536,9 @@ func truncateTableInChunks(
 		if traceKV {
 			log.VEventf(ctx, 2, "table %s truncate at row: %d, span: %s", tableDesc.Name, rowIdx, resume)
 		}
-		if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			rd, err := row.MakeDeleter(
+				ctx,
 				txn,
 				sqlbase.NewImmutableTableDescriptor(*tableDesc),
 				nil,
@@ -553,7 +551,7 @@ func truncateTableInChunks(
 				return err
 			}
 			td := tableDeleter{rd: rd, alloc: alloc}
-			if err := td.init(txn, nil /* *tree.EvalContext */); err != nil {
+			if err := td.init(ctx, txn, nil /* *tree.EvalContext */); err != nil {
 				return err
 			}
 			resume, err = td.deleteAllRows(ctx, resumeAt, chunkSize, traceKV)
@@ -564,4 +562,12 @@ func truncateTableInChunks(
 		done = resume.Key == nil
 	}
 	return nil
+}
+
+// canClearRangeForDrop returns if an index can be deleted by deleting every
+// key from a single span.
+// This determines whether an index is dropped during a schema change, or if
+// it is only deleted upon GC.
+func canClearRangeForDrop(index *sqlbase.IndexDescriptor) bool {
+	return !index.IsInterleaved()
 }

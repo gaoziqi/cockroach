@@ -19,6 +19,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -26,8 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -35,7 +37,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/opentracing/opentracing-go"
+	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClusterFlow(t *testing.T) {
@@ -83,14 +86,16 @@ func TestClusterFlow(t *testing.T) {
 	ctx := opentracing.ContextWithSpan(context.Background(), sp)
 	defer sp.Finish()
 
+	now := tc.Server(0).Clock().Now()
 	txnProto := roachpb.MakeTransaction(
 		"cluster-test",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
-		tc.Server(0).Clock().Now(),
+		now,
 		0, // maxOffset
 	)
-	txnCoordMeta := roachpb.MakeTxnCoordMeta(txnProto)
+	txn := kv.NewTxnFromProto(ctx, kvDB, tc.Server(0).NodeID(), now, kv.RootTxn, &txnProto)
+	leafInputState := txn.GetLeafTxnInputState(ctx)
 
 	tr1 := execinfrapb.TableReaderSpec{
 		Table:    *desc,
@@ -113,8 +118,8 @@ func TestClusterFlow(t *testing.T) {
 	fid := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 
 	req1 := &execinfrapb.SetupFlowRequest{
-		Version:      execinfra.Version,
-		TxnCoordMeta: &txnCoordMeta,
+		Version:           execinfra.Version,
+		LeafTxnInputState: &leafInputState,
 		Flow: execinfrapb.FlowSpec{
 			FlowID: fid,
 			Processors: []execinfrapb.ProcessorSpec{{
@@ -135,8 +140,8 @@ func TestClusterFlow(t *testing.T) {
 	}
 
 	req2 := &execinfrapb.SetupFlowRequest{
-		Version:      execinfra.Version,
-		TxnCoordMeta: &txnCoordMeta,
+		Version:           execinfra.Version,
+		LeafTxnInputState: &leafInputState,
 		Flow: execinfrapb.FlowSpec{
 			FlowID: fid,
 			Processors: []execinfrapb.ProcessorSpec{{
@@ -157,8 +162,8 @@ func TestClusterFlow(t *testing.T) {
 	}
 
 	req3 := &execinfrapb.SetupFlowRequest{
-		Version:      execinfra.Version,
-		TxnCoordMeta: &txnCoordMeta,
+		Version:           execinfra.Version,
+		LeafTxnInputState: &leafInputState,
 		Flow: execinfrapb.FlowSpec{
 			FlowID: fid,
 			Processors: []execinfrapb.ProcessorSpec{
@@ -256,7 +261,7 @@ func TestClusterFlow(t *testing.T) {
 		rows, metas = testGetDecodedRows(t, &decoder, rows, metas)
 	}
 	metas = ignoreMisplannedRanges(metas)
-	metas = ignoreTxnCoordMeta(metas)
+	metas = ignoreLeafTxnState(metas)
 	metas = ignoreMetricsMeta(metas)
 	if len(metas) != 0 {
 		t.Fatalf("unexpected metadata (%d): %+v", len(metas), metas)
@@ -290,12 +295,12 @@ func ignoreMisplannedRanges(metas []execinfrapb.ProducerMetadata) []execinfrapb.
 	return res
 }
 
-// ignoreTxnCoordMeta takes a slice of metadata and returns the entries excluding
-// the transaction coordinator metadata.
-func ignoreTxnCoordMeta(metas []execinfrapb.ProducerMetadata) []execinfrapb.ProducerMetadata {
+// ignoreLeafTxnState takes a slice of metadata and returns the
+// entries excluding the leaf txn state.
+func ignoreLeafTxnState(metas []execinfrapb.ProducerMetadata) []execinfrapb.ProducerMetadata {
 	res := make([]execinfrapb.ProducerMetadata, 0)
 	for _, m := range metas {
-		if m.TxnCoordMeta == nil {
+		if m.LeafTxnFinalState == nil {
 			res = append(res, m)
 		}
 	}
@@ -403,18 +408,22 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		Type: sqlbase.InnerJoin,
 	}
 
+	now := tc.Server(0).Clock().Now()
 	txnProto := roachpb.MakeTransaction(
 		"deadlock-test",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
-		tc.Server(0).Clock().Now(),
+		now,
 		0, // maxOffset
 	)
-	txnCoordMeta := roachpb.MakeTxnCoordMeta(txnProto)
+	txn := kv.NewTxnFromProto(
+		context.TODO(), tc.Server(0).DB(), tc.Server(0).NodeID(),
+		now, kv.RootTxn, &txnProto)
+	leafInputState := txn.GetLeafTxnInputState(context.TODO())
 
 	req := execinfrapb.SetupFlowRequest{
-		Version:      execinfra.Version,
-		TxnCoordMeta: &txnCoordMeta,
+		Version:           execinfra.Version,
+		LeafTxnInputState: &leafInputState,
 		Flow: execinfrapb.FlowSpec{
 			FlowID: execinfrapb.FlowID{UUID: uuid.MakeV4()},
 			// The left-hand Values processor in the diagram above.
@@ -522,7 +531,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		rows, metas = testGetDecodedRows(t, &decoder, rows, metas)
 	}
 	metas = ignoreMisplannedRanges(metas)
-	metas = ignoreTxnCoordMeta(metas)
+	metas = ignoreLeafTxnState(metas)
 	metas = ignoreMetricsMeta(metas)
 	if len(metas) != 0 {
 		t.Errorf("unexpected metadata (%d): %+v", len(metas), metas)
@@ -548,7 +557,7 @@ func TestDistSQLReadsFillGatewayID(t *testing.T) {
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
 				UseDatabase: "test",
-				Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
+				Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 					EvalKnobs: storagebase.BatchEvalTestingKnobs{
 						TestingEvalFilter: func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 							scanReq, ok := filterArgs.Req.(*roachpb.ScanRequest)
@@ -593,6 +602,60 @@ ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[
 	if atomic.LoadInt64(&foundReq) != 1 {
 		t.Fatal("TestingEvalFilter failed to find any requests")
 	}
+}
+
+// Test that we can evaluate built-in functions that use the txn on remote
+// nodes. We have a bug where the EvalCtx.Txn field was only correctly populated
+// on the gateway.
+func TestEvalCtxTxnOnRemoteNodes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	tc := serverutils.StartTestCluster(t, 2, /* numNodes */
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				UseDatabase: "test",
+			},
+		})
+	defer tc.Stopper().Stop(ctx)
+
+	db := tc.ServerConn(0)
+	sqlutils.CreateTable(t, db, "t",
+		"num INT PRIMARY KEY",
+		1, /* numRows */
+		sqlutils.ToRowFn(sqlutils.RowIdxFn))
+
+	// Relocate the table to a remote node.
+	_, err := db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1)")
+	require.NoError(t, err)
+
+	testutils.RunTrueAndFalse(t, "vectorize", func(t *testing.T, vectorize bool) {
+		if vectorize {
+			t.Skip("skipped because we can't yet vectorize queries using DECIMALs")
+		}
+		// We're going to use the first node as the gateway and expect everything to
+		// be planned remotely.
+		db := tc.ServerConn(0)
+		var opt string
+		if vectorize {
+			opt = "experimental_always"
+		} else {
+			opt = "off"
+		}
+		_, err := db.Exec(fmt.Sprintf("set vectorize=%s", opt))
+		require.NoError(t, err)
+
+		// Query using a builtin function which uses the transaction (for example,
+		// cluster_logical_timestamp()) and expect not to crash.
+		_, err = db.Exec("SELECT cluster_logical_timestamp() FROM t")
+		require.NoError(t, err)
+
+		// Query again just in case the previous query executed on the gateway
+		// because the leaseholder cache wasn't populated and we fooled ourselves.
+		_, err = db.Exec("SELECT cluster_logical_timestamp() FROM t")
+		require.NoError(t, err)
+	})
 }
 
 // BenchmarkInfrastructure sets up a flow that doesn't use KV at all and runs it
@@ -660,18 +723,22 @@ func BenchmarkInfrastructure(b *testing.B) {
 						}
 						return execinfrapb.StreamEndpointSpec_REMOTE
 					}
+					now := tc.Server(0).Clock().Now()
 					txnProto := roachpb.MakeTransaction(
 						"cluster-test",
 						nil, // baseKey
 						roachpb.NormalUserPriority,
-						tc.Server(0).Clock().Now(),
+						now,
 						0, // maxOffset
 					)
-					txnCoordMeta := roachpb.MakeTxnCoordMeta(txnProto)
+					txn := kv.NewTxnFromProto(
+						context.TODO(), tc.Server(0).DB(), tc.Server(0).NodeID(),
+						now, kv.RootTxn, &txnProto)
+					leafInputState := txn.GetLeafTxnInputState(context.TODO())
 					for i := range reqs {
 						reqs[i] = execinfrapb.SetupFlowRequest{
-							Version:      execinfra.Version,
-							TxnCoordMeta: &txnCoordMeta,
+							Version:           execinfra.Version,
+							LeafTxnInputState: &leafInputState,
 							Flow: execinfrapb.FlowSpec{
 								Processors: []execinfrapb.ProcessorSpec{{
 									Core: execinfrapb.ProcessorCoreUnion{Values: &valSpecs[i]},
@@ -768,7 +835,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 							rows, metas = testGetDecodedRows(b, &decoder, rows, metas)
 						}
 						metas = ignoreMisplannedRanges(metas)
-						metas = ignoreTxnCoordMeta(metas)
+						metas = ignoreLeafTxnState(metas)
 						metas = ignoreMetricsMeta(metas)
 						if len(metas) != 0 {
 							b.Fatalf("unexpected metadata (%d): %+v", len(metas), metas)

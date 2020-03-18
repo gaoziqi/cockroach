@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
@@ -114,6 +116,7 @@ func (vl List) ProviderIDs() []string {
 
 // CreateOpts is the set of options when creating VMs.
 type CreateOpts struct {
+	ClusterName    string
 	Lifetime       time.Duration
 	GeoDistributed bool
 	VMProviders    []string
@@ -174,6 +177,12 @@ type Provider interface {
 	// Providers[gce.ProviderName] != nil doesn't work because
 	// Providers[gce.ProviderName] can be a stub.
 	Active() bool
+}
+
+// DeleteCluster is an optional capability for a Provider which can
+// destroy an entire cluster in a single operation.
+type DeleteCluster interface {
+	DeleteCluster(name string) error
 }
 
 // Providers contains all known Provider instances. This is initialized by subpackage init() functions.
@@ -306,4 +315,26 @@ func ZonePlacement(numZones, numNodes int) (nodeZones []int) {
 		}
 	}
 	return nodeZones
+}
+
+// ExpandZonesFlag takes a slice of strings which may be of the format
+// zone:N which implies that a given zone should be repeated N times and
+// expands it. For example ["us-west1-b:2", "us-east1-a:2"] will expand to
+// ["us-west1-b", "us-west1-b", "us-east1-a", "us-east1-a"].
+func ExpandZonesFlag(zoneFlag []string) (zones []string, err error) {
+	for _, zone := range zoneFlag {
+		colonIdx := strings.Index(zone, ":")
+		if colonIdx == -1 {
+			zones = append(zones, zone)
+			continue
+		}
+		n, err := strconv.Atoi(zone[colonIdx+1:])
+		if err != nil {
+			return zones, fmt.Errorf("failed to parse %q: %v", zone, err)
+		}
+		for i := 0; i < n; i++ {
+			zones = append(zones, zone[:colonIdx])
+		}
+	}
+	return zones, nil
 }

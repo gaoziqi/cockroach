@@ -18,9 +18,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -31,7 +31,7 @@ func TestUpsertFastPath(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// This filter increments scans and endTxn for every ScanRequest and
-	// EndTransactionRequest that hits user table data.
+	// EndTxnRequest that hits user table data.
 	var scans uint64
 	var endTxn uint64
 	filter := func(filterArgs storagebase.FilterArgs) *roachpb.Error {
@@ -39,7 +39,7 @@ func TestUpsertFastPath(t *testing.T) {
 			switch filterArgs.Req.Method() {
 			case roachpb.Scan:
 				atomic.AddUint64(&scans, 1)
-			case roachpb.EndTransaction:
+			case roachpb.EndTxn:
 				if filterArgs.Hdr.Txn.Status == roachpb.STAGING {
 					// Ignore async explicit commits.
 					return nil
@@ -51,7 +51,7 @@ func TestUpsertFastPath(t *testing.T) {
 	}
 
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
-		Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
+		Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 			EvalKnobs: storagebase.BatchEvalTestingKnobs{
 				TestingEvalFilter: filter,
 			},

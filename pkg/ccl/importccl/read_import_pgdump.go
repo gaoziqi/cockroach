@@ -15,8 +15,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -209,9 +209,10 @@ func removeDefaultRegclass(create *tree.CreateTable) {
 // readPostgresCreateTable returns table descriptors for all tables or the
 // matching table from SQL statements.
 func readPostgresCreateTable(
+	ctx context.Context,
 	input io.Reader,
 	evalCtx *tree.EvalContext,
-	settings *cluster.Settings,
+	p sql.PlanHookState,
 	match string,
 	parentID sqlbase.ID,
 	walltime int64,
@@ -228,6 +229,7 @@ func readPostgresCreateTable(
 	createSeq := make(map[string]*tree.CreateSequence)
 	tableFKs := make(map[string][]*tree.ForeignKeyConstraintTableDef)
 	ps := newPostgreStream(input, max)
+	params := p.RunParams(ctx)
 	for {
 		stmt, err := ps.Next()
 		if err == io.EOF {
@@ -238,10 +240,12 @@ func readPostgresCreateTable(
 					name,
 					seq.Options,
 					parentID,
+					keys.PublicSchemaID,
 					id,
 					hlc.Timestamp{WallTime: walltime},
 					sqlbase.NewDefaultPrivilegeDescriptor(),
-					settings,
+					false, /* temporary */
+					&params,
 				)
 				if err != nil {
 					return nil, err
@@ -256,7 +260,7 @@ func readPostgresCreateTable(
 				}
 				removeDefaultRegclass(create)
 				id := sqlbase.ID(int(defaultCSVTableID) + len(ret))
-				desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), settings, create, parentID, id, fks, walltime)
+				desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), p.ExecCfg().Settings, create, parentID, id, fks, walltime)
 				if err != nil {
 					return nil, err
 				}
@@ -271,7 +275,7 @@ func readPostgresCreateTable(
 				}
 				for _, constraint := range constraints {
 					if err := sql.ResolveFK(
-						evalCtx.Ctx(), nil /* txn */, fks.resolver, desc, constraint, backrefs, sql.NewTable, tree.ValidationDefault, settings,
+						evalCtx.Ctx(), nil /* txn */, fks.resolver, desc, constraint, backrefs, sql.NewTable, tree.ValidationDefault, p.ExecCfg().Settings,
 					); err != nil {
 						return nil, err
 					}
@@ -376,7 +380,8 @@ func readPostgresCreateTable(
 
 func getTableName(tn *tree.TableName) (string, error) {
 	if sc := tn.Schema(); sc != "" && sc != "public" {
-		return "", unimplemented.Newf(
+		return "", unimplemented.NewWithIssueDetailf(
+			26443,
 			"import non-public schema",
 			"non-public schemas unsupported: %s", sc,
 		)
@@ -387,7 +392,8 @@ func getTableName(tn *tree.TableName) (string, error) {
 // getTableName variant for UnresolvedObjectName.
 func getTableName2(u *tree.UnresolvedObjectName) (string, error) {
 	if u.NumParts >= 2 && u.Parts[1] != "public" {
-		return "", unimplemented.Newf(
+		return "", unimplemented.NewWithIssueDetailf(
+			26443,
 			"import non-public schema",
 			"non-public schemas unsupported: %s", u.Parts[1],
 		)
@@ -406,6 +412,7 @@ var _ inputConverter = &pgDumpReader{}
 
 // newPgDumpReader creates a new inputConverter for pg_dump files.
 func newPgDumpReader(
+	ctx context.Context,
 	kvCh chan row.KVBatch,
 	opts roachpb.PgDumpOptions,
 	descs map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
@@ -414,7 +421,7 @@ func newPgDumpReader(
 	converters := make(map[string]*row.DatumRowConverter, len(descs))
 	for name, table := range descs {
 		if table.Desc.IsTable() {
-			conv, err := row.NewDatumRowConverter(table.Desc, nil /* targetColNames */, evalCtx, kvCh)
+			conv, err := row.NewDatumRowConverter(ctx, table.Desc, nil /* targetColNames */, evalCtx, kvCh)
 			if err != nil {
 				return nil, err
 			}
@@ -432,21 +439,18 @@ func newPgDumpReader(
 func (m *pgDumpReader) start(ctx ctxgroup.Group) {
 }
 
-func (m *pgDumpReader) inputFinished(ctx context.Context) {
-	close(m.kvCh)
-}
-
 func (m *pgDumpReader) readFiles(
 	ctx context.Context,
 	dataFiles map[int32]string,
+	resumePos map[int32]int64,
 	format roachpb.IOFileFormat,
 	makeExternalStorage cloud.ExternalStorageFactory,
 ) error {
-	return readInputFiles(ctx, dataFiles, format, m.readFile, makeExternalStorage)
+	return readInputFiles(ctx, dataFiles, resumePos, format, m.readFile, makeExternalStorage)
 }
 
 func (m *pgDumpReader) readFile(
-	ctx context.Context, input *fileReader, inputIdx int32, inputName string, rejected chan string,
+	ctx context.Context, input *fileReader, inputIdx int32, resumePos int64, rejected chan string,
 ) error {
 	var inserts, count int64
 	ps := newPostgreStream(input, int(m.opts.MaxRowSize))
@@ -454,6 +458,9 @@ func (m *pgDumpReader) readFile(
 	for _, conv := range m.tables {
 		conv.KvBatch.Source = inputIdx
 		conv.FractionFn = input.ReadFraction
+		conv.CompletedRowFn = func() int64 {
+			return count
+		}
 	}
 
 	for {
@@ -490,6 +497,9 @@ func (m *pgDumpReader) readFile(
 			startingCount := count
 			for _, tuple := range values.Rows {
 				count++
+				if count <= resumePos {
+					continue
+				}
 				if expected, got := len(conv.VisibleCols), len(tuple); expected != got {
 					return errors.Errorf("expected %d values, got %d: %v", expected, got, tuple)
 				}
@@ -536,7 +546,7 @@ func (m *pgDumpReader) readFile(
 				row, err := ps.Next()
 				// We expect an explicit copyDone here. io.EOF is unexpected.
 				if err == io.EOF {
-					return makeRowErr(inputName, count, pgcode.ProtocolViolation,
+					return makeRowErr("", count, pgcode.ProtocolViolation,
 						"unexpected EOF")
 				}
 				if row == errCopyDone {
@@ -544,25 +554,28 @@ func (m *pgDumpReader) readFile(
 				}
 				count++
 				if err != nil {
-					return wrapRowErr(err, inputName, count, pgcode.Uncategorized, "")
+					return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 				}
 				if !importing {
+					continue
+				}
+				if count <= resumePos {
 					continue
 				}
 				switch row := row.(type) {
 				case copyData:
 					if expected, got := len(conv.VisibleCols), len(row); expected != got {
-						return makeRowErr(inputName, count, pgcode.Syntax,
+						return makeRowErr("", count, pgcode.Syntax,
 							"expected %d values, got %d", expected, got)
 					}
 					for i, s := range row {
 						if s == nil {
 							conv.Datums[i] = tree.DNull
 						} else {
-							conv.Datums[i], err = tree.ParseDatumStringAs(conv.VisibleColTypes[i], *s, conv.EvalCtx)
+							conv.Datums[i], err = sqlbase.ParseDatumStringAs(conv.VisibleColTypes[i], *s, conv.EvalCtx)
 							if err != nil {
 								col := conv.VisibleCols[i]
-								return wrapRowErr(err, inputName, count, pgcode.Syntax,
+								return wrapRowErr(err, "", count, pgcode.Syntax,
 									"parse %q as %s", col.Name, col.Type.SQLString())
 							}
 						}
@@ -571,7 +584,7 @@ func (m *pgDumpReader) readFile(
 						return err
 					}
 				default:
-					return makeRowErr(inputName, count, pgcode.Uncategorized,
+					return makeRowErr("", count, pgcode.Uncategorized,
 						"unexpected: %v", row)
 				}
 			}
@@ -624,7 +637,7 @@ func (m *pgDumpReader) readFile(
 			}
 			key, val, err := sql.MakeSequenceKeyVal(seq.Desc, val, isCalled)
 			if err != nil {
-				return wrapRowErr(err, inputName, count, pgcode.Uncategorized, "")
+				return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 			}
 			kv := roachpb.KeyValue{Key: key}
 			kv.Value.SetInt(val)

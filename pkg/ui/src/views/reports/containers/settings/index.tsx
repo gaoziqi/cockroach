@@ -12,14 +12,14 @@ import _ from "lodash";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
+import { withRouter } from "react-router-dom";
 
 import * as protos from "src/js/protos";
 import { refreshSettings } from "src/redux/apiReducers";
-import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState } from "src/redux/state";
 import Loading from "src/views/shared/components/loading";
-
 import "./index.styl";
+import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 
 interface SettingsOwnProps {
   settings: CachedDataReducerState<protos.cockroach.server.serverpb.SettingsResponse>;
@@ -31,7 +31,7 @@ type SettingsProps = SettingsOwnProps;
 /**
  * Renders the Cluster Settings Report page.
  */
-class Settings extends React.Component<SettingsProps, {}> {
+export class Settings extends React.Component<SettingsProps, {}> {
   refresh(props = this.props) {
     props.refreshSettings(new protos.cockroach.server.serverpb.SettingsRequest());
   }
@@ -41,12 +41,13 @@ class Settings extends React.Component<SettingsProps, {}> {
     this.refresh();
   }
 
-  renderTable() {
+  renderTable(wantPublic: boolean) {
     if (_.isNil(this.props.settings.data)) {
       return null;
     }
 
     const { key_values } = this.props.settings.data;
+    const data: any = _.keys(key_values);
 
     return (
       <table className="settings-table">
@@ -59,9 +60,10 @@ class Settings extends React.Component<SettingsProps, {}> {
         </thead>
         <tbody>
           {
-            _.chain(_.keys(key_values))
+            _.chain(data)
+              .filter(key => key_values[key].public === wantPublic)
               .sort()
-              .map(key => (
+              .map((key: number) => (
                 <tr key={key} className="settings-table__row">
                   <td className="settings-table__cell">{key}</td>
                   <td className="settings-table__cell">{key_values[key].value}</td>
@@ -78,17 +80,18 @@ class Settings extends React.Component<SettingsProps, {}> {
   render() {
     return (
       <div className="section">
-        <Helmet>
-          <title>Cluster Settings | Debug</title>
-        </Helmet>
-        <h1>Cluster Settings</h1>
+        <Helmet title="Cluster Settings | Debug" />
+        <h1 className="base-heading">Cluster Settings</h1>
         <Loading
           loading={!this.props.settings.data}
           error={this.props.settings.lastError}
           render={() => (
             <div>
               <p className="settings-note">Note that some settings have been redacted for security purposes.</p>
-              {this.renderTable()}
+              {this.renderTable(true)}
+              <h3>Reserved settings</h3>
+              <p className="settings-note">Note that changes to the following settings can yield unpredictable or negative effects on the entire cluster. Use at your own risk.</p>
+              {this.renderTable(false)}
             </div>
           )}
         />
@@ -97,14 +100,13 @@ class Settings extends React.Component<SettingsProps, {}> {
   }
 }
 
-function mapStateToProps(state: AdminUIState) {
-  return {
-    settings: state.cachedData.settings,
-  };
-}
+const mapStateToProps = (state: AdminUIState) => ({ // RootState contains declaration for whole state
+  settings: state.cachedData.settings,
+});
 
-const actions = {
+const mapDispatchToProps = {
+  // actionCreators returns objects with type and payload
   refreshSettings,
 };
 
-export default connect(mapStateToProps, actions)(Settings);
+export default withRouter(connect(mapStateToProps, mapDispatchToProps)(Settings));

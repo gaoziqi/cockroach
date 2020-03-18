@@ -12,20 +12,25 @@ package colserde_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
+	"unsafe"
 
 	"github.com/apache/arrow/go/arrow"
 	"github.com/apache/arrow/go/arrow/array"
 	"github.com/apache/arrow/go/arrow/memory"
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -132,6 +137,45 @@ func randomDataFromType(rng *rand.Rand, t coltypes.T, n int, nullProbability flo
 			}
 			builder.(*array.FixedSizeBinaryBuilder).AppendValues(data, valid)
 		}
+	case coltypes.Decimal:
+		var err error
+		builder = array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+		data := make([][]byte, n)
+		for i := range data {
+			var d apd.Decimal
+			// int64(rng.Uint64()) to get negative numbers, too.
+			d.SetFinite(int64(rng.Uint64()), int32(rng.Intn(40)-20))
+			data[i], err = d.MarshalText()
+			if err != nil {
+				panic(err)
+			}
+		}
+		builder.(*array.BinaryBuilder).AppendValues(data, valid)
+	case coltypes.Timestamp:
+		var err error
+		now := timeutil.Now()
+		builder = array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+		data := make([][]byte, n)
+		for i := range data {
+			delta := rng.Int63()
+			ts := now.Add(time.Duration(delta))
+			data[i], err = ts.MarshalBinary()
+			if err != nil {
+				panic(err)
+			}
+		}
+		builder.(*array.BinaryBuilder).AppendValues(data, valid)
+	case coltypes.Interval:
+		builder = array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+		data := make([][]byte, n)
+		sizeOfInt64 := int(unsafe.Sizeof(int64(0)))
+		for i := range data {
+			data[i] = make([]byte, sizeOfInt64*3)
+			binary.LittleEndian.PutUint64(data[i][0:sizeOfInt64], rng.Uint64())
+			binary.LittleEndian.PutUint64(data[i][sizeOfInt64:sizeOfInt64*2], rng.Uint64())
+			binary.LittleEndian.PutUint64(data[i][sizeOfInt64*2:sizeOfInt64*3], rng.Uint64())
+		}
+		builder.(*array.BinaryBuilder).AppendValues(data, valid)
 	default:
 		panic(fmt.Sprintf("unsupported type %s", t))
 	}
@@ -172,7 +216,6 @@ func TestRecordBatchSerializerSerializeDeserializeRandom(t *testing.T) {
 	)
 
 	var (
-		supportedTypes  = make([]coltypes.T, 0, len(coltypes.AllTypes))
 		typs            = make([]coltypes.T, rng.Intn(maxTypes)+1)
 		data            = make([]*array.Data, len(typs))
 		dataLen         = rng.Intn(maxDataLen) + 1
@@ -180,16 +223,8 @@ func TestRecordBatchSerializerSerializeDeserializeRandom(t *testing.T) {
 		buf             = bytes.Buffer{}
 	)
 
-	// We do not support decimals yet.
-	for _, t := range coltypes.AllTypes {
-		if t == coltypes.Decimal {
-			continue
-		}
-		supportedTypes = append(supportedTypes, t)
-	}
-
 	for i := range typs {
-		typs[i] = supportedTypes[rng.Intn(len(supportedTypes))]
+		typs[i] = coltypes.AllTypes[rng.Intn(len(coltypes.AllTypes))]
 		data[i] = randomDataFromType(rng, typs[i], dataLen, nullProbability)
 	}
 

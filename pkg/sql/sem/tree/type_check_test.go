@@ -136,6 +136,11 @@ func TestTypeCheck(t *testing.T) {
 			`(ROW(1:::INT8, 2:::INT8, 3:::INT8) AS "One", two, "Three")`,
 			`((1:::INT8, 2:::INT8, 3:::INT8) AS "One", two, "Three")`,
 		},
+		// Tuples with duplicate labels are allowed, but raise error when accessed by a duplicate label name.
+		// This satisfies a postgres-compatible implementation of unnest(array, array...), where all columns
+		// have the same label (unnest).
+		{`((1,2) AS a,a)`, `((1:::INT8, 2:::INT8) AS a, a)`},
+		{`((1,2,3) AS a,a,a)`, `((1:::INT8, 2:::INT8, 3:::INT8) AS a, a, a)`},
 		// And tuples without labels still work as advertized
 		{`(ROW (1))`, `(1:::INT8,)`},
 		{`ROW(1:::INT8)`, `(1:::INT8,)`},
@@ -147,6 +152,7 @@ func TestTypeCheck(t *testing.T) {
 		{`((ROW (1) AS a)).a`, `1:::INT8`},
 		{`((('1', 2) AS a, b)).a`, `'1':::STRING`},
 		{`((('1', 2) AS a, b)).b`, `2:::INT8`},
+		{`((('1', 2) AS a, b)).@2`, `2:::INT8`},
 		{`(pg_get_keywords()).word`, `(pg_get_keywords()).word`},
 		{
 			`(information_schema._pg_expandarray(ARRAY[1,3])).x`,
@@ -225,6 +231,7 @@ func TestTypeCheckError(t *testing.T) {
 		{`1 = ANY ARRAY[2, 'a']`, `unsupported comparison operator: 1 = ANY ARRAY[2, 'a']: could not parse "a" as type int`},
 		{`1 = ALL current_schemas(true)`, `unsupported comparison operator: <int> = ALL <string[]>`},
 		{`1.0 BETWEEN 2 AND 'a'`, `unsupported comparison operator: <decimal> < <string>`},
+		{`NULL BETWEEN 2 AND 'a'`, `unsupported comparison operator: <int> < <string>`},
 		{`IF(1, 2, 3)`, `incompatible IF condition type: int`},
 		{`IF(true, 'a', 2)`, `incompatible IF expressions: could not parse "a" as type int`},
 		{`IF(true, 2, 'a')`, `incompatible IF expressions: could not parse "a" as type int`},
@@ -237,6 +244,10 @@ func TestTypeCheckError(t *testing.T) {
 		{`3:::int[]`, `incompatible type annotation for 3 as int[], found type: int`},
 		{`B'1001'::decimal`, `invalid cast: varbit -> decimal`},
 		{`101.3::bit`, `invalid cast: decimal -> bit`},
+		{`ARRAY[1] = ARRAY['foo']`, `could not parse "foo" as type int`},
+		{`ARRAY[1]::int[] = ARRAY[1.0]::decimal[]`, `unsupported comparison operator: <int[]> = <decimal[]>`},
+		{`ARRAY[1] @> ARRAY['foo']`, `unsupported comparison operator: <int[]> @> <string[]>`},
+		{`ARRAY[1]::int[] @> ARRAY[1.0]::decimal[]`, `unsupported comparison operator: <int[]> @> <decimal[]>`},
 		{
 			`((1,2) AS a)`,
 			`mismatch in tuple definition: 2 expressions, 1 labels`,
@@ -246,12 +257,12 @@ func TestTypeCheckError(t *testing.T) {
 			`mismatch in tuple definition: 1 expressions, 2 labels`,
 		},
 		{
-			`((1,2) AS a,a)`,
-			`duplicate tuple label: "a"`,
+			`(((1,2) AS a,a)).a`,
+			`column reference "a" is ambiguous`,
 		},
 		{
-			`((1,2,3) AS a,b,a)`,
-			`duplicate tuple label: "a"`,
+			`((ROW (1, '2') AS b,b)).b`,
+			`column reference "b" is ambiguous`,
 		},
 		{
 			`((ROW (1, '2') AS a,b)).x`,

@@ -50,6 +50,11 @@ func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planN
 	return &renameColumnNode{n: n, tableDesc: tableDesc}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because RENAME COLUMN performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *renameColumnNode) ReadingOwnWrites() {}
+
 func (n *renameColumnNode) startExec(params runParams) error {
 	p := params.p
 	ctx := params.ctx
@@ -68,7 +73,8 @@ func (n *renameColumnNode) startExec(params runParams) error {
 		return err
 	}
 
-	return p.writeSchemaChange(ctx, tableDesc, sqlbase.InvalidMutationID)
+	return p.writeSchemaChange(
+		ctx, tableDesc, sqlbase.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()))
 }
 
 func (p *planner) renameColumn(

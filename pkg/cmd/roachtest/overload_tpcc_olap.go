@@ -79,9 +79,11 @@ func verifyNodeLiveness(ctx context.Context, c *cluster, t *test, runDuration ti
 	// Retry because timeseries queries can fail if the underlying inter-node
 	// connections are in a failed state which can happen due to overload.
 	// Now that the load has stopped, this should resolve itself soon.
+	// Even with 60 retries we'll at most spend 30s attempting to fetch
+	// the metrics.
 	if err := retry.WithMaxAttempts(ctx, retry.Options{
 		MaxBackoff: 500 * time.Millisecond,
-	}, 3, func() (err error) {
+	}, 60, func() (err error) {
 		response, err = getMetrics(adminURLs[0], now.Add(-runDuration), now, []tsQuery{
 			{
 				name:      "cr.node.liveness.heartbeatfailures",
@@ -112,6 +114,7 @@ func registerTPCCOverloadSpec(r *testRegistry, s tpccOLAPSpec) {
 		s.Nodes, s.CPUs, s.Warehouses, s.Concurrency)
 	r.Add(testSpec{
 		Name:       name,
+		Owner:      OwnerKV,
 		Cluster:    makeClusterSpec(s.Nodes+1, cpu(s.CPUs)),
 		Run:        s.run,
 		MinVersion: "v19.2.0",

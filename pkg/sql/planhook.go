@@ -83,13 +83,7 @@ type PlanHookState interface {
 	AuthorizationAccessor
 	// The role create/drop call into OSS code to reuse plan nodes.
 	// TODO(mberhault): it would be easier to just pass a planner to plan hooks.
-	CreateUserNode(
-		ctx context.Context, nameE, passwordE tree.Expr, ifNotExists bool, isRole bool, opName string,
-	) (*CreateUserNode, error)
-	DropUserNode(
-		ctx context.Context, namesE tree.Exprs, ifExists bool, isRole bool, opName string,
-	) (*DropUserNode, error)
-	GetAllUsersAndRoles(ctx context.Context) (map[string]bool, error)
+	GetAllRoles(ctx context.Context) (map[string]bool, error)
 	BumpRoleMembershipTableVersion(ctx context.Context) error
 	EvalAsOfTimestamp(asOf tree.AsOfClause) (hlc.Timestamp, error)
 	ResolveUncachedDatabaseByName(
@@ -97,6 +91,9 @@ type PlanHookState interface {
 	ResolveMutableTableDescriptor(
 		ctx context.Context, tn *ObjectName, required bool, requiredType ResolveRequiredType,
 	) (table *MutableTableDescriptor, err error)
+	ShowCreate(
+		ctx context.Context, dbPrefix string, allDescs []sqlbase.Descriptor, desc *sqlbase.TableDescriptor, ignoreFKs shouldOmitFKClausesFromCreate,
+	) (string, error)
 }
 
 // AddPlanHook adds a hook used to short-circuit creating a planNode from a
@@ -108,12 +105,10 @@ func AddPlanHook(f planHookFn) {
 	planHooks = append(planHooks, f)
 }
 
-// AddWrappedPlanHook adds a hook used to short-circuit creating a planNode from a
-// tree.Statement. If the returned plan is non-nil, it is used directly by the planner.
-//
-// See PlanHookState comments for information about why plan hooks are needed.
-func AddWrappedPlanHook(f wrappedPlanHookFn) {
-	wrappedPlanHooks = append(wrappedPlanHooks, f)
+// ClearPlanHooks is used by tests to clear out any mocked out plan hooks that
+// were registered.
+func ClearPlanHooks() {
+	planHooks = nil
 }
 
 // hookFnNode is a planNode implemented in terms of a function. It begins the

@@ -110,6 +110,7 @@ const (
 	PgCatalogAmTableID
 	PgCatalogAttrDefTableID
 	PgCatalogAttributeTableID
+	PgCatalogAuthIDTableID
 	PgCatalogAuthMembersTableID
 	PgCatalogAvailableExtensionsTableID
 	PgCatalogCastTableID
@@ -135,6 +136,7 @@ const (
 	PgCatalogMatViewsTableID
 	PgCatalogNamespaceTableID
 	PgCatalogOperatorTableID
+	PgCatalogPreparedStatementsTableID
 	PgCatalogPreparedXactsTableID
 	PgCatalogProcTableID
 	PgCatalogRangeTableID

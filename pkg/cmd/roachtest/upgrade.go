@@ -78,18 +78,6 @@ func registerUpgrade(r *testRegistry) {
 			t.Fatal(err)
 		}
 
-		stop := func(node int) error {
-			port := fmt.Sprintf("{pgport:%d}", node)
-			// Note that the following command line needs to run against both v2.1
-			// and the current branch. Do not change it in a manner that is
-			// incompatible with 2.1.
-			if err := c.RunE(ctx, c.Node(node), "./cockroach quit --insecure --port="+port); err != nil {
-				return err
-			}
-			c.Stop(ctx, c.Node(node))
-			return nil
-		}
-
 		decommissionAndStop := func(node int) error {
 			t.WorkerStatus("decomission")
 			port := fmt.Sprintf("{pgport:%d}", node)
@@ -139,7 +127,7 @@ func registerUpgrade(r *testRegistry) {
 		// Now perform a rolling restart into the new binary, except the last node.
 		for i := 1; i < nodes; i++ {
 			t.WorkerStatus("upgrading ", i)
-			if err := stop(i); err != nil {
+			if err := c.StopCockroachGracefullyOnNode(ctx, i); err != nil {
 				t.Fatal(err)
 			}
 			c.Put(ctx, cockroach, "./cockroach", c.Node(i))
@@ -158,10 +146,10 @@ func registerUpgrade(r *testRegistry) {
 
 		// Now stop a previously started node and upgrade the last node.
 		// Check cluster version is not upgraded.
-		if err := stop(nodes - 1); err != nil {
+		if err := c.StopCockroachGracefullyOnNode(ctx, nodes-1); err != nil {
 			t.Fatal(err)
 		}
-		if err := stop(nodes); err != nil {
+		if err := c.StopCockroachGracefullyOnNode(ctx, nodes); err != nil {
 			t.Fatal(err)
 		}
 		c.Put(ctx, cockroach, "./cockroach", c.Node(nodes))
@@ -264,6 +252,7 @@ func registerUpgrade(r *testRegistry) {
 
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("upgrade"),
+		Owner:      OwnerKV,
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(5),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -366,7 +355,7 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 
 	// clusterVersionUpgrade performs a cluster version upgrade to its version.
 	// It waits until all nodes have seen the upgraded cluster version.
-	// If manual is set, we'll performe a SET CLUSTER SETTING version =
+	// If newVersion is set, we'll performe a SET CLUSTER SETTING version =
 	// <newVersion>. If it's not, we'll rely on the automatic cluster version
 	// upgrade mechanism (which is not inhibited by the
 	// cluster.preserve_downgrade_option cluster setting in this test.
@@ -474,8 +463,14 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 		// From now on, all version upgrade steps pass an empty version which
 		// means the test will look it up from node_executable_version().
 
-		binaryVersionUpgrade("v19.1.3", nodes),
+		binaryVersionUpgrade("v19.1.5", nodes),
 		clusterVersionUpgrade(""),
+
+		binaryVersionUpgrade("v19.2.1", nodes),
+		clusterVersionUpgrade(""),
+
+		// Each new release has to be added here. When adding a new release, you'll
+		// probably need to use a release candidate binary.
 
 		// HEAD gives us the main binary for this roachtest run.
 		binaryVersionUpgrade("HEAD", nodes),
@@ -572,12 +567,56 @@ func runVersionUpgrade(ctx context.Context, t *test, c *cluster) {
 		}
 	}()
 
+	setupEnsureObjectAccess := func() {
+		// setupEnsureObjectAccess creates a db/table the first time, before
+		// the upgrade sequence starts. This is done to create the db/table without
+		// relying on "if not exists" modifier.
+		db := c.Conn(ctx, 1)
+		defer db.Close()
+
+		_, err := db.Exec(fmt.Sprintf("create database persistent_db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(fmt.Sprintf("create table persistent_db.persistent_table(a int)")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ensureObjectAccess := func() {
+		// run the setup function to create a db with one table before the upgrade
+		// sequence begins. After each step, we should be able to successfully select
+		// from the objects using their FQNs. Prevents bugs such as #43141, where
+		// databases created before the migration were inaccessible after the
+		// migration.
+		db := c.Conn(ctx, 1)
+		defer db.Close()
+		var cv string
+		if err := db.QueryRowContext(ctx, `SHOW CLUSTER SETTING version`).Scan(&cv); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := db.Query(fmt.Sprintf("select * from persistent_db.persistent_table"))
+		if err != nil {
+			t.Fatalf(
+				"expected querying a table created before upgrade to succeed in version %s, got %s",
+				cv, err)
+		}
+		_, err = db.Query(fmt.Sprintf("show tables from persistent_db"))
+		if err != nil {
+			t.Fatalf(
+				"expected querying show tables on a database created before upgrade to succeed in version %s, got %s",
+				cv, err)
+		}
+		t.l.Printf("%s: querying a table/db created before upgrade works as expected\n", cv)
+	}
+
 	for _, node := range nodes {
 		checkNode(node, baseVersion)
 	}
-
+	setupEnsureObjectAccess()
 	for _, step := range steps {
 		step.run()
+		ensureObjectAccess()
 		for _, feature := range features {
 			testFeature(feature)
 		}

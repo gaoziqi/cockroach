@@ -14,11 +14,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -136,7 +136,8 @@ func (b *backfiller) doRun(ctx context.Context) *execinfrapb.ProducerMetadata {
 	if err != nil {
 		return &execinfrapb.ProducerMetadata{Err: err}
 	}
-	if !b.flowCtx.Cfg.Settings.Version.IsActive(cluster.VersionAtomicChangeReplicasTrigger) {
+	st := b.flowCtx.Cfg.Settings
+	if !st.Version.IsActive(ctx, clusterversion.VersionAtomicChangeReplicasTrigger) {
 		// There is a node of older version which could be the coordinator.
 		// So we communicate the finished work by writing to the jobs row.
 		err = WriteResumeSpan(ctx,
@@ -235,7 +236,7 @@ func (b *backfiller) mainLoop(
 func GetResumeSpans(
 	ctx context.Context,
 	jobsRegistry *jobs.Registry,
-	txn *client.Txn,
+	txn *kv.Txn,
 	tableID sqlbase.ID,
 	mutationID sqlbase.MutationID,
 	filter backfill.MutationFilter,
@@ -267,6 +268,10 @@ func GetResumeSpans(
 	// Find the job.
 	var jobID int64
 	if len(tableDesc.MutationJobs) > 0 {
+		// TODO (lucy): We need to get rid of MutationJobs. This is the only place
+		// where we need to get the job where it's not completely straightforward to
+		// remove the use of MutationJobs, since the backfiller doesn't otherwise
+		// know which job it's associated with.
 		for _, job := range tableDesc.MutationJobs {
 			if job.MutationID == mutationID {
 				jobID = job.JobID
@@ -276,6 +281,7 @@ func GetResumeSpans(
 	}
 
 	if jobID == 0 {
+		log.Errorf(ctx, "mutation with no job: %d, table desc: %+v", mutationID, tableDesc)
 		return nil, nil, 0, errors.AssertionFailedf(
 			"no job found for mutation %d", errors.Safe(mutationID))
 	}
@@ -295,7 +301,7 @@ func GetResumeSpans(
 
 // SetResumeSpansInJob adds a list of resume spans into a job details field.
 func SetResumeSpansInJob(
-	ctx context.Context, spans []roachpb.Span, mutationIdx int, txn *client.Txn, job *jobs.Job,
+	ctx context.Context, spans []roachpb.Span, mutationIdx int, txn *kv.Txn, job *jobs.Job,
 ) error {
 	details, ok := job.Details().(jobspb.SchemaChangeDetails)
 	if !ok {
@@ -310,7 +316,7 @@ func SetResumeSpansInJob(
 // resume is the left over work from origSpan.
 func WriteResumeSpan(
 	ctx context.Context,
-	db *client.DB,
+	db *kv.DB,
 	id sqlbase.ID,
 	mutationID sqlbase.MutationID,
 	filter backfill.MutationFilter,
@@ -320,7 +326,7 @@ func WriteResumeSpan(
 	ctx, traceSpan := tracing.ChildSpan(ctx, "checkpoint")
 	defer tracing.FinishSpan(traceSpan)
 
-	return db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		resumeSpans, job, mutationIdx, error := GetResumeSpans(ctx, jobsRegistry, txn, id, mutationID, filter)
 		if error != nil {
 			return error

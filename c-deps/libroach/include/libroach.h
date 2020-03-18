@@ -21,14 +21,14 @@ extern "C" {
 // A DBSlice contains read-only data that does not need to be freed.
 typedef struct {
   char* data;
-  int len;
+  size_t len;
 } DBSlice;
 
 // A DBString is structurally identical to a DBSlice, but the data it
 // contains must be freed via a call to free().
 typedef struct {
   char* data;
-  int len;
+  size_t len;
 } DBString;
 
 // A DBStatus is an alias for DBString and is used to indicate that
@@ -63,10 +63,25 @@ typedef struct {
   DBStatus status;
 } DBIterState;
 
+// A DBIgnoredSeqNumRange is an alias for the Go struct
+// IgnoredSeqNumRange. It must have exactly the same memory
+// layout.
+typedef struct {
+  int32_t start_seqnum;
+  int32_t end_seqnum;
+} DBIgnoredSeqNumRange;
+
+typedef struct {
+  DBIgnoredSeqNumRange* ranges;
+  int len;
+} DBIgnoredSeqNums;
+
 typedef struct DBCache DBCache;
 typedef struct DBEngine DBEngine;
 typedef struct DBIterator DBIterator;
 typedef void* DBWritableFile;
+typedef void* DBReadableFile;
+typedef void* DBDirectory;
 
 // DBOptions contains local database options.
 typedef struct {
@@ -225,6 +240,9 @@ void DBIterDestroy(DBIterator* iter);
 // Positions the iterator at the first key that is >= "key".
 DBIterState DBIterSeek(DBIterator* iter, DBKey key);
 
+// Positions the iterator at the first key that is <= "key".
+DBIterState DBIterSeekForPrev(DBIterator* iter, DBKey key);
+
 typedef struct {
   uint64_t internal_delete_skipped_count;
   // the number of SSTables touched (only for time bound iterators).
@@ -272,7 +290,6 @@ DBStatus DBMergeOne(DBSlice existing, DBSlice update, DBString* new_value);
 // merged with existing. This method is provided for invocation from Go code.
 DBStatus DBPartialMergeOne(DBSlice existing, DBSlice update, DBString* new_value);
 
-
 // NB: The function (cStatsToGoStats) that converts these to the go
 // representation is unfortunately duplicated in engine and engineccl. If this
 // struct is changed, both places need to be updated.
@@ -304,11 +321,12 @@ MVCCStatsResult MVCCComputeStats(DBIterator* iter, DBKey start, DBKey end, int64
 // SST key is greater than or equal to the timestamp of the tombstone, then it
 // is not considered a collision and we continue iteration from the next key in
 // the existing data.
-DBIterState DBCheckForKeyCollisions(DBIterator* existingIter, DBIterator* sstIter, MVCCStatsResult* skippedKVStats, DBString* write_intent);
+DBIterState DBCheckForKeyCollisions(DBIterator* existingIter, DBIterator* sstIter,
+                                    MVCCStatsResult* skippedKVStats, DBString* write_intent);
 
 bool MVCCIsValidSplitKey(DBSlice key);
-DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey min_split,
-                          int64_t target_size, DBString* split_key);
+DBStatus MVCCFindSplitKey(DBIterator* iter, DBKey start, DBKey min_split, int64_t target_size,
+                          DBString* split_key);
 
 // DBTxn contains the fields from a roachpb.Transaction that are
 // necessary for MVCC Get and Scan operations. Note that passing a
@@ -323,6 +341,7 @@ typedef struct {
   uint32_t epoch;
   int32_t sequence;
   DBTimestamp max_timestamp;
+  DBIgnoredSeqNums ignored_seqnums;
 } DBTxn;
 
 typedef struct {
@@ -331,6 +350,8 @@ typedef struct {
   int32_t len;
   // count is the number of key/value pairs in bufs.
   int32_t count;
+  // bytes is the number of bytes (as measured by TargetSize) in bufs.
+  int64_t bytes;
 } DBChunkedBuffer;
 
 // DBScanResults contains the key/value pairs and intents encoded
@@ -339,15 +360,16 @@ typedef struct {
   DBStatus status;
   DBChunkedBuffer data;
   DBSlice intents;
+  DBTimestamp write_too_old_timestamp;
   DBTimestamp uncertainty_timestamp;
   DBSlice resume_key;
 } DBScanResults;
 
 DBScanResults MVCCGet(DBIterator* iter, DBSlice key, DBTimestamp timestamp, DBTxn txn,
-                      bool inconsistent, bool tombstones, bool ignore_sequence);
+                      bool inconsistent, bool tombstones, bool fail_on_more_recent);
 DBScanResults MVCCScan(DBIterator* iter, DBSlice start, DBSlice end, DBTimestamp timestamp,
-                       int64_t max_keys, DBTxn txn, bool inconsistent, bool reverse,
-                       bool tombstones, bool ignore_sequence);
+                       int64_t max_keys, int64_t target_bytes, DBTxn txn, bool inconsistent,
+                       bool reverse, bool tombstones, bool fail_on_more_recent);
 
 // DBStatsResult contains various runtime stats for RocksDB.
 typedef struct {
@@ -447,14 +469,12 @@ DBString DBGetUserProperties(DBEngine* db);
 // Bulk adds the files at the given paths to a database, all atomically. See the
 // RocksDB documentation on `IngestExternalFile` for the various restrictions on
 // what can be added. If move_files is true, the files will be moved instead of
-// copied. If allow_file_modifications is false, RocksDB will return an error if
-// it would have tried to modify any of the files' sequence numbers rather than
-// editing the files in place. If write_global_seqno is false, it will skip
-// writing the seq_no to the SSTs -- this is only safe if this will only ever be
-// read by Rocks version >= 5.16 as older versions would still be looking for
-// the seqno.
-DBStatus DBIngestExternalFiles(DBEngine* db, char** paths, size_t len, bool move_files,
-                               bool write_global_seqno, bool allow_file_modifications);
+// copied.
+//
+// Using this function is only safe if the data will only ever be read by Rocks
+// version >= 5.16 as older versions would be looking for seq_no in the SST and
+// we don't write it.
+DBStatus DBIngestExternalFiles(DBEngine* db, char** paths, size_t len, bool move_files);
 
 typedef struct DBSstFileWriter DBSstFileWriter;
 
@@ -484,7 +504,7 @@ DBStatus DBSstFileWriterDeleteRange(DBSstFileWriter* fw, DBKey start, DBKey end)
 // May be called multiple times. The returned data won't necessarily reflect
 // the latest writes, only the keys whose underlying RocksDB blocks have been
 // flushed. Close cannot have been called.
-DBStatus DBSstFileWriterTruncate(DBSstFileWriter *fw, DBString* data);
+DBStatus DBSstFileWriterTruncate(DBSstFileWriter* fw, DBString* data);
 
 // Finalizes the writer and stores the constructed file's contents in *data. At
 // least one kv entry must have been added. May only be called once.
@@ -501,7 +521,8 @@ void DBRunSSTDump(int argc, char** argv);
 DBStatus DBEnvWriteFile(DBEngine* db, DBSlice path, DBSlice contents);
 
 // DBEnvOpenFile opens a DBWritableFile as a new "file" in the given engine.
-DBStatus DBEnvOpenFile(DBEngine* db, DBSlice path, DBWritableFile* file);
+DBStatus DBEnvOpenFile(DBEngine* db, DBSlice path, uint64_t bytes_per_sync,
+                       DBWritableFile* file);
 
 // DBEnvReadFile reads the file with the given path in the given engine.
 DBStatus DBEnvReadFile(DBEngine* db, DBSlice path, DBSlice* contents);
@@ -532,14 +553,70 @@ typedef void* DBFileLock;
 // DBLockFile sets a lock on the specified file using RocksDB's file locking interface.
 DBStatus DBLockFile(DBSlice filename, DBFileLock* lock);
 
-// DBUnlockFile unlocks the file asscoiated with the specified lock and GCs any allocated memory for
+// DBUnlockFile unlocks the file associated with the specified lock and GCs any allocated memory for
 // the lock.
 DBStatus DBUnlockFile(DBFileLock lock);
 
 // DBExportToSst exports changes over the keyrange and time interval between the
 // start and end DBKeys to an SSTable using an IncrementalIterator.
-DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIterOptions iter_opts,
-                       DBEngine* engine, DBString* data, DBString* write_intent, DBString* summary);
+//
+// If target_size is positive, it indicates that the export should produce SSTs
+// which are roughly target size. Specifically, it will return an SST such that
+// the last key is responsible for exceeding the targetSize. If the resume_key
+// is non-NULL then the returns sst will exceed the targetSize.
+//
+// If max_size is positive, it is an absolute maximum on byte size for the
+// returned sst. If it is the case that the versions of the last key will lead
+// to an SST that exceeds maxSize, an error will be returned. This parameter
+// exists to prevent creating SSTs which are too large to be used.
+DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, 
+                       uint64_t target_size, uint64_t max_size,
+                       DBIterOptions iter_opts, DBEngine* engine, DBString* data,
+                       DBString* write_intent, DBString* summary, DBString* resume);
+
+// DBEnvOpenReadableFile opens a DBReadableFile in the given engine.
+DBStatus DBEnvOpenReadableFile(DBEngine* db, DBSlice path, DBReadableFile* file);
+
+// DBEnvReadAtFile reads from the DBReadableFile into buffer, at the given offset,
+// and returns the bytes read in n.
+DBStatus DBEnvReadAtFile(DBEngine* db, DBReadableFile file, DBSlice buffer, int64_t offset, int* n);
+
+// DBEnvCloseReadableFile closes a DBReadableFile in the given engine.
+DBStatus DBEnvCloseReadableFile(DBEngine* db, DBReadableFile file);
+
+// DBEnvOpenDirectory opens a DBDirectory in the given engine.
+DBStatus DBEnvOpenDirectory(DBEngine* db, DBSlice path, DBDirectory* file);
+
+// DBEnvSyncDirectory syncs a DBDirectory in the given engine.
+DBStatus DBEnvSyncDirectory(DBEngine* db, DBDirectory file);
+
+// DBEnvCloseDirectory closes a DBDirectory in the given engine.
+DBStatus DBEnvCloseDirectory(DBEngine* db, DBDirectory file);
+
+// DBEnvRenameFile renames oldname to newname using the given engine.
+DBStatus DBEnvRenameFile(DBEngine* db, DBSlice oldname, DBSlice newname);
+
+// DBEnvCreateDir creates a directory with name.
+DBStatus DBEnvCreateDir(DBEngine* db, DBSlice name);
+
+// DBEnvDeleteDir deletes the directory with name.
+DBStatus DBEnvDeleteDir(DBEngine* db, DBSlice name);
+
+// DBListDirResults is the contents of a directory.
+typedef struct {
+  DBStatus status;
+  DBString* names;
+  int n;
+} DBListDirResults;
+
+// DBEnvListDir lists the contents of the directory with name.
+DBListDirResults DBEnvListDir(DBEngine* db, DBSlice name);
+
+
+// DBDumpThreadStacks returns the stacks for all threads. The stacks
+// are raw addresses, and do not contain symbols. Use addr2line (or
+// atos on Darwin) to symbolize.
+DBString DBDumpThreadStacks();
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -4,12 +4,6 @@ source [file join [file dirname $argv0] common.tcl]
 
 start_test "Check cockroach demo --with-load runs the movr workload"
 
-# Disable trying to acquire the demo license. This test does not
-# need enterprise features, and sometimes if the licensing server
-# is unavailable, the error message from failing to receive the
-# testing license pollutes the test output.
-set env(COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING) "true"
-
 # Start demo with movr and the movr workload.
 spawn $argv demo movr --with-load
 
@@ -36,6 +30,22 @@ if {!$workloadRunning} {
   report "Workload is not running"
   exit 1
 }
+
+interrupt
+eexpect eof
+end_test
+
+# Ensure that cockroach demo with the movr workload can control the number of ranges that tables are split into.
+start_test "Check that controlling ranges of the movr dataset works"
+# Reset the timeout.
+set timeout 30
+spawn $argv demo movr --num-ranges=6
+
+eexpect "movr>"
+
+send "SELECT count(*) FROM \[SHOW RANGES FROM TABLE USERS\];\r"
+eexpect "6"
+eexpect "(1 row)"
 
 interrupt
 eexpect eof

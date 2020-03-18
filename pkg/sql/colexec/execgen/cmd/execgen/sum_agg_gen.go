@@ -13,15 +13,16 @@ package main
 import (
 	"io"
 	"io/ioutil"
-	"regexp"
 	"strings"
 	"text/template"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
+const sumAggTmpl = "pkg/sql/colexec/sum_agg_tmpl.go"
+
 func genSumAgg(wr io.Writer) error {
-	t, err := ioutil.ReadFile("pkg/sql/colexec/sum_agg_tmpl.go")
+	t, err := ioutil.ReadFile(sumAggTmpl)
 	if err != nil {
 		return err
 	}
@@ -33,8 +34,8 @@ func genSumAgg(wr io.Writer) error {
 	s = strings.Replace(s, "_TYPE", "{{.LTyp}}", -1)
 	s = strings.Replace(s, "_TemplateType", "{{.LTyp}}", -1)
 
-	assignAddRe := regexp.MustCompile(`_ASSIGN_ADD\((.*),(.*),(.*)\)`)
-	s = assignAddRe.ReplaceAllString(s, "{{.Global.Assign $1 $2 $3}}")
+	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 3)
+	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.Assign", 3))
 
 	accumulateSum := makeFunctionRegex("_ACCUMULATE_SUM", 4)
 	s = accumulateSum.ReplaceAllString(s, `{{template "accumulateSum" buildDict "Global" . "HasNulls" $4}}`)
@@ -48,5 +49,5 @@ func genSumAgg(wr io.Writer) error {
 }
 
 func init() {
-	registerGenerator(genSumAgg, "sum_agg.eg.go")
+	registerGenerator(genSumAgg, "sum_agg.eg.go", sumAggTmpl)
 }

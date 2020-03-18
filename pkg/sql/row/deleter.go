@@ -13,8 +13,8 @@ package row
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -38,7 +38,8 @@ type Deleter struct {
 // expectation of which values are passed as values to DeleteRow. Any column
 // passed in requestedCols will be included in FetchCols.
 func MakeDeleter(
-	txn *client.Txn,
+	ctx context.Context,
+	txn *kv.Txn,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	fkTables FkTableMetadata,
 	requestedCols []sqlbase.ColumnDescriptor,
@@ -47,14 +48,14 @@ func MakeDeleter(
 	alloc *sqlbase.DatumAlloc,
 ) (Deleter, error) {
 	rowDeleter, err := makeRowDeleterWithoutCascader(
-		txn, tableDesc, fkTables, requestedCols, checkFKs, alloc,
+		ctx, txn, tableDesc, fkTables, requestedCols, checkFKs, alloc,
 	)
 	if err != nil {
 		return Deleter{}, err
 	}
 	if checkFKs == CheckFKs {
 		var err error
-		rowDeleter.cascader, err = makeDeleteCascader(txn, tableDesc, fkTables, evalCtx, alloc)
+		rowDeleter.cascader, err = makeDeleteCascader(ctx, txn, tableDesc, fkTables, evalCtx, alloc)
 		if err != nil {
 			return Deleter{}, err
 		}
@@ -65,7 +66,8 @@ func MakeDeleter(
 // makeRowDeleterWithoutCascader creates a rowDeleter but does not create an
 // additional cascader.
 func makeRowDeleterWithoutCascader(
-	txn *client.Txn,
+	ctx context.Context,
+	txn *kv.Txn,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	fkTables FkTableMetadata,
 	requestedCols []sqlbase.ColumnDescriptor,
@@ -114,7 +116,7 @@ func makeRowDeleterWithoutCascader(
 	}
 	if checkFKs == CheckFKs {
 		var err error
-		if rd.Fks, err = makeFkExistenceCheckHelperForDelete(txn, tableDesc, fkTables,
+		if rd.Fks, err = makeFkExistenceCheckHelperForDelete(ctx, txn, tableDesc, fkTables,
 			fetchColIDtoRowIndex, alloc); err != nil {
 			return Deleter{}, err
 		}
@@ -128,24 +130,28 @@ func makeRowDeleterWithoutCascader(
 // orphaned rows. The bytesMonitor is only used if cascading/fk checking and can
 // be nil if not.
 func (rd *Deleter) DeleteRow(
-	ctx context.Context,
-	b *client.Batch,
-	values []tree.Datum,
-	checkFKs checkFKConstraints,
-	traceKV bool,
+	ctx context.Context, b *kv.Batch, values []tree.Datum, checkFKs checkFKConstraints, traceKV bool,
 ) error {
-	primaryIndexKey, secondaryIndexEntries, err := rd.Helper.encodeIndexes(rd.FetchColIDtoRowIndex, values)
-	if err != nil {
-		return err
-	}
 
 	// Delete the row from any secondary indices.
-	for i := range secondaryIndexEntries {
-		secondaryIndexEntry := &secondaryIndexEntries[i]
-		if traceKV {
-			log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(rd.Helper.secIndexValDirs[i], secondaryIndexEntry.Key))
+	for i := range rd.Helper.Indexes {
+		// We want to include empty k/v pairs because we want to delete all k/v's for this row.
+		entries, err := sqlbase.EncodeSecondaryIndex(
+			rd.Helper.TableDesc.TableDesc(), &rd.Helper.Indexes[i], rd.FetchColIDtoRowIndex, values, true /* includeEmpty */)
+		if err != nil {
+			return err
 		}
-		b.Del(&secondaryIndexEntry.Key)
+		for _, e := range entries {
+			if traceKV {
+				log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(rd.Helper.secIndexValDirs[i], e.Key))
+			}
+			b.Del(&e.Key)
+		}
+	}
+
+	primaryIndexKey, err := rd.Helper.encodePrimaryIndex(rd.FetchColIDtoRowIndex, values)
+	if err != nil {
+		return err
 	}
 
 	// Delete the row.
@@ -189,11 +195,7 @@ func (rd *Deleter) DeleteRow(
 // DeleteIndexRow adds to the batch the kv operations necessary to delete a
 // table row from the given index.
 func (rd *Deleter) DeleteIndexRow(
-	ctx context.Context,
-	b *client.Batch,
-	idx *sqlbase.IndexDescriptor,
-	values []tree.Datum,
-	traceKV bool,
+	ctx context.Context, b *kv.Batch, idx *sqlbase.IndexDescriptor, values []tree.Datum, traceKV bool,
 ) error {
 	if rd.Fks.checker != nil {
 		if err := rd.Fks.addAllIdxChecks(ctx, values, traceKV); err != nil {
@@ -203,8 +205,12 @@ func (rd *Deleter) DeleteIndexRow(
 			return err
 		}
 	}
+	// We want to include empty k/v pairs because we want
+	// to delete all k/v's for this row. By setting includeEmpty
+	// to true, we will get a k/v pair for each family in the row,
+	// which will guarantee that we delete all the k/v's in this row.
 	secondaryIndexEntry, err := sqlbase.EncodeSecondaryIndex(
-		rd.Helper.TableDesc.TableDesc(), idx, rd.FetchColIDtoRowIndex, values)
+		rd.Helper.TableDesc.TableDesc(), idx, rd.FetchColIDtoRowIndex, values, true /* includeEmpty */)
 	if err != nil {
 		return err
 	}

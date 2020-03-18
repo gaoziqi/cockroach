@@ -13,10 +13,10 @@ package sqlbase
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -102,7 +102,7 @@ func ValidateColumnDefType(t *types.T) error {
 
 	case types.BitFamily, types.IntFamily, types.FloatFamily, types.BoolFamily, types.BytesFamily, types.DateFamily,
 		types.INetFamily, types.IntervalFamily, types.JsonFamily, types.OidFamily, types.TimeFamily,
-		types.TimestampFamily, types.TimestampTZFamily, types.UuidFamily:
+		types.TimestampFamily, types.TimestampTZFamily, types.UuidFamily, types.TimeTZFamily:
 		// These types are OK.
 
 	default:
@@ -151,7 +151,7 @@ func MakeColumnDefDescs(
 
 	col := &ColumnDescriptor{
 		Name:     string(d.Name),
-		Nullable: d.Nullable.Nullability != tree.NotNull && !d.PrimaryKey,
+		Nullable: d.Nullable.Nullability != tree.NotNull && !d.PrimaryKey.IsPrimaryKey,
 	}
 
 	// Validate and assign column type.
@@ -188,11 +188,30 @@ func MakeColumnDefDescs(
 	}
 
 	var idx *IndexDescriptor
-	if d.PrimaryKey || d.Unique {
-		idx = &IndexDescriptor{
-			Unique:           true,
-			ColumnNames:      []string{string(d.Name)},
-			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+	if d.PrimaryKey.IsPrimaryKey || d.Unique {
+		if !d.PrimaryKey.Sharded {
+			idx = &IndexDescriptor{
+				Unique:           true,
+				ColumnNames:      []string{string(d.Name)},
+				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+			}
+		} else {
+			buckets, err := tree.EvalShardBucketCount(d.PrimaryKey.ShardBuckets)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			shardColName := GetShardColumnName([]string{string(d.Name)}, buckets)
+			idx = &IndexDescriptor{
+				Unique:           true,
+				ColumnNames:      []string{shardColName, string(d.Name)},
+				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
+				Sharded: ShardedDescriptor{
+					IsSharded:    true,
+					Name:         shardColName,
+					ShardBuckets: buckets,
+					ColumnNames:  []string{string(d.Name)},
+				},
+			}
 		}
 		if d.UniqueConstraintName != "" {
 			idx.Name = string(d.UniqueConstraintName)
@@ -200,6 +219,17 @@ func MakeColumnDefDescs(
 	}
 
 	return col, idx, typedExpr, nil
+}
+
+// GetShardColumnName generates a name for the hidden shard column to be used to create a
+// hash sharded index.
+func GetShardColumnName(colNames []string, buckets int32) string {
+	// We sort the `colNames` here because we want to avoid creating a duplicate shard
+	// column if one already exists for the set of columns in `colNames`.
+	sort.Strings(colNames)
+	return strings.Join(
+		append(append([]string{`crdb_internal`}, colNames...), fmt.Sprintf(`shard_%v`, buckets)), `_`,
+	)
 }
 
 // EncodeColumns is a version of EncodePartialIndexKey that takes ColumnIDs and
@@ -280,7 +310,7 @@ type tableLookupFn func(ID) (*TableDescriptor, error)
 
 // GetConstraintInfo returns a summary of all constraints on the table.
 func (desc *TableDescriptor) GetConstraintInfo(
-	ctx context.Context, txn *client.Txn,
+	ctx context.Context, txn *kv.Txn,
 ) (map[string]ConstraintDetail, error) {
 	var tableLookup tableLookupFn
 	if txn != nil {
@@ -390,7 +420,8 @@ func (desc *TableDescriptor) collectConstraintInfo(
 
 	for _, c := range desc.AllActiveAndInactiveChecks() {
 		if _, ok := info[c.Name]; ok {
-			return nil, errors.Errorf("duplicate constraint name: %q", c.Name)
+			return nil, pgerror.Newf(pgcode.DuplicateObject,
+				"duplicate constraint name: %q", c.Name)
 		}
 		detail := ConstraintDetail{Kind: ConstraintTypeCheck}
 		// Constraints in the Validating state are considered Unvalidated for this purpose
@@ -417,6 +448,18 @@ func (desc *TableDescriptor) collectConstraintInfo(
 	return info, nil
 }
 
+// IsValidOriginIndex returns whether the index can serve as an origin index for a foreign
+// key constraint with the provided set of originColIDs.
+func (idx *IndexDescriptor) IsValidOriginIndex(originColIDs ColumnIDs) bool {
+	return ColumnIDs(idx.ColumnIDs).HasPrefix(originColIDs)
+}
+
+// IsValidReferencedIndex returns whether the index can serve as a referenced index for a foreign
+// key constraint with the provided set of referencedColumnIDs.
+func (idx *IndexDescriptor) IsValidReferencedIndex(referencedColIDs ColumnIDs) bool {
+	return idx.Unique && ColumnIDs(idx.ColumnIDs).Equals(referencedColIDs)
+}
+
 // FindFKReferencedIndex finds the first index in the supplied referencedTable
 // that can satisfy a foreign key of the supplied column ids.
 func FindFKReferencedIndex(
@@ -424,13 +467,14 @@ func FindFKReferencedIndex(
 ) (*IndexDescriptor, error) {
 	// Search for a unique index on the referenced table that matches our foreign
 	// key columns.
-	if ColumnIDs(referencedTable.PrimaryIndex.ColumnIDs).HasPrefix(referencedColIDs) {
+	if referencedTable.PrimaryIndex.IsValidReferencedIndex(referencedColIDs) {
 		return &referencedTable.PrimaryIndex, nil
 	}
 	// If the PK doesn't match, find the index corresponding to the referenced column.
-	for _, idx := range referencedTable.Indexes {
-		if idx.Unique && ColumnIDs(idx.ColumnIDs).HasPrefix(referencedColIDs) {
-			return &idx, nil
+	for i := range referencedTable.Indexes {
+		idx := &referencedTable.Indexes[i]
+		if idx.IsValidReferencedIndex(referencedColIDs) {
+			return idx, nil
 		}
 	}
 	return nil, pgerror.Newf(
@@ -447,13 +491,14 @@ func FindFKOriginIndex(
 ) (*IndexDescriptor, error) {
 	// Search for an index on the origin table that matches our foreign
 	// key columns.
-	if ColumnIDs(originTable.PrimaryIndex.ColumnIDs).HasPrefix(originColIDs) {
+	if originTable.PrimaryIndex.IsValidOriginIndex(originColIDs) {
 		return &originTable.PrimaryIndex, nil
 	}
 	// If the PK doesn't match, find the index corresponding to the origin column.
-	for _, idx := range originTable.Indexes {
-		if ColumnIDs(idx.ColumnIDs).HasPrefix(originColIDs) {
-			return &idx, nil
+	for i := range originTable.Indexes {
+		idx := &originTable.Indexes[i]
+		if idx.IsValidOriginIndex(originColIDs) {
+			return idx, nil
 		}
 	}
 	return nil, pgerror.Newf(
@@ -469,7 +514,7 @@ func FindFKOriginIndex(
 // because the marshaling is not guaranteed to be stable and also because it's
 // sensitive to things like missing vs default values of fields.
 func ConditionalGetTableDescFromTxn(
-	ctx context.Context, txn *client.Txn, expectation *TableDescriptor,
+	ctx context.Context, txn *kv.Txn, expectation *TableDescriptor,
 ) (*roachpb.Value, error) {
 	key := MakeDescMetadataKey(expectation.ID)
 	existingKV, err := txn.Get(ctx, key)
@@ -490,45 +535,4 @@ func ConditionalGetTableDescFromTxn(
 		return nil, &roachpb.ConditionFailedError{ActualValue: existingKV.Value}
 	}
 	return existingKV.Value, nil
-}
-
-// SplitKeysForTable computes the split keys for a given table descriptor,
-// taking into account all its partitions and their zone configs.
-// The descriptor is taken as a raw Value, as the config package needs to invoke
-// this. If the descriptor represents indeed a table, at least one split point
-// is returned (the start of the table). If the descriptor that's passed in is
-// not a table (i.e. it's a database or a view), then nil is returned.
-//
-// zone is the zone config for the table. Can be nil if no zone config has been
-// configured.
-//
-// The split keys are returned sorted.
-// An error is returned iff a descVal is not a descriptor.
-func SplitKeysForTable(descVal *roachpb.Value, zone *zonepb.ZoneConfig) ([]roachpb.RKey, error) {
-	var desc Descriptor
-	if err := descVal.GetProto(&desc); err != nil {
-		return nil, errors.AssertionFailedf("failed to decode descriptor")
-	}
-
-	table := desc.Table(descVal.Timestamp)
-	if table == nil {
-		// Databases don't require splits.
-		return nil, nil
-	}
-	if viewStr := table.GetViewQuery(); viewStr != "" {
-		// Views don't require splits.
-		return nil, nil
-	}
-	tableKey := roachpb.RKey(keys.MakeTablePrefix(uint32(table.ID)))
-	if zone == nil {
-		return []roachpb.RKey{tableKey}, nil
-	}
-	subzoneSplits := zone.SubzoneSplits()
-	splits := make([]roachpb.RKey, len(subzoneSplits)+1)
-	splits[0] = tableKey
-	for i, s := range subzoneSplits {
-		// Prepend the table prefix to the subzone splits.
-		splits[i+1] = append(append([]byte(nil), tableKey...), s...)
-	}
-	return splits, nil
 }

@@ -18,13 +18,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -34,7 +34,7 @@ import (
 )
 
 type interceptingTransport struct {
-	kv.Transport
+	kvcoord.Transport
 	sendNext func(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, error)
 }
 
@@ -48,15 +48,14 @@ func (t *interceptingTransport) SendNext(
 	}
 }
 
-// TestAmbiguousCommit verifies that an ambiguous commit error is returned
-// from sql.Exec in situations where an EndTransaction is part of a batch and
-// the disposition of the batch request is unknown after a network failure or
-// timeout. The goal here is to prevent spurious transaction retries after the
-// initial transaction actually succeeded. In cases where there's an auto-
-// generated primary key, this can result in silent duplications. In cases
-// where the primary key is specified in advance, it can result in violated
-// uniqueness constraints, or duplicate key violations. See #6053, #7604, and
-// #10023.
+// TestAmbiguousCommit verifies that an ambiguous commit error is returned from
+// sql.Exec in situations where an EndTxn is part of a batch and the disposition
+// of the batch request is unknown after a network failure or timeout. The goal
+// here is to prevent spurious transaction retries after the initial transaction
+// actually succeeded. In cases where there's an auto- generated primary key,
+// this can result in silent duplications. In cases where the primary key is
+// specified in advance, it can result in violated uniqueness constraints, or
+// duplicate key violations. See #6053, #7604, and #10023.
 func TestAmbiguousCommit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -81,11 +80,11 @@ func TestAmbiguousCommit(t *testing.T) {
 			return nil
 		}
 
-		params.Knobs.KVClient = &kv.ClientTestingKnobs{
+		params.Knobs.KVClient = &kvcoord.ClientTestingKnobs{
 			TransportFactory: func(
-				opts kv.SendOptions, nodeDialer *nodedialer.Dialer, replicas kv.ReplicaSlice,
-			) (kv.Transport, error) {
-				transport, err := kv.GRPCTransportFactory(opts, nodeDialer, replicas)
+				opts kvcoord.SendOptions, nodeDialer *nodedialer.Dialer, replicas kvcoord.ReplicaSlice,
+			) (kvcoord.Transport, error) {
+				transport, err := kvcoord.GRPCTransportFactory(opts, nodeDialer, replicas)
 				return &interceptingTransport{
 					Transport: transport,
 					sendNext: func(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
@@ -120,7 +119,7 @@ func TestAmbiguousCommit(t *testing.T) {
 		}
 
 		if ambiguousSuccess {
-			params.Knobs.Store = &storage.StoreTestingKnobs{
+			params.Knobs.Store = &kvserver.StoreTestingKnobs{
 				TestingResponseFilter: func(args roachpb.BatchRequest, _ *roachpb.BatchResponse) *roachpb.Error {
 					if req, ok := args.GetArg(roachpb.ConditionalPut); ok {
 						return maybeRPCError(req.(*roachpb.ConditionalPutRequest))
@@ -156,7 +155,7 @@ func TestAmbiguousCommit(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		tableID := sqlutils.QueryTableID(t, sqlDB, "test", "t")
+		tableID := sqlutils.QueryTableID(t, sqlDB, "test", "public", "t")
 		tableStartKey.Store(keys.MakeTablePrefix(tableID))
 
 		// Wait for new table to split & replication.

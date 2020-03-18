@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -30,10 +30,12 @@ import (
 )
 
 // serverCfg is used as the client-side copy of default server
-// parameters for CLI utilities (other than `cockroach start`, which
-// constructs a proper server.Config for the newly created server).
+// parameters for CLI utilities.
+//
+// NB: `cockroach start` further annotates serverCfg for the newly created
+// server.
 var serverCfg = func() server.Config {
-	st := cluster.MakeClusterSettings(cluster.BinaryMinimumSupportedVersion, cluster.BinaryServerVersion)
+	st := cluster.MakeClusterSettings()
 	settings.SetCanonicalValuesContainer(&st.SV)
 
 	s := server.MakeConfig(context.Background(), st)
@@ -92,8 +94,8 @@ func initCLIDefaults() {
 	dumpCtx.dumpMode = dumpBoth
 	dumpCtx.asOf = ""
 
-	debugCtx.startKey = engine.NilKey
-	debugCtx.endKey = engine.MVCCKeyMax
+	debugCtx.startKey = storage.NilKey
+	debugCtx.endKey = storage.MVCCKeyMax
 	debugCtx.values = false
 	debugCtx.sizes = false
 	debugCtx.replicated = false
@@ -108,15 +110,21 @@ func initCLIDefaults() {
 	serverCfg.JoinList = nil
 	serverCfg.DefaultZoneConfig = zonepb.DefaultZoneConfig()
 	serverCfg.DefaultSystemZoneConfig = zonepb.DefaultSystemZoneConfig()
+	// Attempt to default serverCfg.SQLMemoryPoolSize to 25% if possible.
+	if bytes, _ := memoryPercentResolver(25); bytes != 0 {
+		serverCfg.SQLMemoryPoolSize = bytes
+	}
 
 	startCtx.serverInsecure = baseCfg.Insecure
 	startCtx.serverSSLCertsDir = base.DefaultCertsDirectory
+	startCtx.serverCertPrincipalMap = nil
 	startCtx.serverListenAddr = ""
 	startCtx.tempDir = ""
 	startCtx.externalIODir = ""
 	startCtx.listeningURLFile = ""
 	startCtx.pidFile = ""
 	startCtx.inBackground = false
+	startCtx.backtraceOutputDir = ""
 
 	quitCtx.serverDecommission = false
 
@@ -145,6 +153,8 @@ func initCLIDefaults() {
 	networkBenchCtx.addresses = []string{"localhost:8081"}
 
 	demoCtx.nodes = 1
+	demoCtx.sqlPoolMemorySize = 128 << 20 // 128MB, chosen to fit 9 nodes on 2GB machine.
+	demoCtx.cacheSize = 64 << 20          // 64MB, chosen to fit 9 nodes on 2GB machine.
 	demoCtx.useEmptyDatabase = false
 	demoCtx.simulateLatency = false
 	demoCtx.runWorkload = false
@@ -152,6 +162,10 @@ func initCLIDefaults() {
 	demoCtx.geoPartitionedReplicas = false
 	demoCtx.disableTelemetry = false
 	demoCtx.disableLicenseAcquisition = false
+	demoCtx.transientCluster = nil
+	demoCtx.insecure = true
+
+	authCtx.validityPeriod = 1 * time.Hour
 
 	initPreFlagsDefaults()
 
@@ -254,10 +268,17 @@ var dumpCtx struct {
 	asOf string
 }
 
+// authCtx captures the command-line parameters of the `auth-session`
+// command.
+var authCtx struct {
+	onlyCookie     bool
+	validityPeriod time.Duration
+}
+
 // debugCtx captures the command-line parameters of the `debug` command.
 // Defaults set by InitCLIDefaults() above.
 var debugCtx struct {
-	startKey, endKey  engine.MVCCKey
+	startKey, endKey  storage.MVCCKey
 	values            bool
 	sizes             bool
 	replicated        bool
@@ -271,9 +292,10 @@ var debugCtx struct {
 // Defaults set by InitCLIDefaults() above.
 var startCtx struct {
 	// server-specific values of some flags.
-	serverInsecure    bool
-	serverSSLCertsDir string
-	serverListenAddr  string
+	serverInsecure         bool
+	serverSSLCertsDir      string
+	serverCertPrincipalMap []string
+	serverListenAddr       string
 
 	// temporary directory to use to spill computation results to disk.
 	tempDir string
@@ -296,6 +318,9 @@ var startCtx struct {
 
 	// logging settings specific to file logging.
 	logDir log.DirName
+
+	// directory to use for logging backtrace outputs.
+	backtraceOutputDir string
 }
 
 // quitCtx captures the command-line parameters of the `quit` command.
@@ -346,6 +371,8 @@ var sqlfmtCtx struct {
 // Defaults set by InitCLIDefaults() above.
 var demoCtx struct {
 	nodes                     int
+	sqlPoolMemorySize         int64
+	cacheSize                 int64
 	disableTelemetry          bool
 	disableLicenseAcquisition bool
 	useEmptyDatabase          bool
@@ -353,4 +380,6 @@ var demoCtx struct {
 	localities                demoLocalityList
 	geoPartitionedReplicas    bool
 	simulateLatency           bool
+	transientCluster          *transientCluster
+	insecure                  bool
 }

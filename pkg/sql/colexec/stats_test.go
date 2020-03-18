@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
@@ -28,7 +29,7 @@ import (
 func TestNumBatches(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	nBatches := 10
-	noop := NewNoop(makeFiniteChunksSourceWithBatchSize(nBatches, int(coldata.BatchSize())))
+	noop := NewNoop(makeFiniteChunksSourceWithBatchSize(nBatches, coldata.BatchSize()))
 	vsc := NewVectorizedStatsCollector(noop, 0 /* id */, true /* isStall */, timeutil.NewStopWatch())
 	vsc.Init()
 	for {
@@ -64,36 +65,33 @@ func TestNumTuples(t *testing.T) {
 // expected.
 func TestVectorizedStatsCollector(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
+	defer cleanup()
 	for nBatches := 1; nBatches < 5; nBatches++ {
 		timeSource := timeutil.NewTestTimeSource()
 		mjInputWatch := timeutil.NewTestStopWatch(timeSource.Now)
 
 		leftSource := &timeAdvancingOperator{
-			OneInputNode: NewOneInputNode(makeFiniteChunksSourceWithBatchSize(nBatches, int(coldata.BatchSize()))),
+			OneInputNode: NewOneInputNode(makeFiniteChunksSourceWithBatchSize(nBatches, coldata.BatchSize())),
 			timeSource:   timeSource,
 		}
 		leftInput := NewVectorizedStatsCollector(leftSource, 0 /* id */, true /* isStall */, timeutil.NewTestStopWatch(timeSource.Now))
 		leftInput.SetOutputWatch(mjInputWatch)
 
 		rightSource := &timeAdvancingOperator{
-			OneInputNode: NewOneInputNode(makeFiniteChunksSourceWithBatchSize(nBatches, int(coldata.BatchSize()))),
+			OneInputNode: NewOneInputNode(makeFiniteChunksSourceWithBatchSize(nBatches, coldata.BatchSize())),
 			timeSource:   timeSource,
 		}
 		rightInput := NewVectorizedStatsCollector(rightSource, 1 /* id */, true /* isStall */, timeutil.NewTestStopWatch(timeSource.Now))
 		rightInput.SetOutputWatch(mjInputWatch)
 
-		mergeJoiner, err := NewMergeJoinOp(
-			sqlbase.InnerJoin,
-			leftInput,
-			rightInput,
-			[]uint32{0},
-			[]uint32{0},
-			[]coltypes.T{coltypes.Int64},
-			[]coltypes.T{coltypes.Int64},
+		mergeJoiner, err := newMergeJoinOp(
+			testAllocator, defaultMemoryLimit, queueCfg,
+			NewTestingSemaphore(4), sqlbase.InnerJoin, leftInput, rightInput,
+			[]coltypes.T{coltypes.Int64}, []coltypes.T{coltypes.Int64},
 			[]execinfrapb.Ordering_Column{{ColIdx: 0}},
 			[]execinfrapb.Ordering_Column{{ColIdx: 0}},
-			nil,   /* filterConstructor */
-			false, /* filterOnlyOnLeft */
+			testDiskAcc,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -120,7 +118,7 @@ func TestVectorizedStatsCollector(t *testing.T) {
 
 		require.Equal(t, nBatches, batchCount)
 		require.Equal(t, nBatches, int(mjStatsCollector.NumBatches))
-		require.Equal(t, nBatches*int(coldata.BatchSize()), int(mjStatsCollector.NumTuples))
+		require.Equal(t, nBatches*coldata.BatchSize(), int(mjStatsCollector.NumTuples))
 		// Two inputs are advancing the time source for a total of 2 * nBatches
 		// advances, but these do not count towards merge joiner execution time.
 		// Merge joiner advances the time on its every non-empty batch totaling
@@ -130,12 +128,12 @@ func TestVectorizedStatsCollector(t *testing.T) {
 }
 
 func makeFiniteChunksSourceWithBatchSize(nBatches int, batchSize int) Operator {
-	batch := coldata.NewMemBatchWithSize([]coltypes.T{coltypes.Int64}, batchSize)
+	batch := testAllocator.NewMemBatchWithSize([]coltypes.T{coltypes.Int64}, batchSize)
 	vec := batch.ColVec(0).Int64()
 	for i := 0; i < batchSize; i++ {
 		vec[i] = int64(i)
 	}
-	batch.SetLength(uint16(batchSize))
+	batch.SetLength(batchSize)
 	return newFiniteChunksSource(batch, nBatches, 1 /* matchLen */)
 }
 

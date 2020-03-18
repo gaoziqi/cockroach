@@ -13,9 +13,10 @@ package row
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 )
 
 // KVFetcher wraps kvBatchFetcher, providing a NextKV interface that returns the
@@ -33,14 +34,17 @@ type KVFetcher struct {
 
 // NewKVFetcher creates a new KVFetcher.
 func NewKVFetcher(
-	txn *client.Txn,
+	txn *kv.Txn,
 	spans roachpb.Spans,
 	reverse bool,
 	useBatchLimit bool,
 	firstBatchLimit int64,
+	lockStr sqlbase.ScanLockingStrength,
 	returnRangeInfo bool,
 ) (*KVFetcher, error) {
-	kvBatchFetcher, err := makeKVBatchFetcher(txn, spans, reverse, useBatchLimit, firstBatchLimit, returnRangeInfo)
+	kvBatchFetcher, err := makeKVBatchFetcher(
+		txn, spans, reverse, useBatchLimit, firstBatchLimit, lockStr, returnRangeInfo,
+	)
 	return newKVFetcher(&kvBatchFetcher), err
 }
 

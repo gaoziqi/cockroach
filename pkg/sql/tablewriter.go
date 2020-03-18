@@ -13,7 +13,7 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -45,7 +45,7 @@ type tableWriter interface {
 
 	// init provides the tableWriter with a Txn and optional monitor to write to
 	// and returns an error if it was misconfigured.
-	init(*client.Txn, *tree.EvalContext) error
+	init(context.Context, *kv.Txn, *tree.EvalContext) error
 
 	// row performs a sql row modification (tableInserter performs an insert,
 	// etc). It batches up writes to the init'd txn and periodically sends them.
@@ -77,20 +77,6 @@ type tableWriter interface {
 
 	// enable auto commit in call to finalize().
 	enableAutoCommit()
-}
-
-type autoCommitOpt int
-
-const (
-	autoCommitDisabled autoCommitOpt = 0
-	autoCommitEnabled  autoCommitOpt = 1
-)
-
-// extendedTableWriter is a temporary interface introduced
-// until all the tableWriters implement it. When that is achieved, it will be merged into
-// the main tableWriter interface.
-type extendedTableWriter interface {
-	tableWriter
 
 	// atBatchEnd is called at the end of each batch, just before
 	// finalize/flush. It can utilize the current KV batch which is
@@ -110,30 +96,33 @@ type extendedTableWriter interface {
 	curBatchSize() int
 }
 
-var _ extendedTableWriter = (*tableUpdater)(nil)
-var _ extendedTableWriter = (*tableDeleter)(nil)
-var _ extendedTableWriter = (*tableInserter)(nil)
+type autoCommitOpt int
+
+const (
+	autoCommitDisabled autoCommitOpt = 0
+	autoCommitEnabled  autoCommitOpt = 1
+)
 
 // tableWriterBase is meant to be used to factor common code between
 // the other tableWriters.
 type tableWriterBase struct {
 	// txn is the current KV transaction.
-	txn *client.Txn
+	txn *kv.Txn
 	// is autoCommit turned on.
 	autoCommit autoCommitOpt
 	// b is the current batch.
-	b *client.Batch
+	b *kv.Batch
 	// batchSize is the current batch size (when known).
 	batchSize int
 }
 
-func (tb *tableWriterBase) init(txn *client.Txn) {
+func (tb *tableWriterBase) init(txn *kv.Txn) {
 	tb.txn = txn
 	tb.b = txn.NewBatch()
 }
 
-// flushAndStartNewBatch shares the common flushAndStartNewBatch()
-// code between extendedTableWriters.
+// flushAndStartNewBatch shares the common flushAndStartNewBatch() code between
+// tableWriters.
 func (tb *tableWriterBase) flushAndStartNewBatch(
 	ctx context.Context, tableDesc *sqlbase.ImmutableTableDescriptor,
 ) error {
@@ -145,10 +134,10 @@ func (tb *tableWriterBase) flushAndStartNewBatch(
 	return nil
 }
 
-// curBatchSize shares the common curBatchSize() code between extendedTableWriters().
+// curBatchSize shares the common curBatchSize() code between tableWriters.
 func (tb *tableWriterBase) curBatchSize() int { return tb.batchSize }
 
-// finalize shares the common finalize code between extendedTableWriters.
+// finalize shares the common finalize() code between tableWriters.
 func (tb *tableWriterBase) finalize(
 	ctx context.Context, tableDesc *sqlbase.ImmutableTableDescriptor,
 ) (err error) {
@@ -171,19 +160,3 @@ func (tb *tableWriterBase) finalize(
 func (tb *tableWriterBase) enableAutoCommit() {
 	tb.autoCommit = autoCommitEnabled
 }
-
-// batchedTableWriter is used for tableWriters that
-// do their work at the end of the current batch, currently
-// used for tableUpserter.
-type batchedTableWriter interface {
-	extendedTableWriter
-
-	// batchedCount returns the number of results in the current batch.
-	batchedCount() int
-
-	// batchedValues accesses one row in the current batch.
-	batchedValues(rowIdx int) tree.Datums
-}
-
-var _ batchedTableWriter = (*tableUpserter)(nil)
-var _ batchedTableWriter = (*fastTableUpserter)(nil)

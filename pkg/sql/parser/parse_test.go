@@ -76,6 +76,8 @@ func TestParse(t *testing.T) {
 		{`CREATE DATABASE IF NOT EXISTS a LC_CTYPE = 'C.UTF-8'`},
 		{`CREATE DATABASE IF NOT EXISTS a LC_CTYPE = 'INVALID'`},
 		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = 'template0' ENCODING = 'UTF8' LC_COLLATE = 'C.UTF-8' LC_CTYPE = 'INVALID'`},
+		{`CREATE SCHEMA IF NOT EXISTS foo`},
+		{`CREATE SCHEMA foo`},
 
 		{`CREATE INDEX a ON b (c)`},
 		{`EXPLAIN CREATE INDEX a ON b (c)`},
@@ -111,6 +113,9 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b FLOAT8)`},
 		{`CREATE TABLE a (b SERIAL8)`},
 		{`CREATE TABLE a (b TIME)`},
+		{`CREATE TABLE a (b TIMETZ)`},
+		{`CREATE TABLE a (b TIME(3))`},
+		{`CREATE TABLE a (b TIMETZ(3))`},
 		{`CREATE TABLE a (b UUID)`},
 		{`CREATE TABLE a (b INET)`},
 		{`CREATE TABLE a (b "char")`},
@@ -299,6 +304,8 @@ func TestParse(t *testing.T) {
 		{`CREATE SEQUENCE a INCREMENT 5 NO CYCLE NO MAXVALUE MINVALUE 1 START 3 CACHE 1`},
 		{`CREATE SEQUENCE a VIRTUAL`},
 		{`CREATE TEMPORARY SEQUENCE a`},
+		{`CREATE SEQUENCE a OWNED BY b`},
+		{`CREATE SEQUENCE a OWNED BY NONE`},
 
 		{`CREATE STATISTICS a ON col1 FROM t`},
 		{`EXPLAIN CREATE STATISTICS a ON col1 FROM t`},
@@ -390,6 +397,7 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN EXPLAIN SELECT 1`},
 		{`EXPLAIN (A, B, C) SELECT 1`},
 		{`EXPLAIN ANALYZE (A, B, C) SELECT 1`},
+		{`EXPLAIN BUNDLE SELECT 1`},
 		{`SELECT * FROM [EXPLAIN SELECT 1]`},
 		{`SELECT * FROM [SHOW TRANSACTION STATUS]`},
 
@@ -402,6 +410,7 @@ func TestParse(t *testing.T) {
 		{`SHOW CLUSTER SETTING a`},
 		{`EXPLAIN SHOW CLUSTER SETTING a`},
 		{`SHOW ALL CLUSTER SETTINGS`},
+		{`SHOW PUBLIC CLUSTER SETTINGS`},
 
 		{`SHOW DATABASES`},
 		{`EXPLAIN SHOW DATABASES`},
@@ -513,6 +522,8 @@ func TestParse(t *testing.T) {
 
 		{`SHOW TRANSACTION STATUS`},
 		{`EXPLAIN SHOW TRANSACTION STATUS`},
+		{`SHOW SAVEPOINT STATUS`},
+		{`EXPLAIN SHOW SAVEPOINT STATUS`},
 
 		{`SHOW SYNTAX 'select 1'`},
 		{`EXPLAIN SHOW SYNTAX 'select 1'`},
@@ -659,6 +670,7 @@ func TestParse(t *testing.T) {
 		{`SELECT (() AS a)`},
 		{`SELECT ((() AS a)).a`},
 		{`SELECT ((() AS a)).*`},
+		{`SELECT ((() AS a)).@1`},
 		{`SELECT (TABLE a)`},
 		{`SELECT 0x1`},
 		{`SELECT 'Deutsch' COLLATE de`},
@@ -1041,11 +1053,22 @@ func TestParse(t *testing.T) {
 		{`SELECT * FROM t@[123]`},
 		{`SELECT * FROM [123 AS t]@[456]`},
 
+		{`INSERT INTO [123 AS t] VALUES (1)`},
+		{`INSERT INTO [123(1, 2) AS t] VALUES (1, 2)`},
+		{`INSERT INTO [123 AS t](col1, col2) VALUES (1, 2)`},
+		{`UPSERT INTO [123 AS t] VALUES (1)`},
+		{`UPDATE [123 AS t] SET b = 3`},
+		{`UPDATE [123 AS t]@idx SET b = 3`},
+		{`DELETE FROM [123 AS t]`},
+		{`DELETE FROM [123 AS t]@idx`},
+
 		{`SELECT (1 + 2).*`},
+		{`SELECT (1 + 2).@1`},
 		{`SELECT (1 + 2).col`},
 		{`SELECT (abc.def).col`},
 		{`SELECT (i.keys).col`},
 		{`SELECT (i.keys).*`},
+		{`SELECT (i.keys).@1`},
 		{`SELECT (ARRAY['a', 'b', 'c']).name`},
 
 		{`SELECT 1 FOR UPDATE`},
@@ -1054,6 +1077,13 @@ func TestParse(t *testing.T) {
 		{`SELECT 1 FOR KEY SHARE`},
 		{`SELECT 1 FOR UPDATE OF a`},
 		{`SELECT 1 FOR NO KEY UPDATE OF a, b`},
+		{`SELECT 1 FOR UPDATE SKIP LOCKED`},
+		{`SELECT 1 FOR NO KEY UPDATE OF a, b NOWAIT`},
+		{`SELECT 1 ORDER BY 1 FOR UPDATE`},
+		{`SELECT 1 LIMIT 1 FOR UPDATE`},
+		{`SELECT 1 ORDER BY 1 LIMIT 1 FOR UPDATE`},
+		{`SELECT 1 FOR UPDATE FOR UPDATE`},
+		{`SELECT 1 FOR SHARE OF a FOR KEY SHARE SKIP LOCKED`},
 
 		{`TABLE a`}, // Shorthand for: SELECT * FROM a; used e.g. in CREATE VIEW v AS TABLE t
 		{`EXPLAIN TABLE a`},
@@ -1096,6 +1126,7 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN ALTER INDEX b RENAME TO b`},
 		{`ALTER INDEX a@b RENAME TO b`},
 		{`ALTER INDEX a@primary RENAME TO like`},
+		{`ALTER INDEX IF EXISTS b RENAME TO b`},
 		{`ALTER INDEX IF EXISTS a@b RENAME TO b`},
 		{`ALTER INDEX IF EXISTS a@primary RENAME TO like`},
 
@@ -1122,6 +1153,8 @@ func TestParse(t *testing.T) {
 		{`ALTER TABLE a ADD COLUMN b INT8 CREATE FAMILY fam_b`},
 		{`ALTER TABLE a ADD COLUMN b INT8 CREATE IF NOT EXISTS FAMILY fam_b`},
 
+		{`ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (a, b, c)`},
+
 		{`ALTER TABLE a DROP COLUMN b, DROP CONSTRAINT a_idx`},
 		{`ALTER TABLE a DROP COLUMN IF EXISTS b, DROP CONSTRAINT a_idx`},
 		{`ALTER TABLE IF EXISTS a DROP COLUMN b, DROP CONSTRAINT a_idx`},
@@ -1135,6 +1168,10 @@ func TestParse(t *testing.T) {
 		{`ALTER TABLE a DROP CONSTRAINT b CASCADE`},
 		{`ALTER TABLE a DROP CONSTRAINT IF EXISTS b RESTRICT`},
 		{`ALTER TABLE a VALIDATE CONSTRAINT a`},
+		{`ALTER TABLE a ADD PRIMARY KEY (x, y, z)`},
+		{`ALTER TABLE a ADD PRIMARY KEY (x, y, z) USING HASH WITH BUCKET_COUNT = 10 INTERLEAVE IN PARENT b (x, y)`},
+		{`ALTER TABLE a ADD CONSTRAINT "primary" PRIMARY KEY (x, y, z)`},
+		{`ALTER TABLE a ADD CONSTRAINT "primary" PRIMARY KEY (x, y, z) USING HASH WITH BUCKET_COUNT = 10 INTERLEAVE IN PARENT b (x, y)`},
 
 		{`ALTER TABLE a ALTER COLUMN b SET DEFAULT 42`},
 		{`ALTER TABLE a ALTER COLUMN b SET DEFAULT NULL`},
@@ -1148,6 +1185,7 @@ func TestParse(t *testing.T) {
 
 		{`COPY t FROM STDIN`},
 		{`COPY t (a, b, c) FROM STDIN`},
+		{`COPY crdb_internal.file_upload FROM STDIN WITH destination = 'filename'`},
 
 		{`ALTER TABLE a SPLIT AT VALUES (1)`},
 		{`EXPLAIN ALTER TABLE a SPLIT AT VALUES (1)`},
@@ -1282,6 +1320,8 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN ALTER SEQUENCE a INCREMENT BY 5 START WITH 1000`},
 		{`ALTER SEQUENCE IF EXISTS a INCREMENT BY 5 START WITH 1000`},
 		{`ALTER SEQUENCE IF EXISTS a NO CYCLE CACHE 1`},
+		{`ALTER SEQUENCE a OWNED BY b`},
+		{`ALTER SEQUENCE a OWNED BY NONE`},
 
 		{`EXPERIMENTAL SCRUB DATABASE x`},
 		{`EXPLAIN EXPERIMENTAL SCRUB DATABASE x`},
@@ -1302,9 +1342,11 @@ func TestParse(t *testing.T) {
 		{`BACKUP TABLE foo.foo, baz.baz TO 'bar'`},
 
 		{`SHOW BACKUP 'bar'`},
+		{`SHOW BACKUP 'bar' WITH foo = 'bar'`},
 		{`EXPLAIN SHOW BACKUP 'bar'`},
 		{`SHOW BACKUP RANGES 'bar'`},
 		{`SHOW BACKUP FILES 'bar'`},
+		{`SHOW BACKUP FILES 'bar' WITH foo = 'bar'`},
 
 		{`BACKUP TABLE foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`},
 		{`BACKUP TABLE foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'`},
@@ -1338,17 +1380,17 @@ func TestParse(t *testing.T) {
 		{`BACKUP TABLE foo TO 'bar' WITH key1, key2 = 'value'`},
 		{`RESTORE TABLE foo FROM 'bar' WITH key1, key2 = 'value'`},
 
-		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
-		{`EXPLAIN IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
-		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' DELIMITED DATA ('path/to/some/file', $1)`},
+		{`IMPORT TABLE foo CREATE USING 'nodelocal://0/some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
+		{`EXPLAIN IMPORT TABLE foo CREATE USING 'nodelocal://0/some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
+		{`IMPORT TABLE foo CREATE USING 'nodelocal://0/some/file' DELIMITED DATA ('path/to/some/file', $1)`},
 		{`IMPORT TABLE foo (id INT8 PRIMARY KEY, email STRING, age INT8) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 		{`IMPORT TABLE foo (id INT8, email STRING, age INT8) CSV DATA ('path/to/some/file', $1) WITH comma = ',', "nullif" = 'n/a', temp = $2`},
-		{`IMPORT TABLE foo FROM PGDUMPCREATE 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`},
+		{`IMPORT TABLE foo FROM PGDUMPCREATE 'nodelocal://0/foo/bar' WITH temp = 'path/to/temp'`},
 		{`IMPORT INTO foo(id, email) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 		{`IMPORT INTO foo CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 
-		{`IMPORT PGDUMP 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`},
-		{`EXPLAIN IMPORT PGDUMP 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`},
+		{`IMPORT PGDUMP 'nodelocal://0/foo/bar' WITH temp = 'path/to/temp'`},
+		{`EXPLAIN IMPORT PGDUMP 'nodelocal://0/foo/bar' WITH temp = 'path/to/temp'`},
 
 		{`EXPORT INTO CSV 'a' FROM TABLE a`}, // TODO(knz): Make this explainable.
 		{`EXPORT INTO CSV 'a' FROM SELECT * FROM a`},
@@ -1402,6 +1444,8 @@ func TestParse2(t *testing.T) {
 			`CREATE DATABASE a TEMPLATE = 'template0'`},
 		{`CREATE DATABASE a TEMPLATE = invalid`,
 			`CREATE DATABASE a TEMPLATE = 'invalid'`},
+		{`CREATE TABLE a (b INT) WITH (fillfactor=100)`,
+			`CREATE TABLE a (b INT8)`},
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b))`,
 			`CREATE TABLE a (b INT8, CONSTRAINT foo UNIQUE (b))`},
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b) INTERLEAVE IN PARENT c (d))`,
@@ -1449,6 +1493,20 @@ func TestParse2(t *testing.T) {
 		{`SELECT CAST(1 AS _int8)`, `SELECT CAST(1 AS INT8[])`},
 		{`SELECT CAST(1 AS "_int8")`, `SELECT CAST(1 AS INT8[])`},
 		{`SELECT SERIAL8 'foo', 'foo'::SERIAL8`, `SELECT INT8 'foo', 'foo'::INT8`},
+
+		{`SELECT 'a'::TIMESTAMP(3)`, `SELECT 'a'::TIMESTAMP(3)`},
+		{`SELECT 'a'::TIMESTAMP(3) WITHOUT TIME ZONE`, `SELECT 'a'::TIMESTAMP(3)`},
+		{`SELECT 'a'::TIMESTAMPTZ(3)`, `SELECT 'a'::TIMESTAMPTZ(3)`},
+		{`SELECT 'a'::TIMESTAMP(3) WITH TIME ZONE`, `SELECT 'a'::TIMESTAMPTZ(3)`},
+		{`SELECT TIMESTAMP(3) 'a'`, `SELECT TIMESTAMP(3) 'a'`},
+		{`SELECT TIMESTAMPTZ(3) 'a'`, `SELECT TIMESTAMPTZ(3) 'a'`},
+
+		{`SELECT 'a'::TIME(3)`, `SELECT 'a'::TIME(3)`},
+		{`SELECT 'a'::TIME(3) WITHOUT TIME ZONE`, `SELECT 'a'::TIME(3)`},
+		{`SELECT 'a'::TIMETZ(3)`, `SELECT 'a'::TIMETZ(3)`},
+		{`SELECT 'a'::TIME(3) WITH TIME ZONE`, `SELECT 'a'::TIMETZ(3)`},
+		{`SELECT TIME(3) 'a'`, `SELECT TIME(3) 'a'`},
+		{`SELECT TIMETZ(3) 'a'`, `SELECT TIMETZ(3) 'a'`},
 
 		{`SELECT 'a' FROM t@{FORCE_INDEX=bar}`, `SELECT 'a' FROM t@bar`},
 		{`SELECT 'a' FROM t@{ASC,FORCE_INDEX=idx}`, `SELECT 'a' FROM t@{FORCE_INDEX=idx,ASC}`},
@@ -1540,6 +1598,12 @@ func TestParse2(t *testing.T) {
 			`SELECT current_database()`},
 		{`SELECT CURRENT_TIMESTAMP`,
 			`SELECT current_timestamp()`},
+		{`SELECT current_timestamp(6)`,
+			`SELECT current_timestamp(6)`},
+		{`SELECT CURRENT_TIME`,
+			`SELECT current_time()`},
+		{`SELECT current_time(6)`,
+			`SELECT current_time(6)`},
 		{`SELECT CURRENT_DATE`,
 			`SELECT current_date()`},
 		{`SELECT POSITION(a IN b)`,
@@ -1576,11 +1640,21 @@ func TestParse2(t *testing.T) {
 		{`SELECT a FROM t FETCH FIRST ROW ONLY`,
 			`SELECT a FROM t LIMIT 1`},
 		{`SELECT a FROM t FETCH FIRST (2 * a) ROWS ONLY`,
-			`SELECT a FROM t LIMIT 2 * a`},
+			`SELECT a FROM t LIMIT (2 * a)`},
 		{`SELECT a FROM t OFFSET b FETCH FIRST (2 * a) ROWS ONLY`,
-			`SELECT a FROM t LIMIT 2 * a OFFSET b`},
-		{`SELECT a FROM t FETCH FIRST (2 * a) ROWS ONLY OFFSET b`,
-			`SELECT a FROM t LIMIT 2 * a OFFSET b`},
+			`SELECT a FROM t LIMIT (2 * a) OFFSET b`},
+		{`SELECT a FROM t FETCH FIRST (2 * a) ROWS ONLY OFFSET b ROWS`,
+			`SELECT a FROM t LIMIT (2 * a) OFFSET b`},
+		{`SELECT a FROM t FETCH FIRST $1 ROWS ONLY OFFSET $2 ROWS`,
+			`SELECT a FROM t LIMIT $1 OFFSET $2`},
+		{`SELECT a FROM t FETCH FIRST +3 ROWS ONLY OFFSET +3 ROWS`,
+			`SELECT a FROM t LIMIT 3 OFFSET 3`},
+		{`SELECT a FROM t FETCH FIRST -3 ROWS ONLY OFFSET -3 ROWS`,
+			`SELECT a FROM t LIMIT -3 OFFSET -3`},
+		{`SELECT a FROM t FETCH FIRST +3.0 ROWS ONLY OFFSET +3.0 ROWS`,
+			`SELECT a FROM t LIMIT 3.0 OFFSET 3.0`},
+		{`SELECT a FROM t FETCH FIRST -3.0 ROWS ONLY OFFSET -3.0 ROWS`,
+			`SELECT a FROM t LIMIT -3.0 OFFSET -3.0`},
 		// Double negation. See #1800.
 		{`SELECT *,-/* comment */-5`,
 			`SELECT *, 5`},
@@ -1623,12 +1697,37 @@ func TestParse2(t *testing.T) {
 		{`SELECT '\abc\' NOT SIMILAR TO '-\___-\' ESCAPE '-'`, `SELECT not_similar_to_escape(e'\\abc\\', e'-\\___-\\', '-')`},
 		{`SELECT 'a' NOT SIMILAR TO '\a' ESCAPE ''`, `SELECT not_similar_to_escape('a', e'\\a', '')`},
 
+		// using dollar-quotes
+		{`SELECT $$a'a$$`, `SELECT e'a\'a'`},
+		{`SELECT $$a\\na$$`, `SELECT e'a\\\\na'`},
+		{`SELECT $select$\\n$select$`, `SELECT e'\\\\n'`},
+		{`SELECT $$a"a$$`, `SELECT 'a"a'`},
+		{`SELECT $$full$$`, `SELECT 'full'`}, // must quote column name keyword
+		{`SELECT $select$full$select$`, `SELECT 'full'`},
+		{`SELECT $select$a$$b$select$`, `SELECT 'a$$b'`},
+		{`SELECT $$Dianne's horse$$`, `SELECT e'Dianne\'s horse'`},
+		{`SELECT $SomeTag$Dianne's horse$SomeTag$`, `SELECT e'Dianne\'s horse'`},
+		{`SELECT $function$
+BEGIN
+RETURN ($1 ~ $q$[\t\r\n\v\\]$q$);
+END;
+$function$`,
+			`SELECT e'\nBEGIN\nRETURN ($1 ~ $q$[\\t\\r\\n\\v\\\\]$q$);\nEND;\n'`},
+
 		{`SELECT (ARRAY (1, 2))[1]`, `SELECT (ARRAY[1, 2])[1]`},
 
-		// Interval precision is syntactic sugar.
-		{`SELECT '0'::INTERVAL(6)`, `SELECT '0'::INTERVAL`},
 		// Interval constructor gets eagerly processed.
 		{`SELECT INTERVAL '0'`, `SELECT '00:00:00'`},
+		{`SELECT INTERVAL '1' SECOND`, `SELECT '00:00:01'`},
+		{`SELECT INTERVAL(3) '12.1234s'`, `SELECT '00:00:12.123'`},
+		{`SELECT INTERVAL '12.1234s' SECOND(3)`, `SELECT '00:00:12.123'`},
+		{`SELECT INTERVAL '14.7899s' SECOND(3)`, `SELECT '00:00:14.79'`}, // Check rounding.
+
+		{`SELECT '11s'::INTERVAL(3)`, `SELECT '11s'::INTERVAL(3)`},
+		{`SELECT '10:00:13.123456'::INTERVAL SECOND`, `SELECT '10:00:13.123456'::INTERVAL SECOND`},
+		{`SELECT '10:00:13.123456'::INTERVAL SECOND(3)`, `SELECT '10:00:13.123456'::INTERVAL SECOND(3)`},
+		{`SELECT '10:00:13.123456'::INTERVAL MINUTE TO SECOND`, `SELECT '10:00:13.123456'::INTERVAL MINUTE TO SECOND`},
+		{`SELECT '10:00:13.123456'::INTERVAL MINUTE TO SECOND(3)`, `SELECT '10:00:13.123456'::INTERVAL MINUTE TO SECOND(3)`},
 
 		// Pretty printing the FAMILY INET function is not normal due to the grammar
 		// definition of FAMILY.
@@ -1654,6 +1753,8 @@ func TestParse2(t *testing.T) {
 		{`SET TIME ZONE "Europe/Rome"`,
 			`SET timezone = 'Europe/Rome'`},
 		{`SET TIME ZONE INTERVAL '-7h'`,
+			`SET timezone = '-07:00:00'`},
+		{`SET TIME ZONE INTERVAL(3) '-7h'`,
 			`SET timezone = '-07:00:00'`},
 		{`SET TIME ZONE INTERVAL '-7h0m5s' HOUR TO MINUTE`,
 			`SET timezone = '-06:59:00'`},
@@ -1732,6 +1833,11 @@ func TestParse2(t *testing.T) {
 		{`SELECT ROW()`, `SELECT ()`},
 		{`SELECT ROW(1)`, `SELECT (1,)`},
 		{`SELECT (ROW(1) AS a)`, `SELECT ((1,) AS a)`},
+
+		{`SELECT 1 ORDER BY 1 FOR UPDATE LIMIT 1`,
+			`SELECT 1 ORDER BY 1 LIMIT 1 FOR UPDATE`},
+		// FOR READ ONLY is ignored, like in Postgres.
+		{`SELECT 1 FOR READ ONLY`, `SELECT 1`},
 
 		{`SHOW CREATE TABLE t`,
 			`SHOW CREATE t`},
@@ -1822,6 +1928,7 @@ func TestParse2(t *testing.T) {
 			`CREATE CHANGEFEED FOR TABLE foo INTO 'sink'`},
 
 		{`SHOW CLUSTER SETTING ALL`, `SHOW ALL CLUSTER SETTINGS`},
+		{`SHOW CLUSTER SETTINGS`, `SHOW PUBLIC CLUSTER SETTINGS`},
 
 		{`SHOW SESSIONS`, `SHOW CLUSTER SESSIONS`},
 		{`SHOW ALL SESSIONS`, `SHOW ALL CLUSTER SESSIONS`},
@@ -1851,12 +1958,22 @@ func TestParse2(t *testing.T) {
 			`CREATE USER IF NOT EXISTS 'foo'`},
 		{`CREATE USER foo PASSWORD bar`,
 			`CREATE USER 'foo' WITH PASSWORD 'bar'`},
+		{`CREATE USER foo PASSWORD NULL`,
+			`CREATE USER 'foo' WITH PASSWORD NULL`},
+		{`CREATE USER foo LOGIN VALID UNTIL NULL PASSWORD NULL`,
+			`CREATE USER 'foo' WITH LOGIN VALID UNTIL NULL PASSWORD NULL`},
+		{`CREATE USER foo VALID UNTIL '1970-01-01'`,
+			`CREATE USER 'foo' WITH VALID UNTIL '1970-01-01'`},
 		{`DROP USER foo, bar`,
 			`DROP USER 'foo', 'bar'`},
 		{`DROP USER IF EXISTS foo, bar`,
 			`DROP USER IF EXISTS 'foo', 'bar'`},
+		{`ALTER USER foo PASSWORD bar`,
+			`ALTER USER 'foo' WITH PASSWORD 'bar'`},
 		{`ALTER USER foo WITH PASSWORD bar`,
 			`ALTER USER 'foo' WITH PASSWORD 'bar'`},
+		{`ALTER USER foo WITH PASSWORD NULL`,
+			`ALTER USER 'foo' WITH PASSWORD NULL`},
 
 		{`ALTER TABLE a RENAME b TO c`,
 			`ALTER TABLE a RENAME COLUMN b TO c`},
@@ -1942,17 +2059,29 @@ func TestParse2(t *testing.T) {
 			`CREATE ROLE 'foo'`},
 		{`CREATE ROLE IF NOT EXISTS foo`,
 			`CREATE ROLE IF NOT EXISTS 'foo'`},
+		{`CREATE ROLE foo WITH CREATEROLE`,
+			`CREATE ROLE 'foo' WITH CREATEROLE`},
+		{`CREATE ROLE IF NOT EXISTS foo WITH CREATEROLE`,
+			`CREATE ROLE IF NOT EXISTS 'foo' WITH CREATEROLE`},
+		{`CREATE ROLE foo CREATEROLE`,
+			`CREATE ROLE 'foo' WITH CREATEROLE`},
+		{`CREATE ROLE IF NOT EXISTS foo CREATEROLE`,
+			`CREATE ROLE IF NOT EXISTS 'foo' WITH CREATEROLE`},
+		{`ALTER ROLE foo WITH CREATEROLE`,
+			`ALTER ROLE 'foo' WITH CREATEROLE`},
+		{`ALTER ROLE foo CREATEROLE`,
+			`ALTER ROLE 'foo' WITH CREATEROLE`},
 		{`DROP ROLE foo, bar`,
 			`DROP ROLE 'foo', 'bar'`},
 		{`DROP ROLE IF EXISTS foo, bar`,
 			`DROP ROLE IF EXISTS 'foo', 'bar'`},
 
 		// Backward-compat, deprecated IMPORT syntax
-		{`IMPORT PGDUMP ('nodelocal:///foo/bar') WITH temp = 'path/to/temp'`,
-			`IMPORT PGDUMP 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`,
+		{`IMPORT PGDUMP ('nodelocal://0/foo/bar') WITH temp = 'path/to/temp'`,
+			`IMPORT PGDUMP 'nodelocal://0/foo/bar' WITH temp = 'path/to/temp'`,
 		},
-		{`IMPORT TABLE foo FROM PGDUMPCREATE ('nodelocal:///foo/bar') WITH temp = 'path/to/temp'`,
-			`IMPORT TABLE foo FROM PGDUMPCREATE 'nodelocal:///foo/bar' WITH temp = 'path/to/temp'`,
+		{`IMPORT TABLE foo FROM PGDUMPCREATE ('nodelocal://0/foo/bar') WITH temp = 'path/to/temp'`,
+			`IMPORT TABLE foo FROM PGDUMPCREATE 'nodelocal://0/foo/bar' WITH temp = 'path/to/temp'`,
 		},
 
 		// Clarify the ambiguity between "ON ROLE" (RBAC) and "ON ROLE"
@@ -2508,7 +2637,7 @@ SELECT ANNOTATE_TYPE(1.2+2.3, notatype)
 DETAIL: source SQL:
 CREATE USER foo WITH PASSWORD
                              ^
-HINT: try \h CREATE USER`,
+HINT: try \h CREATE ROLE`,
 		},
 		{
 			`ALTER TABLE t RENAME TO t[TRUE]`,
@@ -3005,7 +3134,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE OPERATOR a`, 0, `create operator`},
 		{`CREATE PUBLICATION a`, 0, `create publication`},
 		{`CREATE RULE a`, 0, `create rule`},
-		{`CREATE SCHEMA a`, 26443, `create`},
 		{`CREATE SERVER a`, 0, `create server`},
 		{`CREATE SUBSCRIPTION a`, 0, `create subscription`},
 		{`CREATE TEXT SEARCH a`, 7821, `create text`},
@@ -3049,7 +3177,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(LIKE b)`, 30840, ``},
 
 		{`CREATE TABLE a(b INT8) WITH OIDS`, 0, `create table with oids`},
-		{`CREATE TABLE a(b INT8) WITH foo = bar`, 0, `create table with foo`},
 
 		{`CREATE TABLE a AS SELECT b WITH NO DATA`, 0, `create table as with no data`},
 
@@ -3066,7 +3193,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(b INT8, CHECK (b > 0) DEFERRABLE)`, 31632, `deferrable`},
 
 		{`CREATE SEQUENCE a AS DOUBLE PRECISION`, 25110, `FLOAT8`},
-		{`CREATE SEQUENCE a OWNED BY b`, 26382, ``},
 
 		{`CREATE OR REPLACE VIEW a AS SELECT b`, 24897, ``},
 		{`CREATE RECURSIVE VIEW a AS SELECT b`, 0, `create recursive view`},
@@ -3096,33 +3222,12 @@ func TestUnimplementedSyntax(t *testing.T) {
 
 		{`SELECT * FROM ROWS FROM (a(b) AS (d))`, 0, `ROWS FROM with col_def_list`},
 
-		{`SELECT 'a'::INTERVAL SECOND`, 0, `interval with unit qualifier`},
-		{`SELECT 'a'::INTERVAL(123)`, 32564, ``},
-		{`SELECT 'a'::INTERVAL SECOND(123)`, 32564, `interval second`},
-		{`SELECT INTERVAL(3) 'a'`, 32564, ``},
-
-		{`SELECT 'a'::TIMESTAMP(123)`, 32098, ``},
-		{`SELECT 'a'::TIMESTAMP(123) WITHOUT TIME ZONE`, 32098, ``},
-		{`SELECT 'a'::TIMESTAMPTZ(123)`, 32098, ``},
-		{`SELECT 'a'::TIMESTAMP(123) WITH TIME ZONE`, 32098, ``},
-		{`SELECT TIMESTAMP(3) 'a'`, 32098, ``},
-		{`SELECT TIMESTAMPTZ(3) 'a'`, 32098, ``},
-
-		{`SELECT 'a'::TIME(123)`, 32565, ``},
-		{`SELECT 'a'::TIME(123) WITHOUT TIME ZONE`, 32565, ``},
-		{`SELECT 'a'::TIMETZ(123)`, 26097, `type with precision`},
-		{`SELECT 'a'::TIME(123) WITH TIME ZONE`, 32565, ``},
-		{`SELECT TIME(3) 'a'`, 32565, ``},
-		{`SELECT TIMETZ(3) 'a'`, 26097, `type with precision`},
-
 		{`SELECT a(b) 'c'`, 0, `a(...) SCONST`},
 		{`SELECT (a,b) OVERLAPS (c,d)`, 0, `overlaps`},
 		{`SELECT UNIQUE (SELECT b)`, 0, `UNIQUE predicate`},
 		{`SELECT GROUPING (a,b,c)`, 0, `d_expr grouping`},
 		{`SELECT a(VARIADIC b)`, 0, `variadic`},
 		{`SELECT a(b, c, VARIADIC b)`, 0, `variadic`},
-		{`SELECT CURRENT_TIME`, 26097, `current_time`},
-		{`SELECT CURRENT_TIME()`, 26097, `current_time`},
 		{`SELECT TREAT (a AS INT8)`, 0, `treat`},
 		{`SELECT a(b) WITHIN GROUP (ORDER BY c)`, 0, `within group`},
 
@@ -3146,7 +3251,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(b TSVECTOR)`, 7821, `tsvector`},
 		{`CREATE TABLE a(b TXID_SNAPSHOT)`, 0, `txid_snapshot`},
 		{`CREATE TABLE a(b XML)`, 0, `xml`},
-		{`CREATE TABLE a(b TIMETZ)`, 26097, `type`},
 
 		{`INSERT INTO a VALUES (1) ON CONFLICT (x) WHERE x > 3 DO NOTHING`, 32557, ``},
 

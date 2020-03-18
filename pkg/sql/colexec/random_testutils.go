@@ -20,9 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 )
 
-// maxVarLen specifies a length limit for variable length types (e.g. byte slices).
-const maxVarLen = 64
-
 func randomType(rng *rand.Rand) coltypes.T {
 	return coltypes.AllTypes[rng.Intn(len(coltypes.AllTypes))]
 }
@@ -36,83 +33,25 @@ func randomTypes(rng *rand.Rand, n int) []coltypes.T {
 	return typs
 }
 
-// RandomVec populates vec with n random values of typ, setting each value to
-// null with a probability of nullProbability. It is assumed that n is in bounds
-// of the given vec.
-func RandomVec(rng *rand.Rand, typ coltypes.T, vec coldata.Vec, n int, nullProbability float64) {
-	switch typ {
-	case coltypes.Bool:
-		bools := vec.Bool()
-		for i := 0; i < n; i++ {
-			if rng.Float64() < 0.5 {
-				bools[i] = true
-			} else {
-				bools[i] = false
-			}
-		}
-	case coltypes.Bytes:
-		bytes := vec.Bytes()
-		for i := 0; i < n; i++ {
-			randBytes := make([]byte, rng.Intn(maxVarLen))
-			// Read always returns len(bytes[i]) and nil.
-			_, _ = rand.Read(randBytes)
-			bytes.Set(i, randBytes)
-		}
-	case coltypes.Decimal:
-		decs := vec.Decimal()
-		for i := 0; i < n; i++ {
-			// int64(rng.Uint64()) to get negative numbers, too
-			decs[i].SetFinite(int64(rng.Uint64()), int32(rng.Intn(40)-20))
-		}
-	case coltypes.Int16:
-		ints := vec.Int16()
-		for i := 0; i < n; i++ {
-			ints[i] = int16(rng.Uint64())
-		}
-	case coltypes.Int32:
-		ints := vec.Int32()
-		for i := 0; i < n; i++ {
-			ints[i] = int32(rng.Uint64())
-		}
-	case coltypes.Int64:
-		ints := vec.Int64()
-		for i := 0; i < n; i++ {
-			ints[i] = int64(rng.Uint64())
-		}
-	case coltypes.Float64:
-		floats := vec.Float64()
-		for i := 0; i < n; i++ {
-			floats[i] = rng.Float64()
-		}
-	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %s", typ))
-	}
-	vec.Nulls().UnsetNulls()
-	if nullProbability == 0 {
-		return
-	}
-
-	for i := 0; i < n; i++ {
-		if rng.Float64() < nullProbability {
-			vec.Nulls().SetNull(uint16(i))
-		}
-	}
-}
-
 // RandomBatch returns a batch with a capacity of capacity and a number of
 // random elements equal to length (capacity if length is 0). The values will be
 // null with a probability of nullProbability.
 func RandomBatch(
-	rng *rand.Rand, typs []coltypes.T, capacity int, length int, nullProbability float64,
+	allocator *Allocator,
+	rng *rand.Rand,
+	typs []coltypes.T,
+	capacity int,
+	length int,
+	nullProbability float64,
 ) coldata.Batch {
-	batch := coldata.NewMemBatchWithSize(typs, capacity)
+	batch := allocator.NewMemBatchWithSize(typs, capacity)
 	if length == 0 {
 		length = capacity
 	}
 	for i, typ := range typs {
-		RandomVec(rng, typ, batch.ColVec(i), length, nullProbability)
+		coldata.RandomVec(rng, typ, 0 /* bytesFixedLength */, batch.ColVec(i), length, nullProbability)
 	}
-	batch.SetLength(uint16(length))
+	batch.SetLength(length)
 	return batch
 }
 
@@ -122,18 +61,18 @@ func RandomBatch(
 // is 0, then the selection vector will contain all rows, but if it is > 0, then
 // some rows might be omitted and the length of the selection vector might be
 // less than batchSize.
-func randomSel(rng *rand.Rand, batchSize uint16, probOfOmitting float64) []uint16 {
+func randomSel(rng *rand.Rand, batchSize int, probOfOmitting float64) []int {
 	if probOfOmitting < 0 || probOfOmitting > 1 {
 		execerror.VectorizedInternalPanic(fmt.Sprintf("probability of omitting a row is %f - outside of [0, 1] range", probOfOmitting))
 	}
-	sel := make([]uint16, batchSize)
-	for i := uint16(0); i < batchSize; i++ {
+	sel := make([]int, 0, batchSize)
+	for i := 0; i < batchSize; i++ {
 		if rng.Float64() < probOfOmitting {
 			continue
 		}
-		sel[i] = i
+		sel = append(sel, i)
 	}
-	return sel[:batchSize]
+	return sel
 }
 
 // Suppress unused warnings.
@@ -146,14 +85,19 @@ var _ = randomTypes
 // selProbability is 0, none will. The returned batch will have its length set
 // to the length of the selection vector, unless selProbability is 0.
 func randomBatchWithSel(
-	rng *rand.Rand, typs []coltypes.T, n int, nullProbability float64, selProbability float64,
+	allocator *Allocator,
+	rng *rand.Rand,
+	typs []coltypes.T,
+	n int,
+	nullProbability float64,
+	selProbability float64,
 ) coldata.Batch {
-	batch := RandomBatch(rng, typs, n, 0 /* length */, nullProbability)
+	batch := RandomBatch(allocator, rng, typs, n, 0 /* length */, nullProbability)
 	if selProbability != 0 {
-		sel := randomSel(rng, uint16(n), 1-selProbability)
+		sel := randomSel(rng, n, 1-selProbability)
 		batch.SetSelection(true)
 		copy(batch.Selection(), sel)
-		batch.SetLength(uint16(len(sel)))
+		batch.SetLength(len(sel))
 	}
 	return batch
 }
@@ -195,6 +139,7 @@ type RandomDataOpArgs struct {
 // RandomDataOpArgs. Call GetBuffer to get all data that was returned.
 type RandomDataOp struct {
 	ZeroInputNode
+	allocator        *Allocator
 	batchAccumulator func(b coldata.Batch)
 	typs             []coltypes.T
 	rng              *rand.Rand
@@ -206,11 +151,11 @@ type RandomDataOp struct {
 }
 
 // NewRandomDataOp creates a new RandomDataOp.
-func NewRandomDataOp(rng *rand.Rand, args RandomDataOpArgs) *RandomDataOp {
+func NewRandomDataOp(allocator *Allocator, rng *rand.Rand, args RandomDataOpArgs) *RandomDataOp {
 	var (
 		availableTyps   = coltypes.AllTypes
 		maxSchemaLength = defaultMaxSchemaLength
-		batchSize       = int(coldata.BatchSize())
+		batchSize       = coldata.BatchSize()
 		numBatches      = defaultNumBatches
 	)
 	if args.AvailableTyps != nil {
@@ -235,6 +180,7 @@ func NewRandomDataOp(rng *rand.Rand, args RandomDataOpArgs) *RandomDataOp {
 		}
 	}
 	return &RandomDataOp{
+		allocator:        allocator,
 		batchAccumulator: args.BatchAccumulator,
 		typs:             typs,
 		rng:              rng,
@@ -252,8 +198,7 @@ func (o *RandomDataOp) Init() {}
 func (o *RandomDataOp) Next(ctx context.Context) coldata.Batch {
 	if o.numReturned == o.numBatches {
 		// Done.
-		b := coldata.NewMemBatchWithSize(o.typs, 0)
-		b.SetLength(0)
+		b := coldata.ZeroBatch
 		if o.batchAccumulator != nil {
 			o.batchAccumulator(b)
 		}
@@ -272,7 +217,7 @@ func (o *RandomDataOp) Next(ctx context.Context) coldata.Batch {
 			nullProbability = o.rng.Float64()
 		}
 
-		b := randomBatchWithSel(o.rng, o.typs, o.batchSize, nullProbability, selProbability)
+		b := randomBatchWithSel(o.allocator, o.rng, o.typs, o.batchSize, nullProbability, selProbability)
 		if !o.selection {
 			b.SetSelection(false)
 		}
@@ -286,4 +231,9 @@ func (o *RandomDataOp) Next(ctx context.Context) coldata.Batch {
 		}
 		return b
 	}
+}
+
+// Typs returns the output types of the RandomDataOp.
+func (o *RandomDataOp) Typs() []coltypes.T {
+	return o.typs
 }

@@ -23,11 +23,13 @@ import (
 )
 
 // FromColumnType returns the T that corresponds to the input ColumnType.
+// Note: if you're adding a new type here, add it to
+// colexec.allSupportedSQLTypes as well.
 func FromColumnType(ct *types.T) coltypes.T {
 	switch ct.Family() {
 	case types.BoolFamily:
 		return coltypes.Bool
-	case types.BytesFamily, types.StringFamily:
+	case types.BytesFamily, types.StringFamily, types.UuidFamily:
 		return coltypes.Bytes
 	case types.DateFamily, types.OidFamily:
 		return coltypes.Int64
@@ -45,6 +47,12 @@ func FromColumnType(ct *types.T) coltypes.T {
 		execerror.VectorizedInternalPanic(fmt.Sprintf("integer with unknown width %d", ct.Width()))
 	case types.FloatFamily:
 		return coltypes.Float64
+	case types.TimestampFamily:
+		return coltypes.Timestamp
+	case types.TimestampTZFamily:
+		return coltypes.Timestamp
+	case types.IntervalFamily:
+		return coltypes.Interval
 	}
 	return coltypes.Unhandled
 }
@@ -82,6 +90,10 @@ func ToColumnType(t coltypes.T) *types.T {
 		return types.Int
 	case coltypes.Float64:
 		return types.Float
+	case coltypes.Timestamp:
+		return types.Timestamp
+	case coltypes.Interval:
+		return types.Interval
 	}
 	execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected coltype %s", t.String()))
 	return nil
@@ -120,14 +132,6 @@ func GetDatumToPhysicalFn(ct *types.T) func(tree.Datum) (interface{}, error) {
 		}
 	case types.IntFamily:
 		switch ct.Width() {
-		case 8:
-			return func(datum tree.Datum) (interface{}, error) {
-				d, ok := datum.(*tree.DInt)
-				if !ok {
-					return nil, errors.Errorf("expected *tree.DInt, found %s", reflect.TypeOf(datum))
-				}
-				return int8(*d), nil
-			}
 		case 16:
 			return func(datum tree.Datum) (interface{}, error) {
 				d, ok := datum.(*tree.DInt)
@@ -199,6 +203,38 @@ func GetDatumToPhysicalFn(ct *types.T) func(tree.Datum) (interface{}, error) {
 				return nil, errors.Errorf("expected *tree.DDecimal, found %s", reflect.TypeOf(datum))
 			}
 			return d.Decimal, nil
+		}
+	case types.UuidFamily:
+		return func(datum tree.Datum) (interface{}, error) {
+			d, ok := datum.(*tree.DUuid)
+			if !ok {
+				return nil, errors.Errorf("expected *tree.DUuid, found %s", reflect.TypeOf(datum))
+			}
+			return d.UUID.GetBytesMut(), nil
+		}
+	case types.TimestampFamily:
+		return func(datum tree.Datum) (interface{}, error) {
+			d, ok := datum.(*tree.DTimestamp)
+			if !ok {
+				return nil, errors.Errorf("expected *tree.DTimestamp, found %s", reflect.TypeOf(datum))
+			}
+			return d.Time, nil
+		}
+	case types.TimestampTZFamily:
+		return func(datum tree.Datum) (interface{}, error) {
+			d, ok := datum.(*tree.DTimestampTZ)
+			if !ok {
+				return nil, errors.Errorf("expected *tree.DTimestampTZ, found %s", reflect.TypeOf(datum))
+			}
+			return d.Time, nil
+		}
+	case types.IntervalFamily:
+		return func(datum tree.Datum) (interface{}, error) {
+			d, ok := datum.(*tree.DInterval)
+			if !ok {
+				return nil, errors.Errorf("expected *tree.DInterval, found %s", reflect.TypeOf(datum))
+			}
+			return d.Duration, nil
 		}
 	}
 	// It would probably be more correct to return an error here, rather than a

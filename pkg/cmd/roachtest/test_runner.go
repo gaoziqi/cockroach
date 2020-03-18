@@ -425,21 +425,31 @@ func (r *testRunner) runWorker(
 		// Prepare the test's logger.
 		logPath := ""
 		var artifactsDir string
+		var artifactsSpec string
 		if artifactsRootDir != "" {
-			artifactsSuffix := "run_" + strconv.Itoa(testToRun.runNum)
-			artifactsDir = filepath.Join(
-				artifactsRootDir, teamCityNameEscape(testToRun.spec.Name), artifactsSuffix)
+			escapedTestName := teamCityNameEscape(testToRun.spec.Name)
+			runSuffix := "run_" + strconv.Itoa(testToRun.runNum)
+
+			base := filepath.Join(artifactsRootDir, escapedTestName)
+
+			artifactsDir = filepath.Join(base, runSuffix)
 			logPath = filepath.Join(artifactsDir, "test.log")
+
+			// Map artifacts/TestFoo/** => TestFoo/**, i.e. collect the artifacts
+			// for this test exactly as they are laid out on disk (when the time
+			// comes).
+			artifactsSpec = fmt.Sprintf("%s/** => %s", base, escapedTestName)
 		}
 		testL, err := rootLogger(logPath, teeOpt)
 		if err != nil {
 			return err
 		}
 		t := &test{
-			spec:         &testToRun.spec,
-			buildVersion: r.buildVersion,
-			artifactsDir: artifactsDir,
-			l:            testL,
+			spec:          &testToRun.spec,
+			buildVersion:  r.buildVersion,
+			artifactsDir:  artifactsDir,
+			artifactsSpec: artifactsSpec,
+			l:             testL,
 		}
 		// Tell the cluster that, from now on, it will be run "on behalf of this
 		// test".
@@ -505,13 +515,29 @@ func getPerfArtifacts(ctx context.Context, l *logger, c *cluster, t *test) {
 	g := ctxgroup.WithContext(ctx)
 	fetchNode := func(node int) func(context.Context) error {
 		return func(ctx context.Context) error {
-			// RunWithBuffer to toss the output.
-			if _, err := c.RunWithBuffer(ctx, l, c.Node(node), "ls", perfArtifactsDir); err != nil {
-				// perfArtifactsDir doesn't exist, nothing to fetch.
-				return nil
+			testCmd := `'PERF_ARTIFACTS="` + perfArtifactsDir + `"
+if [[ -d "${PERF_ARTIFACTS}" ]]; then
+    echo true
+elif [[ -e "${PERF_ARTIFACTS}" ]]; then
+    ls -la "${PERF_ARTIFACTS}"
+    exit 1
+else
+    echo false
+fi'`
+			out, err := c.RunWithBuffer(ctx, l, c.Node(node), "bash", "-c", testCmd)
+			if err != nil {
+				return errors.Wrapf(err, "failed to check for perf artifacts: %v", string(out))
 			}
-			dst := fmt.Sprintf("%s/%d.%s", t.artifactsDir, node, perfArtifactsDir)
-			return c.Get(ctx, l, perfArtifactsDir, dst, c.Node(node))
+			switch out := strings.TrimSpace(string(out)); out {
+			case "true":
+				dst := fmt.Sprintf("%s/%d.%s", t.artifactsDir, node, perfArtifactsDir)
+				return c.Get(ctx, l, perfArtifactsDir, dst, c.Node(node))
+			case "false":
+				l.PrintfCtx(ctx, "no perf artifacts exist on node %v", c.Node(node))
+				return nil
+			default:
+				return errors.Errorf("unexpected output when checking for perf artifacts: %s", out)
+			}
 		}
 	}
 	for _, i := range c.All() {
@@ -520,6 +546,12 @@ func getPerfArtifacts(ctx context.Context, l *logger, c *cluster, t *test) {
 	if err := g.Wait(); err != nil {
 		l.PrintfCtx(ctx, "failed to get perf artifacts: %v", err)
 	}
+}
+
+func allStacks() []byte {
+	// Collect up to 5mb worth of stacks.
+	b := make([]byte, 5*(1<<20))
+	return b[:runtime.Stack(b, true /* all */)]
 }
 
 // An error is returned if the test is still running (on another goroutine) when
@@ -592,10 +624,16 @@ func (r *testRunner) runTest(
 				}
 			}
 
-			shout(ctx, l, stdout, "--- FAIL: %s %s\n%s", t.Name(), durationStr, output)
+			shout(ctx, l, stdout, "--- FAIL: %s (%s)\n%s", t.Name(), durationStr, output)
 			// NB: check NodeCount > 0 to avoid posting issues from this pkg's unit tests.
 			if issues.CanPost() && t.spec.Run != nil && t.spec.Cluster.NodeCount > 0 {
-				authorEmail := getAuthorEmail(failLoc.file, failLoc.line)
+				authorEmail := getAuthorEmail(t.spec.Tags, failLoc.file, failLoc.line)
+				if authorEmail == "" {
+					ownerInfo, ok := roachtestOwners[t.spec.Owner]
+					if ok {
+						authorEmail = ownerInfo.ContactEmail
+					}
+				}
 				branch := "<unknown branch>"
 				if b := os.Getenv("TC_BUILD_BRANCH"); b != "" {
 					branch = b
@@ -604,16 +642,30 @@ func (r *testRunner) runTest(
 					branch, cloud, output)
 				artifacts := fmt.Sprintf("/%s", t.Name())
 
+				req := issues.PostRequest{
+					// TODO(tbg): actually use this as a template.
+					TitleTemplate: fmt.Sprintf("roachtest: %s failed", t.Name()),
+					// TODO(tbg): make a template better adapted to roachtest.
+					BodyTemplate: issues.UnitTestFailureBody,
+					PackageName:  "roachtest",
+					TestName:     t.Name(),
+					Message:      msg,
+					Artifacts:    artifacts,
+					AuthorEmail:  authorEmail,
+					// Issues posted from roachtest are identifiable as such and
+					// they are also release blockers (this label may be removed
+					// by a human upon closer investigation).
+					ExtraLabels: []string{"O-roachtest", "release-blocker"},
+				}
 				if err := issues.Post(
 					context.Background(),
-					fmt.Sprintf("roachtest: %s failed", t.Name()),
-					"roachtest", t.Name(), msg, artifacts, authorEmail, []string{"O-roachtest"},
+					req,
 				); err != nil {
 					shout(ctx, l, stdout, "failed to post issue: %s", err)
 				}
 			}
 		} else {
-			shout(ctx, l, stdout, "--- PASS: %s %s", t.Name(), durationStr)
+			shout(ctx, l, stdout, "--- PASS: %s (%s)", t.Name(), durationStr)
 			// If `##teamcity[testFailed ...]` is not present before `##teamCity[testFinished ...]`,
 			// TeamCity regards the test as successful.
 		}
@@ -621,10 +673,15 @@ func (r *testRunner) runTest(
 		if teamCity {
 			shout(ctx, l, stdout, "##teamcity[testFinished name='%s' flowId='%s']", t.Name(), t.Name())
 
-			artifactsGlobPath := filepath.Join(t.ArtifactsDir(), "**")
-			escapedTestName := teamCityNameEscape(t.Name())
-			artifactsSpec := fmt.Sprintf("%s => %s", artifactsGlobPath, escapedTestName)
-			shout(ctx, l, stdout, "##teamcity[publishArtifacts '%s']", artifactsSpec)
+			if t.artifactsSpec != "" {
+				// Tell TeamCity to collect this test's artifacts now. The TC job
+				// also collects the artifacts directory wholesale at the end, but
+				// here we make sure that the artifacts for any test that has already
+				// finished are available in the UI even before the job as a whole
+				// has completed. We're using the exact same destination to avoid
+				// duplication of any of the artifacts.
+				shout(ctx, l, stdout, "##teamcity[publishArtifacts '%s']", t.artifactsSpec)
+			}
 		}
 
 		r.recordTestFinish(completedTestInfo{
@@ -686,21 +743,60 @@ func (r *testRunner) runTest(
 		defer close(done) // closed only after we've grabbed the debug info below
 
 		// This is the call to actually run the test.
+		defer func() {
+			if r := recover(); r != nil {
+				// TODO(andreimatei): prevent the cluster from being reused.
+				t.Fatalf("test panicked: %v", r)
+			}
+		}()
+
 		t.spec.Run(runCtx, t, c)
 	}()
 
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		// We hit a timeout. We're going to mark the test as failed (which will also
-		// cancel its context). Then we'll wait up to 5 minutes in the hope
-		// that the test reacts either to the ctx cancelation or to the fact that it
-		// was marked as failed. If that happens, great - we return normally and so
-		// the cluster can be reused. It the test does not react to anything, then
-		// we return an error, which will cause the caller to stop everything and
-		// destroy this cluster (as well as all the others). The cluster
-		// cannot be reused since we have a runaway test goroutine that's presumably
-		// going to continue using the cluster.
+		// Timeouts are often opaque. Improve our changes by dumping the stack
+		// so that at least we can piece together what the test is trying to
+		// do at this very moment.
+		// In large roachtest runs, this will dump everyone else's stack as well,
+		// but this is just hard to avoid. Moving to a worker model in which
+		// each roachtest is spawned off as a separate process would address
+		// this at the expense of ease of communication between the runner and
+		// the test.
+		//
+		// Do this before we cancel the context, which might (hopefully) unblock
+		// the test. We want to see where it got stuck.
+		const stacksFile = "__stacks"
+		if cl, err := t.l.ChildLogger(stacksFile, quietStderr, quietStdout); err == nil {
+			cl.PrintfCtx(ctx, "all stacks:\n\n%s\n", allStacks())
+			t.l.PrintfCtx(ctx, "dumped stacks to %s", stacksFile)
+		}
+		// Now kill anything going on in this cluster while collecting stacks
+		// to the logs, to get the server side of the hang.
+		//
+		// TODO(tbg): send --sig=3 followed by a hard kill after we've fixed
+		// https://github.com/cockroachdb/cockroach/issues/45875.
+		// Signal 11 will dump stacks, but it might be confusing to folks
+		// who debug from the artifacts only.
+		//
+		// Don't use surrounding context, which are likely already canceled.
+		if nodes := c.All(); len(nodes) > 0 { // avoid tests
+			innerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = c.StopE(innerCtx, c.All(), stopArgs("--sig=11"))
+			cancel()
+		}
+
+		// Mark the test as failed (which will also cancel its context). Then
+		// we'll wait up to 5 minutes in the hope that the test reacts either to
+		// the ctx cancelation or to the fact that it was marked as failed (and
+		// all processes nuked out from under it).
+		// If that happens, great - we return normally and so the cluster can be
+		// reused. It the test does not react to anything, then we return an
+		// error, which will cause the caller to stop everything and destroy
+		// this cluster (as well as all the others). The cluster cannot be
+		// reused since we have a runaway test goroutine that's presumably going
+		// to continue using the cluster.
 		t.printfAndFail(0 /* skip */, "test timed out (%s)", timeout)
 		select {
 		case <-done:
@@ -708,6 +804,9 @@ func (r *testRunner) runTest(
 				panic("expected success=false after a timeout")
 			}
 		case <-time.After(5 * time.Minute):
+			// We really shouldn't get here unless the test code somehow managed
+			// to deadlock without blocking on anything remote - since we killed
+			// everything.
 			msg := "test timed out and afterwards failed to respond to cancelation"
 			t.l.PrintfCtx(ctx, msg)
 			r.collectClusterLogs(ctx, c, t.l)
@@ -741,11 +840,8 @@ func (r *testRunner) collectClusterLogs(ctx context.Context, c *cluster, l *logg
 	// below has problems. For example, `debug zip` is known to
 	// hang sometimes at the time of writing, see:
 	// https://github.com/cockroachdb/cockroach/issues/39620
-	if err := c.FetchLogs(ctx); err != nil {
-		l.Printf("failed to download logs: %s", err)
-	}
 	l.PrintfCtx(ctx, "collecting cluster logs")
-	if err := c.FetchDebugZip(ctx); err != nil {
+	if err := c.FetchLogs(ctx); err != nil {
 		l.Printf("failed to download logs: %s", err)
 	}
 	if err := c.FetchDmesg(ctx); err != nil {
@@ -759,6 +855,9 @@ func (r *testRunner) collectClusterLogs(ctx context.Context, c *cluster, l *logg
 	}
 	if err := c.CopyRoachprodState(ctx); err != nil {
 		l.Printf("failed to copy roachprod state: %s", err)
+	}
+	if err := c.FetchDebugZip(ctx); err != nil {
+		l.Printf("failed to collect zip: %s", err)
 	}
 }
 
@@ -1038,9 +1137,10 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	buildVersionMajorMinor := fmt.Sprintf("%d.%d", buildVersion.Major(), buildVersion.Minor())
 
 	verMap := map[string]string{
+		"20.1": "19.2.1",
 		"19.2": "19.1.5",
-		"19.1": "2.1.8",
-		"2.2":  "2.1.8",
+		"19.1": "2.1.9",
+		"2.2":  "2.1.9",
 		"2.1":  "2.0.7",
 	}
 	v, ok := verMap[buildVersionMajorMinor]

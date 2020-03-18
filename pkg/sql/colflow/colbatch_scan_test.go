@@ -20,7 +20,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -70,7 +70,7 @@ func BenchmarkColBatchScan(b *testing.B) {
 			flowCtx := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
 				Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
-				Txn:     client.NewTxn(ctx, s.DB(), s.NodeID(), client.RootTxn),
+				Txn:     kv.NewTxn(ctx, s.DB(), s.NodeID()),
 				NodeID:  s.NodeID(),
 			}
 
@@ -78,7 +78,12 @@ func BenchmarkColBatchScan(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
-				res, err := colexec.NewColOperator(ctx, &flowCtx, &spec, nil /* inputs */)
+				args := colexec.NewColOperatorArgs{
+					Spec:                &spec,
+					StreamingMemAccount: testMemAcc,
+				}
+				args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+				res, err := colexec.NewColOperator(ctx, &flowCtx, args)
 				if err != nil {
 					b.Fatal(err)
 				}

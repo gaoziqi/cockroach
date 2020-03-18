@@ -58,7 +58,6 @@ type ParallelUnorderedSynchronizer struct {
 
 	initialized bool
 	done        bool
-	zeroBatch   coldata.Batch
 	// externalWaitGroup refers to the WaitGroup passed in externally. Since the
 	// ParallelUnorderedSynchronizer spawns goroutines, this allows callers to
 	// wait for the completion of these goroutines.
@@ -75,12 +74,12 @@ type ParallelUnorderedSynchronizer struct {
 }
 
 // ChildCount implements the execinfra.OpNode interface.
-func (s *ParallelUnorderedSynchronizer) ChildCount() int {
+func (s *ParallelUnorderedSynchronizer) ChildCount(verbose bool) int {
 	return len(s.inputs)
 }
 
 // Child implements the execinfra.OpNode interface.
-func (s *ParallelUnorderedSynchronizer) Child(nth int) execinfra.OpNode {
+func (s *ParallelUnorderedSynchronizer) Child(nth int, verbose bool) execinfra.OpNode {
 	return s.inputs[nth]
 }
 
@@ -99,14 +98,11 @@ func NewParallelUnorderedSynchronizer(
 		// only be one message on the channel at a time.
 		readNextBatch[i] = make(chan struct{}, 1)
 	}
-	zeroBatch := coldata.NewMemBatchWithSize(typs, 0)
-	zeroBatch.SetLength(0)
 	return &ParallelUnorderedSynchronizer{
 		inputs:            inputs,
 		readNextBatch:     readNextBatch,
 		batches:           make([]coldata.Batch, len(inputs)),
 		nextBatch:         make([]func(), len(inputs)),
-		zeroBatch:         zeroBatch,
 		externalWaitGroup: wg,
 		internalWaitGroup: &sync.WaitGroup{},
 		batchCh:           make(chan *unorderedSynchronizerMsg, len(inputs)),
@@ -203,9 +199,7 @@ func (s *ParallelUnorderedSynchronizer) init(ctx context.Context) {
 // Next is part of the Operator interface.
 func (s *ParallelUnorderedSynchronizer) Next(ctx context.Context) coldata.Batch {
 	if s.done {
-		// TODO(yuzefovich): do we want to be on the safe side and explicitly set
-		// the length here (and below) to 0?
-		return s.zeroBatch
+		return coldata.ZeroBatch
 	}
 	if !s.initialized {
 		s.init(ctx)
@@ -237,7 +231,7 @@ func (s *ParallelUnorderedSynchronizer) Next(ctx context.Context) coldata.Batch 
 			default:
 			}
 			s.done = true
-			return s.zeroBatch
+			return coldata.ZeroBatch
 		}
 		s.lastReadInputIdx = msg.inputIdx
 		return msg.b

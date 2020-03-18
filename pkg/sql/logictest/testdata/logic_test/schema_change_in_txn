@@ -1,9 +1,3 @@
-# LogicTest: local fakedist fakedist-metadata fakedist-disk
-# The local-mixed-19.1-19.2 configuration is excluded for this file because of
-# 1) remaining bugs that need to be fixed in the 19.1/19.2 mixed state, and 2)
-# different FK behavior between 19.1 and 19.2. Tests to be run in that
-# configuration are in schema_change_in_txn-local-mixed-19.1-19.2.
-
 # Disable automatic stats to avoid flakiness (sometimes causes retry errors).
 statement ok
 SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
@@ -520,7 +514,7 @@ CREATE TABLE shopping (item, quantity) AS VALUES ('cups', 10), ('plates', 30), (
 statement count 3
 SELECT * FROM shopping
 
-statement error pgcode 42P15 division by zero
+statement error pgcode 22012 division by zero
 ALTER TABLE shopping ADD COLUMN c int AS (quantity::int // 0) STORED
 
 statement ok
@@ -777,14 +771,19 @@ k  CHAR  false  NULL  ·  {primary}  false
 query error pq: index "j_idx" not found
 SELECT * FROM customers@j_idx
 
-query TTT
+query TT
 SELECT status,
-       running_status,
        regexp_replace(description, 'ROLL BACK JOB \d+.*', 'ROLL BACK JOB') as description
-  FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE' ORDER BY job_id DESC LIMIT 2
+  FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE' ORDER BY job_id DESC LIMIT 1
 ----
-running  waiting for GC TTL  ROLL BACK JOB
-failed   NULL                ALTER TABLE test.public.customers ADD COLUMN i INT8 DEFAULT 5;ALTER TABLE test.public.customers ADD COLUMN j INT8 DEFAULT 4;ALTER TABLE test.public.customers ADD COLUMN l INT8 DEFAULT 3;ALTER TABLE test.public.customers ADD COLUMN m CHAR;ALTER TABLE test.public.customers ADD COLUMN n CHAR DEFAULT 'a';CREATE INDEX j_idx ON test.public.customers (j);CREATE INDEX l_idx ON test.public.customers (l);CREATE INDEX m_idx ON test.public.customers (m);CREATE UNIQUE INDEX i_idx ON test.public.customers (i);CREATE UNIQUE INDEX n_idx ON test.public.customers (n)
+failed   ALTER TABLE test.public.customers ADD COLUMN i INT8 DEFAULT 5;ALTER TABLE test.public.customers ADD COLUMN j INT8 DEFAULT 4;ALTER TABLE test.public.customers ADD COLUMN l INT8 DEFAULT 3;ALTER TABLE test.public.customers ADD COLUMN m CHAR;ALTER TABLE test.public.customers ADD COLUMN n CHAR DEFAULT 'a';CREATE INDEX j_idx ON test.public.customers (j);CREATE INDEX l_idx ON test.public.customers (l);CREATE INDEX m_idx ON test.public.customers (m);CREATE UNIQUE INDEX i_idx ON test.public.customers (i);CREATE UNIQUE INDEX n_idx ON test.public.customers (n)
+
+query TT
+SELECT status,
+       regexp_replace(description, 'ROLL BACK JOB \d+.*', 'ROLL BACK JOB') as description
+  FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC' ORDER BY job_id DESC LIMIT 1
+----
+running  GC for ROLLBACK of ALTER TABLE test.public.customers ADD COLUMN i INT8 DEFAULT 5;ALTER TABLE test.public.customers ADD COLUMN j INT8 DEFAULT 4;ALTER TABLE test.public.customers ADD COLUMN l INT8 DEFAULT 3;ALTER TABLE test.public.customers ADD COLUMN m CHAR;ALTER TABLE test.public.customers ADD COLUMN n CHAR DEFAULT 'a';CREATE INDEX j_idx ON test.public.customers (j);CREATE INDEX l_idx ON test.public.customers (l);CREATE INDEX m_idx ON test.public.customers (m);CREATE UNIQUE INDEX i_idx ON test.public.customers (i);CREATE UNIQUE INDEX n_idx ON test.public.customers (n)
 
 subtest add_multiple_computed_elements
 
@@ -1746,3 +1745,45 @@ DROP TABLE people;
 
 statement ok
 COMMIT;
+
+subtest add_column_default_sequence_op
+
+# This is a current known limitation (#42508). This test ensures that
+# the error message is properly reported, with issue hint.
+# Once the limitation is lifted, this entire test can be removed
+# (and replaced by test for the feature).
+
+statement ok
+CREATE TABLE t42508(x INT); INSERT INTO t42508(x) VALUES (1);
+
+statement ok
+CREATE SEQUENCE s42508
+
+statement error pgcode 0A000 unimplemented: cannot evaluate scalar expressions containing sequence operations.*\nHINT.*\n.*42508
+ALTER TABLE t42508 ADD COLUMN y INT DEFAULT nextval('s42508')
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t42508 ADD COLUMN y INT DEFAULT nextval('s42508')
+
+statement error pgcode XXA00 unimplemented: cannot evaluate scalar expressions containing sequence operations.*\nHINT.*\n.*42508
+COMMIT
+
+# Test that rolling back to a savepoint past a schema change does not result in
+# a deadlock. This is a regression test for #24885. Rolling back past a schema
+# change used to have a problem because leaving locks behind on descriptors or
+# namespace entries could block the schema resolution after the rollback (schema
+# resolution uses different transactions to do its reads). We've fixed it by having those
+# other transactions run at high priority, thus pushing the intents out of their way.
+subtest no_schemachange_deadlock_after_savepoint_rollback
+
+statement ok
+begin; savepoint s; create table t(x int); rollback to savepoint s;
+
+query error relation "t" does not exist
+select * from t;
+
+statement ok
+commit;

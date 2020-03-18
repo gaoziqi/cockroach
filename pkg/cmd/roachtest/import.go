@@ -51,6 +51,7 @@ func registerImportTPCC(r *testRegistry) {
 	for _, numNodes := range []int{4, 32} {
 		r.Add(testSpec{
 			Name:    fmt.Sprintf("import/tpcc/warehouses=%d/nodes=%d", warehouses, numNodes),
+			Owner:   OwnerBulkIO,
 			Cluster: makeClusterSpec(numNodes),
 			Timeout: 5 * time.Hour,
 			Run: func(ctx context.Context, t *test, c *cluster) {
@@ -62,6 +63,7 @@ func registerImportTPCC(r *testRegistry) {
 	const geoZones = "europe-west2-b,europe-west4-b,asia-northeast1-b,us-west1-b"
 	r.Add(testSpec{
 		Name:    fmt.Sprintf("import/tpcc/warehouses=%d/geo", geoWarehouses),
+		Owner:   OwnerBulkIO,
 		Cluster: makeClusterSpec(8, cpu(16), geo(), zones(geoZones)),
 		Timeout: 5 * time.Hour,
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -84,11 +86,13 @@ func registerImportTPCH(r *testRegistry) {
 		// is required to confirm this. Until then, the 4 and 32 node configurations
 		// are removed (4 is too slow and 32 is pretty expensive) while 8-node is
 		// given a 50% longer timeout (which running by hand suggests should be OK).
-		{8, 6 * time.Hour},
+		// (10/30/19) The timeout was increased again to 8 hours.
+		{8, 8 * time.Hour},
 	} {
 		item := item
 		r.Add(testSpec{
 			Name:    fmt.Sprintf(`import/tpch/nodes=%d`, item.nodes),
+			Owner:   OwnerBulkIO,
 			Cluster: makeClusterSpec(item.nodes),
 			Timeout: item.timeout,
 			Run: func(ctx context.Context, t *test, c *cluster) {

@@ -13,6 +13,7 @@ package main
 import (
 	"io"
 	"io/ioutil"
+	"sort"
 	"strings"
 	"text/template"
 
@@ -45,8 +46,10 @@ type columnConversion struct {
 	ExecType coltypes.T
 }
 
+const rowsToVecTmpl = "pkg/sql/colexec/rowstovec_tmpl.go"
+
 func genRowsToVec(wr io.Writer) error {
-	f, err := ioutil.ReadFile("pkg/sql/colexec/rowstovec_tmpl.go")
+	f, err := ioutil.ReadFile(rowsToVecTmpl)
 	if err != nil {
 		return err
 	}
@@ -97,11 +100,18 @@ func genRowsToVec(wr io.Writer) error {
 
 	columnConversions := make([]columnConversion, 0, len(conversionsMap))
 	for _, conversion := range conversionsMap {
+		sort.Slice(conversion.Widths, func(i, j int) bool {
+			return conversion.Widths[i].Width < conversion.Widths[j].Width
+		})
 		columnConversions = append(columnConversions, *conversion)
 	}
+	// Sort the list so that we output in a consistent order.
+	sort.Slice(columnConversions, func(i, j int) bool {
+		return strings.Compare(columnConversions[i].Family, columnConversions[j].Family) < 0
+	})
 	return tmpl.Execute(wr, columnConversions)
 }
 
 func init() {
-	registerGenerator(genRowsToVec, "rowstovec.eg.go")
+	registerGenerator(genRowsToVec, "rowstovec.eg.go", rowsToVecTmpl)
 }
