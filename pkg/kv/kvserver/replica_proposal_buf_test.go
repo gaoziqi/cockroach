@@ -16,11 +16,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft"
@@ -77,9 +77,9 @@ func newPropData(leaseReq bool) (*ProposalData, []byte) {
 		ba.Add(&roachpb.PutRequest{})
 	}
 	return &ProposalData{
-		command: &storagepb.RaftCommand{},
+		command: &kvserverpb.RaftCommand{},
 		Request: &ba,
-	}, make([]byte, 0, storagepb.MaxRaftCommandFooterSize())
+	}, make([]byte, 0, kvserverpb.MaxRaftCommandFooterSize())
 }
 
 // TestProposalBuffer tests the basic behavior of the Raft proposal buffer.
@@ -180,7 +180,7 @@ func TestProposalBufferConcurrentWithDestroy(t *testing.T) {
 				pd, data := newPropData(false)
 				mlai, err := b.Insert(pd, data)
 				if err != nil {
-					if err == dsErr {
+					if errors.Is(err, dsErr) {
 						return nil
 					}
 					return errors.Wrap(err, "Insert")

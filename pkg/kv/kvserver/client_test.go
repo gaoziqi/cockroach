@@ -61,8 +61,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft"
 	"google.golang.org/grpc"
@@ -131,7 +131,7 @@ func createTestStoreWithOpts(
 	// Ensure that tests using this test context and restart/shut down
 	// their servers do not inadvertently start talking to servers from
 	// unrelated concurrent tests.
-	rpcContext.ClusterID.Set(context.TODO(), uuid.MakeV4())
+	rpcContext.ClusterID.Set(context.Background(), uuid.MakeV4())
 	nodeDesc := &roachpb.NodeDescriptor{
 		NodeID:  1,
 		Address: util.MakeUnresolvedAddr("tcp", "invalid.invalid:26257"),
@@ -141,9 +141,7 @@ func createTestStoreWithOpts(
 		nodeDesc.NodeID, rpcContext, server, stopper, metric.NewRegistry(), storeCfg.DefaultZoneConfig,
 	)
 	storeCfg.ScanMaxIdleTime = 1 * time.Second
-	stores := kvserver.NewStores(
-		ac, storeCfg.Clock,
-		clusterversion.TestingBinaryVersion, clusterversion.TestingBinaryMinSupportedVersion)
+	stores := kvserver.NewStores(ac, storeCfg.Clock)
 
 	if err := storeCfg.Gossip.SetNodeDescriptor(nodeDesc); err != nil {
 		t.Fatal(err)
@@ -177,8 +175,9 @@ func createTestStoreWithOpts(
 	// TODO(bdarnell): arrange to have the transport closed.
 	ctx := context.Background()
 	if !opts.dontBootstrap {
+		require.NoError(t, kvserver.WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
 		if err := kvserver.InitEngine(
-			ctx, eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1}, clusterversion.TestingClusterVersion,
+			ctx, eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1},
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -187,8 +186,9 @@ func createTestStoreWithOpts(
 	if !opts.dontBootstrap {
 		var kvs []roachpb.KeyValue
 		var splits []roachpb.RKey
-		bootstrapVersion := clusterversion.TestingClusterVersion
-		kvs, tableSplits := sqlbase.MakeMetadataSchema(storeCfg.DefaultZoneConfig, storeCfg.DefaultSystemZoneConfig).GetInitialValues(bootstrapVersion)
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(
+			keys.SystemSQLCodec, storeCfg.DefaultZoneConfig, storeCfg.DefaultSystemZoneConfig,
+		).GetInitialValues()
 		if !opts.dontCreateSystemRanges {
 			splits = config.StaticSplits()
 			splits = append(splits, tableSplits...)
@@ -368,7 +368,7 @@ func (m *multiTestContext) Start(t testing.TB, numStores int) {
 		// Ensure that tests using this test context and restart/shut down
 		// their servers do not inadvertently start talking to servers from
 		// unrelated concurrent tests.
-		m.rpcContext.ClusterID.Set(context.TODO(), uuid.MakeV4())
+		m.rpcContext.ClusterID.Set(context.Background(), uuid.MakeV4())
 		// We are sharing the same RPC context for all simulated nodes, so we can't enforce
 		// some of the RPC check validation.
 		m.rpcContext.TestingAllowNamedRPCToAnonymousServer = true
@@ -431,7 +431,7 @@ func (m *multiTestContext) Stop() {
 					// any test (TestRaftAfterRemove is a good example) results
 					// in deadlocks where a task can't finish because of
 					// getting stuck in addWriteCommand.
-					s.Quiesce(context.TODO())
+					s.Quiesce(context.Background())
 				}
 			}(s)
 		}
@@ -442,13 +442,13 @@ func (m *multiTestContext) Stop() {
 		defer m.mu.RUnlock()
 		for _, stopper := range m.stoppers {
 			if stopper != nil {
-				stopper.Stop(context.TODO())
+				stopper.Stop(context.Background())
 			}
 		}
-		m.transportStopper.Stop(context.TODO())
+		m.transportStopper.Stop(context.Background())
 
 		for _, s := range m.engineStoppers {
-			s.Stop(context.TODO())
+			s.Stop(context.Background())
 		}
 		close(done)
 	}()
@@ -820,7 +820,7 @@ func (m *multiTestContext) addStore(idx int) {
 	if len(m.engines) > idx {
 		eng = m.engines[idx]
 		_, err := kvserver.ReadStoreIdent(context.Background(), eng)
-		if _, notBootstrapped := err.(*kvserver.NotBootstrappedError); notBootstrapped {
+		if errors.HasType(err, (*kvserver.NotBootstrappedError)(nil)) {
 			needBootstrap = true
 		} else if err != nil {
 			m.t.Fatal(err)
@@ -870,7 +870,7 @@ func (m *multiTestContext) addStore(idx int) {
 	m.populateDB(idx, cfg.Settings, stopper)
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
 	m.nodeLivenesses[idx] = kvserver.NewNodeLiveness(
-		ambient, m.clocks[idx], m.dbs[idx], m.engines, m.gossips[idx],
+		ambient, m.clocks[idx], m.dbs[idx], m.gossips[idx],
 		nlActive, nlRenewal, cfg.Settings, metric.TestSampleInterval,
 	)
 	m.populateStorePool(idx, cfg, m.nodeLivenesses[idx])
@@ -880,18 +880,20 @@ func (m *multiTestContext) addStore(idx int) {
 
 	ctx := context.Background()
 	if needBootstrap {
+		require.NoError(m.t, kvserver.WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
 		if err := kvserver.InitEngine(ctx, eng, roachpb.StoreIdent{
 			NodeID:  roachpb.NodeID(idx + 1),
 			StoreID: roachpb.StoreID(idx + 1),
-		}, clusterversion.TestingClusterVersion); err != nil {
+		}); err != nil {
 			m.t.Fatal(err)
 		}
 	}
 	if needBootstrap && idx == 0 {
 		// Bootstrap the initial range on the first engine.
 		var splits []roachpb.RKey
-		bootstrapVersion := clusterversion.TestingClusterVersion
-		kvs, tableSplits := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig).GetInitialValues(bootstrapVersion)
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(
+			keys.SystemSQLCodec, cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig,
+		).GetInitialValues()
 		if !m.startWithSingleRange {
 			splits = config.StaticSplits()
 			splits = append(splits, tableSplits...)
@@ -914,9 +916,7 @@ func (m *multiTestContext) addStore(idx int) {
 		m.t.Fatal(err)
 	}
 
-	sender := kvserver.NewStores(ambient, clock,
-		clusterversion.TestingBinaryVersion, clusterversion.TestingBinaryMinSupportedVersion,
-	)
+	sender := kvserver.NewStores(ambient, clock)
 	sender.AddStore(store)
 	perReplicaServer := kvserver.MakeServer(&roachpb.NodeDescriptor{NodeID: nodeID}, sender)
 	kvserver.RegisterPerReplicaServer(grpcServer, perReplicaServer)
@@ -972,10 +972,10 @@ func (m *multiTestContext) addStore(idx int) {
 	}{
 		ch: make(chan struct{}),
 	}
-	m.nodeLivenesses[idx].StartHeartbeat(ctx, stopper, func(ctx context.Context) {
+	m.nodeLivenesses[idx].StartHeartbeat(ctx, stopper, m.engines[idx:idx+1], func(ctx context.Context) {
 		now := clock.Now()
 		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 		ran.Do(func() {
 			close(ran.ch)
@@ -1023,7 +1023,7 @@ func (m *multiTestContext) stopStore(i int) {
 	stopper := m.stoppers[i]
 	m.mu.RUnlock()
 
-	stopper.Stop(context.TODO())
+	stopper.Stop(context.Background())
 
 	m.mu.Lock()
 	m.stoppers[i] = nil
@@ -1050,7 +1050,7 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	m.populateDB(i, m.storeConfig.Settings, stopper)
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
 	m.nodeLivenesses[i] = kvserver.NewNodeLiveness(
-		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}, m.clocks[i], m.dbs[i], m.engines,
+		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}, m.clocks[i], m.dbs[i],
 		m.gossips[i], nlActive, nlRenewal, cfg.Settings, metric.TestSampleInterval,
 	)
 	m.populateStorePool(i, cfg, m.nodeLivenesses[i])
@@ -1069,10 +1069,10 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.DefaultClass).Reset()
 	m.transport.GetCircuitBreaker(m.idents[i].NodeID, rpc.SystemClass).Reset()
 	m.mu.Unlock()
-	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, func(ctx context.Context) {
+	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, m.engines[i:i+1], func(ctx context.Context) {
 		now := m.clocks[i].Now()
 		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 	})
 }
@@ -1187,7 +1187,7 @@ func (m *multiTestContext) changeReplicas(
 			break
 		}
 
-		if _, ok := errors.Cause(err).(*roachpb.AmbiguousResultError); ok {
+		if errors.HasType(err, (*roachpb.AmbiguousResultError)(nil)) {
 			// Try again after an AmbiguousResultError. If the operation
 			// succeeded, then the next attempt will return alreadyDoneErr;
 			// if it failed then the next attempt should succeed.
@@ -1198,7 +1198,7 @@ func (m *multiTestContext) changeReplicas(
 		// is lost. We could make a this into a roachpb.Error but it seems overkill
 		// for this one usage.
 		if testutils.IsError(err, "snapshot failed: .*|descriptor changed") {
-			log.Info(ctx, err)
+			log.Infof(ctx, "%v", err)
 			continue
 		}
 		return 0, err
@@ -1280,14 +1280,12 @@ func (m *multiTestContext) waitForUnreplicated(rangeID roachpb.RangeID, dest int
 	// Wait for the unreplications to complete on destination node.
 	return retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
 		_, err := m.stores[dest].GetReplica(rangeID)
-		switch err.(type) {
-		case nil:
+		if err == nil {
 			return fmt.Errorf("replica still exists on dest %d", dest)
-		case *roachpb.RangeNotFoundError:
+		} else if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
 			return nil
-		default:
-			return err
 		}
+		return err
 	})
 }
 
@@ -1300,13 +1298,13 @@ func (m *multiTestContext) readIntFromEngines(key roachpb.Key) []int64 {
 		val, _, err := storage.MVCCGet(context.Background(), eng, key, m.clocks[i].Now(),
 			storage.MVCCGetOptions{})
 		if err != nil {
-			log.VEventf(context.TODO(), 1, "engine %d: error reading from key %s: %s", i, key, err)
+			log.VEventf(context.Background(), 1, "engine %d: error reading from key %s: %s", i, key, err)
 		} else if val == nil {
-			log.VEventf(context.TODO(), 1, "engine %d: missing key %s", i, key)
+			log.VEventf(context.Background(), 1, "engine %d: missing key %s", i, key)
 		} else {
 			results[i], err = val.GetInt()
 			if err != nil {
-				log.Errorf(context.TODO(), "engine %d: error decoding %s from key %s: %+v", i, val, key, err)
+				log.Errorf(context.Background(), "engine %d: error decoding %s from key %s: %+v", i, val, key, err)
 			}
 		}
 	}
@@ -1397,7 +1395,7 @@ func (m *multiTestContext) heartbeatLiveness(ctx context.Context, store int) err
 	}
 
 	for r := retry.StartWithCtx(ctx, retry.Options{MaxRetries: 5}); r.Next(); {
-		if err = nl.Heartbeat(ctx, l); err != kvserver.ErrEpochIncremented {
+		if err = nl.Heartbeat(ctx, l); !errors.Is(err, kvserver.ErrEpochIncremented) {
 			break
 		}
 	}
@@ -1616,7 +1614,7 @@ func waitForTombstone(
 	testutils.SucceedsSoon(t, func() error {
 		tombstoneKey := keys.RangeTombstoneKey(rangeID)
 		ok, err := storage.MVCCGetProto(
-			context.TODO(), reader, tombstoneKey, hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
+			context.Background(), reader, tombstoneKey, hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
 		)
 		if err != nil {
 			t.Fatalf("failed to read tombstone: %v", err)

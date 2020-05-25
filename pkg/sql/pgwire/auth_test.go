@@ -146,7 +146,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 
 		s, conn, _ := serverutils.StartServer(t,
 			base.TestServerArgs{Insecure: insecure, SocketFile: maybeSocketFile})
-		defer s.Stopper().Stop(context.TODO())
+		defer s.Stopper().Stop(context.Background())
 
 		// Enable conn/auth logging.
 		// We can't use the cluster settings to do this, because
@@ -405,7 +405,7 @@ var durationRe = regexp.MustCompile(`duration: \d.*s`)
 func fmtErr(err error) string {
 	if err != nil {
 		errStr := ""
-		if pqErr, ok := err.(*pq.Error); ok {
+		if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
 			errStr = pqErr.Message
 			if pqErr.Code != pgcode.Uncategorized {
 				errStr += fmt.Sprintf(" (SQLSTATE %s)", pqErr.Code)

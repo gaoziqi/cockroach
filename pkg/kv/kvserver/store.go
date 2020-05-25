@@ -68,9 +68,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/google/btree"
-	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft"
 	"golang.org/x/time/rate"
 )
@@ -133,6 +133,27 @@ var concurrentRangefeedItersLimit = settings.RegisterPositiveIntSetting(
 	64,
 )
 
+// raftLeadershipTransferTimeout limits the amount of time a drain command
+// waits for lease transfers.
+var raftLeadershipTransferWait = func() *settings.DurationSetting {
+	s := settings.RegisterValidatedDurationSetting(
+		raftLeadershipTransferWaitKey,
+		"the amount of time a server waits to transfer range leases before proceeding with the rest of the shutdown process",
+		5*time.Second,
+		func(v time.Duration) error {
+			if v < 0 {
+				return errors.Errorf("cannot set %s to a negative duration: %s",
+					raftLeadershipTransferWaitKey, v)
+			}
+			return nil
+		},
+	)
+	s.SetVisibility(settings.Public)
+	return s
+}()
+
+const raftLeadershipTransferWaitKey = "server.shutdown.lease_transfer_wait"
+
 // ExportRequestsLimit is the number of Export requests that can run at once.
 // Each extracts data from RocksDB to a temp file and then uploads it to cloud
 // storage. In order to not exhaust the disk or memory, or saturate the network,
@@ -161,7 +182,6 @@ func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 		CoalescedHeartbeatsInterval: 50 * time.Millisecond,
 		RaftHeartbeatIntervalTicks:  1,
 		ScanInterval:                10 * time.Minute,
-		TimestampCachePageSize:      tscache.TestSklPageSize,
 		HistogramWindowInterval:     metric.TestSampleInterval,
 		EnableEpochRangeLeases:      true,
 		ClosedTimestamp:             container.NoopContainer(),
@@ -680,9 +700,6 @@ type StoreConfig struct {
 	// to be applied concurrently.
 	concurrentSnapshotApplyLimit int
 
-	// TimestampCachePageSize is (server.Config).TimestampCachePageSize
-	TimestampCachePageSize uint32
-
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval
 	HistogramWindowInterval time.Duration
 
@@ -814,7 +831,7 @@ func NewStore(
 	s.rangefeedReplicas.m = map[roachpb.RangeID]struct{}{}
 	s.rangefeedReplicas.Unlock()
 
-	s.tsCache = tscache.New(cfg.Clock, cfg.TimestampCachePageSize)
+	s.tsCache = tscache.New(cfg.Clock)
 	s.metrics.registry.AddMetricStruct(s.tsCache.Metrics())
 
 	s.txnWaitMetrics = txnwait.NewMetrics(cfg.HistogramWindowInterval)
@@ -965,15 +982,16 @@ func (s *Store) AnnotateCtx(ctx context.Context) context.Context {
 	return s.cfg.AmbientCtx.AnnotateCtx(ctx)
 }
 
-// The maximum amount of time waited for leadership shedding before commencing
-// to drain a store.
-const raftLeadershipTransferWait = 5 * time.Second
-
 // SetDraining (when called with 'true') causes incoming lease transfers to be
 // rejected, prevents all of the Store's Replicas from acquiring or extending
 // range leases, and attempts to transfer away any leases owned.
 // When called with 'false', returns to the normal mode of operation.
-func (s *Store) SetDraining(drain bool) {
+//
+// The reporter callback, if non-nil, is called on a best effort basis
+// to report work that needed to be done and which may or may not have
+// been done by the time this call returns. See the explanation in
+// pkg/server/drain.go for details.
+func (s *Store) SetDraining(drain bool, reporter func(int, string)) {
 	s.draining.Store(drain)
 	if !drain {
 		newStoreReplicaVisitor(s).Visit(func(r *Replica) bool {
@@ -985,25 +1003,73 @@ func (s *Store) SetDraining(drain bool) {
 		return
 	}
 
+	baseCtx := logtags.AddTag(context.Background(), "drain", nil)
+
+	// In a running server, the code below (transferAllAway and the loop
+	// that calls it) does not need to be conditional on messaging by
+	// the Stopper. This is because the top level Server calls SetDrain
+	// upon a graceful shutdown, and waits until the SetDrain calls
+	// completes, at which point the work has terminated on its own. If
+	// the top-level server is forcefully shut down, it does not matter
+	// if some of the code below is still running.
+	//
+	// However, the situation is different in unit tests where we also
+	// assert there are no leaking goroutines when a test terminates.
+	// If a test terminates with a timed out lease transfer, it's
+	// possible for the transferAllAway() closure to be still running
+	// when the closer shuts down the test server.
+	//
+	// To prevent this, we add this code here which adds the missing
+	// cancel + wait in the particular case where the stopper is
+	// completing a shutdown while a graceful SetDrain is still ongoing.
+	ctx, cancelFn := s.stopper.WithCancelOnStop(baseCtx)
+	defer cancelFn()
+
 	var wg sync.WaitGroup
 
-	ctx := logtags.AddTag(context.Background(), "drain", nil)
-	transferAllAway := func() int {
+	transferAllAway := func(transferCtx context.Context) int {
 		// Limit the number of concurrent lease transfers.
 		const leaseTransferConcurrency = 100
 		sem := quotapool.NewIntPool("Store.SetDraining", leaseTransferConcurrency)
-		// Incremented for every lease or Raft leadership transfer attempted. We try
-		// to send both the lease and the Raft leaders away, but this may not
-		// reliably work. Instead, we run the surrounding retry loop until there are
-		// no leaders/leases left (ignoring single-replica or uninitialized Raft
-		// groups).
+
+		// Incremented for every lease or Raft leadership transfer
+		// attempted. We try to send both the lease and the Raft leaders
+		// away, but this may not reliably work. Instead, we run the
+		// surrounding retry loop until there are no leaders/leases left
+		// (ignoring single-replica or uninitialized Raft groups).
 		var numTransfersAttempted int32
 		newStoreReplicaVisitor(s).Visit(func(r *Replica) bool {
+			//
+			// We need to be careful about the case where the ctx has been canceled
+			// prior to the call to (*Stopper).RunLimitedAsyncTask(). In that case,
+			// the goroutine is not even spawned. However, we don't want to
+			// mis-count the missing goroutine as the lack of transfer attempted.
+			// So what we do here is immediately increase numTransfersAttempted
+			// to count this replica, and then decrease it when it is known
+			// below that there is nothing to transfer (not lease holder and
+			// not raft leader).
+			atomic.AddInt32(&numTransfersAttempted, 1)
 			wg.Add(1)
 			if err := s.stopper.RunLimitedAsyncTask(
 				r.AnnotateCtx(ctx), "storage.Store: draining replica", sem, true, /* wait */
 				func(ctx context.Context) {
 					defer wg.Done()
+
+					select {
+					case <-transferCtx.Done():
+						// Context canceled: the timeout loop has decided we've
+						// done enough draining
+						// (server.shutdown.lease_transfer_wait).
+						//
+						// We need this check here because each call of
+						// transferAllAway() traverses all stores/replicas without
+						// checking for the timeout otherwise.
+						if log.V(1) {
+							log.Infof(ctx, "lease transfer aborted due to exceeded timeout")
+						}
+						return
+					default:
+					}
 
 					r.mu.Lock()
 					r.mu.draining = true
@@ -1039,8 +1105,17 @@ func (s *Store) SetDraining(drain bool) {
 						drainingLease.OwnedBy(s.StoreID()) &&
 						r.IsLeaseValid(drainingLease, s.Clock().Now())
 
-					if needsLeaseTransfer || needsRaftTransfer {
-						atomic.AddInt32(&numTransfersAttempted, 1)
+					if !needsLeaseTransfer && !needsRaftTransfer {
+						if log.V(1) {
+							// This logging is useful to troubleshoot incomplete drains.
+							log.Info(ctx, "not moving out")
+						}
+						atomic.AddInt32(&numTransfersAttempted, -1)
+						return
+					}
+					if log.V(1) {
+						// This logging is useful to troubleshoot incomplete drains.
+						log.Infof(ctx, "trying to move replica out: lease transfer = %v, raft transfer = %v", needsLeaseTransfer, needsRaftTransfer)
 					}
 
 					if needsLeaseTransfer {
@@ -1089,31 +1164,59 @@ func (s *Store) SetDraining(drain bool) {
 		return int(numTransfersAttempted)
 	}
 
-	transferAllAway()
+	// Give all replicas at least one chance to transfer.
+	// If we don't do that, then it's possible that a configured
+	// value for raftLeadershipTransferWait is too low to iterate
+	// through all the replicas at least once, and the drain
+	// condition on the remaining value will never be reached.
+	if numRemaining := transferAllAway(ctx); numRemaining > 0 {
+		// Report progress to the Drain RPC.
+		if reporter != nil {
+			reporter(numRemaining, "range lease iterations")
+		}
+	} else {
+		// No more work to do.
+		return
+	}
 
-	if err := contextutil.RunWithTimeout(ctx, "wait for raft leadership transfer", raftLeadershipTransferWait,
+	// We've seen all the replicas once. Now we're going to iterate
+	// until they're all gone, up to the configured timeout.
+	transferTimeout := raftLeadershipTransferWait.Get(&s.cfg.Settings.SV)
+
+	if err := contextutil.RunWithTimeout(ctx, "wait for raft leadership transfer", transferTimeout,
 		func(ctx context.Context) error {
 			opts := retry.Options{
 				InitialBackoff: 10 * time.Millisecond,
 				MaxBackoff:     time.Second,
 				Multiplier:     2,
 			}
-			// Avoid retry.ForDuration because of https://github.com/cockroachdb/cockroach/issues/25091.
 			everySecond := log.Every(time.Second)
-			return retry.WithMaxAttempts(ctx, opts, 10000, func() error {
-				if numRemaining := transferAllAway(); numRemaining > 0 {
-					err := errors.Errorf("waiting for %d replicas to transfer their lease away", numRemaining)
-					if everySecond.ShouldLog() {
-						log.Info(ctx, err)
+			var err error
+			// Avoid retry.ForDuration because of https://github.com/cockroachdb/cockroach/issues/25091.
+			for r := retry.StartWithCtx(ctx, opts); r.Next(); {
+				err = nil
+				if numRemaining := transferAllAway(ctx); numRemaining > 0 {
+					// Report progress to the Drain RPC.
+					if reporter != nil {
+						reporter(numRemaining, "range lease iterations")
 					}
-					return err
+					err = errors.Errorf("waiting for %d replicas to transfer their lease away", numRemaining)
+					if everySecond.ShouldLog() {
+						log.Infof(ctx, "%v", err)
+					}
 				}
-				return nil
-			})
+				if err == nil {
+					// All leases transferred. We can stop retrying.
+					break
+				}
+			}
+			// If there's an error in the context but not yet detected in
+			// err, take it into account here.
+			return errors.CombineErrors(err, ctx.Err())
 		}); err != nil {
 		// You expect this message when shutting down a server in an unhealthy
 		// cluster. If we see it on healthy ones, there's likely something to fix.
-		log.Warningf(ctx, "unable to drain cleanly within %s, service might briefly deteriorate: %+v", raftLeadershipTransferWait, err)
+		log.Warningf(ctx, "unable to drain cleanly within %s, service might briefly deteriorate: %+v", transferTimeout, err)
 	}
 }
 
@@ -1292,9 +1395,13 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	}
 
 	// Create ID allocators.
-	idAlloc, err := idalloc.NewAllocator(
-		s.cfg.AmbientCtx, keys.RangeIDGenerator, s.db, rangeIDAllocCount, s.stopper,
-	)
+	idAlloc, err := idalloc.NewAllocator(idalloc.Options{
+		AmbientCtx:  s.cfg.AmbientCtx,
+		Key:         keys.RangeIDGenerator,
+		Incrementer: idalloc.DBIncrementer(s.db),
+		BlockSize:   rangeIDAllocCount,
+		Stopper:     s.stopper,
+	})
 	if err != nil {
 		return err
 	}
@@ -1539,7 +1646,7 @@ func (s *Store) startGossip() {
 						annotatedCtx := repl.AnnotateCtx(ctx)
 						if err := gossipFn.fn(annotatedCtx, repl); err != nil {
 							log.Warningf(annotatedCtx, "could not gossip %s: %+v", gossipFn.description, err)
-							if err != errPeriodicGossipsDisabled {
+							if !errors.Is(err, errPeriodicGossipsDisabled) {
 								continue
 							}
 						}
@@ -1587,7 +1694,7 @@ func (s *Store) startLeaseRenewer(ctx context.Context) {
 			s.renewableLeases.Range(func(k int64, v unsafe.Pointer) bool {
 				repl := (*Replica)(v)
 				annotatedCtx := repl.AnnotateCtx(ctx)
-				if _, _, pErr := repl.redirectOnOrAcquireLease(annotatedCtx); pErr != nil {
+				if _, pErr := repl.redirectOnOrAcquireLease(annotatedCtx); pErr != nil {
 					if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); !ok {
 						log.Warningf(annotatedCtx, "failed to proactively renew lease: %s", pErr)
 					}
@@ -1733,13 +1840,6 @@ func (s *Store) asyncGossipStore(ctx context.Context, reason string, useCached b
 
 // GossipStore broadcasts the store on the gossip network.
 func (s *Store) GossipStore(ctx context.Context, useCached bool) error {
-	select {
-	case <-s.cfg.Gossip.Connected:
-	default:
-		// Nothing to do if gossip is not connected.
-		return nil
-	}
-
 	// Temporarily indicate that we're gossiping the store capacity to avoid
 	// recursively triggering a gossip of the store capacity.
 	syncutil.StoreFloat64(&s.gossipQueriesPerSecondVal, -1)
@@ -1843,7 +1943,7 @@ func (s *Store) recordNewPerSecondStats(newQPS, newWPS float64) {
 
 // VisitReplicas invokes the visitor on the Store's Replicas until the visitor returns false.
 // Replicas which are added to the Store after iteration begins may or may not be observed.
-func (s *Store) VisitReplicas(visitor func(*Replica) bool) {
+func (s *Store) VisitReplicas(visitor func(*Replica) (wantMore bool)) {
 	v := newStoreReplicaVisitor(s)
 	v.Visit(visitor)
 }
@@ -1940,23 +2040,40 @@ func ReadMaxHLCUpperBound(ctx context.Context, engines []storage.Engine) (int64,
 	return hlcUpperBound, nil
 }
 
-func checkEngineEmpty(ctx context.Context, eng storage.Engine) error {
+// checkCanInitializeEngine ensures that the engine is empty except for a
+// cluster version, which must be present.
+func checkCanInitializeEngine(ctx context.Context, eng storage.Engine) error {
 	kvs, err := storage.Scan(eng, roachpb.KeyMin, roachpb.KeyMax, 10)
 	if err != nil {
 		return err
 	}
-	if len(kvs) > 0 {
-		// See if this is an already-bootstrapped store.
-		ident, err := ReadStoreIdent(ctx, eng)
-		if err != nil {
-			return errors.Wrap(err, "unable to read store ident")
-		}
-		keyVals := make([]string, len(kvs))
-		for i, kv := range kvs {
-			keyVals[i] = fmt.Sprintf("%s: %q", kv.Key, kv.Value)
-		}
-		return errors.Errorf("engine belongs to store %s, contains %s", ident.String(), keyVals)
+	// See if this is an already-bootstrapped store.
+	ident, err := ReadStoreIdent(ctx, eng)
+	if err == nil {
+		return errors.Errorf("engine already initialized as %s", ident.String())
+	} else if !errors.HasType(err, (*NotBootstrappedError)(nil)) {
+		return errors.Wrap(err, "unable to read store ident")
 	}
+
+	// Engine is not bootstrapped yet (i.e. no StoreIdent). Does it contain
+	// a cluster version and nothing else?
+
+	var sawClusterVersion bool
+	var keyVals []string
+	for _, kv := range kvs {
+		if kv.Key.Key.Equal(keys.StoreClusterVersionKey()) {
+			sawClusterVersion = true
+			continue
+		}
+		keyVals = append(keyVals, fmt.Sprintf("%s: %q", kv.Key, kv.Value))
+	}
+	if len(keyVals) > 0 {
+		return errors.Errorf("engine cannot be bootstrapped, contains:\n%s", keyVals)
+	}
+	if !sawClusterVersion {
+		return errors.New("no cluster version found on uninitialized engine")
+	}
+
 	return nil
 }
 
@@ -2199,6 +2316,13 @@ func (s *Store) Descriptor(useCached bool) (*roachpb.StoreDescriptor, error) {
 func (s *Store) RangeFeed(
 	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) *roachpb.Error {
+
+	if filter := s.TestingKnobs().TestingRangefeedFilter; filter != nil {
+		if pErr := filter(args, stream); pErr != nil {
+			return pErr
+		}
+	}
+
 	if err := verifyKeys(args.Span.Key, args.Span.EndKey, true); err != nil {
 		return roachpb.NewError(err)
 	}
@@ -2296,7 +2420,8 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		if wps, dur := rep.writeStats.avgQPS(); dur >= MinStatsDuration {
 			averageWritesPerSecond += wps
 		}
-		if mc := rep.maxClosed(ctx); minMaxClosedTS.IsEmpty() || mc.Less(minMaxClosedTS) {
+		mc, ok := rep.maxClosed(ctx)
+		if ok && (minMaxClosedTS.IsEmpty() || mc.Less(minMaxClosedTS)) {
 			minMaxClosedTS = mc
 		}
 		return true // more

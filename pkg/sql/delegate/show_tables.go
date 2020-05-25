@@ -25,45 +25,69 @@ import (
 //          mysql only returns tables you have privileges on.
 func (d *delegator) delegateShowTables(n *tree.ShowTables) (tree.Statement, error) {
 	flags := cat.Flags{AvoidDescriptorCaches: true}
-	_, name, err := d.catalog.ResolveSchema(d.ctx, flags, &n.TableNamePrefix)
+	_, name, err := d.catalog.ResolveSchema(d.ctx, flags, &n.ObjectNamePrefix)
 	if err != nil {
 		return nil, err
 	}
 
-	var query string
-	schema := lex.EscapeSQLString(name.Schema())
-	if name.Schema() == sessiondata.PgTempSchemaName {
-		schema = lex.EscapeSQLString(d.evalCtx.SessionData.SearchPath.GetTemporarySchemaName())
+	var schemaClause string
+	if n.ExplicitSchema {
+		schema := lex.EscapeSQLString(name.Schema())
+		if name.Schema() == sessiondata.PgTempSchemaName {
+			schema = lex.EscapeSQLString(d.evalCtx.SessionData.SearchPath.GetTemporarySchemaName())
+		}
+		schemaClause = fmt.Sprintf("AND ns.nspname = %s", schema)
+	} else {
+		// These must be custom defined until the sql <-> sql/delegate cyclic dependency
+		// is resolved. When we have that, we should read the names off "virtualSchemas" instead.
+		schemaClause = "AND ns.nspname NOT IN ('information_schema', 'pg_catalog', 'crdb_internal', 'pg_extension')"
 	}
 
+	var query string
 	if n.WithComment {
 		const getTablesQuery = `
 SELECT
+	ns.nspname AS schema_name,
 	pc.relname AS table_name,
+	(CASE
+		WHEN pc.relkind = 'v' THEN 'view'
+		WHEN pc.relkind = 'S' THEN 'sequence'
+		ELSE 'table'
+	END) AS "type",
   COALESCE(pd.description, '') AS comment
  FROM %[1]s.pg_catalog.pg_class       AS pc
  JOIN %[1]s.pg_catalog.pg_namespace   AS ns ON (ns.oid = pc.relnamespace)
-LEFT JOIN %[1]s.pg_catalog.pg_description AS pd ON (pc.oid = pd.objoid AND pd.objsubid = 0)
-WHERE ns.nspname = %[2]s
-  AND pc.relkind IN ('r', 'v')`
+ LEFT JOIN %[1]s.pg_catalog.pg_description AS pd ON (pc.oid = pd.objoid AND pd.objsubid = 0)
+WHERE pc.relkind IN ('r', 'v', 'S') %[2]s
+ORDER BY schema_name, table_name
+`
 
 		query = fmt.Sprintf(
 			getTablesQuery,
 			&name.CatalogName,
-			schema,
+			schemaClause,
 		)
 
 	} else {
 		const getTablesQuery = `
-  SELECT table_name
-    FROM %[1]s.information_schema.tables
-   WHERE table_schema = %[2]s
-ORDER BY table_name`
+SELECT
+	ns.nspname AS schema_name,
+	pc.relname AS table_name,
+	(CASE
+		WHEN pc.relkind = 'v' THEN 'view'
+		WHEN pc.relkind = 'S' THEN 'sequence'
+		ELSE 'table'
+	END) AS "type"
+ FROM %[1]s.pg_catalog.pg_class       AS pc
+ JOIN %[1]s.pg_catalog.pg_namespace   AS ns ON (ns.oid = pc.relnamespace)
+WHERE pc.relkind IN ('r', 'v', 'S') %[2]s
+ORDER BY schema_name, table_name
+`
 
 		query = fmt.Sprintf(
 			getTablesQuery,
 			&name.CatalogName,
-			schema,
+			schemaClause,
 		)
 	}
 

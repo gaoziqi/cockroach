@@ -44,7 +44,11 @@ func (n *cancelQueriesNode) Next(params runParams) (bool, error) {
 		return true, nil
 	}
 
-	statusServer := params.extendedEvalCtx.StatusServer
+	statusServer, err := params.extendedEvalCtx.StatusServer.OptionalErr(47895)
+	if err != nil {
+		return false, err
+	}
+
 	queryIDString, ok := tree.AsDString(datum)
 	if !ok {
 		return false, errors.AssertionFailedf("%q: expected *DString, found %T", datum, datum)

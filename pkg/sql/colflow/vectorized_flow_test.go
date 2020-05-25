@@ -12,49 +12,53 @@ package colflow
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow/colrpc"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 )
 
 type callbackRemoteComponentCreator struct {
-	newOutboxFn func(*colexec.Allocator, colexec.Operator, []coltypes.T, []execinfrapb.MetadataSource) (*colrpc.Outbox, error)
-	newInboxFn  func(allocator *colexec.Allocator, typs []coltypes.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
+	newOutboxFn func(*colmem.Allocator, colexecbase.Operator, []*types.T, []execinfrapb.MetadataSource) (*colrpc.Outbox, error)
+	newInboxFn  func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error)
 }
 
 func (c callbackRemoteComponentCreator) newOutbox(
-	allocator *colexec.Allocator,
-	input colexec.Operator,
-	typs []coltypes.T,
+	allocator *colmem.Allocator,
+	input colexecbase.Operator,
+	typs []*types.T,
 	metadataSources []execinfrapb.MetadataSource,
+	toClose []colexec.IdempotentCloser,
 ) (*colrpc.Outbox, error) {
 	return c.newOutboxFn(allocator, input, typs, metadataSources)
 }
 
 func (c callbackRemoteComponentCreator) newInbox(
-	allocator *colexec.Allocator, typs []coltypes.T, streamID execinfrapb.StreamID,
+	allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
 ) (*colrpc.Inbox, error) {
 	return c.newInboxFn(allocator, typs, streamID)
 }
 
-func intCols(numCols int) []types.T {
-	cols := make([]types.T, numCols)
+func intCols(numCols int) []*types.T {
+	cols := make([]*types.T, numCols)
 	for i := range cols {
-		cols[i] = *types.Int
+		cols[i] = types.Int
 	}
 	return cols
 }
@@ -178,13 +182,13 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 		},
 	}
 
-	inboxToNumInputTypes := make(map[*colrpc.Inbox][]coltypes.T)
+	inboxToNumInputTypes := make(map[*colrpc.Inbox][]*types.T)
 	outboxCreated := false
 	componentCreator := callbackRemoteComponentCreator{
 		newOutboxFn: func(
-			allocator *colexec.Allocator,
-			op colexec.Operator,
-			typs []coltypes.T,
+			allocator *colmem.Allocator,
+			op colexecbase.Operator,
+			typs []*types.T,
 			sources []execinfrapb.MetadataSource,
 		) (*colrpc.Outbox, error) {
 			require.False(t, outboxCreated)
@@ -195,9 +199,9 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 			// expect from the input DAG.
 			require.Len(t, sources, 1)
 			require.Len(t, inboxToNumInputTypes[sources[0].(*colrpc.Inbox)], numInputTypesToOutbox)
-			return colrpc.NewOutbox(allocator, op, typs, sources)
+			return colrpc.NewOutbox(allocator, op, typs, sources, nil /* toClose */)
 		},
-		newInboxFn: func(allocator *colexec.Allocator, typs []coltypes.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error) {
+		newInboxFn: func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error) {
 			inbox, err := colrpc.NewInbox(allocator, typs, streamID)
 			inboxToNumInputTypes[inbox] = typs
 			return inbox, err
@@ -208,7 +212,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 	evalCtx := tree.MakeTestingEvalContext(st)
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
-	f := &flowinfra.FlowBase{FlowCtx: execinfra.FlowCtx{EvalCtx: &evalCtx, NodeID: roachpb.NodeID(1)}}
+	f := &flowinfra.FlowBase{FlowCtx: execinfra.FlowCtx{EvalCtx: &evalCtx, NodeID: base.TestingIDContainer}}
 	var wg sync.WaitGroup
 	vfc := newVectorizedFlowCreator(&vectorizedFlowCreatorHelper{f: f}, componentCreator, false, &wg, &execinfra.RowChannel{}, nil, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{}, nil)
 
@@ -235,11 +239,13 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
 
-	const baseDirName = "base"
-
-	ngn := storage.NewDefaultInMem()
+	// We use an on-disk engine for this test since we're testing FS interactions
+	// and want to get the same behavior as a non-testing environment.
+	tempPath, dirCleanup := testutils.TempDir(t)
+	ngn, err := storage.NewDefaultEngine(0 /* cacheSize */, base.StorageConfig{Dir: tempPath})
+	require.NoError(t, err)
 	defer ngn.Close()
-	require.NoError(t, ngn.CreateDir(baseDirName))
+	defer dirCleanup()
 
 	newVectorizedFlow := func() *vectorizedFlow {
 		return NewVectorizedFlow(
@@ -247,22 +253,26 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 				FlowCtx: execinfra.FlowCtx{
 					Cfg: &execinfra.ServerConfig{
 						TempFS:          ngn,
-						TempStoragePath: baseDirName,
-						VecFDSemaphore:  &colexec.TestingSemaphore{},
+						TempStoragePath: tempPath,
+						VecFDSemaphore:  &colexecbase.TestingSemaphore{},
 						Metrics:         &execinfra.DistSQLMetrics{},
 					},
 					EvalCtx: &evalCtx,
-					NodeID:  roachpb.NodeID(1),
+					NodeID:  base.TestingIDContainer,
 				},
 			},
 		).(*vectorizedFlow)
 	}
 
-	checkDirs := func(t *testing.T, numDirs int) {
+	dirs, err := ngn.List(tempPath)
+	require.NoError(t, err)
+	numDirsTheTestStartedWith := len(dirs)
+	checkDirs := func(t *testing.T, numExtraDirs int) {
 		t.Helper()
-		dirs, err := ngn.ListDir(baseDirName)
+		dirs, err := ngn.List(tempPath)
 		require.NoError(t, err)
-		require.Equal(t, numDirs, len(dirs), "expected %d directories but found %d: %s", numDirs, len(dirs), dirs)
+		expectedNumDirs := numDirsTheTestStartedWith + numExtraDirs
+		require.Equal(t, expectedNumDirs, len(dirs), "expected %d directories but found %d: %s", expectedNumDirs, len(dirs), dirs)
 	}
 
 	// LazilyCreated asserts that a directory is not created during flow Setup
@@ -339,6 +349,31 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 		vf1.Cleanup(ctx)
 		checkDirs(t, 1)
 		vf2.Cleanup(ctx)
+		checkDirs(t, 0)
+	})
+
+	t.Run("DirCreationRace", func(t *testing.T) {
+		vf := newVectorizedFlow()
+		var creator *vectorizedFlowCreator
+		vf.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
+			creator = c
+		}
+
+		_, err := vf.Setup(ctx, &execinfrapb.FlowSpec{}, flowinfra.FuseNormally)
+		require.NoError(t, err)
+
+		createTempDir := creator.diskQueueCfg.OnNewDiskQueueCb
+		errCh := make(chan error)
+		go func() {
+			createTempDir()
+			errCh <- ngn.MkdirAll(filepath.Join(vf.tempStorage.path, "async"))
+		}()
+		createTempDir()
+		// Both goroutines should be able to create their subdirectories within the
+		// flow's temporary directory.
+		require.NoError(t, ngn.MkdirAll(filepath.Join(vf.tempStorage.path, "main_goroutine")))
+		require.NoError(t, <-errCh)
+		vf.Cleanup(ctx)
 		checkDirs(t, 0)
 	})
 }

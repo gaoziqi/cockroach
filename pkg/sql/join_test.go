@@ -13,6 +13,7 @@ package sql
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
@@ -21,9 +22,9 @@ import (
 )
 
 func newTestScanNode(kvDB *kv.DB, tableName string) (*scanNode, error) {
-	desc := sqlbase.GetImmutableTableDescriptor(kvDB, sqlutils.TestDB, tableName)
+	desc := sqlbase.GetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, tableName)
 
-	p := planner{}
+	p := planner{alloc: &sqlbase.DatumAlloc{}}
 	scan := p.Scan()
 	scan.desc = desc
 	err := scan.initDescDefaults(p.curPlan.deps, publicColumnsCfg)
@@ -45,8 +46,8 @@ func newTestScanNode(kvDB *kv.DB, tableName string) (*scanNode, error) {
 		}
 	}
 	scan.reqOrdering = ordering
-	sb := span.MakeBuilder(desc.TableDesc(), &desc.PrimaryIndex)
-	scan.spans, err = sb.SpansFromConstraint(nil /* constraint */, exec.ColumnOrdinalSet{}, false /* forDelete */)
+	sb := span.MakeBuilder(keys.SystemSQLCodec, desc.TableDesc(), &desc.PrimaryIndex)
+	scan.spans, err = sb.SpansFromConstraint(nil /* constraint */, exec.TableColumnOrdinalSet{}, false /* forDelete */)
 	if err != nil {
 		return nil, err
 	}

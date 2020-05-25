@@ -63,11 +63,25 @@ const (
 	// ErrorScoreTxnRestart indicates that the transaction should be restarted
 	// with an incremented epoch.
 	ErrorScoreTxnRestart
+
+	// ErrorScoreUnambiguousError is used for errors which are known to return a
+	// transaction reflecting the highest timestamp of any intent that was
+	// written. We allow the transaction to continue after such errors; we also
+	// allow RollbackToSavepoint() to be called after such errors. In particular,
+	// this is useful for SQL which wants to allow rolling back to a savepoint
+	// after ConditionFailedErrors (uniqueness violations). With continuing after
+	// errors its important for the coordinator to track the timestamp at which
+	// intents might have been written.
+	//
+	// Note that all the lower scores also are unambiguous in this sense, so this
+	// score can be seen as an upper-bound for unambiguous errors.
+	ErrorScoreUnambiguousError
+
 	// ErrorScoreNonRetriable indicates that the transaction performed an
-	// operation that does not warrant a retry. Often this indicates that the
-	// operation ran into a logic error. The error should be propagated to the
-	// client and the transaction should terminate immediately.
+	// operation that does not warrant a retry. The error should be propagated to
+	// the client and the transaction should terminate immediately.
 	ErrorScoreNonRetriable
+
 	// ErrorScoreTxnAbort indicates that the transaction is aborted. The
 	// operation can only try again under the purview of a new transaction.
 	//
@@ -97,6 +111,12 @@ func ErrPriority(err error) ErrorPriority {
 			return ErrorScoreTxnAbort
 		}
 		return ErrorScoreTxnRestart
+	case *ConditionFailedError:
+		// We particularly care about returning the low ErrorScoreUnambiguousError
+		// because we don't want to transition a transaction that encounters
+		// ConditionFailedError to an error state. More specifically, we want to
+		// allow rollbacks to savepoint after a ConditionFailedError.
+		return ErrorScoreUnambiguousError
 	}
 	return ErrorScoreNonRetriable
 }
@@ -124,10 +144,10 @@ func NewErrorWithTxn(err error, txn *Transaction) *Error {
 // passthrough to fmt.Errorf, with an additional prefix containing the
 // filename and line number.
 func NewErrorf(format string, a ...interface{}) *Error {
-	// Cannot use errors.Errorf here due to cyclic dependency.
+	err := errors.Newf(format, a...)
 	file, line, _ := caller.Lookup(1)
-	s := fmt.Sprintf("%s:%d: ", file, line)
-	return NewError(fmt.Errorf(s+format, a...))
+	err = errors.Wrapf(err, "%s:%d", file, line)
+	return NewError(err)
 }
 
 // String implements fmt.Stringer.
@@ -252,7 +272,7 @@ func (e *Error) checkTxnStatusValid() {
 	if e.TransactionRestart == TransactionRestart_NONE {
 		return
 	}
-	if _, ok := err.(*TransactionAbortedError); ok {
+	if errors.HasType(err, (*TransactionAbortedError)(nil)) {
 		return
 	}
 	if txn.Status.IsFinalized() {
@@ -865,10 +885,5 @@ var _ ErrorDetailInterface = &IndeterminateCommitError{}
 
 // IsRangeNotFoundError returns true if err contains a *RangeNotFoundError.
 func IsRangeNotFoundError(err error) bool {
-	// TODO(ajwerner): adopt errors.IsType once the pull request to add it merges.
-	_, isRangeNotFound := errors.If(err, func(err error) (interface{}, bool) {
-		_, isRangeNotFound := err.(*RangeNotFoundError)
-		return err, isRangeNotFound
-	})
-	return isRangeNotFound
+	return errors.HasType(err, (*RangeNotFoundError)(nil))
 }

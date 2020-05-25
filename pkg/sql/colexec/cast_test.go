@@ -16,9 +16,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -29,6 +30,16 @@ import (
 
 func TestRandomizedCast(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	flowCtx := &execinfra.FlowCtx{
+		EvalCtx: &evalCtx,
+		Cfg: &execinfra.ServerConfig{
+			Settings: st,
+		},
+	}
 
 	datumAsBool := func(d tree.Datum) interface{} {
 		return bool(tree.MustBeDBool(d))
@@ -70,7 +81,6 @@ func TestRandomizedCast(t *testing.T) {
 		{types.Float, datumAsFloat, types.Decimal, datumAsDecimal, false},
 	}
 
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	rng, _ := randutil.NewPseudoRand()
 
 	for _, c := range tc {
@@ -87,12 +97,12 @@ func TestRandomizedCast(t *testing.T) {
 					toDatum tree.Datum
 					err     error
 				)
-				toDatum, err = tree.PerformCast(evalCtx, fromDatum, c.toTyp)
+				toDatum, err = tree.PerformCast(&evalCtx, fromDatum, c.toTyp)
 				if c.retryGeneration {
 					for err != nil {
 						// If we are allowed to retry, make a new datum and cast it on error.
 						fromDatum = sqlbase.RandDatum(rng, c.fromTyp, false)
-						toDatum, err = tree.PerformCast(evalCtx, fromDatum, c.toTyp)
+						toDatum, err = tree.PerformCast(&evalCtx, fromDatum, c.toTyp)
 					}
 				} else {
 					if err != nil {
@@ -103,8 +113,8 @@ func TestRandomizedCast(t *testing.T) {
 				output = append(output, tuple{c.fromPhysType(fromDatum), c.toPhysType(toDatum)})
 			}
 			runTests(t, []tuples{input}, output, orderedVerifier,
-				func(input []Operator) (Operator, error) {
-					return GetCastOperator(testAllocator, input[0], 0 /* inputIdx*/, 1 /* resultIdx */, c.fromTyp, c.toTyp)
+				func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+					return createTestCastOperator(ctx, flowCtx, input[0], c.fromTyp, c.toTyp)
 				})
 		})
 	}
@@ -112,11 +122,20 @@ func TestRandomizedCast(t *testing.T) {
 
 func BenchmarkCastOp(b *testing.B) {
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	flowCtx := &execinfra.FlowCtx{
+		EvalCtx: &evalCtx,
+		Cfg: &execinfra.ServerConfig{
+			Settings: st,
+		},
+	}
 	rng, _ := randutil.NewPseudoRand()
-	for _, typePair := range [][]types.T{
-		{*types.Int, *types.Float},
-		{*types.Int, *types.Decimal},
-		{*types.Float, *types.Decimal},
+	for _, typePair := range [][]*types.T{
+		{types.Int, types.Float},
+		{types.Int, types.Decimal},
+		{types.Float, types.Decimal},
 	} {
 		for _, useSel := range []bool{true, false} {
 			for _, hasNulls := range []bool{true, false} {
@@ -124,7 +143,6 @@ func BenchmarkCastOp(b *testing.B) {
 					fmt.Sprintf("useSel=%t/hasNulls=%t/%s_to_%s",
 						useSel, hasNulls, typePair[0].Name(), typePair[1].Name(),
 					), func(b *testing.B) {
-						fromType := typeconv.FromColumnType(&typePair[0])
 						nullProbability := nullProbability
 						if !hasNulls {
 							nullProbability = 0
@@ -133,12 +151,13 @@ func BenchmarkCastOp(b *testing.B) {
 						if !useSel {
 							selectivity = 1.0
 						}
-						batch := randomBatchWithSel(
-							testAllocator, rng, []coltypes.T{fromType},
+						typs := []*types.T{typePair[0]}
+						batch := coldatatestutils.RandomBatchWithSel(
+							testAllocator, rng, typs,
 							coldata.BatchSize(), nullProbability, selectivity,
 						)
-						source := NewRepeatableBatchSource(testAllocator, batch)
-						op, err := GetCastOperator(testAllocator, source, 0, 1, &typePair[0], &typePair[1])
+						source := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
+						op, err := createTestCastOperator(ctx, flowCtx, source, typePair[0], typePair[1])
 						require.NoError(b, err)
 						b.SetBytes(int64(8 * coldata.BatchSize()))
 						b.ResetTimer()
@@ -150,4 +169,20 @@ func BenchmarkCastOp(b *testing.B) {
 			}
 		}
 	}
+}
+
+func createTestCastOperator(
+	ctx context.Context,
+	flowCtx *execinfra.FlowCtx,
+	input colexecbase.Operator,
+	fromTyp *types.T,
+	toTyp *types.T,
+) (colexecbase.Operator, error) {
+	// We currently don't support casting to decimal type (other than when
+	// casting from decimal with the same precision), so we will allow falling
+	// back to row-by-row engine.
+	return createTestProjectingOperator(
+		ctx, flowCtx, input, []*types.T{fromTyp},
+		fmt.Sprintf("@1::%s", toTyp.Name()), true, /* canFallbackToRowexec */
+	)
 }

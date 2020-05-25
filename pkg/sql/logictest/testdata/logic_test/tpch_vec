@@ -1,4 +1,4 @@
-# LogicTest: local-vec
+# LogicTest: local
 
 # Note that statistics are populated for TPCH Scale Factor 1.
 
@@ -754,15 +754,13 @@ EXPLAIN (VEC) SELECT ps_partkey, sum(ps_supplycost * ps_availqty::float) AS valu
 │
 └ Node 1
   └ *colexec.sortOp
-    └ *colexec.selGTFloat64Float64Op
-      └ *colexec.castOpNullAny
-        └ *colexec.constNullOp
-          └ *colexec.hashAggregator
+    └ *rowexec.noopProcessor
+      └ *colexec.hashAggregator
+        └ *rowexec.joinReader
+          └ *rowexec.joinReader
             └ *rowexec.joinReader
-              └ *rowexec.joinReader
-                └ *rowexec.joinReader
-                  └ *colexec.selEQBytesBytesConstOp
-                    └ *colexec.colBatchScan
+              └ *colexec.selEQBytesBytesConstOp
+                └ *colexec.colBatchScan
 
 # Query 12
 query T
@@ -817,9 +815,24 @@ EXPLAIN (VEC) SELECT 100.00 * sum(CASE WHEN p_type LIKE 'PROMO%' THEN l_extended
                     └ *colexec.bufferOp
 
 # Query 15
-#-- TODO(yuzefovich): figure out how to execute this query consisting of three
-#-- statements.
-#-- CREATE VIEW revenue0 (supplier_no, total_revenue) AS SELECT l_suppkey, sum(l_extendedprice * (1 - l_discount)) FROM lineitem WHERE l_shipdate >= DATE '1996-01-01' AND l_shipdate < DATE '1996-01-01' + INTERVAL '3' MONTH GROUP BY l_suppkey; SELECT s_suppkey, s_name, s_address, s_phone, total_revenue FROM supplier, revenue0 WHERE s_suppkey = supplier_no AND total_revenue = ( SELECT max(total_revenue) FROM revenue0) ORDER BY s_suppkey; DROP VIEW revenue0
+statement ok
+CREATE VIEW revenue0 (supplier_no, total_revenue) AS SELECT l_suppkey, sum(l_extendedprice * (1 - l_discount)) FROM lineitem WHERE l_shipdate >= DATE '1996-01-01' AND l_shipdate < DATE '1996-01-01' + INTERVAL '3' MONTH GROUP BY l_suppkey
+
+query T
+EXPLAIN (VEC) SELECT s_suppkey, s_name, s_address, s_phone, total_revenue FROM supplier, revenue0 WHERE s_suppkey = supplier_no AND total_revenue = ( SELECT max(total_revenue) FROM revenue0) ORDER BY s_suppkey
+----
+│
+└ Node 1
+  └ *colexec.mergeJoinInnerOp
+    ├ *colexec.colBatchScan
+    └ *colexec.sortOp
+      └ *rowexec.noopProcessor
+        └ *colexec.hashAggregator
+          └ *rowexec.indexJoiner
+            └ *colexec.colBatchScan
+
+statement ok
+DROP VIEW revenue0
 
 # Query 16
 query T
@@ -989,11 +1002,4 @@ EXPLAIN (VEC) SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctba
   └ *colexec.sortOp
     └ *colexec.hashAggregator
       └ *rowexec.joinReader
-        └ *colexec.selGTFloat64Float64Op
-          └ *colexec.castOpNullAny
-            └ *colexec.constNullOp
-              └ *colexec.selectInOpBytes
-                └ *colexec.substringInt64Int64Operator
-                  └ *colexec.constInt64Op
-                    └ *colexec.constInt64Op
-                      └ *colexec.colBatchScan
+        └ *rowexec.tableReader

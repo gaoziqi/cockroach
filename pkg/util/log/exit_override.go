@@ -21,8 +21,11 @@ import (
 // if true, suppresses the stack trace, which is useful for test
 // callers wishing to keep the logs reasonably clean.
 //
-// Call with a nil function to undo.
+// Use ResetExitFunc() to reset.
 func SetExitFunc(hideStack bool, f func(int)) {
+	if f == nil {
+		panic("nil exit func invalid")
+	}
 	setExitErrFunc(hideStack, func(x int, err error) { f(x) })
 }
 
@@ -76,7 +79,11 @@ func (l *loggerT) exitLocked(err error) {
 	f := logging.mu.exitOverride.f
 	logging.mu.Unlock()
 	if f != nil {
+		// Avoid conflicting lock order between l.mu and locks in f.
+		l.mu.Unlock()
 		f(2, err)
+		// Avoid double unlock on l.mu.
+		l.mu.Lock()
 	} else {
 		os.Exit(2)
 	}

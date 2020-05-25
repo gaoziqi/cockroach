@@ -21,7 +21,6 @@
 #             step in some important transformations (like eliminating
 #             subqueries).
 
-
 # Scan returns a result set containing every row in a table by scanning one of
 # the table's indexes according to its ordering. The ScanPrivate field
 # identifies the table and index to scan, as well as the subset of columns to
@@ -79,35 +78,6 @@ define ScanPrivate {
     PartitionConstrainedScan bool
 }
 
-# VirtualScan returns a result set containing every row in a virtual table.
-# Virtual tables are system tables that are populated "on the fly" with rows
-# synthesized from system metadata and other state. An example is the
-# "information_schema.tables" virtual table which returns one row for each
-# accessible system or user table.
-#
-# VirtualScan has many of the same characteristics as the Scan operator.
-# However, virtual tables do not have indexes or keys, and the physical operator
-# used to scan virtual tables does not support limits or constraints. Therefore,
-# nearly all the rules that apply to Scan do not apply to VirtualScan, so it
-# makes sense to have a separate operator.
-[Relational]
-define VirtualScan {
-    _ VirtualScanPrivate
-}
-
-[Private]
-define VirtualScanPrivate {
-    # Table identifies the virtual table to synthesize and scan. It is an id
-    # that can be passed to the Metadata.Table method in order to fetch
-    # cat.Table metadata.
-    Table TableID
-
-    # Cols specifies the set of columns that the VirtualScan operator projects.
-    # This is always every column in the virtual table (i.e. never a subset even
-    # if all columns are not needed).
-    Cols ColSet
-}
-
 # SequenceSelect represents a read from a sequence as a data source. It always returns
 # three columns, last_value, log_cnt, and is_called, with a single row. last_value is
 # the most recent value returned from the sequence and log_cnt and is_called are
@@ -119,11 +89,11 @@ define SequenceSelect {
 
 [Private]
 define SequenceSelectPrivate {
-  # Sequence identifies the sequence to read from.
-  Sequence SequenceID
+    # Sequence identifies the sequence to read from.
+    Sequence SequenceID
 
-  # Cols is the 3 element list of column IDs returned by the operator.
-  Cols ColList
+    # Cols is the 3 element list of column IDs returned by the operator.
+    Cols ColList
 }
 
 # Values returns a manufactured result set containing a constant number of rows.
@@ -138,8 +108,7 @@ define SequenceSelectPrivate {
 [Relational]
 define Values {
     Rows ScalarListExpr
-
-    _    ValuesPrivate
+    _ ValuesPrivate
 }
 
 [Private]
@@ -160,7 +129,7 @@ define ValuesPrivate {
 # matching easier.
 [Relational]
 define Select {
-    Input   RelExpr
+    Input RelExpr
     Filters FiltersExpr
 }
 
@@ -173,9 +142,8 @@ define Select {
 # output columns.
 [Relational]
 define Project {
-    Input       RelExpr
+    Input RelExpr
     Projections ProjectionsExpr
-
     Passthrough ColSet
 
     # notNullCols is the set of columns (input or synthesized) that are known to
@@ -192,57 +160,51 @@ define Project {
 # predicate are filtered. While expressions in the predicate can refer to
 # columns projected by either the left or right inputs, the inputs are not
 # allowed to refer to the other's projected columns.
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define InnerJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define LeftJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
-   _ JoinPrivate
+    On FiltersExpr
+    _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define RightJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define FullJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define SemiJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
-[Relational, Join, JoinNonApply, Telemetry]
+[Relational, Join, JoinNonApply]
 define AntiJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
@@ -264,7 +226,6 @@ define JoinPrivate {
 [Relational]
 define IndexJoin {
     Input RelExpr
-
     _ IndexJoinPrivate
 }
 
@@ -281,11 +242,10 @@ define IndexJoinPrivate {
 
 # LookupJoin represents a join between an input expression and an index. The
 # type of join is in the LookupJoinPrivate field.
-[Relational, Telemetry]
+[Relational]
 define LookupJoin {
     Input RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ LookupJoinPrivate
 
     # lookupProps caches relational properties for the "table" side of the lookup
@@ -332,7 +292,72 @@ define LookupJoinPrivate {
     # conditions on the KeyCols. These filters are needed by the statistics code to
     # correctly estimate selectivity.
     ConstFilters FiltersExpr
+    _ JoinPrivate
+}
 
+# GeoLookupJoin represents a join between an input expression and an index,
+# where the index is an inverted index on a Geometry or Geography column.
+#
+# A GeoLookupJoin can be generated for queries containing a join where one of
+# the join conditions is a geospatial binary function such as ST_Covers or
+# ST_CoveredBy, and at least one of the two inputs to the function is an
+# indexed geospatial column. The type of geospatial function implies the
+# GeoRelationshipType (Covers, CoveredBy or Intersects) for the join, which is
+# stored in the GeoLookupJoinPrivate and affects how the join is executed. For
+# a full list of the geospatial functions that can be index-accelerated and
+# their corresponding GeoRelationshipTypes, see geoRelationshipMap in
+# xform/custom_funcs.go.
+#
+# The GeoLookupJoin has no false negatives, but it may return false positives
+# that would not have been returned by the original geospatial function
+# join predicate. Therefore, the original function must still be applied on
+# the output of the join. Since the inverted index does not actually include
+# the geospatial column (or any other columns besides the primary key columns),
+# the GeoLookupJoin will be wrapped in an index join. The geospatial function
+# and any other filters on non-key columns will be appied as filters on the
+# outer index join.
+[Relational]
+define GeoLookupJoin {
+    Input RelExpr
+
+    # On only contains filters on the input columns and primary key columns of
+    # the inverted index's base table. (Since the indexed geospatial column is
+    # not actually included in the index, the GeoLookupJoin must be wrapped in
+    # an index join, which will contain the original geospatial function as one
+    # of its On conditions.)
+    On FiltersExpr
+    _ GeoLookupJoinPrivate
+
+    # lookupProps caches relational properties for the "table" side of the lookup
+    # join, treating it as if it were another relational input. This makes the
+    # lookup join appear more like other join operators.
+    lookupProps RelProps
+}
+
+[Private]
+define GeoLookupJoinPrivate {
+    # JoinType is InnerJoin, LeftJoin, SemiJoin, or AntiJoin.
+    JoinType Operator
+
+    # GeoRelationshipType is Covers, CoveredBy, or Intersects.
+    GeoRelationshipType GeoRelationshipType
+
+    # Table identifies the table do to lookups in.
+    Table TableID
+
+    # Index identifies the geospatial inverted index to do lookups in. It can
+    # be passed to the cat.Table.Index() method in order to fetch the cat.Index
+    # metadata.
+    Index IndexOrdinal
+
+    # GeoCol is the geospatial column (produced by the input) used to
+    # determine the keys (i.e., s2 CellIDs) to scan in the inverted index.
+    GeoCol ColumnID
+
+    # Cols is the set of columns produced by the geospatial lookup join. This
+    # set can contain columns from the input and columns from the index. Any
+    # columns not in the input are retrieved from the index.
+    Cols ColSet
     _ JoinPrivate
 }
 
@@ -340,12 +365,11 @@ define LookupJoinPrivate {
 # MergeOn is a scalar which contains the ON condition and merge-join ordering
 # information; see the MergeOn scalar operator.
 # It can be any type of join (identified in the MergeJoinPrivate field).
-[Relational, Telemetry]
+[Relational]
 define MergeJoin {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ MergeJoinPrivate
 }
 
@@ -363,16 +387,15 @@ define MergeJoinPrivate {
     # Examples of valid settings for abc JOIN def ON a=d,b=e:
     #   LeftEq: a+,b+   RightEq: d+,e+
     #   LeftEq: b-,a+   RightEq: e-,d+
-    LeftEq  Ordering
+    LeftEq Ordering
     RightEq Ordering
 
     # LeftOrdering and RightOrdering are "simplified" versions of LeftEq/RightEq,
     # taking into account the functional dependencies of each side. We need both
     # versions because we need to configure execution with specific equality
     # columns and orderings.
-    LeftOrdering  OrderingChoice
+    LeftOrdering OrderingChoice
     RightOrdering OrderingChoice
-
     _ JoinPrivate
 }
 
@@ -384,8 +407,7 @@ define MergeJoinPrivate {
 # TODO(itsbilal): Add support for representing multi-way zigzag joins.
 [Relational, Telemetry]
 define ZigzagJoin {
-    On   FiltersExpr
-
+    On FiltersExpr
     _ ZigzagJoinPrivate
 
     # leftProps and rightProps cache relational properties corresponding to an
@@ -438,37 +460,33 @@ define ZigzagJoinPrivate {
 # left input.
 [Relational, Join, JoinApply, Telemetry]
 define InnerJoinApply {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
 [Relational, Join, JoinApply, Telemetry]
 define LeftJoinApply {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
 [Relational, Join, JoinApply, Telemetry]
 define SemiJoinApply {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
 [Relational, Join, JoinApply, Telemetry]
 define AntiJoinApply {
-    Left  RelExpr
+    Left RelExpr
     Right RelExpr
-    On    FiltersExpr
-
+    On FiltersExpr
     _ JoinPrivate
 }
 
@@ -499,15 +517,15 @@ define AntiJoinApply {
 # interesting orderings.
 [Relational, Grouping, Telemetry]
 define GroupBy {
-    Input        RelExpr
+    Input RelExpr
     Aggregations AggregationsExpr
-
     _ GroupingPrivate
 }
 
 # GroupingPrivate is shared between the grouping-related operators: GroupBy
-# ScalarGroupBy, DistinctOn, and UpsertDistinctOn. This allows the operators to
-# be treated polymorphically.
+# ScalarGroupBy, DistinctOn, EnsureDistinctOn, UpsertDistinctOn, and
+# EnsureUpsertDistinctOn. This allows the operators to be treated
+# polymorphically.
 [Private]
 define GroupingPrivate {
     # GroupingCols partitions the GroupBy input rows into aggregation groups.
@@ -528,9 +546,16 @@ define GroupingPrivate {
     # orderings that contain grouping columns.
     Ordering OrderingChoice
 
-    # ErrorOnDup, if true, triggers an error if any aggregation group contains
-    # more than one row. This can only be true for the UpsertDistinctOn operator.
-    ErrorOnDup bool
+    # NullsAreDistinct specifies the null behavior of the grouping operator. If
+    # true, the operator considers nulls to be distinct for grouping purposes.
+    # NullsAreDistinct should only be true for UpsertDistinctOn and
+    # EnsureUpsertDistinctOn.
+    NullsAreDistinct bool
+
+    # ErrorOnDup, if non-empty, triggers an error with the given text if any
+    # aggregation group contains more than one row. This can only take on a
+    # value for the EnsureDistinctOn and EnsureUpsertDistinctOn operators.
+    ErrorOnDup string
 }
 
 # ScalarGroupBy computes aggregate functions over the complete set of input
@@ -547,9 +572,8 @@ define GroupingPrivate {
 # empty.
 [Relational, Grouping, Telemetry]
 define ScalarGroupBy {
-    Input        RelExpr
+    Input RelExpr
     Aggregations AggregationsExpr
-
     _ GroupingPrivate
 }
 
@@ -589,32 +613,65 @@ define ScalarGroupBy {
 # ConstAgg.
 [Relational, Grouping, Telemetry]
 define DistinctOn {
-    Input        RelExpr
+    Input RelExpr
     Aggregations AggregationsExpr
+    _ GroupingPrivate
+}
 
+# EnsureDistinctOn is a variation on DistinctOn that is only used to replace a
+# Max1Row operator in a decorrelation attempt. It raises an error if any
+# distinct grouping contains more than one row. Or in other words, it "ensures"
+# that the input is distinct on the grouping columns.
+#
+# EnsureDistinctOn is used when nulls are not considered distinct for grouping
+# purposes and an error should be raised when duplicates are detected.
+#
+# Rules should only "push through" or eliminate an EnsureDistinctOn if they
+# preserve the expected error behavior. For example, it would be invalid to
+# push a Select filter into an EnsureDistinctOn, as it might eliminate rows
+# that would otherwise trigger the EnsureDistinctOn error.
+[Relational, Grouping, Telemetry]
+define EnsureDistinctOn {
+    Input RelExpr
+    Aggregations AggregationsExpr
     _ GroupingPrivate
 }
 
 # UpsertDistinctOn is a variation on DistinctOn that is only used with UPSERT
-# and INSERT..ON CONFLICT statements. It differs from DistinctOn in two ways:
+# and INSERT..ON CONFLICT statements. Unlike DistinctOn, UpsertDistinctOn treats
+# NULL values as not equal to one another for purposes of grouping. Two rows
+# having a NULL-valued grouping column will be placed in different groups. This
+# differs from DistinctOn behavior, where the two rows would be grouped
+# together. This behavior difference reflects SQL semantics, in which a unique
+# index key still allows multiple NULL values.
 #
-#   1. Null behavior: UpsertDistinctOn treats NULL values as not equal to one
-#      another for purposes of grouping. Two rows having a NULL-valued grouping
-#      column will be placed in different groups. This differs from DistinctOn
-#      behavior, where the two rows would be grouped together. This behavior
-#      difference reflects SQL semantics, in which a unique index key still
-#      allows multiple NULL values.
-#
-#   2. Duplicate behavior: UpsertDistinctOn raises an error if any distinct
-#      grouping contains more than one row. It has "input must be distinct"
-#      semantics rather than "make the input distinct" semantics. This is used
-#      to ensure that no row will be updated more than once.
-#
+# UpsertDistinctOn is used when nulls are considered distinct for grouping
+# purposes and duplicates should be filtered out without raising an error.
 [Relational, Grouping, Telemetry]
 define UpsertDistinctOn {
-    Input        RelExpr
+    Input RelExpr
     Aggregations AggregationsExpr
+    _ GroupingPrivate
+}
 
+# EnsureUpsertDistinctOn is a variation on UpsertDistinctOn that is only used
+# with UPSERT and INSERT..ON CONFLICT statements. Like UpsertDistinctOn,
+# EnsureUpsertDistinctOn treats NULL values as not equal to one another for
+# purposes of grouping. Unlike UpsertDistinctOn, it raises an error if any
+# distinct grouping contains more than one row. Or in other words, it "ensures"
+# that the input is distinct on the grouping columns.
+#
+# EnsureUpsertDistinctOn is used when nulls are considered distinct for grouping
+# purposes and an error should be raised when duplicates are detected.
+#
+# Rules should only "push through" or eliminate an EnsureUpsertDistinctOn if
+# they preserve the expected error behavior. For example, it would be invalid to
+# push a Select filter into an EnsureUpsertDistinctOn, as it might eliminate
+# rows that would otherwise trigger the EnsureUpsertDistinctOn error.
+[Relational, Grouping, Telemetry]
+define EnsureUpsertDistinctOn {
+    Input RelExpr
+    Aggregations AggregationsExpr
     _ GroupingPrivate
 }
 
@@ -625,9 +682,8 @@ define UpsertDistinctOn {
 # details.
 [Relational, Set]
 define Union {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -655,9 +711,9 @@ define Union {
 # must have matching types.
 [Private]
 define SetPrivate {
-    LeftCols  ColList
+    LeftCols ColList
     RightCols ColList
-    OutCols   ColList
+    OutCols ColList
 }
 
 # Intersect is an operator used to perform an intersection between the Left
@@ -669,9 +725,8 @@ define SetPrivate {
 # details.
 [Relational, Set]
 define Intersect {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -682,9 +737,8 @@ define Intersect {
 # with the output columns. See the comment above SetPrivate for more details.
 [Relational, Set]
 define Except {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -707,9 +761,8 @@ define Except {
 # details.
 [Relational, Set]
 define UnionAll {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -734,9 +787,8 @@ define UnionAll {
 # details.
 [Relational, Set]
 define IntersectAll {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -760,9 +812,8 @@ define IntersectAll {
 # details.
 [Relational, Set]
 define ExceptAll {
-    Left    RelExpr
-    Right   RelExpr
-
+    Left RelExpr
+    Right RelExpr
     _ SetPrivate
 }
 
@@ -775,7 +826,6 @@ define ExceptAll {
 define Limit {
     Input RelExpr
     Limit ScalarExpr
-
     Ordering OrderingChoice
 }
 
@@ -783,9 +833,8 @@ define Limit {
 # conjunction with Limit.
 [Relational]
 define Offset {
-    Input  RelExpr
+    Input RelExpr
     Offset ScalarExpr
-
     Ordering OrderingChoice
 }
 
@@ -797,7 +846,6 @@ define Offset {
 [Relational]
 define Max1Row {
     Input RelExpr
-
     ErrorText string
 }
 
@@ -806,7 +854,6 @@ define Max1Row {
 [Relational]
 define Ordinality {
     Input RelExpr
-
     _ OrdinalityPrivate
 }
 
@@ -837,7 +884,7 @@ define OrdinalityPrivate {
 [Relational, Telemetry]
 define ProjectSet {
     Input RelExpr
-    Zip   ZipExpr
+    Zip ZipExpr
 }
 
 # Window represents a window function. Window functions are operators which
@@ -853,11 +900,10 @@ define ProjectSet {
 # cumulative sum, or something else.
 [Relational]
 define Window {
-    Input    RelExpr
+    Input RelExpr
 
     # Windows is the set of window functions to be computed for this operator.
     Windows WindowsExpr
-
     _ WindowPrivate
 }
 
@@ -886,8 +932,7 @@ define WindowPrivate {
 [Relational]
 define With {
     Binding RelExpr
-    Main    RelExpr
-
+    Main RelExpr
     _ WithPrivate
 }
 
@@ -898,6 +943,10 @@ define WithPrivate {
     # OriginalExpr contains the original CTE expression (so that we can display
     # it in the EXPLAIN plan).
     OriginalExpr Statement
+
+    # Mtr is used to specify whether or not to override the optimizer's
+    # default decision for materializing or not materializing tables.
+    Mtr MaterializeClause
 
     # Name is used to identify the with for debugging purposes.
     Name string
@@ -951,7 +1000,6 @@ define WithScanPrivate {
 define RecursiveCTE {
     Initial RelExpr
     Recursive RelExpr
-
     _ RecursiveCTEPrivate
 }
 

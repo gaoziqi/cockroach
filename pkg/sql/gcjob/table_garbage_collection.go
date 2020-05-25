@@ -45,7 +45,7 @@ func gcTables(
 		var table *sqlbase.TableDescriptor
 		if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			var err error
-			table, err = sqlbase.GetTableDescFromID(ctx, txn, droppedTable.ID)
+			table, err = sqlbase.GetTableDescFromID(ctx, txn, execCfg.Codec, droppedTable.ID)
 			return err
 		}); err != nil {
 			return false, errors.Wrapf(err, "fetching table %d", droppedTable.ID)
@@ -57,12 +57,12 @@ func gcTables(
 		}
 
 		// First, delete all the table data.
-		if err := clearTableData(ctx, execCfg.DB, execCfg.DistSender, table); err != nil {
+		if err := clearTableData(ctx, execCfg.DB, execCfg.DistSender, execCfg.Codec, table); err != nil {
 			return false, errors.Wrapf(err, "clearing data for table %d", table.ID)
 		}
 
 		// Finished deleting all the table data, now delete the table meta data.
-		if err := dropTableDesc(ctx, execCfg.DB, table); err != nil {
+		if err := dropTableDesc(ctx, execCfg.DB, execCfg.Codec, table); err != nil {
 			return false, errors.Wrapf(err, "dropping table descriptor for table %d", table.ID)
 		}
 
@@ -75,7 +75,11 @@ func gcTables(
 
 // clearTableData deletes all of the data in the specified table.
 func clearTableData(
-	ctx context.Context, db *kv.DB, distSender *kvcoord.DistSender, table *sqlbase.TableDescriptor,
+	ctx context.Context,
+	db *kv.DB,
+	distSender *kvcoord.DistSender,
+	codec keys.SQLCodec,
+	table *sqlbase.TableDescriptor,
 ) error {
 	// If DropTime isn't set, assume this drop request is from a version
 	// 1.1 server and invoke legacy code that uses DeleteRange and range GC.
@@ -84,11 +88,11 @@ func clearTableData(
 	// cleaned up.
 	if table.DropTime == 0 || table.IsInterleaved() {
 		log.Infof(ctx, "clearing data in chunks for table %d", table.ID)
-		return sql.ClearTableDataInChunks(ctx, table, db, false /* traceKV */)
+		return sql.ClearTableDataInChunks(ctx, db, codec, table, false /* traceKV */)
 	}
 	log.Infof(ctx, "clearing data for table %d", table.ID)
 
-	tableKey := roachpb.RKey(keys.MakeTablePrefix(uint32(table.ID)))
+	tableKey := roachpb.RKey(codec.TablePrefix(uint32(table.ID)))
 	tableSpan := roachpb.RSpan{Key: tableKey, EndKey: tableKey.PrefixEnd()}
 
 	// ClearRange requests lays down RocksDB range deletion tombstones that have
@@ -122,7 +126,7 @@ func clearTableData(
 
 	for ri.Seek(ctx, tableSpan.Key, kvcoord.Ascending); ; ri.Next(ctx) {
 		if !ri.Valid() {
-			return ri.Error().GoError()
+			return ri.Error()
 		}
 
 		if n++; n >= batchSize || !ri.NeedAnother(tableSpan) {

@@ -51,6 +51,8 @@ func buildOpaque(
 		plan, err = p.AlterIndex(ctx, n)
 	case *tree.AlterTable:
 		plan, err = p.AlterTable(ctx, n)
+	case *tree.AlterType:
+		plan, err = p.AlterType(ctx, n)
 	case *tree.AlterRole:
 		plan, err = p.AlterRole(ctx, n)
 	case *tree.AlterSequence:
@@ -69,6 +71,8 @@ func buildOpaque(
 		plan, err = p.CreateIndex(ctx, n)
 	case *tree.CreateSchema:
 		plan, err = p.CreateSchema(ctx, n)
+	case *tree.CreateType:
+		plan, err = p.CreateType(ctx, n)
 	case *tree.CreateRole:
 		plan, err = p.CreateRole(ctx, n)
 	case *tree.CreateSequence:
@@ -87,6 +91,8 @@ func buildOpaque(
 		plan, err = p.DropRole(ctx, n)
 	case *tree.DropTable:
 		plan, err = p.DropTable(ctx, n)
+	case *tree.DropType:
+		plan, err = p.DropType(ctx, n)
 	case *tree.DropView:
 		plan, err = p.DropView(ctx, n)
 	case *tree.DropSequence:
@@ -160,6 +166,7 @@ func init() {
 	for _, stmt := range []tree.Statement{
 		&tree.AlterIndex{},
 		&tree.AlterTable{},
+		&tree.AlterType{},
 		&tree.AlterSequence{},
 		&tree.AlterRole{},
 		&tree.CommentOnColumn{},
@@ -171,12 +178,14 @@ func init() {
 		&tree.CreateSchema{},
 		&tree.CreateSequence{},
 		&tree.CreateStats{},
+		&tree.CreateType{},
 		&tree.CreateRole{},
 		&tree.Deallocate{},
 		&tree.Discard{},
 		&tree.DropDatabase{},
 		&tree.DropIndex{},
 		&tree.DropTable{},
+		&tree.DropType{},
 		&tree.DropView{},
 		&tree.DropRole{},
 		&tree.DropSequence{},

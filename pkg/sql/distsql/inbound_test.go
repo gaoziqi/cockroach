@@ -34,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -56,8 +56,6 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	ni := base.NodeIDContainer{}
-	ni.Set(ctx, 1)
 	st := cluster.MakeTestingClusterSettings()
 	mt := execinfra.MakeDistSQLMetrics(time.Hour /* histogramWindow */)
 	srv := NewServer(
@@ -66,7 +64,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 			Settings: st,
 			Stopper:  stopper,
 			Metrics:  &mt,
-			NodeID:   &ni,
+			NodeID:   base.TestingIDContainer,
 		},
 	)
 

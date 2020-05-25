@@ -15,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // AlterTable represents an ALTER TABLE statement.
@@ -70,7 +69,6 @@ func (*AlterTableDropStored) alterTableCmd()         {}
 func (*AlterTableSetNotNull) alterTableCmd()         {}
 func (*AlterTableRenameColumn) alterTableCmd()       {}
 func (*AlterTableRenameConstraint) alterTableCmd()   {}
-func (*AlterTableRenameTable) alterTableCmd()        {}
 func (*AlterTableSetAudit) alterTableCmd()           {}
 func (*AlterTableSetDefault) alterTableCmd()         {}
 func (*AlterTableValidateConstraint) alterTableCmd() {}
@@ -87,7 +85,6 @@ var _ AlterTableCmd = &AlterTableDropStored{}
 var _ AlterTableCmd = &AlterTableSetNotNull{}
 var _ AlterTableCmd = &AlterTableRenameColumn{}
 var _ AlterTableCmd = &AlterTableRenameConstraint{}
-var _ AlterTableCmd = &AlterTableRenameTable{}
 var _ AlterTableCmd = &AlterTableSetAudit{}
 var _ AlterTableCmd = &AlterTableSetDefault{}
 var _ AlterTableCmd = &AlterTableValidateConstraint{}
@@ -161,6 +158,26 @@ func (node *AlterTable) HoistAddColumnConstraints() {
 				)
 			}
 			d.CheckExprs = nil
+			if d.HasFKConstraint() {
+				var targetCol NameList
+				if d.References.Col != "" {
+					targetCol = append(targetCol, d.References.Col)
+				}
+				fk := &ForeignKeyConstraintTableDef{
+					Table:    *d.References.Table,
+					FromCols: NameList{d.Name},
+					ToCols:   targetCol,
+					Name:     d.References.ConstraintName,
+					Actions:  d.References.Actions,
+					Match:    d.References.Match,
+				}
+				constraint := &AlterTableAddConstraint{
+					ConstraintDef:      fk,
+					ValidationBehavior: ValidationDefault,
+				}
+				normalizedCmds = append(normalizedCmds, constraint)
+				d.References.Table = nil
+			}
 		}
 	}
 	node.Cmds = normalizedCmds
@@ -200,7 +217,7 @@ func (node *AlterTableAddConstraint) Format(ctx *FmtCtx) {
 type AlterTableAlterColumnType struct {
 	Collation string
 	Column    Name
-	ToType    *types.T
+	ToType    ResolvableTypeReference
 	Using     Expr
 }
 
@@ -317,22 +334,6 @@ func (node *AlterTableValidateConstraint) TelemetryCounter() telemetry.Counter {
 func (node *AlterTableValidateConstraint) Format(ctx *FmtCtx) {
 	ctx.WriteString(" VALIDATE CONSTRAINT ")
 	ctx.FormatNode(&node.Constraint)
-}
-
-// AlterTableRenameTable represents an ALTE RTABLE RENAME TO command.
-type AlterTableRenameTable struct {
-	NewName TableName
-}
-
-// TelemetryCounter implements the AlterTableCmd interface.
-func (node *AlterTableRenameTable) TelemetryCounter() telemetry.Counter {
-	return sqltelemetry.SchemaChangeAlterCounterWithExtra("table", "rename_table")
-}
-
-// Format implements the NodeFormatter interface.
-func (node *AlterTableRenameTable) Format(ctx *FmtCtx) {
-	ctx.WriteString(" RENAME TO ")
-	ctx.FormatNode(&node.NewName)
 }
 
 // AlterTableRenameColumn represents an ALTER TABLE RENAME [COLUMN] command.

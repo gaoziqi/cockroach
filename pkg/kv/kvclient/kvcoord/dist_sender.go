@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -32,9 +33,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -98,6 +100,12 @@ var (
 		Measurement: "Range Lookups",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaDistSenderSlowRPCs = metric.Metadata{
+		Name:        "requests.slow.distsender",
+		Help:        "Number of RPCs stuck or retrying for a long time",
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // CanSendToFollower is used by the DistSender to determine if it needs to look
@@ -148,6 +156,7 @@ type DistSenderMetrics struct {
 	NotLeaseHolderErrCount  *metric.Counter
 	InLeaseTransferBackoffs *metric.Counter
 	RangeLookups            *metric.Counter
+	SlowRPCs                *metric.Gauge
 }
 
 func makeDistSenderMetrics() DistSenderMetrics {
@@ -162,6 +171,7 @@ func makeDistSenderMetrics() DistSenderMetrics {
 		NotLeaseHolderErrCount:  metric.NewCounter(metaDistSenderNotLeaseHolderErrCount),
 		InLeaseTransferBackoffs: metric.NewCounter(metaDistSenderInLeaseTransferBackoffsCount),
 		RangeLookups:            metric.NewCounter(metaDistSenderRangeLookups),
+		SlowRPCs:                metric.NewGauge(metaDistSenderSlowRPCs),
 	}
 }
 
@@ -210,9 +220,6 @@ type DistSender struct {
 	// It is copied out of the rpcContext at construction time and used in
 	// testing.
 	clusterID *base.ClusterIDContainer
-	// rangeIteratorGen returns a range iterator bound to the DistSender.
-	// Used to avoid allocations.
-	rangeIteratorGen RangeIteratorGen
 
 	// disableFirstRangeUpdates disables updates of the first range via
 	// gossip. Used by tests which want finer control of the contents of the
@@ -277,7 +284,7 @@ func NewDistSender(cfg DistSenderConfig, g *gossip.Gossip) *DistSender {
 	getRangeDescCacheSize := func() int64 {
 		return rangeDescriptorCacheSize.Get(&ds.st.SV)
 	}
-	ds.rangeCache = NewRangeDescriptorCache(ds.st, rdb, getRangeDescCacheSize)
+	ds.rangeCache = NewRangeDescriptorCache(ds.st, rdb, getRangeDescCacheSize, cfg.RPCContext.Stopper)
 	ds.leaseHolderCache = NewLeaseHolderCache(getRangeDescCacheSize)
 	if tf := cfg.TestingKnobs.TransportFactory; tf != nil {
 		ds.transportFactory = tf
@@ -303,7 +310,6 @@ func NewDistSender(cfg DistSenderConfig, g *gossip.Gossip) *DistSender {
 		ds.asyncSenderSem.UpdateCapacity(uint64(senderConcurrencyLimit.Get(&cfg.Settings.SV)))
 	})
 	ds.rpcContext.Stopper.AddCloser(ds.asyncSenderSem.Closer("stopper"))
-	ds.rangeIteratorGen = func() *RangeIterator { return NewRangeIterator(ds) }
 
 	if g != nil {
 		ctx := ds.AnnotateCtx(context.Background())
@@ -482,7 +488,7 @@ func (ds *DistSender) CountRanges(ctx context.Context, rs roachpb.RSpan) (int64,
 			break
 		}
 	}
-	return count, ri.Error().GoError()
+	return count, ri.Error()
 }
 
 // getDescriptor looks up the range descriptor to use for a query of
@@ -498,6 +504,11 @@ func (ds *DistSender) CountRanges(ctx context.Context, rs roachpb.RSpan) (int64,
 // start its query is returned first. Next returned is an EvictionToken. In
 // case the descriptor is discovered stale, the returned EvictionToken's evict
 // method should be called; it evicts the cache appropriately.
+//
+// If useReverseScan is set and descKey is the boundary between the two ranges,
+// the left range will be returned (even though descKey is actually contained on
+// the right range). This is useful for ReverseScans, which call this method
+// with their exclusive EndKey.
 func (ds *DistSender) getDescriptor(
 	ctx context.Context, descKey roachpb.RKey, evictToken *EvictionToken, useReverseScan bool,
 ) (*roachpb.RangeDescriptor, *EvictionToken, error) {
@@ -506,6 +517,19 @@ func (ds *DistSender) getDescriptor(
 	)
 	if err != nil {
 		return nil, returnToken, err
+	}
+
+	// Sanity check: the descriptor we're about to return must include the key
+	// we're interested in.
+	{
+		containsFn := (*roachpb.RangeDescriptor).ContainsKey
+		if useReverseScan {
+			containsFn = (*roachpb.RangeDescriptor).ContainsKeyInverted
+		}
+		if !containsFn(desc, descKey) {
+			log.Fatalf(ctx, "programming error: range resolution returning non-matching descriptor: "+
+				"desc: %s, key: %s, reverse: %t", desc, descKey, log.Safe(useReverseScan))
+		}
 	}
 
 	return desc, returnToken, nil
@@ -541,7 +565,7 @@ func (ds *DistSender) sendSingleRange(
 	class := rpc.ConnectionClassForKey(desc.RSpan().Key)
 	br, err := ds.sendRPC(ctx, ba, class, desc.RangeID, replicas, cachedLeaseHolder, withCommit)
 	if err != nil {
-		log.VErrEvent(ctx, 2, err.Error())
+		log.VErrEventf(ctx, 2, "%v", err)
 		return nil, roachpb.NewError(err)
 	}
 
@@ -586,22 +610,19 @@ func (ds *DistSender) initAndVerifyBatch(
 		for _, req := range ba.Requests {
 			inner := req.GetInner()
 			switch inner.(type) {
-			case *roachpb.ScanRequest, *roachpb.DeleteRangeRequest:
-				// Accepted range requests. All other range requests are still
-				// not supported. Note that ReverseScanRequest is _not_ handled here.
-				// TODO(vivek): don't enumerate all range requests.
+			case *roachpb.ScanRequest, *roachpb.ResolveIntentRangeRequest,
+				*roachpb.DeleteRangeRequest, *roachpb.RevertRangeRequest:
+				// Accepted forward range requests.
 				if isReverse {
 					return roachpb.NewErrorf("batch with limit contains both forward and reverse scans")
 				}
 
-			case *roachpb.QueryIntentRequest, *roachpb.ResolveIntentRangeRequest:
-				continue
+			case *roachpb.ReverseScanRequest:
+				// Accepted reverse range requests.
 
-			case *roachpb.EndTxnRequest, *roachpb.ReverseScanRequest:
-				continue
+			case *roachpb.QueryIntentRequest, *roachpb.EndTxnRequest:
+				// Accepted point requests that can be in batches with limit.
 
-			case *roachpb.RevertRangeRequest:
-				continue
 			default:
 				return roachpb.NewErrorf("batch with limit contains %T request", inner)
 			}
@@ -1079,7 +1100,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	ri := NewRangeIterator(ds)
 	ri.Seek(ctx, seekKey, scanDir)
 	if !ri.Valid() {
-		return nil, ri.Error()
+		return nil, roachpb.NewError(ri.Error())
 	}
 	// Take the fast path if this batch fits within a single range.
 	if !ri.NeedAnother(rs) {
@@ -1254,8 +1275,21 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 				// passed recursively to further divideAndSendBatchToRanges() calls.
 				if ba.MaxSpanRequestKeys > 0 {
 					if replyResults > ba.MaxSpanRequestKeys {
-						log.Fatalf(ctx, "received %d results, limit was %d",
-							replyResults, ba.MaxSpanRequestKeys)
+						// NOTE: v19.2 and below have a bug where MaxSpanRequestKeys
+						// is not respected by ResolveIntentRangeRequest once the
+						// limit has already been exhausted by the batch. This is
+						// mostly harmless (or at least, the damage has already been
+						// done by this point and resulted in a large Raft entry)
+						// and has been fixed in v20.1+, so don't bother hitting the
+						// assertion.
+						//
+						// TODO(nvanbenschoten): remove this hack in v20.2.
+						if _, ok := ba.GetArg(roachpb.ResolveIntentRange); ok {
+							replyResults = ba.MaxSpanRequestKeys
+						} else {
+							log.Fatalf(ctx, "received %d results, limit was %d",
+								replyResults, ba.MaxSpanRequestKeys)
+						}
 					}
 					ba.MaxSpanRequestKeys -= replyResults
 					// Exiting; any missing responses will be filled in via defer().
@@ -1292,7 +1326,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 
 	// We've exited early. Return the range iterator error.
 	responseCh := make(chan response, 1)
-	responseCh <- response{pErr: ri.Error()}
+	responseCh <- response{pErr: roachpb.NewError(ri.Error())}
 	responseChs = append(responseChs, responseCh)
 	return
 }
@@ -1325,6 +1359,16 @@ func (ds *DistSender) sendPartialBatchAsync(
 		return false
 	}
 	return true
+}
+
+func slowRangeRPCWarningStr(
+	dur time.Duration, attempts int64, desc *roachpb.RangeDescriptor, pErr *roachpb.Error,
+) string {
+	return fmt.Sprintf("have been waiting %.2fs (%d attempts) for RPC to %s: %s", dur.Seconds(), attempts, desc, pErr)
+}
+
+func slowRangeRPCReturnWarningStr(dur time.Duration, attempts int64) string {
+	return fmt.Sprintf("slow RPC finished after %.2fs (%d attempts)", dur.Seconds(), attempts)
 }
 
 // sendPartialBatch sends the supplied batch to the range specified by
@@ -1379,7 +1423,9 @@ func (ds *DistSender) sendPartialBatch(
 	}
 
 	// Start a retry loop for sending the batch to the range.
+	tBegin, attempts := timeutil.Now(), int64(0) // for slow log message
 	for r := retry.StartWithCtx(ctx, ds.rpcRetryOptions); r.Next(); {
+		attempts++
 		// If we've cleared the descriptor on a send failure, re-lookup.
 		if desc == nil {
 			var descKey roachpb.RKey
@@ -1411,6 +1457,19 @@ func (ds *DistSender) sendPartialBatch(
 			pErr.Index.Index = int32(positions[pErr.Index.Index])
 		}
 
+		const slowDistSenderThreshold = time.Minute
+		if dur := timeutil.Since(tBegin); dur > slowDistSenderThreshold && !tBegin.IsZero() {
+			ds.metrics.SlowRPCs.Inc(1)
+			dur := dur // leak dur to heap only when branch taken
+			log.Warningf(ctx, "slow range RPC: %v",
+				slowRangeRPCWarningStr(dur, attempts, desc, pErr))
+			defer func(tBegin time.Time, attempts int64) {
+				ds.metrics.SlowRPCs.Dec(1)
+				log.Warningf(ctx, "slow RPC response: %v",
+					slowRangeRPCReturnWarningStr(timeutil.Since(tBegin), attempts))
+			}(tBegin, attempts)
+			tBegin = time.Time{} // prevent reentering branch for this RPC
+		}
 		log.VErrEventf(ctx, 2, "reply error %s: %s", ba, pErr)
 
 		// Error handling: If the error indicates that our range
@@ -1423,10 +1482,11 @@ func (ds *DistSender) sendPartialBatch(
 		// to our caller.
 		switch tErr := pErr.GetDetail().(type) {
 		case *roachpb.SendError:
-			// We've tried all the replicas without success. Either
-			// they're all down, or we're using an out-of-date range
-			// descriptor. Invalidate the cache and try again with the new
-			// metadata.
+			// We've tried all the replicas without success. Either they're all down,
+			// or we're using an out-of-date range descriptor. Invalidate the cache
+			// and try again with the new metadata. Re-sending the request is ok even
+			// though it might have succeeded the first time around because of
+			// idempotency.
 			log.VEventf(ctx, 1, "evicting range descriptor on %T and backoff for re-lookup: %+v", tErr, desc)
 			if err := evictToken.Evict(ctx); err != nil {
 				return response{pErr: roachpb.NewError(err)}
@@ -1473,22 +1533,24 @@ func (ds *DistSender) sendPartialBatch(
 	// Propagate error if either the retry closer or context done
 	// channels were closed.
 	if pErr == nil {
-		if pErr = ds.deduceRetryEarlyExitError(ctx); pErr == nil {
+		if err := ds.deduceRetryEarlyExitError(ctx); err == nil {
 			log.Fatal(ctx, "exited retry loop without an error")
+		} else {
+			pErr = roachpb.NewError(err)
 		}
 	}
 
 	return response{pErr: pErr}
 }
 
-func (ds *DistSender) deduceRetryEarlyExitError(ctx context.Context) *roachpb.Error {
+func (ds *DistSender) deduceRetryEarlyExitError(ctx context.Context) error {
 	select {
 	case <-ds.rpcRetryOptions.Closer:
 		// Typically happens during shutdown.
-		return roachpb.NewError(&roachpb.NodeUnavailableError{})
+		return &roachpb.NodeUnavailableError{}
 	case <-ctx.Done():
 		// Happens when the client request is canceled.
-		return roachpb.NewError(errors.Wrap(ctx.Err(), "aborted in distSender"))
+		return errors.Wrap(ctx.Err(), "aborted in distSender")
 	default:
 	}
 	return nil
@@ -1642,17 +1704,53 @@ func (ds *DistSender) sendToReplicas(
 	var ambiguousError error
 	for {
 		if err != nil {
-			// For most connection errors, we cannot tell whether or not
-			// the request may have succeeded on the remote server, so we
-			// set the ambiguous commit flag (exceptions are captured in
-			// the grpcutil.RequestDidNotStart function).
+			// For most connection errors, we cannot tell whether or not the request
+			// may have succeeded on the remote server (exceptions are captured in the
+			// grpcutil.RequestDidNotStart function). We'll retry the request in order
+			// to attempt to eliminate the ambiguity; see below. If there's a commit
+			// in the batch, we track the ambiguity more explicitly by setting
+			// ambiguousError. This serves two purposes:
+			// 1) the higher-level retries in the DistSender will not forget the
+			// ambiguity, like they forget it for non-commit batches. This in turn
+			// will ensure that TxnCoordSender-level retries don't happen across
+			// commits; that'd be bad since requests are not idempotent across
+			// commits.
+			// TODO(andrei): This higher-level does things too bluntly, retrying only
+			// in case of SendError. It should also retry in case of
+			// AmbiguousRetryError as long as it makes sure to not forget about the
+			// ambiguity.
+			// 2) SQL recognizes AmbiguousResultErrors and gives them a special code
+			// (StatementCompletionUnknown).
+			// TODO(andrei): The use of this code is inconsistent because a) the
+			// DistSender tries to only return the code for commits, but it'll happily
+			// forward along AmbiguousResultErrors coming from the replica and b) we
+			// probably should be returning that code for non-commit statements too.
 			//
-			// We retry ambiguous commit batches to avoid returning the
-			// unrecoverable AmbiguousResultError. This is safe because
-			// repeating an already-successfully applied batch is
-			// guaranteed to return an error. If the original attempt merely timed out
-			// or was lost, then the batch will succeed and we can be assured the
-			// commit was applied just once.
+			// We retry requests in order to avoid returning errors (in particular,
+			// AmbiguousResultError). Retrying the batch will either:
+			// a) succeed if the request had not been evaluated the first time.
+			// b) succeed if the request also succeeded the first time, but is
+			//    idempotent (i.e. it is internal to a txn, without a commit in the
+			//    batch).
+			// c) fail if it succeeded the first time and the request is not
+			//    idempotent. In the case of EndTxn requests, this is ensured by the
+			//    tombstone keys in the timestamp cache. The retry failing does not
+			//    prove that the request did not succeed the first time around, so we
+			//    can't claim success (and even if we could claim success, we still
+			//    wouldn't have the complete result of the successful evaluation).
+			//
+			// Case a) is great - the retry made the request succeed. Case b) is also
+			// good; due to idempotency we managed to swallow a communication error.
+			// Case c) is not great - we'll end up returning an error even though the
+			// request might have succeeded (an AmbiguousResultError if withCommit is
+			// set).
+			//
+			// TODO(andrei): Case c) is broken for non-transactional requests: nothing
+			// prevents them from double evaluation. This can result in, for example,
+			// an increment applying twice, or more subtle problems like a blind write
+			// evaluating twice, overwriting another unrelated write that fell
+			// in-between.
+			//
 			if withCommit && !grpcutil.RequestDidNotStart(err) {
 				ambiguousError = err
 			}
@@ -1756,10 +1854,10 @@ func (ds *DistSender) sendToReplicas(
 
 		// Has the caller given up?
 		if ctx.Err() != nil {
-			errMsg := fmt.Sprintf("context done during DistSender.Send: %s", ctx.Err())
-			log.Eventf(ctx, errMsg)
+			reportedErr := errors.Wrap(ctx.Err(), "context done during DistSender.Send")
+			log.Eventf(ctx, "%v", reportedErr)
 			if ambiguousError != nil {
-				return nil, roachpb.NewAmbiguousResultError(errMsg)
+				return nil, roachpb.NewAmbiguousResultError(reportedErr.Error())
 			}
 			// Don't consider this a SendError, because SendErrors indicate that we
 			// were unable to reach a replica that could serve the request, and they
@@ -1784,7 +1882,7 @@ func (ds *DistSender) sendToReplicas(
 
 		ds.metrics.NextReplicaErrCount.Inc(1)
 		curReplica = transport.NextReplica()
-		log.VEventf(ctx, 2, "error: %v %v; trying next peer %s", br, err, curReplica)
+		log.VEventf(ctx, 2, "error: %v %v; trying next peer %s", br, err, curReplica.String())
 		br, err = transport.SendNext(ctx, ba)
 	}
 }

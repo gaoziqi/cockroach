@@ -19,6 +19,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -29,8 +31,7 @@ import (
 )
 
 const (
-	informationSchemaName = "information_schema"
-	pgCatalogName         = sessiondata.PgCatalogName
+	pgCatalogName = sessiondata.PgCatalogName
 )
 
 var pgCatalogNameDString = tree.NewDString(pgCatalogName)
@@ -38,7 +39,7 @@ var pgCatalogNameDString = tree.NewDString(pgCatalogName)
 // informationSchema lists all the table definitions for
 // information_schema.
 var informationSchema = virtualSchema{
-	name: informationSchemaName,
+	name: sessiondata.InformationSchemaName,
 	allTableNames: buildStringSet(
 		// Generated with:
 		// select distinct '"'||table_name||'",' from information_schema.tables
@@ -316,7 +317,7 @@ https://www.postgresql.org/docs/9.5/infoschema-check-constraints.html`,
 				// uses the format <namespace_oid>_<table_oid>_<col_idx>_not_null.
 				// We might as well do the same.
 				conNameStr := tree.NewDString(fmt.Sprintf(
-					"%s_%s_%d_not_null", h.NamespaceOid(db, scName), defaultOid(table.ID), colNum,
+					"%s_%s_%d_not_null", h.NamespaceOid(db, scName), tableOid(table.ID), colNum,
 				))
 				chkExprStr := tree.NewDString(fmt.Sprintf(
 					"%s IS NOT NULL", column.Name,
@@ -387,20 +388,20 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 					collationName = tree.NewDString(locale)
 				}
 				return addRow(
-					dbNameStr,                                            // table_catalog
-					scNameStr,                                            // table_schema
-					tree.NewDString(table.Name),                          // table_name
-					tree.NewDString(column.Name),                         // column_name
-					tree.NewDInt(tree.DInt(column.ID)),                   // ordinal_position
+					dbNameStr,                    // table_catalog
+					scNameStr,                    // table_schema
+					tree.NewDString(table.Name),  // table_name
+					tree.NewDString(column.Name), // column_name
+					tree.NewDInt(tree.DInt(column.GetLogicalColumnID())), // ordinal_position
 					dStringPtrOrNull(column.DefaultExpr),                 // column_default
 					yesOrNoDatum(column.Nullable),                        // is_nullable
 					tree.NewDString(column.Type.InformationSchemaName()), // data_type
-					characterMaximumLength(&column.Type),                 // character_maximum_length
-					characterOctetLength(&column.Type),                   // character_octet_length
-					numericPrecision(&column.Type),                       // numeric_precision
-					numericPrecisionRadix(&column.Type),                  // numeric_precision_radix
-					numericScale(&column.Type),                           // numeric_scale
-					datetimePrecision(&column.Type),                      // datetime_precision
+					characterMaximumLength(column.Type),                  // character_maximum_length
+					characterOctetLength(column.Type),                    // character_octet_length
+					numericPrecision(column.Type),                        // numeric_precision
+					numericPrecisionRadix(column.Type),                   // numeric_precision_radix
+					numericScale(column.Type),                            // numeric_scale
+					datetimePrecision(column.Type),                       // datetime_precision
 					tree.DNull,                                           // interval_type
 					tree.DNull,                                           // interval_precision
 					tree.DNull,                                           // character_set_catalog
@@ -964,16 +965,17 @@ var informationSchemaSchemataTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-schemata.html`,
 	schema: vtable.InformationSchemaSchemata,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachDatabaseDesc(ctx, p, dbContext, func(db *sqlbase.DatabaseDescriptor) error {
-			return forEachSchemaName(ctx, p, db, func(sc string) error {
-				return addRow(
-					tree.NewDString(db.Name), // catalog_name
-					tree.NewDString(sc),      // schema_name
-					tree.DNull,               // default_character_set_name
-					tree.DNull,               // sql_path
-				)
+		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
+			func(db *sqlbase.DatabaseDescriptor) error {
+				return forEachSchemaName(ctx, p, db, func(sc string) error {
+					return addRow(
+						tree.NewDString(db.Name), // catalog_name
+						tree.NewDString(sc),      // schema_name
+						tree.DNull,               // default_character_set_name
+						tree.DNull,               // sql_path
+					)
+				})
 			})
-		})
 	},
 }
 
@@ -990,30 +992,31 @@ CREATE TABLE information_schema.schema_privileges (
 	IS_GRANTABLE    STRING
 )`,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachDatabaseDesc(ctx, p, dbContext, func(db *sqlbase.DatabaseDescriptor) error {
-			return forEachSchemaName(ctx, p, db, func(scName string) error {
-				privs := db.Privileges.Show()
-				dbNameStr := tree.NewDString(db.Name)
-				scNameStr := tree.NewDString(scName)
-				// TODO(knz): This should filter for the current user, see
-				// https://github.com/cockroachdb/cockroach/issues/35572
-				for _, u := range privs {
-					userNameStr := tree.NewDString(u.User)
-					for _, priv := range u.Privileges {
-						if err := addRow(
-							userNameStr,           // grantee
-							dbNameStr,             // table_catalog
-							scNameStr,             // table_schema
-							tree.NewDString(priv), // privilege_type
-							tree.DNull,            // is_grantable
-						); err != nil {
-							return err
+		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
+			func(db *sqlbase.DatabaseDescriptor) error {
+				return forEachSchemaName(ctx, p, db, func(scName string) error {
+					privs := db.Privileges.Show()
+					dbNameStr := tree.NewDString(db.Name)
+					scNameStr := tree.NewDString(scName)
+					// TODO(knz): This should filter for the current user, see
+					// https://github.com/cockroachdb/cockroach/issues/35572
+					for _, u := range privs {
+						userNameStr := tree.NewDString(u.User)
+						for _, priv := range u.Privileges {
+							if err := addRow(
+								userNameStr,           // grantee
+								dbNameStr,             // table_catalog
+								scNameStr,             // table_schema
+								tree.NewDString(priv), // privilege_type
+								tree.DNull,            // is_grantable
+							); err != nil {
+								return err
+							}
 						}
 					}
-				}
-				return nil
+					return nil
+				})
 			})
-		})
 	},
 }
 
@@ -1237,7 +1240,7 @@ CREATE TABLE information_schema.table_constraints (
 					colNum++
 					// NOT NULL column constraints are implemented as a CHECK in postgres.
 					conNameStr := tree.NewDString(fmt.Sprintf(
-						"%s_%s_%d_not_null", h.NamespaceOid(db, scName), defaultOid(table.ID), colNum,
+						"%s_%s_%d_not_null", h.NamespaceOid(db, scName), tableOid(table.ID), colNum,
 					))
 					if !col.Nullable {
 						if err := addRow(
@@ -1273,23 +1276,24 @@ CREATE TABLE information_schema.user_privileges (
 	IS_GRANTABLE   STRING
 )`,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachDatabaseDesc(ctx, p, dbContext, func(dbDesc *DatabaseDescriptor) error {
-			dbNameStr := tree.NewDString(dbDesc.Name)
-			for _, u := range []string{security.RootUser, sqlbase.AdminRole} {
-				grantee := tree.NewDString(u)
-				for _, p := range privilege.List(privilege.ByValue[:]).SortedNames() {
-					if err := addRow(
-						grantee,            // grantee
-						dbNameStr,          // table_catalog
-						tree.NewDString(p), // privilege_type
-						tree.DNull,         // is_grantable
-					); err != nil {
-						return err
+		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
+			func(dbDesc *DatabaseDescriptor) error {
+				dbNameStr := tree.NewDString(dbDesc.Name)
+				for _, u := range []string{security.RootUser, sqlbase.AdminRole} {
+					grantee := tree.NewDString(u)
+					for _, p := range privilege.List(privilege.ByValue[:]).SortedNames() {
+						if err := addRow(
+							grantee,            // grantee
+							dbNameStr,          // table_catalog
+							tree.NewDString(p), // privilege_type
+							tree.DNull,         // is_grantable
+						); err != nil {
+							return err
+						}
 					}
 				}
-			}
-			return nil
-		})
+				return nil
+			})
 	},
 }
 
@@ -1356,35 +1360,60 @@ var informationSchemaTablesTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-tables.html`,
 	schema: vtable.InformationSchemaTables,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, dbContext, virtualMany,
-			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
-				if table.IsSequence() {
-					return nil
-				}
-				tableType := tableTypeBaseTable
-				insertable := yesString
-				if table.IsVirtualTable() {
-					tableType = tableTypeSystemView
-					insertable = noString
-				} else if table.IsView() {
-					tableType = tableTypeView
-					insertable = noString
-				} else if table.Temporary {
-					tableType = tableTypeTemporary
-				}
-				dbNameStr := tree.NewDString(db.Name)
-				scNameStr := tree.NewDString(scName)
-				tbNameStr := tree.NewDString(table.Name)
-				return addRow(
-					dbNameStr,                              // table_catalog
-					scNameStr,                              // table_schema
-					tbNameStr,                              // table_name
-					tableType,                              // table_type
-					insertable,                             // is_insertable_into
-					tree.NewDInt(tree.DInt(table.Version)), // version
-				)
-			})
+		return forEachTableDesc(ctx, p, dbContext, virtualMany, addTablesTableRow(addRow))
 	},
+	indexes: []virtualIndex{
+		{
+			populate: func(ctx context.Context, constraint tree.Datum, p *planner, db *DatabaseDescriptor,
+				addRow func(...tree.Datum) error) (bool, error) {
+				// This index is on the TABLE_NAME column.
+				name := tree.MustBeDString(constraint)
+				desc, err := resolver.ResolveExistingTableObject(ctx, p, tree.NewUnqualifiedTableName(tree.Name(name)),
+					tree.ObjectLookupFlags{}, resolver.ResolveAnyDescType)
+				if err != nil || desc == nil {
+					return false, err
+				}
+				schemaName, err := resolver.ResolveSchemaNameByID(ctx, p.txn, p.ExecCfg().Codec, db.ID, desc.GetParentSchemaID())
+				if err != nil {
+					return false, err
+				}
+				return true, addTablesTableRow(addRow)(db, schemaName, desc.TableDesc())
+			},
+		},
+	},
+}
+
+func addTablesTableRow(
+	addRow func(...tree.Datum) error,
+) func(db *sqlbase.DatabaseDescriptor, scName string,
+	table *sqlbase.TableDescriptor) error {
+	return func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
+		if table.IsSequence() {
+			return nil
+		}
+		tableType := tableTypeBaseTable
+		insertable := yesString
+		if table.IsVirtualTable() {
+			tableType = tableTypeSystemView
+			insertable = noString
+		} else if table.IsView() {
+			tableType = tableTypeView
+			insertable = noString
+		} else if table.Temporary {
+			tableType = tableTypeTemporary
+		}
+		dbNameStr := tree.NewDString(db.Name)
+		scNameStr := tree.NewDString(scName)
+		tbNameStr := tree.NewDString(table.Name)
+		return addRow(
+			dbNameStr,                              // table_catalog
+			scNameStr,                              // table_schema
+			tbNameStr,                              // table_name
+			tableType,                              // table_type
+			insertable,                             // is_insertable_into
+			tree.NewDInt(tree.DInt(table.Version)), // version
+		)
+	}
 }
 
 // Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-views.html
@@ -1463,23 +1492,35 @@ func forEachSchemaName(
 
 // forEachDatabaseDesc calls a function for the given DatabaseDescriptor, or if
 // it is nil, retrieves all database descriptors and iterates through them in
-// lexicographical order with respect to their name. The function is only called
-// if the user has privileges on the database.
+// lexicographical order with respect to their name. If privileges are required,
+// the function is only called if the user has privileges on the database.
 func forEachDatabaseDesc(
 	ctx context.Context,
 	p *planner,
 	dbContext *DatabaseDescriptor,
+	requiresPrivileges bool,
 	fn func(*sqlbase.DatabaseDescriptor) error,
 ) error {
 	var dbDescs []*sqlbase.DatabaseDescriptor
-	dbDescs, err := p.Tables().getAllDatabaseDescriptors(ctx, p.txn)
-	if err != nil {
-		return err
+	if dbContext == nil {
+		allDbDescs, err := p.Tables().GetAllDatabaseDescriptors(ctx, p.txn)
+		if err != nil {
+			return err
+		}
+		dbDescs = allDbDescs
+	} else {
+		// We can't just use dbContext here because we need to fetch the descriptor
+		// with privileges from kv.
+		fetchedDbDesc, err := catalogkv.GetDatabaseDescriptorsFromIDs(ctx, p.txn, p.ExecCfg().Codec, []sqlbase.ID{dbContext.ID})
+		if err != nil {
+			return err
+		}
+		dbDescs = fetchedDbDesc
 	}
 
 	// Ignore databases that the user cannot see.
 	for _, dbDesc := range dbDescs {
-		if (dbContext == nil || dbContext.ID == dbDesc.ID) && userCanSeeDatabase(ctx, p, dbDesc) {
+		if !requiresPrivileges || userCanSeeDatabase(ctx, p, dbDesc) {
 			if err := fn(dbDesc); err != nil {
 				return err
 			}
@@ -1586,15 +1627,15 @@ func getSchemaNames(
 	ctx context.Context, p *planner, dbContext *DatabaseDescriptor,
 ) (map[sqlbase.ID]string, error) {
 	if dbContext != nil {
-		return p.Tables().getSchemasForDatabase(ctx, p.txn, dbContext.ID)
+		return p.Tables().GetSchemasForDatabase(ctx, p.txn, dbContext.ID)
 	}
 	ret := make(map[sqlbase.ID]string)
-	dbs, err := p.Tables().getAllDatabaseDescriptors(ctx, p.txn)
+	dbs, err := p.Tables().GetAllDatabaseDescriptors(ctx, p.txn)
 	if err != nil {
 		return nil, err
 	}
 	for _, db := range dbs {
-		schemas, err := p.Tables().getSchemasForDatabase(ctx, p.txn, db.ID)
+		schemas, err := p.Tables().GetSchemasForDatabase(ctx, p.txn, db.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -1618,7 +1659,7 @@ func forEachTableDescWithTableLookupInternal(
 	allowAdding bool,
 	fn func(*DatabaseDescriptor, string, *TableDescriptor, tableLookupFn) error,
 ) error {
-	descs, err := p.Tables().getAllDescriptors(ctx, p.txn)
+	descs, err := p.Tables().GetAllDescriptors(ctx, p.txn)
 	if err != nil {
 		return err
 	}

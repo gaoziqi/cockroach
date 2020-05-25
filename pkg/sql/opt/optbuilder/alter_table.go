@@ -46,19 +46,19 @@ func (b *Builder) buildAlterTableSplit(split *tree.Split, inScope *scope) (outSc
 
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	emptyScope := &scope{builder: b}
+	emptyScope := b.allocScope()
 	inputScope := b.buildStmt(split.Rows, colTypes, emptyScope)
 	checkInputColumns("SPLIT AT", inputScope, colNames, colTypes, 1)
 
 	// Build the expiration scalar.
 	var expiration opt.ScalarExpr
 	if split.ExpireExpr != nil {
-		emptyScope.context = "ALTER TABLE SPLIT AT"
+		emptyScope.context = exprKindAlterTableSplitAt
 		// We need to save and restore the previous value of the field in
 		// semaCtx in case we are recursively called within a subquery
 		// context.
 		defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-		b.semaCtx.Properties.Require(emptyScope.context, tree.RejectSpecial)
+		b.semaCtx.Properties.Require(emptyScope.context.String(), tree.RejectSpecial)
 
 		texpr := emptyScope.resolveType(split.ExpireExpr, types.String)
 		expiration = b.buildScalar(texpr, emptyScope, nil /* outScope */, nil /* outCol */, nil /* colRefs */)
@@ -118,7 +118,7 @@ func (b *Builder) buildAlterTableUnsplit(unsplit *tree.Unsplit, inScope *scope) 
 
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	inputScope := b.buildStmt(unsplit.Rows, colTypes, &scope{builder: b})
+	inputScope := b.buildStmt(unsplit.Rows, colTypes, b.allocScope())
 	checkInputColumns("UNSPLIT AT", inputScope, colNames, colTypes, 1)
 	private.Props = inputScope.makePhysicalProps()
 
@@ -169,7 +169,7 @@ func (b *Builder) buildAlterTableRelocate(
 
 	// We don't allow the input statement to reference outer columns, so we
 	// pass a "blank" scope rather than inScope.
-	inputScope := b.buildStmt(relocate.Rows, colTypes, &scope{builder: b})
+	inputScope := b.buildStmt(relocate.Rows, colTypes, b.allocScope())
 	checkInputColumns(cmdName, inputScope, colNames, colTypes, 2)
 
 	outScope.expr = b.factory.ConstructAlterTableRelocate(

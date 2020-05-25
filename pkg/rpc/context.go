@@ -38,11 +38,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 	"golang.org/x/sync/syncmap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
 	encodingproto "google.golang.org/grpc/encoding/proto"
@@ -690,12 +691,23 @@ func (ctx *Context) grpcDialOptions(
 	var unaryInterceptors []grpc.UnaryClientInterceptor
 
 	if tracer := ctx.AmbientCtx.Tracer; tracer != nil {
-		// We use a SpanInclusionFunc to circumvent the interceptor's work when
-		// tracing is disabled. Otherwise, the interceptor causes an increase in
-		// the number of packets (even with an empty context!). See #17177.
 		unaryInterceptors = append(unaryInterceptors,
 			otgrpc.OpenTracingClientInterceptor(tracer,
-				otgrpc.IncludingSpans(otgrpc.SpanInclusionFunc(spanInclusionFuncForClient))))
+				// We use a SpanInclusionFunc to circumvent the interceptor's work when
+				// tracing is disabled. Otherwise, the interceptor causes an increase in
+				// the number of packets (even with an empty context!). See #17177.
+				otgrpc.IncludingSpans(otgrpc.SpanInclusionFunc(spanInclusionFuncForClient)),
+				// We use a decorator to set the "node" tag. All other spans get the
+				// node tag from context log tags.
+				//
+				// Unfortunately we cannot use the corresponding interceptor on the
+				// server-side of gRPC to set this tag on server spans because that
+				// interceptor runs too late - after a traced RPC's recording had
+				// already been collected. So, on the server-side, the equivalent code
+				// is in setupSpanForIncomingRPC().
+				otgrpc.SpanDecorator(func(span opentracing.Span, _ string, _, _ interface{}, _ error) {
+					span.SetTag("node", ctx.NodeID.String())
+				})))
 	}
 	if ctx.testingKnobs.UnaryClientInterceptor != nil {
 		testingUnaryInterceptor := ctx.testingKnobs.UnaryClientInterceptor(target, class)
@@ -887,7 +899,11 @@ func (ctx *Context) grpcDialRaw(
 	// Add a stats handler to measure client network stats.
 	dialOpts = append(dialOpts, grpc.WithStatsHandler(ctx.stats.newClient(target)))
 
-	dialOpts = append(dialOpts, grpc.WithBackoffMaxDelay(maxBackoff))
+	// Lower the MaxBackoff (which defaults to ~minutes) to something in the
+	// ~second range.
+	backoffConfig := backoff.DefaultConfig
+	backoffConfig.MaxDelay = maxBackoff
+	dialOpts = append(dialOpts, grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoffConfig}))
 	dialOpts = append(dialOpts, grpc.WithKeepaliveParams(clientKeepalive))
 	dialOpts = append(dialOpts,
 		grpc.WithInitialWindowSize(initialWindowSize),

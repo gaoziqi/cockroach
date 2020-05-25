@@ -31,8 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -57,16 +57,14 @@ var webSessionTimeout = settings.RegisterPublicNonNegativeDurationSetting(
 )
 
 type authenticationServer struct {
-	server     *Server
-	memMetrics *sql.MemoryMetrics
+	server *Server
 }
 
 // newAuthenticationServer allocates and returns a new REST server for
 // authentication APIs.
 func newAuthenticationServer(s *Server) *authenticationServer {
 	return &authenticationServer{
-		server:     s,
-		memMetrics: &s.adminMemMetrics,
+		server: s,
 	}
 }
 
@@ -135,7 +133,7 @@ func (s *authenticationServer) UserLogin(
 		ID:     id,
 		Secret: secret,
 	}
-	cookie, err := EncodeSessionCookie(cookieValue)
+	cookie, err := EncodeSessionCookie(cookieValue, !s.server.cfg.DisableTLSForHTTP)
 	if err != nil {
 		return nil, apiInternalError(ctx, err)
 	}
@@ -167,7 +165,7 @@ func (s *authenticationServer) UserLogout(
 	}
 
 	// Revoke the session.
-	if n, err := s.server.internalExecutor.ExecEx(
+	if n, err := s.server.sqlServer.internalExecutor.ExecEx(
 		ctx,
 		"revoke-auth-session",
 		nil, /* txn */
@@ -177,14 +175,14 @@ func (s *authenticationServer) UserLogout(
 	); err != nil {
 		return nil, apiInternalError(ctx, err)
 	} else if n == 0 {
-		msg := fmt.Sprintf("session with id %d nonexistent", sessionID)
-		log.Info(ctx, msg)
-		return nil, fmt.Errorf(msg)
+		err := errors.Newf("session with id %d nonexistent", sessionID)
+		log.Infof(ctx, "%v", err)
+		return nil, err
 	}
 
 	// Send back a header which will cause the browser to destroy the cookie.
 	// See https://tools.ietf.org/search/rfc6265, page 7.
-	cookie := makeCookieWithValue("")
+	cookie := makeCookieWithValue("", false /* forHTTPSOnly */)
 	cookie.MaxAge = -1
 
 	// Set the cookie header on the outgoing response.
@@ -215,7 +213,7 @@ WHERE id = $1`
 		isRevoked    bool
 	)
 
-	row, err := s.server.internalExecutor.QueryRowEx(
+	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
 		ctx,
 		"lookup-auth-session",
 		nil, /* txn */
@@ -264,7 +262,7 @@ func (s *authenticationServer) verifyPassword(
 	ctx context.Context, username string, password string,
 ) (valid bool, expired bool, err error) {
 	exists, canLogin, pwRetrieveFn, validUntilFn, err := sql.GetUserHashedPassword(
-		ctx, s.server.execCfg.InternalExecutor, username,
+		ctx, s.server.sqlServer.execCfg.InternalExecutor, username,
 	)
 	if err != nil {
 		return false, false, err
@@ -322,7 +320,7 @@ RETURNING id
 `
 	var id int64
 
-	row, err := s.server.internalExecutor.QueryRowEx(
+	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
 		ctx,
 		"create-auth-session",
 		nil, /* txn */
@@ -404,22 +402,28 @@ func (am *authenticationMux) ServeHTTP(w http.ResponseWriter, req *http.Request)
 }
 
 // EncodeSessionCookie encodes a SessionCookie proto into an http.Cookie.
-func EncodeSessionCookie(sessionCookie *serverpb.SessionCookie) (*http.Cookie, error) {
+// The flag forHTTPSOnly, if set, produces the "Secure" flag on the
+// resulting HTTP cookie, which means the cookie should only be
+// transmitted over HTTPS channels. Note that a cookie without
+// the "Secure" flag can be transmitted over either HTTP or HTTPS channels.
+func EncodeSessionCookie(
+	sessionCookie *serverpb.SessionCookie, forHTTPSOnly bool,
+) (*http.Cookie, error) {
 	cookieValueBytes, err := protoutil.Marshal(sessionCookie)
 	if err != nil {
 		return nil, errors.Wrap(err, "session cookie could not be encoded")
 	}
 	value := base64.StdEncoding.EncodeToString(cookieValueBytes)
-	return makeCookieWithValue(value), nil
+	return makeCookieWithValue(value, forHTTPSOnly), nil
 }
 
-func makeCookieWithValue(value string) *http.Cookie {
+func makeCookieWithValue(value string, forHTTPSOnly bool) *http.Cookie {
 	return &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   forHTTPSOnly,
 	}
 }
 

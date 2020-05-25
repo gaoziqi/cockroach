@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/errors"
 )
 
 // Base config defaults.
@@ -190,6 +190,9 @@ type Config struct {
 	// HTTPAddr is the configured HTTP listen address.
 	HTTPAddr string
 
+	// DisableTLSForHTTP, if set, disables TLS for the HTTP listener.
+	DisableTLSForHTTP bool
+
 	// HTTPAdvertiseAddr is the advertised HTTP address.
 	// This is computed from HTTPAddr if specified otherwise Addr.
 	HTTPAdvertiseAddr string
@@ -210,10 +213,14 @@ type Config struct {
 	// connections to determine connection health and update the local view
 	// of remote clocks.
 	RPCHeartbeatInterval time.Duration
+
+	// Enables the use of an PTP hardware clock user space API for HLC current time.
+	// This contains the path to the device to be used (i.e. /dev/ptp0)
+	ClockDevicePath string
 }
 
 func wrapError(err error) error {
-	if _, ok := err.(*security.Error); !ok {
+	if !errors.HasType(err, (*security.Error)(nil)) {
 		return &security.Error{
 			Message: "problem using security settings",
 			Err:     err,
@@ -230,6 +237,7 @@ func (cfg *Config) InitDefaults() {
 	cfg.Addr = defaultAddr
 	cfg.AdvertiseAddr = cfg.Addr
 	cfg.HTTPAddr = defaultHTTPAddr
+	cfg.DisableTLSForHTTP = false
 	cfg.HTTPAdvertiseAddr = ""
 	cfg.SplitListenSQL = false
 	cfg.SQLAddr = defaultSQLAddr
@@ -239,11 +247,13 @@ func (cfg *Config) InitDefaults() {
 	cfg.RPCHeartbeatInterval = defaultRPCHeartbeatInterval
 	cfg.ClusterName = ""
 	cfg.DisableClusterNameVerification = false
+	cfg.ClockDevicePath = ""
 }
 
-// HTTPRequestScheme returns "http" or "https" based on the value of Insecure.
+// HTTPRequestScheme returns "http" or "https" based on the value of
+// Insecure and DisableTLSForHTTP.
 func (cfg *Config) HTTPRequestScheme() string {
-	if cfg.Insecure {
+	if cfg.Insecure || cfg.DisableTLSForHTTP {
 		return httpScheme
 	}
 	return httpsScheme
@@ -257,8 +267,8 @@ func (cfg *Config) AdminURL() *url.URL {
 	}
 }
 
-// GetClientCertPaths returns the paths to the client cert and key.
-func (cfg *Config) GetClientCertPaths(user string) (string, string, error) {
+// getClientCertPaths returns the paths to the client cert and key.
+func (cfg *Config) getClientCertPaths(user string) (string, string, error) {
 	cm, err := cfg.GetCertificateManager()
 	if err != nil {
 		return "", "", err
@@ -266,8 +276,8 @@ func (cfg *Config) GetClientCertPaths(user string) (string, string, error) {
 	return cm.GetClientCertPaths(user)
 }
 
-// GetCACertPath returns the path to the CA certificate.
-func (cfg *Config) GetCACertPath() (string, error) {
+// getCACertPath returns the path to the CA certificate.
+func (cfg *Config) getCACertPath() (string, error) {
 	cm, err := cfg.GetCertificateManager()
 	if err != nil {
 		return "", err
@@ -294,7 +304,7 @@ func (cfg *Config) LoadSecurityOptions(options url.Values, username string) erro
 			// verify-ca and verify-full need a CA certificate.
 			if options.Get("sslrootcert") == "" {
 				// Fetch CA cert. This is required.
-				caCertPath, err := cfg.GetCACertPath()
+				caCertPath, err := cfg.getCACertPath()
 				if err != nil {
 					return wrapError(err)
 				}
@@ -306,7 +316,7 @@ func (cfg *Config) LoadSecurityOptions(options url.Values, username string) erro
 		}
 
 		// Fetch certs, but don't fail, we may be using a password.
-		certPath, keyPath, err := cfg.GetClientCertPaths(username)
+		certPath, keyPath, err := cfg.getClientCertPaths(username)
 		if err == nil {
 			if options.Get("sslcert") == "" {
 				options.Set("sslcert", certPath)
@@ -344,36 +354,6 @@ func (cfg *Config) GetCertificateManager() (*security.CertificateManager, error)
 	return cfg.certificateManager.cm, cfg.certificateManager.err
 }
 
-// InitializeNodeTLSConfigs tries to load client and server-side TLS configs.
-// It also enables the reload-on-SIGHUP functionality on the certificate manager.
-// This should be called early in the life of the server to make sure there are no
-// issues with TLS configs.
-// Returns the certificate manager if successfully created and in secure mode.
-func (cfg *Config) InitializeNodeTLSConfigs(
-	stopper *stop.Stopper,
-) (*security.CertificateManager, error) {
-	if cfg.Insecure {
-		return nil, nil
-	}
-
-	if _, err := cfg.GetServerTLSConfig(); err != nil {
-		return nil, err
-	}
-	if _, err := cfg.GetUIServerTLSConfig(); err != nil {
-		return nil, err
-	}
-	if _, err := cfg.GetClientTLSConfig(); err != nil {
-		return nil, err
-	}
-
-	cm, err := cfg.GetCertificateManager()
-	if err != nil {
-		return nil, err
-	}
-	cm.RegisterSignalHandler(stopper)
-	return cm, nil
-}
-
 // GetClientTLSConfig returns the client TLS config, initializing it if needed.
 // If Insecure is true, return a nil config, otherwise ask the certificate
 // manager for a TLS config using certs for the config.User.
@@ -396,11 +376,11 @@ func (cfg *Config) GetClientTLSConfig() (*tls.Config, error) {
 	return tlsCfg, nil
 }
 
-// GetUIClientTLSConfig returns the client TLS config for Admin UI clients, initializing it if needed.
+// getUIClientTLSConfig returns the client TLS config for Admin UI clients, initializing it if needed.
 // If Insecure is true, return a nil config, otherwise ask the certificate
 // manager for a TLS config configured to talk to the Admin UI.
 // This TLSConfig is **NOT** suitable to talk to the GRPC or SQL servers, use GetClientTLSConfig instead.
-func (cfg *Config) GetUIClientTLSConfig() (*tls.Config, error) {
+func (cfg *Config) getUIClientTLSConfig() (*tls.Config, error) {
 	// Early out.
 	if cfg.Insecure {
 		return nil, nil
@@ -442,9 +422,12 @@ func (cfg *Config) GetServerTLSConfig() (*tls.Config, error) {
 // GetUIServerTLSConfig returns the server TLS config for the Admin UI, initializing it if needed.
 // If Insecure is true, return a nil config, otherwise ask the certificate
 // manager for a server UI TLS config.
+//
+// TODO(peter): This method is only used by `server.NewServer` and
+// `Server.Start`. Move it.
 func (cfg *Config) GetUIServerTLSConfig() (*tls.Config, error) {
 	// Early out.
-	if cfg.Insecure {
+	if cfg.Insecure || cfg.DisableTLSForHTTP {
 		return nil, nil
 	}
 
@@ -467,7 +450,7 @@ func (cfg *Config) GetHTTPClient() (http.Client, error) {
 		cfg.httpClient.httpClient.Timeout = 10 * time.Second
 		var transport http.Transport
 		cfg.httpClient.httpClient.Transport = &transport
-		transport.TLSClientConfig, cfg.httpClient.err = cfg.GetUIClientTLSConfig()
+		transport.TLSClientConfig, cfg.httpClient.err = cfg.getUIClientTLSConfig()
 	})
 
 	return cfg.httpClient.httpClient, cfg.httpClient.err
@@ -725,31 +708,22 @@ func TempStorageConfigFromEnv(
 	specIdx int,
 ) TempStorageConfig {
 	inMem := parentDir == "" && firstStore.InMemory
-	var monitor mon.BytesMonitor
+	var monitorName string
 	if inMem {
-		monitor = mon.MakeMonitor(
-			"in-mem temp storage",
-			mon.MemoryResource,
-			nil,             /* curCount */
-			nil,             /* maxHist */
-			1024*1024,       /* increment */
-			maxSizeBytes/10, /* noteworthy */
-			st,
-		)
-		monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+		monitorName = "in-mem temp storage"
 	} else {
-		monitor = mon.MakeMonitor(
-			"temp disk storage",
-			mon.DiskResource,
-			nil,             /* curCount */
-			nil,             /* maxHist */
-			1024*1024,       /* increment */
-			maxSizeBytes/10, /* noteworthy */
-			st,
-		)
-		monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+		monitorName = "temp disk storage"
 	}
-
+	monitor := mon.MakeMonitor(
+		monitorName,
+		mon.DiskResource,
+		nil,             /* curCount */
+		nil,             /* maxHist */
+		1024*1024,       /* increment */
+		maxSizeBytes/10, /* noteworthy */
+		st,
+	)
+	monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
 	return TempStorageConfig{
 		InMemory: inMem,
 		Mon:      &monitor,

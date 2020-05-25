@@ -25,10 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -40,9 +40,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 	"golang.org/x/time/rate"
 )
 
@@ -65,7 +65,7 @@ type ProposalData struct {
 	// commands by their MaxLeaseIndex, and doing so should be ok with a stop-
 	// the-world migration. However, various test facilities depend on the
 	// command ID for e.g. replay protection.
-	idKey storagebase.CmdIDKey
+	idKey kvserverbase.CmdIDKey
 
 	// proposedAtTicks is the (logical) time at which this command was
 	// last (re-)proposed.
@@ -73,19 +73,20 @@ type ProposalData struct {
 
 	// command is serialized and proposed to raft. In the event of
 	// reproposals its MaxLeaseIndex field is mutated.
-	command *storagepb.RaftCommand
+	command *kvserverpb.RaftCommand
 
 	// encodedCommand is the encoded Raft command, with an optional prefix
 	// containing the command ID.
 	encodedCommand []byte
 
-	// quotaAlloc is the allocation retrieved from the proposalQuota.
-	// Once a proposal has been passed to raft modifying this field requires
-	// holding the raftMu.
+	// quotaAlloc is the allocation retrieved from the proposalQuota. Once a
+	// proposal has been passed to raft modifying this field requires holding the
+	// raftMu. Once the proposal comes out of Raft, ownerwhip of this quota is
+	// passed to r.mu.quotaReleaseQueue.
 	quotaAlloc *quotapool.IntAlloc
 
 	// tmpFooter is used to avoid an allocation.
-	tmpFooter storagepb.RaftCommandFooter
+	tmpFooter kvserverpb.RaftCommandFooter
 
 	// ec.done is called after command application to update the timestamp
 	// cache and optionally release latches and exits lock wait-queues.
@@ -179,7 +180,7 @@ func (r *Replica) gcOldChecksumEntriesLocked(now time.Time) {
 	}
 }
 
-func (r *Replica) computeChecksumPostApply(ctx context.Context, cc storagepb.ComputeChecksum) {
+func (r *Replica) computeChecksumPostApply(ctx context.Context, cc kvserverpb.ComputeChecksum) {
 	stopper := r.store.Stopper()
 	now := timeutil.Now()
 	r.mu.Lock()
@@ -276,7 +277,7 @@ A file preventing this node from restarting was placed at:
 `, r, auxDir, path)
 
 			if err := ioutil.WriteFile(path, []byte(preventStartupMsg), 0644); err != nil {
-				log.Warning(ctx, err)
+				log.Warningf(ctx, "%v", err)
 			}
 
 			if p := r.store.cfg.TestingKnobs.ConsistencyTestingKnobs.OnBadChecksumFatal; p != nil {
@@ -289,7 +290,7 @@ A file preventing this node from restarting was placed at:
 
 	}); err != nil {
 		defer snap.Close()
-		log.Error(ctx, errors.Wrapf(err, "could not run async checksum computation (ID = %s)", cc.ChecksumID))
+		log.Errorf(ctx, "could not run async checksum computation (ID = %s): %v", cc.ChecksumID, err)
 		// Set checksum to nil.
 		r.computeChecksumDone(ctx, cc.ChecksumID, nil, nil)
 	}
@@ -446,16 +447,21 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease, pe
 	// range lease that is only reacquired extremely infrequently.
 	if iAmTheLeaseHolder {
 		if err := r.MaybeGossipSystemConfig(ctx); err != nil {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 		}
 		if err := r.MaybeGossipNodeLiveness(ctx, keys.NodeLivenessSpan); err != nil {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 		}
 
 		// Emit an MLAI on the leaseholder replica, as follower will be looking
 		// for one and if we went on to quiesce, they wouldn't necessarily get
 		// one otherwise (unless they ask for it, which adds latency).
 		r.EmitMLAI()
+
+		if leaseChangingHands && log.V(1) {
+			// This logging is useful to troubleshoot incomplete drains.
+			log.Info(ctx, "is now leaseholder")
+		}
 	}
 
 	// Mark the new lease in the replica's lease history.
@@ -470,7 +476,7 @@ func addSSTablePreApply(
 	eng storage.Engine,
 	sideloaded SideloadStorage,
 	term, index uint64,
-	sst storagepb.ReplicatedEvalResult_AddSSTable,
+	sst kvserverpb.ReplicatedEvalResult_AddSSTable,
 	limiter *rate.Limiter,
 ) bool {
 	checksum := util.CRC32(sst.Data)
@@ -527,14 +533,14 @@ func addSSTablePreApply(
 			// If the fs supports it, make a hard-link for rocks to ingest. We cannot
 			// pass it the path in the sideload store as it deletes the passed path on
 			// success.
-			if linkErr := eng.LinkFile(path, ingestPath); linkErr == nil {
+			if linkErr := eng.Link(path, ingestPath); linkErr == nil {
 				ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath})
 				if ingestErr == nil {
 					// Adding without modification succeeded, no copy necessary.
 					log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
 					return false
 				}
-				if rmErr := eng.DeleteFile(ingestPath); rmErr != nil {
+				if rmErr := eng.Remove(ingestPath); rmErr != nil {
 					log.Fatalf(ctx, "failed to move ingest sst: %v", rmErr)
 				}
 				const seqNoMsg = "Global seqno is required, but disabled"
@@ -548,8 +554,8 @@ func addSSTablePreApply(
 				// going to be surfaced.
 				ingestErrMsg := ingestErr.Error()
 				isSeqNoErr := strings.Contains(ingestErrMsg, seqNoMsg) || strings.Contains(ingestErrMsg, seqNoOnReIngest)
-				if _, ok := ingestErr.(*storage.Error); !ok || !isSeqNoErr {
-					log.Fatalf(ctx, "while ingesting %s: %s", ingestPath, ingestErr)
+				if ingestErr := (*storage.Error)(nil); !errors.As(err, &ingestErr) || !isSeqNoErr {
+					log.Fatalf(ctx, "while ingesting %s: %v", ingestPath, ingestErr)
 				}
 			}
 		}
@@ -657,14 +663,21 @@ func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult re
 
 	if lResult.MaybeGossipSystemConfig {
 		if err := r.MaybeGossipSystemConfig(ctx); err != nil {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 		}
 		lResult.MaybeGossipSystemConfig = false
 	}
 
+	if lResult.MaybeGossipSystemConfigIfHaveFailure {
+		if err := r.MaybeGossipSystemConfigIfHaveFailure(ctx); err != nil {
+			log.Errorf(ctx, "%v", err)
+		}
+		lResult.MaybeGossipSystemConfigIfHaveFailure = false
+	}
+
 	if lResult.MaybeGossipNodeLiveness != nil {
 		if err := r.MaybeGossipNodeLiveness(ctx, *lResult.MaybeGossipNodeLiveness); err != nil {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 		}
 		lResult.MaybeGossipNodeLiveness = nil
 	}
@@ -702,7 +715,10 @@ type proposalResult struct {
 //
 // Replica.mu must not be held.
 func (r *Replica) evaluateProposal(
-	ctx context.Context, idKey storagebase.CmdIDKey, ba *roachpb.BatchRequest, spans *spanset.SpanSet,
+	ctx context.Context,
+	idKey kvserverbase.CmdIDKey,
+	ba *roachpb.BatchRequest,
+	latchSpans *spanset.SpanSet,
 ) (*result.Result, bool, *roachpb.Error) {
 	if ba.Timestamp == (hlc.Timestamp{}) {
 		return nil, false, roachpb.NewErrorf("can't propose Raft command with zero timestamp")
@@ -713,7 +729,7 @@ func (r *Replica) evaluateProposal(
 	// important since evaluating a proposal is expensive.
 	// TODO(tschottdorf): absorb all returned values in `res` below this point
 	// in the call stack as well.
-	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, spans)
+	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, latchSpans)
 
 	// Note: reusing the proposer's batch when applying the command on the
 	// proposer was explored as an optimization but resulted in no performance
@@ -732,11 +748,9 @@ func (r *Replica) evaluateProposal(
 
 		// Failed proposals can't have any Result except for what's
 		// whitelisted here.
-		intents := res.Local.DetachEncounteredIntents()
-		endTxns := res.Local.DetachEndTxns(true /* alwaysOnly */)
 		res.Local = result.LocalResult{
-			EncounteredIntents: intents,
-			EndTxns:            endTxns,
+			EncounteredIntents: res.Local.DetachEncounteredIntents(),
+			EndTxns:            res.Local.DetachEndTxns(true /* alwaysOnly */),
 			Metrics:            res.Local.Metrics,
 		}
 		res.Replicated.Reset()
@@ -757,12 +771,12 @@ func (r *Replica) evaluateProposal(
 	// 3. the request has replicated side-effects.
 	needConsensus := !batch.Empty() ||
 		ms != (enginepb.MVCCStats{}) ||
-		!res.Replicated.Equal(storagepb.ReplicatedEvalResult{})
+		!res.Replicated.Equal(kvserverpb.ReplicatedEvalResult{})
 
 	if needConsensus {
 		// Set the proposal's WriteBatch, which is the serialized representation of
 		// the proposals effect on RocksDB.
-		res.WriteBatch = &storagepb.WriteBatch{
+		res.WriteBatch = &kvserverpb.WriteBatch{
 			Data: batch.Repr(),
 		}
 
@@ -813,7 +827,7 @@ func (r *Replica) evaluateProposal(
 			// operator can then run the old binary for a while to upgrade the
 			// stragglers.
 			if res.Replicated.State == nil {
-				res.Replicated.State = &storagepb.ReplicaState{}
+				res.Replicated.State = &kvserverpb.ReplicaState{}
 			}
 			res.Replicated.State.UsingAppliedStateKey = true
 		}
@@ -826,10 +840,16 @@ func (r *Replica) evaluateProposal(
 // evaluating it. The returned ProposalData is partially valid even
 // on a non-nil *roachpb.Error and should be proposed through Raft
 // if ProposalData.command is non-nil.
+//
+// TODO(nvanbenschoten): combine idKey, ba, and latchSpans into a
+// `serializedRequest` struct.
 func (r *Replica) requestToProposal(
-	ctx context.Context, idKey storagebase.CmdIDKey, ba *roachpb.BatchRequest, spans *spanset.SpanSet,
+	ctx context.Context,
+	idKey kvserverbase.CmdIDKey,
+	ba *roachpb.BatchRequest,
+	latchSpans *spanset.SpanSet,
 ) (*ProposalData, *roachpb.Error) {
-	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, spans)
+	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, latchSpans)
 
 	// Fill out the results even if pErr != nil; we'll return the error below.
 	proposal := &ProposalData{
@@ -841,7 +861,7 @@ func (r *Replica) requestToProposal(
 	}
 
 	if needConsensus {
-		proposal.command = &storagepb.RaftCommand{
+		proposal.command = &kvserverpb.RaftCommand{
 			ReplicatedEvalResult: res.Replicated,
 			WriteBatch:           res.WriteBatch,
 			LogicalOpLog:         res.LogicalOpLog,

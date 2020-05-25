@@ -29,6 +29,7 @@ import (
 
 	cld "github.com/cockroachdb/cockroach/pkg/cmd/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/config"
+	rperrors "github.com/cockroachdb/cockroach/pkg/cmd/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/ssh"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/ui"
@@ -38,7 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm/gce"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm/local"
 	"github.com/cockroachdb/cockroach/pkg/util/flagutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/sys/unix"
@@ -260,12 +261,25 @@ func verifyClusterName(clusterName string) (string, error) {
 		clusterName, suggestions)
 }
 
+// Provide `cobra.Command` functions with a standard return code handler.
+// Exit codes come from rperrors.Error.ExitCode().
+//
+// If the wrapped error tree of an error does not contain an instance of
+// rperrors.Error, the error will automatically be wrapped with
+// rperrors.Unclassified.
 func wrap(f func(cmd *cobra.Command, args []string) error) func(cmd *cobra.Command, args []string) {
 	return func(cmd *cobra.Command, args []string) {
 		err := f(cmd, args)
 		if err != nil {
-			cmd.Println("Error: ", err.Error())
-			os.Exit(1)
+			roachprodError, ok := rperrors.AsError(err)
+			if !ok {
+				roachprodError = rperrors.Unclassified{Err: err}
+				err = roachprodError
+			}
+
+			cmd.Printf("Error: %+v\n", err)
+
+			os.Exit(roachprodError.ExitCode())
 		}
 	}
 }
@@ -276,12 +290,12 @@ type clusterAlreadyExistsError struct {
 	name string
 }
 
-func (e clusterAlreadyExistsError) Error() string {
+func (e *clusterAlreadyExistsError) Error() string {
 	return fmt.Sprintf("cluster %s already exists", e.name)
 }
 
 func newClusterAlreadyExistsError(name string) error {
-	return clusterAlreadyExistsError{name: name}
+	return &clusterAlreadyExistsError{name: name}
 }
 
 var createCmd = &cobra.Command{
@@ -341,7 +355,7 @@ Local Clusters
 			if retErr == nil || clusterName == config.Local {
 				return
 			}
-			if _, ok := retErr.(clusterAlreadyExistsError); ok {
+			if errors.HasType(retErr, (*clusterAlreadyExistsError)(nil)) {
 				return
 			}
 			fmt.Fprintf(os.Stderr, "Cleaning up partially-created cluster (prev err: %s)\n", retErr)
@@ -1182,7 +1196,7 @@ the 'zfs rollback' command:
 			return fmt.Errorf("unknown filesystem %q", fs)
 		}
 
-		err = c.Run(os.Stdout, os.Stderr, c.Nodes, "reformatting", fmt.Sprintf(`
+		err = c.Run(os.Stdout, os.Stderr, c.Nodes, install.OtherCmd, "reformatting", fmt.Sprintf(`
 set -euo pipefail
 if sudo zpool list -Ho name 2>/dev/null | grep ^data1$; then
   sudo zpool destroy -f data1
@@ -1224,7 +1238,7 @@ var runCmd = &cobra.Command{
 		if len(title) > 30 {
 			title = title[:27] + "..."
 		}
-		return c.Run(os.Stdout, os.Stderr, c.Nodes, title, cmd)
+		return c.Run(os.Stdout, os.Stderr, c.Nodes, install.CockroachCmd, title, cmd)
 	}),
 }
 
@@ -1422,9 +1436,15 @@ var pgurlCmd = &cobra.Command{
 
 		var urls []string
 		for i, ip := range ips {
+			if ip == "" {
+				return errors.Errorf("empty ip: %v", ips)
+			}
 			urls = append(urls, c.Impl.NodeURL(c, ip, c.Impl.NodePort(c, nodes[i])))
 		}
 		fmt.Println(strings.Join(urls, " "))
+		if len(urls) != len(nodes) {
+			return errors.Errorf("have nodes %v, but urls %v from ips %v", nodes, urls, ips)
+		}
 		return nil
 	}),
 }

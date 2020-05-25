@@ -26,6 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/database"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -280,7 +282,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		Metrics:         makeMetrics(false /*internal*/),
 		InternalMetrics: makeMetrics(true /*internal*/),
 		// dbCache will be updated on Start().
-		dbCache:       newDatabaseCacheHolder(newDatabaseCache(systemCfg)),
+		dbCache:       newDatabaseCacheHolder(database.NewCache(cfg.Codec, systemCfg)),
 		pool:          pool,
 		sqlStats:      sqlStats{st: cfg.Settings, apps: make(map[string]*appStats)},
 		reportedStats: sqlStats{st: cfg.Settings, apps: make(map[string]*appStats)},
@@ -318,12 +320,12 @@ func makeMetrics(internal bool) Metrics {
 
 // Start starts the Server's background processing.
 func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
-	gossipUpdateC := s.cfg.Gossip.RegisterSystemConfigChannel()
+	gossipUpdateC := s.cfg.Gossip.DeprecatedRegisterSystemConfigChannel(47150)
 	stopper.RunWorker(ctx, func(ctx context.Context) {
 		for {
 			select {
 			case <-gossipUpdateC:
-				sysCfg := s.cfg.Gossip.GetSystemConfig()
+				sysCfg := s.cfg.Gossip.DeprecatedSystemConfig(47150)
 				s.dbCache.updateSystemConfig(sysCfg)
 			case <-stopper.ShouldStop():
 				return
@@ -339,8 +341,6 @@ func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
 	s.PeriodicallyClearSQLStats(ctx, stopper, maxSQLStatReset, &s.reportedStats)
 	// Start a second loop to clear SQL stats at the requested interval.
 	s.PeriodicallyClearSQLStats(ctx, stopper, sqlStatReset, &s.sqlStats)
-
-	s.PeriodicallyPollForStatementInfoRequests(ctx, stopper)
 }
 
 // ResetSQLStats resets the executor's collected sql statistics.
@@ -415,10 +415,20 @@ func (s *Server) SetupConn(
 	memMetrics MemoryMetrics,
 ) (ConnectionHandler, error) {
 	sd := s.newSessionData(args)
+
+	// Set the SessionData from args.SessionDefaults. This also validates the
+	// respective values.
 	sdMut := s.makeSessionDataMutator(sd, args.SessionDefaults)
-	ex, err := s.newConnExecutor(
-		ctx, sd, &sdMut, stmtBuf, clientComm, memMetrics, &s.Metrics, resetSessionDataToDefaults)
-	return ConnectionHandler{ex}, err
+	if err := resetSessionVars(ctx, &sdMut); err != nil {
+		log.Errorf(ctx, "error setting up client session: %s", err)
+		return ConnectionHandler{}, err
+	}
+
+	ex := s.newConnExecutor(
+		ctx, sd, args.SessionDefaults, stmtBuf, clientComm, memMetrics, &s.Metrics,
+		s.sqlStats.getStatsForApplication(sd.ApplicationName),
+	)
+	return ConnectionHandler{ex}, nil
 }
 
 // ConnectionHandler is the interface between the result of SetupConn
@@ -516,30 +526,22 @@ func (s *Server) populateMinimalSessionData(sd *sessiondata.SessionData) {
 	}
 }
 
-type sdResetOption bool
-
-const (
-	resetSessionDataToDefaults     sdResetOption = true
-	dontResetSessionDataToDefaults               = false
-)
-
 // newConnExecutor creates a new connExecutor.
 //
-// resetOpt controls whether sd is to be reset to the default values.
-// TODO(andrei): resetOpt is a hack needed by the InternalExecutor, which
-// doesn't want this resetting. Figure out a better API where the responsibility
-// of assigning default values is either entirely inside or outside of this
-// ctor.
+// sd is expected to be fully initialized with the values of all the session
+// vars.
+// sdDefaults controls what the session vars will be reset to through
+// RESET statements.
 func (s *Server) newConnExecutor(
 	ctx context.Context,
 	sd *sessiondata.SessionData,
-	sdMutator *sessionDataMutator,
+	sdDefaults SessionDefaults,
 	stmtBuf *StmtBuf,
 	clientComm ClientComm,
 	memMetrics MemoryMetrics,
 	srvMetrics *Metrics,
-	resetOpt sdResetOption,
-) (*connExecutor, error) {
+	appStats *appStats,
+) *connExecutor {
 	// Create the various monitors.
 	// The session monitors are started in activate().
 	sessionRootMon := mon.MakeMonitor(
@@ -565,6 +567,10 @@ func (s *Server) newConnExecutor(
 		-1 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
 	)
 
+	nodeIDOrZero, _ := s.cfg.NodeID.OptionalNodeID()
+	sdMutator := new(sessionDataMutator)
+	*sdMutator = s.makeSessionDataMutator(sd, sdDefaults)
+
 	ex := &connExecutor{
 		server:      s,
 		metrics:     srvMetrics,
@@ -579,67 +585,43 @@ func (s *Server) newConnExecutor(
 			connCtx: ctx,
 		},
 		transitionCtx: transitionCtx{
-			db:     s.cfg.DB,
-			nodeID: s.cfg.NodeID.Get(),
-			clock:  s.cfg.Clock,
+			db:           s.cfg.DB,
+			nodeIDOrZero: nodeIDOrZero,
+			clock:        s.cfg.Clock,
 			// Future transaction's monitors will inherits from sessionRootMon.
 			connMon:  &sessionRootMon,
 			tracer:   s.cfg.AmbientCtx.Tracer,
 			settings: s.cfg.Settings,
 		},
 		memMetrics: memMetrics,
-		planner:    planner{execCfg: s.cfg},
+		planner:    planner{execCfg: s.cfg, alloc: &sqlbase.DatumAlloc{}},
 
 		// ctxHolder will be reset at the start of run(). We only define
 		// it here so that an early call to close() doesn't panic.
 		ctxHolder:                 ctxHolder{connCtx: ctx},
 		executorType:              executorTypeExec,
 		hasCreatedTemporarySchema: false,
-		stmtInfoRegistry:          s.cfg.stmtInfoRequestRegistry,
+		stmtDiagnosticsRecorder:   s.cfg.StmtDiagnosticsRecorder,
 	}
 
 	ex.state.txnAbortCount = ex.metrics.EngineMetrics.TxnAbortCount
 
+	// The transaction_read_only variable is special; its updates need to be
+	// hooked-up to the executor.
 	sdMutator.setCurTxnReadOnly = func(val bool) {
 		ex.state.readOnly = val
 	}
+
 	sdMutator.onTempSchemaCreation = func() {
 		ex.hasCreatedTemporarySchema = true
 	}
+
+	ex.applicationName.Store(ex.sessionData.ApplicationName)
+	ex.appStats = appStats
 	sdMutator.RegisterOnSessionDataChange("application_name", func(newName string) {
-		ex.appStats = ex.server.sqlStats.getStatsForApplication(newName)
 		ex.applicationName.Store(newName)
+		ex.appStats = ex.server.sqlStats.getStatsForApplication(newName)
 	})
-	// Initialize the session data from provided defaults. We need to do this early
-	// because other initializations below use the configured values.
-	if resetOpt == resetSessionDataToDefaults {
-		if err := resetSessionVars(ctx, sdMutator); err != nil {
-			log.Errorf(ctx, "error setting up client session: %v", err)
-			return nil, err
-		}
-	} else {
-		// We have set the ex.sessionData without using the dataMutator.
-		// So we need to update the application name manually.
-		ex.applicationName.Store(ex.sessionData.ApplicationName)
-		// When the connEx is serving an internal executor, it can inherit
-		// the application name from an outer session. This happens
-		// e.g. during ::regproc casts and built-in functions that use SQL internally.
-		// In that case, we do not want to record statistics against
-		// the outer application name directly; instead we want
-		// to use a separate bucket. However we will still
-		// want to have separate buckets for different applications so that
-		// we can measure their respective "pressure" on internal queries.
-		// Hence the choice here to add the delegate prefix
-		// to the current app name.
-		var appStatsBucketName string
-		if !strings.HasPrefix(ex.sessionData.ApplicationName, sqlbase.InternalAppNamePrefix) {
-			appStatsBucketName = sqlbase.DelegatedAppNamePrefix + ex.sessionData.ApplicationName
-		} else {
-			// If this is already an "internal app", don't put more prefix.
-			appStatsBucketName = ex.sessionData.ApplicationName
-		}
-		ex.appStats = s.sqlStats.getStatsForApplication(appStatsBucketName)
-	}
 
 	ex.phaseTimes[sessionInit] = timeutil.Now()
 	ex.extraTxnState.prepStmtsNamespace = prepStmtNamespace{
@@ -650,12 +632,8 @@ func (s *Server) newConnExecutor(
 		prepStmts: make(map[string]*PreparedStatement),
 		portals:   make(map[string]*PreparedPortal),
 	}
-	ex.extraTxnState.tables = TableCollection{
-		leaseMgr:          s.cfg.LeaseManager,
-		databaseCache:     s.dbCache.getDatabaseCache(),
-		dbCacheSubscriber: s.dbCache,
-		settings:          s.cfg.Settings,
-	}
+	ex.extraTxnState.descCollection = descs.MakeCollection(s.cfg.LeaseManager,
+		s.cfg.Settings, s.dbCache.getDatabaseCache(), s.dbCache)
 	ex.extraTxnState.txnRewindPos = -1
 	ex.mu.ActiveQueries = make(map[ClusterWideID]*queryMeta)
 	ex.machine = fsm.MakeMachine(TxnStateTransitions, stateNoTxn{}, &ex.state)
@@ -665,7 +643,7 @@ func (s *Server) newConnExecutor(
 	ex.statsCollector = ex.newStatsCollector()
 	ex.initPlanner(ctx, &ex.planner)
 
-	return ex, nil
+	return ex
 }
 
 // newConnExecutorWithTxn creates a connExecutor that will execute statements
@@ -681,21 +659,17 @@ func (s *Server) newConnExecutor(
 func (s *Server) newConnExecutorWithTxn(
 	ctx context.Context,
 	sd *sessiondata.SessionData,
-	sdMutator *sessionDataMutator,
+	sdDefaults SessionDefaults,
 	stmtBuf *StmtBuf,
 	clientComm ClientComm,
 	parentMon *mon.BytesMonitor,
 	memMetrics MemoryMetrics,
 	srvMetrics *Metrics,
 	txn *kv.Txn,
-	tcModifier tableCollectionModifier,
-	resetOpt sdResetOption,
-) (*connExecutor, error) {
-	ex, err := s.newConnExecutor(
-		ctx, sd, sdMutator, stmtBuf, clientComm, memMetrics, srvMetrics, resetOpt)
-	if err != nil {
-		return nil, err
-	}
+	tcModifier descs.ModifiedCollectionCopier,
+	appStats *appStats,
+) *connExecutor {
+	ex := s.newConnExecutor(ctx, sd, sdDefaults, stmtBuf, clientComm, memMetrics, srvMetrics, appStats)
 
 	// The new transaction stuff below requires active monitors and traces, so
 	// we need to activate the executor now.
@@ -718,13 +692,13 @@ func (s *Server) newConnExecutorWithTxn(
 		txn,
 		ex.transitionCtx)
 
-	// Modify the TableCollection to match the parent executor's TableCollection.
+	// Modify the Collection to match the parent executor's Collection.
 	// This allows the InternalExecutor to see schema changes made by the
 	// parent executor.
 	if tcModifier != nil {
-		tcModifier.copyModifiedSchema(&ex.extraTxnState.tables)
+		tcModifier.CopyModifiedObjects(&ex.extraTxnState.descCollection)
 	}
-	return ex, nil
+	return ex
 }
 
 var sqlStatReset = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
@@ -772,30 +746,6 @@ func (s *Server) PeriodicallyClearSQLStats(
 	})
 }
 
-// PeriodicallyPollForStatementInfoRequests runs a worker that periodically
-// polls system.statement_diagnostics_requests.
-func (s *Server) PeriodicallyPollForStatementInfoRequests(
-	ctx context.Context, stopper *stop.Stopper,
-) {
-	pollingInterval := 10 * time.Second
-	stopper.RunWorker(ctx, func(ctx context.Context) {
-		ctx, _ = stopper.WithCancelOnQuiesce(ctx)
-		var timer timeutil.Timer
-		for {
-			if err := s.cfg.stmtInfoRequestRegistry.pollRequests(ctx); err != nil {
-				log.Warningf(ctx, "error polling for statement diagnostics requests: %s", err)
-			}
-			timer.Reset(pollingInterval)
-			select {
-			case <-stopper.ShouldQuiesce():
-				return
-			case <-timer.C:
-				timer.Read = true
-			}
-		}
-	})
-}
-
 type closeType int
 
 const (
@@ -819,8 +769,8 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 			cutStmt = cutStmt[:panicLogOutputCutoffChars] + " [...]"
 		}
 
-		log.Shout(ctx, log.Severity_ERROR,
-			fmt.Sprintf("a SQL panic has occurred while executing %q: %s", cutStmt, recovered))
+		log.Shoutf(ctx, log.Severity_ERROR,
+			"a SQL panic has occurred while executing %q: %s", cutStmt, recovered)
 
 		ex.close(ctx, panicClose)
 
@@ -849,6 +799,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 			ctx,
 			ex.server.cfg.Settings,
 			ex.server.cfg.DB,
+			ex.server.cfg.Codec,
 			&ie,
 			ex.sessionID,
 		)
@@ -965,8 +916,8 @@ type connExecutor struct {
 	// This is only used in the Open state. extraTxnState is reset whenever a
 	// transaction finishes or gets retried.
 	extraTxnState struct {
-		// tables collects descriptors used by the current transaction.
-		tables TableCollection
+		// descCollection collects descriptors used by the current transaction.
+		descCollection descs.Collection
 
 		// jobs accumulates jobs staged for execution inside the transaction.
 		// Staging happens when executing statements that are implemented with a
@@ -1101,9 +1052,9 @@ type connExecutor struct {
 	// temporary schema, which requires special cleanup on close.
 	hasCreatedTemporarySchema bool
 
-	// stmtInfoRequestRegistry is used to track which queries need to have
+	// stmtDiagnosticsRecorder is used to track which queries need to have
 	// information collected.
-	stmtInfoRegistry *stmtDiagnosticsRequestRegistry
+	stmtDiagnosticsRecorder StmtDiagnosticsRecorder
 }
 
 // ctxHolder contains a connection's context and, while session tracing is
@@ -1188,9 +1139,9 @@ func (ex *connExecutor) resetExtraTxnState(
 ) error {
 	ex.extraTxnState.jobs = nil
 
-	ex.extraTxnState.tables.releaseTables(ctx)
+	ex.extraTxnState.descCollection.ReleaseAll(ctx)
 
-	ex.extraTxnState.tables.databaseCache = dbCacheHolder.getDatabaseCache()
+	ex.extraTxnState.descCollection.ResetDatabaseCache(dbCacheHolder.getDatabaseCache())
 
 	// Close all portals.
 	for name, p := range ex.extraTxnState.prepStmtsNamespace.portals {
@@ -1321,7 +1272,7 @@ func (ex *connExecutor) run(
 
 		var err error
 		if err = ex.execCmd(ex.Ctx()); err != nil {
-			if err == io.EOF || err == errDrainingComplete {
+			if errors.IsAny(err, io.EOF, errDrainingComplete) {
 				return nil
 			}
 			return err
@@ -1772,9 +1723,7 @@ func (ex *connExecutor) execCopyIn(
 		ex.state.mon.Start(ctx, ex.sessionMon, mon.BoundAccount{} /* reserved */)
 		monToStop = ex.state.mon
 	}
-	var cm copyMachineInterface
-	var err error
-	resetPlanner := func(p *planner, txn *kv.Txn, txnTS time.Time, stmtTS time.Time) {
+	txnOpt.resetPlanner = func(ctx context.Context, p *planner, txn *kv.Txn, txnTS time.Time, stmtTS time.Time) {
 		// HACK: We're reaching inside ex.state and changing sqlTimestamp by hand.
 		// It is used by resetPlanner. Normally sqlTimestamp is updated by the
 		// state machine, but the copyMachine manages its own transactions without
@@ -1785,11 +1734,13 @@ func (ex *connExecutor) execCopyIn(
 		ex.initPlanner(ctx, p)
 		ex.resetPlanner(ctx, p, txn, stmtTS)
 	}
+	var cm copyMachineInterface
+	var err error
 	if table := cmd.Stmt.Table; table.Table() == fileUploadTable && table.Schema() == crdbInternalName {
-		cm, err = newFileUploadMachine(cmd.Conn, cmd.Stmt, ex.server.cfg, resetPlanner)
+		cm, err = newFileUploadMachine(ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg)
 	} else {
 		cm, err = newCopyMachine(
-			ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg, resetPlanner,
+			ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg,
 			// execInsertPlan
 			func(ctx context.Context, p *planner, res RestrictedCommandResult) error {
 				_, _, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, false /* distribute */, nil /* progressAtomic */)
@@ -1823,11 +1774,11 @@ func stmtHasNoData(stmt tree.Statement) bool {
 	return stmt == nil || stmt.StatementType() != tree.Rows
 }
 
-// generateID generates a unique ID based on the node's ID and its current HLC
-// timestamp. These IDs are either scoped at the query level or at the session
-// level.
+// generateID generates a unique ID based on the SQL instance ID and its current
+// HLC timestamp. These IDs are either scoped at the query level or at the
+// session level.
 func (ex *connExecutor) generateID() ClusterWideID {
-	return GenerateClusterWideID(ex.server.cfg.Clock.Now(), ex.server.cfg.NodeID.Get())
+	return GenerateClusterWideID(ex.server.cfg.Clock.Now(), ex.server.cfg.NodeID.SQLInstanceID())
 }
 
 // commitPrepStmtNamespace deallocates everything in
@@ -1872,9 +1823,7 @@ func isCommit(stmt tree.Statement) bool {
 }
 
 func errIsRetriable(err error) bool {
-	err = errors.UnwrapAll(err)
-	_, retriable := err.(*roachpb.TransactionRetryWithProtoRefreshError)
-	return retriable
+	return errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil))
 }
 
 // makeErrEvent takes an error and returns either an eventRetriableErr or an
@@ -1911,10 +1860,7 @@ func (ex *connExecutor) setTransactionModes(
 	// Transform the transaction options into the types needed by the state
 	// machine.
 	if modes.UserPriority != tree.UnspecifiedUserPriority {
-		pri, err := priorityToProto(modes.UserPriority)
-		if err != nil {
-			return err
-		}
+		pri := txnPriorityToProto(modes.UserPriority)
 		if err := ex.state.setPriority(pri); err != nil {
 			return err
 		}
@@ -1937,7 +1883,7 @@ func (ex *connExecutor) setTransactionModes(
 	return ex.state.setReadOnlyMode(rwMode)
 }
 
-func priorityToProto(mode tree.UserPriority) (roachpb.UserPriority, error) {
+func txnPriorityToProto(mode tree.UserPriority) roachpb.UserPriority {
 	var pri roachpb.UserPriority
 	switch mode {
 	case tree.UnspecifiedUserPriority:
@@ -1949,9 +1895,16 @@ func priorityToProto(mode tree.UserPriority) (roachpb.UserPriority, error) {
 	case tree.High:
 		pri = roachpb.MaxUserPriority
 	default:
-		return roachpb.UserPriority(0), errors.AssertionFailedf("unknown user priority: %s", errors.Safe(mode))
+		log.Fatalf(context.Background(), "unknown user priority: %s", mode)
 	}
-	return pri, nil
+	return pri
+}
+
+func (ex *connExecutor) txnPriorityWithSessionDefault(mode tree.UserPriority) roachpb.UserPriority {
+	if mode == tree.UnspecifiedUserPriority {
+		mode = tree.UserPriority(ex.sessionData.DefaultTxnPriority)
+	}
+	return txnPriorityToProto(mode)
 }
 
 func (ex *connExecutor) readWriteModeWithSessionDefault(
@@ -1970,7 +1923,7 @@ func (ex *connExecutor) readWriteModeWithSessionDefault(
 // same across multiple statements. resetEvalCtx must also be called before each
 // statement, to reinitialize other fields.
 func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalContext, p *planner) {
-	scInterface := newSchemaInterface(&ex.extraTxnState.tables, ex.server.cfg.VirtualSchemas)
+	scInterface := newSchemaInterface(&ex.extraTxnState.descCollection, ex.server.cfg.VirtualSchemas)
 
 	ie := MakeInternalExecutor(
 		ctx,
@@ -1983,16 +1936,18 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 	*evalCtx = extendedEvalContext{
 		EvalContext: tree.EvalContext{
 			Planner:            p,
-			Sequence:           p,
-			SessionData:        ex.sessionData,
-			SessionAccessor:    p,
 			PrivilegedAccessor: p,
+			SessionAccessor:    p,
 			ClientNoticeSender: p,
+			Sequence:           p,
+			Tenant:             p,
+			SessionData:        ex.sessionData,
 			Settings:           ex.server.cfg.Settings,
 			TestingKnobs:       ex.server.cfg.EvalContextTestingKnobs,
 			ClusterID:          ex.server.cfg.ClusterID(),
 			ClusterName:        ex.server.cfg.RPCContext.ClusterName(),
-			NodeID:             ex.server.cfg.NodeID.Get(),
+			NodeID:             ex.server.cfg.NodeID,
+			Codec:              ex.server.cfg.Codec,
 			Locality:           ex.server.cfg.Locality,
 			ReCache:            ex.server.reCache,
 			InternalExecutor:   &ie,
@@ -2003,7 +1958,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 		Tracing:           &ex.sessionTracing,
 		StatusServer:      ex.server.cfg.StatusServer,
 		MemMetrics:        &ex.memMetrics,
-		Tables:            &ex.extraTxnState.tables,
+		Descs:             &ex.extraTxnState.descCollection,
 		ExecCfg:           ex.server.cfg,
 		DistSQLPlanner:    ex.server.cfg.DistSQLPlanner,
 		TxnModesSetter:    ex,
@@ -2081,6 +2036,7 @@ func (ex *connExecutor) resetPlanner(
 	p.semaCtx.SearchPath = ex.sessionData.SearchPath
 	p.semaCtx.AsOfTimestamp = nil
 	p.semaCtx.Annotations = nil
+	p.semaCtx.TypeResolver = p
 
 	ex.resetEvalCtx(&p.extendedEvalCtx, txn, stmtTS)
 
@@ -2107,7 +2063,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 
 	err := ex.machine.ApplyWithPayload(withStatement(ex.Ctx(), ex.curStmt), ev, payload)
 	if err != nil {
-		if _, ok := err.(fsm.TransitionNotFoundError); ok {
+		if errors.HasType(err, (*fsm.TransitionNotFoundError)(nil)) {
 			panic(err)
 		}
 		return advanceInfo{}, err
@@ -2133,7 +2089,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 					advInfo.txnEvent.String()+ //the event is included like this so that it doesn't get sanitized
 					" generated even though res.Err() has been set to: %s",
 				res.Err())
-			log.Error(ex.Ctx(), err)
+			log.Errorf(ex.Ctx(), "%v", err)
 			errorutil.SendReport(ex.Ctx(), &ex.server.cfg.Settings.SV, err)
 			return advanceInfo{}, err
 		}
@@ -2174,6 +2130,8 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 				res.SetError(newErr)
 			}
 		}
+		ex.notifyStatsRefresherOfNewTables(ex.Ctx())
+
 		if err := ex.server.cfg.JobRegistry.Run(
 			ex.ctxHolder.connCtx,
 			ex.server.cfg.InternalExecutor,
@@ -2182,7 +2140,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		}
 
 		// Wait for the cache to reflect the dropped databases if any.
-		ex.extraTxnState.tables.waitForCacheToDropDatabases(ex.Ctx())
+		ex.extraTxnState.descCollection.WaitForCacheToDropDatabases(ex.Ctx())
 
 		fallthrough
 	case txnRestart, txnRollback:
@@ -2257,10 +2215,16 @@ func (ex *connExecutor) serialize() serverpb.Session {
 	defer ex.state.mu.RUnlock()
 
 	var kvTxnID *uuid.UUID
+	var activeTxnInfo *serverpb.TxnInfo
 	txn := ex.state.mu.txn
 	if txn != nil {
 		id := txn.ID()
 		kvTxnID = &id
+		activeTxnInfo = &serverpb.TxnInfo{
+			ID:             id,
+			Start:          ex.state.mu.txnStart,
+			TxnDescription: txn.String(),
+		}
 	}
 
 	activeQueries := make([]serverpb.ActiveQuery, 0, len(ex.mu.ActiveQueries))
@@ -2286,6 +2250,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 		sql := truncateSQL(query.getStatement())
 		progress := math.Float64frombits(atomic.LoadUint64(&query.progressAtomic))
 		activeQueries = append(activeQueries, serverpb.ActiveQuery{
+			TxnID:         query.txnID,
 			ID:            id.String(),
 			Start:         query.start.UTC(),
 			Sql:           sql,
@@ -2310,6 +2275,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 		ApplicationName: ex.applicationName.Load().(string),
 		Start:           ex.phaseTimes[sessionInit].UTC(),
 		ActiveQueries:   activeQueries,
+		ActiveTxn:       activeTxnInfo,
 		KvTxnID:         kvTxnID,
 		LastActiveQuery: lastActiveQuery,
 		ID:              ex.sessionID.GetBytes(),
@@ -2331,6 +2297,23 @@ func (ex *connExecutor) sessionEventf(ctx context.Context, format string, args .
 	}
 	if ex.eventLog != nil {
 		ex.eventLog.Printf(format, args...)
+	}
+}
+
+// notifyStatsRefresherOfNewTables is called on txn commit to inform
+// the stats refresher that new tables exist and should have their stats
+// collected now.
+func (ex *connExecutor) notifyStatsRefresherOfNewTables(ctx context.Context) {
+	for _, desc := range ex.extraTxnState.descCollection.GetTableDescsWithNewVersion() {
+		// The CREATE STATISTICS run for an async CTAS query is initiated by the
+		// SchemaChanger, so we don't do it here.
+		if desc.IsTable() && !desc.IsAs() {
+			// Initiate a run of CREATE STATISTICS. We use a large number
+			// for rowsAffected because we want to make sure that stats always get
+			// created/refreshed here.
+			ex.planner.execCfg.StatsRefresher.
+				NotifyMutation(desc.ID, math.MaxInt32 /* rowsAffected */)
+		}
 	}
 }
 

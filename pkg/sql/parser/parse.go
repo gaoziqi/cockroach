@@ -296,7 +296,7 @@ func ParseExpr(sql string) (tree.Expr, error) {
 }
 
 // ParseType parses a column type.
-func ParseType(sql string) (*types.T, error) {
+func ParseType(sql string) (tree.ResolvableTypeReference, error) {
 	expr, err := ParseExpr(fmt.Sprintf("1::%s", sql))
 	if err != nil {
 		return nil, err
@@ -354,31 +354,18 @@ func newDecimal(prec, scale int32) (*types.T, error) {
 	return types.MakeDecimal(prec, scale), nil
 }
 
-// ArrayOf creates a type alias for an array of the given element type and fixed
-// bounds.
-func arrayOf(colType *types.T, bounds []int32) (*types.T, error) {
-	if err := types.CheckArrayElementType(colType); err != nil {
-		return nil, err
+// arrayOf creates a type alias for an array of the given element type and fixed
+// bounds. The bounds are currently ignored.
+func arrayOf(
+	ref tree.ResolvableTypeReference, bounds []int32,
+) (tree.ResolvableTypeReference, error) {
+	// If the reference is a statically known type, then return an array type,
+	// rather than an array type reference.
+	if typ, ok := tree.GetStaticallyKnownType(ref); ok {
+		if err := types.CheckArrayElementType(typ); err != nil {
+			return nil, err
+		}
+		return types.MakeArray(typ), nil
 	}
-
-	// Currently bounds are ignored.
-	return types.MakeArray(colType), nil
-}
-
-// The SERIAL types are pseudo-types that are only used during parsing. After
-// that, they should behave identically to INT columns. They are declared
-// as INT types, but using different instances than types.Int, types.Int2, etc.
-// so that they can be compared by pointer to differentiate them from the
-// singleton INT types. While the usual requirement is that == is never used to
-// compare types, this is one case where it's allowed.
-var (
-	serial2Type = *types.Int2
-	serial4Type = *types.Int4
-	serial8Type = *types.Int
-)
-
-func isSerialType(typ *types.T) bool {
-	// This is a special case where == is used to compare types, since the SERIAL
-	// types are pseudo-types.
-	return typ == &serial2Type || typ == &serial4Type || typ == &serial8Type
+	return &tree.ArrayTypeReference{ElementType: ref}, nil
 }

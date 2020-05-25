@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/errors"
 )
 
 // A RangeIterator provides a mechanism for iterating over all ranges
@@ -30,11 +31,8 @@ type RangeIterator struct {
 	desc    *roachpb.RangeDescriptor
 	token   *EvictionToken
 	init    bool
-	pErr    *roachpb.Error
+	err     error
 }
-
-// RangeIteratorGen is a generator of RangeIterators.
-type RangeIteratorGen func() *RangeIterator
 
 // NewRangeIterator creates a new RangeIterator.
 func NewRangeIterator(ds *DistSender) *RangeIterator {
@@ -105,11 +103,11 @@ func (ri *RangeIterator) Valid() bool {
 
 // Error returns the error the iterator encountered, if any. If
 // the iterator has not been initialized, returns iterator error.
-func (ri *RangeIterator) Error() *roachpb.Error {
+func (ri *RangeIterator) Error() error {
 	if !ri.init {
-		return roachpb.NewErrorf("range iterator not intialized with Seek()")
+		return errors.New("range iterator not intialized with Seek()")
 	}
-	return ri.pErr
+	return ri.err
 }
 
 // Reset resets the RangeIterator to its initial state.
@@ -146,12 +144,12 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 	}
 	ri.scanDir = scanDir
 	ri.init = true // the iterator is now initialized
-	ri.pErr = nil  // clear any prior error
+	ri.err = nil   // clear any prior error
 	ri.key = key   // set the key
 
 	if (scanDir == Ascending && key.Equal(roachpb.RKeyMax)) ||
 		(scanDir == Descending && key.Equal(roachpb.RKeyMin)) {
-		ri.pErr = roachpb.NewErrorf("RangeIterator seek to invalid key %s", key)
+		ri.err = errors.Errorf("RangeIterator seek to invalid key %s", key)
 		return
 	}
 
@@ -176,25 +174,6 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 			continue
 		}
 
-		// It's possible that the returned descriptor misses parts of the
-		// keys it's supposed to include after it's truncated to match the
-		// descriptor. Example revscan [a,g), first desc lookup for "g"
-		// returns descriptor [c,d) -> [d,g) is never scanned.
-		// We evict and retry in such a case.
-		// TODO: this code is subject to removal. See
-		// https://groups.google.com/d/msg/cockroach-db/DebjQEgU9r4/_OhMe7atFQAJ
-		reverse := ri.scanDir == Descending
-		if (reverse && !ri.desc.ContainsKeyInverted(ri.key)) ||
-			(!reverse && !ri.desc.ContainsKey(ri.key)) {
-			log.Eventf(ctx, "addressing error: %s does not include key %s", ri.desc, ri.key)
-			if err := ri.token.Evict(ctx); err != nil {
-				ri.pErr = roachpb.NewError(err)
-				return
-			}
-			// On addressing errors, don't backoff; retry immediately.
-			r.Reset()
-			continue
-		}
 		if log.V(2) {
 			log.Infof(ctx, "returning; key: %s, desc: %s", ri.key, ri.desc)
 		}
@@ -202,9 +181,9 @@ func (ri *RangeIterator) Seek(ctx context.Context, key roachpb.RKey, scanDir Sca
 	}
 
 	// Check for an early exit from the retry loop.
-	if pErr := ri.ds.deduceRetryEarlyExitError(ctx); pErr != nil {
-		ri.pErr = pErr
+	if err := ri.ds.deduceRetryEarlyExitError(ctx); err != nil {
+		ri.err = err
 	} else {
-		ri.pErr = roachpb.NewErrorf("RangeIterator failed to seek to %s", key)
+		ri.err = errors.Errorf("RangeIterator failed to seek to %s", key)
 	}
 }

@@ -206,11 +206,12 @@ func (sb *statisticsBuilder) availabilityFromInput(e RelExpr) bool {
 	case *ScanExpr:
 		return sb.makeTableStatistics(t.Table).Available
 
-	case *VirtualScanExpr:
-		return sb.makeTableStatistics(t.Table).Available
-
 	case *LookupJoinExpr:
 		ensureLookupJoinInputProps(t, sb)
+		return t.lookupProps.Stats.Available && t.Input.Relational().Stats.Available
+
+	case *GeoLookupJoinExpr:
+		ensureGeoLookupJoinInputProps(t, sb)
 		return t.lookupProps.Stats.Available && t.Input.Relational().Stats.Available
 
 	case *ZigzagJoinExpr:
@@ -239,13 +240,11 @@ func (sb *statisticsBuilder) colStatFromInput(
 	colSet opt.ColSet, e RelExpr,
 ) (*props.ColumnStatistic, *props.Statistics) {
 	var lookupJoin *LookupJoinExpr
+	var geospatialLookupJoin *GeoLookupJoinExpr
 	var zigzagJoin *ZigzagJoinExpr
 
 	switch t := e.(type) {
 	case *ScanExpr:
-		return sb.colStatTable(t.Table, colSet), sb.makeTableStatistics(t.Table)
-
-	case *VirtualScanExpr:
 		return sb.colStatTable(t.Table, colSet), sb.makeTableStatistics(t.Table)
 
 	case *SelectExpr:
@@ -255,12 +254,17 @@ func (sb *statisticsBuilder) colStatFromInput(
 		lookupJoin = t
 		ensureLookupJoinInputProps(lookupJoin, sb)
 
+	case *GeoLookupJoinExpr:
+		geospatialLookupJoin = t
+		ensureGeoLookupJoinInputProps(geospatialLookupJoin, sb)
+
 	case *ZigzagJoinExpr:
 		zigzagJoin = t
 		ensureZigzagJoinInputProps(zigzagJoin, sb)
 	}
 
-	if lookupJoin != nil || zigzagJoin != nil || opt.IsJoinOp(e) || e.Op() == opt.MergeJoinOp {
+	if lookupJoin != nil || geospatialLookupJoin != nil || zigzagJoin != nil ||
+		opt.IsJoinOp(e) || e.Op() == opt.MergeJoinOp {
 		var leftProps *props.Relational
 		if zigzagJoin != nil {
 			leftProps = &zigzagJoin.leftProps
@@ -272,6 +276,8 @@ func (sb *statisticsBuilder) colStatFromInput(
 		var intersectsRight bool
 		if lookupJoin != nil {
 			intersectsRight = lookupJoin.lookupProps.OutputCols.Intersects(colSet)
+		} else if geospatialLookupJoin != nil {
+			intersectsRight = geospatialLookupJoin.lookupProps.OutputCols.Intersects(colSet)
 		} else if zigzagJoin != nil {
 			intersectsRight = zigzagJoin.rightProps.OutputCols.Intersects(colSet)
 		} else {
@@ -293,6 +299,11 @@ func (sb *statisticsBuilder) colStatFromInput(
 			if lookupJoin != nil {
 				return sb.colStatTable(lookupJoin.Table, colSet),
 					sb.makeTableStatistics(lookupJoin.Table)
+			}
+			if geospatialLookupJoin != nil {
+				// TODO(rytaft): use inverted index stats when available.
+				return sb.colStatTable(geospatialLookupJoin.Table, colSet),
+					sb.makeTableStatistics(geospatialLookupJoin.Table)
 			}
 			if zigzagJoin != nil {
 				return sb.colStatTable(zigzagJoin.RightTable, colSet),
@@ -337,9 +348,6 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet, e RelExpr) *props.Column
 	case opt.ScanOp:
 		return sb.colStatScan(colSet, e.(*ScanExpr))
 
-	case opt.VirtualScanOp:
-		return sb.colStatVirtualScan(colSet, e.(*VirtualScanExpr))
-
 	case opt.SelectOp:
 		return sb.colStatSelect(colSet, e.(*SelectExpr))
 
@@ -352,7 +360,7 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet, e RelExpr) *props.Column
 	case opt.InnerJoinOp, opt.LeftJoinOp, opt.RightJoinOp, opt.FullJoinOp,
 		opt.SemiJoinOp, opt.AntiJoinOp, opt.InnerJoinApplyOp, opt.LeftJoinApplyOp,
 		opt.SemiJoinApplyOp, opt.AntiJoinApplyOp, opt.MergeJoinOp, opt.LookupJoinOp,
-		opt.ZigzagJoinOp:
+		opt.GeoLookupJoinOp, opt.ZigzagJoinOp:
 		return sb.colStatJoin(colSet, e)
 
 	case opt.IndexJoinOp:
@@ -362,7 +370,8 @@ func (sb *statisticsBuilder) colStat(colSet opt.ColSet, e RelExpr) *props.Column
 		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp:
 		return sb.colStatSetNode(colSet, e)
 
-	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.UpsertDistinctOnOp:
+	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.EnsureDistinctOnOp,
+		opt.UpsertDistinctOnOp, opt.EnsureUpsertDistinctOnOp:
 		return sb.colStatGroupBy(colSet, e)
 
 	case opt.LimitOp:
@@ -421,10 +430,10 @@ func (sb *statisticsBuilder) colStatLeaf(
 	}
 
 	// If some of the columns are a lax key, the distinct count equals the row
-	// count. The null count is 0 if these columns are not nullable, otherwise
-	// copy the null count from the nullable columns in colSet.
+	// count. The null count is 0 if any of these columns are not nullable,
+	// otherwise copy the null count from the nullable columns in colSet.
 	if fd.ColsAreLaxKey(colSet) {
-		if colSet.SubsetOf(notNullCols) {
+		if colSet.Intersects(notNullCols) {
 			colStat.NullCount = 0
 		} else {
 			nullableCols := colSet.Difference(notNullCols)
@@ -461,14 +470,13 @@ func (sb *statisticsBuilder) colStatLeaf(
 		}
 	} else {
 		distinctCount := 1.0
-		nullCount := 0.0
+		nullCount := s.RowCount
 		colSet.ForEach(func(i opt.ColumnID) {
 			colStatLeaf := sb.colStatLeaf(opt.MakeColSet(i), s, fd, notNullCols)
 			distinctCount *= colStatLeaf.DistinctCount
-			if nullCount < s.RowCount {
-				// Subtract the expected chance of collisions with nulls already collected.
-				nullCount += colStatLeaf.NullCount * (1 - nullCount/s.RowCount)
-			}
+			// Multiply by the expected chance of collisions with nulls already
+			// collected.
+			nullCount *= colStatLeaf.NullCount / s.RowCount
 		})
 		// Fetch the colStat again since it may now have a different address.
 		colStat, _ = s.ColStats.Lookup(colSet)
@@ -515,14 +523,20 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 		// column set. Stats are ordered with most recent first.
 		for i := 0; i < tab.StatisticCount(); i++ {
 			stat := tab.Statistic(i)
+			if stat.ColumnCount() > 1 && !sb.evalCtx.SessionData.OptimizerUseMultiColStats {
+				continue
+			}
+
 			var cols opt.ColSet
 			for i := 0; i < stat.ColumnCount(); i++ {
 				cols.Add(tabID.ColumnID(stat.ColumnOrdinal(i)))
 			}
+
 			if colStat, ok := stats.ColStats.Add(cols); ok {
 				colStat.DistinctCount = float64(stat.DistinctCount())
 				colStat.NullCount = float64(stat.NullCount())
-				if cols.Len() == 1 && stat.Histogram() != nil {
+				if cols.Len() == 1 && stat.Histogram() != nil &&
+					sb.evalCtx.SessionData.OptimizerUseHistograms {
 					col, _ := cols.Next(0)
 					colStat.Histogram = &props.Histogram{}
 					colStat.Histogram.Init(sb.evalCtx, col, stat.Histogram())
@@ -619,37 +633,10 @@ func (sb *statisticsBuilder) colStatScan(colSet opt.ColSet, scan *ScanExpr) *pro
 		colStat.ApplySelectivity(s.Selectivity, tableStats.RowCount)
 	}
 
-	if colSet.SubsetOf(relProps.NotNullCols) {
+	if colSet.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 
-	sb.finalizeFromRowCount(colStat, s.RowCount)
-	return colStat
-}
-
-// +-------------+
-// | VirtualScan |
-// +-------------+
-
-func (sb *statisticsBuilder) buildVirtualScan(scan *VirtualScanExpr, relProps *props.Relational) {
-	s := &relProps.Stats
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
-		// Short cut if cardinality is 0.
-		return
-	}
-	s.Available = sb.availabilityFromInput(scan)
-
-	inputStats := sb.makeTableStatistics(scan.Table)
-
-	s.RowCount = inputStats.RowCount
-	sb.finalizeFromCardinality(relProps)
-}
-
-func (sb *statisticsBuilder) colStatVirtualScan(
-	colSet opt.ColSet, scan *VirtualScanExpr,
-) *props.ColumnStatistic {
-	s := &scan.Relational().Stats
-	colStat := sb.copyColStat(colSet, s, sb.colStatTable(scan.Table, colSet))
 	sb.finalizeFromRowCount(colStat, s.RowCount)
 	return colStat
 }
@@ -719,7 +706,7 @@ func (sb *statisticsBuilder) colStatSelect(
 	// exploration could absorb some of the filter conditions.
 	selectivity := s.RowCount / inputStats.RowCount
 	colStat.ApplySelectivity(selectivity, inputStats.RowCount)
-	if colSet.SubsetOf(relProps.NotNullCols) {
+	if colSet.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -755,8 +742,9 @@ func (sb *statisticsBuilder) colStatProject(
 	// may be synthesized by the projection operation.
 	inputCols := prj.Input.Relational().OutputCols
 	reqInputCols := colSet.Intersection(inputCols)
-	nullOpFound := false
-	if reqSynthCols := colSet.Difference(inputCols); !reqSynthCols.Empty() {
+	nonNullFound := false
+	reqSynthCols := colSet.Difference(inputCols)
+	if !reqSynthCols.Empty() {
 		// Some of the columns in colSet were synthesized or from a higher scope
 		// (in the case of a correlated subquery). We assume that the statistics of
 		// the synthesized columns are the same as the statistics of their input
@@ -769,10 +757,10 @@ func (sb *statisticsBuilder) colStatProject(
 			if reqSynthCols.Contains(item.Col) {
 				reqInputCols.UnionWith(item.scalar.OuterCols)
 
-				// If the element is a null constant, account for that
+				// If the element is not a null constant, account for that
 				// when calculating null counts.
-				if item.Element.Op() == opt.NullOp {
-					nullOpFound = true
+				if item.Element.Op() != opt.NullOp {
+					nonNullFound = true
 				}
 			}
 		}
@@ -790,21 +778,21 @@ func (sb *statisticsBuilder) colStatProject(
 		// above.
 		inputColStat := sb.colStatFromChild(reqInputCols, prj, 0 /* childIdx */)
 		colStat.DistinctCount = inputColStat.DistinctCount
-		if nullOpFound {
-			colStat.NullCount = s.RowCount
+		if nonNullFound {
+			colStat.NullCount = 0
 		} else {
 			colStat.NullCount = inputColStat.NullCount
 		}
 	} else {
 		// There are no columns in this expression, so it must be a constant.
 		colStat.DistinctCount = 1
-		if nullOpFound {
-			colStat.NullCount = s.RowCount
-		} else {
+		if nonNullFound {
 			colStat.NullCount = 0
+		} else {
+			colStat.NullCount = s.RowCount
 		}
 	}
-	if colSet.SubsetOf(relProps.NotNullCols) {
+	if colSet.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -945,6 +933,9 @@ func (sb *statisticsBuilder) buildJoin(
 		s.ApplySelectivity(sb.selectivityFromEquivalencies(equivReps, &h.filtersFD, join, s))
 	}
 
+	if join.Op() == opt.GeoLookupJoinOp {
+		s.ApplySelectivity(sb.selectivityFromGeoRelationship(join, s))
+	}
 	s.ApplySelectivity(sb.selectivityFromHistograms(histCols, join, s))
 	s.ApplySelectivity(sb.selectivityFromDistinctCounts(constrainedCols.Difference(histCols), join, s))
 	s.ApplySelectivity(sb.selectivityFromUnappliedConjuncts(numUnappliedConjuncts))
@@ -1019,6 +1010,8 @@ func (sb *statisticsBuilder) buildJoin(
 			join,
 			leftSideCols,
 			rightSideCols,
+			leftStats.RowCount,
+			rightStats.RowCount,
 		)
 
 		// Update all null counts not zeroed out in updateNullCountsFromProps
@@ -1036,7 +1029,7 @@ func (sb *statisticsBuilder) buildJoin(
 
 		switch h.joinType {
 		case opt.LeftJoinOp, opt.LeftJoinApplyOp, opt.RightJoinOp, opt.FullJoinOp:
-			if !colStat.Cols.SubsetOf(relProps.NotNullCols) {
+			if !colStat.Cols.Intersects(relProps.NotNullCols) {
 				sb.adjustNullCountsForOuterJoins(
 					colStat,
 					h.joinType,
@@ -1075,6 +1068,12 @@ func (sb *statisticsBuilder) colStatJoin(colSet opt.ColSet, join RelExpr) *props
 		joinType = j.JoinType
 		leftProps = j.Input.Relational()
 		ensureLookupJoinInputProps(j, sb)
+		rightProps = &j.lookupProps
+
+	case *GeoLookupJoinExpr:
+		joinType = j.JoinType
+		leftProps = j.Input.Relational()
+		ensureGeoLookupJoinInputProps(j, sb)
 		rightProps = &j.lookupProps
 
 	case *ZigzagJoinExpr:
@@ -1117,7 +1116,7 @@ func (sb *statisticsBuilder) colStatJoin(colSet opt.ColSet, join RelExpr) *props
 		//   columns.
 		var colStat *props.ColumnStatistic
 		inputRowCount := leftProps.Stats.RowCount * rightProps.Stats.RowCount
-		var leftNullCount, rightNullCount float64
+		leftNullCount, rightNullCount := leftProps.Stats.RowCount, rightProps.Stats.RowCount
 		if rightCols.Empty() {
 			colStat = sb.copyColStat(colSet, s, sb.colStatFromJoinLeft(colSet, join))
 			leftNullCount = colStat.NullCount
@@ -1183,7 +1182,7 @@ func (sb *statisticsBuilder) colStatJoin(colSet opt.ColSet, join RelExpr) *props
 			colStat.DistinctCount = max(colStat.DistinctCount, 1)
 		}
 
-		if colSet.SubsetOf(relProps.NotNullCols) {
+		if colSet.Intersects(relProps.NotNullCols) {
 			colStat.NullCount = 0
 		}
 		sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -1193,10 +1192,11 @@ func (sb *statisticsBuilder) colStatJoin(colSet opt.ColSet, join RelExpr) *props
 
 // leftRightNullCounts returns null counts on the left and right sides of the
 // specified join. If either leftCols or rightCols are empty, the corresponding
-// side's return value is zero.
+// side's return value is equal to the number of rows on that side.
 func (sb *statisticsBuilder) leftRightNullCounts(
-	e RelExpr, leftCols opt.ColSet, rightCols opt.ColSet,
+	e RelExpr, leftCols, rightCols opt.ColSet, leftRowCount, rightRowCount float64,
 ) (leftNullCount, rightNullCount float64) {
+	leftNullCount, rightNullCount = leftRowCount, rightRowCount
 	if !leftCols.Empty() {
 		leftColStat := sb.colStatFromJoinLeft(leftCols, e)
 		leftNullCount = leftColStat.NullCount
@@ -1211,12 +1211,12 @@ func (sb *statisticsBuilder) leftRightNullCounts(
 
 // innerJoinNullCount returns an estimate of the number of nulls in an inner
 // join with the specified column stats.
+//
+// The caller should ensure that if leftCols are empty then leftNullCount
+// equals leftRowCount, and if rightCols are empty then rightNullCount equals
+// rightRowCount.
 func innerJoinNullCount(
-	rowCount float64,
-	leftNullCount float64,
-	leftRowCount float64,
-	rightNullCount float64,
-	rightRowCount float64,
+	rowCount, leftNullCount, leftRowCount, rightNullCount, rightRowCount float64,
 ) float64 {
 	// Here, f1 and f2 are probabilities of nulls on either side of the join.
 	var f1, f2 float64
@@ -1227,61 +1227,46 @@ func innerJoinNullCount(
 		f2 = rightNullCount / rightRowCount
 	}
 
-	// Rough estimate of nulls in the combined result set,
-	// assuming independence.
-	return rowCount * (f1 + f2 - f1*f2)
+	// Rough estimate of nulls in the combined result set, assuming independence.
+	return rowCount * f1 * f2
 }
 
-// adjustNullCountsForOuterJoins modifies the null counts for the specified columns
-// to adjust for additional nulls created in this type of outer join. It first does
-// a max of the nulls on the appropriate side of the join (i.e. left for left, both
-// for full), and then adds an expected number of nulls created by column extension
-// on non-matching rows (such as on right cols for left joins and both for full).
+// adjustNullCountsForOuterJoins modifies the null counts for the specified
+// columns to adjust for additional nulls created in this type of outer join.
+// It adds an expected number of nulls created by column extension on
+// non-matching rows (such as on right cols for left joins and both for full).
+//
+// The caller should ensure that if leftCols are empty then leftNullCount
+// equals leftRowCount, and if rightCols are empty then rightNullCount equals
+// rightRowCount.
 func (sb *statisticsBuilder) adjustNullCountsForOuterJoins(
 	colStat *props.ColumnStatistic,
 	joinType opt.Operator,
-	leftCols opt.ColSet,
-	rightCols opt.ColSet,
-	leftNullCount float64,
-	leftRowCount float64,
-	rightNullCount float64,
-	rightRowCount float64,
-	rowCount float64,
-	innerJoinRowCount float64,
+	leftCols, rightCols opt.ColSet,
+	leftNullCount, leftRowCount, rightNullCount, rightRowCount, rowCount, innerJoinRowCount float64,
 ) {
-	// This switch is based on the same premise as the RowCount one in buildJoin.
-	// Adjust null counts for non-inner joins. The additive factor denotes
-	// nulls created due to column extension - such as right columns for non-matching
-	// rows in left joins.
+	// Adjust null counts for non-inner joins, adding nulls created due to column
+	// extension - such as right columns for non-matching rows in left joins.
 	switch joinType {
 	case opt.LeftJoinOp, opt.LeftJoinApplyOp:
-		// All nulls from left side should be in the result.
-		colStat.NullCount = max(colStat.NullCount, leftNullCount)
 		if !rightCols.Empty() {
-			colStat.NullCount += (rowCount - innerJoinRowCount) * (1 - leftNullCount/leftRowCount)
+			colStat.NullCount += (rowCount - innerJoinRowCount) * leftNullCount / leftRowCount
 		}
 
 	case opt.RightJoinOp:
-		// All nulls from right side should be in the result.
-		colStat.NullCount = max(colStat.NullCount, rightNullCount)
 		if !leftCols.Empty() {
-			colStat.NullCount += (rowCount - innerJoinRowCount) * (1 - rightNullCount/rightRowCount)
+			colStat.NullCount += (rowCount - innerJoinRowCount) * rightNullCount / rightRowCount
 		}
 
 	case opt.FullJoinOp:
-		// All nulls from both sides should be in the result.
-		leftJoinNullCount := max(colStat.NullCount, leftNullCount)
-		rightJoinNullCount := max(colStat.NullCount, rightNullCount)
-		colStat.NullCount = leftJoinNullCount + rightJoinNullCount - colStat.NullCount
-
 		leftJoinRowCount := max(innerJoinRowCount, leftRowCount)
 		rightJoinRowCount := max(innerJoinRowCount, rightRowCount)
 
 		if !leftCols.Empty() {
-			colStat.NullCount += (rightJoinRowCount - innerJoinRowCount) * (1 - rightNullCount/rightRowCount)
+			colStat.NullCount += (rightJoinRowCount - innerJoinRowCount) * rightNullCount / rightRowCount
 		}
 		if !rightCols.Empty() {
-			colStat.NullCount += (leftJoinRowCount - innerJoinRowCount) * (1 - leftNullCount/leftRowCount)
+			colStat.NullCount += (leftJoinRowCount - innerJoinRowCount) * leftNullCount / leftRowCount
 		}
 	}
 }
@@ -1339,7 +1324,7 @@ func (sb *statisticsBuilder) colStatIndexJoin(
 
 	colStat, _ := s.ColStats.Add(colSet)
 	colStat.DistinctCount = 1
-	colStat.NullCount = 0
+	colStat.NullCount = s.RowCount
 
 	// Some of the requested columns may be from the input index.
 	reqInputCols := colSet.Intersection(inputCols)
@@ -1369,13 +1354,13 @@ func (sb *statisticsBuilder) colStatIndexJoin(
 		colStat.DistinctCount *= lookupColStat.DistinctCount
 
 		// Assuming null columns are completely independent, calculate
-		// the expected value of having nulls in either column set.
+		// the expected value of having nulls in both column sets.
 		f1 := lookupColStat.NullCount / inputStats.RowCount
 		f2 := colStat.NullCount / inputStats.RowCount
-		colStat.NullCount = inputStats.RowCount * (f1 + f2 - f1*f2)
+		colStat.NullCount = inputStats.RowCount * f1 * f2
 	}
 
-	if colSet.SubsetOf(relProps.NotNullCols) {
+	if colSet.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -1497,7 +1482,7 @@ func (sb *statisticsBuilder) buildGroupBy(groupNode RelExpr, relProps *props.Rel
 	} else {
 		inputStats := sb.statsFromChild(groupNode, 0 /* childIdx */)
 
-		if groupingPrivate.ErrorOnDup {
+		if groupingPrivate.ErrorOnDup != "" {
 			// If any input group has more than one row, then the distinct operator
 			// will raise an error, so in non-error cases it has the same number of
 			// rows as its input.
@@ -1505,11 +1490,19 @@ func (sb *statisticsBuilder) buildGroupBy(groupNode RelExpr, relProps *props.Rel
 		} else {
 			// Estimate the row count based on the distinct count of the grouping
 			// columns. Non-scalar GroupBy should never increase the number of rows.
-			//
-			// TODO(itsbilal): Update null count here, using a formula similar to the
-			// ones in colStatGroupBy.
 			colStat := sb.copyColStatFromChild(groupingColSet, groupNode, s)
 			s.RowCount = min(colStat.DistinctCount, inputStats.RowCount)
+
+			// Update the null counts for the column statistic.
+			if groupNode.Op() != opt.UpsertDistinctOnOp {
+				// UpsertDistinctOp inherits NullCount from child, since it does not
+				// group NULL values. Other group by operators only have 1 possible
+				// null value.
+				colStat.NullCount = min(1, colStat.NullCount)
+			}
+			if groupingColSet.Intersects(relProps.NotNullCols) {
+				colStat.NullCount = 0
+			}
 		}
 	}
 
@@ -1546,7 +1539,7 @@ func (sb *statisticsBuilder) colStatGroupBy(
 		colStat = sb.copyColStatFromChild(colSet, groupNode, s)
 		inputColStat = sb.colStatFromChild(colSet, groupNode, 0 /* childIdx */)
 
-		if groupingPrivate.ErrorOnDup && colSet.Equals(groupingColSet) {
+		if groupingPrivate.ErrorOnDup != "" && colSet.Equals(groupingColSet) {
 			// If any input group has more than one row, then the distinct operator
 			// will raise an error, so in non-error cases its distinct count is the
 			// same as its row count.
@@ -1554,24 +1547,16 @@ func (sb *statisticsBuilder) colStatGroupBy(
 		}
 	}
 
-	if groupNode.Op() == opt.UpsertDistinctOnOp {
-		// UpsertDistinctOp inherits NullCount from child, since it does not group
-		// NULL values.
+	if groupNode.Op() == opt.UpsertDistinctOnOp || groupNode.Op() == opt.EnsureUpsertDistinctOnOp {
+		// UpsertDistinctOnOp and EnsureUpsertDistinctOnOp inherit NullCount from
+		// child, since they do not group NULL values.
 		colStat.NullCount = inputColStat.NullCount
 	} else {
-		// For null counts - we either only have 1 possible null value (if we're
-		// grouping on a single column), or we have as many nulls as in the grouping
-		// col set, multiplied by DistinctCount/RowCount - an inverse of a rough
-		// duplicate factor.
-		if groupingColSet.Len() == 1 {
-			colStat.NullCount = min(1, inputColStat.NullCount)
-		} else {
-			inputRowCount := sb.statsFromChild(groupNode, 0 /* childIdx */).RowCount
-			colStat.NullCount = (colStat.DistinctCount / inputRowCount) * inputColStat.NullCount
-		}
+		// For other group by operators, we only have 1 possible null value.
+		colStat.NullCount = min(1, inputColStat.NullCount)
 	}
 
-	if colSet.SubsetOf(relProps.NotNullCols) {
+	if colSet.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -1638,19 +1623,8 @@ func (sb *statisticsBuilder) colStatSetNodeImpl(
 
 	colStat, _ := s.ColStats.Add(outputCols)
 
-	// Use the actual null counts for bag operations, and normalize them for set
-	// operations.
 	leftNullCount := leftColStat.NullCount
 	rightNullCount := rightColStat.NullCount
-	switch setNode.Op() {
-	case opt.UnionOp, opt.IntersectOp, opt.ExceptOp:
-		// It's very difficult to make any determination about the null count when
-		// the number of output columns is greater than 1.
-		if len(setPrivate.OutCols) == 1 {
-			leftNullCount = min(1, leftNullCount)
-			rightNullCount = min(1, rightNullCount)
-		}
-	}
 
 	// These calculations are an upper bound on the distinct count. It's likely
 	// that there is some overlap between the two sets, but not full overlap.
@@ -1665,10 +1639,22 @@ func (sb *statisticsBuilder) colStatSetNodeImpl(
 
 	case opt.ExceptOp, opt.ExceptAllOp:
 		colStat.DistinctCount = leftColStat.DistinctCount
-		colStat.NullCount = leftNullCount
+		colStat.NullCount = max(leftNullCount-rightNullCount, 0)
 	}
 
-	if outputCols.SubsetOf(relProps.NotNullCols) {
+	// Use the actual null counts for bag operations, and normalize them for set
+	// operations.
+	switch setNode.Op() {
+	case opt.UnionOp, opt.IntersectOp:
+		colStat.NullCount = min(1, colStat.NullCount)
+	case opt.ExceptOp:
+		colStat.NullCount = min(1, colStat.NullCount)
+		if rightNullCount > 0 {
+			colStat.NullCount = 0
+		}
+	}
+
+	if outputCols.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -1705,17 +1691,16 @@ func (sb *statisticsBuilder) colStatValues(
 	// map to find the exact count of distinct values for the columns in colSet.
 	// Use a hash to combine column values (this does not have to be exact).
 	distinct := make(map[uint64]struct{}, values.Rows[0].ChildCount())
-	// Determine null count by looking at tuples that have at least one
-	// NullOp in them.
+	// Determine null count by looking at tuples that have only NullOps in them.
 	nullCount := 0
 	for _, row := range values.Rows {
 		// Use the FNV-1a algorithm. See comments for the interner class.
 		hash := uint64(offset64)
-		hasNull := false
+		hasNonNull := false
 		for i, elem := range row.(*TupleExpr).Elems {
 			if colSet.Contains(values.Cols[i]) {
-				if elem.Op() == opt.NullOp {
-					hasNull = true
+				if elem.Op() != opt.NullOp {
+					hasNonNull = true
 				}
 				// Use the pointer value of the scalar expression, since it's already
 				// been interned. Therefore, two expressions with the same pointer
@@ -1725,7 +1710,7 @@ func (sb *statisticsBuilder) colStatValues(
 				hash *= prime64
 			}
 		}
-		if hasNull {
+		if !hasNonNull {
 			nullCount++
 		}
 		distinct[hash] = struct{}{}
@@ -1778,7 +1763,7 @@ func (sb *statisticsBuilder) colStatLimit(
 
 	// Scale distinct count based on the selectivity of the limit operation.
 	colStat.ApplySelectivity(s.Selectivity, inputStats.RowCount)
-	if colSet.SubsetOf(relProps.NotNullCols) {
+	if colSet.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -1830,7 +1815,7 @@ func (sb *statisticsBuilder) colStatOffset(
 
 	// Scale distinct count based on the selectivity of the offset operation.
 	colStat.ApplySelectivity(s.Selectivity, inputStats.RowCount)
-	if colSet.SubsetOf(relProps.NotNullCols) {
+	if colSet.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -1860,7 +1845,7 @@ func (sb *statisticsBuilder) colStatMax1Row(
 	colStat, _ := s.ColStats.Add(colSet)
 	colStat.DistinctCount = 1
 	colStat.NullCount = s.RowCount * unknownNullCountRatio
-	if colSet.SubsetOf(max1Row.Relational().NotNullCols) {
+	if colSet.Intersects(max1Row.Relational().NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -1896,23 +1881,14 @@ func (sb *statisticsBuilder) colStatOrdinality(
 	if colSet.Contains(ord.ColID) {
 		// The ordinality column is a key, so every row is distinct.
 		colStat.DistinctCount = s.RowCount
-		if colSet.Len() == 1 {
-			// The generated column is the only column being requested.
-			colStat.NullCount = 0
-		} else {
-			// Copy NullCount from child.
-			colSetChild := colSet.Copy()
-			colSetChild.Remove(ord.ColID)
-			inputColStat := sb.colStatFromChild(colSetChild, ord, 0 /* childIdx */)
-			colStat.NullCount = inputColStat.NullCount
-		}
+		colStat.NullCount = 0
 	} else {
 		inputColStat := sb.colStatFromChild(colSet, ord, 0 /* childIdx */)
 		colStat.DistinctCount = inputColStat.DistinctCount
 		colStat.NullCount = inputColStat.NullCount
 	}
 
-	if colSet.SubsetOf(relProps.NotNullCols) {
+	if colSet.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -1978,7 +1954,7 @@ func (sb *statisticsBuilder) colStatWindow(
 		colStat.NullCount = inputColStat.NullCount
 	}
 
-	if colSet.SubsetOf(relProps.NotNullCols) {
+	if colSet.Intersects(relProps.NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -2039,7 +2015,7 @@ func (sb *statisticsBuilder) colStatProjectSet(
 
 	colStat, _ := s.ColStats.Add(colSet)
 	colStat.DistinctCount = 1
-	colStat.NullCount = 0
+	colStat.NullCount = s.RowCount
 
 	// Some of the requested columns may be from the input.
 	reqInputCols := colSet.Intersection(inputCols)
@@ -2056,7 +2032,7 @@ func (sb *statisticsBuilder) colStatProjectSet(
 		// Calculate the the distinct count and null count for the zip columns
 		// after the cross join has been applied.
 		zipColsDistinctCount := float64(1)
-		zipColsNullCount := float64(0)
+		zipColsNullCount := s.RowCount
 		for i := range projectSet.Zip {
 			item := &projectSet.Zip[i]
 			if item.Cols.ToSet().Intersects(reqZipCols) {
@@ -2066,7 +2042,7 @@ func (sb *statisticsBuilder) colStatProjectSet(
 					// requested columns correspond to, and estimate the distinct count and
 					// null count based on the type of generator function and its parameters.
 					zipColsDistinctCount *= unknownGeneratorRowCount * unknownGeneratorDistinctCountRatio
-					zipColsNullCount += (s.RowCount - zipColsNullCount) * unknownNullCountRatio
+					zipColsNullCount *= unknownNullCountRatio
 				} else {
 					// The columns(s) contain a scalar function or expression.
 					// These columns can contain many null values if the zip also
@@ -2085,9 +2061,9 @@ func (sb *statisticsBuilder) colStatProjectSet(
 					//
 					// After the cross product with the input, the total number of nulls
 					// for the column(s) equals (output row count - input row count).
-					// (Also subtract the expected chance of collisions with nulls
+					// (Also multiply by the expected chance of collisions with nulls
 					// already collected.)
-					zipColsNullCount += (s.RowCount - inputStats.RowCount) * (1 - zipColsNullCount/s.RowCount)
+					zipColsNullCount *= (s.RowCount - inputStats.RowCount) / s.RowCount
 				}
 
 				if item.ScalarProps().OuterCols.Intersects(inputProps.OutputCols) {
@@ -2105,13 +2081,13 @@ func (sb *statisticsBuilder) colStatProjectSet(
 		colStat.DistinctCount *= zipColsDistinctCount
 
 		// Assuming null columns are completely independent, calculate
-		// the expected value of having nulls in either column set.
+		// the expected value of having nulls in both column sets.
 		f1 := zipColsNullCount / s.RowCount
 		f2 := colStat.NullCount / s.RowCount
-		colStat.NullCount = s.RowCount * (f1 + f2 - f1*f2)
+		colStat.NullCount = s.RowCount * f1 * f2
 	}
 
-	if colSet.SubsetOf(projectSet.Relational().NotNullCols) {
+	if colSet.Intersects(projectSet.Relational().NotNullCols) {
 		colStat.NullCount = 0
 	}
 	sb.finalizeFromRowCount(colStat, s.RowCount)
@@ -2382,6 +2358,30 @@ func (sb *statisticsBuilder) rowsProcessed(e RelExpr) float64 {
 		withoutOn := e.Memo().MemoizeLookupJoin(t.Input, nil /* on */, lookupJoinPrivate)
 		return withoutOn.Relational().Stats.RowCount
 
+	case *GeoLookupJoinExpr:
+		var lookupJoinPrivate *GeoLookupJoinPrivate
+		switch t.JoinType {
+		case opt.SemiJoinOp, opt.SemiJoinApplyOp, opt.AntiJoinOp, opt.AntiJoinApplyOp:
+			// The number of rows processed for semi and anti joins is closer to the
+			// number of output rows for an equivalent inner join.
+			copy := t.GeoLookupJoinPrivate
+			copy.JoinType = semiAntiJoinToInnerJoin(t.JoinType)
+			lookupJoinPrivate = &copy
+
+		default:
+			if t.On.IsTrue() {
+				// If there are no additional ON filters, the number of rows processed
+				// equals the number of output rows.
+				return e.Relational().Stats.RowCount
+			}
+			lookupJoinPrivate = &t.GeoLookupJoinPrivate
+		}
+
+		// We need to determine the row count of the join before the
+		// ON conditions are applied.
+		withoutOn := e.Memo().MemoizeGeoLookupJoin(t.Input, nil /* on */, lookupJoinPrivate)
+		return withoutOn.Relational().Stats.RowCount
+
 	case *MergeJoinExpr:
 		var mergeJoinPrivate *MergeJoinPrivate
 		switch t.JoinType {
@@ -2518,6 +2518,11 @@ const (
 	// This is the minimum cardinality an expression should have in order to make
 	// it worth adding the overhead of using a histogram.
 	minCardinalityForHistogram = 100
+
+	// This is the default selectivity estimated for geospatial lookup joins
+	// until we can get better statistics on inverted indexes and geospatial
+	// columns.
+	unknownGeoRelationshipSelectivity = 1.0 / 100.0
 )
 
 // countJSONPaths returns the number of JSON paths in the specified
@@ -2672,17 +2677,22 @@ func (sb *statisticsBuilder) applyIndexConstraint(
 		return constrainedCols, histCols
 	}
 
-	// Calculate histogram.
-	inputStat, _ := sb.colStatFromInput(constrainedCols, e)
-	inputHist := inputStat.Histogram
-	if inputHist != nil && inputHist.CanFilter(c) {
-		s := &relProps.Stats
-		if colStat, ok := s.ColStats.Lookup(constrainedCols); ok {
-			colStat.Histogram = inputHist.Filter(c)
-			histCols = constrainedCols
-			sb.updateDistinctCountFromHistogram(colStat, inputStat.DistinctCount)
+	// Calculate histograms.
+	constrainedCols.ForEach(func(col opt.ColumnID) {
+		colSet := opt.MakeColSet(col)
+		inputStat, _ := sb.colStatFromInput(colSet, e)
+		inputHist := inputStat.Histogram
+		if inputHist != nil {
+			if _, ok := inputHist.CanFilter(c); ok {
+				s := &relProps.Stats
+				if colStat, ok := s.ColStats.Lookup(colSet); ok {
+					colStat.Histogram = inputHist.Filter(c)
+					histCols.Add(col)
+					sb.updateDistinctCountFromHistogram(colStat, inputStat.DistinctCount)
+				}
+			}
 		}
-	}
+	})
 
 	return constrainedCols, histCols
 }
@@ -2735,11 +2745,13 @@ func (sb *statisticsBuilder) applyConstraintSet(
 		cols := opt.MakeColSet(col)
 		inputStat, _ := sb.colStatFromInput(cols, e)
 		inputHist := inputStat.Histogram
-		if inputHist != nil && inputHist.CanFilter(c) {
-			if colStat, ok := s.ColStats.Lookup(cols); ok {
-				colStat.Histogram = inputHist.Filter(c)
-				histCols.UnionWith(cols)
-				sb.updateDistinctCountFromHistogram(colStat, inputStat.DistinctCount)
+		if inputHist != nil {
+			if _, ok := inputHist.CanFilter(c); ok {
+				if colStat, ok := s.ColStats.Lookup(cols); ok {
+					colStat.Histogram = inputHist.Filter(c)
+					histCols.UnionWith(cols)
+					sb.updateDistinctCountFromHistogram(colStat, inputStat.DistinctCount)
+				}
 			}
 		}
 	}
@@ -2981,7 +2993,7 @@ func (sb *statisticsBuilder) updateDistinctNullCountsFromEquivalency(
 		if !ok {
 			colStat, _ = sb.colStatFromInput(colSet, e)
 			colStat = sb.copyColStat(colSet, s, colStat)
-			if colStat.NullCount > 0 && colSet.SubsetOf(relProps.NotNullCols) {
+			if colStat.NullCount > 0 && colSet.Intersects(relProps.NotNullCols) {
 				colStat.NullCount = 0
 				colStat.DistinctCount = max(colStat.DistinctCount-1, epsilon)
 			}
@@ -3222,6 +3234,12 @@ func (sb *statisticsBuilder) selectivityFromEquivalencySemiJoin(
 	}
 
 	return fraction(minDistinctCountRight, maxDistinctCountLeft)
+}
+
+func (sb *statisticsBuilder) selectivityFromGeoRelationship(
+	e RelExpr, s *props.Statistics,
+) (selectivity float64) {
+	return unknownGeoRelationshipSelectivity
 }
 
 func (sb *statisticsBuilder) selectivityFromUnappliedConjuncts(

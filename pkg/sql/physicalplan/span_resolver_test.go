@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -45,7 +46,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 				UseDatabase: "t",
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	rowRanges, _ := setupRanges(
 		tc.Conns[0], tc.Servers[0], tc.Servers[0].DB(), t)
@@ -84,7 +85,9 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 
 	lr := physicalplan.NewSpanResolver(
 		s3.Cfg.Settings,
-		s3.DistSenderI().(*kvcoord.DistSender), s3.Gossip(), s3.GetNode().Descriptor, nil,
+		s3.DistSenderI().(*kvcoord.DistSender),
+		gossip.MakeExposedGossip(s3.Gossip()),
+		s3.GetNode().Descriptor, nil,
 		replicaoracle.BinPackingChoice)
 
 	var spans []spanWithDir
@@ -102,7 +105,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 
 	// Resolve the spans. Since the LeaseHolderCache is empty, all the ranges
 	// should be grouped and "assigned" to replica 0.
-	replicas, err := resolveSpans(context.TODO(), lr.NewSpanResolverIterator(nil), spans...)
+	replicas, err := resolveSpans(context.Background(), lr.NewSpanResolverIterator(nil), spans...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +132,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 	if err := populateCache(tc.Conns[3], 3 /* expectedNumRows */); err != nil {
 		t.Fatal(err)
 	}
-	replicas, err = resolveSpans(context.TODO(), lr.NewSpanResolverIterator(nil), spans...)
+	replicas, err = resolveSpans(context.Background(), lr.NewSpanResolverIterator(nil), spans...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,12 +188,13 @@ func TestSpanResolver(t *testing.T) {
 	s, db, cdb := serverutils.StartServer(t, base.TestServerArgs{
 		UseDatabase: "t",
 	})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	rowRanges, tableDesc := setupRanges(db, s.(*server.TestServer), cdb, t)
 	lr := physicalplan.NewSpanResolver(
 		s.(*server.TestServer).Cfg.Settings,
-		s.DistSenderI().(*kvcoord.DistSender), s.GossipI().(*gossip.Gossip),
+		s.DistSenderI().(*kvcoord.DistSender),
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
 		s.(*server.TestServer).GetNode().Descriptor, nil,
 		replicaoracle.BinPackingChoice)
 
@@ -279,12 +283,13 @@ func TestMixedDirections(t *testing.T) {
 	s, db, cdb := serverutils.StartServer(t, base.TestServerArgs{
 		UseDatabase: "t",
 	})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	rowRanges, tableDesc := setupRanges(db, s.(*server.TestServer), cdb, t)
 	lr := physicalplan.NewSpanResolver(
 		s.(*server.TestServer).Cfg.Settings,
-		s.DistSenderI().(*kvcoord.DistSender), s.GossipI().(*gossip.Gossip),
+		s.DistSenderI().(*kvcoord.DistSender),
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
 		s.(*server.TestServer).GetNode().Descriptor,
 		nil,
 		replicaoracle.BinPackingChoice)
@@ -327,7 +332,7 @@ func setupRanges(
 		}
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(cdb, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(cdb, keys.SystemSQLCodec, "t", "test")
 	// Split every SQL row to its own range.
 	rowRanges := make([]roachpb.RangeDescriptor, len(values))
 	for i, val := range values {

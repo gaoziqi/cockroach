@@ -56,6 +56,14 @@ const (
 	VersionCreateRolePrivilege
 	VersionStatementDiagnosticsSystemTables
 	VersionSchemaChangeJob
+	VersionSavepoints
+	VersionTimeTZType
+	VersionTimePrecision
+	Version20_1
+	VersionStart20_2
+	VersionGeospatialType
+	VersionEnums
+	VersionRangefeedLeases
 
 	// Add new versions here (step one of two).
 )
@@ -436,6 +444,55 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Key:     VersionSchemaChangeJob,
 		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 15},
 	},
+	{
+		// VersionSavepoints enables the use of SQL savepoints, whereby
+		// the ignored seqnum list can become populated in transaction
+		// records.
+		Key:     VersionSavepoints,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 16},
+	},
+	{
+		// VersionTimeTZType enables the use of the TimeTZ data type.
+		Key:     VersionTimeTZType,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 17},
+	},
+	{
+		// VersionTimePrecision enables the use of precision with time/intervals.
+		Key:     VersionTimePrecision,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 18},
+	},
+	{
+		// Version20_1 is CockroachDB v20.1. It's used for all v20.1.x patch releases.
+		Key:     Version20_1,
+		Version: roachpb.Version{Major: 20, Minor: 1},
+	},
+	{
+		// VersionStart20_2 demarcates work towards CockroachDB v20.2.
+		Key:     VersionStart20_2,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 1},
+	},
+	{
+
+		// VersionGeospatialType enables the use of Geospatial features.
+		Key:     VersionGeospatialType,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 2},
+	},
+	{
+		// VersionEnums enables the use of ENUM types.
+		Key:     VersionEnums,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 3},
+	},
+	{
+
+		// VersionRangefeedLeases is the enablement of leases uses rangefeeds.
+		// All nodes with this versions will have rangefeeds enabled on all system
+		// ranges. Once this version is finalized, gossip is not needed in the
+		// schema lease subsystem. Nodes which start with this version finalized
+		// will not pass gossip to the SQL layer.
+		Key:     VersionRangefeedLeases,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 4},
+	},
+
 	// Add new versions here (step two of two).
 
 })

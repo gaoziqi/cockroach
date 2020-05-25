@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
@@ -190,13 +190,11 @@ func TestEval(t *testing.T) {
 				// caught before execution.
 				return strings.TrimSpace(d.Expected)
 			}
-			typs := []types.T{*typedExpr.ResolvedType()}
+			typs := []*types.T{typedExpr.ResolvedType()}
 
 			// inputTyps has no relation to the actual expression result type. Used
 			// for generating a batch.
-			inputTyps := []types.T{*types.Int}
-			inputColTyps, err := typeconv.FromColumnTypes(inputTyps)
-			require.NoError(t, err)
+			inputTyps := []*types.T{types.Int}
 
 			batchesReturned := 0
 			args := colexec.NewColOperatorArgs{
@@ -212,14 +210,14 @@ func TestEval(t *testing.T) {
 						RenderExprs: []execinfrapb.Expression{{Expr: d.Input}},
 					},
 				},
-				Inputs: []colexec.Operator{
-					&colexec.CallbackOperator{
+				Inputs: []colexecbase.Operator{
+					&colexecbase.CallbackOperator{
 						NextCb: func(_ context.Context) coldata.Batch {
 							if batchesReturned > 0 {
 								return coldata.ZeroBatch
 							}
 							// It doesn't matter what types we create the input batch with.
-							batch := coldata.NewMemBatch(inputColTyps)
+							batch := coldata.NewMemBatch(inputTyps, coldata.StandardColumnFactory)
 							batch.SetLength(1)
 							batchesReturned++
 							return batch
@@ -246,9 +244,9 @@ func TestEval(t *testing.T) {
 				0, /* processorID */
 				result.Op,
 				typs,
-				&execinfrapb.PostProcessSpec{},
 				nil, /* output */
 				nil, /* metadataSourcesQueue */
+				nil, /* toClose */
 				nil, /* outputStatsToTrace */
 				nil, /* cancelFlow */
 			)
@@ -281,7 +279,7 @@ func TestEval(t *testing.T) {
 func optBuildScalar(evalCtx *tree.EvalContext, e tree.Expr) (tree.TypedExpr, error) {
 	var o xform.Optimizer
 	o.Init(evalCtx, nil /* catalog */)
-	b := optbuilder.NewScalar(context.TODO(), &tree.SemaContext{}, evalCtx, o.Factory())
+	b := optbuilder.NewScalar(context.Background(), &tree.SemaContext{}, evalCtx, o.Factory())
 	b.AllowUnsupportedExpr = true
 	if err := b.Build(e); err != nil {
 		return nil, err
@@ -318,10 +316,9 @@ func TestTimeConversion(t *testing.T) {
 		// %e (+ %Y %m)
 		{`2006 10  3`, `%Y %m %e`, `2006-10-03 00:00:00+00:00`, ``, ``},
 		// %f (+ %c)
-		{`Wed Oct 5 01:02:03 2016 .123`, `%c .%f`, `2016-10-05 01:02:03.123+00:00`, `.%f`, `.123000000`},
-		{`Wed Oct 5 01:02:03 2016 .123456`, `%c .%f`, `2016-10-05 01:02:03.123456+00:00`, `.%f`, `.123456000`},
-		{`Wed Oct 5 01:02:03 2016 .123456789`, `%c .%f`, `2016-10-05 01:02:03.123457+00:00`, `.%f`, `.123457000`},
-		{`Wed Oct 5 01:02:03 2016 .999999999`, `%c .%f`, `2016-10-05 01:02:04+00:00`, `.%f`, `.000000000`},
+		{`Wed Oct 5 01:02:03 2016 .123`, `%c .%f`, `2016-10-05 01:02:03.123+00:00`, `.%f`, `.123000`},
+		{`Wed Oct 5 01:02:03 2016 .123456`, `%c .%f`, `2016-10-05 01:02:03.123456+00:00`, `.%f`, `.123456`},
+		{`Wed Oct 5 01:02:03 2016 .999999`, `%c .%f`, `2016-10-05 01:02:03.999999+00:00`, `.%f`, `.999999`},
 		// %F
 		{`2006-10-03`, `%F`, `2006-10-03 00:00:00+00:00`, ``, ``},
 		// %h (+ %Y %d)

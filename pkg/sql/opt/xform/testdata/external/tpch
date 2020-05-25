@@ -95,8 +95,6 @@ sort
 # TODO:
 #   1. Join ordering
 #   2. Push down equivalent column comparisons
-#   3. Allow Select to be pushed below Ordinality used to add key column
-#   4. Add decorrelation rule for Ordinality/RowKey
 # --------------------------------------------------
 opt
 SELECT
@@ -1763,9 +1761,6 @@ sort
 # (past and pending) in the 7-year database. What would be the average yearly
 # gross (undiscounted) loss in revenue if orders for these parts with a quantity
 # of less than 20% of this average were no longer taken?
-#
-# TODO:
-#   1. Allow Select to be pushed below Ordinality used to add key column
 # --------------------------------------------------
 opt
 SELECT
@@ -1789,7 +1784,6 @@ WHERE
 project
  ├── columns: avg_yearly:45
  ├── cardinality: [1 - 1]
- ├── side-effects
  ├── key: ()
  ├── fd: ()-->(45)
  ├── scalar-group-by
@@ -1856,7 +1850,7 @@ project
  │         └── sum [as=sum:44, outer=(6)]
  │              └── l_extendedprice:6
  └── projections
-      └── sum:44 / 7.0 [as=avg_yearly:45, outer=(44), side-effects]
+      └── sum:44 / 7.0 [as=avg_yearly:45, outer=(44)]
 
 # --------------------------------------------------
 # Q18

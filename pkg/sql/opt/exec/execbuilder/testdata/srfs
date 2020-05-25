@@ -71,14 +71,14 @@ render                        ·            ·                      (a, b, gener
       │    │                  type         cross                  ·                                         ·
       │    ├── scan           ·            ·                      (b)                                       ·
       │    │                  table        u@primary              ·                                         ·
-      │    │                  spans        ALL                    ·                                         ·
+      │    │                  spans        FULL SCAN              ·                                         ·
       │    └── project set    ·            ·                      (generate_series, generate_series)        ·
       │         │             render 0     generate_series(1, 2)  ·                                         ·
       │         │             render 1     generate_series(3, 4)  ·                                         ·
       │         └── emptyrow  ·            ·                      ()                                        ·
       └── scan                ·            ·                      (a)                                       ·
 ·                             table        t@primary              ·                                         ·
-·                             spans        ALL                    ·                                         ·
+·                             spans        FULL SCAN              ·                                         ·
 
 subtest correlated_SRFs
 
@@ -96,7 +96,7 @@ sort              ·            ·                            (a, generate_serie
       │           render 0     generate_series(@1, @1 + 1)  ·                     ·
       └── scan    ·            ·                            (a)                   ·
 ·                 table        data@primary                 ·                     ·
-·                 spans        ALL                          ·                     ·
+·                 spans        FULL SCAN                    ·                     ·
 
 statement ok
 CREATE TABLE xy (x INT PRIMARY KEY, y INT)
@@ -109,7 +109,7 @@ EXPLAIN (VERBOSE) SELECT x, y, z, information_schema._pg_expandarray(ARRAY[x, y,
   FROM xy NATURAL JOIN xz WHERE y < z ORDER BY 1, 2, 3
 ----
 ·                               distributed         false                                                  ·                                                ·
-·                               vectorized          false                                                  ·                                                ·
+·                               vectorized          true                                                   ·                                                ·
 render                          ·                   ·                                                      (x, y, z, "information_schema._pg_expandarray")  ·
  │                              render 0            x                                                      ·                                                ·
  │                              render 1            y                                                      ·                                                ·
@@ -133,10 +133,10 @@ render                          ·                   ·                         
                      │          pred                y < z                                                  ·                                                ·
                      ├── scan   ·                   ·                                                      (x, y)                                           +x
                      │          table               xy@primary                                             ·                                                ·
-                     │          spans               ALL                                                    ·                                                ·
+                     │          spans               FULL SCAN                                              ·                                                ·
                      └── scan   ·                   ·                                                      (x, z)                                           +x
 ·                               table               xz@primary                                             ·                                                ·
-·                               spans               ALL                                                    ·                                                ·
+·                               spans               FULL SCAN                                              ·                                                ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT generate_series(x, z) FROM xz WHERE z < ANY(SELECT generate_series(x, y) FROM xy)
@@ -152,12 +152,12 @@ render                      ·            ·                        (generate_se
            │                pred         z < generate_series      ·                        ·
            ├── scan         ·            ·                        (x, z)                   ·
            │                table        xz@primary               ·                        ·
-           │                spans        ALL                      ·                        ·
+           │                spans        FULL SCAN                ·                        ·
            └── project set  ·            ·                        (x, y, generate_series)  ·
                 │           render 0     generate_series(@1, @2)  ·                        ·
                 └── scan    ·            ·                        (x, y)                   ·
 ·                           table        xy@primary               ·                        ·
-·                           spans        ALL                      ·                        ·
+·                           spans        FULL SCAN                ·                        ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT generate_subscripts(ARRAY[0, x, 1, 2]), generate_series(x, y), unnest(ARRAY[0, x, y, z]), y, z
@@ -183,36 +183,36 @@ render                ·                   ·                                   
            │          mergeJoinOrder      +"(x=x)"                                 ·                                                           ·
            ├── scan   ·                   ·                                        (x, y)                                                      +x
            │          table               xy@primary                               ·                                                           ·
-           │          spans               ALL                                      ·                                                           ·
+           │          spans               FULL SCAN                                ·                                                           ·
            └── scan   ·                   ·                                        (x, z)                                                      +x
 ·                     table               xz@primary                               ·                                                           ·
-·                     spans               ALL                                      ·                                                           ·
+·                     spans               FULL SCAN                                ·                                                           ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT generate_series((SELECT unnest(ARRAY[x, y]) FROM xy), z) FROM xz
 ----
-·                                distributed   false                                 ·                     ·
-·                                vectorized    true                                  ·                     ·
-root                             ·             ·                                     (generate_series)     ·
- ├── render                      ·             ·                                     (generate_series)     ·
- │    │                          render 0      generate_series                       ·                     ·
- │    └── project set            ·             ·                                     (z, generate_series)  ·
- │         │                     render 0      generate_series(@S1, @1)              ·                     ·
- │         └── scan              ·             ·                                     (z)                   ·
- │                               table         xz@primary                            ·                     ·
- │                               spans         ALL                                   ·                     ·
- └── subquery                    ·             ·                                     (generate_series)     ·
-      │                          id            @S1                                   ·                     ·
-      │                          original sql  (SELECT unnest(ARRAY[x, y]) FROM xy)  ·                     ·
-      │                          exec mode     one row                               ·                     ·
-      └── max1row                ·             ·                                     (unnest)              ·
-           └── render            ·             ·                                     (unnest)              ·
-                │                render 0      unnest                                ·                     ·
-                └── project set  ·             ·                                     (x, y, unnest)        ·
-                     │           render 0      unnest(ARRAY[@1, @2])                 ·                     ·
-                     └── scan    ·             ·                                     (x, y)                ·
-·                                table         xy@primary                            ·                     ·
-·                                spans         ALL                                   ·                     ·
+·                               distributed   false                                 ·                     ·
+·                               vectorized    true                                  ·                     ·
+root                            ·             ·                                     (generate_series)     ·
+ ├── render                     ·             ·                                     (generate_series)     ·
+ │    │                         render 0      generate_series                       ·                     ·
+ │    └── project set           ·             ·                                     (z, generate_series)  ·
+ │         │                    render 0      generate_series(@S1, @1)              ·                     ·
+ │         └── scan             ·             ·                                     (z)                   ·
+ │                              table         xz@primary                            ·                     ·
+ │                              spans         FULL SCAN                             ·                     ·
+ └── subquery                   ·             ·                                     ·                     ·
+      │                         id            @S1                                   ·                     ·
+      │                         original sql  (SELECT unnest(ARRAY[x, y]) FROM xy)  ·                     ·
+      │                         exec mode     one row                               ·                     ·
+      └── max1row               ·             ·                                     (unnest)              ·
+           └── render           ·             ·                                     (unnest)              ·
+                │               render 0      unnest                                ·                     ·
+                └── apply-join  ·             ·                                     (x, y, unnest)        ·
+                     │          type          inner                                 ·                     ·
+                     └── scan   ·             ·                                     (x, y)                ·
+·                               table         xy@primary                            ·                     ·
+·                               spans         FULL SCAN                             ·                     ·
 
 # Regression test for #24676.
 statement ok
@@ -229,18 +229,36 @@ EXPLAIN (VERBOSE) SELECT
 FROM
   groups g
 ----
-·                     distributed  false                     ·                                         ·
-·                     vectorized   false                     ·                                         ·
-render                ·            ·                         (group_name, jsonb_array_elements)        ·
- │                    render 0     data->>'name'             ·                                         ·
- │                    render 1     jsonb_array_elements      ·                                         ·
- └── project set      ·            ·                         (data, "?column?", jsonb_array_elements)  ·
-      │               render 0     jsonb_array_elements(@2)  ·                                         ·
-      └── apply-join  ·            ·                         (data, "?column?")                        ·
-           │          type         left outer                ·                                         ·
-           └── scan   ·            ·                         (data)                                    ·
-·                     table        groups@primary            ·                                         ·
-·                     spans        ALL                       ·                                         ·
+·                                   distributed         false                     ·                                             ·
+·                                   vectorized          true                      ·                                             ·
+render                              ·                   ·                         (group_name, jsonb_array_elements)            ·
+ │                                  render 0            data->>'name'             ·                                             ·
+ │                                  render 1            jsonb_array_elements      ·                                             ·
+ └── project set                    ·                   ·                         (id, data, "?column?", jsonb_array_elements)  ·
+      │                             render 0            jsonb_array_elements(@3)  ·                                             ·
+      └── distinct                  ·                   ·                         (id, data, "?column?")                        ·
+           │                        distinct on         id                        ·                                             ·
+           │                        error on duplicate  ·                         ·                                             ·
+           └── render               ·                   ·                         (id, data, "?column?")                        ·
+                │                   render 0            id                        ·                                             ·
+                │                   render 1            data                      ·                                             ·
+                │                   render 2            "?column?"                ·                                             ·
+                └── hash-join       ·                   ·                         (column8, id, data, column9, "?column?")      ·
+                     │              type                left outer                ·                                             ·
+                     │              equality            (column8) = (column9)     ·                                             ·
+                     ├── render     ·                   ·                         (column8, id, data)                           ·
+                     │    │         render 0            data->>'name'             ·                                             ·
+                     │    │         render 1            id                        ·                                             ·
+                     │    │         render 2            data                      ·                                             ·
+                     │    └── scan  ·                   ·                         (id, data)                                    ·
+                     │              table               groups@primary            ·                                             ·
+                     │              spans               FULL SCAN                 ·                                             ·
+                     └── render     ·                   ·                         (column9, "?column?")                         ·
+                          │         render 0            data->>'name'             ·                                             ·
+                          │         render 1            data->'members'           ·                                             ·
+                          └── scan  ·                   ·                         (data)                                        ·
+·                                   table               groups@primary            ·                                             ·
+·                                   spans               FULL SCAN                 ·                                             ·
 
 # Regression test for #32162.
 query TTTTT
@@ -275,7 +293,7 @@ ORDER BY a0.created_at
   OFFSET 0;
 ----
 ·                                     distributed  false                      ·                                                                                        ·
-·                                     vectorized   false                      ·                                                                                        ·
+·                                     vectorized   true                       ·                                                                                        ·
 limit                                 ·            ·                          (id, body, description, title, slug, tag_list, user_id, created_at, updated_at)          +created_at
  │                                    count        10                         ·                                                                                        ·
  └── sort                             ·            ·                          (id, body, description, title, slug, tag_list, user_id, created_at, updated_at)          +created_at
@@ -307,7 +325,7 @@ limit                                 ·            ·                          
                           │           render 0     unnest(@6)                 ·                                                                                        ·
                           └── scan    ·            ·                          (id, body, description, title, slug, tag_list, user_id, created_at, updated_at)          ·
 ·                                     table        articles@primary           ·                                                                                        ·
-·                                     spans        ALL                        ·                                                                                        ·
+·                                     spans        FULL SCAN                  ·                                                                                        ·
 
 # Regression test for #32723.
 query TTTTT

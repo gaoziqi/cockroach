@@ -33,9 +33,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -56,8 +56,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	crdberrors "github.com/cockroachdb/errors"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -789,7 +790,7 @@ func TestChangefeedSchemaChangeAllowBackfill(t *testing.T) {
 func fetchDescVersionModificationTime(
 	t testing.TB, db *gosql.DB, f cdctest.TestFeedFactory, tableName string, version int,
 ) hlc.Timestamp {
-	tblKey := roachpb.Key(keys.MakeTablePrefix(keys.DescriptorTableID))
+	tblKey := keys.SystemSQLCodec.TablePrefix(keys.DescriptorTableID)
 	header := roachpb.RequestHeader{
 		Key:    tblKey,
 		EndKey: tblKey.PrefixEnd(),
@@ -821,7 +822,7 @@ func fetchDescVersionModificationTime(
 				continue
 			}
 			k := it.UnsafeKey()
-			remaining, _, _, err := sqlbase.DecodeTableIDIndexID(k.Key)
+			remaining, _, _, err := keys.SystemSQLCodec.DecodeIndexPrefix(k.Key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -983,7 +984,7 @@ func TestChangefeedStopOnSchemaChange(t *testing.T) {
 		t.Helper()
 		for {
 			if ev, err := f.Next(); err != nil {
-				log.Infof(context.TODO(), "got event %v %v", ev, err)
+				log.Infof(context.Background(), "got event %v %v", ev, err)
 				tsStr = timestampStrFromError(t, err)
 				_ = f.Close()
 				return tsStr
@@ -2165,7 +2166,7 @@ func TestChangefeedProtectedTimestamps(t *testing.T) {
 				}
 			}
 		}
-		requestFilter = storagebase.ReplicaRequestFilter(func(
+		requestFilter = kvserverbase.ReplicaRequestFilter(func(
 			ctx context.Context, ba roachpb.BatchRequest,
 		) *roachpb.Error {
 			if ba.Txn == nil || ba.Txn.Name != "changefeed backfill" {
@@ -2203,8 +2204,8 @@ func TestChangefeedProtectedTimestamps(t *testing.T) {
 		}
 		mkCheckRecord = func(t *testing.T, tableID int) func(r *ptpb.Record) error {
 			expectedKeys := map[string]struct{}{
-				string(keys.MakeTablePrefix(uint32(tableID))):        {},
-				string(keys.MakeTablePrefix(keys.DescriptorTableID)): {},
+				string(keys.SystemSQLCodec.TablePrefix(uint32(tableID))):        {},
+				string(keys.SystemSQLCodec.TablePrefix(keys.DescriptorTableID)): {},
 			}
 			return func(ptr *ptpb.Record) error {
 				if ptr == nil {
@@ -2308,6 +2309,82 @@ func TestChangefeedProtectedTimestamps(t *testing.T) {
 		}))
 }
 
+func TestChangefeedProtectedTimestampOnPause(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	defer func(i time.Duration) { jobs.DefaultAdoptInterval = i }(jobs.DefaultAdoptInterval)
+	jobs.DefaultAdoptInterval = 10 * time.Millisecond
+
+	testutils.RunTrueAndFalse(t, "protect_on_pause", func(t *testing.T, shouldPause bool) {
+		t.Run(`enterprise`, enterpriseTest(func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+			sqlDB := sqlutils.MakeSQLRunner(db)
+			sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+			sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'a'), (2, 'b'), (4, 'c'), (7, 'd'), (8, 'e')`)
+
+			var tableID int
+			sqlDB.QueryRow(t, `SELECT table_id FROM crdb_internal.tables `+
+				`WHERE name = 'foo' AND database_name = current_database()`).
+				Scan(&tableID)
+			stmt := `CREATE CHANGEFEED FOR foo WITH resolved`
+			if shouldPause {
+				stmt += ", " + changefeedbase.OptProtectDataFromGCOnPause
+			}
+			foo := feed(t, f, stmt).(*cdctest.TableFeed)
+			defer closeFeed(t, foo)
+			assertPayloads(t, foo, []string{
+				`foo: [1]->{"after": {"a": 1, "b": "a"}}`,
+				`foo: [2]->{"after": {"a": 2, "b": "b"}}`,
+				`foo: [4]->{"after": {"a": 4, "b": "c"}}`,
+				`foo: [7]->{"after": {"a": 7, "b": "d"}}`,
+				`foo: [8]->{"after": {"a": 8, "b": "e"}}`,
+			})
+			expectResolvedTimestamp(t, foo)
+
+			// Pause the job then ensure that it has a reasonable protected timestamp.
+
+			ctx := context.Background()
+			serverCfg := f.Server().DistSQLServer().(*distsql.ServerImpl).ServerConfig
+			jr := serverCfg.JobRegistry
+			pts := serverCfg.ProtectedTimestampProvider
+
+			require.NoError(t, foo.Pause())
+			{
+				j, err := jr.LoadJob(ctx, foo.JobID)
+				require.NoError(t, err)
+				progress := j.Progress()
+				details := progress.Details.(*jobspb.Progress_Changefeed).Changefeed
+				if shouldPause {
+					require.NotEqual(t, uuid.Nil, details.ProtectedTimestampRecord)
+					var r *ptpb.Record
+					require.NoError(t, serverCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+						r, err = pts.GetRecord(ctx, txn, details.ProtectedTimestampRecord)
+						return err
+					}))
+					require.Equal(t, r.Timestamp, *progress.GetHighWater())
+				} else {
+					require.Equal(t, uuid.Nil, details.ProtectedTimestampRecord)
+				}
+			}
+
+			// Resume the job and ensure that the protected timestamp is removed once
+			// the changefeed has caught up.
+			require.NoError(t, foo.Resume())
+			testutils.SucceedsSoon(t, func() error {
+				expectResolvedTimestamp(t, foo)
+				j, err := jr.LoadJob(ctx, foo.JobID)
+				require.NoError(t, err)
+				details := j.Progress().Details.(*jobspb.Progress_Changefeed).Changefeed
+				if details.ProtectedTimestampRecord != uuid.Nil {
+					return fmt.Errorf("expected no protected timestamp record")
+				}
+				return nil
+			})
+
+		}))
+	})
+
+}
+
 // This test ensures that the changefeed attempts to verify its initial protected
 // timestamp record and that when that verification fails, the job is canceled
 // and the record removed.
@@ -2318,7 +2395,7 @@ func TestChangefeedProtectedTimestampsVerificationFails(t *testing.T) {
 	jobs.DefaultAdoptInterval = 10 * time.Millisecond
 
 	verifyRequestCh := make(chan *roachpb.AdminVerifyProtectedTimestampRequest, 1)
-	requestFilter := storagebase.ReplicaRequestFilter(func(
+	requestFilter := kvserverbase.ReplicaRequestFilter(func(
 		ctx context.Context, ba roachpb.BatchRequest,
 	) *roachpb.Error {
 		if r, ok := ba.GetArg(roachpb.AdminVerifyProtectedTimestamp); ok {
@@ -2335,7 +2412,7 @@ func TestChangefeedProtectedTimestampsVerificationFails(t *testing.T) {
 			args.Knobs.Store = storeKnobs
 		},
 		func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-			ctx := context.TODO()
+			ctx := context.Background()
 			sqlDB := sqlutils.MakeSQLRunner(db)
 			sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 			_, err := f.Feed(`CREATE CHANGEFEED FOR foo WITH resolved`)

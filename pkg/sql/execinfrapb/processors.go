@@ -26,7 +26,7 @@ import (
 // GetAggregateInfo returns the aggregate constructor and the return type for
 // the given aggregate function when applied on the given type.
 func GetAggregateInfo(
-	fn AggregatorSpec_Func, inputTypes ...types.T,
+	fn AggregatorSpec_Func, inputTypes ...*types.T,
 ) (
 	aggregateConstructor func(*tree.EvalContext, tree.Datums) tree.AggregateFunc,
 	returnType *types.T,
@@ -38,11 +38,7 @@ func GetAggregateInfo(
 		if len(inputTypes) != 1 {
 			return nil, nil, errors.Errorf("any_not_null aggregate needs 1 input")
 		}
-		return builtins.NewAnyNotNullAggregate, &inputTypes[0], nil
-	}
-	datumTypes := make([]*types.T, len(inputTypes))
-	for i := range inputTypes {
-		datumTypes[i] = &inputTypes[i]
+		return builtins.NewAnyNotNullAggregate, inputTypes[0], nil
 	}
 
 	props, builtins := builtins.GetBuiltinProperties(strings.ToLower(fn.String()))
@@ -53,8 +49,8 @@ func GetAggregateInfo(
 		}
 		match := true
 		for i, t := range typs {
-			if !datumTypes[i].Equivalent(t) {
-				if props.NullableArgs && datumTypes[i].IsAmbiguous() {
+			if !inputTypes[i].Equivalent(t) {
+				if props.NullableArgs && inputTypes[i].IsAmbiguous() {
 					continue
 				}
 				match = false
@@ -64,7 +60,7 @@ func GetAggregateInfo(
 		if match {
 			// Found!
 			constructAgg := func(evalCtx *tree.EvalContext, arguments tree.Datums) tree.AggregateFunc {
-				return b.AggregateFunc(datumTypes, evalCtx, arguments)
+				return b.AggregateFunc(inputTypes, evalCtx, arguments)
 			}
 
 			colTyp := b.FixedReturnType()
@@ -102,9 +98,8 @@ func (a AggregatorSpec_Aggregation) Equals(b AggregatorSpec_Aggregation) bool {
 	return true
 }
 
-// IsScalarAggregate returns whether the aggregate function is in scalar
-// context.
-func IsScalarAggregate(spec *AggregatorSpec) bool {
+// IsScalar returns whether the aggregate function is in scalar context.
+func (spec *AggregatorSpec) IsScalar() bool {
 	switch spec.Type {
 	case AggregatorSpec_SCALAR:
 		return true
@@ -116,10 +111,20 @@ func IsScalarAggregate(spec *AggregatorSpec) bool {
 	}
 }
 
+// IsRowCount returns true if the aggregator spec is scalar and has a single
+// COUNT_ROWS aggregation with no FILTER or DISTINCT.
+func (spec *AggregatorSpec) IsRowCount() bool {
+	return len(spec.Aggregations) == 1 &&
+		spec.Aggregations[0].FilterColIdx == nil &&
+		spec.Aggregations[0].Func == AggregatorSpec_COUNT_ROWS &&
+		!spec.Aggregations[0].Distinct &&
+		spec.IsScalar()
+}
+
 // GetWindowFunctionInfo returns windowFunc constructor and the return type
 // when given fn is applied to given inputTypes.
 func GetWindowFunctionInfo(
-	fn WindowerSpec_Func, inputTypes ...types.T,
+	fn WindowerSpec_Func, inputTypes ...*types.T,
 ) (windowConstructor func(*tree.EvalContext) tree.WindowFunc, returnType *types.T, err error) {
 	if fn.AggregateFunc != nil && *fn.AggregateFunc == AggregatorSpec_ANY_NOT_NULL {
 		// The ANY_NOT_NULL builtin does not have a fixed return type;
@@ -127,11 +132,7 @@ func GetWindowFunctionInfo(
 		if len(inputTypes) != 1 {
 			return nil, nil, errors.Errorf("any_not_null aggregate needs 1 input")
 		}
-		return builtins.NewAggregateWindowFunc(builtins.NewAnyNotNullAggregate), &inputTypes[0], nil
-	}
-	datumTypes := make([]*types.T, len(inputTypes))
-	for i := range inputTypes {
-		datumTypes[i] = &inputTypes[i]
+		return builtins.NewAggregateWindowFunc(builtins.NewAnyNotNullAggregate), inputTypes[0], nil
 	}
 
 	var funcStr string
@@ -152,8 +153,8 @@ func GetWindowFunctionInfo(
 		}
 		match := true
 		for i, t := range typs {
-			if !datumTypes[i].Equivalent(t) {
-				if props.NullableArgs && datumTypes[i].IsAmbiguous() {
+			if !inputTypes[i].Equivalent(t) {
+				if props.NullableArgs && inputTypes[i].IsAmbiguous() {
 					continue
 				}
 				match = false
@@ -163,7 +164,7 @@ func GetWindowFunctionInfo(
 		if match {
 			// Found!
 			constructAgg := func(evalCtx *tree.EvalContext) tree.WindowFunc {
-				return b.WindowFunc(datumTypes, evalCtx)
+				return b.WindowFunc(inputTypes, evalCtx)
 			}
 			return constructAgg, b.FixedReturnType(), nil
 		}
@@ -254,7 +255,7 @@ func (spec *WindowerSpec_Frame_Bounds) initFromAST(
 				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "invalid preceding or following size in window function")
 			}
 			typ := dStartOffset.ResolvedType()
-			spec.Start.OffsetType = DatumInfo{Encoding: sqlbase.DatumEncoding_VALUE, Type: *typ}
+			spec.Start.OffsetType = DatumInfo{Encoding: sqlbase.DatumEncoding_VALUE, Type: typ}
 			var buf []byte
 			var a sqlbase.DatumAlloc
 			datum := sqlbase.DatumToEncDatum(typ, dStartOffset)
@@ -298,7 +299,7 @@ func (spec *WindowerSpec_Frame_Bounds) initFromAST(
 					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "invalid preceding or following size in window function")
 				}
 				typ := dEndOffset.ResolvedType()
-				spec.End.OffsetType = DatumInfo{Encoding: sqlbase.DatumEncoding_VALUE, Type: *typ}
+				spec.End.OffsetType = DatumInfo{Encoding: sqlbase.DatumEncoding_VALUE, Type: typ}
 				var buf []byte
 				var a sqlbase.DatumAlloc
 				datum := sqlbase.DatumToEncDatum(typ, dEndOffset)

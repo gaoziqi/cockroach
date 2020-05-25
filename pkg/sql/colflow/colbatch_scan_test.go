@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -50,13 +51,15 @@ func BenchmarkColBatchScan(b *testing.B) {
 			numRows,
 			sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(42)),
 		)
-		tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", tableName)
+		tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
 			spec := execinfrapb.ProcessorSpec{
 				Core: execinfrapb.ProcessorCoreUnion{
 					TableReader: &execinfrapb.TableReaderSpec{
 						Table: *tableDesc,
-						Spans: []execinfrapb.TableReaderSpan{{Span: tableDesc.PrimaryIndexSpan()}},
+						Spans: []execinfrapb.TableReaderSpan{
+							{Span: tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)},
+						},
 					}},
 				Post: execinfrapb.PostProcessSpec{
 					Projection:    true,
@@ -71,7 +74,7 @@ func BenchmarkColBatchScan(b *testing.B) {
 				EvalCtx: &evalCtx,
 				Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 				Txn:     kv.NewTxn(ctx, s.DB(), s.NodeID()),
-				NodeID:  s.NodeID(),
+				NodeID:  evalCtx.NodeID,
 			}
 
 			b.SetBytes(int64(numRows * numCols * 8))

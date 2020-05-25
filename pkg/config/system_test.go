@@ -14,7 +14,6 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -33,7 +32,7 @@ func plainKV(k, v string) roachpb.KeyValue {
 }
 
 func tkey(tableID uint32, chunks ...string) []byte {
-	key := keys.MakeTablePrefix(tableID)
+	key := keys.SystemSQLCodec.TablePrefix(tableID)
 	for _, c := range chunks {
 		key = append(key, []byte(c)...)
 	}
@@ -49,7 +48,7 @@ func sqlKV(tableID uint32, indexID, descriptorID uint64) roachpb.KeyValue {
 }
 
 func descriptor(descriptorID uint64) roachpb.KeyValue {
-	return kv(sqlbase.MakeDescMetadataKey(sqlbase.ID(descriptorID)), nil)
+	return kv(sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(descriptorID)), nil)
 }
 
 func zoneConfig(descriptorID uint32, spans ...zonepb.SubzoneSpan) roachpb.KeyValue {
@@ -162,10 +161,10 @@ func TestGetLargestID(t *testing.T) {
 
 		// Real SQL layout.
 		func() testCase {
-			ms := sqlbase.MakeMetadataSchema(zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
+			ms := sqlbase.MakeMetadataSchema(keys.SystemSQLCodec, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
 			descIDs := ms.DescriptorIDs()
 			maxDescID := descIDs[len(descIDs)-1]
-			kvs, _ /* splits */ := ms.GetInitialValues(clusterversion.TestingClusterVersion)
+			kvs, _ /* splits */ := ms.GetInitialValues()
 			return testCase{kvs, uint32(maxDescID), 0, ""}
 		}(),
 
@@ -258,7 +257,9 @@ func TestComputeSplitKeySystemRanges(t *testing.T) {
 	}
 
 	cfg := config.NewSystemConfig(zonepb.DefaultZoneConfigRef())
-	kvs, _ /* splits */ := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, zonepb.DefaultSystemZoneConfigRef()).GetInitialValues(clusterversion.TestingClusterVersion)
+	kvs, _ /* splits */ := sqlbase.MakeMetadataSchema(
+		keys.SystemSQLCodec, cfg.DefaultZoneConfig, zonepb.DefaultSystemZoneConfigRef(),
+	).GetInitialValues()
 	cfg.SystemConfigEntries = config.SystemConfigEntries{
 		Values: kvs,
 	}
@@ -288,11 +289,13 @@ func TestComputeSplitKeyTableIDs(t *testing.T) {
 	// separately above.
 	minKey := roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd())
 
-	schema := sqlbase.MakeMetadataSchema(zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
+	schema := sqlbase.MakeMetadataSchema(
+		keys.SystemSQLCodec, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef(),
+	)
 	// Real system tables only.
-	baseSql, _ /* splits */ := schema.GetInitialValues(clusterversion.TestingClusterVersion)
+	baseSql, _ /* splits */ := schema.GetInitialValues()
 	// Real system tables plus some user stuff.
-	kvs, _ /* splits */ := schema.GetInitialValues(clusterversion.TestingClusterVersion)
+	kvs, _ /* splits */ := schema.GetInitialValues()
 	userSQL := append(kvs, descriptor(start), descriptor(start+1), descriptor(start+5))
 	// Real system tables and partitioned user tables.
 	var subzoneSQL = make([]roachpb.KeyValue, len(userSQL))
@@ -396,7 +399,7 @@ func TestGetZoneConfigForKey(t *testing.T) {
 		{roachpb.RKey(keys.SystemPrefix.Next()), keys.SystemRangesID},
 		{roachpb.RKey(keys.MigrationLease), keys.SystemRangesID},
 		{roachpb.RKey(keys.NodeLivenessPrefix), keys.LivenessRangesID},
-		{roachpb.RKey(keys.DescIDGenerator), keys.SystemRangesID},
+		{roachpb.RKey(keys.SystemSQLCodec.DescIDSequenceKey()), keys.SystemRangesID},
 		{roachpb.RKey(keys.NodeIDGenerator), keys.SystemRangesID},
 		{roachpb.RKey(keys.RangeIDGenerator), keys.SystemRangesID},
 		{roachpb.RKey(keys.StoreIDGenerator), keys.SystemRangesID},
@@ -434,7 +437,9 @@ func TestGetZoneConfigForKey(t *testing.T) {
 	}()
 	cfg := config.NewSystemConfig(zonepb.DefaultZoneConfigRef())
 
-	kvs, _ /* splits */ := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, zonepb.DefaultSystemZoneConfigRef()).GetInitialValues(clusterversion.TestingClusterVersion)
+	kvs, _ /* splits */ := sqlbase.MakeMetadataSchema(
+		keys.SystemSQLCodec, cfg.DefaultZoneConfig, zonepb.DefaultSystemZoneConfigRef(),
+	).GetInitialValues()
 	cfg.SystemConfigEntries = config.SystemConfigEntries{
 		Values: kvs,
 	}

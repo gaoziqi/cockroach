@@ -13,11 +13,13 @@ package sql
 import (
 	"context"
 	"math"
+	"strings"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -60,14 +62,14 @@ type InternalExecutor struct {
 	// the executor will run on copies of this data.
 	sessionData *sessiondata.SessionData
 
-	// The internal executor uses its own TableCollection. A TableCollection
+	// The internal executor uses its own Collection. A Collection
 	// is a schema cache for each transaction and contains data like the schema
 	// modified by a transaction. Occasionally an internal executor is called
 	// within the context of a transaction that has modified the schema, the
 	// internal executor should see the modified schema. This interface allows
-	// the internal executor to modify its TableCollection to match the
-	// TableCollection of the parent executor.
-	tcModifier tableCollectionModifier
+	// the internal executor to modify its Collection to match the
+	// Collection of the parent executor.
+	tcModifier descs.ModifiedCollectionCopier
 }
 
 // MakeInternalExecutor creates an InternalExecutor.
@@ -110,7 +112,6 @@ func (ie *InternalExecutor) initConnEx(
 	ctx context.Context,
 	txn *kv.Txn,
 	sd *sessiondata.SessionData,
-	sdMut sessionDataMutator,
 	syncCallback func([]resWithPos),
 	errCallback func(error),
 ) (*StmtBuf, *sync.WaitGroup, error) {
@@ -120,23 +121,41 @@ func (ie *InternalExecutor) initConnEx(
 		lastDelivered: -1,
 	}
 
+	// When the connEx is serving an internal executor, it can inherit the
+	// application name from an outer session. This happens e.g. during ::regproc
+	// casts and built-in functions that use SQL internally. In that case, we do
+	// not want to record statistics against the outer application name directly;
+	// instead we want to use a separate bucket. However we will still want to
+	// have separate buckets for different applications so that we can measure
+	// their respective "pressure" on internal queries. Hence the choice here to
+	// add the delegate prefix to the current app name.
+	var appStatsBucketName string
+	if !strings.HasPrefix(sd.ApplicationName, sqlbase.InternalAppNamePrefix) {
+		appStatsBucketName = sqlbase.DelegatedAppNamePrefix + sd.ApplicationName
+	} else {
+		// If this is already an "internal app", don't put more prefix.
+		appStatsBucketName = sd.ApplicationName
+	}
+	appStats := ie.s.sqlStats.getStatsForApplication(appStatsBucketName)
+
 	stmtBuf := NewStmtBuf()
 	var ex *connExecutor
-	var err error
 	if txn == nil {
-		ex, err = ie.s.newConnExecutor(
+		ex = ie.s.newConnExecutor(
 			ctx,
-			sd, &sdMut,
+			sd,
+			nil, /* sdDefaults */
 			stmtBuf,
 			clientComm,
 			ie.memMetrics,
 			&ie.s.InternalMetrics,
-			dontResetSessionDataToDefaults,
+			appStats,
 		)
 	} else {
-		ex, err = ie.s.newConnExecutorWithTxn(
+		ex = ie.s.newConnExecutorWithTxn(
 			ctx,
-			sd, &sdMut,
+			sd,
+			nil, /* sdDefaults */
 			stmtBuf,
 			clientComm,
 			ie.mon,
@@ -144,11 +163,8 @@ func (ie *InternalExecutor) initConnEx(
 			&ie.s.InternalMetrics,
 			txn,
 			ie.tcModifier,
-			dontResetSessionDataToDefaults,
+			appStats,
 		)
-	}
-	if err != nil {
-		return nil, nil, err
 	}
 	ex.executorType = executorTypeInternal
 
@@ -371,7 +387,6 @@ func (ie *InternalExecutor) execInternal(
 	if sd.ApplicationName == "" {
 		sd.ApplicationName = sqlbase.InternalAppNamePrefix + "-" + opName
 	}
-	sdMutator := ie.s.makeSessionDataMutator(sd, nil /* defaults */)
 
 	defer func() {
 		// We wrap errors with the opName, but not if they're retriable - in that
@@ -424,14 +439,17 @@ func (ie *InternalExecutor) execInternal(
 		}
 		resCh <- result{err: err}
 	}
-	stmtBuf, wg, err := ie.initConnEx(ctx, txn, sd, sdMutator, syncCallback, errCallback)
+	stmtBuf, wg, err := ie.initConnEx(ctx, txn, sd, syncCallback, errCallback)
 	if err != nil {
 		return result{}, err
 	}
 
 	// Transforms the args to datums. The datum types will be passed as type hints
 	// to the PrepareStmt command.
-	datums := golangFillQueryArguments(qargs...)
+	datums, err := golangFillQueryArguments(qargs...)
+	if err != nil {
+		return result{}, err
+	}
 	typeHints := make(tree.PlaceholderTypes, len(datums))
 	for i, d := range datums {
 		// Arg numbers start from 1.

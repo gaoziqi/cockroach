@@ -1,0 +1,361 @@
+statement error pq: unimplemented: DROP TYPE
+DROP TYPE mytype
+
+statement error pq: unimplemented: DROP TYPE
+DROP TYPE IF EXISTS mytype
+
+statement ok
+CREATE TYPE t AS ENUM ()
+
+statement error pq: relation "t" does not exist
+SELECT * FROM t
+
+statement error pq: type "t" already exists
+CREATE TABLE t (x INT)
+
+statement error pq: type "t" already exists
+CREATE TYPE t AS ENUM ()
+
+statement ok
+CREATE TABLE torename (x INT)
+
+statement error pq: type "t" already exists
+ALTER TABLE torename RENAME TO t
+
+statement ok
+CREATE DATABASE db2;
+CREATE TYPE db2.t AS ENUM ()
+
+statement error pq: relation "db2.t" does not exist
+SELECT * FROM db2.t
+
+statement error pq: type "db2.public.t" already exists
+CREATE TYPE db2.t AS ENUM ()
+
+# Regression for #48537. Dropping a table with a type name caused a panic.
+statement error pq: relation "t" does not exist
+DROP TABLE t
+
+statement error pq: enum definition contains duplicate value "dup"
+CREATE TYPE bad AS ENUM ('dup', 'dup')
+
+# Duplicates with different casing count as different.
+statement ok
+CREATE TYPE notbad AS ENUM ('dup', 'DUP')
+
+# Test that we can create types that shadow builtin type names,
+# but in different schemas.
+statement ok
+CREATE TYPE int AS ENUM ('Z', 'S of int')
+
+statement error pq: could not parse "Z" as type int
+SELECT 'Z'::int
+
+query T
+SELECT 'Z'::public.int
+----
+Z
+
+query T
+SELECT 'Z'::"int"
+----
+Z
+
+statement ok
+CREATE TYPE greeting AS ENUM ('hello', 'howdy', 'hi')
+
+# Test that we can only reference greeting with the right qualification.
+statement error pq: type "pg_catalog.greeting" does not exist
+SELECT 'hello'::pg_catalog.greeting
+
+query T
+SELECT 'hello'::public.greeting
+----
+hello
+
+# Test some expression evaluation on enums.
+# These test should live in TestEval, but it is difficult to adjust the
+# test to handle creation of user defined types.
+query TTT
+SELECT 'hello'::greeting, 'howdy'::greeting, 'hi'::greeting
+----
+hello howdy hi
+
+# Test type annotations.
+query TTT
+SELECT 'hello':::greeting, 'howdy':::greeting, 'hi':::greeting
+----
+hello howdy hi
+
+statement error pq: invalid input value for enum greeting: "goodbye"
+SELECT 'goodbye'::greeting
+
+query T
+SELECT 'hello'::greeting::string
+----
+hello
+
+query BBBBBBBBBBB
+SELECT 'hello'::greeting < 'howdy'::greeting,
+       'howdy'::greeting < 'hi',
+       'hi' > 'hello'::greeting,
+       'howdy'::greeting < 'hello'::greeting,
+       'hi'::greeting <= 'hi',
+       NULL < 'hello'::greeting,
+       'hi'::greeting < NULL,
+       'hello'::greeting = 'hello'::greeting,
+       'hello' != 'hi'::greeting,
+       'howdy'::greeting IS NOT DISTINCT FROM NULL,
+       'hello'::greeting IN ('hi'::greeting, 'howdy'::greeting, 'hello'::greeting)
+----
+true true true false true NULL NULL true true false true
+
+statement ok
+CREATE TYPE farewell AS ENUM ('bye', 'seeya')
+
+statement error pq: unsupported comparison operator: <greeting> = <farewell>
+SELECT 'hello'::greeting = 'bye'::farewell
+
+statement error pq: unsupported comparison operator: <greeting> < <farewell>
+SELECT 'hello'::greeting < 'bye'::farewell
+
+statement error pq: unsupported comparison operator: <greeting> <= <farewell>
+SELECT 'hello'::greeting <= 'bye'::farewell
+
+query T
+SELECT 'hello'::greeting::greeting
+----
+hello
+
+statement ok
+CREATE TYPE greeting2 AS ENUM ('hello')
+
+statement error pq: invalid cast: greeting -> greeting2
+SELECT 'hello'::greeting::greeting2
+
+# Ensure that we can perform a limited form of implicit casts for
+# the case of ENUM binary operations with strings.
+query BB
+SELECT 'hello'::greeting != 'howdy', 'hi' > 'hello'::greeting
+----
+true true
+
+# Check that the implicit cast gives an appropriate error message
+# when firing but unable to complete the type check.
+statement error pq: invalid input value for enum greeting: "notagreeting"
+SELECT 'hello'::greeting = 'notagreeting'
+
+statement error pq: unimplemented: ALTER TYPE ADD VALUE unsupported
+ALTER TYPE greeting ADD VALUE 'hola' AFTER 'hello'
+
+statement error pq: unimplemented: ALTER TYPE RENAME VALUE unsupported
+ALTER TYPE greeting RENAME VALUE 'hello' TO 'helloooooo'
+
+statement error pq: unimplemented: ALTER TYPE RENAME unsupported
+ALTER TYPE greeting RENAME TO greetings
+
+statement error pq: unimplemented: ALTER TYPE SET SCHEMA unsupported
+ALTER TYPE greeting SET SCHEMA newschema
+
+# Tests for enum builtins.
+statement ok
+CREATE TYPE dbs AS ENUM ('postgres', 'mysql', 'spanner', 'cockroach')
+
+query TT
+SELECT enum_first('mysql'::dbs), enum_last('spanner'::dbs)
+----
+postgres cockroach
+
+query T
+SELECT enum_range('cockroach'::dbs)
+----
+{postgres,mysql,spanner,cockroach}
+
+query TT
+SELECT enum_range(NULL, 'mysql'::dbs), enum_range('spanner'::dbs, NULL)
+----
+{postgres,mysql} {spanner,cockroach}
+
+query TT
+SELECT enum_range('postgres'::dbs, 'spanner'::dbs), enum_range('spanner'::dbs, 'cockroach'::dbs)
+----
+{postgres,mysql,spanner} {spanner,cockroach}
+
+query T
+SELECT enum_range('cockroach'::dbs, 'cockroach'::dbs)
+----
+{cockroach}
+
+query T
+SELECT enum_range('cockroach'::dbs, 'spanner'::dbs)
+----
+{}
+
+query error pq: enum_range\(\): both arguments cannot be NULL
+SELECT enum_range(NULL::dbs, NULL::dbs)
+
+query error pq: enum_range\(\): mismatched types
+SELECT enum_range('cockroach'::dbs, 'hello'::greeting)
+
+# Test inserting and reading enum data from tables.
+statement ok
+CREATE TABLE greeting_table (x1 greeting, x2 greeting)
+
+statement error pq: invalid input value for enum greeting: "bye"
+INSERT INTO greeting_table VALUES ('bye', 'hi')
+
+statement ok
+INSERT INTO greeting_table VALUES ('hi', 'hello')
+
+query TT
+SELECT * FROM greeting_table
+----
+hi hello
+
+query TT
+SELECT 'hello'::greeting, x1 FROM greeting_table
+----
+hello hi
+
+query TB
+SELECT x1, x1 < 'hello' FROM greeting_table
+----
+hi false
+
+query TT
+SELECT x1, enum_first(x1) FROM greeting_table
+----
+hi hello
+
+statement ok
+CREATE TABLE t1 (x greeting, INDEX i (x));
+CREATE TABLE t2 (x greeting, INDEX i (x));
+INSERT INTO t1 VALUES ('hello');
+INSERT INTO t2 VALUES ('hello')
+
+query TT
+SELECT * FROM t1 INNER LOOKUP JOIN t2 ON t1.x = t2.x
+----
+hello hello
+
+query TT
+SELECT * FROM t1 INNER HASH JOIN t2 ON t1.x = t2.x
+----
+hello hello
+
+query TT
+SELECT * FROM t1 INNER MERGE JOIN t2 ON t1.x = t2.x
+----
+hello hello
+
+statement ok
+INSERT INTO t2 VALUES ('hello'), ('hello'), ('howdy'), ('hi')
+
+query T rowsort
+SELECT DISTINCT x FROM t2
+----
+hello
+howdy
+hi
+
+query T
+SELECT DISTINCT x FROM t2 ORDER BY x DESC
+----
+hi
+howdy
+hello
+
+# Test out some subqueries.
+query T rowsort
+SELECT x FROM t2 WHERE x > (SELECT x FROM t1 ORDER BY x LIMIT 1)
+----
+hi
+howdy
+
+# Test ordinality.
+query TI
+SELECT * FROM t2 WITH ORDINALITY ORDER BY x
+----
+hello  1
+hello  2
+hello  3
+howdy  4
+hi     5
+
+# Test ordering with and without limits.
+statement ok
+INSERT INTO t1 VALUES ('hi'), ('hello'), ('howdy'), ('howdy'), ('howdy'), ('hello')
+
+query T
+SELECT x FROM t1 ORDER BY x DESC
+----
+hi
+howdy
+howdy
+howdy
+hello
+hello
+hello
+
+query T
+SELECT x FROM t1 ORDER BY x ASC
+----
+hello
+hello
+hello
+howdy
+howdy
+howdy
+hi
+
+query T
+SELECT x FROM t1 ORDER BY x ASC LIMIT 3
+----
+hello
+hello
+hello
+
+query T
+SELECT x FROM t1 ORDER BY x DESC LIMIT 3
+----
+hi
+howdy
+howdy
+
+# Test we can group on enums.
+query T rowsort
+(SELECT * FROM t1) UNION (SELECT * FROM t2)
+----
+hello
+howdy
+hi
+
+statement ok
+CREATE TABLE enum_agg (x greeting, y INT);
+INSERT INTO enum_agg VALUES
+  ('hello', 1),
+  ('hello', 3),
+  ('howdy', 5),
+  ('howdy', 0),
+  ('howdy', 1),
+  ('hi', 10)
+
+query TIRI rowsort
+SELECT x, max(y), sum(y), min(y) FROM enum_agg GROUP BY x
+----
+hello 3 4 1
+howdy 5 6 0
+hi 10 10 10
+
+
+# Regression to ensure that statistics jobs can be run on tables
+# with user defined types.
+statement ok
+CREATE TABLE greeting_stats (x greeting PRIMARY KEY);
+INSERT INTO greeting_stats VALUES ('hi');
+CREATE STATISTICS s FROM greeting_stats
+
+query T
+SELECT x FROM greeting_stats
+----
+hi

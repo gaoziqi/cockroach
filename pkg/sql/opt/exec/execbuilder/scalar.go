@@ -137,9 +137,6 @@ func (b *Builder) indexedVar(
 ) tree.TypedExpr {
 	idx, ok := ctx.ivarMap.Get(int(colID))
 	if !ok {
-		if b.nullifyMissingVarExprs > 0 {
-			return tree.ReType(tree.DNull, md.ColumnMeta(colID).Type)
-		}
 		panic(errors.AssertionFailedf("cannot map variable %d to an indexed var", log.Safe(colID)))
 	}
 	return ctx.ivh.IndexedVarWithType(idx, md.ColumnMeta(colID).Type)
@@ -208,6 +205,20 @@ func (b *Builder) buildBoolean(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree
 	case opt.RangeOp:
 		return b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
 
+	case opt.IsTupleNullOp:
+		expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewTypedIsNullExpr(expr), nil
+
+	case opt.IsTupleNotNullOp:
+		expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewTypedIsNotNullExpr(expr), nil
+
 	default:
 		panic(errors.AssertionFailedf("invalid op %s", log.Safe(scalar.Op())))
 	}
@@ -224,6 +235,19 @@ func (b *Builder) buildComparison(
 	if err != nil {
 		return nil, err
 	}
+
+	// When the operator is an IsOp, the right is NULL, and the left is not a
+	// tuple, return the unary tree.IsNullExpr.
+	if scalar.Op() == opt.IsOp && right == tree.DNull && left.ResolvedType().Family() != types.TupleFamily {
+		return tree.NewTypedIsNullExpr(left), nil
+	}
+
+	// When the operator is an IsNotOp, the right is NULL, and the left is not a
+	// tuple, return the unary tree.IsNotNullExpr.
+	if scalar.Op() == opt.IsNotOp && right == tree.DNull && left.ResolvedType().Family() != types.TupleFamily {
+		return tree.NewTypedIsNotNullExpr(left), nil
+	}
+
 	operator := opt.ComparisonOpReverseMap[scalar.Op()]
 	return tree.NewTypedComparisonExpr(operator, left, right), nil
 }
@@ -320,7 +344,7 @@ func (b *Builder) buildCast(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Ty
 	if err != nil {
 		return nil, err
 	}
-	return tree.NewTypedCastExpr(input, cast.Typ)
+	return tree.NewTypedCastExpr(input, cast.Typ), nil
 }
 
 func (b *Builder) buildCoalesce(
@@ -487,9 +511,9 @@ func (b *Builder) buildAny(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Typ
 	}
 
 	// Construct tuple type of columns in the row.
-	contents := make([]types.T, plan.numOutputCols())
+	contents := make([]*types.T, plan.numOutputCols())
 	plan.outputCols.ForEach(func(key, val int) {
-		contents[val] = *b.mem.Metadata().ColumnMeta(opt.ColumnID(key)).Type
+		contents[val] = b.mem.Metadata().ColumnMeta(opt.ColumnID(key)).Type
 	})
 	typs := types.MakeTuple(contents)
 	subqueryExpr := b.addSubquery(exec.SubqueryAnyRows, typs, plan.root, any.OriginalExpr)

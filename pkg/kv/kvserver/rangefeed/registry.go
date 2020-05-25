@@ -28,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Stream is a object capable of transmitting RangeFeedEvents.
@@ -235,7 +235,7 @@ func (r *registration) outputLoop(ctx context.Context) error {
 	if r.catchupIter != nil {
 		if err := r.runCatchupScan(); err != nil {
 			err = errors.Wrap(err, "catch-up scan failed")
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 			return err
 		}
 	}

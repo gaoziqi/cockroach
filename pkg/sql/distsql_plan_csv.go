@@ -107,7 +107,11 @@ func (dsp *DistSQLPlanner) setupAllNodesPlanning(
 ) (*PlanningCtx, []roachpb.NodeID, error) {
 	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, nil /* txn */)
 
-	resp, err := execCfg.StatusServer.Nodes(ctx, &serverpb.NodesRequest{})
+	ss, err := execCfg.StatusServer.OptionalErr(47900)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := ss.Nodes(ctx, &serverpb.NodesRequest{})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -184,7 +188,7 @@ func presplitTableBoundaries(
 ) error {
 	expirationTime := cfg.DB.Clock().Now().Add(time.Hour.Nanoseconds(), 0)
 	for _, tbl := range tables {
-		for _, span := range tbl.Desc.AllIndexSpans() {
+		for _, span := range tbl.Desc.AllIndexSpans(cfg.Codec) {
 			if err := cfg.DB.AdminSplit(ctx, span.Key, span.Key, expirationTime); err != nil {
 				return err
 			}
@@ -247,7 +251,7 @@ func DistIngest(
 
 	// The direct-ingest readers will emit a binary encoded BulkOpSummary.
 	p.PlanToStreamColMap = []int{0, 1}
-	p.ResultTypes = []types.T{*types.Bytes, *types.Bytes}
+	p.ResultTypes = []*types.T{types.Bytes, types.Bytes}
 
 	dsp.FinalizePlan(planCtx, &p)
 

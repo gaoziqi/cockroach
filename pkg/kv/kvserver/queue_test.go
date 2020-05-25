@@ -34,8 +34,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -380,7 +380,7 @@ func TestBaseQueueProcess(t *testing.T) {
 	tsc := TestStoreConfig(nil)
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.StartWithStoreConfig(t, stopper, tsc)
 
 	repls := createReplicas(t, &tc, 2)
@@ -567,7 +567,7 @@ func TestNeedsSystemConfig(t *testing.T) {
 func TestAcceptsUnsplitRanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	s, _ := createTestStore(t,
 		testStoreOpts{
 			// This test was written before test stores could start with more than one
@@ -708,7 +708,7 @@ func TestBaseQueuePurgatory(t *testing.T) {
 	tsc := TestStoreConfig(nil)
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.StartWithStoreConfig(t, stopper, tsc)
 
 	testQueue := &testQueueImpl{
@@ -847,7 +847,7 @@ func TestBaseQueueProcessTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.Start(t, stopper)
 
 	r, err := tc.store.GetReplica(1)
@@ -963,7 +963,7 @@ func TestBaseQueueTimeMetric(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.Start(t, stopper)
 
 	r, err := tc.store.GetReplica(1)
@@ -1061,7 +1061,7 @@ func TestBaseQueueDisable(t *testing.T) {
 	}
 
 	// Add the range directly, bypassing shouldQueue.
-	if _, err := bq.testingAdd(ctx, r, 1.0); err != errQueueDisabled {
+	if _, err := bq.testingAdd(ctx, r, 1.0); !errors.Is(err, errQueueDisabled) {
 		t.Fatal(err)
 	}
 
@@ -1104,7 +1104,7 @@ func TestBaseQueueProcessConcurrently(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.Start(t, stopper)
 
 	repls := createReplicas(t, &tc, 3)
@@ -1211,7 +1211,7 @@ func TestBaseQueueRequeue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.Start(t, stopper)
 
 	repls := createReplicas(t, &tc, 1)

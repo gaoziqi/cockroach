@@ -37,14 +37,13 @@ type Builder struct {
 	// expression node.
 	subqueries []exec.Subquery
 
-	// postqueries accumulates check queries that are run after the main query.
-	postqueries []exec.Node
+	// cascades accumulates cascades that run after the main query but before
+	// checks.
+	cascades []exec.Cascade
 
-	// nullifyMissingVarExprs, if greater than 0, tells the builder to replace
-	// VariableExprs that have no bindings with DNull. This is useful for apply
-	// join, which needs to be able to create a plan that has outer columns.
-	// The number indicates the depth of apply joins.
-	nullifyMissingVarExprs int
+	// checks accumulates check queries that are run after the main query and
+	// any cascades.
+	checks []exec.Node
 
 	// nameGen is used to generate names for the tables that will be created for
 	// each relational subexpression when evalCtx.SessionData.SaveTablesPrefix is
@@ -85,11 +84,12 @@ func New(
 	factory exec.Factory, mem *memo.Memo, catalog cat.Catalog, e opt.Expr, evalCtx *tree.EvalContext,
 ) *Builder {
 	b := &Builder{
-		factory: factory,
-		mem:     mem,
-		catalog: catalog,
-		e:       e,
-		evalCtx: evalCtx,
+		factory:         factory,
+		mem:             mem,
+		catalog:         catalog,
+		e:               e,
+		evalCtx:         evalCtx,
+		allowAutoCommit: true,
 	}
 	if evalCtx != nil {
 		if evalCtx.SessionData.SaveTablesPrefix != "" {
@@ -100,11 +100,6 @@ func New(
 	return b
 }
 
-// DisableTelemetry prevents the execbuilder from updating telemetry counters.
-func (b *Builder) DisableTelemetry() {
-	b.disableTelemetry = true
-}
-
 // Build constructs the execution node tree and returns its root node if no
 // error occurred.
 func (b *Builder) Build() (_ exec.Plan, err error) {
@@ -112,7 +107,7 @@ func (b *Builder) Build() (_ exec.Plan, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return b.factory.ConstructPlan(plan.root, b.subqueries, b.postqueries)
+	return b.factory.ConstructPlan(plan.root, b.subqueries, b.cascades, b.checks)
 }
 
 func (b *Builder) build(e opt.Expr) (_ execPlan, err error) {
@@ -137,7 +132,7 @@ func (b *Builder) build(e opt.Expr) (_ execPlan, err error) {
 		)
 	}
 
-	b.allowAutoCommit = b.canAutoCommit(rel)
+	b.allowAutoCommit = b.allowAutoCommit && b.canAutoCommit(rel)
 
 	return b.buildRelational(rel)
 }
@@ -167,13 +162,24 @@ type builtWithExpr struct {
 	// outputCols maps the output ColumnIDs of the With expression to the ordinal
 	// positions they are output to. See execPlan.outputCols for more details.
 	outputCols opt.ColMap
-	bufferNode exec.Node
+	bufferNode exec.BufferNode
 }
 
-func (b *Builder) addBuiltWithExpr(id opt.WithID, outputCols opt.ColMap, bufferNode exec.Node) {
+func (b *Builder) addBuiltWithExpr(
+	id opt.WithID, outputCols opt.ColMap, bufferNode exec.BufferNode,
+) {
 	b.withExprs = append(b.withExprs, builtWithExpr{
 		id:         id,
 		outputCols: outputCols,
 		bufferNode: bufferNode,
 	})
+}
+
+func (b *Builder) findBuiltWithExpr(id opt.WithID) *builtWithExpr {
+	for i := range b.withExprs {
+		if b.withExprs[i].id == id {
+			return &b.withExprs[i]
+		}
+	}
+	return nil
 }

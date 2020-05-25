@@ -25,13 +25,16 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
+
+// Remove unused warning.
+var _ = execgen.UNSAFEGET
 
 // {{/*
 
@@ -46,19 +49,25 @@ var _ tree.Datum
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
 
-// _GOTYPE is the template Go type variable for this operator. It will be
-// replaced by the Go type equivalent for each type in coltypes.T, for example
-// int64 for coltypes.Int64.
+// Dummy import to pull in "coldataext" package.
+var _ coldataext.Datum
+
+// _GOTYPE is the template variable.
 type _GOTYPE interface{}
 
-// _TYPES_T is the template type variable for coltypes.T. It will be replaced by
-// coltypes.Foo for each type Foo in the coltypes.T type.
-const _TYPES_T = coltypes.Unhandled
+// Dummy import to pull in "typeconv" package.
+var _ = typeconv.DatumVecCanonicalTypeFamily
+
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
 
 // _ASSIGN_NE is the template equality function for assigning the first input
 // to the result of the second input != the third input.
-func _ASSIGN_NE(_, _, _ string) bool {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN_NE(_, _, _, _, _, _ string) bool {
+	colexecerror.InternalError("")
 }
 
 // */}}
@@ -66,32 +75,34 @@ func _ASSIGN_NE(_, _, _ string) bool {
 // valuesDiffer takes in two ColVecs as well as values indices to check whether
 // the values differ. This function pays attention to NULLs, and two NULL
 // values do *not* differ.
-func valuesDiffer(
-	t coltypes.T, aColVec coldata.Vec, aValueIdx int, bColVec coldata.Vec, bValueIdx int,
-) bool {
-	switch t {
+func valuesDiffer(aColVec coldata.Vec, aValueIdx int, bColVec coldata.Vec, bValueIdx int) bool {
+	switch aColVec.CanonicalTypeFamily() {
 	// {{range .}}
-	case _TYPES_T:
-		aCol := aColVec._TemplateType()
-		bCol := bColVec._TemplateType()
-		aNulls := aColVec.Nulls()
-		bNulls := bColVec.Nulls()
-		aNull := aNulls.MaybeHasNulls() && aNulls.NullAt(aValueIdx)
-		bNull := bNulls.MaybeHasNulls() && bNulls.NullAt(bValueIdx)
-		if aNull && bNull {
-			return false
-		} else if aNull || bNull {
-			return true
+	case _CANONICAL_TYPE_FAMILY:
+		switch aColVec.Type().Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			aCol := aColVec.TemplateType()
+			bCol := bColVec.TemplateType()
+			aNulls := aColVec.Nulls()
+			bNulls := bColVec.Nulls()
+			aNull := aNulls.MaybeHasNulls() && aNulls.NullAt(aValueIdx)
+			bNull := bNulls.MaybeHasNulls() && bNulls.NullAt(bValueIdx)
+			if aNull && bNull {
+				return false
+			} else if aNull || bNull {
+				return true
+			}
+			arg1 := execgen.UNSAFEGET(aCol, aValueIdx)
+			arg2 := execgen.UNSAFEGET(bCol, bValueIdx)
+			var unique bool
+			_ASSIGN_NE(unique, arg1, arg2, _, aCol, bCol)
+			return unique
+			// {{end}}
 		}
-		arg1 := execgen.UNSAFEGET(aCol, aValueIdx)
-		arg2 := execgen.UNSAFEGET(bCol, bValueIdx)
-		var unique bool
-		_ASSIGN_NE(unique, arg1, arg2)
-		return unique
-	// {{end}}
-	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unsupported valuesDiffer type %s", t))
-		// This code is unreachable, but the compiler cannot infer that.
-		return false
+		// {{end}}
 	}
+	colexecerror.InternalError(fmt.Sprintf("unsupported valuesDiffer type %s", aColVec.Type()))
+	// This code is unreachable, but the compiler cannot infer that.
+	return false
 }

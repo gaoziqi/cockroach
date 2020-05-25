@@ -1,4 +1,4 @@
-# LogicTest: 5node-dist 5node-dist-metadata
+# LogicTest: 5node 5node-metadata
 
 # Disable automatic stats.
 statement ok
@@ -169,6 +169,10 @@ s2               {a}           256        4               0
 # Test default column statistics
 #
 
+# Disable multi-column stats to start.
+statement ok
+SET CLUSTER SETTING sql.stats.multi_column_collection.enabled = false
+
 statement ok
 CREATE STATISTICS s3 FROM data
 
@@ -186,9 +190,14 @@ column_names  row_count  distinct_count  null_count  has_histogram
 {d}           256        4               0           false
 {e}           256        2               0           true
 
-# Add indexes, including duplicate index on column c.
+
+# Re-enable multi-column stats.
 statement ok
-CREATE INDEX ON data (c DESC, b ASC); CREATE INDEX ON data (b DESC)
+SET CLUSTER SETTING sql.stats.multi_column_collection.enabled = true
+
+# Add indexes, including duplicate index on column c and columns (a, b).
+statement ok
+CREATE INDEX ON data (c DESC, b ASC); CREATE INDEX ON data (b DESC, a);
 
 statement ok
 CREATE STATISTICS s4 FROM data
@@ -201,7 +210,12 @@ WHERE statistics_name = 's4'
 ----
 column_names  row_count  distinct_count  null_count
 {a}           256        4               0
+{a,b}         256        16              0
+{a,b,c}       256        64              0
+{a,b,c,d}     256        256             0
 {c}           256        4               0
+{c,d}         256        16              0
+{c,b}         256        16              0
 {b}           256        4               0
 {d}           256        4               0
 {e}           256        2               0
@@ -221,6 +235,9 @@ WHERE statistics_name = 's5'
 ----
 column_names  row_count  distinct_count  null_count
 {a}           256        4               0
+{a,b}         256        16              0
+{a,b,c}       256        64              0
+{a,b,c,d}     256        256             0
 {b}           256        4               0
 {c}           256        4               0
 {d}           256        4               0
@@ -263,6 +280,42 @@ default_stat2    {rowid}       1          1               0
 default_stat2    {y}           1          1               1
 default_stat2    {x}           1          1               1
 
+# Add a few more rows.
+statement ok
+INSERT INTO simple VALUES (DEFAULT, DEFAULT);
+INSERT INTO simple VALUES (0, DEFAULT);
+INSERT INTO simple VALUES (DEFAULT, 0);
+INSERT INTO simple VALUES (0, 1);
+
+# Add an index.
+statement ok
+CREATE INDEX ON simple (x, y)
+
+statement ok
+CREATE STATISTICS default_stat3 FROM simple
+
+query TTIII colnames
+SELECT statistics_name, column_names, row_count, distinct_count, null_count
+FROM [SHOW STATISTICS FOR TABLE simple]
+----
+statistics_name  column_names  row_count  distinct_count  null_count
+default_stat3    {rowid}       5          5               0
+default_stat3    {y}           5          3               3
+default_stat3    {x}           5          2               3
+default_stat3    {x,y}         5          4               2
+
+let $hist_id_3
+SELECT histogram_id FROM [SHOW STATISTICS FOR TABLE simple]
+WHERE statistics_name = 'default_stat3' AND column_names = '{y}'
+
+# The counts in each bucket should not include null values.
+query TIRI colnames
+SHOW HISTOGRAM $hist_id_3
+----
+upper_bound  range_rows  distinct_range_rows  equal_rows
+0            0           0                    1
+1            0           0                    1
+
 #
 # Test numeric references
 #
@@ -275,6 +328,11 @@ SELECT statistics_name, column_names, row_count, distinct_count, null_count
 FROM [SHOW STATISTICS FOR TABLE data]
 ----
 statistics_name  column_names  row_count  distinct_count  null_count
+s4               {c,d}         256        16              0
+s4               {c,b}         256        16              0
+s5               {a,b}         256        16              0
+s5               {a,b,c}       256        64              0
+s5               {a,b,c,d}     256        256             0
 s5               {b}           256        4               0
 s5               {c}           256        4               0
 s5               {d}           256        4               0
@@ -292,6 +350,9 @@ WHERE statistics_name = '__auto__'
 ----
 column_names  row_count  distinct_count  null_count
 {a}           256        4               0
+{a,b}         256        16              0
+{a,b,c}       256        64              0
+{a,b,c,d}     256        256             0
 {b}           256        4               0
 {c}           256        4               0
 {d}           256        4               0
@@ -302,7 +363,7 @@ column_names  row_count  distinct_count  null_count
 #
 
 statement ok
-DROP INDEX data@data_b_idx
+DROP INDEX data@data_b_a_idx
 
 statement ok
 CREATE STATISTICS __auto__ FROM [53];
@@ -318,6 +379,21 @@ SELECT statistics_name, column_names
 FROM [SHOW STATISTICS FOR TABLE data] ORDER BY statistics_name, column_names::STRING
 ----
 statistics_name  column_names
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b}
+__auto__         {a,b}
+__auto__         {a,b}
+__auto__         {a,b}
+__auto__         {a,b}
 __auto__         {a}
 __auto__         {a}
 __auto__         {a}
@@ -343,6 +419,8 @@ __auto__         {e}
 __auto__         {e}
 __auto__         {e}
 __auto__         {e}
+s4               {c,b}
+s4               {c,d}
 
 statement ok
 CREATE STATISTICS s7 ON a FROM [53]
@@ -352,6 +430,21 @@ SELECT statistics_name, column_names
 FROM [SHOW STATISTICS FOR TABLE data] ORDER BY statistics_name, column_names::STRING
 ----
 statistics_name  column_names
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b}
+__auto__         {a,b}
+__auto__         {a,b}
+__auto__         {a,b}
+__auto__         {a,b}
 __auto__         {a}
 __auto__         {a}
 __auto__         {a}
@@ -376,6 +469,8 @@ __auto__         {e}
 __auto__         {e}
 __auto__         {e}
 __auto__         {e}
+s4               {c,b}
+s4               {c,d}
 s7               {a}
 
 statement ok
@@ -387,6 +482,21 @@ SELECT statistics_name, column_names
 FROM [SHOW STATISTICS FOR TABLE data] ORDER BY statistics_name, column_names::STRING
 ----
 statistics_name  column_names
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c,d}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b,c}
+__auto__         {a,b}
+__auto__         {a,b}
+__auto__         {a,b}
+__auto__         {a,b}
+__auto__         {a,b}
 __auto__         {a}
 __auto__         {a}
 __auto__         {a}
@@ -411,6 +521,8 @@ __auto__         {e}
 __auto__         {e}
 __auto__         {e}
 __auto__         {e}
+s4               {c,b}
+s4               {c,d}
 s8               {a}
 
 # Regression test for #33195.
@@ -486,3 +598,45 @@ FROM [SHOW STATISTICS FOR TABLE arr] ORDER BY statistics_name, column_names::STR
 statistics_name  column_names  row_count  distinct_count  null_count
 arr_stats        {rowid}       4          4               0
 arr_stats        {x}           4          3               1
+
+# Regression test for #46964. Do not try to create a histogram on the array column.
+statement ok
+CREATE STATISTICS arr_stats_x ON x FROM arr
+
+query TTIIIB colnames
+SELECT
+  statistics_name,
+  column_names,
+  row_count,
+  distinct_count,
+  null_count,
+  histogram_id IS NOT NULL AS has_histogram
+FROM [SHOW STATISTICS FOR TABLE arr]
+ORDER BY statistics_name, column_names::STRING
+----
+statistics_name  column_names  row_count  distinct_count  null_count  has_histogram
+arr_stats        {rowid}       4          4               0           true
+arr_stats_x      {x}           4          3               1           false
+
+# Test that enum columns always have histograms collected for them.
+statement ok
+CREATE TYPE e AS ENUM ('hello', 'howdy', 'hi');
+CREATE TABLE et (x e, y e, PRIMARY KEY (x));
+INSERT INTO et VALUES ('hello', 'hello'), ('howdy', 'howdy'), ('hi', 'hi');
+CREATE STATISTICS s FROM et
+
+query TTIIB colnames,rowsort
+SELECT
+  statistics_name,
+  column_names,
+  row_count,
+  null_count,
+  histogram_id IS NOT NULL AS has_histogram
+FROM
+  [SHOW STATISTICS FOR TABLE et]
+ORDER BY
+  column_names::STRING, created
+----
+statistics_name  column_names  row_count  null_count  has_histogram
+s                {x}           3          0           true
+s                {y}           3          0           true

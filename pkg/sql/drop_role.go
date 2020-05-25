@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // DropRoleNode deletes entries from the system.users table.
@@ -31,8 +31,6 @@ type DropRoleNode struct {
 	ifExists bool
 	isRole   bool
 	names    func() ([]string, error)
-
-	run dropRoleRun
 }
 
 // DropRole represents a DROP ROLE statement.
@@ -59,12 +57,6 @@ func (p *planner) DropRoleNode(
 		isRole:   isRole,
 		names:    names,
 	}, nil
-}
-
-// dropRoleRun contains the run-time state of DropRoleNode during local execution.
-type dropRoleRun struct {
-	// The number of users deleted.
-	numDeleted int
 }
 
 func (n *DropRoleNode) startExec(params runParams) error {
@@ -97,7 +89,7 @@ func (n *DropRoleNode) startExec(params runParams) error {
 	// Now check whether the user still has permission on any object in the database.
 
 	// First check all the databases.
-	if err := forEachDatabaseDesc(params.ctx, params.p, nil, /*nil prefix = all databases*/
+	if err := forEachDatabaseDesc(params.ctx, params.p, nil /*nil prefix = all databases*/, true, /* requiresPrivileges */
 		func(db *sqlbase.DatabaseDescriptor) error {
 			for _, u := range db.GetPrivileges().Users {
 				if _, ok := userNames[u.User]; ok {
@@ -119,7 +111,7 @@ func (n *DropRoleNode) startExec(params runParams) error {
 	// the predefined forEachTableAll() function because we need to look
 	// at all _visible_ descriptors, not just those on which the current
 	// user has permission.
-	descs, err := params.p.Tables().getAllDescriptors(params.ctx, params.p.txn)
+	descs, err := params.p.Tables().GetAllDescriptors(params.ctx, params.p.txn)
 	if err != nil {
 		return err
 	}
@@ -160,7 +152,7 @@ func (n *DropRoleNode) startExec(params runParams) error {
 	}
 
 	// All safe - do the work.
-	var numUsersDeleted, numRoleMembershipsDeleted, numRoleOptionsDeleted int
+	var numRoleMembershipsDeleted int
 	for normalizedUsername := range userNames {
 		// Specifically reject special users and roles. Some (root, admin) would fail with
 		// "privileges still exist" first.
@@ -173,7 +165,7 @@ func (n *DropRoleNode) startExec(params runParams) error {
 				pgcode.InvalidParameterValue, "cannot drop special user %s", normalizedUsername)
 		}
 
-		rowsAffected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		numUsersDeleted, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
 			params.ctx,
 			opName,
 			params.p.txn,
@@ -184,13 +176,12 @@ func (n *DropRoleNode) startExec(params runParams) error {
 			return err
 		}
 
-		if rowsAffected == 0 && !n.ifExists {
+		if numUsersDeleted == 0 && !n.ifExists {
 			return errors.Errorf("role/user %s does not exist", normalizedUsername)
 		}
-		numUsersDeleted += rowsAffected
 
 		// Drop all role memberships involving the user/role.
-		rowsAffected, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		numRoleMembershipsDeleted, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
 			params.ctx,
 			"drop-role-membership",
 			params.p.txn,
@@ -201,7 +192,7 @@ func (n *DropRoleNode) startExec(params runParams) error {
 			return err
 		}
 
-		numRoleOptionsDeleted, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		_, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
 			params.ctx,
 			opName,
 			params.p.txn,
@@ -214,8 +205,6 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		if err != nil {
 			return err
 		}
-
-		numRoleMembershipsDeleted += rowsAffected
 	}
 
 	if numRoleMembershipsDeleted > 0 {
@@ -225,9 +214,6 @@ func (n *DropRoleNode) startExec(params runParams) error {
 			return err
 		}
 	}
-
-	n.run.numDeleted = numUsersDeleted
-	n.run.numDeleted += numRoleOptionsDeleted
 
 	return nil
 }
@@ -240,6 +226,3 @@ func (*DropRoleNode) Values() tree.Datums { return tree.Datums{} }
 
 // Close implements the planNode interface.
 func (*DropRoleNode) Close(context.Context) {}
-
-// FastPathResults implements the planNodeFastPath interface.
-func (n *DropRoleNode) FastPathResults() (int, bool) { return n.run.numDeleted, true }

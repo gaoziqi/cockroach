@@ -16,12 +16,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestRunWithTimeout(t *testing.T) {
-	ctx := context.TODO()
+	ctx := context.Background()
 	err := RunWithTimeout(ctx, "foo", 1, func(ctx context.Context) error {
 		time.Sleep(10 * time.Millisecond)
 		return nil
@@ -38,14 +38,14 @@ func TestRunWithTimeout(t *testing.T) {
 	if err.Error() != expectedMsg {
 		t.Fatalf("expected %s, actual %s", expectedMsg, err.Error())
 	}
-	netError, ok := err.(net.Error)
-	if !ok {
+	var netError net.Error
+	if !errors.As(err, &netError) {
 		t.Fatal("RunWithTimeout should return a net.Error")
 	}
 	if !netError.Timeout() || !netError.Temporary() {
 		t.Fatal("RunWithTimeout should return a timeout and temporary error")
 	}
-	if errors.Cause(err) != context.DeadlineExceeded {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("RunWithTimeout should return an error with a DeadlineExceeded cause")
 	}
 
@@ -55,16 +55,15 @@ func TestRunWithTimeout(t *testing.T) {
 	})
 	expExtended := expectedMsg + ": custom error: context deadline exceeded"
 	if err.Error() != expExtended {
-		t.Fatalf("expected %s, actual %s", expExtended, err.Error())
+		t.Fatalf("expected %q, actual %q", expExtended, err.Error())
 	}
-	netError, ok = err.(net.Error)
-	if !ok {
+	if !errors.As(err, &netError) {
 		t.Fatal("RunWithTimeout should return a net.Error")
 	}
 	if !netError.Timeout() || !netError.Temporary() {
 		t.Fatal("RunWithTimeout should return a timeout and temporary error")
 	}
-	if errors.Cause(err) != context.DeadlineExceeded {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("RunWithTimeout should return an error with a DeadlineExceeded cause")
 	}
 }
@@ -75,20 +74,20 @@ func TestRunWithTimeout(t *testing.T) {
 // returned error is still a TimeoutError. In this case however the underlying
 // cause should be the returned error and not context.DeadlineExceeded.
 func TestRunWithTimeoutWithoutDeadlineExceeded(t *testing.T) {
-	ctx := context.TODO()
+	ctx := context.Background()
 	notContextDeadlineExceeded := errors.New(context.DeadlineExceeded.Error())
 	err := RunWithTimeout(ctx, "foo", 1, func(ctx context.Context) error {
 		<-ctx.Done()
 		return notContextDeadlineExceeded
 	})
-	netError, ok := err.(net.Error)
-	if !ok {
+	var netError net.Error
+	if !errors.As(err, &netError) {
 		t.Fatal("RunWithTimeout should return a net.Error")
 	}
 	if !netError.Timeout() || !netError.Temporary() {
 		t.Fatal("RunWithTimeout should return a timeout and temporary error")
 	}
-	if errors.Cause(err) != notContextDeadlineExceeded {
+	if !errors.Is(err, notContextDeadlineExceeded) {
 		t.Fatalf("RunWithTimeout should return an error caused by the underlying " +
 			"returned error")
 	}

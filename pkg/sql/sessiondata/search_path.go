@@ -17,18 +17,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
-// PgDatabaseName is the name of the default postgres system database.
-const PgDatabaseName = "postgres"
-
-// DefaultDatabaseName is the name ofthe default CockroachDB database used
-// for connections without a current db set.
-const DefaultDatabaseName = "defaultdb"
-
 // PgCatalogName is the name of the pg_catalog system schema.
 const PgCatalogName = "pg_catalog"
 
+// InformationSchemaName is the name of the information_schema system schema.
+const InformationSchemaName = "information_schema"
+
+// CRDBInternalSchemaName is the name of the crdb_internal system schema.
+const CRDBInternalSchemaName = "crdb_internal"
+
 // PgTempSchemaName is the alias for temporary schemas across sessions.
 const PgTempSchemaName = "pg_temp"
+
+// PgExtensionSchemaName is the alias for schemas which are usually "public" in postgres
+// when installing an extension, but must be stored as a separate schema in CRDB.
+const PgExtensionSchemaName = "pg_extension"
 
 // SearchPath represents a list of namespaces to search builtins in.
 // The names must be normalized (as per Name.Normalize) already.

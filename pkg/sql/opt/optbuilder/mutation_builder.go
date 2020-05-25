@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
@@ -122,11 +124,14 @@ type mutationBuilder struct {
 	// from the table schema. These are parsed once and cached for reuse.
 	parsedExprs []tree.Expr
 
-	// checks contains foreign key check queries; see buildFKChecks* methods.
+	// checks contains foreign key check queries; see buildFK* methods.
 	checks memo.FKChecksExpr
 
+	// cascades contains foreign key check cascades; see buildFK* methods.
+	cascades memo.FKCascades
+
 	// fkFallback is true if we need to fall back on the legacy path for
-	// FK checks / cascades. See buildFKChecks methods.
+	// FK checks / cascades. See buildFK* methods.
 	fkFallback bool
 
 	// withID is nonzero if we need to buffer the input for FK checks.
@@ -215,8 +220,10 @@ func (mb *mutationBuilder) buildInputForUpdate(
 	orderBy tree.OrderBy,
 ) {
 	var indexFlags *tree.IndexFlags
-	if source, ok := texpr.(*tree.AliasedTableExpr); ok {
+	if source, ok := texpr.(*tree.AliasedTableExpr); ok && source.IndexFlags != nil {
 		indexFlags = source.IndexFlags
+		telemetry.Inc(sqltelemetry.IndexHintUseCounter)
+		telemetry.Inc(sqltelemetry.IndexHintUpdateUseCounter)
 	}
 
 	// Fetch columns from different instance of the table metadata, so that it's
@@ -224,8 +231,8 @@ func (mb *mutationBuilder) buildInputForUpdate(
 	//
 	//   UPDATE abc SET a=b
 	//
-
-	// FROM
+	// NOTE: Include mutation columns, but be careful to never use them for any
+	//       reason other than as "fetch columns". See buildScan comment.
 	mb.outScope = mb.b.buildScan(
 		mb.b.addTable(mb.tab, &mb.alias),
 		nil, /* ordinals */
@@ -296,7 +303,7 @@ func (mb *mutationBuilder) buildInputForUpdate(
 
 		if !pkCols.Empty() {
 			mb.outScope = mb.b.buildDistinctOn(
-				pkCols, mb.outScope, false /* nullsAreDistinct */, false /* errorOnDup */)
+				pkCols, mb.outScope, false /* nullsAreDistinct */, "" /* errorOnDup */)
 		}
 	}
 
@@ -321,8 +328,10 @@ func (mb *mutationBuilder) buildInputForDelete(
 	inScope *scope, texpr tree.TableExpr, where *tree.Where, limit *tree.Limit, orderBy tree.OrderBy,
 ) {
 	var indexFlags *tree.IndexFlags
-	if source, ok := texpr.(*tree.AliasedTableExpr); ok {
+	if source, ok := texpr.(*tree.AliasedTableExpr); ok && source.IndexFlags != nil {
 		indexFlags = source.IndexFlags
+		telemetry.Inc(sqltelemetry.IndexHintUseCounter)
+		telemetry.Inc(sqltelemetry.IndexHintDeleteUseCounter)
 	}
 
 	// Fetch columns from different instance of the table metadata, so that it's
@@ -330,6 +339,9 @@ func (mb *mutationBuilder) buildInputForDelete(
 	//
 	//   DELETE FROM abc WHERE a=b
 	//
+	// NOTE: Include mutation columns, but be careful to never use them for any
+	//       reason other than as "fetch columns". See buildScan comment.
+	// TODO(andyk): Why does execution engine need mutation columns for Delete?
 	mb.outScope = mb.b.buildScan(
 		mb.b.addTable(mb.tab, &mb.alias),
 		nil, /* ordinals */
@@ -494,13 +506,23 @@ func (mb *mutationBuilder) replaceDefaultExprs(inRows *tree.Select) (outRows *tr
 	return inRows
 }
 
-// addSynthesizedCols is a helper method for addDefaultAndComputedColsForInsert
-// and addComputedColsForUpdate that scans the list of table columns, looking
+// addSynthesizedCols is a helper method for addSynthesizedColsForInsert
+// and addSynthesizedColsForUpdate that scans the list of table columns, looking
 // for any that do not yet have values provided by the input expression. New
 // columns are synthesized for any missing columns, as long as the addCol
 // callback function returns true for that column.
+//
+// Values are synthesized for columns based on checking these rules, in order:
+//   1. If column is computed, evaluate that expression as its value.
+//   2. If column has a default value specified for it, use that as its value.
+//   3. If column is nullable, use NULL as its value.
+//   4. If column is currently being added or dropped (i.e. a mutation column),
+//      use a default value (0 for INT column, "" for STRING column, etc). Note
+//      that the existing "fetched" value returned by the scan cannot be used,
+//      since it may not have been initialized yet by the backfiller.
+//
 func (mb *mutationBuilder) addSynthesizedCols(
-	scopeOrds []scopeOrdinal, addCol func(tabCol cat.Column) bool,
+	scopeOrds []scopeOrdinal, addCol func(colOrd int) bool,
 ) {
 	var projectionsScope *scope
 
@@ -513,8 +535,7 @@ func (mb *mutationBuilder) addSynthesizedCols(
 		}
 
 		// Invoke addCol to determine whether column should be added.
-		tabCol := mb.tab.Column(i)
-		if !addCol(tabCol) {
+		if !addCol(i) {
 			continue
 		}
 
@@ -525,6 +546,7 @@ func (mb *mutationBuilder) addSynthesizedCols(
 			projectionsScope.appendColumnsFromScope(mb.outScope)
 		}
 		tabColID := mb.tabID.ColumnID(i)
+		tabCol := mb.tab.Column(i)
 		expr := mb.parseDefaultOrComputedExpr(tabColID)
 		texpr := mb.outScope.resolveAndRequireType(expr, tabCol.DatumType())
 		scopeCol := mb.b.addColumn(projectionsScope, "" /* alias */, texpr)
@@ -727,12 +749,12 @@ func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationP
 		UpdateCols: makeColList(mb.updateOrds),
 		CanaryCol:  mb.canaryColID,
 		CheckCols:  makeColList(mb.checkOrds),
+		FKCascades: mb.cascades,
 		FKFallback: mb.fkFallback,
 	}
 
-	// If we didn't actually plan any checks (e.g. because of cascades), don't
-	// buffer the input.
-	if len(mb.checks) > 0 {
+	// If we didn't actually plan any checks or cascades, don't buffer the input.
+	if len(mb.checks) > 0 || len(mb.cascades) > 0 {
 		private.WithID = mb.withID
 	}
 
@@ -795,7 +817,9 @@ func (mb *mutationBuilder) mapToReturnScopeOrd(tabOrd int) scopeOrdinal {
 func (mb *mutationBuilder) buildReturning(returning tree.ReturningExprs) {
 	// Handle case of no RETURNING clause.
 	if returning == nil {
-		mb.outScope = &scope{builder: mb.b, expr: mb.outScope.expr}
+		expr := mb.outScope.expr
+		mb.outScope = mb.b.allocScope()
+		mb.outScope.expr = expr
 		return
 	}
 
@@ -862,7 +886,19 @@ func (mb *mutationBuilder) parseDefaultOrComputedExpr(colID opt.ColumnID) tree.E
 		exprStr = tabCol.ComputedExprStr()
 	case tabCol.HasDefault():
 		exprStr = tabCol.DefaultExprStr()
+	case tabCol.IsNullable():
+		return tree.DNull
 	default:
+		// Synthesize default value for NOT NULL mutation column so that it can be
+		// set when in the write-only state. This is only used when no other value
+		// is possible (no default value available, NULL not allowed).
+		if cat.IsMutationColumn(mb.tab, ord) {
+			datum, err := tree.NewDefaultDatum(mb.b.evalCtx, tabCol.DatumType())
+			if err != nil {
+				panic(err)
+			}
+			return datum
+		}
 		return tree.DNull
 	}
 

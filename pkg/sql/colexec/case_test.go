@@ -14,10 +14,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -35,64 +34,46 @@ func TestCaseOp(t *testing.T) {
 			Settings: st,
 		},
 	}
-	spec := &execinfrapb.ProcessorSpec{
-		Input: []execinfrapb.InputSyncSpec{{}},
-		Core: execinfrapb.ProcessorCoreUnion{
-			Noop: &execinfrapb.NoopCoreSpec{},
-		},
-		Post: execinfrapb.PostProcessSpec{
-			RenderExprs: []execinfrapb.Expression{{}},
-		},
-	}
-
-	decs := make([]apd.Decimal, 2)
-	decs[0].SetInt64(0)
-	decs[1].SetInt64(1)
-	zero := decs[0]
-	one := decs[1]
 
 	for _, tc := range []struct {
 		tuples     tuples
 		renderExpr string
 		expected   tuples
-		inputTypes []types.T
+		inputTypes []*types.T
 	}{
 		{
 			// Basic test.
 			tuples:     tuples{{1}, {2}, {nil}, {3}},
 			renderExpr: "CASE WHEN @1 = 2 THEN 1 ELSE 0 END",
 			expected:   tuples{{0}, {1}, {0}, {0}},
-			inputTypes: []types.T{*types.Int},
+			inputTypes: []*types.T{types.Int},
 		},
 		{
 			// Test "reordered when's."
 			tuples:     tuples{{1, 1}, {2, 0}, {nil, nil}, {3, 3}},
 			renderExpr: "CASE WHEN @1 + @2 > 3 THEN 0 WHEN @1 = 2 THEN 1 ELSE 2 END",
 			expected:   tuples{{2}, {1}, {2}, {0}},
-			inputTypes: []types.T{*types.Int, *types.Int},
+			inputTypes: []*types.T{types.Int, types.Int},
 		},
 		{
 			// Test the short-circuiting behavior.
 			tuples:     tuples{{1, 2}, {2, 0}, {nil, nil}, {3, 3}},
-			renderExpr: "CASE WHEN @1 = 2 THEN 0::DECIMAL WHEN @1 / @2 = 1 THEN 1::DECIMAL END",
-			expected:   tuples{{nil}, {zero}, {nil}, {one}},
-			inputTypes: []types.T{*types.Int, *types.Int},
+			renderExpr: "CASE WHEN @1 = 2 THEN 0::FLOAT WHEN @1 / @2 = 1 THEN 1::FLOAT END",
+			expected:   tuples{{nil}, {0.0}, {nil}, {1.0}},
+			inputTypes: []*types.T{types.Int, types.Int},
 		},
 	} {
-		runTests(t, []tuples{tc.tuples}, tc.expected, orderedVerifier, func(inputs []Operator) (Operator, error) {
-			spec.Input[0].ColumnTypes = tc.inputTypes
-			spec.Post.RenderExprs[0].Expr = tc.renderExpr
-			args := NewColOperatorArgs{
-				Spec:                spec,
-				Inputs:              inputs,
-				StreamingMemAccount: testMemAcc,
-			}
-			args.TestingKnobs.UseStreamingMemAccountForBuffering = true
-			result, err := NewColOperator(ctx, flowCtx, args)
+		runTests(t, []tuples{tc.tuples}, tc.expected, orderedVerifier, func(inputs []colexecbase.Operator) (colexecbase.Operator, error) {
+			caseOp, err := createTestProjectingOperator(
+				ctx, flowCtx, inputs[0], tc.inputTypes, tc.renderExpr,
+				false, /* canFallbackToRowexec */
+			)
 			if err != nil {
 				return nil, err
 			}
-			return result.Op, nil
+			// We will project out the input columns in order to have test
+			// cases be less verbose.
+			return NewSimpleProjectOp(caseOp, len(tc.inputTypes)+1, []uint32{uint32(len(tc.inputTypes))}), nil
 		})
 	}
 }

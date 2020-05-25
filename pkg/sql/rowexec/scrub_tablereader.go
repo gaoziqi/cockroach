@@ -37,10 +37,10 @@ import (
 // TODO(joey): If we want a way find the key for the error, we will need
 // additional data such as the key bytes and the table descriptor ID.
 // Repair won't be possible without this.
-var ScrubTypes = []types.T{
-	*types.String,
-	*types.String,
-	*types.Jsonb,
+var ScrubTypes = []*types.T{
+	types.String,
+	types.String,
+	types.Jsonb,
 }
 
 type scrubTableReader struct {
@@ -68,7 +68,8 @@ func newScrubTableReader(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (*scrubTableReader, error) {
-	if flowCtx.NodeID == 0 {
+	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
+	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
 		return nil, errors.Errorf("attempting to create a tableReader with uninitialized NodeID")
 	}
 	tr := &scrubTableReader{
@@ -121,8 +122,8 @@ func newScrubTableReader(
 
 	var fetcher row.Fetcher
 	if _, _, err := initRowFetcher(
-		&fetcher, &tr.tableDesc, int(spec.IndexIdx), tr.tableDesc.ColumnIdxMap(), spec.Reverse,
-		neededColumns, true /* isCheck */, &tr.alloc,
+		flowCtx, &fetcher, &tr.tableDesc, int(spec.IndexIdx), tr.tableDesc.ColumnIdxMap(),
+		spec.Reverse, neededColumns, true /* isCheck */, &tr.alloc,
 		execinfrapb.ScanVisibility_PUBLIC, spec.LockingStrength,
 	); err != nil {
 		return nil, err
@@ -155,7 +156,7 @@ func (tr *scrubTableReader) generateScrubErrorRow(
 	for i, colIdx := range tr.fetcherResultToColIdx {
 		col := tr.tableDesc.Columns[colIdx]
 		// TODO(joey): We should maybe try to get the underlying type.
-		rowDetails[col.Name] = row[i].String(&col.Type)
+		rowDetails[col.Name] = row[i].String(col.Type)
 	}
 	details["row_data"] = rowDetails
 	details["index_name"] = index.Name
@@ -169,15 +170,15 @@ func (tr *scrubTableReader) generateScrubErrorRow(
 	primaryKeyValues := tr.prettyPrimaryKeyValues(row, &tr.tableDesc)
 	return sqlbase.EncDatumRow{
 		sqlbase.DatumToEncDatum(
-			&ScrubTypes[0],
+			ScrubTypes[0],
 			tree.NewDString(scrubErr.Code),
 		),
 		sqlbase.DatumToEncDatum(
-			&ScrubTypes[1],
+			ScrubTypes[1],
 			tree.NewDString(primaryKeyValues),
 		),
 		sqlbase.DatumToEncDatum(
-			&ScrubTypes[2],
+			ScrubTypes[2],
 			detailsJSON,
 		),
 	}, nil
@@ -202,7 +203,7 @@ func (tr *scrubTableReader) prettyPrimaryKeyValues(
 			primaryKeyValues.WriteByte(',')
 		}
 		primaryKeyValues.WriteString(
-			row[colIDToRowIdxMap[id]].String(&table.Columns[colIdxMap[id]].Type))
+			row[colIDToRowIdxMap[id]].String(table.Columns[colIdxMap[id]].Type))
 	}
 	primaryKeyValues.WriteByte(')')
 	return primaryKeyValues.String()

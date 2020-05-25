@@ -17,17 +17,17 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // TxnEpoch is a zero-indexed epoch for a transaction. When a transaction
 // retries, it increments its epoch, invalidating all of its previous writes.
 type TxnEpoch int32
 
-// TxnSeq is a zero-indexed sequence number asssigned to a a request performed
-// by a transaction. Writes within a transaction have unique sequences and start
-// at sequence number 1. Reads within a transaction have non-unique sequences
-// and start at sequence number 0.
+// TxnSeq is a zero-indexed sequence number assigned to a request performed by a
+// transaction. Writes within a transaction have unique sequences and start at
+// sequence number 1. Reads within a transaction have non-unique sequences and
+// start at sequence number 0.
 //
 // Writes within a transaction logically take place in sequence number order.
 // Reads within a transaction observe only writes performed by the transaction
@@ -387,7 +387,7 @@ func (t TxnMeta) SafeMessage() string {
 	return buf.String()
 }
 
-var _ log.SafeMessager = (*TxnMeta)(nil)
+var _ errors.SafeMessager = (*TxnMeta)(nil)
 
 // FormatBytesAsKey is injected by module roachpb as dependency upon initialization.
 var FormatBytesAsKey = func(k []byte) string {

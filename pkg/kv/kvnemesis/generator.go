@@ -183,6 +183,9 @@ func NewDefaultConfig() GeneratorConfig {
 	// TODO(dan): Make this `config.Ops.Batch.Ops.PutExisting = 0` once #46081 is
 	// fixed.
 	config.Ops.Batch = BatchOperationConfig{}
+	// TODO(dan): Remove when #45586 is addressed.
+	config.Ops.ClosureTxn.CommitBatchOps.GetExisting = 0
+	config.Ops.ClosureTxn.CommitBatchOps.GetMissing = 0
 	return config
 }
 
@@ -190,8 +193,8 @@ func NewDefaultConfig() GeneratorConfig {
 // by this Generator.
 func GeneratorDataSpan() roachpb.Span {
 	return roachpb.Span{
-		Key:    roachpb.Key(keys.MakeTablePrefix(50)),
-		EndKey: roachpb.Key(keys.MakeTablePrefix(51)),
+		Key:    keys.SystemSQLCodec.TablePrefix(50),
+		EndKey: keys.SystemSQLCodec.TablePrefix(51),
 	}
 }
 

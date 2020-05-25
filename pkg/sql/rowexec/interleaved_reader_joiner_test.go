@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -35,7 +36,7 @@ import (
 // min and max are inclusive bounds on the root table's ID.
 // If min and/or max is -1, then no bound is used for that endpoint.
 func makeSpanWithRootBound(desc *sqlbase.TableDescriptor, min int, max int) roachpb.Span {
-	keyPrefix := sqlbase.MakeIndexKeyPrefix(desc, desc.PrimaryIndex.ID)
+	keyPrefix := sqlbase.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.PrimaryIndex.ID)
 
 	startKey := roachpb.Key(append([]byte(nil), keyPrefix...))
 	if min != -1 {
@@ -117,10 +118,10 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 	(32, 32, '32')
 	`, sqlutils.TestDB))
 
-	pd := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "parent")
-	cd1 := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "child1")
-	cd2 := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "child2")
-	cd3 := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "child3")
+	pd := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "parent")
+	cd1 := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "child1")
+	cd2 := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "child2")
+	cd3 := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "child3")
 
 	// InterleavedReaderJoiner specs for each parent-child combination used
 	// throughout the test cases.
@@ -132,12 +133,12 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 			{
 				Desc:     *pd,
 				Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}}},
-				Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan()}},
+				Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 			},
 			{
 				Desc:     *cd1,
 				Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}}},
-				Spans:    []execinfrapb.TableReaderSpan{{Span: cd1.PrimaryIndexSpan()}},
+				Spans:    []execinfrapb.TableReaderSpan{{Span: cd1.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 			},
 		},
 		Type: sqlbase.InnerJoin,
@@ -150,10 +151,10 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 
 	pdCd2Spec := copySpec(pdCd1Spec)
 	pdCd2Spec.Tables[1].Desc = *cd2
-	pdCd2Spec.Tables[1].Spans = []execinfrapb.TableReaderSpan{{Span: cd2.PrimaryIndexSpan()}}
+	pdCd2Spec.Tables[1].Spans = []execinfrapb.TableReaderSpan{{Span: cd2.PrimaryIndexSpan(keys.SystemSQLCodec)}}
 	pdCd3Spec := copySpec(pdCd1Spec)
 	pdCd3Spec.Tables[1].Desc = *cd3
-	pdCd3Spec.Tables[1].Spans = []execinfrapb.TableReaderSpan{{Span: cd3.PrimaryIndexSpan()}}
+	pdCd3Spec.Tables[1].Spans = []execinfrapb.TableReaderSpan{{Span: cd3.PrimaryIndexSpan(keys.SystemSQLCodec)}}
 
 	testCases := []struct {
 		spec     execinfrapb.InterleavedReaderJoinerSpec
@@ -402,7 +403,7 @@ func TestInterleavedReaderJoiner(t *testing.T) {
 				Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 				// Run in a RootTxn so that there's no txn metadata produced.
 				Txn:    kv.NewTxn(ctx, s.DB(), s.NodeID()),
-				NodeID: s.NodeID(),
+				NodeID: evalCtx.NodeID,
 			}
 
 			out := &distsqlutils.RowBuffer{}
@@ -461,9 +462,9 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 		sqlutils.ToRowFn(sqlutils.RowModuloShiftedFn(0, 0), sqlutils.RowModuloShiftedFn(0), sqlutils.RowIdxFn),
 	)
 
-	pd := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "parent")
-	cd := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "child")
-	gcd := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "grandchild")
+	pd := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "parent")
+	cd := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "child")
+	gcd := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "grandchild")
 
 	testCases := []struct {
 		spec     execinfrapb.InterleavedReaderJoinerSpec
@@ -476,12 +477,12 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 					{
 						Desc:     *pd,
 						Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}}},
-						Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan()}},
+						Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 					},
 					{
 						Desc:     *cd,
 						Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_DESC}}},
-						Spans:    []execinfrapb.TableReaderSpan{{Span: cd.PrimaryIndexSpan()}},
+						Spans:    []execinfrapb.TableReaderSpan{{Span: cd.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 					},
 				},
 				Type: sqlbase.InnerJoin,
@@ -495,7 +496,7 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 					{
 						Desc:     *pd,
 						Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}}},
-						Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan()}},
+						Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 					},
 				},
 				Type: sqlbase.InnerJoin,
@@ -509,12 +510,12 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 					{
 						Desc:     *cd,
 						Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}}},
-						Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan()}},
+						Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 					},
 					{
 						Desc:     *gcd,
 						Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}}},
-						Spans:    []execinfrapb.TableReaderSpan{{Span: gcd.PrimaryIndexSpan()}},
+						Spans:    []execinfrapb.TableReaderSpan{{Span: gcd.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 					},
 				},
 				Type: sqlbase.InnerJoin,
@@ -532,7 +533,7 @@ func TestInterleavedReaderJoinerErrors(t *testing.T) {
 				Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 				// Run in a RootTxn so that there's no txn metadata produced.
 				Txn:    kv.NewTxn(ctx, s.DB(), s.NodeID()),
-				NodeID: s.NodeID(),
+				NodeID: evalCtx.NodeID,
 			}
 
 			out := &distsqlutils.RowBuffer{}
@@ -571,8 +572,8 @@ func TestInterleavedReaderJoinerTrailingMetadata(t *testing.T) {
 		func(row int) []tree.Datum { return nil },
 	)
 
-	pd := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "parent")
-	cd := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, "child")
+	pd := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "parent")
+	cd := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, "child")
 
 	evalCtx := tree.MakeTestingEvalContext(s.ClusterSettings())
 	defer evalCtx.Stop(ctx)
@@ -591,7 +592,7 @@ func TestInterleavedReaderJoinerTrailingMetadata(t *testing.T) {
 		Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 		// Run in a LeafTxn so that txn metadata is produced.
 		Txn:    leafTxn,
-		NodeID: s.NodeID(),
+		NodeID: evalCtx.NodeID,
 	}
 
 	innerJoinSpec := execinfrapb.InterleavedReaderJoinerSpec{
@@ -599,12 +600,12 @@ func TestInterleavedReaderJoinerTrailingMetadata(t *testing.T) {
 			{
 				Desc:     *pd,
 				Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}}},
-				Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan()}},
+				Spans:    []execinfrapb.TableReaderSpan{{Span: pd.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 			},
 			{
 				Desc:     *cd,
 				Ordering: execinfrapb.Ordering{Columns: []execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}}},
-				Spans:    []execinfrapb.TableReaderSpan{{Span: cd.PrimaryIndexSpan()}},
+				Spans:    []execinfrapb.TableReaderSpan{{Span: cd.PrimaryIndexSpan(keys.SystemSQLCodec)}},
 			},
 		},
 		Type: sqlbase.InnerJoin,

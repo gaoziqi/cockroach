@@ -17,16 +17,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft"
 )
 
@@ -91,7 +91,7 @@ func newUnloadedReplica(
 	split.Init(&r.loadBasedSplitter, rand.Intn, func() float64 {
 		return float64(SplitByLoadQPSThreshold.Get(&store.cfg.Settings.SV))
 	})
-	r.mu.proposals = map[storagebase.CmdIDKey]*ProposalData{}
+	r.mu.proposals = map[kvserverbase.CmdIDKey]*ProposalData{}
 	r.mu.checksums = map[uuid.UUID]ReplicaChecksum{}
 	r.mu.proposalBuf.Init((*replicaProposer)(r))
 
@@ -249,7 +249,7 @@ func (r *Replica) maybeInitializeRaftGroup(ctx context.Context) {
 	// the below withRaftGroupLocked will no-op.
 	if err := r.withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
 		return true, nil
-	}); err != nil && err != errRemoved {
+	}); err != nil && !errors.Is(err, errRemoved) {
 		log.VErrEventf(ctx, 1, "unable to initialize raft group: %s", err)
 	}
 }

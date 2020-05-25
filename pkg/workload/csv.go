@@ -21,10 +21,10 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -39,7 +39,7 @@ const (
 func WriteCSVRows(
 	ctx context.Context, w io.Writer, table Table, rowStart, rowEnd int, sizeBytesLimit int64,
 ) (rowBatchIdx int, err error) {
-	cb := coldata.NewMemBatchWithSize(nil, 0)
+	cb := coldata.NewMemBatchWithSize(nil /* types */, 0 /* size */, coldata.StandardColumnFactory)
 	var a bufalloc.ByteAllocator
 
 	bytesWrittenW := &bytesWrittenWriter{w: w}
@@ -91,7 +91,7 @@ type csvRowsReader struct {
 
 func (r *csvRowsReader) Read(p []byte) (n int, err error) {
 	if r.cb == nil {
-		r.cb = coldata.NewMemBatchWithSize(nil, 0)
+		r.cb = coldata.NewMemBatchWithSize(nil /* types */, 0 /* size */, coldata.StandardColumnFactory)
 	}
 
 	for {
@@ -138,19 +138,19 @@ func colDatumToCSVString(col coldata.Vec, rowIdx int) string {
 	if col.Nulls().NullAt(rowIdx) {
 		return `NULL`
 	}
-	switch col.Type() {
-	case coltypes.Bool:
+	switch col.CanonicalTypeFamily() {
+	case types.BoolFamily:
 		return strconv.FormatBool(col.Bool()[rowIdx])
-	case coltypes.Int64:
+	case types.IntFamily:
 		return strconv.FormatInt(col.Int64()[rowIdx], 10)
-	case coltypes.Float64:
+	case types.FloatFamily:
 		return strconv.FormatFloat(col.Float64()[rowIdx], 'f', -1, 64)
-	case coltypes.Bytes:
+	case types.BytesFamily:
 		// See the HACK comment in ColBatchToRows.
 		bytes := col.Bytes().Get(rowIdx)
 		return *(*string)(unsafe.Pointer(&bytes))
 	}
-	panic(fmt.Sprintf(`unhandled type %s`, col.Type().GoTypeName()))
+	panic(fmt.Sprintf(`unhandled type %s`, col.Type()))
 }
 
 // HandleCSV configures a Generator with url params and outputs the data for a

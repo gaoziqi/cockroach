@@ -27,16 +27,16 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
-	// HACK: crlfmt removes the "*/}}" comment if it's the last line in the
-	// import block. This was picked because it sorts after
-	// "pkg/sql/colexec/execgen" and has no deps.
-	_ "github.com/cockroachdb/cockroach/pkg/util/bufalloc"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
+
+// Remove unused warning.
+var _ = execgen.UNSAFEGET
 
 // {{/*
 
@@ -49,13 +49,25 @@ var _ reflect.SliceHeader
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
 
+// Dummy import to pull in "coldataext" package.
+var _ coldataext.Datum
+
 // _GOTYPESLICE is a template Go type slice variable.
 type _GOTYPESLICE interface{}
 
+// Dummy import to pull in "typeconv" package.
+var _ = typeconv.DatumVecCanonicalTypeFamily
+
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
+
 // _ASSIGN_HASH is the template equality function for assigning the first input
 // to the result of the hash value of the second input.
-func _ASSIGN_HASH(_, _ interface{}) uint64 {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN_HASH(_, _, _, _ interface{}) uint64 {
+	colexecerror.InternalError("")
 }
 
 // */}}
@@ -74,26 +86,27 @@ func _REHASH_BODY(
 	// {{define "rehashBody" -}}
 	// Early bounds checks.
 	_ = buckets[nKeys-1]
-	// {{ if .HasSel }}
+	// {{if .HasSel}}
 	_ = sel[nKeys-1]
-	// {{ else }}
+	// {{else}}
 	_ = execgen.UNSAFEGET(keys, nKeys-1)
-	// {{ end }}
+	// {{end}}
+	var selIdx int
 	for i := 0; i < nKeys; i++ {
 		cancelChecker.check(ctx)
-		// {{ if .HasSel }}
-		selIdx := sel[i]
-		// {{ else }}
-		selIdx := i
-		// {{ end }}
-		// {{ if .HasNulls }}
+		// {{if .HasSel}}
+		selIdx = sel[i]
+		// {{else}}
+		selIdx = i
+		// {{end}}
+		// {{if .HasNulls}}
 		if nulls.NullAt(selIdx) {
 			continue
 		}
-		// {{ end }}
+		// {{end}}
 		v := execgen.UNSAFEGET(keys, selIdx)
 		p := uintptr(buckets[i])
-		_ASSIGN_HASH(p, v)
+		_ASSIGN_HASH(p, v, _, keys)
 		buckets[i] = uint64(p)
 	}
 	// {{end}}
@@ -109,33 +122,37 @@ func _REHASH_BODY(
 func rehash(
 	ctx context.Context,
 	buckets []uint64,
-	t coltypes.T,
 	col coldata.Vec,
 	nKeys int,
 	sel []int,
 	cancelChecker CancelChecker,
 	decimalScratch decimalOverloadScratch,
+	datumAlloc *sqlbase.DatumAlloc,
 ) {
-	switch t {
-	// {{range $hashType := .}}
-	case _TYPES_T:
-		keys, nulls := col._TemplateType(), col.Nulls()
-		if col.MaybeHasNulls() {
-			if sel != nil {
-				_REHASH_BODY(ctx, buckets, keys, nulls, nKeys, sel, true, true)
+	switch col.CanonicalTypeFamily() {
+	// {{range .}}
+	case _CANONICAL_TYPE_FAMILY:
+		switch col.Type().Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			keys, nulls := col.TemplateType(), col.Nulls()
+			if col.MaybeHasNulls() {
+				if sel != nil {
+					_REHASH_BODY(ctx, buckets, keys, nulls, nKeys, sel, true, true)
+				} else {
+					_REHASH_BODY(ctx, buckets, keys, nulls, nKeys, sel, false, true)
+				}
 			} else {
-				_REHASH_BODY(ctx, buckets, keys, nulls, nKeys, sel, false, true)
+				if sel != nil {
+					_REHASH_BODY(ctx, buckets, keys, nulls, nKeys, sel, true, false)
+				} else {
+					_REHASH_BODY(ctx, buckets, keys, nulls, nKeys, sel, false, false)
+				}
 			}
-		} else {
-			if sel != nil {
-				_REHASH_BODY(ctx, buckets, keys, nulls, nKeys, sel, true, false)
-			} else {
-				_REHASH_BODY(ctx, buckets, keys, nulls, nKeys, sel, false, false)
-			}
+			// {{end}}
 		}
-
-	// {{end}}
+		// {{end}}
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", t))
+		colexecerror.InternalError(fmt.Sprintf("unhandled type %s", col.Type()))
 	}
 }

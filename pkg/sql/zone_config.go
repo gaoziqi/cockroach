@@ -19,11 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func init() {
@@ -33,6 +34,12 @@ func init() {
 }
 
 var errNoZoneConfigApplies = errors.New("no zone config applies")
+
+// TODO(nvanbenschoten): determine how zone configurations fit into a
+// multi-tenant cluster. Does each tenant have its own Zones table? Does KV have
+// to make sure to look at the correct Zones according to the tenant prefix of
+// its key range? See #48375.
+var zoneConfigCodec = keys.TODOSQLCodec
 
 // getZoneConfig recursively looks up entries in system.zones until an
 // entry that applies to the object with the specified id is
@@ -72,7 +79,7 @@ func getZoneConfig(
 
 	// No zone config for this ID. We need to figure out if it's a table, so we
 	// look up its descriptor.
-	if descVal, err := getKey(sqlbase.MakeDescMetadataKey(sqlbase.ID(id))); err != nil {
+	if descVal, err := getKey(sqlbase.MakeDescMetadataKey(zoneConfigCodec, sqlbase.ID(id))); err != nil {
 		return 0, nil, 0, nil, err
 	} else if descVal != nil {
 		var desc sqlbase.Descriptor
@@ -116,7 +123,7 @@ func completeZoneConfig(
 	}
 	// Check to see if its a table. If so, inherit from the database.
 	// For all other cases, inherit from the default.
-	if descVal, err := getKey(sqlbase.MakeDescMetadataKey(sqlbase.ID(id))); err != nil {
+	if descVal, err := getKey(sqlbase.MakeDescMetadataKey(zoneConfigCodec, sqlbase.ID(id))); err != nil {
 		return err
 	} else if descVal != nil {
 		var desc sqlbase.Descriptor
@@ -156,7 +163,7 @@ func ZoneConfigHook(
 	}
 	zoneID, zone, _, placeholder, err := getZoneConfig(
 		id, getKey, false /* getInheritedDefault */)
-	if err == errNoZoneConfigApplies {
+	if errors.Is(err, errNoZoneConfigApplies) {
 		return nil, nil, true, nil
 	} else if err != nil {
 		return nil, nil, false, err
@@ -244,7 +251,7 @@ func (p *planner) resolveTableForZone(
 		p.runWithOptions(resolveFlags{skipCache: true}, func() {
 			flags := tree.ObjectLookupFlagsWithRequired()
 			flags.IncludeOffline = true
-			immutRes, err = ResolveExistingObject(ctx, p, &zs.TableOrIndex.Table, flags, ResolveAnyDescType)
+			immutRes, err = resolver.ResolveExistingTableObject(ctx, p, &zs.TableOrIndex.Table, flags, resolver.ResolveAnyDescType)
 		})
 		if err != nil {
 			return nil, err
@@ -263,7 +270,7 @@ func resolveZone(ctx context.Context, txn *kv.Txn, zs *tree.ZoneSpecifier) (sqlb
 	errMissingKey := errors.New("missing key")
 	id, err := zonepb.ResolveZoneSpecifier(zs,
 		func(parentID uint32, name string) (uint32, error) {
-			found, id, err := sqlbase.LookupPublicTableID(ctx, txn, sqlbase.ID(parentID), name)
+			found, id, err := sqlbase.LookupPublicTableID(ctx, txn, zoneConfigCodec, sqlbase.ID(parentID), name)
 			if err != nil {
 				return 0, err
 			}
@@ -274,7 +281,7 @@ func resolveZone(ctx context.Context, txn *kv.Txn, zs *tree.ZoneSpecifier) (sqlb
 		},
 	)
 	if err != nil {
-		if err == errMissingKey {
+		if errors.Is(err, errMissingKey) {
 			return 0, zoneSpecifierNotFoundError(*zs)
 		}
 		return 0, err

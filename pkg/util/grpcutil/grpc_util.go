@@ -17,7 +17,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -41,20 +41,33 @@ func IsLocalRequestContext(ctx context.Context) bool {
 	return ctx.Value(localRequestKey{}) != nil
 }
 
+// IsTimeout returns true if err's Cause is a gRPC timeout, or the request
+// was canceled by a context timeout.
+func IsTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	err = errors.Cause(err)
+	if s, ok := status.FromError(err); ok {
+		return s.Code() == codes.DeadlineExceeded
+	}
+	return false
+}
+
 // IsClosedConnection returns true if err's Cause is an error produced by gRPC
 // on closed connections.
 func IsClosedConnection(err error) bool {
-	err = errors.Cause(err)
-	if err == ErrCannotReuseClientConn {
+	if errors.Is(err, ErrCannotReuseClientConn) {
 		return true
 	}
+	err = errors.Cause(err)
 	if s, ok := status.FromError(err); ok {
 		if s.Code() == codes.Canceled ||
 			s.Code() == codes.Unavailable {
 			return true
 		}
 	}
-	if err == context.Canceled ||
+	if errors.Is(err, context.Canceled) ||
 		strings.Contains(err.Error(), "is closing") ||
 		strings.Contains(err.Error(), "tls: use of closed connection") ||
 		strings.Contains(err.Error(), "use of closed network connection") ||
@@ -77,13 +90,11 @@ func IsClosedConnection(err error) bool {
 // TODO(bdarnell): Replace this with a cleaner mechanism when/if
 // https://github.com/grpc/grpc-go/issues/1443 is resolved.
 func RequestDidNotStart(err error) bool {
-	if _, ok := err.(connectionNotReadyError); ok {
+	if errors.HasType(err, connectionNotReadyError{}) ||
+		errors.HasType(err, (*netutil.InitialHeartbeatFailedError)(nil)) {
 		return true
 	}
-	if _, ok := err.(*netutil.InitialHeartbeatFailedError); ok {
-		return true
-	}
-	s, ok := status.FromError(err)
+	s, ok := status.FromError(errors.Cause(err))
 	if !ok {
 		// This is a non-gRPC error; assume nothing.
 		return false

@@ -27,17 +27,20 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
+
+// Remove unused warning.
+var _ = execgen.UNSAFEGET
 
 // {{/*
 // Declarations to make the template compile properly.
@@ -60,32 +63,47 @@ var _ time.Time
 // Dummy import to pull in "duration" package.
 var _ duration.Duration
 
-// Dummy import to pull in "coltypes" package.
-var _ coltypes.T
+// Dummy import to pull in "coldataext" package.
+var _ coldataext.Datum
+
+// _LEFT_CANONICAL_TYPE_FAMILY is the template variable.
+const _LEFT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _LEFT_TYPE_WIDTH is the template variable.
+const _LEFT_TYPE_WIDTH = 0
+
+// _RIGHT_CANONICAL_TYPE_FAMILY is the template variable.
+const _RIGHT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _RIGHT_TYPE_WIDTH is the template variable.
+const _RIGHT_TYPE_WIDTH = 0
+
+// _NON_CONST_GOTYPESLICE is a template Go type slice variable.
+type _NON_CONST_GOTYPESLICE interface{}
 
 // _ASSIGN is the template function for assigning the first input to the result
 // of computation an operation on the second and the third inputs.
-func _ASSIGN(_, _, _ interface{}) {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN(_, _, _, _, _, _ interface{}) {
+	colexecerror.InternalError("")
 }
 
-// _RET_UNSAFEGET is the template function that will be replaced by
+// _RETURN_UNSAFEGET is the template function that will be replaced by
 // "execgen.UNSAFEGET" which uses _RET_TYP.
-func _RET_UNSAFEGET(_, _ interface{}) interface{} {
-	execerror.VectorizedInternalPanic("")
+func _RETURN_UNSAFEGET(_, _ interface{}) interface{} {
+	colexecerror.InternalError("")
 }
 
 // */}}
 
-// {{define "projConstOp" }}
+// {{define "projConstOp"}}
 
 type _OP_CONST_NAME struct {
 	projConstOpBase
-	// {{ if _IS_CONST_LEFT }}
+	// {{if _IS_CONST_LEFT}}
 	constArg _L_GO_TYPE
-	// {{ else }}
+	// {{else}}
 	constArg _R_GO_TYPE
-	// {{ end }}
+	// {{end}}
 }
 
 func (p _OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
@@ -100,14 +118,19 @@ func (p _OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
 	if n == 0 {
 		return coldata.ZeroBatch
 	}
-	p.allocator.MaybeAddColumn(batch, coltypes._RET_TYP, p.outputIdx)
 	vec := batch.ColVec(p.colIdx)
+	var col _NON_CONST_GOTYPESLICE
 	// {{if _IS_CONST_LEFT}}
-	col := vec._R_TYP()
+	col = vec._R_TYP()
 	// {{else}}
-	col := vec._L_TYP()
+	col = vec._L_TYP()
 	// {{end}}
 	projVec := batch.ColVec(p.outputIdx)
+	if projVec.MaybeHasNulls() {
+		// We need to make sure that there are no left over null values in the
+		// output vector.
+		projVec.Nulls().UnsetNulls()
+	}
 	projCol := projVec._RET_TYP()
 	if vec.Nulls().MaybeHasNulls() {
 		_SET_PROJECTION(true)
@@ -142,7 +165,7 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 		}
 	} else {
 		col = execgen.SLICE(col, 0, n)
-		_ = _RET_UNSAFEGET(projCol, n-1)
+		_ = _RETURN_UNSAFEGET(projCol, n-1)
 		for execgen.RANGE(i, col, 0, n) {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
 		}
@@ -169,11 +192,11 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 		// {{end}}
 		arg := execgen.UNSAFEGET(col, i)
 		// {{if _IS_CONST_LEFT}}
-		_ASSIGN(projCol[i], p.constArg, arg)
+		_ASSIGN(projCol[i], p.constArg, arg, projCol, _, col)
 		// {{else}}
-		_ASSIGN(projCol[i], arg, p.constArg)
+		_ASSIGN(projCol[i], arg, p.constArg, projCol, col, _)
 		// {{end}}
-		// {{if _HAS_NULLS }}
+		// {{if _HAS_NULLS}}
 	}
 	// {{end}}
 	// {{end}}
@@ -183,17 +206,30 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 
 // */}}
 
-// {{/*
-// The outer range is a coltypes.T (the left type). The middle range is also a
-// coltypes.T (the right type). The inner is the overloads associated with
-// those two types.
-// */}}
-// {{range .}}
-// {{range .}}
-// {{range .}}
+// {{range .BinOps}}
+// {{range .LeftFamilies}}
+// {{range .LeftWidths}}
+// {{range .RightFamilies}}
+// {{range .RightWidths}}
 
 // {{template "projConstOp" .}}
 
+// {{end}}
+// {{end}}
+// {{end}}
+// {{end}}
+// {{end}}
+
+// {{range .CmpOps}}
+// {{range .LeftFamilies}}
+// {{range .LeftWidths}}
+// {{range .RightFamilies}}
+// {{range .RightWidths}}
+
+// {{template "projConstOp" .}}
+
+// {{end}}
+// {{end}}
 // {{end}}
 // {{end}}
 // {{end}}
@@ -201,81 +237,104 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool) { // */}}
 // GetProjection_CONST_SIDEConstOperator returns the appropriate constant
 // projection operator for the given left and right column types and operation.
 func GetProjection_CONST_SIDEConstOperator(
-	allocator *Allocator,
-	leftColType *types.T,
-	rightColType *types.T,
+	allocator *colmem.Allocator,
+	leftType *types.T,
+	rightType *types.T,
+	outputType *types.T,
 	op tree.Operator,
-	input Operator,
+	input colexecbase.Operator,
 	colIdx int,
 	constArg tree.Datum,
 	outputIdx int,
-) (Operator, error) {
+) (colexecbase.Operator, error) {
+	input = newVectorTypeEnforcer(allocator, input, outputType, outputIdx)
 	projConstOpBase := projConstOpBase{
 		OneInputNode: NewOneInputNode(input),
 		allocator:    allocator,
 		colIdx:       colIdx,
 		outputIdx:    outputIdx,
 	}
+	var (
+		c   interface{}
+		err error
+	)
 	// {{if _IS_CONST_LEFT}}
-	c, err := typeconv.GetDatumToPhysicalFn(leftColType)(constArg)
+	c, err = getDatumToPhysicalFn(leftType)(constArg)
 	// {{else}}
-	c, err := typeconv.GetDatumToPhysicalFn(rightColType)(constArg)
+	c, err = getDatumToPhysicalFn(rightType)(constArg)
 	// {{end}}
 	if err != nil {
 		return nil, err
 	}
-	switch leftType := typeconv.FromColumnType(leftColType); leftType {
-	// {{range $lTyp, $rTypToOverloads := .}}
-	case coltypes._L_TYP_VAR:
-		switch rightType := typeconv.FromColumnType(rightColType); rightType {
-		// {{range $rTyp, $overloads := $rTypToOverloads}}
-		case coltypes._R_TYP_VAR:
-			switch op.(type) {
-			case tree.BinaryOperator:
-				switch op {
-				// {{range $overloads}}
-				// {{if .IsBinOp}}
-				case tree._NAME:
-					return &_OP_CONST_NAME{
-						projConstOpBase: projConstOpBase,
-						// {{if _IS_CONST_LEFT}}
-						constArg: c.(_L_GO_TYPE),
-						// {{else}}
-						constArg: c.(_R_GO_TYPE),
+	switch op.(type) {
+	case tree.BinaryOperator:
+		switch op {
+		// {{range .BinOps}}
+		case tree._NAME:
+			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
+			// {{range .LeftFamilies}}
+			case _LEFT_CANONICAL_TYPE_FAMILY:
+				switch leftType.Width() {
+				// {{range .LeftWidths}}
+				case _LEFT_TYPE_WIDTH:
+					switch typeconv.TypeFamilyToCanonicalTypeFamily(rightType.Family()) {
+					// {{range .RightFamilies}}
+					case _RIGHT_CANONICAL_TYPE_FAMILY:
+						switch rightType.Width() {
+						// {{range .RightWidths}}
+						case _RIGHT_TYPE_WIDTH:
+							return &_OP_CONST_NAME{
+								projConstOpBase: projConstOpBase,
+								// {{if _IS_CONST_LEFT}}
+								constArg: c.(_L_GO_TYPE),
+								// {{else}}
+								constArg: c.(_R_GO_TYPE),
+								// {{end}}
+							}, nil
+							// {{end}}
+						}
 						// {{end}}
-					}, nil
-				// {{end}}
-				// {{end}}
-				default:
-					return nil, errors.Errorf("unhandled binary operator: %s", op)
+					}
+					// {{end}}
 				}
-			case tree.ComparisonOperator:
-				switch op {
-				// {{range $overloads}}
-				// {{if .IsCmpOp}}
-				case tree._NAME:
-					return &_OP_CONST_NAME{
-						projConstOpBase: projConstOpBase,
-						// {{if _IS_CONST_LEFT}}
-						constArg: c.(_L_GO_TYPE),
-						// {{else}}
-						constArg: c.(_R_GO_TYPE),
-						// {{end}}
-					}, nil
 				// {{end}}
-				// {{end}}
-				default:
-					return nil, errors.Errorf("unhandled comparison operator: %s", op)
-				}
-			default:
-				return nil, errors.New("unhandled operator type")
 			}
-		// {{end}}
-		default:
-			return nil, errors.Errorf("unhandled right type: %s", rightType)
+			// {{end}}
 		}
-	// {{end}}
-	default:
-		return nil, errors.Errorf("unhandled left type: %s", leftType)
+	case tree.ComparisonOperator:
+		switch op {
+		// {{range .CmpOps}}
+		case tree._NAME:
+			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
+			// {{range .LeftFamilies}}
+			case _LEFT_CANONICAL_TYPE_FAMILY:
+				switch leftType.Width() {
+				// {{range .LeftWidths}}
+				case _LEFT_TYPE_WIDTH:
+					switch typeconv.TypeFamilyToCanonicalTypeFamily(rightType.Family()) {
+					// {{range .RightFamilies}}
+					case _RIGHT_CANONICAL_TYPE_FAMILY:
+						switch rightType.Width() {
+						// {{range .RightWidths}}
+						case _RIGHT_TYPE_WIDTH:
+							return &_OP_CONST_NAME{
+								projConstOpBase: projConstOpBase,
+								// {{if _IS_CONST_LEFT}}
+								constArg: c.(_L_GO_TYPE),
+								// {{else}}
+								constArg: c.(_R_GO_TYPE),
+								// {{end}}
+							}, nil
+							// {{end}}
+						}
+						// {{end}}
+					}
+					// {{end}}
+				}
+				// {{end}}
+			}
+			// {{end}}
+		}
 	}
+	return nil, errors.Errorf("couldn't find overload for %s %s %s", leftType.Name(), op, rightType.Name())
 }

@@ -18,12 +18,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvfeed"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -145,7 +144,7 @@ func newChangeAggregatorProcessor(
 	return ca, nil
 }
 
-func (ca *changeAggregator) OutputTypes() []types.T {
+func (ca *changeAggregator) OutputTypes() []*types.T {
 	return changefeedResultTypes
 }
 
@@ -158,8 +157,12 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 
 	spans, sf := ca.setupSpans()
 	timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf, initialInclusiveLowerBound: ca.spec.Feed.StatementTime}
-	nodeID := ca.flowCtx.EvalCtx.NodeID
-	var err error
+	nodeID, err := ca.flowCtx.EvalCtx.NodeID.OptionalNodeIDErr(48274)
+	if err != nil {
+		ca.MoveToDraining(err)
+		return ctx
+	}
+
 	if ca.sink, err = getSink(
 		ctx, ca.spec.Feed.SinkURI, nodeID, ca.spec.Feed.Opts, ca.spec.Feed.Targets,
 		ca.flowCtx.Cfg.Settings, timestampOracle, ca.flowCtx.Cfg.ExternalStorageFromURI,
@@ -202,11 +205,11 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	ca.kvFeedMemMon = &kvFeedMemMon
 
 	buf := kvfeed.MakeChanBuffer()
-	leaseMgr := ca.flowCtx.Cfg.LeaseManager.(*sql.LeaseManager)
+	leaseMgr := ca.flowCtx.Cfg.LeaseManager.(*lease.Manager)
 	_, withDiff := ca.spec.Feed.Opts[changefeedbase.OptDiff]
 	kvfeedCfg := makeKVFeedCfg(ca.flowCtx.Cfg, leaseMgr, ca.kvFeedMemMon, ca.spec,
 		spans, withDiff, buf, metrics)
-	rowsFn := kvsToRows(leaseMgr, ca.spec.Feed, buf.Get)
+	rowsFn := kvsToRows(ca.flowCtx.Codec(), leaseMgr, ca.spec.Feed, buf.Get)
 	ca.tickFn = emitEntries(ca.flowCtx.Cfg.Settings, ca.spec.Feed,
 		kvfeedCfg.InitialHighWater, sf, ca.encoder, ca.sink, rowsFn, knobs, metrics)
 	ca.startKVFeed(ctx, kvfeedCfg)
@@ -237,7 +240,7 @@ func (ca *changeAggregator) startKVFeed(ctx context.Context, kvfeedCfg kvfeed.Co
 
 func makeKVFeedCfg(
 	cfg *execinfra.ServerConfig,
-	leaseMgr *sql.LeaseManager,
+	leaseMgr *lease.Manager,
 	mm *mon.BytesMonitor,
 	spec execinfrapb.ChangeAggregatorSpec,
 	spans []roachpb.Span,
@@ -529,7 +532,7 @@ func newChangeFrontierProcessor(
 	return cf, nil
 }
 
-func (cf *changeFrontier) OutputTypes() []types.T {
+func (cf *changeFrontier) OutputTypes() []*types.T {
 	return changefeedResultTypes
 }
 
@@ -541,8 +544,11 @@ func (cf *changeFrontier) Start(ctx context.Context) context.Context {
 	// early returns if errors are detected.
 	ctx = cf.StartInternal(ctx, changeFrontierProcName)
 
-	nodeID := cf.flowCtx.EvalCtx.NodeID
-	var err error
+	nodeID, err := cf.flowCtx.EvalCtx.NodeID.OptionalNodeIDErr(48274)
+	if err != nil {
+		cf.MoveToDraining(err)
+		return ctx
+	}
 	// Pass a nil oracle because this sink is only used to emit resolved timestamps
 	// but the oracle is only used when emitting row updates.
 	var nilOracle timestampLowerBoundOracle
@@ -693,7 +699,7 @@ func (cf *changeFrontier) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMeta
 }
 
 func (cf *changeFrontier) noteResolvedSpan(d sqlbase.EncDatum) error {
-	if err := d.EnsureDecoded(&changefeedResultTypes[0], &cf.a); err != nil {
+	if err := d.EnsureDecoded(changefeedResultTypes[0], &cf.a); err != nil {
 		return err
 	}
 	raw, ok := d.Datum.(*tree.DBytes)
@@ -848,13 +854,10 @@ func (cf *changeFrontier) maybeProtectTimestamp(
 	if cf.isSinkless() || !cf.schemaChangeBoundaryReached() || !cf.shouldProtectBoundaries() {
 		return nil
 	}
-	progress.ProtectedTimestampRecord = uuid.MakeV4()
-	log.VEventf(ctx, 2, "creating protected timestamp %v at %v",
-		progress.ProtectedTimestampRecord, resolved)
-	spansToProtect := makeSpansToProtect(cf.spec.Feed.Targets)
-	rec := jobsprotectedts.MakeRecord(
-		progress.ProtectedTimestampRecord, cf.spec.JobID, resolved, spansToProtect)
-	return pts.Protect(ctx, txn, rec)
+
+	jobID := cf.spec.JobID
+	targets := cf.spec.Feed.Targets
+	return createProtectedTimestampRecord(ctx, pts, txn, jobID, targets, resolved, progress)
 }
 
 func (cf *changeFrontier) maybeEmitResolved(newResolved hlc.Timestamp) error {
@@ -895,7 +898,7 @@ func (cf *changeFrontier) maybeLogBehindSpan(frontierChanged bool) (isBehind boo
 	}
 
 	description := `sinkless feed`
-	if cf.isSinkless() {
+	if !cf.isSinkless() {
 		description = fmt.Sprintf("job %d", cf.spec.JobID)
 	}
 	if frontierChanged {

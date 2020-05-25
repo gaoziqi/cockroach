@@ -16,6 +16,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/lib/pq/oid"
 	"github.com/stretchr/testify/assert"
@@ -32,6 +34,10 @@ func TestTypes(t *testing.T) {
 		{MakeArray(Any), AnyArray},
 		{MakeArray(Any), &T{InternalType: InternalType{
 			Family: ArrayFamily, ArrayContents: Any, Oid: oid.T_anyarray, Locale: &emptyLocale}}},
+
+		{MakeArray(Float), FloatArray},
+		{MakeArray(Float), &T{InternalType: InternalType{
+			Family: ArrayFamily, ArrayContents: Float, Oid: oid.T__float8, Locale: &emptyLocale}}},
 
 		{MakeArray(Decimal), DecimalArray},
 		{MakeArray(Decimal), &T{InternalType: InternalType{
@@ -141,6 +147,74 @@ func TestTypes(t *testing.T) {
 		{Float4, &T{InternalType: InternalType{
 			Family: FloatFamily, Width: 32, Oid: oid.T_float4, Locale: &emptyLocale}}},
 		{Float4, MakeScalar(FloatFamily, oid.T_float4, 0, 32, emptyLocale)},
+
+		// GEOGRAPHY
+		{
+			Geography,
+			&T{
+				InternalType: InternalType{
+					Family: GeographyFamily,
+					Oid:    oidext.T_geography,
+					Locale: &emptyLocale,
+					GeoMetadata: &GeoMetadata{
+						SRID:  0,
+						Shape: geopb.Shape_Unset,
+					},
+				},
+			},
+		},
+		{
+			Geography,
+			MakeScalar(GeographyFamily, oidext.T_geography, 0, 0, emptyLocale),
+		},
+		{
+			&T{
+				InternalType: InternalType{
+					Family: GeographyFamily,
+					Oid:    oidext.T_geography,
+					Locale: &emptyLocale,
+					GeoMetadata: &GeoMetadata{
+						SRID:  4325,
+						Shape: geopb.Shape_MultiPoint,
+					},
+				},
+			},
+			MakeGeography(geopb.Shape_MultiPoint, 4325),
+		},
+
+		// GEOMETRY
+		{
+			Geometry,
+			&T{
+				InternalType: InternalType{
+					Family: GeometryFamily,
+					Oid:    oidext.T_geometry,
+					Locale: &emptyLocale,
+					GeoMetadata: &GeoMetadata{
+						SRID:  0,
+						Shape: geopb.Shape_Unset,
+					},
+				},
+			},
+		},
+		{
+			Geometry,
+			MakeScalar(GeometryFamily, oidext.T_geometry, 0, 0, emptyLocale),
+		},
+		{
+			&T{
+				InternalType: InternalType{
+					Family: GeometryFamily,
+					Oid:    oidext.T_geometry,
+					Locale: &emptyLocale,
+					GeoMetadata: &GeoMetadata{
+						SRID:  4325,
+						Shape: geopb.Shape_MultiPoint,
+					},
+				},
+			},
+			MakeGeometry(geopb.Shape_MultiPoint, 4325),
+		},
 
 		// INET
 		{INet, &T{InternalType: InternalType{
@@ -403,14 +477,14 @@ func TestTypes(t *testing.T) {
 
 		// TUPLE
 		{MakeTuple(nil), EmptyTuple},
-		{MakeTuple([]T{*Any}), AnyTuple},
-		{MakeTuple([]T{*Int}), &T{InternalType: InternalType{
-			Family: TupleFamily, Oid: oid.T_record, TupleContents: []T{*Int}, Locale: &emptyLocale}}},
-		{MakeTuple([]T{*Int, *String}), &T{InternalType: InternalType{
-			Family: TupleFamily, Oid: oid.T_record, TupleContents: []T{*Int, *String}, Locale: &emptyLocale}}},
+		{MakeTuple([]*T{Any}), AnyTuple},
+		{MakeTuple([]*T{Int}), &T{InternalType: InternalType{
+			Family: TupleFamily, Oid: oid.T_record, TupleContents: []*T{Int}, Locale: &emptyLocale}}},
+		{MakeTuple([]*T{Int, String}), &T{InternalType: InternalType{
+			Family: TupleFamily, Oid: oid.T_record, TupleContents: []*T{Int, String}, Locale: &emptyLocale}}},
 
-		{MakeLabeledTuple([]T{*Int, *String}, []string{"foo", "bar"}), &T{InternalType: InternalType{
-			Family: TupleFamily, Oid: oid.T_record, TupleContents: []T{*Int, *String},
+		{MakeLabeledTuple([]*T{Int, String}, []string{"foo", "bar"}), &T{InternalType: InternalType{
+			Family: TupleFamily, Oid: oid.T_record, TupleContents: []*T{Int, String},
 			TupleLabels: []string{"foo", "bar"}, Locale: &emptyLocale}}},
 
 		// UNKNOWN
@@ -422,6 +496,14 @@ func TestTypes(t *testing.T) {
 		{Uuid, &T{InternalType: InternalType{
 			Family: UuidFamily, Oid: oid.T_uuid, Locale: &emptyLocale}}},
 		{Uuid, MakeScalar(UuidFamily, oid.T_uuid, 0, 0, emptyLocale)},
+
+		// ENUMs
+		{MakeEnum(15210), &T{InternalType: InternalType{
+			Family:       EnumFamily,
+			Locale:       &emptyLocale,
+			Oid:          StableTypeIDToOID(15210),
+			StableTypeID: 15210,
+		}}},
 	}
 
 	for i, tc := range testCases {
@@ -514,15 +596,19 @@ func TestEquivalent(t *testing.T) {
 		{Int, IntArray, false},
 
 		// TUPLE
-		{MakeTuple([]T{}), MakeTuple([]T{}), true},
-		{MakeTuple([]T{*Int, *String}), MakeTuple([]T{*Int4, *VarChar}), true},
-		{MakeTuple([]T{*Int, *String}), AnyTuple, true},
-		{AnyTuple, MakeTuple([]T{*Int, *String}), true},
-		{MakeTuple([]T{*Int, *String}),
-			MakeLabeledTuple([]T{*Int4, *VarChar}, []string{"label2", "label1"}), true},
-		{MakeLabeledTuple([]T{*Int, *String}, []string{"label1", "label2"}),
-			MakeLabeledTuple([]T{*Int4, *VarChar}, []string{"label2", "label1"}), true},
-		{MakeTuple([]T{*String, *Int}), MakeTuple([]T{*Int, *String}), false},
+		{MakeTuple([]*T{}), MakeTuple([]*T{}), true},
+		{MakeTuple([]*T{Int, String}), MakeTuple([]*T{Int4, VarChar}), true},
+		{MakeTuple([]*T{Int, String}), AnyTuple, true},
+		{AnyTuple, MakeTuple([]*T{Int, String}), true},
+		{MakeTuple([]*T{Int, String}),
+			MakeLabeledTuple([]*T{Int4, VarChar}, []string{"label2", "label1"}), true},
+		{MakeLabeledTuple([]*T{Int, String}, []string{"label1", "label2"}),
+			MakeLabeledTuple([]*T{Int4, VarChar}, []string{"label2", "label1"}), true},
+		{MakeTuple([]*T{String, Int}), MakeTuple([]*T{Int, String}), false},
+
+		// ENUM
+		{MakeEnum(15210), MakeEnum(15210), true},
+		{MakeEnum(15210), MakeEnum(15150), false},
 
 		// UNKNOWN
 		{Unknown, &T{InternalType: InternalType{
@@ -834,6 +920,19 @@ func TestUpgradeType(t *testing.T) {
 				},
 			}},
 		},
+		{
+			desc: "varbit types are not assigned the default family Oid value",
+			input: &T{InternalType: InternalType{
+				Family:      BitFamily,
+				VisibleType: visibleVARBIT,
+				Locale:      &emptyLocale,
+			}},
+			expected: &T{InternalType: InternalType{
+				Family: BitFamily,
+				Oid:    oid.T_varbit,
+				Locale: &emptyLocale,
+			}},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -841,6 +940,26 @@ func TestUpgradeType(t *testing.T) {
 			err := tc.input.upgradeType()
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expected, tc.input)
+		})
+	}
+}
+
+func TestOidSetDuringUpgrade(t *testing.T) {
+	for family, Oid := range familyToOid {
+		t.Run(fmt.Sprintf("family-%s", Family_name[int32(family)]), func(t *testing.T) {
+			input := &T{InternalType: InternalType{
+				Family: family,
+			}}
+			if family == ArrayFamily {
+				// This is not material to this test, but needs to be set to avoid
+				// panic.
+				input.InternalType.ArrayContents = &T{InternalType: InternalType{
+					Family: BoolFamily,
+				}}
+			}
+			err := input.upgradeType()
+			assert.NoError(t, err)
+			assert.Equal(t, Oid, input.Oid())
 		})
 	}
 }

@@ -21,11 +21,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGossipFirstRange(t *testing.T) {
@@ -35,7 +37,7 @@ func TestGossipFirstRange(t *testing.T) {
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	errors := make(chan error, 1)
 	descs := make(chan *roachpb.RangeDescriptor)
@@ -76,7 +78,7 @@ func TestGossipFirstRange(t *testing.T) {
 				if reflect.DeepEqual(&desc, gossiped) {
 					return
 				}
-				log.Infof(context.TODO(), "expected\n%+v\nbut found\n%+v", desc, gossiped)
+				log.Infof(context.Background(), "expected\n%+v\nbut found\n%+v", desc, gossiped)
 			}
 		}
 	}
@@ -163,7 +165,7 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 		base.TestClusterArgs{
 			ServerArgs: serverArgs,
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	// Take down the first node and replace it with a new one.
 	oldNodeIdx := 0
@@ -189,5 +191,64 @@ func TestGossipHandlesReplacedNode(t *testing.T) {
 		if err := kvClient.Put(ctx, fmt.Sprintf("%d", i), i); err != nil {
 			t.Errorf("failed Put to node %d: %+v", i, err)
 		}
+	}
+}
+
+// TestGossipAfterAbortOfSystemConfigTransactionAfterFailureDueToIntents tests
+// that failures to gossip the system config due to intents are rectified when
+// later intents are aborted.
+func TestGossipAfterAbortOfSystemConfigTransactionAfterFailureDueToIntents(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+	require.NoError(t, tc.WaitForFullReplication())
+
+	db := tc.Server(0).DB()
+
+	txA := db.NewTxn(ctx, "a")
+	txB := db.NewTxn(ctx, "b")
+
+	require.NoError(t, txA.SetSystemConfigTrigger())
+	require.NoError(t, txA.Put(ctx, keys.SystemSQLCodec.DescMetadataKey(1000), &sqlbase.Descriptor{}))
+
+	require.NoError(t, txB.SetSystemConfigTrigger())
+	require.NoError(t, txB.Put(ctx, keys.SystemSQLCodec.DescMetadataKey(2000), &sqlbase.Descriptor{}))
+
+	const someTime = 10 * time.Millisecond
+	clearNotifictions := func(ch <-chan struct{}) {
+		for {
+			select {
+			case <-ch:
+			case <-time.After(someTime):
+				return
+			}
+		}
+	}
+	systemConfChangeCh := tc.Server(0).GossipI().(*gossip.Gossip).RegisterSystemConfigChannel()
+	clearNotifictions(systemConfChangeCh)
+	require.NoError(t, txB.Commit(ctx))
+	select {
+	case <-systemConfChangeCh:
+		// This case is rare but happens sometimes. We gossip the node liveness
+		// in a bunch of cases so we just let the test finish here. The important
+		// thing is that sometimes we get to the next phase.
+		t.Log("got unexpected update. This can happen for a variety of " +
+			"reasons like lease transfers. The test is exiting without testing anything")
+		return
+	case <-time.After(someTime):
+		// Did not expect an update so this is the happy case
+	}
+	// Roll back the transaction which had laid down the intent which blocked the
+	// earlier gossip update, make sure we get a gossip notification now.
+	const aLongTime = 20 * someTime
+	require.NoError(t, txA.Rollback(ctx))
+	select {
+	case <-systemConfChangeCh:
+		// Got an update.
+	case <-time.After(aLongTime):
+		t.Fatal("expected update")
 	}
 }

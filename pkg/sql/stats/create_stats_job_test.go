@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
@@ -34,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // TestCreateStatsControlJob tests that PAUSE JOB, RESUME JOB, and CANCEL JOB
@@ -666,7 +666,7 @@ func TestCreateStatsAsOfTime(t *testing.T) {
 // Create a blocking request filter for the actions related
 // to CREATE STATISTICS, i.e. Scanning a user table. See discussion
 // on jobutils.RunJob for where this might be useful.
-func createStatsRequestFilter(allowProgressIota *chan struct{}) storagebase.ReplicaRequestFilter {
+func createStatsRequestFilter(allowProgressIota *chan struct{}) kvserverbase.ReplicaRequestFilter {
 	return func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		if req, ok := ba.GetArg(roachpb.Scan); ok {
 			_, tableID, _ := encoding.DecodeUvarintAscending(req.(*roachpb.ScanRequest).Key)

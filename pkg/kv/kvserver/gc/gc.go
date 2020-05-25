@@ -24,8 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -166,7 +165,7 @@ func Run(
 	cleanupTxnIntentsAsyncFn CleanupTxnIntentsAsyncFunc,
 ) (Info, error) {
 
-	txnExp := now.Add(-storagebase.TxnCleanupThreshold.Nanoseconds(), 0)
+	txnExp := now.Add(-kvserverbase.TxnCleanupThreshold.Nanoseconds(), 0)
 	if err := gcer.SetGCThreshold(ctx, Threshold{
 		Key: newThreshold,
 		Txn: txnExp,
@@ -413,7 +412,7 @@ func processLocalKeyRange(
 		// If the transaction needs to be pushed or there are intents to
 		// resolve, invoke the cleanup function.
 		if !txn.Status.IsFinalized() || len(txn.LockSpans) > 0 {
-			return cleanupTxnIntentsAsyncFn(ctx, txn, roachpb.AsLockUpdates(txn, txn.LockSpans, lock.Replicated))
+			return cleanupTxnIntentsAsyncFn(ctx, txn, roachpb.AsLockUpdates(txn, txn.LockSpans))
 		}
 		b.FlushingAdd(ctx, key)
 		return nil
@@ -507,7 +506,7 @@ func processAbortSpan(
 		return nil
 	})
 	if err != nil {
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "%v", err)
 	}
 }
 

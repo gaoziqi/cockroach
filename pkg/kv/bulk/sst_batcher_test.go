@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -39,7 +39,7 @@ import (
 )
 
 func makeIntTableKVs(numKeys, valueSize, maxRevisions int) []storage.MVCCKeyValue {
-	prefix := encoding.EncodeUvarintAscending(keys.MakeTablePrefix(uint32(100)), uint64(1))
+	prefix := keys.SystemSQLCodec.IndexPrefix(100, 1)
 	kvs := make([]storage.MVCCKeyValue, numKeys)
 	r, _ := randutil.NewPseudoRand()
 
@@ -146,7 +146,7 @@ func runTestImport(t *testing.T, batchSizeValue int64) {
 		{{0, 3}, {4}},
 	} {
 		t.Run(fmt.Sprintf("%d-%v", i, testCase), func(t *testing.T) {
-			prefix := encoding.EncodeUvarintAscending(keys.MakeTablePrefix(uint32(100+i)), uint64(1))
+			prefix := keys.SystemSQLCodec.IndexPrefix(uint32(100+i), 1)
 			key := func(i int) roachpb.Key {
 				return encoding.EncodeStringAscending(append([]byte{}, prefix...), fmt.Sprintf("k%d", i))
 			}
@@ -162,7 +162,7 @@ func runTestImport(t *testing.T, batchSizeValue int64) {
 			// splits to exercise that codepath, but we also want to make sure we
 			// still handle an unexpected split, so we make our own range cache and
 			// only populate it with one of our two splits.
-			mockCache := kvcoord.NewRangeDescriptorCache(s.ClusterSettings(), nil, func() int64 { return 2 << 10 })
+			mockCache := kvcoord.NewRangeDescriptorCache(s.ClusterSettings(), nil, func() int64 { return 2 << 10 }, s.Stopper())
 			addr, err := keys.Addr(key(0))
 			if err != nil {
 				t.Fatal(err)
@@ -178,7 +178,7 @@ func runTestImport(t *testing.T, batchSizeValue int64) {
 
 			ts := hlc.Timestamp{WallTime: 100}
 			b, err := bulk.MakeBulkAdder(
-				ctx, kvDB, mockCache, s.ClusterSettings(), ts, storagebase.BulkAdderOptions{MinBufferSize: batchSize(), SSTSize: batchSize}, nil, /* bulkMon */
+				ctx, kvDB, mockCache, s.ClusterSettings(), ts, kvserverbase.BulkAdderOptions{MinBufferSize: batchSize(), SSTSize: batchSize}, nil, /* bulkMon */
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -332,7 +332,7 @@ func TestAddBigSpanningSSTWithSplits(t *testing.T) {
 
 	t.Logf("Adding %dkb sst spanning %d splits from %v to %v", len(sst)/kb, len(splits), start, end)
 	if _, err := bulk.AddSSTable(
-		context.TODO(), mock, start, end, sst, false /* disallowShadowing */, enginepb.MVCCStats{}, cluster.MakeTestingClusterSettings(),
+		context.Background(), mock, start, end, sst, false /* disallowShadowing */, enginepb.MVCCStats{}, cluster.MakeTestingClusterSettings(),
 	); err != nil {
 		t.Fatal(err)
 	}

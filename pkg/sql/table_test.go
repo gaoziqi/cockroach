@@ -15,32 +15,11 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/stretchr/testify/assert"
 )
-
-func TestIsSupportedSchemaName(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	testCases := []struct {
-		name  string
-		valid bool
-	}{
-		{"db_name", false},
-		{"public", true},
-		{"pg_temp", true},
-		{"pg_temp_1234_1", true},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.valid, isSupportedSchemaName(tree.Name(tc.name)))
-		})
-	}
-}
 
 func TestMakeTableDescColumns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -188,14 +167,14 @@ func TestMakeTableDescColumns(t *testing.T) {
 	}
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (a " + d.sqlType + " PRIMARY KEY, b " + d.sqlType + ")"
-		schema, err := CreateTestTableDescriptor(context.TODO(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
+		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
 		if err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
 		if schema.Columns[0].Nullable {
 			t.Fatalf("%d: expected non-nullable primary key, but got %+v", i, schema.Columns[0].Nullable)
 		}
-		if !reflect.DeepEqual(*d.colType, schema.Columns[0].Type) {
+		if !d.colType.Identical(schema.Columns[0].Type) {
 			t.Fatalf("%d: expected %+v, but got %+v", i, d.colType.DebugString(), schema.Columns[0].Type.DebugString())
 		}
 		if d.nullable != schema.Columns[1].Nullable {
@@ -302,7 +281,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 	}
 	for i, d := range testData {
 		s := "CREATE TABLE foo.test (" + d.sql + ")"
-		schema, err := CreateTestTableDescriptor(context.TODO(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
+		schema, err := CreateTestTableDescriptor(context.Background(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
 		if err != nil {
 			t.Fatalf("%d (%s): %v", i, d.sql, err)
 		}
@@ -319,7 +298,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 func TestPrimaryKeyUnspecified(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := "CREATE TABLE foo.test (a INT, b INT, CONSTRAINT c UNIQUE (b))"
-	desc, err := CreateTestTableDescriptor(context.TODO(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
+	desc, err := CreateTestTableDescriptor(context.Background(), 1, 100, s, sqlbase.NewDefaultPrivilegeDescriptor())
 	if err != nil {
 		t.Fatal(err)
 	}

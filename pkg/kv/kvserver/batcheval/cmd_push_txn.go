@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func init() {
@@ -142,6 +142,7 @@ func PushTxn(
 	if err != nil {
 		return result.Result{}, err
 	} else if !ok {
+		log.VEventf(ctx, 2, "pushee txn record not found")
 		// There are three cases in which there is no transaction record:
 		//
 		// * the pushee is still active but its transaction record has not
@@ -177,11 +178,6 @@ func PushTxn(
 	} else {
 		// Start with the persisted transaction record.
 		reply.PusheeTxn = existTxn
-
-		// Forward the last heartbeat time of the transaction record by
-		// the timestamp of the intent. This is another indication of
-		// client activity.
-		reply.PusheeTxn.LastHeartbeat.Forward(args.PusheeTxn.WriteTimestamp)
 	}
 
 	// If already committed or aborted, return success.
@@ -248,9 +244,12 @@ func PushTxn(
 		if !pusherWins {
 			s = "failed to push"
 		}
-		log.Infof(ctx, "%s "+s+" (push type=%s) %s: %s (pushee last active: %s)",
-			args.PusherTxn.Short(), pushType, args.PusheeTxn.Short(),
-			reason, reply.PusheeTxn.LastActive())
+		log.Infof(ctx, "%s %s (push type=%s) %s: %s (pushee last active: %s)",
+			args.PusherTxn.Short(), log.Safe(s),
+			log.Safe(pushType),
+			args.PusheeTxn.Short(),
+			log.Safe(reason),
+			reply.PusheeTxn.LastActive())
 	}
 
 	// If the pushed transaction is in the staging state, we can't change its
@@ -259,17 +258,13 @@ func PushTxn(
 	recoverOnFailedPush := cArgs.EvalCtx.EvalKnobs().RecoverIndeterminateCommitsOnFailedPushes
 	if reply.PusheeTxn.Status == roachpb.STAGING && (pusherWins || recoverOnFailedPush) {
 		err := roachpb.NewIndeterminateCommitError(reply.PusheeTxn)
-		if log.V(1) {
-			log.Infof(ctx, "%v", err)
-		}
+		log.VEventf(ctx, 1, "%v", err)
 		return result.Result{}, err
 	}
 
 	if !pusherWins {
 		err := roachpb.NewTransactionPushError(reply.PusheeTxn)
-		if log.V(1) {
-			log.Infof(ctx, "%v", err)
-		}
+		log.VEventf(ctx, 1, "%v", err)
 		return result.Result{}, err
 	}
 

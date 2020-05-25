@@ -16,7 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // joinerBase is the common core of all joiners.
@@ -48,8 +48,8 @@ func (jb *joinerBase) init(
 	self execinfra.RowSource,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
-	leftTypes []types.T,
-	rightTypes []types.T,
+	leftTypes []*types.T,
+	rightTypes []*types.T,
 	jType sqlbase.JoinType,
 	onExpr execinfrapb.Expression,
 	leftEqColumns []uint32,
@@ -69,11 +69,11 @@ func (jb *joinerBase) init(
 
 	jb.emptyLeft = make(sqlbase.EncDatumRow, len(leftTypes))
 	for i := range jb.emptyLeft {
-		jb.emptyLeft[i] = sqlbase.DatumToEncDatum(&leftTypes[i], tree.DNull)
+		jb.emptyLeft[i] = sqlbase.DatumToEncDatum(leftTypes[i], tree.DNull)
 	}
 	jb.emptyRight = make(sqlbase.EncDatumRow, len(rightTypes))
 	for i := range jb.emptyRight {
-		jb.emptyRight[i] = sqlbase.DatumToEncDatum(&rightTypes[i], tree.DNull)
+		jb.emptyRight[i] = sqlbase.DatumToEncDatum(rightTypes[i], tree.DNull)
 	}
 
 	jb.eqCols[leftSide] = leftEqColumns
@@ -83,11 +83,11 @@ func (jb *joinerBase) init(
 	size := len(leftTypes) + jb.numMergedEqualityColumns + len(rightTypes)
 	jb.combinedRow = make(sqlbase.EncDatumRow, size)
 
-	condTypes := make([]types.T, 0, size)
+	condTypes := make([]*types.T, 0, size)
 	for idx := 0; idx < jb.numMergedEqualityColumns; idx++ {
 		ltype := leftTypes[jb.eqCols[leftSide][idx]]
 		rtype := rightTypes[jb.eqCols[rightSide][idx]]
-		var ctype types.T
+		var ctype *types.T
 		if ltype.Family() != types.UnknownFamily {
 			ctype = ltype
 		} else {
@@ -99,7 +99,7 @@ func (jb *joinerBase) init(
 	condTypes = append(condTypes, rightTypes...)
 
 	outputSize := len(leftTypes) + jb.numMergedEqualityColumns
-	if shouldIncludeRightColsInOutput(jb.joinType) {
+	if jb.joinType.ShouldIncludeRightColsInOutput() {
 		outputSize += len(rightTypes)
 	}
 	outputTypes := condTypes[:outputSize]
@@ -155,15 +155,6 @@ func (jb *joinerBase) renderUnmatchedRow(
 	jb.combinedRow = append(jb.combinedRow, lrow...)
 	jb.combinedRow = append(jb.combinedRow, rrow...)
 	return jb.combinedRow
-}
-
-func shouldIncludeRightColsInOutput(joinType sqlbase.JoinType) bool {
-	switch joinType {
-	case sqlbase.LeftSemiJoin, sqlbase.LeftAntiJoin, sqlbase.IntersectAllJoin, sqlbase.ExceptAllJoin:
-		return false
-	default:
-		return true
-	}
 }
 
 // shouldEmitUnmatchedRow determines if we should emit am ummatched row (with

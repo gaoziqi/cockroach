@@ -1,3 +1,4 @@
+# LogicTest: !3node-tenant
 query T
 SHOW DATABASES
 ----
@@ -15,6 +16,8 @@ test  information_schema  admin  ALL
 test  information_schema  root   ALL
 test  pg_catalog          admin  ALL
 test  pg_catalog          root   ALL
+test  pg_extension        admin  ALL
+test  pg_extension        root   ALL
 test  public              admin  ALL
 test  public              root   ALL
 
@@ -69,6 +72,8 @@ u  information_schema  admin  ALL
 u  information_schema  root   ALL
 u  pg_catalog          admin  ALL
 u  pg_catalog          root   ALL
+u  pg_extension        admin  ALL
+u  pg_extension        root   ALL
 u  public              admin  ALL
 u  public              root   ALL
 
@@ -83,10 +88,10 @@ SELECT * FROM kv
 5 6
 7 8
 
-statement error empty database name
+statement error pgcode 42601 empty database name
 ALTER DATABASE "" RENAME TO u
 
-statement error empty database name
+statement error pgcode 42601 empty database name
 ALTER DATABASE u RENAME TO ""
 
 statement ok
@@ -119,10 +124,10 @@ user root
 statement ok
 CREATE VIEW t.v AS SELECT k,v FROM u.kv
 
-query T
+query TTT
 SHOW TABLES FROM u
 ----
-kv
+public  kv  table
 
 statement error cannot rename database because relation "t.public.v" depends on relation "u.public.kv"
 ALTER DATABASE u RENAME TO v

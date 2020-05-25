@@ -11,30 +11,30 @@ CREATE TABLE information_schema.t (x INT)
 query error database "information_schema" does not exist
 DROP DATABASE information_schema
 
-query T
+query TTT
 SHOW TABLES FROM information_schema
 ----
-administrable_role_authorizations
-applicable_roles
-check_constraints
-column_privileges
-columns
-constraint_column_usage
-enabled_roles
-key_column_usage
-parameters
-referential_constraints
-role_table_grants
-routines
-schema_privileges
-schemata
-sequences
-statistics
-table_constraints
-table_privileges
-tables
-user_privileges
-views
+information_schema  administrable_role_authorizations  table
+information_schema  applicable_roles                   table
+information_schema  check_constraints                  table
+information_schema  column_privileges                  table
+information_schema  columns                            table
+information_schema  constraint_column_usage            table
+information_schema  enabled_roles                      table
+information_schema  key_column_usage                   table
+information_schema  parameters                         table
+information_schema  referential_constraints            table
+information_schema  role_table_grants                  table
+information_schema  routines                           table
+information_schema  schema_privileges                  table
+information_schema  schemata                           table
+information_schema  sequences                          table
+information_schema  statistics                         table
+information_schema  table_constraints                  table
+information_schema  table_privileges                   table
+information_schema  tables                             table
+information_schema  user_privileges                    table
+information_schema  views                              table
 
 # Verify that the name is not special for databases.
 
@@ -118,30 +118,30 @@ postgres
 system
 test
 
-query T
+query TTT
 SHOW TABLES FROM test.information_schema
 ----
-administrable_role_authorizations
-applicable_roles
-check_constraints
-column_privileges
-columns
-constraint_column_usage
-enabled_roles
-key_column_usage
-parameters
-referential_constraints
-role_table_grants
-routines
-schema_privileges
-schemata
-sequences
-statistics
-table_constraints
-table_privileges
-tables
-user_privileges
-views
+information_schema  administrable_role_authorizations  table
+information_schema  applicable_roles                   table
+information_schema  check_constraints                  table
+information_schema  column_privileges                  table
+information_schema  columns                            table
+information_schema  constraint_column_usage            table
+information_schema  enabled_roles                      table
+information_schema  key_column_usage                   table
+information_schema  parameters                         table
+information_schema  referential_constraints            table
+information_schema  role_table_grants                  table
+information_schema  routines                           table
+information_schema  schema_privileges                  table
+information_schema  schemata                           table
+information_schema  sequences                          table
+information_schema  statistics                         table
+information_schema  table_constraints                  table
+information_schema  table_privileges                   table
+information_schema  tables                             table
+information_schema  user_privileges                    table
+information_schema  views                              table
 
 query TT colnames
 SHOW CREATE TABLE information_schema.tables
@@ -153,7 +153,8 @@ information_schema.tables  CREATE TABLE tables (
                            table_name STRING NOT NULL,
                            table_type STRING NOT NULL,
                            is_insertable_into STRING NOT NULL,
-                           version INT8 NULL
+                           version INT8 NULL,
+                           INDEX tables_table_name_idx (table_name ASC) STORING (table_catalog, table_schema, table_type, is_insertable_into, version)
 )
 
 query TTBTTTB colnames
@@ -195,6 +196,7 @@ catalog_name  schema_name         default_character_set_name  sql_path
 test          crdb_internal       NULL                        NULL
 test          information_schema  NULL                        NULL
 test          pg_catalog          NULL                        NULL
+test          pg_extension        NULL                        NULL
 test          public              NULL                        NULL
 
 query TTTT colnames
@@ -204,6 +206,7 @@ catalog_name  schema_name         default_character_set_name  sql_path
 test          crdb_internal       NULL                        NULL
 test          information_schema  NULL                        NULL
 test          pg_catalog          NULL                        NULL
+test          pg_extension        NULL                        NULL
 test          public              NULL                        NULL
 
 ## information_schema.tables
@@ -218,6 +221,7 @@ crdb_internal       builtin_functions
 crdb_internal       cluster_queries
 crdb_internal       cluster_sessions
 crdb_internal       cluster_settings
+crdb_internal       cluster_transactions
 crdb_internal       create_statements
 crdb_internal       feature_usage
 crdb_internal       forward_dependencies
@@ -236,6 +240,7 @@ crdb_internal       node_queries
 crdb_internal       node_runtime_info
 crdb_internal       node_sessions
 crdb_internal       node_statement_statistics
+crdb_internal       node_transactions
 crdb_internal       node_txn_stats
 crdb_internal       partitions
 crdb_internal       predefined_comments
@@ -269,6 +274,7 @@ information_schema  table_privileges
 information_schema  tables
 information_schema  user_privileges
 information_schema  views
+pg_catalog          pg_aggregate
 pg_catalog          pg_am
 pg_catalog          pg_attrdef
 pg_catalog          pg_attribute
@@ -285,6 +291,7 @@ pg_catalog          pg_default_acl
 pg_catalog          pg_depend
 pg_catalog          pg_description
 pg_catalog          pg_enum
+pg_catalog          pg_event_trigger
 pg_catalog          pg_extension
 pg_catalog          pg_foreign_data_wrapper
 pg_catalog          pg_foreign_server
@@ -318,6 +325,9 @@ pg_catalog          pg_type
 pg_catalog          pg_user
 pg_catalog          pg_user_mapping
 pg_catalog          pg_views
+pg_extension        geography_columns
+pg_extension        geometry_columns
+pg_extension        spatial_ref_sys
 
 statement ok
 CREATE DATABASE other_db
@@ -358,6 +368,7 @@ builtin_functions
 cluster_queries
 cluster_sessions
 cluster_settings
+cluster_transactions
 create_statements
 feature_usage
 forward_dependencies
@@ -376,6 +387,7 @@ node_queries
 node_runtime_info
 node_sessions
 node_statement_statistics
+node_transactions
 node_txn_stats
 partitions
 predefined_comments
@@ -409,11 +421,12 @@ table_privileges
 tables
 user_privileges
 views
+pg_aggregate
 pg_am
 pg_attrdef
 pg_attribute
-pg_authid
 pg_auth_members
+pg_authid
 pg_available_extensions
 pg_cast
 pg_class
@@ -425,6 +438,7 @@ pg_default_acl
 pg_depend
 pg_description
 pg_enum
+pg_event_trigger
 pg_extension
 pg_foreign_data_wrapper
 pg_foreign_server
@@ -458,6 +472,9 @@ pg_type
 pg_user
 pg_user_mapping
 pg_views
+geography_columns
+geometry_columns
+spatial_ref_sys
 xyz
 
 # Check that the other_db tables become visible to non-root when the current database is changed.
@@ -505,6 +522,7 @@ system         crdb_internal       builtin_functions                  SYSTEM VIE
 system         crdb_internal       cluster_queries                    SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_sessions                   SYSTEM VIEW  NO                  1
 system         crdb_internal       cluster_settings                   SYSTEM VIEW  NO                  1
+system         crdb_internal       cluster_transactions               SYSTEM VIEW  NO                  1
 system         crdb_internal       create_statements                  SYSTEM VIEW  NO                  1
 system         crdb_internal       feature_usage                      SYSTEM VIEW  NO                  1
 system         crdb_internal       forward_dependencies               SYSTEM VIEW  NO                  1
@@ -523,6 +541,7 @@ system         crdb_internal       node_queries                       SYSTEM VIE
 system         crdb_internal       node_runtime_info                  SYSTEM VIEW  NO                  1
 system         crdb_internal       node_sessions                      SYSTEM VIEW  NO                  1
 system         crdb_internal       node_statement_statistics          SYSTEM VIEW  NO                  1
+system         crdb_internal       node_transactions                  SYSTEM VIEW  NO                  1
 system         crdb_internal       node_txn_stats                     SYSTEM VIEW  NO                  1
 system         crdb_internal       partitions                         SYSTEM VIEW  NO                  1
 system         crdb_internal       predefined_comments                SYSTEM VIEW  NO                  1
@@ -556,6 +575,7 @@ system         information_schema  table_privileges                   SYSTEM VIE
 system         information_schema  tables                             SYSTEM VIEW  NO                  1
 system         information_schema  user_privileges                    SYSTEM VIEW  NO                  1
 system         information_schema  views                              SYSTEM VIEW  NO                  1
+system         pg_catalog          pg_aggregate                       SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_am                              SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_attrdef                         SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_attribute                       SYSTEM VIEW  NO                  1
@@ -572,6 +592,7 @@ system         pg_catalog          pg_default_acl                     SYSTEM VIE
 system         pg_catalog          pg_depend                          SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_description                     SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_enum                            SYSTEM VIEW  NO                  1
+system         pg_catalog          pg_event_trigger                   SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_extension                       SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_foreign_data_wrapper            SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_foreign_server                  SYSTEM VIEW  NO                  1
@@ -605,11 +626,15 @@ system         pg_catalog          pg_type                            SYSTEM VIE
 system         pg_catalog          pg_user                            SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_user_mapping                    SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_views                           SYSTEM VIEW  NO                  1
-system         public              namespace_deprecated               BASE TABLE   YES                 1
+system         pg_extension        geography_columns                  SYSTEM VIEW  NO                  1
+system         pg_extension        geometry_columns                   SYSTEM VIEW  NO                  1
+system         pg_extension        spatial_ref_sys                    SYSTEM VIEW  NO                  1
+system         public              namespace                          BASE TABLE   YES                 1
 system         public              descriptor                         BASE TABLE   YES                 1
 system         public              users                              BASE TABLE   YES                 1
 system         public              zones                              BASE TABLE   YES                 1
 system         public              settings                           BASE TABLE   YES                 1
+system         public              tenants                            BASE TABLE   YES                 1
 system         public              lease                              BASE TABLE   YES                 1
 system         public              eventlog                           BASE TABLE   YES                 1
 system         public              rangelog                           BASE TABLE   YES                 1
@@ -619,12 +644,12 @@ system         public              web_sessions                       BASE TABLE
 system         public              table_statistics                   BASE TABLE   YES                 1
 system         public              locations                          BASE TABLE   YES                 1
 system         public              role_members                       BASE TABLE   YES                 1
-system         public              comments                           BASE TABLE   YES                 5
+system         public              comments                           BASE TABLE   YES                 1
 system         public              replication_constraint_stats       BASE TABLE   YES                 1
 system         public              replication_critical_localities    BASE TABLE   YES                 1
 system         public              replication_stats                  BASE TABLE   YES                 1
 system         public              reports_meta                       BASE TABLE   YES                 1
-system         public              namespace                          BASE TABLE   YES                 1
+system         public              namespace2                         BASE TABLE   YES                 1
 system         public              protected_ts_meta                  BASE TABLE   YES                 1
 system         public              protected_ts_records               BASE TABLE   YES                 1
 system         public              role_options                       BASE TABLE   YES                 1
@@ -715,13 +740,13 @@ system              public             630200280_21_2_not_null  system         p
 system              public             630200280_21_3_not_null  system         public        locations                        CHECK            NO             NO
 system              public             630200280_21_4_not_null  system         public        locations                        CHECK            NO             NO
 system              public             primary                  system         public        locations                        PRIMARY KEY      NO             NO
-system              public             630200280_30_1_not_null  system         public        namespace                        CHECK            NO             NO
-system              public             630200280_30_2_not_null  system         public        namespace                        CHECK            NO             NO
-system              public             630200280_30_3_not_null  system         public        namespace                        CHECK            NO             NO
+system              public             630200280_2_1_not_null   system         public        namespace                        CHECK            NO             NO
+system              public             630200280_2_2_not_null   system         public        namespace                        CHECK            NO             NO
 system              public             primary                  system         public        namespace                        PRIMARY KEY      NO             NO
-system              public             630200280_2_1_not_null   system         public        namespace_deprecated             CHECK            NO             NO
-system              public             630200280_2_2_not_null   system         public        namespace_deprecated             CHECK            NO             NO
-system              public             primary                  system         public        namespace_deprecated             PRIMARY KEY      NO             NO
+system              public             630200280_30_1_not_null  system         public        namespace2                       CHECK            NO             NO
+system              public             630200280_30_2_not_null  system         public        namespace2                       CHECK            NO             NO
+system              public             630200280_30_3_not_null  system         public        namespace2                       CHECK            NO             NO
+system              public             primary                  system         public        namespace2                       PRIMARY KEY      NO             NO
 system              public             630200280_31_1_not_null  system         public        protected_ts_meta                CHECK            NO             NO
 system              public             630200280_31_2_not_null  system         public        protected_ts_meta                CHECK            NO             NO
 system              public             630200280_31_3_not_null  system         public        protected_ts_meta                CHECK            NO             NO
@@ -798,6 +823,9 @@ system              public             630200280_20_6_not_null  system         p
 system              public             630200280_20_7_not_null  system         public        table_statistics                 CHECK            NO             NO
 system              public             630200280_20_8_not_null  system         public        table_statistics                 CHECK            NO             NO
 system              public             primary                  system         public        table_statistics                 PRIMARY KEY      NO             NO
+system              public             630200280_8_1_not_null   system         public        tenants                          CHECK            NO             NO
+system              public             630200280_8_2_not_null   system         public        tenants                          CHECK            NO             NO
+system              public             primary                  system         public        tenants                          PRIMARY KEY      NO             NO
 system              public             630200280_14_1_not_null  system         public        ui                               CHECK            NO             NO
 system              public             630200280_14_3_not_null  system         public        ui                               CHECK            NO             NO
 system              public             primary                  system         public        ui                               PRIMARY KEY      NO             NO
@@ -919,6 +947,8 @@ system              public             630200280_5_1_not_null   id IS NOT NULL
 system              public             630200280_6_1_not_null   name IS NOT NULL
 system              public             630200280_6_2_not_null   value IS NOT NULL
 system              public             630200280_6_3_not_null   lastUpdated IS NOT NULL
+system              public             630200280_8_1_not_null   id IS NOT NULL
+system              public             630200280_8_2_not_null   active IS NOT NULL
 system              public             check_singleton          ((singleton))
 
 query TTTTTTT colnames
@@ -942,9 +972,9 @@ system         public        locations                        localityKey     sy
 system         public        locations                        localityValue   system              public             primary
 system         public        namespace                        name            system              public             primary
 system         public        namespace                        parentID        system              public             primary
-system         public        namespace                        parentSchemaID  system              public             primary
-system         public        namespace_deprecated             name            system              public             primary
-system         public        namespace_deprecated             parentID        system              public             primary
+system         public        namespace2                       name            system              public             primary
+system         public        namespace2                       parentID        system              public             primary
+system         public        namespace2                       parentSchemaID  system              public             primary
 system         public        protected_ts_meta                singleton       system              public             check_singleton
 system         public        protected_ts_meta                singleton       system              public             primary
 system         public        protected_ts_records             id              system              public             primary
@@ -970,6 +1000,7 @@ system         public        statement_diagnostics            id              sy
 system         public        statement_diagnostics_requests   id              system              public             primary
 system         public        table_statistics                 statisticID     system              public             primary
 system         public        table_statistics                 tableID         system              public             primary
+system         public        tenants                          id              system              public             primary
 system         public        ui                               key             system              public             primary
 system         public        users                            username        system              public             primary
 system         public        web_sessions                     id              system              public             primary
@@ -1070,6 +1101,20 @@ system         public        eventlog                         reportingID       
 system         public        eventlog                         targetID                  3
 system         public        eventlog                         timestamp                 1
 system         public        eventlog                         uniqueID                  6
+system         pg_extension  geography_columns                coord_dimension           5
+system         pg_extension  geography_columns                f_geography_column        4
+system         pg_extension  geography_columns                f_table_catalog           1
+system         pg_extension  geography_columns                f_table_name              3
+system         pg_extension  geography_columns                f_table_schema            2
+system         pg_extension  geography_columns                srid                      6
+system         pg_extension  geography_columns                type                      7
+system         pg_extension  geometry_columns                 coord_dimension           5
+system         pg_extension  geometry_columns                 f_geometry_column         4
+system         pg_extension  geometry_columns                 f_table_catalog           1
+system         pg_extension  geometry_columns                 f_table_name              3
+system         pg_extension  geometry_columns                 f_table_schema            2
+system         pg_extension  geometry_columns                 srid                      6
+system         pg_extension  geometry_columns                 type                      7
 system         public        jobs                             created                   3
 system         public        jobs                             id                        1
 system         public        jobs                             payload                   4
@@ -1083,13 +1128,13 @@ system         public        locations                        latitude          
 system         public        locations                        localityKey               1
 system         public        locations                        localityValue             2
 system         public        locations                        longitude                 4
-system         public        namespace                        id                        4
-system         public        namespace                        name                      3
+system         public        namespace                        id                        3
+system         public        namespace                        name                      2
 system         public        namespace                        parentID                  1
-system         public        namespace                        parentSchemaID            2
-system         public        namespace_deprecated             id                        3
-system         public        namespace_deprecated             name                      2
-system         public        namespace_deprecated             parentID                  1
+system         public        namespace2                       id                        4
+system         public        namespace2                       name                      3
+system         public        namespace2                       parentID                  1
+system         public        namespace2                       parentSchemaID            2
 system         public        protected_ts_meta                num_records               3
 system         public        protected_ts_meta                num_spans                 4
 system         public        protected_ts_meta                singleton                 1
@@ -1140,6 +1185,11 @@ system         public        settings                         lastUpdated       
 system         public        settings                         name                      1
 system         public        settings                         value                     2
 system         public        settings                         valueType                 4
+system         pg_extension  spatial_ref_sys                  auth_name                 2
+system         pg_extension  spatial_ref_sys                  auth_srid                 3
+system         pg_extension  spatial_ref_sys                  proj4text                 5
+system         pg_extension  spatial_ref_sys                  srid                      1
+system         pg_extension  spatial_ref_sys                  srtext                    4
 system         public        statement_bundle_chunks          data                      3
 system         public        statement_bundle_chunks          description               2
 system         public        statement_bundle_chunks          id                        1
@@ -1164,6 +1214,9 @@ system         public        table_statistics                 nullCount         
 system         public        table_statistics                 rowCount                  6
 system         public        table_statistics                 statisticID               2
 system         public        table_statistics                 tableID                   1
+system         public        tenants                          active                    2
+system         public        tenants                          id                        1
+system         public        tenants                          info                      3
 system         public        ui                               key                       1
 system         public        ui                               lastUpdated               3
 system         public        ui                               value                     2
@@ -1464,6 +1517,8 @@ admin    other_db       information_schema  ALL             NULL
 root     other_db       information_schema  ALL             NULL
 admin    other_db       pg_catalog          ALL             NULL
 root     other_db       pg_catalog          ALL             NULL
+admin    other_db       pg_extension        ALL             NULL
+root     other_db       pg_extension        ALL             NULL
 admin    other_db       public              ALL             NULL
 root     other_db       public              ALL             NULL
 
@@ -1483,6 +1538,9 @@ testuser  other_db       information_schema  SELECT          NULL
 admin     other_db       pg_catalog          ALL             NULL
 root      other_db       pg_catalog          ALL             NULL
 testuser  other_db       pg_catalog          SELECT          NULL
+admin     other_db       pg_extension        ALL             NULL
+root      other_db       pg_extension        ALL             NULL
+testuser  other_db       pg_extension        SELECT          NULL
 admin     other_db       public              ALL             NULL
 root      other_db       public              ALL             NULL
 testuser  other_db       public              SELECT          NULL
@@ -1499,6 +1557,7 @@ NULL     public   system         crdb_internal       builtin_functions          
 NULL     public   system         crdb_internal       cluster_queries                    SELECT          NULL          YES
 NULL     public   system         crdb_internal       cluster_sessions                   SELECT          NULL          YES
 NULL     public   system         crdb_internal       cluster_settings                   SELECT          NULL          YES
+NULL     public   system         crdb_internal       cluster_transactions               SELECT          NULL          YES
 NULL     public   system         crdb_internal       create_statements                  SELECT          NULL          YES
 NULL     public   system         crdb_internal       feature_usage                      SELECT          NULL          YES
 NULL     public   system         crdb_internal       forward_dependencies               SELECT          NULL          YES
@@ -1517,6 +1576,7 @@ NULL     public   system         crdb_internal       node_queries               
 NULL     public   system         crdb_internal       node_runtime_info                  SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_sessions                      SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_statement_statistics          SELECT          NULL          YES
+NULL     public   system         crdb_internal       node_transactions                  SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_txn_stats                     SELECT          NULL          YES
 NULL     public   system         crdb_internal       partitions                         SELECT          NULL          YES
 NULL     public   system         crdb_internal       predefined_comments                SELECT          NULL          YES
@@ -1550,6 +1610,7 @@ NULL     public   system         information_schema  table_privileges           
 NULL     public   system         information_schema  tables                             SELECT          NULL          YES
 NULL     public   system         information_schema  user_privileges                    SELECT          NULL          YES
 NULL     public   system         information_schema  views                              SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_aggregate                       SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_am                              SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_attrdef                         SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_attribute                       SELECT          NULL          YES
@@ -1566,6 +1627,7 @@ NULL     public   system         pg_catalog          pg_default_acl             
 NULL     public   system         pg_catalog          pg_depend                          SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_description                     SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_enum                            SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_event_trigger                   SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_extension                       SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_foreign_data_wrapper            SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_foreign_server                  SELECT          NULL          YES
@@ -1599,6 +1661,9 @@ NULL     public   system         pg_catalog          pg_type                    
 NULL     public   system         pg_catalog          pg_user                            SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_user_mapping                    SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_views                           SELECT          NULL          YES
+NULL     public   system         pg_extension        geography_columns                  SELECT          NULL          YES
+NULL     public   system         pg_extension        geometry_columns                   SELECT          NULL          YES
+NULL     public   system         pg_extension        spatial_ref_sys                    SELECT          NULL          YES
 NULL     admin    system         public              comments                           DELETE          NULL          NO
 NULL     admin    system         public              comments                           GRANT           NULL          NO
 NULL     admin    system         public              comments                           INSERT          NULL          NO
@@ -1658,10 +1723,10 @@ NULL     admin    system         public              namespace                  
 NULL     admin    system         public              namespace                          SELECT          NULL          YES
 NULL     root     system         public              namespace                          GRANT           NULL          NO
 NULL     root     system         public              namespace                          SELECT          NULL          YES
-NULL     admin    system         public              namespace_deprecated               GRANT           NULL          NO
-NULL     admin    system         public              namespace_deprecated               SELECT          NULL          YES
-NULL     root     system         public              namespace_deprecated               GRANT           NULL          NO
-NULL     root     system         public              namespace_deprecated               SELECT          NULL          YES
+NULL     admin    system         public              namespace2                         GRANT           NULL          NO
+NULL     admin    system         public              namespace2                         SELECT          NULL          YES
+NULL     root     system         public              namespace2                         GRANT           NULL          NO
+NULL     root     system         public              namespace2                         SELECT          NULL          YES
 NULL     admin    system         public              protected_ts_meta                  GRANT           NULL          NO
 NULL     admin    system         public              protected_ts_meta                  SELECT          NULL          YES
 NULL     root     system         public              protected_ts_meta                  GRANT           NULL          NO
@@ -1790,6 +1855,10 @@ NULL     root     system         public              table_statistics           
 NULL     root     system         public              table_statistics                   INSERT          NULL          NO
 NULL     root     system         public              table_statistics                   SELECT          NULL          YES
 NULL     root     system         public              table_statistics                   UPDATE          NULL          NO
+NULL     admin    system         public              tenants                            GRANT           NULL          NO
+NULL     admin    system         public              tenants                            SELECT          NULL          YES
+NULL     root     system         public              tenants                            GRANT           NULL          NO
+NULL     root     system         public              tenants                            SELECT          NULL          YES
 NULL     admin    system         public              ui                                 DELETE          NULL          NO
 NULL     admin    system         public              ui                                 GRANT           NULL          NO
 NULL     admin    system         public              ui                                 INSERT          NULL          NO
@@ -1840,6 +1909,7 @@ NULL     public   system         crdb_internal       builtin_functions          
 NULL     public   system         crdb_internal       cluster_queries                    SELECT          NULL          YES
 NULL     public   system         crdb_internal       cluster_sessions                   SELECT          NULL          YES
 NULL     public   system         crdb_internal       cluster_settings                   SELECT          NULL          YES
+NULL     public   system         crdb_internal       cluster_transactions               SELECT          NULL          YES
 NULL     public   system         crdb_internal       create_statements                  SELECT          NULL          YES
 NULL     public   system         crdb_internal       feature_usage                      SELECT          NULL          YES
 NULL     public   system         crdb_internal       forward_dependencies               SELECT          NULL          YES
@@ -1858,6 +1928,7 @@ NULL     public   system         crdb_internal       node_queries               
 NULL     public   system         crdb_internal       node_runtime_info                  SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_sessions                      SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_statement_statistics          SELECT          NULL          YES
+NULL     public   system         crdb_internal       node_transactions                  SELECT          NULL          YES
 NULL     public   system         crdb_internal       node_txn_stats                     SELECT          NULL          YES
 NULL     public   system         crdb_internal       partitions                         SELECT          NULL          YES
 NULL     public   system         crdb_internal       predefined_comments                SELECT          NULL          YES
@@ -1891,6 +1962,7 @@ NULL     public   system         information_schema  table_privileges           
 NULL     public   system         information_schema  tables                             SELECT          NULL          YES
 NULL     public   system         information_schema  user_privileges                    SELECT          NULL          YES
 NULL     public   system         information_schema  views                              SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_aggregate                       SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_am                              SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_attrdef                         SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_attribute                       SELECT          NULL          YES
@@ -1907,6 +1979,7 @@ NULL     public   system         pg_catalog          pg_default_acl             
 NULL     public   system         pg_catalog          pg_depend                          SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_description                     SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_enum                            SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_event_trigger                   SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_extension                       SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_foreign_data_wrapper            SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_foreign_server                  SELECT          NULL          YES
@@ -1940,10 +2013,13 @@ NULL     public   system         pg_catalog          pg_type                    
 NULL     public   system         pg_catalog          pg_user                            SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_user_mapping                    SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_views                           SELECT          NULL          YES
-NULL     admin    system         public              namespace_deprecated               GRANT           NULL          NO
-NULL     admin    system         public              namespace_deprecated               SELECT          NULL          YES
-NULL     root     system         public              namespace_deprecated               GRANT           NULL          NO
-NULL     root     system         public              namespace_deprecated               SELECT          NULL          YES
+NULL     public   system         pg_extension        geography_columns                  SELECT          NULL          YES
+NULL     public   system         pg_extension        geometry_columns                   SELECT          NULL          YES
+NULL     public   system         pg_extension        spatial_ref_sys                    SELECT          NULL          YES
+NULL     admin    system         public              namespace                          GRANT           NULL          NO
+NULL     admin    system         public              namespace                          SELECT          NULL          YES
+NULL     root     system         public              namespace                          GRANT           NULL          NO
+NULL     root     system         public              namespace                          SELECT          NULL          YES
 NULL     admin    system         public              descriptor                         GRANT           NULL          NO
 NULL     admin    system         public              descriptor                         SELECT          NULL          YES
 NULL     root     system         public              descriptor                         GRANT           NULL          NO
@@ -1978,6 +2054,10 @@ NULL     root     system         public              settings                   
 NULL     root     system         public              settings                           INSERT          NULL          NO
 NULL     root     system         public              settings                           SELECT          NULL          YES
 NULL     root     system         public              settings                           UPDATE          NULL          NO
+NULL     admin    system         public              tenants                            GRANT           NULL          NO
+NULL     admin    system         public              tenants                            SELECT          NULL          YES
+NULL     root     system         public              tenants                            GRANT           NULL          NO
+NULL     root     system         public              tenants                            SELECT          NULL          YES
 NULL     admin    system         public              lease                              DELETE          NULL          NO
 NULL     admin    system         public              lease                              GRANT           NULL          NO
 NULL     admin    system         public              lease                              INSERT          NULL          NO
@@ -2119,10 +2199,10 @@ NULL     root     system         public              reports_meta               
 NULL     root     system         public              reports_meta                       INSERT          NULL          NO
 NULL     root     system         public              reports_meta                       SELECT          NULL          YES
 NULL     root     system         public              reports_meta                       UPDATE          NULL          NO
-NULL     admin    system         public              namespace                          GRANT           NULL          NO
-NULL     admin    system         public              namespace                          SELECT          NULL          YES
-NULL     root     system         public              namespace                          GRANT           NULL          NO
-NULL     root     system         public              namespace                          SELECT          NULL          YES
+NULL     admin    system         public              namespace2                         GRANT           NULL          NO
+NULL     admin    system         public              namespace2                         SELECT          NULL          YES
+NULL     root     system         public              namespace2                         GRANT           NULL          NO
+NULL     root     system         public              namespace2                         SELECT          NULL          YES
 NULL     admin    system         public              protected_ts_meta                  GRANT           NULL          NO
 NULL     admin    system         public              protected_ts_meta                  SELECT          NULL          YES
 NULL     root     system         public              protected_ts_meta                  GRANT           NULL          NO

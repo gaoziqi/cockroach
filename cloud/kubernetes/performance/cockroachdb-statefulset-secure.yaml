@@ -202,7 +202,7 @@ spec:
         command:
         - "/bin/ash"
         - "-ecx"
-        - "/request-cert -namespace=${POD_NAMESPACE} -certs-dir=/cockroach-certs -type=node -addresses=localhost,127.0.0.1,$(hostname -f),$(hostname -f|cut -f 1-2 -d '.'),cockroachdb-public,cockroachdb-public.$(hostname -f|cut -f 3- -d '.') -symlink-ca-from=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        - "/request-cert -namespace=${POD_NAMESPACE} -certs-dir=/cockroach-certs -type=node -addresses=localhost,127.0.0.1,$(hostname -f),$(hostname -f|cut -f 1-2 -d '.'),cockroachdb-public,cockroachdb-public.$(hostname -f|cut -f 3- -d '.'),cockroachdb-public.$(hostname -f|cut -f 3-4 -d '.'),cockroachdb-public.$(hostname -f|cut -f 3 -d '.') -symlink-ca-from=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -231,7 +231,7 @@ spec:
       - name: cockroachdb
         # NOTE: Always use the most recent version of CockroachDB for the best
         # performance and reliability.
-        image: cockroachdb/cockroach:v19.2.4
+        image: cockroachdb/cockroach:v20.1.0
         imagePullPolicy: IfNotPresent
         # TODO: Change these to appropriate values for the hardware that you're running. You can see
         # the amount of allocatable resources on each of your Kubernetes nodes by running:

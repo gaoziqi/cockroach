@@ -67,12 +67,14 @@ func genRankOps(wr io.Writer) error {
 
 	s := string(d)
 
-	s = strings.Replace(s, "_RANK_STRING", "{{.String}}", -1)
+	s = strings.ReplaceAll(s, "_RANK_STRING", "{{.String}}")
 
+	computeRankRe := makeFunctionRegex("_COMPUTE_RANK", 0)
+	s = computeRankRe.ReplaceAllString(s, `{{template "computeRank" buildDict "Global" . "HasPartition" .HasPartition}}`)
 	updateRankRe := makeFunctionRegex("_UPDATE_RANK", 0)
-	s = updateRankRe.ReplaceAllString(s, makeTemplateFunctionCall("UpdateRank", 0))
+	s = updateRankRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.UpdateRank", 0))
 	updateRankIncrementRe := makeFunctionRegex("_UPDATE_RANK_INCREMENT", 0)
-	s = updateRankIncrementRe.ReplaceAllString(s, makeTemplateFunctionCall("UpdateRankIncrement", 0))
+	s = updateRankIncrementRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.UpdateRankIncrement", 0))
 
 	// Now, generate the op, from the template.
 	tmpl, err := template.New("rank_op").Funcs(template.FuncMap{"buildDict": buildDict}).Parse(s)

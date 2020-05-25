@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/ssh/terminal"
 )
@@ -43,7 +43,7 @@ var sha256NewSum = sha256.New().Sum(nil)
 func appendEmptySha256(password string) []byte {
 	// In the past we incorrectly called the hash.Hash.Sum method. That
 	// method uses its argument as a place to put the current hash:
-	// it does not add its argument to the curret hash. Thus, using
+	// it does not add its argument to the current hash. Thus, using
 	// h.Sum([]byte(password))) is the equivalent to the below append.
 	return append([]byte(password), sha256NewSum...)
 }

@@ -29,9 +29,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 )
 
 var noRewindExpected = CmdPos(-1)
@@ -72,7 +72,7 @@ func makeTestContext() testContext {
 			settings,
 		),
 		tracer:   ambient.Tracer,
-		ctx:      context.TODO(),
+		ctx:      context.Background(),
 		settings: settings,
 	}
 }
@@ -206,12 +206,12 @@ func checkTxn(txn *kv.Txn, exp expKVTxn) error {
 func TestTransitions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	dummyRewCap := rewindCapability{rewindPos: CmdPos(12)}
 	testCon := makeTestContext()
 	tranCtx := transitionCtx{
 		db:             testCon.mockDB,
-		nodeID:         roachpb.NodeID(5),
+		nodeIDOrZero:   roachpb.NodeID(5),
 		clock:          testCon.clock,
 		tracer:         tracing.NewTracer(),
 		connMon:        &testCon.mon,

@@ -17,7 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // UserPriority is a custom type for transaction's user priority.
@@ -247,6 +247,21 @@ type Response interface {
 // into a single one.
 type combinable interface {
 	combine(combinable) error
+}
+
+// CombineResponses attempts to combine the two provided responses. If both of
+// the responses are combinable, they will be combined. If neither are
+// combinable, the function is a no-op and returns a nil error. If one of the
+// responses is combinable and the other isn't, the function returns an error.
+func CombineResponses(left, right Response) error {
+	cLeft, lOK := left.(combinable)
+	cRight, rOK := right.(combinable)
+	if lOK && rOK {
+		return cLeft.combine(cRight)
+	} else if lOK != rOK {
+		return errors.Errorf("can not combine %T and %T", left, right)
+	}
+	return nil
 }
 
 // combine is used by range-spanning Response types (e.g. Scan or DeleteRange)

@@ -26,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -37,42 +37,41 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 )
 
 // testUser has valid client certs.
 var testUser = server.TestUser
-
-var errInfo = testutils.MakeCaller(3, 2)
 
 // checkKVs verifies that a KeyValue slice contains the expected keys and
 // values. The values can be either integers or strings; the expected results
 // are passed as alternating keys and values, e.g:
 //   checkScanResult(t, result, key1, val1, key2, val2)
 func checkKVs(t *testing.T, kvs []kv.KeyValue, expected ...interface{}) {
+	t.Helper()
 	expLen := len(expected) / 2
 	if expLen != len(kvs) {
-		t.Errorf("%s: expected %d scan results, got %d", errInfo(), expLen, len(kvs))
+		t.Errorf("expected %d scan results, got %d", expLen, len(kvs))
 		return
 	}
 	for i := 0; i < expLen; i++ {
 		expKey := expected[2*i].(roachpb.Key)
 		if key := kvs[i].Key; !key.Equal(expKey) {
-			t.Errorf("%s: expected scan key %d to be %q; got %q", errInfo(), i, expKey, key)
+			t.Errorf("expected scan key %d to be %q; got %q", i, expKey, key)
 		}
 		switch expValue := expected[2*i+1].(type) {
 		case int:
 			if value, err := kvs[i].Value.GetInt(); err != nil {
-				t.Errorf("%s: non-integer scan value %d: %q", errInfo(), i, kvs[i].Value)
+				t.Errorf("non-integer scan value %d: %q", i, kvs[i].Value)
 			} else if value != int64(expValue) {
-				t.Errorf("%s: expected scan value %d to be %d; got %d",
-					errInfo(), i, expValue, value)
+				t.Errorf("expected scan value %d to be %d; got %d",
+					i, expValue, value)
 			}
 		case string:
 			if value := kvs[i].Value.String(); value != expValue {
-				t.Errorf("%s: expected scan value %d to be %s; got %s",
-					errInfo(), i, expValue, value)
+				t.Errorf("expected scan value %d to be %s; got %s",
+					i, expValue, value)
 			}
 		default:
 			t.Fatalf("unsupported type %T", expValue)
@@ -99,7 +98,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 	}{
 		m: make(map[string]struct{}),
 	}
-	filter := func(args storagebase.FilterArgs) *roachpb.Error {
+	filter := func(args kvserverbase.FilterArgs) *roachpb.Error {
 		mu.Lock()
 		defer mu.Unlock()
 		pushArg, ok := args.Req.(*roachpb.PushTxnRequest)
@@ -112,14 +111,14 @@ func TestClientRetryNonTxn(t *testing.T) {
 	args := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				EvalKnobs: storagebase.BatchEvalTestingKnobs{
+				EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 					TestingEvalFilter: filter,
 				},
 			},
 		},
 	}
 	s, _, _ := serverutils.StartServer(t, args)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	testCases := []struct {
 		args        roachpb.Request
@@ -143,7 +142,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 		// doneCall signals when the non-txn read or write has completed.
 		doneCall := make(chan error)
 		count := 0 // keeps track of retries
-		err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+		err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 			if test.canPush {
 				if err := txn.SetUserPriority(roachpb.MinUserPriority); err != nil {
 					t.Fatal(err)
@@ -156,7 +155,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 			}
 			// On the first iteration, send the non-txn put or get.
 			if count == 1 {
-				nonTxnCtx := context.TODO()
+				nonTxnCtx := context.Background()
 
 				// The channel lets us pause txn until after the non-txn
 				// method has run once. Use a channel length of size 1 to
@@ -174,7 +173,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 					}
 					notify <- struct{}{}
 					if err != nil {
-						log.Errorf(context.TODO(), "error on non-txn request: %s", err)
+						log.Errorf(context.Background(), "error on non-txn request: %s", err)
 					}
 					doneCall <- errors.Wrapf(
 						err, "%d: expected success on non-txn call to %s",
@@ -209,7 +208,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 		}
 
 		// Get the current value to verify whether the txn happened first.
-		gr, err := db.Get(context.TODO(), key)
+		gr, err := db.Get(context.Background(), key)
 		if err != nil {
 			t.Fatalf("%d: expected success getting %q: %s", i, key, err)
 		}
@@ -234,14 +233,14 @@ func TestClientRetryNonTxn(t *testing.T) {
 func TestClientRunTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
 	for _, commit := range []bool{true, false} {
 		value := []byte("value")
 		key := []byte(fmt.Sprintf("%s/key-%t", testUser, commit))
 
-		err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+		err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 			// Put transactional value.
 			if err := txn.Put(ctx, key, value); err != nil {
 				return err
@@ -273,7 +272,7 @@ func TestClientRunTransaction(t *testing.T) {
 		}
 
 		// Verify the value is now visible on commit == true, and not visible otherwise.
-		gr, err := db.Get(context.TODO(), key)
+		gr, err := db.Get(context.Background(), key)
 		if commit {
 			if err != nil || gr.Value == nil || !bytes.Equal(gr.ValueBytes(), value) {
 				t.Errorf("expected success reading value: %+v, %v", gr.Value, err)
@@ -291,23 +290,23 @@ func TestClientRunTransaction(t *testing.T) {
 func TestClientGetAndPutProto(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
 	zoneConfig := zonepb.ZoneConfig{
 		NumReplicas:   proto.Int32(2),
-		Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "mem"}}}},
+		Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "mem"}}}},
 		RangeMinBytes: proto.Int64(1 << 10), // 1k
 		RangeMaxBytes: proto.Int64(1 << 18), // 256k
 	}
 
 	key := roachpb.Key(testUser + "/zone-config")
-	if err := db.Put(context.TODO(), key, &zoneConfig); err != nil {
+	if err := db.Put(context.Background(), key, &zoneConfig); err != nil {
 		t.Fatalf("unable to put proto: %s", err)
 	}
 
 	var readZoneConfig zonepb.ZoneConfig
-	if err := db.GetProto(context.TODO(), key, &readZoneConfig); err != nil {
+	if err := db.GetProto(context.Background(), key, &readZoneConfig); err != nil {
 		t.Fatalf("unable to get proto: %s", err)
 	}
 	if !proto.Equal(&zoneConfig, &readZoneConfig) {
@@ -320,14 +319,14 @@ func TestClientGetAndPutProto(t *testing.T) {
 func TestClientGetAndPut(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
 	value := []byte("value")
-	if err := db.Put(context.TODO(), testUser+"/key", value); err != nil {
+	if err := db.Put(context.Background(), testUser+"/key", value); err != nil {
 		t.Fatalf("unable to put value: %s", err)
 	}
-	gr, err := db.Get(context.TODO(), testUser+"/key")
+	gr, err := db.Get(context.Background(), testUser+"/key")
 	if err != nil {
 		t.Fatalf("unable to get value: %s", err)
 	}
@@ -342,14 +341,14 @@ func TestClientGetAndPut(t *testing.T) {
 func TestClientPutInline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
 	value := []byte("value")
-	if err := db.PutInline(context.TODO(), testUser+"/key", value); err != nil {
+	if err := db.PutInline(context.Background(), testUser+"/key", value); err != nil {
 		t.Fatalf("unable to put value: %s", err)
 	}
-	gr, err := db.Get(context.TODO(), testUser+"/key")
+	gr, err := db.Get(context.Background(), testUser+"/key")
 	if err != nil {
 		t.Fatalf("unable to get value: %s", err)
 	}
@@ -369,22 +368,22 @@ func TestClientPutInline(t *testing.T) {
 func TestClientEmptyValues(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
-	if err := db.Put(context.TODO(), testUser+"/a", []byte{}); err != nil {
+	if err := db.Put(context.Background(), testUser+"/a", []byte{}); err != nil {
 		t.Error(err)
 	}
-	if gr, err := db.Get(context.TODO(), testUser+"/a"); err != nil {
+	if gr, err := db.Get(context.Background(), testUser+"/a"); err != nil {
 		t.Error(err)
 	} else if bytes := gr.ValueBytes(); bytes == nil || len(bytes) != 0 {
 		t.Errorf("expected non-nil empty byte slice; got %q", bytes)
 	}
 
-	if _, err := db.Inc(context.TODO(), testUser+"/b", 0); err != nil {
+	if _, err := db.Inc(context.Background(), testUser+"/b", 0); err != nil {
 		t.Error(err)
 	}
-	if gr, err := db.Get(context.TODO(), testUser+"/b"); err != nil {
+	if gr, err := db.Get(context.Background(), testUser+"/b"); err != nil {
 		t.Error(err)
 	} else if gr.Value == nil {
 		t.Errorf("expected non-nil integer")
@@ -398,9 +397,9 @@ func TestClientEmptyValues(t *testing.T) {
 func TestClientBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	keys := []roachpb.Key{}
 	{
@@ -527,7 +526,7 @@ func TestClientBatch(t *testing.T) {
 	// Induce a non-transactional failure.
 	{
 		key := roachpb.Key("conditionalPut")
-		if err := db.Put(context.TODO(), key, "hello"); err != nil {
+		if err := db.Put(context.Background(), key, "hello"); err != nil {
 			t.Fatal(err)
 		}
 
@@ -552,7 +551,7 @@ func TestClientBatch(t *testing.T) {
 	// Induce a transactional failure.
 	{
 		key := roachpb.Key("conditionalPut")
-		if err := db.Put(context.TODO(), key, "hello"); err != nil {
+		if err := db.Put(context.Background(), key, "hello"); err != nil {
 			t.Fatal(err)
 		}
 
@@ -598,7 +597,7 @@ func concurrentIncrements(db *kv.DB, t *testing.T) {
 			// Wait until the other goroutines are running.
 			wgStart.Wait()
 
-			if err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+			if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 				txn.SetDebugName(fmt.Sprintf("test-%d", i))
 
 				// Retrieve the other key.
@@ -631,7 +630,7 @@ func concurrentIncrements(db *kv.DB, t *testing.T) {
 	results := []int64(nil)
 	for i := 0; i < 2; i++ {
 		readKey := []byte(fmt.Sprintf(testUser+"/value-%d", i))
-		gr, err := db.Get(context.TODO(), readKey)
+		gr, err := db.Get(context.Background(), readKey)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -654,13 +653,13 @@ func concurrentIncrements(db *kv.DB, t *testing.T) {
 func TestConcurrentIncrements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
 	// Convenience loop: Crank up this number for testing this
 	// more often. It'll increase test duration though.
 	for k := 0; k < 5; k++ {
-		if err := db.DelRange(context.TODO(), testUser+"/value-0", testUser+"/value-1x"); err != nil {
+		if err := db.DelRange(context.Background(), testUser+"/value-0", testUser+"/value-1x"); err != nil {
 			t.Fatalf("%d: unable to clean up: %s", k, err)
 		}
 		concurrentIncrements(db, t)
@@ -692,7 +691,7 @@ func TestReadConsistencyTypes(t *testing.T) {
 
 			clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 			db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock)
-			ctx := context.TODO()
+			ctx := context.Background()
 
 			prepWithRC := func() *kv.Batch {
 				b := &kv.Batch{}
@@ -737,7 +736,7 @@ func TestReadConsistencyTypes(t *testing.T) {
 func TestTxn_ReverseScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
 	keys := []roachpb.Key{}
@@ -747,12 +746,12 @@ func TestTxn_ReverseScan(t *testing.T) {
 		keys = append(keys, key)
 		b.Put(key, i)
 	}
-	if err := db.Run(context.TODO(), b); err != nil {
+	if err := db.Run(context.Background(), b); err != nil {
 		t.Error(err)
 	}
 
 	// Try reverse scans for all keys.
-	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		rows, err := txn.ReverseScan(ctx, testUser+"/key/00", testUser+"/key/10", 100)
 		if err != nil {
 			return err
@@ -766,7 +765,7 @@ func TestTxn_ReverseScan(t *testing.T) {
 	}
 
 	// Try reverse scans for half of the keys.
-	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		rows, err := txn.ReverseScan(ctx, testUser+"/key/00", testUser+"/key/05", 100)
 		if err != nil {
 			return err
@@ -778,7 +777,7 @@ func TestTxn_ReverseScan(t *testing.T) {
 	}
 
 	// Try limit maximum rows.
-	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		rows, err := txn.ReverseScan(ctx, testUser+"/key/00", testUser+"/key/05", 3)
 		if err != nil {
 			return err
@@ -790,7 +789,7 @@ func TestTxn_ReverseScan(t *testing.T) {
 	}
 
 	// Try reverse scan with the same start and end key.
-	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		rows, err := txn.ReverseScan(ctx, testUser+"/key/00", testUser+"/key/00", 100)
 		if len(rows) > 0 {
 			t.Errorf("expected empty, got %v", rows)
@@ -803,7 +802,7 @@ func TestTxn_ReverseScan(t *testing.T) {
 	}
 
 	// Try reverse scan with non-existent key.
-	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		rows, err := txn.ReverseScan(ctx, testUser+"/key/aa", testUser+"/key/bb", 100)
 		if err != nil {
 			return err
@@ -827,10 +826,18 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 			return ba.CreateReply(), nil
 		})
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	dbCtx := kv.DefaultDBContext()
-	dbCtx.NodeID = &base.NodeIDContainer{}
-	db := kv.NewDBWithContext(testutils.MakeAmbientCtx(), factory, clock, dbCtx)
+	setup := func(nodeID roachpb.NodeID) *kv.DB {
+		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+		dbCtx := kv.DefaultDBContext()
+		var c base.NodeIDContainer
+		if nodeID != 0 {
+			c.Set(context.Background(), nodeID)
+		}
+		dbCtx.NodeID = base.NewSQLIDContainer(0, &c, true /* exposed */)
+
+		db := kv.NewDBWithContext(testutils.MakeAmbientCtx(), factory, clock, dbCtx)
+		return db
+	}
 	ctx := context.Background()
 
 	// Verify direct creation of Txns.
@@ -846,6 +853,7 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 	}
 	for i, test := range directCases {
 		t.Run(fmt.Sprintf("direct-txn-%d", i), func(t *testing.T) {
+			db := setup(test.nodeID)
 			now := db.Clock().Now()
 			kvTxn := roachpb.MakeTransaction("unnamed", nil /*baseKey*/, roachpb.NormalUserPriority, now, db.Clock().MaxOffset().Nanoseconds())
 			txn := kv.NewTxnFromProto(ctx, db, test.nodeID, now, test.typ, &kvTxn)
@@ -866,9 +874,7 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 	}
 	for i, test := range indirectCases {
 		t.Run(fmt.Sprintf("indirect-txn-%d", i), func(t *testing.T) {
-			if test.nodeID != 0 {
-				dbCtx.NodeID.Set(ctx, test.nodeID)
-			}
+			db := setup(test.nodeID)
 			if err := db.Txn(
 				ctx, func(_ context.Context, txn *kv.Txn) error {
 					ots := txn.TestingCloneTxn().ObservedTimestamps
@@ -889,9 +895,9 @@ func TestIntentCleanupUnblocksReaders(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	key := roachpb.Key("a")
 
 	// We're going to repeatedly lay down an intent and then race a reader with
@@ -971,7 +977,7 @@ func TestRollbackWithCanceledContextBasic(t *testing.T) {
 	// weren't blocked on an intent or, if we were, that intent was cleaned up by
 	// someone else than the would-be pusher fast. Similar in
 	// TestSessionFinishRollsBackTxn.
-	if _, err := db.Get(context.TODO(), key); err != nil {
+	if _, err := db.Get(context.Background(), key); err != nil {
 		t.Fatal(err)
 	}
 	dur := timeutil.Since(start)
@@ -1029,7 +1035,7 @@ func TestRollbackWithCanceledContextInsidious(t *testing.T) {
 	// weren't blocked on an intent or, if we were, that intent was cleaned up by
 	// someone else than the would-be pusher fast. Similar in
 	// TestSessionFinishRollsBackTxn.
-	if _, err := db.Get(context.TODO(), key); err != nil {
+	if _, err := db.Get(context.Background(), key); err != nil {
 		t.Fatal(err)
 	}
 	dur := timeutil.Since(start)

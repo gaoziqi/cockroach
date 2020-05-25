@@ -268,7 +268,8 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 		}
 		seen[col.Name] = true
 		// If this is the first column and it's invertable (i.e., JSONB), make an inverted index.
-		if len(cols) == 0 && sqlbase.ColumnTypeIsInvertedIndexable(col.Type) {
+		if len(cols) == 0 &&
+			sqlbase.ColumnTypeIsInvertedIndexable(tree.MustBeStaticallyKnownType(col.Type)) {
 			inverted = true
 			unique = false
 			cols = append(cols, tree.IndexElem{
@@ -276,7 +277,7 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 			})
 			break
 		}
-		if sqlbase.ColumnTypeIsIndexable(col.Type) {
+		if sqlbase.ColumnTypeIsIndexable(tree.MustBeStaticallyKnownType(col.Type)) {
 			cols = append(cols, tree.IndexElem{
 				Column:    col.Name,
 				Direction: s.randDirection(),
@@ -294,12 +295,13 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 	}
 
 	return &tree.CreateIndex{
-		Name:     s.name("idx"),
-		Table:    *tableRef.TableName,
-		Unique:   unique,
-		Columns:  cols,
-		Storing:  storing,
-		Inverted: inverted,
+		Name:         s.name("idx"),
+		Table:        *tableRef.TableName,
+		Unique:       unique,
+		Columns:      cols,
+		Storing:      storing,
+		Inverted:     inverted,
+		Concurrently: s.coin(),
 	}, true
 }
 
@@ -308,6 +310,7 @@ func makeDropIndex(s *Smither) (tree.Statement, bool) {
 	return &tree.DropIndex{
 		IndexList:    tree.TableIndexNames{tin},
 		DropBehavior: s.randDropBehavior(),
+		Concurrently: s.coin(),
 	}, ok
 }
 

@@ -17,43 +17,40 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-type avgAggTmplInfo struct {
-	Type      coltypes.T
-	assignAdd func(string, string, string) string
+func (o lastArgWidthOverload) AssignAdd(
+	targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string,
+) string {
+	return o.WidthOverloads[0].Assign(targetElem, leftElem, rightElem, targetCol, leftCol, rightCol)
 }
 
-func (a avgAggTmplInfo) AssignAdd(target, l, r string) string {
-	return a.assignAdd(target, l, r)
-}
-
-func (a avgAggTmplInfo) AssignDivInt64(target, l, r string) string {
-	switch a.Type {
-	case coltypes.Decimal:
-		return fmt.Sprintf(
-			`%s.SetInt64(%s)
-if _, err := tree.DecimalCtx.Quo(&%s, &%s, &%s); err != nil {
-			execerror.VectorizedInternalPanic(err)
+func (o lastArgWidthOverload) AssignDivInt64(
+	targetElem, leftElem, rightElem, _, _, _ string,
+) string {
+	switch o.lastArgTypeOverload.CanonicalTypeFamily {
+	case types.DecimalFamily:
+		return fmt.Sprintf(`
+			%s.SetInt64(%s)
+			if _, err := tree.DecimalCtx.Quo(&%s, &%s, &%s); err != nil {
+			colexecerror.InternalError(err)
 		}`,
-			target, r, target, l, target,
+			targetElem, rightElem, targetElem, leftElem, targetElem,
 		)
-	case coltypes.Float64:
-		return fmt.Sprintf("%s = %s / float64(%s)", target, l, r)
-	default:
-		execerror.VectorizedInternalPanic("unsupported avg agg type")
-		// This code is unreachable, but the compiler cannot infer that.
-		return ""
+	case types.FloatFamily:
+		return fmt.Sprintf("%s = %s / float64(%s)", targetElem, leftElem, rightElem)
 	}
+	colexecerror.InternalError("unsupported avg agg type")
+	// This code is unreachable, but the compiler cannot infer that.
+	return ""
 }
 
-// Avoid unused warnings. These methods are used in the template.
 var (
-	_ = avgAggTmplInfo{}.AssignAdd
-	_ = avgAggTmplInfo{}.AssignDivInt64
+	_ = lastArgWidthOverload{}.AssignAdd
+	_ = lastArgWidthOverload{}.AssignDivInt64
 )
 
 const avgAggTmpl = "pkg/sql/colexec/avg_agg_tmpl.go"
@@ -66,15 +63,17 @@ func genAvgAgg(wr io.Writer) error {
 
 	s := string(t)
 
-	s = strings.Replace(s, "_GOTYPE", "{{.Type.GoTypeName}}", -1)
-	s = strings.Replace(s, "_TYPES_T", "coltypes.{{.Type}}", -1)
-	s = strings.Replace(s, "_TYPE", "{{.Type}}", -1)
-	s = strings.Replace(s, "_TemplateType", "{{.Type}}", -1)
+	s = strings.ReplaceAll(s, "_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}")
+	s = strings.ReplaceAll(s, "_TYPE_WIDTH", typeWidthReplacement)
+	s = strings.ReplaceAll(s, "_GOTYPESLICE", "{{.GoTypeSliceName}}")
+	s = strings.ReplaceAll(s, "_GOTYPE", "{{.GoType}}")
+	s = strings.ReplaceAll(s, "_TYPE", "{{.VecMethod}}")
+	s = strings.ReplaceAll(s, "TemplateType", "{{.VecMethod}}")
 
-	assignDivRe := makeFunctionRegex("_ASSIGN_DIV_INT64", 3)
-	s = assignDivRe.ReplaceAllString(s, makeTemplateFunctionCall("AssignDivInt64", 3))
-	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 3)
-	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.AssignAdd", 3))
+	assignDivRe := makeFunctionRegex("_ASSIGN_DIV_INT64", 6)
+	s = assignDivRe.ReplaceAllString(s, makeTemplateFunctionCall("AssignDivInt64", 6))
+	assignAddRe := makeFunctionRegex("_ASSIGN_ADD", 6)
+	s = assignAddRe.ReplaceAllString(s, makeTemplateFunctionCall("Global.AssignAdd", 6))
 
 	accumulateAvg := makeFunctionRegex("_ACCUMULATE_AVG", 4)
 	s = accumulateAvg.ReplaceAllString(s, `{{template "accumulateAvg" buildDict "Global" . "HasNulls" $4}}`)
@@ -84,20 +83,24 @@ func genAvgAgg(wr io.Writer) error {
 		return err
 	}
 
-	// TODO(asubiotto): Support more coltypes.
-	supportedTypes := []coltypes.T{coltypes.Decimal, coltypes.Float64}
-	spm := make(map[coltypes.T]int)
+	// TODO(asubiotto): support more types.
+	supportedTypes := []*types.T{types.Decimal, types.Float}
+	tmplInfos := make([]*oneArgOverload, len(supportedTypes))
 	for i, typ := range supportedTypes {
-		spm[typ] = i
-	}
-	tmplInfos := make([]avgAggTmplInfo, len(supportedTypes))
-	for _, o := range sameTypeBinaryOpToOverloads[tree.Plus] {
-		i, ok := spm[o.LTyp]
-		if !ok {
-			continue
+		var overload *oneArgOverload
+		for _, o := range sameTypeBinaryOpToOverloads[tree.Plus] {
+			if o.CanonicalTypeFamily == typ.Family() {
+				overload = o
+				break
+			}
 		}
-		tmplInfos[i].Type = o.LTyp
-		tmplInfos[i].assignAdd = o.Assign
+		if overload == nil {
+			colexecerror.InternalError(fmt.Sprintf("unexpectedly didn't find plus binary overload for %s", typ.String()))
+		}
+		if len(overload.WidthOverloads) != 1 {
+			colexecerror.InternalError(fmt.Sprintf("unexpectedly plus binary overload for %s doesn't contain a single overload", typ.String()))
+		}
+		tmplInfos[i] = overload
 	}
 
 	return tmpl.Execute(wr, tmplInfos)

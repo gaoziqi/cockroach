@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -45,7 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // SplitTable splits a range in the table, creates a replica for the right
@@ -136,7 +137,7 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 		ServerArgs: base.TestServerArgs{UseDatabase: "test"},
 	})
 
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	sqlutils.CreateTable(
 		t, tc.ServerConn(0), "t", "x INT PRIMARY KEY, xsquared INT",
@@ -147,7 +148,7 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 	)
 
 	// Start a worker that continuously performs splits in the background.
-	tc.Stopper().RunWorker(context.TODO(), func(ctx context.Context) {
+	tc.Stopper().RunWorker(context.Background(), func(ctx context.Context) {
 		rng, _ := randutil.NewPseudoRand()
 		cdb := tc.Server(0).DB()
 		for {
@@ -156,7 +157,7 @@ func TestPlanningDuringSplitsAndMerges(t *testing.T) {
 				return
 			default:
 				// Split the table at a random row.
-				desc := sqlbase.GetTableDescriptor(cdb, "test", "t")
+				desc := sqlbase.GetTableDescriptor(cdb, keys.SystemSQLCodec, "test", "t")
 
 				val := rng.Intn(n)
 				t.Logf("splitting at %d", val)
@@ -253,10 +254,10 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 
 	size := func() int64 { return 2 << 10 }
 	st := cluster.MakeTestingClusterSettings()
-	rangeCache := kvcoord.NewRangeDescriptorCache(st, nil /* db */, size)
+	rangeCache := kvcoord.NewRangeDescriptorCache(st, nil /* db */, size, stop.NewStopper())
 	leaseCache := kvcoord.NewLeaseHolderCache(size)
 	r := MakeDistSQLReceiver(
-		context.TODO(), nil /* resultWriter */, tree.Rows,
+		context.Background(), nil /* resultWriter */, tree.Rows,
 		rangeCache, leaseCache, nil /* txn */, nil /* updateClock */, &SessionTracing{})
 
 	descs := []roachpb.RangeDescriptor{
@@ -306,7 +307,7 @@ func TestDistSQLReceiverUpdatesCaches(t *testing.T) {
 			t.Fatalf("expected: %+v, got: %+v", descs[i], desc)
 		}
 
-		_, ok := leaseCache.Lookup(context.TODO(), descs[i].RangeID)
+		_, ok := leaseCache.Lookup(context.Background(), descs[i].RangeID)
 		if !ok {
 			t.Fatalf("didn't find lease for RangeID: %d", descs[i].RangeID)
 		}
@@ -329,7 +330,7 @@ func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 				UseDatabase: "test",
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	db0 := tc.ServerConn(0)
 	sqlutils.CreateTable(t, db0, "left",
@@ -379,7 +380,7 @@ func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 
 	// Run everything in a transaction, so we're bound on a connection on which we
 	// force DistSQL.
-	txn, err := db3.BeginTx(context.TODO(), nil /* opts */)
+	txn, err := db3.BeginTx(context.Background(), nil /* opts */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +404,7 @@ func TestDistSQLRangeCachesIntegrationTest(t *testing.T) {
 
 	// Run a non-trivial query to force the "wrong range" metadata to flow through
 	// a number of components.
-	row = txn.QueryRowContext(context.TODO(), query)
+	row = txn.QueryRowContext(context.Background(), query)
 	var cnt int
 	if err := row.Scan(&cnt); err != nil {
 		t.Fatal(err)
@@ -440,7 +441,7 @@ func TestDistSQLDeadHosts(t *testing.T) {
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs:      base.TestServerArgs{UseDatabase: "test"},
 	})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	db := tc.ServerConn(0)
 	db.SetMaxOpenConns(1)
@@ -468,7 +469,7 @@ func TestDistSQLDeadHosts(t *testing.T) {
 
 	// Run a query that uses the entire table and is easy to verify.
 	runQuery := func() error {
-		log.Infof(context.TODO(), "running test query")
+		log.Infof(context.Background(), "running test query")
 		var res int
 		if err := db.QueryRow("SELECT sum(xsquared) FROM t").Scan(&res); err != nil {
 			return err
@@ -476,7 +477,7 @@ func TestDistSQLDeadHosts(t *testing.T) {
 		if exp := (n * (n + 1) * (2*n + 1)) / 6; res != exp {
 			t.Fatalf("incorrect result %d, expected %d", res, exp)
 		}
-		log.Infof(context.TODO(), "test query OK")
+		log.Infof(context.Background(), "test query OK")
 		return nil
 	}
 	if err := runQuery(); err != nil {
@@ -522,7 +523,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 			ServerArgs:      base.TestServerArgs{Knobs: base.TestingKnobs{DistSQL: &execinfra.TestingKnobs{DrainFast: true}}, UseDatabase: "test"},
 		},
 	)
-	ctx := context.TODO()
+	ctx := context.Background()
 	defer tc.Stopper().Stop(ctx)
 
 	conn := tc.ServerConn(0)
@@ -576,7 +577,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 	// Drain the second node and expect the query to be planned on only the
 	// first node.
 	distServer := tc.Server(1).DistSQLServer().(*distsql.ServerImpl)
-	distServer.Drain(ctx, 0 /* flowDrainWait */)
+	distServer.Drain(ctx, 0 /* flowDrainWait */, nil /* reporter */)
 
 	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html#eJyUkM9Kw0AYxO8-xTKnVlba9LgnS60QqElNIgolyJp8hEC6G_cPKCHvLkkErVDR4843M79hO9jXBgLpdrfdZMybht0m8R07bJ_2u3UYsdlNmGbp_W7OPi2F9srNLueTT_mjzcGhdEmRPJKFOCBAztEaXZC12gxSNxrC8g1iyVGr1rtBzjkKbQiig6tdQxDI5EtDCcmSzGIJjpKcrJuxtjX1UZr364EJjrSVygp2BY7YO8EirQh5z6G9--q3TlYEEfT87xvWVWWokk6bRXA6YRM_RNlzEj-ms_lZ1uo_rIRsq5WlE8655mWfc1BZ0fSnVntT0N7oYsRMz3jMjUJJ1k3XYHqEajoNA7-Hg1_Dqx_hvL_4CAAA__-ln7ge"}})
 
@@ -778,7 +779,7 @@ func TestPartitionSpans(t *testing.T) {
 	// We need a mock Gossip to contain addresses for the nodes. Otherwise the
 	// DistSQLPlanner will not plan flows on them.
 	testStopper := stop.NewStopper()
-	defer testStopper.Stop(context.TODO())
+	defer testStopper.Stop(context.Background())
 	mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
 		testStopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	var nodeDescs []*roachpb.NodeDescriptor
@@ -808,22 +809,23 @@ func TestPartitionSpans(t *testing.T) {
 	for testIdx, tc := range testCases {
 		t.Run(strconv.Itoa(testIdx), func(t *testing.T) {
 			stopper := stop.NewStopper()
-			defer stopper.Stop(context.TODO())
+			defer stopper.Stop(context.Background())
 
 			tsp := &testSpanResolver{
 				nodes:  nodeDescs,
 				ranges: tc.ranges,
 			}
 
+			gw := gossip.MakeExposedGossip(mockGossip)
 			dsp := DistSQLPlanner{
 				planVersion:  execinfra.Version,
 				st:           cluster.MakeTestingClusterSettings(),
 				nodeDesc:     *tsp.nodes[tc.gatewayNode-1],
 				stopper:      stopper,
 				spanResolver: tsp,
-				gossip:       mockGossip,
+				gossip:       gw,
 				nodeHealth: distSQLNodeHealth{
-					gossip: mockGossip,
+					gossip: gw,
 					connHealth: func(node roachpb.NodeID, _ rpc.ConnectionClass) error {
 						for _, n := range tc.deadNodes {
 							if int(node) == n {
@@ -962,13 +964,13 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 
 			stopper := stop.NewStopper()
-			defer stopper.Stop(context.TODO())
+			defer stopper.Stop(context.Background())
 
 			// We need a mock Gossip to contain addresses for the nodes. Otherwise the
 			// DistSQLPlanner will not plan flows on them. This Gossip will also
 			// reflect tc.nodesNotAdvertisingDistSQLVersion.
 			testStopper := stop.NewStopper()
-			defer testStopper.Stop(context.TODO())
+			defer testStopper.Stop(context.Background())
 			mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
 				testStopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 			var nodeDescs []*roachpb.NodeDescriptor
@@ -999,15 +1001,16 @@ func TestPartitionSpansSkipsIncompatibleNodes(t *testing.T) {
 				ranges: ranges,
 			}
 
+			gw := gossip.MakeExposedGossip(mockGossip)
 			dsp := DistSQLPlanner{
 				planVersion:  tc.planVersion,
 				st:           cluster.MakeTestingClusterSettings(),
 				nodeDesc:     *tsp.nodes[gatewayNode-1],
 				stopper:      stopper,
 				spanResolver: tsp,
-				gossip:       mockGossip,
+				gossip:       gw,
 				nodeHealth: distSQLNodeHealth{
-					gossip: mockGossip,
+					gossip: gw,
 					connHealth: func(roachpb.NodeID, rpc.ConnectionClass) error {
 						// All the nodes are healthy.
 						return nil
@@ -1056,7 +1059,7 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 	ranges := []testSpanResolverRange{{"A", 1}, {"B", 2}, {"C", 1}}
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	mockGossip := gossip.NewTest(roachpb.NodeID(1), nil /* rpcContext */, nil, /* grpcServer */
 		stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
@@ -1094,15 +1097,16 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 		ranges: ranges,
 	}
 
+	gw := gossip.MakeExposedGossip(mockGossip)
 	dsp := DistSQLPlanner{
 		planVersion:  execinfra.Version,
 		st:           cluster.MakeTestingClusterSettings(),
 		nodeDesc:     *tsp.nodes[gatewayNode-1],
 		stopper:      stopper,
 		spanResolver: tsp,
-		gossip:       mockGossip,
+		gossip:       gw,
 		nodeHealth: distSQLNodeHealth{
-			gossip: mockGossip,
+			gossip: gw,
 			connHealth: func(node roachpb.NodeID, _ rpc.ConnectionClass) error {
 				_, err := mockGossip.GetNodeIDAddress(node)
 				return err
@@ -1144,7 +1148,7 @@ func TestCheckNodeHealth(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	const nodeID = roachpb.NodeID(5)
 
@@ -1196,10 +1200,11 @@ func TestCheckNodeHealth(t *testing.T) {
 		{notLive, "not using n5 due to liveness: node n5 is not live"},
 	}
 
+	gw := gossip.MakeExposedGossip(mockGossip)
 	for _, test := range livenessTests {
 		t.Run("liveness", func(t *testing.T) {
 			h := distSQLNodeHealth{
-				gossip:     mockGossip,
+				gossip:     gw,
 				connHealth: connHealthy,
 				isLive:     test.isLive,
 			}
@@ -1220,7 +1225,7 @@ func TestCheckNodeHealth(t *testing.T) {
 	for _, test := range connHealthTests {
 		t.Run("connHealth", func(t *testing.T) {
 			h := distSQLNodeHealth{
-				gossip:     mockGossip,
+				gossip:     gw,
 				connHealth: test.connHealth,
 				isLive:     live,
 			}

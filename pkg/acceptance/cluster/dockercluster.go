@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
@@ -45,7 +46,6 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -864,7 +864,7 @@ func (l *DockerCluster) ExecCLI(ctx context.Context, i int, cmd []string) (strin
 func (l *DockerCluster) Cleanup(ctx context.Context, preserveLogs bool) {
 	volumes, err := ioutil.ReadDir(l.volumesDir)
 	if err != nil {
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "%v", err)
 		return
 	}
 	for _, v := range volumes {
@@ -872,7 +872,7 @@ func (l *DockerCluster) Cleanup(ctx context.Context, preserveLogs bool) {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(l.volumesDir, v.Name())); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 	}
 }

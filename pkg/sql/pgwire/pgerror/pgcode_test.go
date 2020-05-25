@@ -52,9 +52,6 @@ func TestPGCode(t *testing.T) {
 					tt.CheckEqual(err.Error(), t.innerErr.Error())
 
 					tt.Check(pgerror.HasCandidateCode(err))
-					if _, ok := errors.If(err, func(err error) (interface{}, bool) { return nil, pgerror.IsCandidateCode(err) }); !ok {
-						tt.Error("woops")
-					}
 
 					code := pgerror.GetPGCodeInternal(err, pgerror.ComputeDefaultCode)
 					tt.CheckEqual(code, t.expectedCode)
@@ -66,8 +63,8 @@ func TestPGCode(t *testing.T) {
 
 				tt.Run("local", func(tt testutils.T) { theTest(tt, origErr) })
 
-				enc := errors.EncodeError(context.TODO(), origErr)
-				newErr := errors.DecodeError(context.TODO(), enc)
+				enc := errors.EncodeError(context.Background(), origErr)
+				newErr := errors.DecodeError(context.Background(), enc)
 
 				tt.Run("remote", func(tt testutils.T) { theTest(tt, newErr) })
 

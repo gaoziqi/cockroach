@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -40,8 +41,8 @@ func TestRemovePartitioningOSS(t *testing.T) {
 	if err := tests.CreateKVTable(sqlDBRaw, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	tableKey := sqlbase.MakeDescMetadataKey(tableDesc.ID)
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	tableKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID)
 
 	// Hack in partitions. Doing this properly requires a CCL binary.
 	tableDesc.PrimaryIndex.Partitioning = sqlbase.PartitioningDescriptor{
@@ -60,9 +61,14 @@ func TestRemovePartitioningOSS(t *testing.T) {
 			ToExclusive:   encoding.EncodeIntValue(nil /* appendTo */, encoding.NoColumnID, 2),
 		}},
 	}
+	// Note that this is really a gross hack - it breaks planner caches, which
+	// assume that nothing is going to change out from under them like this. We
+	// "fix" the issue by altering the table's name to refresh the cache, below.
 	if err := kvDB.Put(ctx, tableKey, sqlbase.WrapDescriptor(tableDesc)); err != nil {
 		t.Fatal(err)
 	}
+	sqlDB.Exec(t, "ALTER TABLE t.kv RENAME to t.kv2")
+	sqlDB.Exec(t, "ALTER TABLE t.kv2 RENAME to t.kv")
 	exp := `CREATE TABLE kv (
 	k INT8 NOT NULL,
 	v INT8 NULL,

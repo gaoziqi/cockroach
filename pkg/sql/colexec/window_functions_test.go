@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -74,9 +75,19 @@ func TestWindowFunctions(t *testing.T) {
 		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
 		for _, tc := range []windowFnTestCase{
 			// With PARTITION BY, no ORDER BY.
-			//
-			// Without ORDER BY, the output of row_number is non-deterministic, so we
-			// skip such a case for rowNumberFn.
+			{
+				tuples:   tuples{{1}, {1}, {1}, {2}, {2}, {3}},
+				expected: tuples{{1, 1}, {1, 2}, {1, 3}, {2, 1}, {2, 2}, {3, 1}},
+				windowerSpec: execinfrapb.WindowerSpec{
+					PartitionBy: []uint32{0},
+					WindowFns: []execinfrapb.WindowerSpec_WindowFn{
+						{
+							Func:         execinfrapb.WindowerSpec_Func{WindowFunc: &rowNumberFn},
+							OutputColIdx: 1,
+						},
+					},
+				},
+			},
 			{
 				tuples:   tuples{{3}, {1}, {2}, {nil}, {1}, {nil}, {3}},
 				expected: tuples{{nil, 1}, {nil, 1}, {1, 1}, {1, 1}, {2, 1}, {3, 1}, {3, 1}},
@@ -271,11 +282,11 @@ func TestWindowFunctions(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("spillForced=%t/%s", spillForced, tc.windowerSpec.WindowFns[0].Func.String()), func(t *testing.T) {
 				var semsToCheck []semaphore.Semaphore
-				runTests(t, []tuples{tc.tuples}, tc.expected, unorderedVerifier, func(inputs []Operator) (Operator, error) {
+				runTests(t, []tuples{tc.tuples}, tc.expected, unorderedVerifier, func(inputs []colexecbase.Operator) (colexecbase.Operator, error) {
 					tc.init()
-					ct := make([]types.T, len(tc.tuples[0]))
+					ct := make([]*types.T, len(tc.tuples[0]))
 					for i := range ct {
-						ct[i] = *types.Int
+						ct[i] = types.Int
 					}
 					spec := &execinfrapb.ProcessorSpec{
 						Input: []execinfrapb.InputSyncSpec{{ColumnTypes: ct}},
@@ -283,7 +294,7 @@ func TestWindowFunctions(t *testing.T) {
 							Windower: &tc.windowerSpec,
 						},
 					}
-					sem := NewTestingSemaphore(maxNumberFDs)
+					sem := colexecbase.NewTestingSemaphore(maxNumberFDs)
 					args := NewColOperatorArgs{
 						Spec:                spec,
 						Inputs:              inputs,

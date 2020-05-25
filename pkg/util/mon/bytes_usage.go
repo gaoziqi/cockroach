@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // BoundAccount and BytesMonitor together form the mechanism by which
@@ -396,7 +396,8 @@ func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
 	if check && mm.mu.curAllocated != 0 {
 		log.ReportOrPanic(
 			ctx, &mm.settings.SV,
-			fmt.Sprintf("%s: unexpected %d leftover bytes", mm.name, mm.mu.curAllocated))
+			"%s: unexpected %d leftover bytes",
+			log.Safe(mm.name), log.Safe(mm.mu.curAllocated))
 		mm.releaseBytes(ctx, mm.mu.curAllocated)
 	}
 
@@ -437,6 +438,11 @@ func (mm *BytesMonitor) AllocBytes() int64 {
 func (mm *BytesMonitor) SetMetrics(curCount *metric.Gauge, maxHist *metric.Histogram) {
 	mm.curBytesCount = curCount
 	mm.maxBytesHist = maxHist
+}
+
+// Resource returns the type of the resource the monitor is tracking.
+func (mm *BytesMonitor) Resource() Resource {
+	return mm.resource
 }
 
 // BoundAccount tracks the cumulated allocations for one client of a pool or

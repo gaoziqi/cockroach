@@ -17,7 +17,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
@@ -64,8 +63,8 @@ type windower struct {
 	runningState windowerState
 	input        execinfra.RowSource
 	inputDone    bool
-	inputTypes   []types.T
-	outputTypes  []types.T
+	inputTypes   []*types.T
+	outputTypes  []*types.T
 	datumAlloc   sqlbase.DatumAlloc
 	acc          mon.BoundAccount
 	diskMonitor  *mon.BytesMonitor
@@ -116,11 +115,11 @@ func newWindower(
 	w.builtins = make([]tree.WindowFunc, 0, len(windowFns))
 	// windower passes through all of its input columns and appends an output
 	// column for each of window functions it is computing.
-	w.outputTypes = make([]types.T, len(w.inputTypes)+len(windowFns))
+	w.outputTypes = make([]*types.T, len(w.inputTypes)+len(windowFns))
 	copy(w.outputTypes, w.inputTypes)
 	for _, windowFn := range windowFns {
 		// Check for out of bounds arguments has been done during planning step.
-		argTypes := make([]types.T, len(windowFn.ArgsIdxs))
+		argTypes := make([]*types.T, len(windowFn.ArgsIdxs))
 		for i, argIdx := range windowFn.ArgsIdxs {
 			argTypes[i] = w.inputTypes[argIdx]
 		}
@@ -128,7 +127,7 @@ func newWindower(
 		if err != nil {
 			return nil, err
 		}
-		w.outputTypes[windowFn.OutputColIdx] = *outputType
+		w.outputTypes[windowFn.OutputColIdx] = outputType
 
 		w.builtins = append(w.builtins, windowConstructor(evalCtx))
 		wf := &windowFunc{
@@ -202,6 +201,9 @@ func newWindower(
 	}
 
 	w.acc = w.MemMonitor.MakeBoundAccount()
+	// If we have aggregate builtins that aggregate a single datum, we want
+	// them to reuse the same shared memory account with the windower.
+	evalCtx.SingleDatumAggMemAccount = &w.acc
 
 	if sp := opentracing.SpanFromContext(ctx); sp != nil && tracing.IsRecording(sp) {
 		w.input = newInputStatCollector(w.input)
@@ -462,7 +464,7 @@ func (w *windower) processPartition(
 				case execinfrapb.WindowerSpec_Frame_ROWS:
 					frameRun.StartBoundOffset = tree.NewDInt(tree.DInt(int(startBound.IntOffset)))
 				case execinfrapb.WindowerSpec_Frame_RANGE:
-					datum, rem, err := sqlbase.DecodeTableValue(&w.datumAlloc, &startBound.OffsetType.Type, startBound.TypedOffset)
+					datum, rem, err := sqlbase.DecodeTableValue(&w.datumAlloc, startBound.OffsetType.Type, startBound.TypedOffset)
 					if err != nil {
 						return errors.NewAssertionErrorWithWrappedErrf(err,
 							"error decoding %d bytes", errors.Safe(len(startBound.TypedOffset)))
@@ -486,7 +488,7 @@ func (w *windower) processPartition(
 					case execinfrapb.WindowerSpec_Frame_ROWS:
 						frameRun.EndBoundOffset = tree.NewDInt(tree.DInt(int(endBound.IntOffset)))
 					case execinfrapb.WindowerSpec_Frame_RANGE:
-						datum, rem, err := sqlbase.DecodeTableValue(&w.datumAlloc, &endBound.OffsetType.Type, endBound.TypedOffset)
+						datum, rem, err := sqlbase.DecodeTableValue(&w.datumAlloc, endBound.OffsetType.Type, endBound.TypedOffset)
 						if err != nil {
 							return errors.NewAssertionErrorWithWrappedErrf(err,
 								"error decoding %d bytes", errors.Safe(len(endBound.TypedOffset)))
@@ -511,7 +513,7 @@ func (w *windower) processPartition(
 				// as zeroth "entry" which its proto equivalent doesn't have.
 				frameRun.OrdDirection = encoding.Direction(ordCol.Direction + 1)
 
-				colTyp := &w.inputTypes[ordCol.ColIdx]
+				colTyp := w.inputTypes[ordCol.ColIdx]
 				// Type of offset depends on the ordering column's type.
 				offsetTyp := colTyp
 				if types.IsDateTimeType(colTyp) {
@@ -674,7 +676,7 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *tree.Eva
 						"hash column %d, row with only %d columns", errors.Safe(col), errors.Safe(len(row)))
 				}
 				var err error
-				w.scratch, err = row[int(col)].Encode(&w.inputTypes[int(col)], &w.datumAlloc, flowinfra.PreferredEncoding, w.scratch)
+				w.scratch, err = row[int(col)].Fingerprint(w.inputTypes[int(col)], &w.datumAlloc, w.scratch)
 				if err != nil {
 					return err
 				}
@@ -735,7 +737,7 @@ func (w *windower) populateNextOutputRow() (bool, error) {
 		copy(w.outputRow, inputRow[:len(w.inputTypes)])
 		for windowFnIdx, windowFn := range w.windowFns {
 			windowFnRes := w.windowValues[w.partitionIdx][windowFnIdx][rowIdx]
-			encWindowFnRes := sqlbase.DatumToEncDatum(&w.outputTypes[windowFn.outputColIdx], windowFnRes)
+			encWindowFnRes := sqlbase.DatumToEncDatum(w.outputTypes[windowFn.outputColIdx], windowFnRes)
 			w.outputRow[windowFn.outputColIdx] = encWindowFnRes
 		}
 		w.rowsInBucketEmitted++
@@ -844,12 +846,21 @@ func (ws *WindowerStats) Stats() map[string]string {
 
 // StatsForQueryPlan implements the DistSQLSpanStats interface.
 func (ws *WindowerStats) StatsForQueryPlan() []string {
-	return append(
-		ws.InputStats.StatsForQueryPlan("" /* prefix */),
-		fmt.Sprintf("%s: %s", MaxMemoryQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedMem)),
-		fmt.Sprintf("%s: %s", MaxDiskQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedDisk)),
-	)
+	stats := ws.InputStats.StatsForQueryPlan("" /* prefix */)
+
+	if ws.MaxAllocatedMem != 0 {
+		stats = append(stats,
+			fmt.Sprintf("%s: %s", MaxMemoryQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedMem)))
+	}
+
+	if ws.MaxAllocatedDisk != 0 {
+		stats = append(stats,
+			fmt.Sprintf("%s: %s", MaxDiskQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedDisk)))
+	}
+
+	return stats
 }
+
 func (w *windower) outputStatsToTrace() {
 	is, ok := getInputStats(w.FlowCtx, w.input)
 	if !ok {
@@ -869,7 +880,10 @@ func (w *windower) outputStatsToTrace() {
 
 // ChildCount is part of the execinfra.OpNode interface.
 func (w *windower) ChildCount(verbose bool) int {
-	return 1
+	if _, ok := w.input.(execinfra.OpNode); ok {
+		return 1
+	}
+	return 0
 }
 
 // Child is part of the execinfra.OpNode interface.

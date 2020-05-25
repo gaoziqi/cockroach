@@ -13,12 +13,14 @@ package execbuilder
 import (
 	"bytes"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 )
 
@@ -63,6 +65,7 @@ func (b *Builder) buildCreateView(cv *memo.CreateViewExpr) (execPlan, error) {
 		schema,
 		cv.ViewName,
 		cv.IfNotExists,
+		cv.Replace,
 		cv.Temporary,
 		cv.ViewQuery,
 		cols,
@@ -77,11 +80,11 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 	if explain.Options.Mode == tree.ExplainOpt {
 		fmtFlags := memo.ExprFmtHideAll
 		switch {
-		case explain.Options.Flags.Contains(tree.ExplainFlagVerbose):
+		case explain.Options.Flags[tree.ExplainFlagVerbose]:
 			fmtFlags = memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars |
 				memo.ExprFmtHideTypes | memo.ExprFmtHideNotNull
 
-		case explain.Options.Flags.Contains(tree.ExplainFlagTypes):
+		case explain.Options.Flags[tree.ExplainFlagTypes]:
 			fmtFlags = memo.ExprFmtHideQualifications
 		}
 
@@ -89,7 +92,7 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 
 		// If catalog option was passed, show catalog object details for all tables.
 		var planText bytes.Buffer
-		if explain.Options.Flags.Contains(tree.ExplainFlagCatalog) {
+		if explain.Options.Flags[tree.ExplainFlagCatalog] {
 			for _, t := range b.mem.Metadata().AllTables() {
 				tp := treeprinter.New()
 				cat.FormatTable(b.catalog, t.Table, tp)
@@ -106,7 +109,7 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 		// need to run to get that information, and we can't run them from here, so
 		// tell the exec factory what information it needs to fetch.
 		var envOpts exec.ExplainEnvData
-		if explain.Options.Flags.Contains(tree.ExplainFlagEnv) {
+		if explain.Options.Flags[tree.ExplainFlagEnv] {
 			envOpts = b.getEnvData()
 		}
 
@@ -129,7 +132,7 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 			return execPlan{}, err
 		}
 
-		plan, err := b.factory.ConstructPlan(input.root, b.subqueries, b.postqueries)
+		plan, err := b.factory.ConstructPlan(input.root, b.subqueries, b.cascades, b.checks)
 		if err != nil {
 			return execPlan{}, err
 		}
@@ -144,10 +147,11 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 	for i, c := range explain.ColList {
 		ep.outputCols.Set(int(c), i)
 	}
-	// The sub- and postqueries are now owned by the explain node; remove them so
-	// they don't also show up in the final plan.
-	b.subqueries = b.subqueries[:0]
-	b.postqueries = b.postqueries[:0]
+	// The subqueries/cascades/checks are now owned by the explain node;
+	// remove them so they don't also show up in the final plan.
+	b.subqueries = nil
+	b.cascades = nil
+	b.checks = nil
 	return ep, nil
 }
 
@@ -270,6 +274,9 @@ func (b *Builder) buildCancelQueries(cancel *memo.CancelQueriesExpr) (execPlan, 
 	if err != nil {
 		return execPlan{}, err
 	}
+	if !b.disableTelemetry {
+		telemetry.Inc(sqltelemetry.CancelQueriesUseCounter)
+	}
 	// CancelQueries returns no columns.
 	return execPlan{root: node}, nil
 }
@@ -282,6 +289,9 @@ func (b *Builder) buildCancelSessions(cancel *memo.CancelSessionsExpr) (execPlan
 	node, err := b.factory.ConstructCancelSessions(input.root, cancel.IfExists)
 	if err != nil {
 		return execPlan{}, err
+	}
+	if !b.disableTelemetry {
+		telemetry.Inc(sqltelemetry.CancelSessionsUseCounter)
 	}
 	// CancelSessions returns no columns.
 	return execPlan{root: node}, nil

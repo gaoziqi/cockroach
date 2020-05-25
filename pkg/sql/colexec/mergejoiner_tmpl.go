@@ -28,15 +28,18 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
+
+// Remove unused warning.
+var _ = execgen.UNSAFEGET
 
 // {{/*
 // Declarations to make the template compile properly.
@@ -59,25 +62,35 @@ var _ duration.Duration
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
 
-// _TYPES_T is the template type variable for coltypes.T. It will be replaced by
-// coltypes.Foo for each type Foo in the coltypes.T type.
-const _TYPES_T = coltypes.Unhandled
+// Dummy import to pull in "coldataext" package.
+var _ coldataext.Datum
 
-// _GOTYPE is the template Go type variable for this operator. It will be
-// replaced by the Go type equivalent for each type in coltypes.T, for example
-// int64 for coltypes.Int64.
+// _GOTYPE is the template variable.
 type _GOTYPE interface{}
+
+// Dummy import to pull in "typeconv" package.
+var _ = typeconv.DatumVecCanonicalTypeFamily
+
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
 
 // _ASSIGN_EQ is the template equality function for assigning the first input
 // to the result of the second input == the third input.
-func _ASSIGN_EQ(_, _, _ interface{}) int {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN_EQ(_, _, _, _, _, _ interface{}) int {
+	colexecerror.InternalError("")
 }
 
-// _ASSIGN_LT is the template equality function for assigning the first input
-// to the result of the the second input < the third input.
-func _ASSIGN_LT(_, _, _ interface{}) int {
-	execerror.VectorizedInternalPanic("")
+// _ASSIGN_CMP is the template equality function for assigning the first input
+// to the result of comparing the second input to the third input which returns
+// an integer. That integer is:
+// - negative if left < right
+// - zero if left == right
+// - positive if left > right.
+func _ASSIGN_CMP(_, _, _, _, _ interface{}) int {
+	colexecerror.VectorizedInternalPanic("")
 }
 
 // _L_SEL_IND is the template type variable for the loop variable that
@@ -88,7 +101,6 @@ const _L_SEL_IND = 0
 // _R_SEL_IND is the template type variable for the loop variable that
 // is either curRIdx or rSel[curRIdx] depending on whether we're in a
 // selection or not.
-
 const _R_SEL_IND = 0
 
 // _SEL_ARG is used in place of the string "$sel", since that isn't valid go
@@ -99,14 +111,10 @@ const _SEL_ARG = 0
 // valid go code.
 const _JOIN_TYPE = 0
 
-// _MJ_OVERLOAD is used in place of the string "$mjOverload", since that isn't
-// valid go code.
-const _MJ_OVERLOAD = 0
-
 // */}}
 
 type mergeJoin_JOIN_TYPE_STRINGOp struct {
-	mergeJoinBase
+	*mergeJoinBase
 }
 
 var _ InternalMemoryOperator = &mergeJoin_JOIN_TYPE_STRINGOp{}
@@ -117,161 +125,287 @@ func _PROBE_SWITCH(
 	_JOIN_TYPE joinTypeInfo, _SEL_PERMUTATION selPermutation, _L_HAS_NULLS bool, _R_HAS_NULLS bool,
 ) { // */}}
 	// {{define "probeSwitch"}}
-	// {{ $sel := $.SelPermutation }}
-	// {{ $mjOverloads := $.Global.MJOverloads }}
-	switch colType {
-	// {{range $mjOverload := $.Global.MJOverloads }}
-	case _TYPES_T:
-		lKeys := lVec._TemplateType()
-		rKeys := rVec._TemplateType()
-		var lGroup, rGroup group
-		for o.groups.nextGroupInCol(&lGroup, &rGroup) {
-			curLIdx := lGroup.rowStartIdx
-			curRIdx := rGroup.rowStartIdx
-			curLLength := lGroup.rowEndIdx
-			curRLength := rGroup.rowEndIdx
-			areGroupsProcessed := false
-			_LEFT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE)
-			_RIGHT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE)
-			// Expand or filter each group based on the current equality column.
-			for curLIdx < curLLength && curRIdx < curRLength && !areGroupsProcessed {
-				// {{ if _L_HAS_NULLS }}
-				if lVec.Nulls().NullAt(_L_SEL_IND) {
-					_NULL_FROM_LEFT_SWITCH(_JOIN_TYPE)
-					curLIdx++
-					continue
-				}
-				// {{ end }}
-				// {{ if _R_HAS_NULLS }}
-				if rVec.Nulls().NullAt(_R_SEL_IND) {
-					_NULL_FROM_RIGHT_SWITCH(_JOIN_TYPE)
-					curRIdx++
-					continue
-				}
-				// {{ end }}
+	// {{$sel := $.SelPermutation}}
+	switch lVec.CanonicalTypeFamily() {
+	// {{range $overload := $.Global.Overloads}}
+	case _CANONICAL_TYPE_FAMILY:
+		switch colType.Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			lKeys := lVec.TemplateType()
+			rKeys := rVec.TemplateType()
+			var (
+				lGroup, rGroup   group
+				cmp              int
+				match            bool
+				lVal, rVal       _GOTYPE
+				lSelIdx, rSelIdx int
+			)
 
-				lSelIdx := _L_SEL_IND
-				lVal := execgen.UNSAFEGET(lKeys, lSelIdx)
-				rSelIdx := _R_SEL_IND
-				rVal := execgen.UNSAFEGET(rKeys, rSelIdx)
+			for o.groups.nextGroupInCol(&lGroup, &rGroup) {
+				curLIdx := lGroup.rowStartIdx
+				curRIdx := rGroup.rowStartIdx
+				curLEndIdx := lGroup.rowEndIdx
+				curREndIdx := rGroup.rowEndIdx
+				areGroupsProcessed := false
+				_LEFT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE)
+				_RIGHT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE)
+				// Expand or filter each group based on the current equality column.
+				for curLIdx < curLEndIdx && curRIdx < curREndIdx && !areGroupsProcessed {
+					cmp = 0
+					// {{if _L_HAS_NULLS}}
+					lNull := lVec.Nulls().NullAt(_L_SEL_IND)
+					// {{end}}
+					// {{if _R_HAS_NULLS}}
+					rNull := rVec.Nulls().NullAt(_R_SEL_IND)
+					// {{end}}
 
-				var match bool
-				// {{/*
-				// TODO(yuzefovich): we can reduce the number of "assigns" here.
-				// */}}
-				_ASSIGN_EQ(match, lVal, rVal)
-				if match {
-					// Find the length of the groups on each side.
-					lGroupLength, rGroupLength := 1, 1
-					lComplete, rComplete := false, false
-					beginLIdx, beginRIdx := curLIdx, curRIdx
-
-					// Find the length of the group on the left.
-					if curLLength == 0 {
-						lGroupLength, lComplete = 0, true
-					} else {
+					// {{if _JOIN_TYPE.IsSetOp}}
+					// {{/*
+					//     Set operations allow null equality, so we handle
+					//     NULLs first.
+					// */}}
+					// {{if _L_HAS_NULLS}}
+					if lNull {
+						// {{/* If we have NULL on the left, then it is smaller than the right value. */}}
+						cmp = -1
+					}
+					// {{end}}
+					// {{if _R_HAS_NULLS}}
+					if rNull {
+						// {{/* If we have NULL on the right, then it is smaller than the left value. */}}
+						cmp = 1
+					}
+					// {{end}}
+					// {{if _L_HAS_NULLS}}
+					var nullMatch bool
+					// {{/* Remove unused warning for some code paths of INTERSECT ALL join. */}}
+					_ = nullMatch
+					// {{if _R_HAS_NULLS}}
+					// {{/* Both vectors might have nulls. */}}
+					// If we have a NULL match, it will take precedence over
+					// cmp value set above.
+					nullMatch = lNull && rNull
+					// {{end}}
+					// {{end}}
+					// {{else}}
+					// {{/*
+					//     Non-set operation joins do not allow null equality,
+					//     so if either value is NULL, the tuples are not
+					//     matches.
+					// */}}
+					// TODO(yuzefovich): we can advance both sides if both are
+					// NULL.
+					// {{if _L_HAS_NULLS}}
+					if lNull {
+						_NULL_FROM_LEFT_SWITCH(_JOIN_TYPE)
 						curLIdx++
-						for curLIdx < curLLength {
-							// {{ if _L_HAS_NULLS }}
-							if lVec.Nulls().NullAt(_L_SEL_IND) {
-								lComplete = true
-								break
-							}
-							// {{ end }}
-							lSelIdx := _L_SEL_IND
-							newLVal := execgen.UNSAFEGET(lKeys, lSelIdx)
-							_ASSIGN_EQ(match, newLVal, lVal)
-							if !match {
-								lComplete = true
-								break
+						continue
+					}
+					// {{end}}
+					// {{if _R_HAS_NULLS}}
+					if rNull {
+						_NULL_FROM_RIGHT_SWITCH(_JOIN_TYPE)
+						curRIdx++
+						continue
+					}
+					// {{end}}
+					// {{end}}
+
+					// {{if _JOIN_TYPE.IsSetOp}}
+					// {{if and _L_HAS_NULLS _R_HAS_NULLS}}
+					if nullMatch {
+						// We have a null match, so two values are equal.
+						cmp = 0
+					} else
+					// {{end}}
+					// {{end}}
+					{
+						// {{if _JOIN_TYPE.IsSetOp}}
+						// {{if or _L_HAS_NULLS _R_HAS_NULLS}}
+						// {{/*
+						//     For set operation joins we might have set 'cmp'
+						//     to non-zero value above if we had a null mismatch.
+						//     In such scenario we already know that the values
+						//     are different and we know which side to advance.
+						// */}}
+						if cmp == 0 {
+							// {{end}}
+							// {{end}}
+
+							lSelIdx = _L_SEL_IND
+							lVal = execgen.UNSAFEGET(lKeys, lSelIdx)
+							rSelIdx = _R_SEL_IND
+							rVal = execgen.UNSAFEGET(rKeys, rSelIdx)
+							_ASSIGN_CMP(cmp, lVal, rVal, lKeys, rKeys)
+
+							// {{if _JOIN_TYPE.IsSetOp}}
+							// {{if or _L_HAS_NULLS _R_HAS_NULLS}}
+						}
+						// {{end}}
+						// {{end}}
+					}
+
+					if cmp == 0 {
+						// Find the length of the groups on each side.
+						lGroupLength, rGroupLength := 1, 1
+						// If a group ends before the end of the probing batch,
+						// then we know it is complete.
+						lComplete := curLEndIdx < o.proberState.lLength
+						rComplete := curREndIdx < o.proberState.rLength
+						beginLIdx, beginRIdx := curLIdx, curRIdx
+						curLIdx++
+						curRIdx++
+
+						// Find the length of the group on the left.
+						for curLIdx < curLEndIdx {
+							// {{if _JOIN_TYPE.IsSetOp}}
+							// {{if and _L_HAS_NULLS _R_HAS_NULLS}}
+							if nullMatch {
+								// {{/*
+								//     We have a NULL match, so we only
+								//     extend the left group if we have a
+								//     NULL element.
+								// */}}
+								if !lVec.Nulls().NullAt(_L_SEL_IND) {
+									lComplete = true
+									break
+								}
+							} else
+							// {{end}}
+							// {{end}}
+							{
+								// {{if _L_HAS_NULLS}}
+								if lVec.Nulls().NullAt(_L_SEL_IND) {
+									lComplete = true
+									break
+								}
+								// {{end}}
+								lSelIdx = _L_SEL_IND
+								newLVal := execgen.UNSAFEGET(lKeys, lSelIdx)
+								_ASSIGN_EQ(match, newLVal, lVal, _, lKeys, lKeys)
+								if !match {
+									lComplete = true
+									break
+								}
 							}
 							lGroupLength++
 							curLIdx++
 						}
-					}
 
-					// Find the length of the group on the right.
-					if curRLength == 0 {
-						rGroupLength, rComplete = 0, true
-					} else {
-						curRIdx++
-						for curRIdx < curRLength {
-							// {{ if _R_HAS_NULLS }}
-							if rVec.Nulls().NullAt(_R_SEL_IND) {
-								rComplete = true
-								break
-							}
-							// {{ end }}
-							rSelIdx := _R_SEL_IND
-							newRVal := execgen.UNSAFEGET(rKeys, rSelIdx)
-							_ASSIGN_EQ(match, newRVal, rVal)
-							if !match {
-								rComplete = true
-								break
+						// Find the length of the group on the right.
+						for curRIdx < curREndIdx {
+							// {{if _JOIN_TYPE.IsSetOp}}
+							// {{if and _L_HAS_NULLS _R_HAS_NULLS}}
+							if nullMatch {
+								// {{/*
+								//     We have a NULL match, so we only
+								//     extend the right group if we have a
+								//     NULL element.
+								// */}}
+								if !rVec.Nulls().NullAt(_R_SEL_IND) {
+									rComplete = true
+									break
+								}
+							} else
+							// {{end}}
+							// {{end}}
+							{
+								// {{if _R_HAS_NULLS}}
+								if rVec.Nulls().NullAt(_R_SEL_IND) {
+									rComplete = true
+									break
+								}
+								// {{end}}
+								rSelIdx = _R_SEL_IND
+								newRVal := execgen.UNSAFEGET(rKeys, rSelIdx)
+								_ASSIGN_EQ(match, newRVal, rVal, _, rKeys, rKeys)
+								if !match {
+									rComplete = true
+									break
+								}
 							}
 							rGroupLength++
 							curRIdx++
 						}
-					}
 
-					// Last equality column and either group is incomplete. Save state
-					// and have it handled in the next iteration.
-					if eqColIdx == len(o.left.eqCols)-1 && (!lComplete || !rComplete) {
-						o.appendToBufferedGroup(ctx, &o.left, o.proberState.lBatch, lSel, beginLIdx, lGroupLength)
-						o.proberState.lIdx = lGroupLength + beginLIdx
-						o.appendToBufferedGroup(ctx, &o.right, o.proberState.rBatch, rSel, beginRIdx, rGroupLength)
-						o.proberState.rIdx = rGroupLength + beginRIdx
+						// Last equality column and either group is incomplete. Save state
+						// and have it handled in the next iteration.
+						if eqColIdx == len(o.left.eqCols)-1 && (!lComplete || !rComplete) {
+							o.appendToBufferedGroup(ctx, &o.left, o.proberState.lBatch, lSel, beginLIdx, lGroupLength)
+							o.proberState.lIdx = lGroupLength + beginLIdx
+							o.appendToBufferedGroup(ctx, &o.right, o.proberState.rBatch, rSel, beginRIdx, rGroupLength)
+							o.proberState.rIdx = rGroupLength + beginRIdx
 
-						o.groups.finishedCol()
-						break EqLoop
-					}
+							o.groups.finishedCol()
+							break EqLoop
+						}
 
-					if eqColIdx < len(o.left.eqCols)-1 {
-						o.groups.addGroupsToNextCol(beginLIdx, lGroupLength, beginRIdx, rGroupLength)
-					} else {
-						// {{ if _JOIN_TYPE.IsLeftSemi }}
-						o.groups.addLeftSemiGroup(beginLIdx, lGroupLength)
-						// {{ else if _JOIN_TYPE.IsLeftAnti }}
-						// With LEFT ANTI join, we are only interested in unmatched tuples
-						// from the left, and all tuples in the current group have a match.
-						// {{ else }}
-						// Neither group ends with the batch, so add the group to the
-						// circular buffer.
-						o.groups.addGroupsToNextCol(beginLIdx, lGroupLength, beginRIdx, rGroupLength)
-						// {{ end }}
+						if eqColIdx < len(o.left.eqCols)-1 {
+							o.groups.addGroupsToNextCol(beginLIdx, lGroupLength, beginRIdx, rGroupLength)
+						} else {
+							// {{if _JOIN_TYPE.IsLeftSemi}}
+							leftSemiGroupLength := lGroupLength
+							// {{if _JOIN_TYPE.IsSetOp}}
+							// For INTERSECT ALL join we add a left semi group
+							// of length min(lGroupLength, rGroupLength).
+							if rGroupLength < lGroupLength {
+								leftSemiGroupLength = rGroupLength
+							}
+							// {{end}}
+							o.groups.addLeftSemiGroup(beginLIdx, leftSemiGroupLength)
+							// {{else if _JOIN_TYPE.IsLeftAnti}}
+							// {{if _JOIN_TYPE.IsSetOp}}
+							// For EXCEPT ALL join we add (lGroupLength - rGroupLength) number
+							// (if positive) of unmatched left groups.
+							for leftUnmatchedTupleIdx := beginLIdx + rGroupLength; leftUnmatchedTupleIdx < beginLIdx+lGroupLength; leftUnmatchedTupleIdx++ {
+								// Right index here doesn't matter.
+								o.groups.addLeftUnmatchedGroup(leftUnmatchedTupleIdx, beginRIdx)
+							}
+							// {{else}}
+							// With LEFT ANTI join, we are only interested in unmatched tuples
+							// from the left, and all tuples in the current group have a match.
+							// {{end}}
+							// {{else}}
+							// Neither group ends with the batch, so add the group to the
+							// circular buffer.
+							o.groups.addGroupsToNextCol(beginLIdx, lGroupLength, beginRIdx, rGroupLength)
+							// {{end}}
+						}
+					} else { // mismatch
+						// The line below is a compact form of the following:
+						//   incrementLeft :=
+						//    (cmp < 0 && o.left.directions[eqColIdx] == execinfrapb.Ordering_Column_ASC) ||
+						//	  (cmp > 0 && o.left.directions[eqColIdx] == execinfrapb.Ordering_Column_DESC).
+						incrementLeft := cmp < 0 == (o.left.directions[eqColIdx] == execinfrapb.Ordering_Column_ASC)
+						if incrementLeft {
+							curLIdx++
+							// {{if _L_HAS_NULLS}}
+							_INCREMENT_LEFT_SWITCH(_JOIN_TYPE, _SEL_ARG, true)
+							// {{else}}
+							_INCREMENT_LEFT_SWITCH(_JOIN_TYPE, _SEL_ARG, false)
+							// {{end}}
+						} else {
+							curRIdx++
+							// {{if _R_HAS_NULLS}}
+							_INCREMENT_RIGHT_SWITCH(_JOIN_TYPE, _SEL_ARG, true)
+							// {{else}}
+							_INCREMENT_RIGHT_SWITCH(_JOIN_TYPE, _SEL_ARG, false)
+							// {{end}}
+						}
 					}
-				} else { // mismatch
-					var incrementLeft bool
-					_ASSIGN_LT(incrementLeft, lVal, rVal)
-					// Switch the direction of increment if we're sorted descendingly.
-					incrementLeft = incrementLeft == (o.left.directions[eqColIdx] == execinfrapb.Ordering_Column_ASC)
-					if incrementLeft {
-						curLIdx++
-						// {{ if _L_HAS_NULLS }}
-						_INCREMENT_LEFT_SWITCH(_JOIN_TYPE, _SEL_ARG, _MJ_OVERLOAD, true)
-						// {{ else }}
-						_INCREMENT_LEFT_SWITCH(_JOIN_TYPE, _SEL_ARG, _MJ_OVERLOAD, false)
-						// {{ end }}
-					} else {
-						curRIdx++
-						// {{ if _R_HAS_NULLS }}
-						_INCREMENT_RIGHT_SWITCH(_JOIN_TYPE, _SEL_ARG, _MJ_OVERLOAD, true)
-						// {{ else }}
-						_INCREMENT_RIGHT_SWITCH(_JOIN_TYPE, _SEL_ARG, _MJ_OVERLOAD, false)
-						// {{ end }}
-					}
-
 				}
+				_PROCESS_NOT_LAST_GROUP_IN_COLUMN_SWITCH(_JOIN_TYPE)
+				// Both o.proberState.lIdx and o.proberState.rIdx should point to the
+				// last elements processed in their respective batches.
+				o.proberState.lIdx = curLIdx
+				o.proberState.rIdx = curRIdx
 			}
-			_PROCESS_NOT_LAST_GROUP_IN_COLUMN_SWITCH(_JOIN_TYPE)
-			// Both o.proberState.lIdx and o.proberState.rIdx should point to the
-			// last elements processed in their respective batches.
-			o.proberState.lIdx = curLIdx
-			o.proberState.rIdx = curRIdx
+			// {{end}}
 		}
-	// {{end}}
+		// {{end}}
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", colType))
+		colexecerror.InternalError(fmt.Sprintf("unhandled type %s", colType))
 	}
 	// {{end}}
 	// {{/*
@@ -283,16 +417,17 @@ func _PROBE_SWITCH(
 // This code snippet processes an unmatched group from the left.
 func _LEFT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 	// {{define "leftUnmatchedGroupSwitch"}}
-	// {{ if or $.JoinType.IsInner $.JoinType.IsLeftSemi }}
+	// {{if or $.JoinType.IsInner $.JoinType.IsLeftSemi}}
 	// {{/*
-	// Unmatched groups are not possible with INNER JOIN and LEFT SEMI JOIN, so
-	// there is nothing to do here.
+	// Unmatched groups are not possible with INNER, LEFT SEMI, and INTERSECT
+	// ALL joins (the latter has IsLeftSemi == true), so there is nothing to do
+	// here.
 	// */}}
-	// {{ end }}
-	// {{ if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti }}
+	// {{end}}
+	// {{if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti}}
 	if lGroup.unmatched {
-		if curLIdx+1 != curLLength {
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unexpectedly length %d of the left unmatched group is not 1", curLLength-curLIdx))
+		if curLIdx+1 != curLEndIdx {
+			colexecerror.InternalError(fmt.Sprintf("unexpectedly length %d of the left unmatched group is not 1", curLEndIdx-curLIdx))
 		}
 		// The row already does not have a match, so we don't need to do any
 		// additional processing.
@@ -300,13 +435,13 @@ func _LEFT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 		curLIdx++
 		areGroupsProcessed = true
 	}
-	// {{ end }}
-	// {{ if $.JoinType.IsRightOuter }}
+	// {{end}}
+	// {{if $.JoinType.IsRightOuter}}
 	// {{/*
-	// Unmatched groups from the left are not possible with RIGHT OUTER JOIN, so
+	// Unmatched groups from the left are not possible with RIGHT OUTER join, so
 	// there is nothing to do here.
 	// */}}
-	// {{ end }}
+	// {{end}}
 	// {{end}}
 	// {{/*
 }
@@ -317,22 +452,24 @@ func _LEFT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 // This code snippet processes an unmatched group from the right.
 func _RIGHT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 	// {{define "rightUnmatchedGroupSwitch"}}
-	// {{ if or $.JoinType.IsInner $.JoinType.IsLeftSemi }}
+	// {{if or $.JoinType.IsInner $.JoinType.IsLeftSemi}}
 	// {{/*
-	// Unmatched groups are not possible with INNER JOIN and LEFT SEMI JOIN, so
-	// there is nothing to do here.
+	// Unmatched groups are not possible with INNER, LEFT SEMI, and INTERSECT
+	// ALL joins (the latter has IsLeftSemi == true), so there is nothing to do
+	// here.
 	// */}}
-	// {{ end }}
-	// {{ if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti }}
+	// {{end}}
+	// {{if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti}}
 	// {{/*
-	// Unmatched groups from the right are not possible with LEFT OUTER JOIN and
-	// LEFT ANTI JOIN, so there is nothing to do here.
+	// Unmatched groups from the right are not possible with LEFT OUTER, LEFT
+	// ANTI, and EXCEPT ALL joins (the latter has IsLeftAnti == true), so there
+	// is nothing to do here.
 	// */}}
-	// {{ end }}
-	// {{ if $.JoinType.IsRightOuter }}
+	// {{end}}
+	// {{if $.JoinType.IsRightOuter}}
 	if rGroup.unmatched {
-		if curRIdx+1 != curRLength {
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unexpectedly length %d of the right unmatched group is not 1", curRLength-curRIdx))
+		if curRIdx+1 != curREndIdx {
+			colexecerror.InternalError(fmt.Sprintf("unexpectedly length %d of the right unmatched group is not 1", curREndIdx-curRIdx))
 		}
 		// The row already does not have a match, so we don't need to do any
 		// additional processing.
@@ -340,7 +477,7 @@ func _RIGHT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 		curRIdx++
 		areGroupsProcessed = true
 	}
-	// {{ end }}
+	// {{end}}
 	// {{end}}
 	// {{/*
 }
@@ -349,23 +486,24 @@ func _RIGHT_UNMATCHED_GROUP_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 
 // {{/*
 // This code snippet decides what to do if we encounter null in the equality
-// column from the left input.
+// column from the left input. Note that the case of Null equality *must* be
+// checked separately.
 func _NULL_FROM_LEFT_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 	// {{define "nullFromLeftSwitch"}}
-	// {{ if or $.JoinType.IsInner $.JoinType.IsLeftSemi }}
+	// {{if or $.JoinType.IsInner $.JoinType.IsLeftSemi}}
 	// {{/*
-	// Nulls coming from the left input are ignored in INNER JOIN and LEFT SEMI
-	// JOIN.
+	// Nulls coming from the left input are ignored in INNER and LEFT SEMI
+	// joins.
 	// */}}
-	// {{ end }}
-	// {{ if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti }}
+	// {{end}}
+	// {{if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti}}
 	o.groups.addLeftUnmatchedGroup(curLIdx, curRIdx)
-	// {{ end }}
-	// {{ if $.JoinType.IsRightOuter }}
+	// {{end}}
+	// {{if $.JoinType.IsRightOuter}}
 	// {{/*
-	// Nulls coming from the left input are ignored in RIGHT OUTER JOIN.
+	// Nulls coming from the left input are ignored in RIGHT OUTER join.
 	// */}}
-	// {{ end }}
+	// {{end}}
 	// {{end}}
 	// {{/*
 }
@@ -374,24 +512,25 @@ func _NULL_FROM_LEFT_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 
 // {{/*
 // This code snippet decides what to do if we encounter null in the equality
-// column from the right input.
+// column from the right input. Note that the case of Null equality *must* be
+// checked separately.
 func _NULL_FROM_RIGHT_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 	// {{define "nullFromRightSwitch"}}
-	// {{ if or $.JoinType.IsInner $.JoinType.IsLeftSemi }}
+	// {{if or $.JoinType.IsInner $.JoinType.IsLeftSemi}}
 	// {{/*
-	// Nulls coming from the right input are ignored in INNER JOIN and LEFT SEMI
-	// JOIN.
+	// Nulls coming from the right input are ignored in INNER and LEFT SEMI
+	// joins.
 	// */}}
-	// {{ end }}
-	// {{ if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti }}
+	// {{end}}
+	// {{if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti}}
 	// {{/*
-	// Nulls coming from the right input are ignored in LEFT OUTER JOIN and LEFT
-	// ANTI JOIN.
+	// Nulls coming from the right input are ignored in LEFT OUTER and LEFT
+	// ANTI joins.
 	// */}}
-	// {{ end }}
-	// {{ if $.JoinType.IsRightOuter }}
+	// {{end}}
+	// {{if $.JoinType.IsRightOuter}}
 	o.groups.addRightOuterGroup(curLIdx, curRIdx)
-	// {{ end }}
+	// {{end}}
 	// {{end}}
 	// {{/*
 }
@@ -403,47 +542,72 @@ func _NULL_FROM_RIGHT_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 // between two inputs - we need to advance the left side, i.e. it decides how
 // to handle an unmatched tuple from the left.
 func _INCREMENT_LEFT_SWITCH(
-	_JOIN_TYPE joinTypeInfo,
-	_SEL_PERMUTATION selPermutation,
-	_MJ_OVERLOAD mjOverload,
-	_L_HAS_NULLS bool,
+	_JOIN_TYPE joinTypeInfo, _SEL_PERMUTATION selPermutation, _L_HAS_NULLS bool,
 ) { // */}}
 	// {{define "incrementLeftSwitch"}}
-	// {{ $sel := $.SelPermutation }}
-	// {{ $mjOverload := $.MJOverload }}
-	// {{ if or $.JoinType.IsInner $.JoinType.IsLeftSemi }}
+	// {{$sel := $.SelPermutation}}
+	// {{if or $.JoinType.IsInner $.JoinType.IsLeftSemi}}
 	// {{/*
-	// Unmatched tuple from the left source is not outputted in INNER JOIN and
-	// LEFT SEMI JOIN.
+	// Unmatched tuple from the left source is not outputted in INNER, LEFT
+	// SEMI, and INTERSECT ALL joins (the latter has IsLeftSemi == true).
 	// */}}
-	// {{ end }}
-	// {{ if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti }}
+	// {{end}}
+	// {{if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti}}
 	// All the rows on the left within the current group will not get a match on
 	// the right, so we're adding each of them as a left unmatched group.
 	o.groups.addLeftUnmatchedGroup(curLIdx-1, curRIdx)
-	for curLIdx < curLLength {
-		// {{ if _L_HAS_NULLS }}
+	for curLIdx < curLEndIdx {
+		// {{/*
+		//     EXCEPT ALL join allows NULL equality, so we have special
+		//     treatment of NULLs.
+		// */}}
+		// {{if _L_HAS_NULLS}}
+		// {{if _JOIN_TYPE.IsSetOp}}
+		newLValNull := lVec.Nulls().NullAt(_L_SEL_IND)
+		if lNull != newLValNull {
+			// We have a null mismatch, so we've reached the end of the current
+			// group on the left.
+			break
+		} else if newLValNull && lNull {
+			nullMatch = true
+		} else {
+			nullMatch = false
+		}
+		// {{else}}
 		if lVec.Nulls().NullAt(_L_SEL_IND) {
 			break
 		}
-		// {{ end }}
-		lSelIdx = _L_SEL_IND
-		newLVal := execgen.UNSAFEGET(lKeys, lSelIdx)
-		// {{with _MJ_OVERLOAD}}
-		_ASSIGN_EQ(match, newLVal, lVal)
 		// {{end}}
-		if !match {
-			break
+		// {{end}}
+
+		// {{if and _JOIN_TYPE.IsSetOp _L_HAS_NULLS}}
+		// {{/*
+		//     We have checked for null equality above and set nullMatch to the
+		//     correct value. If it is true, then both the old and the new
+		//     values are NULL, so there is no further comparison needed.
+		// */}}
+		if !nullMatch {
+			// {{end}}
+			lSelIdx = _L_SEL_IND
+			// {{with .Global}}
+			newLVal := execgen.UNSAFEGET(lKeys, lSelIdx)
+			_ASSIGN_EQ(match, newLVal, lVal, _, lKeys, lKeys)
+			// {{end}}
+			if !match {
+				break
+			}
+			// {{if and _JOIN_TYPE.IsSetOp _L_HAS_NULLS}}
 		}
+		// {{end}}
 		o.groups.addLeftUnmatchedGroup(curLIdx, curRIdx)
 		curLIdx++
 	}
-	// {{ end }}
-	// {{ if $.JoinType.IsRightOuter }}
+	// {{end}}
+	// {{if $.JoinType.IsRightOuter}}
 	// {{/*
-	// Unmatched tuple from the left source is not outputted in RIGHT OUTER JOIN.
+	// Unmatched tuple from the left source is not outputted in RIGHT OUTER join.
 	// */}}
-	// {{ end }}
+	// {{end}}
 	// {{end}}
 	// {{/*
 }
@@ -455,40 +619,36 @@ func _INCREMENT_LEFT_SWITCH(
 // between two inputs - we need to advance the right side, i.e. it decides how
 // to handle an unmatched tuple from the right.
 func _INCREMENT_RIGHT_SWITCH(
-	_JOIN_TYPE joinTypeInfo,
-	_SEL_PERMUTATION selPermutation,
-	_MJ_OVERLOAD mjOverload,
-	_R_HAS_NULLS bool,
+	_JOIN_TYPE joinTypeInfo, _SEL_PERMUTATION selPermutation, _R_HAS_NULLS bool,
 ) { // */}}
 	// {{define "incrementRightSwitch"}}
-	// {{ $sel := $.SelPermutation }}
-	// {{ $mjOverload := $.MJOverload }}
-	// {{ if or $.JoinType.IsInner $.JoinType.IsLeftSemi }}
+	// {{$sel := $.SelPermutation}}
+	// {{if or $.JoinType.IsInner $.JoinType.IsLeftSemi}}
 	// {{/*
-	// Unmatched tuple from the right source is not outputted in INNER JOIN and
-	// LEFT SEMI JOIN.
+	// Unmatched tuple from the right source is not outputted in INNER, LEFT
+	// SEMI, and INTERSECT ALL joins (the latter has IsLeftSemi == true).
 	// */}}
-	// {{ end }}
-	// {{ if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti }}
+	// {{end}}
+	// {{if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti}}
 	// {{/*
-	// Unmatched tuple from the right source is not outputted in LEFT OUTER JOIN
-	// and LEFT ANTI JOIN.
+	// Unmatched tuple from the right source is not outputted in LEFT OUTER,
+	// LEFT ANTI, and EXCEPT ALL joins (the latter has IsLeftAnti == true).
 	// */}}
-	// {{ end }}
-	// {{ if $.JoinType.IsRightOuter }}
+	// {{end}}
+	// {{if $.JoinType.IsRightOuter}}
 	// All the rows on the right within the current group will not get a match on
 	// the left, so we're adding each of them as a right outer group.
 	o.groups.addRightOuterGroup(curLIdx, curRIdx-1)
-	for curRIdx < curRLength {
-		// {{ if _R_HAS_NULLS }}
+	for curRIdx < curREndIdx {
+		// {{if _R_HAS_NULLS}}
 		if rVec.Nulls().NullAt(_R_SEL_IND) {
 			break
 		}
-		// {{ end }}
+		// {{end}}
 		rSelIdx = _R_SEL_IND
+		// {{with .Global}}
 		newRVal := execgen.UNSAFEGET(rKeys, rSelIdx)
-		// {{with _MJ_OVERLOAD}}
-		_ASSIGN_EQ(match, newRVal, rVal)
+		_ASSIGN_EQ(match, newRVal, rVal, _, rKeys, rKeys)
 		// {{end}}
 		if !match {
 			break
@@ -496,7 +656,7 @@ func _INCREMENT_RIGHT_SWITCH(
 		o.groups.addRightOuterGroup(curLIdx, curRIdx)
 		curRIdx++
 	}
-	// {{ end }}
+	// {{end}}
 	// {{end}}
 	// {{/*
 }
@@ -508,42 +668,42 @@ func _INCREMENT_RIGHT_SWITCH(
 // reached the end of either the left or right group.
 func _PROCESS_NOT_LAST_GROUP_IN_COLUMN_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 	// {{define "processNotLastGroupInColumnSwitch"}}
-	// {{ if or $.JoinType.IsInner $.JoinType.IsLeftSemi }}
+	// {{if or $.JoinType.IsInner $.JoinType.IsLeftSemi}}
 	// {{/*
 	// Nothing to do here since an unmatched tuple is omitted.
 	// */}}
-	// {{ end }}
-	// {{ if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti }}
+	// {{end}}
+	// {{if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti}}
 	if !o.groups.isLastGroupInCol() && !areGroupsProcessed {
 		// The current group is not the last one within the column, so it cannot be
 		// extended into the next batch, and we need to process it right now. Any
 		// unprocessed row in the left group will not get a match, so each one of
 		// them becomes a new unmatched group with a corresponding null group.
-		for curLIdx < curLLength {
+		for curLIdx < curLEndIdx {
 			o.groups.addLeftUnmatchedGroup(curLIdx, curRIdx)
 			curLIdx++
 		}
 	}
-	// {{ end }}
-	// {{ if $.JoinType.IsRightOuter }}
+	// {{end}}
+	// {{if $.JoinType.IsRightOuter}}
 	if !o.groups.isLastGroupInCol() && !areGroupsProcessed {
 		// The current group is not the last one within the column, so it cannot be
 		// extended into the next batch, and we need to process it right now. Any
 		// unprocessed row in the right group will not get a match, so each one of
 		// them becomes a new unmatched group with a corresponding null group.
-		for curRIdx < curRLength {
+		for curRIdx < curREndIdx {
 			o.groups.addRightOuterGroup(curLIdx, curRIdx)
 			curRIdx++
 		}
 	}
-	// {{ end }}
+	// {{end}}
 	// {{end}}
 	// {{/*
 }
 
 // */}}
 
-// {{ range $sel := $.SelPermutations }}
+// {{range $sel := $.SelPermutations}}
 func (o *mergeJoin_JOIN_TYPE_STRINGOp) probeBodyLSel_IS_L_SELRSel_IS_R_SEL(ctx context.Context) {
 	lSel := o.proberState.lBatch.Selection()
 	rSel := o.proberState.rBatch.Selection()
@@ -553,47 +713,64 @@ EqLoop:
 		rightColIdx := o.right.eqCols[eqColIdx]
 		lVec := o.proberState.lBatch.ColVec(int(leftColIdx))
 		rVec := o.proberState.rBatch.ColVec(int(rightColIdx))
-		leftPhysType := o.left.sourceTypes[leftColIdx]
-		rightPhysType := o.right.sourceTypes[rightColIdx]
-		colType := leftPhysType
+		leftType := o.left.sourceTypes[leftColIdx]
+		rightType := o.right.sourceTypes[rightColIdx]
+		colType := leftType
 		// Merge joiner only supports the case when the physical types in the
 		// equality columns in both inputs are the same. If that is not the case,
 		// we need to cast one of the vectors to another's physical type putting
 		// the result of the cast into a temporary vector that is used instead of
 		// the original.
-		if leftPhysType != rightPhysType {
+		leftCanonicalTypeFamily := o.left.canonicalTypeFamilies[leftColIdx]
+		isNumeric := leftCanonicalTypeFamily == types.IntFamily ||
+			leftCanonicalTypeFamily == types.FloatFamily ||
+			leftCanonicalTypeFamily == types.DecimalFamily
+		if isNumeric && !leftType.Identical(rightType) {
 			castLeftToRight := false
 			// There is a hierarchy of valid casts:
 			//   Int16 -> Int32 -> Int64 -> Float64 -> Decimal
 			// and the cast is valid if 'fromType' is mentioned before 'toType'
 			// in this chain.
-			switch leftPhysType {
-			case coltypes.Int16:
-				castLeftToRight = true
-			case coltypes.Int32:
-				castLeftToRight = rightPhysType != coltypes.Int16
-			case coltypes.Int64:
-				castLeftToRight = rightPhysType != coltypes.Int16 && rightPhysType != coltypes.Int32
-			case coltypes.Float64:
-				castLeftToRight = rightPhysType == coltypes.Decimal
+			switch leftCanonicalTypeFamily {
+			case types.IntFamily:
+				switch leftType.Width() {
+				case 16:
+					castLeftToRight = true
+				case 32:
+					castLeftToRight = !rightType.Identical(types.Int2)
+				case 64:
+					castLeftToRight = !rightType.Identical(types.Int2) && !rightType.Identical(types.Int4)
+				}
+			case types.FloatFamily:
+				castLeftToRight = o.right.canonicalTypeFamilies[rightColIdx] == types.DecimalFamily
 			}
-			toType := leftPhysType
+
+			toType := leftType
 			if castLeftToRight {
-				toType = rightPhysType
+				toType = rightType
 			}
-			tempVec := o.scratch.tempVecByType[toType]
+			var tempVec coldata.Vec
+			for _, vec := range o.scratch.tempVecs {
+				if vec.Type().Identical(toType) {
+					tempVec = vec
+					break
+				}
+			}
 			if tempVec == nil {
 				tempVec = o.unlimitedAllocator.NewMemColumn(toType, coldata.BatchSize())
-				o.scratch.tempVecByType[toType] = tempVec
+				o.scratch.tempVecs = append(o.scratch.tempVecs, tempVec)
 			} else {
 				tempVec.Nulls().UnsetNulls()
+				if tempVec.CanonicalTypeFamily() == types.BytesFamily {
+					tempVec.Bytes().Reset()
+				}
 			}
 			if castLeftToRight {
-				cast(leftPhysType, rightPhysType, lVec, tempVec, o.proberState.lBatch.Length(), lSel)
+				cast(lVec, tempVec, o.proberState.lBatch.Length(), lSel)
 				lVec = tempVec
-				colType = o.right.sourceTypes[rightColIdx]
+				colType = rightType
 			} else {
-				cast(rightPhysType, leftPhysType, rVec, tempVec, o.proberState.rBatch.Length(), rSel)
+				cast(rVec, tempVec, o.proberState.rBatch.Length(), rSel)
 				rVec = tempVec
 			}
 		}
@@ -616,101 +793,107 @@ EqLoop:
 	}
 }
 
-// {{ end }}
+// {{end}}
 
 // {{/*
 // This code snippet builds the output corresponding to the left side (i.e. is
 // the main body of buildLeftGroupsFromBatch()).
 func _LEFT_SWITCH(_JOIN_TYPE joinTypeInfo, _HAS_SELECTION bool, _HAS_NULLS bool) { // */}}
 	// {{define "leftSwitch"}}
-	switch colType {
-	// {{ range $.Global.MJOverloads }}
-	case _TYPES_T:
-		var srcCol _GOTYPESLICE
-		if src != nil {
-			srcCol = src._TemplateType()
-		}
-		outCol := out._TemplateType()
-		var val _GOTYPE
-		var srcStartIdx int
-
-		// Loop over every group.
-		for ; o.builderState.left.groupsIdx < len(leftGroups); o.builderState.left.groupsIdx++ {
-			leftGroup := &leftGroups[o.builderState.left.groupsIdx]
-			// {{ if _JOIN_TYPE.IsLeftAnti }}
-			// {{/*
-			// With LEFT ANTI JOIN we want to emit output corresponding only to
-			// unmatched tuples, so we're skipping all "matched" groups.
-			// */}}
-			if !leftGroup.unmatched {
-				continue
+	switch input.canonicalTypeFamilies[colIdx] {
+	// {{range $.Global.Overloads}}
+	case _CANONICAL_TYPE_FAMILY:
+		switch input.sourceTypes[colIdx].Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			var srcCol _GOTYPESLICE
+			if src != nil {
+				srcCol = src.TemplateType()
 			}
-			// {{ end }}
-			// If curSrcStartIdx is uninitialized, start it at the group's start idx.
-			// Otherwise continue where we left off.
-			if o.builderState.left.curSrcStartIdx == zeroMJCPCurSrcStartIdx {
-				o.builderState.left.curSrcStartIdx = leftGroup.rowStartIdx
-			}
-			// Loop over every row in the group.
-			for ; o.builderState.left.curSrcStartIdx < leftGroup.rowEndIdx; o.builderState.left.curSrcStartIdx++ {
-				// Repeat each row numRepeats times.
-				srcStartIdx = o.builderState.left.curSrcStartIdx
-				// {{ if _HAS_SELECTION }}
-				srcStartIdx = sel[srcStartIdx]
-				// {{ end }}
+			outCol := out.TemplateType()
+			var val _GOTYPE
+			var srcStartIdx int
 
-				repeatsLeft := leftGroup.numRepeats - o.builderState.left.numRepeatsIdx
-				toAppend := repeatsLeft
-				if outStartIdx+toAppend > outputBatchSize {
-					toAppend = outputBatchSize - outStartIdx
-				}
-
-				// {{ if _JOIN_TYPE.IsRightOuter }}
+			// Loop over every group.
+			for ; o.builderState.left.groupsIdx < len(leftGroups); o.builderState.left.groupsIdx++ {
+				leftGroup := &leftGroups[o.builderState.left.groupsIdx]
+				// {{if _JOIN_TYPE.IsLeftAnti}}
 				// {{/*
-				// Null groups on the left can only occur with RIGHT OUTER and FULL
-				// OUTER joins for both of which IsRightOuter is true. For other joins,
-				// we're omitting this check.
+				// With LEFT ANTI and EXCEPT ALL joins (the latter has
+				// IsLeftAnti == true) we want to emit output corresponding only to
+				// unmatched tuples, so we're skipping all "matched" groups.
 				// */}}
-				if leftGroup.nullGroup {
-					out.Nulls().SetNullRange(outStartIdx, outStartIdx+toAppend)
-					outStartIdx += toAppend
-				} else
-				// {{ end }}
-				{
-					// {{ if _HAS_NULLS }}
-					if src.Nulls().NullAt(srcStartIdx) {
+				if !leftGroup.unmatched {
+					continue
+				}
+				// {{end}}
+				// If curSrcStartIdx is uninitialized, start it at the group's start idx.
+				// Otherwise continue where we left off.
+				if o.builderState.left.curSrcStartIdx == zeroMJCPCurSrcStartIdx {
+					o.builderState.left.curSrcStartIdx = leftGroup.rowStartIdx
+				}
+				// Loop over every row in the group.
+				for ; o.builderState.left.curSrcStartIdx < leftGroup.rowEndIdx; o.builderState.left.curSrcStartIdx++ {
+					// Repeat each row numRepeats times.
+					srcStartIdx = o.builderState.left.curSrcStartIdx
+					// {{if _HAS_SELECTION}}
+					srcStartIdx = sel[srcStartIdx]
+					// {{end}}
+
+					repeatsLeft := leftGroup.numRepeats - o.builderState.left.numRepeatsIdx
+					toAppend := repeatsLeft
+					if outStartIdx+toAppend > outputBatchSize {
+						toAppend = outputBatchSize - outStartIdx
+					}
+
+					// {{if _JOIN_TYPE.IsRightOuter}}
+					// {{/*
+					// Null groups on the left can only occur with RIGHT OUTER and FULL
+					// OUTER joins for both of which IsRightOuter is true. For other joins,
+					// we're omitting this check.
+					// */}}
+					if leftGroup.nullGroup {
 						out.Nulls().SetNullRange(outStartIdx, outStartIdx+toAppend)
 						outStartIdx += toAppend
 					} else
-					// {{ end }}
+					// {{end}}
 					{
-						val = execgen.UNSAFEGET(srcCol, srcStartIdx)
-						for i := 0; i < toAppend; i++ {
-							execgen.SET(outCol, outStartIdx, val)
-							outStartIdx++
+						// {{if _HAS_NULLS}}
+						if src.Nulls().NullAt(srcStartIdx) {
+							out.Nulls().SetNullRange(outStartIdx, outStartIdx+toAppend)
+							outStartIdx += toAppend
+						} else
+						// {{end}}
+						{
+							val = execgen.UNSAFEGET(srcCol, srcStartIdx)
+							for i := 0; i < toAppend; i++ {
+								execgen.SET(outCol, outStartIdx, val)
+								outStartIdx++
+							}
 						}
 					}
-				}
 
-				if toAppend < repeatsLeft {
-					// We didn't materialize all the rows in the group so save state and
-					// move to the next column.
-					o.builderState.left.numRepeatsIdx += toAppend
-					if colIdx == len(input.sourceTypes)-1 {
-						return
+					if toAppend < repeatsLeft {
+						// We didn't materialize all the rows in the group so save state and
+						// move to the next column.
+						o.builderState.left.numRepeatsIdx += toAppend
+						if colIdx == len(input.sourceTypes)-1 {
+							return
+						}
+						o.builderState.left.setBuilderColumnState(initialBuilderState)
+						continue LeftColLoop
 					}
-					o.builderState.left.setBuilderColumnState(initialBuilderState)
-					continue LeftColLoop
-				}
 
-				o.builderState.left.numRepeatsIdx = zeroMJCPNumRepeatsIdx
+					o.builderState.left.numRepeatsIdx = zeroMJCPNumRepeatsIdx
+				}
+				o.builderState.left.curSrcStartIdx = zeroMJCPCurSrcStartIdx
 			}
-			o.builderState.left.curSrcStartIdx = zeroMJCPCurSrcStartIdx
+			o.builderState.left.groupsIdx = zeroMJCPGroupsIdx
+			// {{end}}
 		}
-		o.builderState.left.groupsIdx = zeroMJCPGroupsIdx
-	// {{end}}
+		// {{end}}
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", colType))
+		colexecerror.InternalError(fmt.Sprintf("unhandled type %s", input.sourceTypes[colIdx].String()))
 	}
 	// {{end}}
 	// {{/*
@@ -750,7 +933,7 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildLeftGroupsFromBatch(
 		func() {
 			// Loop over every column.
 		LeftColLoop:
-			for colIdx, colType := range input.sourceTypes {
+			for colIdx := range input.sourceTypes {
 				outStartIdx := destStartIdx
 				out := o.output.ColVec(colIdx)
 				var src coldata.Vec
@@ -782,10 +965,16 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildLeftGroupsFromBatch(
 // builds the output columns corresponding to the left input based on the
 // buffered group. The goal is to repeat each row from the left buffered group
 // leftGroup.numRepeats times.
-// Note that all other fields of leftGroup are ignored because, by definition,
-// all rows in the buffered group are part of leftGroup (i.e. we don't need to
-// look at rowStartIdx and rowEndIdx). Also, all rows in the buffered group do
-// have a match, so the group can neither be "nullGroup" nor "unmatched".
+// Note that for non-set operation joins all other fields of leftGroup are
+// ignored because, by definition, all rows in the buffered group are part of
+// leftGroup (i.e. we don't need to look at rowStartIdx and rowEndIdx). Also,
+// all rows in the buffered group do have a match, so the group can neither be
+// "nullGroup" nor "unmatched".
+// This function does pay attention to rowEndIdx field for set operation joins:
+// only the first rowEndIdx will be output. For performance reasons we choose
+// to output the first rows (for both INTERSECT ALL and EXCEPT ALL joins we
+// need to output exactly rowEndIdx different rows from the left, but the
+// choice of rows can be arbitrary).
 func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildLeftBufferedGroup(
 	ctx context.Context,
 	leftGroup group,
@@ -798,10 +987,11 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildLeftBufferedGroup(
 	if currentBatch == nil {
 		currentBatch, err = bufferedGroup.dequeue(ctx)
 		if err != nil {
-			execerror.VectorizedInternalPanic(err)
+			colexecerror.InternalError(err)
 		}
 		o.builderState.lBufferedGroupBatch = currentBatch
 		o.builderState.left.curSrcStartIdx = 0
+		o.builderState.left.numRepeatsIdx = 0
 	}
 	initialBuilderState := o.builderState.left
 	o.unlimitedAllocator.PerformOperation(
@@ -809,86 +999,133 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildLeftBufferedGroup(
 		func() {
 			batchLength := currentBatch.Length()
 			for batchLength > 0 {
-				var updatedDestStartIdx int
 				// Loop over every column.
 			LeftColLoop:
-				for colIdx, colType := range input.sourceTypes {
+				for colIdx := range input.sourceTypes {
 					outStartIdx := destStartIdx
 					src := currentBatch.ColVec(colIdx)
 					out := o.output.ColVec(colIdx)
-					switch colType {
-					// {{ range $.MJOverloads }}
-					case _TYPES_T:
-						srcCol := src._TemplateType()
-						outCol := out._TemplateType()
-						var val _GOTYPE
-						// Loop over every row in the group.
-						for ; o.builderState.left.curSrcStartIdx < batchLength; o.builderState.left.curSrcStartIdx++ {
-							// Repeat each row numRepeats times.
-							// {{/*
-							// TODO(yuzefovich): we can optimize this code for LEFT SEMI
-							// because in that case numRepeats is always 1.
-							// */}}
-							srcStartIdx := o.builderState.left.curSrcStartIdx
-							repeatsLeft := leftGroup.numRepeats - o.builderState.left.numRepeatsIdx
-							toAppend := repeatsLeft
-							if outStartIdx+toAppend > o.outputBatchSize {
-								toAppend = o.outputBatchSize - outStartIdx
-							}
-
-							if src.Nulls().NullAt(srcStartIdx) {
-								out.Nulls().SetNullRange(outStartIdx, outStartIdx+toAppend)
-								outStartIdx += toAppend
-							} else {
-								val = execgen.UNSAFEGET(srcCol, srcStartIdx)
-								for i := 0; i < toAppend; i++ {
-									execgen.SET(outCol, outStartIdx, val)
-									outStartIdx++
+					switch input.canonicalTypeFamilies[colIdx] {
+					// {{range $.Overloads}}
+					case _CANONICAL_TYPE_FAMILY:
+						switch input.sourceTypes[colIdx].Width() {
+						// {{range .WidthOverloads}}
+						case _TYPE_WIDTH:
+							srcCol := src.TemplateType()
+							outCol := out.TemplateType()
+							var val _GOTYPE
+							// {{if _JOIN_TYPE.IsSetOp}}
+							// Loop over every row in the group until we hit
+							// rowEndIdx number of rows.
+							// {{else}}
+							// Loop over every row in the group.
+							// {{end}}
+							for ; o.builderState.left.curSrcStartIdx < batchLength; o.builderState.left.curSrcStartIdx++ {
+								// Repeat each row numRepeats times.
+								// {{/*
+								// TODO(yuzefovich): we can optimize this code for
+								// LEFT SEMI, INTERSECT ALL, and EXCEPT ALL joins
+								// because in that case numRepeats is always 1.
+								// */}}
+								srcStartIdx := o.builderState.left.curSrcStartIdx
+								repeatsLeft := leftGroup.numRepeats - o.builderState.left.numRepeatsIdx
+								toAppend := repeatsLeft
+								if outStartIdx+toAppend > o.outputBatchSize {
+									toAppend = o.outputBatchSize - outStartIdx
 								}
-							}
 
-							if toAppend < repeatsLeft {
-								// We didn't materialize all the rows in the current batch, so
-								// we move to the next column.
-								if colIdx == len(input.sourceTypes)-1 {
-									// This is the last column, so we update the builder state
-									// and exit.
-									o.builderState.left.numRepeatsIdx += toAppend
-									return
+								// {{if _JOIN_TYPE.IsSetOp}}
+								if o.builderState.left.setOpLeftSrcIdx == leftGroup.rowEndIdx {
+									// We have fully materialized first rowEndIdx
+									// rows in the current column, so we need to
+									// either transition to the next column or exit.
+									// We can accomplish this by setting toAppend
+									// to 0.
+									toAppend = 0
 								}
-								o.builderState.left.setBuilderColumnState(initialBuilderState)
-								continue LeftColLoop
+								o.builderState.left.setOpLeftSrcIdx += toAppend
+								// {{end}}
+
+								// {{/*
+								// TODO(yuzefovich): check whether it is beneficial
+								// to have 'if toAppend > 0' check here.
+								// */}}
+								if src.Nulls().NullAt(srcStartIdx) {
+									out.Nulls().SetNullRange(outStartIdx, outStartIdx+toAppend)
+									outStartIdx += toAppend
+								} else {
+									val = execgen.UNSAFEGET(srcCol, srcStartIdx)
+									for i := 0; i < toAppend; i++ {
+										execgen.SET(outCol, outStartIdx, val)
+										outStartIdx++
+									}
+								}
+
+								if toAppend < repeatsLeft {
+									// We didn't materialize all the rows in the current batch, so
+									// we move to the next column.
+									if colIdx == len(input.sourceTypes)-1 {
+										// This is the last column, so we update the builder state
+										// and exit.
+										o.builderState.left.numRepeatsIdx += toAppend
+										// {{if _JOIN_TYPE.IsSetOp}}
+										// {{/*
+										//     For non-set operation join the builder state is reset once the
+										//     buffered group has been fully built (at the very bottom of this
+										//     function), but we might be short-circuiting right now because
+										//     set operation joins can have partially-built groups.
+										// */}}
+										if o.builderState.left.setOpLeftSrcIdx == leftGroup.rowEndIdx {
+											o.builderState.lBufferedGroupBatch = nil
+											o.builderState.left.reset()
+										}
+										// {{end}}
+										return
+									}
+									// We need to start building the next column
+									// with the same initial builder state as the
+									// current column.
+									o.builderState.left.setBuilderColumnState(initialBuilderState)
+									continue LeftColLoop
+								}
+								// We fully processed the current row, and before moving on to the
+								// next one, we need to reset numRepeatsIdx (so that the next row
+								// would be repeated leftGroup.numRepeats times).
+								o.builderState.left.numRepeatsIdx = 0
 							}
-							// We fully processed the current row, and before moving on to the
-							// next one, we need to reset numRepeatsIdx (so that the next row
-							// would be repeated leftGroup.numRepeats times).
-							o.builderState.left.numRepeatsIdx = 0
+							// {{end}}
 						}
 					// {{end}}
 					default:
-						execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", colType))
+						colexecerror.InternalError(fmt.Sprintf("unhandled type %s", input.sourceTypes[colIdx].String()))
 					}
-					updatedDestStartIdx = outStartIdx
-					o.builderState.left.setBuilderColumnState(initialBuilderState)
+					if colIdx == len(input.sourceTypes)-1 {
+						// We have appended some tuples into the output batch from the current
+						// batch (the latter is now fully processed), so we need to adjust
+						// destStartIdx accordingly for the next batch.
+						destStartIdx = outStartIdx
+					} else {
+						o.builderState.left.setBuilderColumnState(initialBuilderState)
+					}
 				}
-				// We have appended some tuples into the output batch from the current
-				// batch (the latter is now fully processed), so we need to adjust
-				// destStartIdx accordingly for the next batch.
-				destStartIdx = updatedDestStartIdx
 				// We have processed all tuples in the current batch from the
 				// buffered group, so we need to dequeue the next one.
 				o.unlimitedAllocator.ReleaseBatch(currentBatch)
 				currentBatch, err = bufferedGroup.dequeue(ctx)
 				if err != nil {
-					execerror.VectorizedInternalPanic(err)
+					colexecerror.InternalError(err)
 				}
 				o.builderState.lBufferedGroupBatch = currentBatch
 				batchLength = currentBatch.Length()
-				// Note that here we're not resetting the builder state to
-				// initialBuilderState because we have transitioned to building from a
-				// new batch.
+				// We have transitioned to building from a new batch, so we
+				// need to update the builder state to build from the beginning
+				// of the new batch.
 				o.builderState.left.curSrcStartIdx = 0
 				o.builderState.left.numRepeatsIdx = 0
+				// We also need to update 'initialBuilderState' so that the
+				// builder state gets reset correctly in-between different
+				// columns in the loop above.
+				initialBuilderState = o.builderState.left
 			}
 			o.builderState.lBufferedGroupBatch = nil
 			o.builderState.left.reset()
@@ -902,101 +1139,105 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildLeftBufferedGroup(
 func _RIGHT_SWITCH(_JOIN_TYPE joinTypeInfo, _HAS_SELECTION bool, _HAS_NULLS bool) { // */}}
 	// {{define "rightSwitch"}}
 
-	switch colType {
-	// {{range $.Global.MJOverloads }}
-	case _TYPES_T:
-		var srcCol _GOTYPESLICE
-		if src != nil {
-			srcCol = src._TemplateType()
-		}
-		outCol := out._TemplateType()
-
-		// Loop over every group.
-		for ; o.builderState.right.groupsIdx < len(rightGroups); o.builderState.right.groupsIdx++ {
-			rightGroup := &rightGroups[o.builderState.right.groupsIdx]
-			// Repeat every group numRepeats times.
-			for ; o.builderState.right.numRepeatsIdx < rightGroup.numRepeats; o.builderState.right.numRepeatsIdx++ {
-				if o.builderState.right.curSrcStartIdx == zeroMJCPCurSrcStartIdx {
-					o.builderState.right.curSrcStartIdx = rightGroup.rowStartIdx
-				}
-				toAppend := rightGroup.rowEndIdx - o.builderState.right.curSrcStartIdx
-				if outStartIdx+toAppend > outputBatchSize {
-					toAppend = outputBatchSize - outStartIdx
-				}
-
-				// {{ if _JOIN_TYPE.IsLeftOuter }}
-				// {{/*
-				// Null groups on the right can only occur with LEFT OUTER and FULL
-				// OUTER joins for both of which IsLeftOuter is true. For other joins,
-				// we're omitting this check.
-				// */}}
-				if rightGroup.nullGroup {
-					out.Nulls().SetNullRange(outStartIdx, outStartIdx+toAppend)
-				} else
-				// {{ end }}
-				{
-					// Optimization in the case that group length is 1, use assign
-					// instead of copy.
-					if toAppend == 1 {
-						// {{ if _HAS_SELECTION }}
-						// {{ if _HAS_NULLS }}
-						if src.Nulls().NullAt(sel[o.builderState.right.curSrcStartIdx]) {
-							out.Nulls().SetNull(outStartIdx)
-						} else
-						// {{ end }}
-						{
-							v := execgen.UNSAFEGET(srcCol, sel[o.builderState.right.curSrcStartIdx])
-							execgen.SET(outCol, outStartIdx, v)
-						}
-						// {{ else }}
-						// {{ if _HAS_NULLS }}
-						if src.Nulls().NullAt(o.builderState.right.curSrcStartIdx) {
-							out.Nulls().SetNull(outStartIdx)
-						} else
-						// {{ end }}
-						{
-							v := execgen.UNSAFEGET(srcCol, o.builderState.right.curSrcStartIdx)
-							execgen.SET(outCol, outStartIdx, v)
-						}
-						// {{ end }}
-					} else {
-						out.Copy(
-							coldata.CopySliceArgs{
-								SliceArgs: coldata.SliceArgs{
-									ColType:     colType,
-									Src:         src,
-									Sel:         sel,
-									DestIdx:     outStartIdx,
-									SrcStartIdx: o.builderState.right.curSrcStartIdx,
-									SrcEndIdx:   o.builderState.right.curSrcStartIdx + toAppend,
-								},
-							},
-						)
-					}
-				}
-
-				outStartIdx += toAppend
-
-				// If we haven't materialized all the rows from the group, then we are
-				// done with the current column.
-				if toAppend < rightGroup.rowEndIdx-o.builderState.right.curSrcStartIdx {
-					// If it's the last column, save state and return.
-					if colIdx == len(input.sourceTypes)-1 {
-						o.builderState.right.curSrcStartIdx += toAppend
-						return
-					}
-					// Otherwise, reset to the initial state and begin the next column.
-					o.builderState.right.setBuilderColumnState(initialBuilderState)
-					continue RightColLoop
-				}
-				o.builderState.right.curSrcStartIdx = zeroMJCPCurSrcStartIdx
+	switch input.canonicalTypeFamilies[colIdx] {
+	// {{range $.Global.Overloads}}
+	case _CANONICAL_TYPE_FAMILY:
+		switch input.sourceTypes[colIdx].Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			var srcCol _GOTYPESLICE
+			if src != nil {
+				srcCol = src.TemplateType()
 			}
-			o.builderState.right.numRepeatsIdx = zeroMJCPNumRepeatsIdx
+			outCol := out.TemplateType()
+
+			// Loop over every group.
+			for ; o.builderState.right.groupsIdx < len(rightGroups); o.builderState.right.groupsIdx++ {
+				rightGroup := &rightGroups[o.builderState.right.groupsIdx]
+				// Repeat every group numRepeats times.
+				for ; o.builderState.right.numRepeatsIdx < rightGroup.numRepeats; o.builderState.right.numRepeatsIdx++ {
+					if o.builderState.right.curSrcStartIdx == zeroMJCPCurSrcStartIdx {
+						o.builderState.right.curSrcStartIdx = rightGroup.rowStartIdx
+					}
+					toAppend := rightGroup.rowEndIdx - o.builderState.right.curSrcStartIdx
+					if outStartIdx+toAppend > outputBatchSize {
+						toAppend = outputBatchSize - outStartIdx
+					}
+
+					// {{if _JOIN_TYPE.IsLeftOuter}}
+					// {{/*
+					// Null groups on the right can only occur with LEFT OUTER and FULL
+					// OUTER joins for both of which IsLeftOuter is true. For other joins,
+					// we're omitting this check.
+					// */}}
+					if rightGroup.nullGroup {
+						out.Nulls().SetNullRange(outStartIdx, outStartIdx+toAppend)
+					} else
+					// {{end}}
+					{
+						// Optimization in the case that group length is 1, use assign
+						// instead of copy.
+						if toAppend == 1 {
+							// {{if _HAS_SELECTION}}
+							// {{if _HAS_NULLS}}
+							if src.Nulls().NullAt(sel[o.builderState.right.curSrcStartIdx]) {
+								out.Nulls().SetNull(outStartIdx)
+							} else
+							// {{end}}
+							{
+								v := execgen.UNSAFEGET(srcCol, sel[o.builderState.right.curSrcStartIdx])
+								execgen.SET(outCol, outStartIdx, v)
+							}
+							// {{else}}
+							// {{if _HAS_NULLS}}
+							if src.Nulls().NullAt(o.builderState.right.curSrcStartIdx) {
+								out.Nulls().SetNull(outStartIdx)
+							} else
+							// {{end}}
+							{
+								v := execgen.UNSAFEGET(srcCol, o.builderState.right.curSrcStartIdx)
+								execgen.SET(outCol, outStartIdx, v)
+							}
+							// {{end}}
+						} else {
+							out.Copy(
+								coldata.CopySliceArgs{
+									SliceArgs: coldata.SliceArgs{
+										Src:         src,
+										Sel:         sel,
+										DestIdx:     outStartIdx,
+										SrcStartIdx: o.builderState.right.curSrcStartIdx,
+										SrcEndIdx:   o.builderState.right.curSrcStartIdx + toAppend,
+									},
+								},
+							)
+						}
+					}
+
+					outStartIdx += toAppend
+
+					// If we haven't materialized all the rows from the group, then we are
+					// done with the current column.
+					if toAppend < rightGroup.rowEndIdx-o.builderState.right.curSrcStartIdx {
+						// If it's the last column, save state and return.
+						if colIdx == len(input.sourceTypes)-1 {
+							o.builderState.right.curSrcStartIdx += toAppend
+							return
+						}
+						// Otherwise, reset to the initial state and begin the next column.
+						o.builderState.right.setBuilderColumnState(initialBuilderState)
+						continue RightColLoop
+					}
+					o.builderState.right.curSrcStartIdx = zeroMJCPCurSrcStartIdx
+				}
+				o.builderState.right.numRepeatsIdx = zeroMJCPNumRepeatsIdx
+			}
+			o.builderState.right.groupsIdx = zeroMJCPGroupsIdx
+			// {{end}}
 		}
-		o.builderState.right.groupsIdx = zeroMJCPGroupsIdx
 	// {{end}}
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", colType))
+		colexecerror.InternalError(fmt.Sprintf("unhandled type %s", input.sourceTypes[colIdx].String()))
 	}
 	// {{end}}
 	// {{/*
@@ -1035,7 +1276,7 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildRightGroupsFromBatch(
 		func() {
 			// Loop over every column.
 		RightColLoop:
-			for colIdx, colType := range input.sourceTypes {
+			for colIdx := range input.sourceTypes {
 				outStartIdx := destStartIdx
 				out := o.output.ColVec(colIdx + colOffset)
 				var src coldata.Vec
@@ -1090,7 +1331,7 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildRightBufferedGroup(
 				if currentBatch == nil {
 					currentBatch, err = bufferedGroup.dequeue(ctx)
 					if err != nil {
-						execerror.VectorizedInternalPanic(err)
+						colexecerror.InternalError(err)
 					}
 					o.builderState.rBufferedGroupBatch = currentBatch
 					o.builderState.right.curSrcStartIdx = 0
@@ -1103,40 +1344,44 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildRightBufferedGroup(
 					}
 
 					// Loop over every column.
-					for colIdx, colType := range input.sourceTypes {
+					for colIdx := range input.sourceTypes {
 						out := o.output.ColVec(colIdx + colOffset)
 						src := currentBatch.ColVec(colIdx)
-						switch colType {
-						// {{range $.MJOverloads }}
-						case _TYPES_T:
-							srcCol := src._TemplateType()
-							outCol := out._TemplateType()
+						switch input.canonicalTypeFamilies[colIdx] {
+						// {{range $.Overloads}}
+						case _CANONICAL_TYPE_FAMILY:
+							switch input.sourceTypes[colIdx].Width() {
+							// {{range .WidthOverloads}}
+							case _TYPE_WIDTH:
+								srcCol := src.TemplateType()
+								outCol := out.TemplateType()
 
-							// Optimization in the case that group length is 1, use assign
-							// instead of copy.
-							if toAppend == 1 {
-								if src.Nulls().NullAt(o.builderState.right.curSrcStartIdx) {
-									out.Nulls().SetNull(outStartIdx)
+								// Optimization in the case that group length is 1, use assign
+								// instead of copy.
+								if toAppend == 1 {
+									if src.Nulls().NullAt(o.builderState.right.curSrcStartIdx) {
+										out.Nulls().SetNull(outStartIdx)
+									} else {
+										v := execgen.UNSAFEGET(srcCol, o.builderState.right.curSrcStartIdx)
+										execgen.SET(outCol, outStartIdx, v)
+									}
 								} else {
-									v := execgen.UNSAFEGET(srcCol, o.builderState.right.curSrcStartIdx)
-									execgen.SET(outCol, outStartIdx, v)
-								}
-							} else {
-								out.Copy(
-									coldata.CopySliceArgs{
-										SliceArgs: coldata.SliceArgs{
-											ColType:     colType,
-											Src:         src,
-											DestIdx:     outStartIdx,
-											SrcStartIdx: o.builderState.right.curSrcStartIdx,
-											SrcEndIdx:   o.builderState.right.curSrcStartIdx + toAppend,
+									out.Copy(
+										coldata.CopySliceArgs{
+											SliceArgs: coldata.SliceArgs{
+												Src:         src,
+												DestIdx:     outStartIdx,
+												SrcStartIdx: o.builderState.right.curSrcStartIdx,
+												SrcEndIdx:   o.builderState.right.curSrcStartIdx + toAppend,
+											},
 										},
-									},
-								)
+									)
+								}
+								// {{end}}
 							}
 							// {{end}}
 						default:
-							execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", colType))
+							colexecerror.InternalError(fmt.Sprintf("unhandled type %s", input.sourceTypes[colIdx].String()))
 						}
 					}
 					outStartIdx += toAppend
@@ -1152,7 +1397,7 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildRightBufferedGroup(
 					o.unlimitedAllocator.ReleaseBatch(currentBatch)
 					currentBatch, err = bufferedGroup.dequeue(ctx)
 					if err != nil {
-						execerror.VectorizedInternalPanic(err)
+						colexecerror.InternalError(err)
 					}
 					o.builderState.rBufferedGroupBatch = currentBatch
 					batchLength = currentBatch.Length()
@@ -1161,7 +1406,7 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) buildRightBufferedGroup(
 				// We have fully processed all the batches from the buffered group, so
 				// we need to rewind it.
 				if err := bufferedGroup.rewind(); err != nil {
-					execerror.VectorizedInternalPanic(err)
+					colexecerror.InternalError(err)
 				}
 				o.builderState.rBufferedGroupBatch = nil
 			}
@@ -1199,25 +1444,50 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) probe(ctx context.Context) {
 // setBuilderSourceToBufferedGroup sets up the builder state to use the
 // buffered group.
 func (o *mergeJoin_JOIN_TYPE_STRINGOp) setBuilderSourceToBufferedGroup(ctx context.Context) {
-	// {{ if _JOIN_TYPE.IsLeftAnti }}
+	// {{if and (_JOIN_TYPE.IsLeftAnti) (not _JOIN_TYPE.IsSetOp)}}
 	// All tuples in the buffered group have matches, so they are not output in
 	// case of LEFT ANTI join.
 	o.builderState.lGroups = o.builderState.lGroups[:0]
-	// {{ else }}
+	// {{else}}
 	lGroupEndIdx := o.proberState.lBufferedGroup.numTuples
+	rGroupEndIdx := o.proberState.rBufferedGroup.numTuples
 	// The capacity of builder state lGroups and rGroups is always at least 1
 	// given the init.
 	o.builderState.lGroups = o.builderState.lGroups[:1]
 	o.builderState.rGroups = o.builderState.rGroups[:1]
-	// {{ if _JOIN_TYPE.IsLeftSemi }}
+	// {{if _JOIN_TYPE.IsLeftAnti}}
+	// For EXCEPT ALL join we add (lGroupEndIdx - rGroupEndIdx) number
+	// (if positive) of unmatched rows.
+	if lGroupEndIdx > rGroupEndIdx {
+		o.builderState.lGroups[0] = group{
+			rowStartIdx: 0,
+			rowEndIdx:   lGroupEndIdx - rGroupEndIdx,
+			numRepeats:  1,
+			toBuild:     lGroupEndIdx - rGroupEndIdx,
+			unmatched:   true,
+		}
+	} else {
+		o.builderState.lGroups = o.builderState.lGroups[:0]
+	}
+	// {{else if _JOIN_TYPE.IsLeftSemi}}
+	numMatched := lGroupEndIdx
+	// {{if _JOIN_TYPE.IsSetOp}}
+	// For INTERSECT ALL join we add a left group to build of length
+	// min(lGroupEndIdx, rGroupEndIdx).
+	if rGroupEndIdx < lGroupEndIdx {
+		numMatched = rGroupEndIdx
+	}
+	// {{else}}
+	// Remove unused warning.
+	_ = rGroupEndIdx
+	// {{end}}
 	o.builderState.lGroups[0] = group{
 		rowStartIdx: 0,
-		rowEndIdx:   lGroupEndIdx,
+		rowEndIdx:   numMatched,
 		numRepeats:  1,
-		toBuild:     lGroupEndIdx,
+		toBuild:     numMatched,
 	}
-	// {{ else }}
-	rGroupEndIdx := o.proberState.rBufferedGroup.numTuples
+	// {{else}}
 	o.builderState.lGroups[0] = group{
 		rowStartIdx: 0,
 		rowEndIdx:   lGroupEndIdx,
@@ -1230,8 +1500,8 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) setBuilderSourceToBufferedGroup(ctx conte
 		numRepeats:  lGroupEndIdx,
 		toBuild:     rGroupEndIdx * lGroupEndIdx,
 	}
-	// {{ end }}
-	// {{ end }}
+	// {{end}}
+	// {{end}}
 
 	o.builderState.buildFrom = mjBuildFromBufferedGroup
 
@@ -1246,13 +1516,14 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) setBuilderSourceToBufferedGroup(ctx conte
 // the left source. It should only be called when the right source has been
 // exhausted.
 func (o *mergeJoin_JOIN_TYPE_STRINGOp) exhaustLeftSource(ctx context.Context) {
-	// {{ if or _JOIN_TYPE.IsInner _JOIN_TYPE.IsLeftSemi }}
+	// {{if or _JOIN_TYPE.IsInner _JOIN_TYPE.IsLeftSemi}}
 	// {{/*
 	// Remaining tuples from the left source do not have a match, so they are
-	// ignored in INNER JOIN and LEFT SEMI JOIN.
+	// ignored in INNER, LEFT SEMI, and INTERSECT ALL joins (the latter has
+	// IsLeftSemi == true).
 	// */}}
-	// {{ end }}
-	// {{ if or _JOIN_TYPE.IsLeftOuter _JOIN_TYPE.IsLeftAnti }}
+	// {{end}}
+	// {{if or _JOIN_TYPE.IsLeftOuter _JOIN_TYPE.IsLeftAnti}}
 	// The capacity of builder state lGroups and rGroups is always at least 1
 	// given the init.
 	o.builderState.lGroups = o.builderState.lGroups[:1]
@@ -1263,7 +1534,7 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) exhaustLeftSource(ctx context.Context) {
 		toBuild:     o.proberState.lLength - o.proberState.lIdx,
 		unmatched:   true,
 	}
-	// {{ if _JOIN_TYPE.IsLeftOuter }}
+	// {{if _JOIN_TYPE.IsLeftOuter}}
 	o.builderState.rGroups = o.builderState.rGroups[:1]
 	o.builderState.rGroups[0] = group{
 		rowStartIdx: o.proberState.lIdx,
@@ -1272,35 +1543,23 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) exhaustLeftSource(ctx context.Context) {
 		toBuild:     o.proberState.lLength - o.proberState.lIdx,
 		nullGroup:   true,
 	}
-	// {{ end }}
+	// {{end}}
 
 	o.proberState.lIdx = o.proberState.lLength
-	// {{ end }}
-	// {{ if _JOIN_TYPE.IsRightOuter }}
+	// {{end}}
+	// {{if _JOIN_TYPE.IsRightOuter}}
 	// {{/*
 	// Remaining tuples from the left source do not have a match, so they are
-	// ignored in RIGHT OUTER JOIN.
+	// ignored in RIGHT OUTER join.
 	// */}}
-	// {{ end }}
+	// {{end}}
 }
 
 // exhaustRightSource sets up the builder to process any remaining tuples from
 // the right source. It should only be called when the left source has been
 // exhausted.
 func (o *mergeJoin_JOIN_TYPE_STRINGOp) exhaustRightSource() {
-	// {{ if or _JOIN_TYPE.IsInner _JOIN_TYPE.IsLeftSemi }}
-	// {{/*
-	// Remaining tuples from the right source do not have a match, so they are
-	// ignored in INNER JOIN and LEFT SEMI JOIN.
-	// */}}
-	// {{ end }}
-	// {{ if _JOIN_TYPE.IsLeftOuter }}
-	// {{/*
-	// Remaining tuples from the right source do not have a match, so they are
-	// ignored in LEFT OUTER JOIN.
-	// */}}
-	// {{ end }}
-	// {{ if _JOIN_TYPE.IsRightOuter }}
+	// {{if _JOIN_TYPE.IsRightOuter}}
 	// The capacity of builder state lGroups and rGroups is always at least 1
 	// given the init.
 	o.builderState.lGroups = o.builderState.lGroups[:1]
@@ -1321,7 +1580,10 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) exhaustRightSource() {
 	}
 
 	o.proberState.rIdx = o.proberState.rLength
-	// {{ end }}
+	// {{else}}
+	// Remaining tuples from the right source do not have a match, so they are
+	// ignored in all joins except for RIGHT OUTER and FULL OUTER.
+	// {{end}}
 }
 
 // calculateOutputCount uses the toBuild field of each group and the output
@@ -1332,13 +1594,14 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) calculateOutputCount(groups []group) int 
 	count := o.builderState.outCount
 
 	for i := 0; i < len(groups); i++ {
-		// {{ if _JOIN_TYPE.IsLeftAnti }}
+		// {{if _JOIN_TYPE.IsLeftAnti}}
 		if !groups[i].unmatched {
-			// "Matched" groups are not outputted in LEFT ANTI JOIN, so they do not
+			// "Matched" groups are not outputted in LEFT ANTI and EXCEPT ALL
+			// joins (for the latter IsLeftAnti == true), so they do not
 			// contribute to the output count.
 			continue
 		}
-		// {{ end }}
+		// {{end}}
 		count += groups[i].toBuild
 		groups[i].toBuild = 0
 		if count > o.outputBatchSize {
@@ -1363,17 +1626,17 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) build(ctx context.Context) {
 		switch o.builderState.buildFrom {
 		case mjBuildFromBatch:
 			o.buildLeftGroupsFromBatch(o.builderState.lGroups, &o.left, o.proberState.lBatch, outStartIdx)
-			// {{ if not (or _JOIN_TYPE.IsLeftSemi _JOIN_TYPE.IsLeftAnti) }}
+			// {{if not (or _JOIN_TYPE.IsLeftSemi _JOIN_TYPE.IsLeftAnti)}}
 			o.buildRightGroupsFromBatch(o.builderState.rGroups, len(o.left.sourceTypes), &o.right, o.proberState.rBatch, outStartIdx)
-		// {{ end }}
+		// {{end}}
 		case mjBuildFromBufferedGroup:
 			o.buildLeftBufferedGroup(ctx, o.builderState.lGroups[0], &o.left, o.proberState.lBufferedGroup, outStartIdx)
-			// {{ if not (or _JOIN_TYPE.IsLeftSemi _JOIN_TYPE.IsLeftAnti) }}
+			// {{if not (or _JOIN_TYPE.IsLeftSemi _JOIN_TYPE.IsLeftAnti)}}
 			o.buildRightBufferedGroup(ctx, o.builderState.rGroups[0], len(o.left.sourceTypes), &o.right, o.proberState.rBufferedGroup, outStartIdx)
-		// {{ end }}
+		// {{end}}
 
 		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unsupported mjBuildFrom %d", o.builderState.buildFrom))
+			colexecerror.InternalError(fmt.Sprintf("unsupported mjBuildFrom %d", o.builderState.buildFrom))
 		}
 	}
 }
@@ -1386,17 +1649,17 @@ func _SOURCE_FINISHED_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 	// {{define "sourceFinishedSwitch"}}
 	o.outputReady = true
 	o.builderState.buildFrom = mjBuildFromBatch
-	// {{ if or $.JoinType.IsInner $.JoinType.IsLeftSemi }}
+	// {{if or $.JoinType.IsInner $.JoinType.IsLeftSemi}}
 	o.setBuilderSourceToBufferedGroup(ctx)
-	// {{ else }}
+	// {{else}}
 	// Next, we need to make sure that builder state is set up for a case when
 	// neither exhaustLeftSource nor exhaustRightSource is called below. In such
 	// scenario the merge joiner is done, so it'll be outputting zero-length
 	// batches from now on.
 	o.builderState.lGroups = o.builderState.lGroups[:0]
 	o.builderState.rGroups = o.builderState.rGroups[:0]
-	// {{ end }}
-	// {{ if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti }}
+	// {{end}}
+	// {{if or $.JoinType.IsLeftOuter $.JoinType.IsLeftAnti}}
 	// At least one of the sources is finished. If it was the right one,
 	// then we need to emit remaining tuples from the left source with
 	// nulls corresponding to the right one. But if the left source is
@@ -1408,8 +1671,8 @@ func _SOURCE_FINISHED_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 		// desired output batch size, the output will be returned.
 		o.outputReady = false
 	}
-	// {{ end }}
-	// {{ if $.JoinType.IsRightOuter }}
+	// {{end}}
+	// {{if $.JoinType.IsRightOuter}}
 	// At least one of the sources is finished. If it was the left one,
 	// then we need to emit remaining tuples from the right source with
 	// nulls corresponding to the left one. But if the right source is
@@ -1421,7 +1684,7 @@ func _SOURCE_FINISHED_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 		// desired output batch size, the output will be returned.
 		o.outputReady = false
 	}
-	// {{ end }}
+	// {{end}}
 	// {{end}}
 	// {{/*
 }
@@ -1429,6 +1692,8 @@ func _SOURCE_FINISHED_SWITCH(_JOIN_TYPE joinTypeInfo) { // */}}
 // */}}
 
 func (o *mergeJoin_JOIN_TYPE_STRINGOp) Next(ctx context.Context) coldata.Batch {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.output.ResetInternalBatch()
 	for {
 		switch o.state {
@@ -1479,15 +1744,19 @@ func (o *mergeJoin_JOIN_TYPE_STRINGOp) Next(ctx context.Context) coldata.Batch {
 				return o.output
 			}
 		case mjDone:
-			if err := o.proberState.lBufferedGroup.close(ctx); err != nil {
-				execerror.VectorizedInternalPanic(err)
+			// Note that resetting of buffered groups will close disk queues
+			// (if there are any).
+			if o.proberState.lBufferedGroupNeedToReset {
+				o.proberState.lBufferedGroup.reset(ctx)
+				o.proberState.lBufferedGroupNeedToReset = false
 			}
-			if err := o.proberState.rBufferedGroup.close(ctx); err != nil {
-				execerror.VectorizedInternalPanic(err)
+			if o.proberState.rBufferedGroupNeedToReset {
+				o.proberState.rBufferedGroup.reset(ctx)
+				o.proberState.rBufferedGroupNeedToReset = false
 			}
 			return coldata.ZeroBatch
 		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected merge joiner state in Next: %v", o.state))
+			colexecerror.InternalError(fmt.Sprintf("unexpected merge joiner state in Next: %v", o.state))
 		}
 	}
 }

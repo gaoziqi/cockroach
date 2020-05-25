@@ -15,12 +15,14 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
@@ -32,14 +34,15 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+	codec := keys.SystemSQLCodec
 
 	// IDs to map (parentID, name) to. Actual ID value is irrelevant to the test.
 	idCounter := keys.MinNonPredefinedUserDescID
 
 	// Database name.
-	dKey := sqlbase.NewDeprecatedDatabaseKey("test").Key()
+	dKey := sqlbase.NewDeprecatedDatabaseKey("test").Key(codec)
 	if gr, err := kvDB.Get(ctx, dKey); err != nil {
 		t.Fatal(err)
 	} else if gr.Exists() {
@@ -79,6 +82,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	if _, err := sqlDB.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)
 	}
+	idCounter++
 
 	// Ensure the new entry is added to the new namespace table.
 	if gr, err := kvDB.Get(ctx, dKey); err != nil {
@@ -86,7 +90,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	} else if gr.Exists() {
 		t.Fatal("database key unexpectedly found in the deprecated system.namespace")
 	}
-	newDKey := sqlbase.NewDatabaseKey("test").Key()
+	newDKey := sqlbase.NewDatabaseKey("test").Key(codec)
 	if gr, err := kvDB.Get(ctx, newDKey); err != nil {
 		t.Fatal(err)
 	} else if !gr.Exists() {
@@ -94,7 +98,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	}
 
 	txn := kvDB.NewTxn(ctx, "lookup-test-db-id")
-	found, dbID, err := sqlbase.LookupDatabaseID(ctx, txn, "test")
+	found, dbID, err := sqlbase.LookupDatabaseID(ctx, txn, codec, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,8 +107,40 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	}
 
 	// Simulate the same test for a table and sequence.
-	tKey := sqlbase.NewDeprecatedTableKey(dbID, "rel").Key()
+	tKey := sqlbase.NewDeprecatedTableKey(dbID, "rel").Key(codec)
 	if err := kvDB.CPut(ctx, tKey, idCounter, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// TODO (rohany): This is pretty hacky, but needs to be done in order
+	//  for the exact errors to show up below.
+	// The tests below ensure that namespace collisions are detected against
+	// the deprecated namespace key entry for (dbID, "rel"). Just writing
+	// the key in the namespace table worked until the create table functions
+	// perform a lookup into system.descriptor to see what kind of object they
+	// collided with, now that user defined types are present. To make sure
+	// everything is working as expected, we need to bump the ID generator
+	// counter to be in line with idCounter, and write a dummy table descriptor
+	// into system.descriptor so that conflicts against this fake entry are
+	// correctly detected.
+	if _, err := kvDB.Inc(ctx, codec.DescIDSequenceKey(), 1); err != nil {
+		t.Fatal(err)
+	}
+	mKey := sqlbase.MakeDescMetadataKey(codec, sqlbase.ID(idCounter))
+	// Fill the dummy descriptor with garbage.
+	desc := sql.InitTableDescriptor(
+		sqlbase.ID(idCounter),
+		dbID,
+		keys.PublicSchemaID,
+		"rel",
+		hlc.Timestamp{},
+		&sqlbase.PrivilegeDescriptor{},
+		false,
+	)
+	if err := desc.AllocateIDs(); err != nil {
+		t.Fatal(err)
+	}
+	if err := kvDB.Put(ctx, mKey, sqlbase.WrapDescriptor(&desc)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -160,7 +196,7 @@ func TestNamespaceTableSemantics(t *testing.T) {
 	} else if gr.Exists() {
 		t.Fatal("table key unexpectedly found in the deprecated system.namespace")
 	}
-	newTKey := sqlbase.NewPublicTableKey(dbID, "rel").Key()
+	newTKey := sqlbase.NewPublicTableKey(dbID, "rel").Key(codec)
 	if gr, err := kvDB.Get(ctx, newTKey); err != nil {
 		t.Fatal(err)
 	} else if !gr.Exists() {

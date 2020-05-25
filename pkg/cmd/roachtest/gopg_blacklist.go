@@ -13,6 +13,7 @@ package main
 var gopgBlacklists = blacklistsForVersion{
 	{"v19.2", "gopgBlackList19_2", gopgBlackList19_2, "gopgIgnoreList19_2", gopgIgnoreList19_2},
 	{"v20.1", "gopgBlackList20_1", gopgBlackList20_1, "gopgIgnoreList20_1", gopgIgnoreList20_1},
+	{"v20.2", "gopgBlackList20_2", gopgBlackList20_2, "gopgIgnoreList20_2", gopgIgnoreList20_2},
 }
 
 // These are lists of known gopg test errors and failures.
@@ -23,6 +24,8 @@ var gopgBlacklists = blacklistsForVersion{
 // Please keep these lists alphabetized for easy diffing.
 // After a failed run, an updated version of this blacklist should be available
 // in the test log.
+
+var gopgBlackList20_2 = gopgBlackList20_1
 
 var gopgBlackList20_1 = blacklist{
 	"pg | CopyFrom/CopyTo | copies corrupted data to a table":         "41608",
@@ -90,6 +93,8 @@ var gopgBlackList19_2 = blacklist{
 	"v9.TestUnixSocket": "31113",
 }
 
+var gopgIgnoreList20_2 = gopgIgnoreList20_1
+
 var gopgIgnoreList20_1 = gopgIgnoreList19_2
 
 var gopgIgnoreList19_2 = blacklist{
@@ -101,8 +106,9 @@ var gopgIgnoreList19_2 = blacklist{
 	"pg | ORM struct model | fetches Author relations":    "41690",
 	"pg | ORM struct model | fetches Book relations":      "41690",
 	"pg | ORM struct model | fetches Genre relations":     "41690",
-	// This test assumes different transaction isolation level (READ COMMITTED).
-	"pg | Tx | supports CopyFrom and CopyIn": "41690",
+	// These tests assume different transaction isolation level (READ COMMITTED).
+	"pg | Tx | supports CopyFrom and CopyIn":             "41690",
+	"pg | Tx | supports CopyFrom and CopyIn with errors": "41690",
 	// These tests sometimes failed and we haven't diagnosed it
 	"pg | DB race | SelectOrInsert with OnConflict is race free":    "unknown",
 	"pg | DB race | SelectOrInsert without OnConflict is race free": "unknown",

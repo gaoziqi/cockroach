@@ -26,8 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
-	"github.com/pkg/errors"
 )
 
 // DefaultStorageEngine represents the default storage engine to use.
@@ -364,10 +364,23 @@ type Engine interface {
 	// this engine. Batched engines accumulate all mutations and apply
 	// them atomically on a call to Commit().
 	NewBatch() Batch
-	// NewReadOnly returns a new instance of a ReadWriter that wraps
-	// this engine. This wrapper panics when unexpected operations (e.g., write
+	// NewReadOnly returns a new instance of a ReadWriter that wraps this
+	// engine. This wrapper panics when unexpected operations (e.g., write
 	// operations) are executed on it and caches iterators to avoid the overhead
 	// of creating multiple iterators for batched reads.
+	//
+	// All iterators created from a read-only engine with the same "Prefix"
+	// option are guaranteed to provide a consistent snapshot of the underlying
+	// engine. For instance, two prefix iterators created from a read-only
+	// engine will provide a consistent snapshot. Similarly, two non-prefix
+	// iterators created from a read-only engine will provide a consistent
+	// snapshot. However, a prefix iterator and a non-prefix iterator created
+	// from a read-only engine are not guaranteed to provide a consistent view
+	// of the underlying engine.
+	//
+	// TODO(nvanbenschoten): remove this complexity when we're fully on Pebble
+	// and can guarantee that all iterators created from a read-only engine are
+	// consistent. To do this, we will want to add an Iterator.Clone method.
 	NewReadOnly() ReadWriter
 	// NewWriteOnlyBatch returns a new instance of a batched engine which wraps
 	// this engine. A write-only batch accumulates all mutations and applies them
@@ -462,7 +475,8 @@ type Batch interface {
 	Repr() []byte
 }
 
-// Stats is a set of RocksDB stats. These are all described in RocksDB
+// Stats is a set of Engine stats. Most are described in RocksDB.
+// Some stats (eg, `IngestedBytes`) are only exposed by Pebble.
 //
 // Currently, we collect stats from the following sources:
 // 1. RocksDB's internal "tickers" (i.e. counters). They're defined in
@@ -481,7 +495,11 @@ type Stats struct {
 	BloomFilterPrefixUseful        int64
 	MemtableTotalSize              int64
 	Flushes                        int64
+	FlushedBytes                   int64
 	Compactions                    int64
+	IngestedBytes                  int64 // Pebble only
+	CompactedBytesRead             int64
+	CompactedBytesWritten          int64
 	TableReadersMemEstimate        int64
 	PendingCompactionBytesEstimate int64
 	L0FileCount                    int64
@@ -546,7 +564,7 @@ func NewEngine(
 		}
 
 		return NewTee(ctx, rocksDB, pebbleDB), nil
-	case enginepb.EngineTypePebble:
+	case enginepb.EngineTypeDefault, enginepb.EngineTypePebble:
 		pebbleConfig := PebbleConfig{
 			StorageConfig: storageConfig,
 			Opts:          DefaultPebbleOptions(),
@@ -555,7 +573,7 @@ func NewEngine(
 		defer pebbleConfig.Opts.Cache.Unref()
 
 		return NewPebble(context.Background(), pebbleConfig)
-	case enginepb.EngineTypeDefault, enginepb.EngineTypeRocksDB:
+	case enginepb.EngineTypeRocksDB:
 		cache := NewRocksDBCache(cacheSize)
 		defer cache.Release()
 

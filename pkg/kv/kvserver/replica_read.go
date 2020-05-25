@@ -16,13 +16,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/kr/pretty"
 )
@@ -32,30 +31,13 @@ import (
 // iterator to evaluate the batch and then updates the timestamp cache to
 // reflect the key spans that it read.
 func (r *Replica) executeReadOnlyBatch(
-	ctx context.Context, ba *roachpb.BatchRequest, g *concurrency.Guard,
+	ctx context.Context, ba *roachpb.BatchRequest, st kvserverpb.LeaseStatus, g *concurrency.Guard,
 ) (br *roachpb.BatchResponse, _ *concurrency.Guard, pErr *roachpb.Error) {
-	// If the read is not inconsistent, the read requires the range lease or
-	// permission to serve via follower reads.
-	var status storagepb.LeaseStatus
-	var now hlc.Timestamp
-	if ba.ReadConsistency.RequiresReadLease() {
-		if status, now, pErr = r.redirectOnOrAcquireLease(ctx); pErr != nil {
-			if nErr := r.canServeFollowerRead(ctx, ba, pErr); nErr != nil {
-				return nil, g, nErr
-			}
-			r.store.metrics.FollowerReadsCount.Inc(1)
-		}
-	} else {
-		now = r.Clock().Now() // get a clock reading for checkExecutionCanProceed
-	}
-	r.limitTxnMaxTimestamp(ctx, ba, status)
-
-	log.Event(ctx, "waiting for read lock")
 	r.readOnlyCmdMu.RLock()
 	defer r.readOnlyCmdMu.RUnlock()
 
 	// Verify that the batch can be executed.
-	if err := r.checkExecutionCanProceed(ba, g, now, &status); err != nil {
+	if err := r.checkExecutionCanProceed(ba, g, &st); err != nil {
 		return nil, g, roachpb.NewError(err)
 	}
 
@@ -82,73 +64,29 @@ func (r *Replica) executeReadOnlyBatch(
 
 	var result result.Result
 	br, result, pErr = r.executeReadOnlyBatchWithServersideRefreshes(ctx, rw, rec, ba, spans)
-	if err := r.handleReadOnlyLocalEvalResult(ctx, ba, result.Local); err != nil {
-		pErr = roachpb.NewError(err)
-	}
-	r.updateTimestampCache(ctx, ba, br, pErr)
 
-	if pErr != nil {
-		log.VErrEvent(ctx, 3, pErr.String())
-	} else {
-		log.Event(ctx, "read completed")
-	}
-	return br, g, pErr
-}
-
-// executeReadOnlyBatchWithServersideRefreshes invokes evaluateBatch and retries
-// at a higher timestamp in the event of some retriable errors if allowed by the
-// batch/txn.
-func (r *Replica) executeReadOnlyBatchWithServersideRefreshes(
-	ctx context.Context,
-	rw storage.ReadWriter,
-	rec batcheval.EvalContext,
-	ba *roachpb.BatchRequest,
-	spans *spanset.SpanSet,
-) (br *roachpb.BatchResponse, res result.Result, pErr *roachpb.Error) {
-	for retries := 0; ; retries++ {
-		if retries > 0 {
-			log.VEventf(ctx, 2, "server-side retry of batch")
-		}
-		br, res, pErr = evaluateBatch(ctx, storagebase.CmdIDKey(""), rw, rec, nil, ba, true /* readOnly */)
-
-		// If we can retry, set a higher batch timestamp and continue.
-		// Allow one retry only.
-		if pErr == nil || retries > 0 || !canDoServersideRetry(ctx, pErr, ba, br, spans, nil /* deadline */) {
-			break
-		}
-	}
-	return br, res, pErr
-}
-
-func (r *Replica) handleReadOnlyLocalEvalResult(
-	ctx context.Context, ba *roachpb.BatchRequest, lResult result.LocalResult,
-) error {
-	// Fields for which no action is taken in this method are zeroed so that
-	// they don't trigger an assertion at the end of the method (which checks
-	// that all fields were handled).
-	{
-		lResult.Reply = nil
+	// If the request hit a server-side concurrency retry error, immediately
+	// proagate the error. Don't assume ownership of the concurrency guard.
+	if isConcurrencyRetryError(pErr) {
+		return nil, g, pErr
 	}
 
-	if lResult.MaybeWatchForMerge {
-		// A merge is (likely) about to be carried out, and this replica needs
-		// to block all traffic until the merge either commits or aborts. See
-		// docs/tech-notes/range-merges.md.
-		if err := r.maybeWatchForMerge(ctx); err != nil {
-			return err
-		}
-		lResult.MaybeWatchForMerge = false
+	// Handle any local (leaseholder-only) side-effects of the request.
+	intents := result.Local.DetachEncounteredIntents()
+	if pErr == nil {
+		pErr = r.handleReadOnlyLocalEvalResult(ctx, ba, result.Local)
 	}
 
-	if lResult.AcquiredLocks != nil {
-		// These will all be unreplicated locks.
-		for i := range lResult.AcquiredLocks {
-			r.concMgr.OnLockAcquired(ctx, &lResult.AcquiredLocks[i])
-		}
-		lResult.AcquiredLocks = nil
-	}
+	// Otherwise, update the timestamp cache and release the concurrency guard.
+	ec, g := endCmds{repl: r, g: g}, nil
+	ec.done(ctx, ba, br, pErr)
 
-	if intents := lResult.DetachEncounteredIntents(); len(intents) > 0 {
+	// Semi-synchronously process any intents that need resolving here in
+	// order to apply back pressure on the client which generated them. The
+	// resolution is semi-synchronous in that there is a limited number of
+	// outstanding asynchronous resolution tasks allowed after which
+	// further calls will block.
+	if len(intents) > 0 {
 		log.Eventf(ctx, "submitting %d intents to asynchronous processing", len(intents))
 		// We only allow synchronous intent resolution for consistent requests.
 		// Intent resolution is async/best-effort for inconsistent requests.
@@ -160,8 +98,81 @@ func (r *Replica) handleReadOnlyLocalEvalResult(
 		// prohibits any concurrent requests for the same range. See #17760.
 		allowSyncProcessing := ba.ReadConsistency == roachpb.CONSISTENT
 		if err := r.store.intentResolver.CleanupIntentsAsync(ctx, intents, allowSyncProcessing); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
+	}
+
+	if pErr != nil {
+		log.VErrEventf(ctx, 3, "%v", pErr.String())
+	} else {
+		log.Event(ctx, "read completed")
+	}
+	return br, nil, pErr
+}
+
+// executeReadOnlyBatchWithServersideRefreshes invokes evaluateBatch and retries
+// at a higher timestamp in the event of some retriable errors if allowed by the
+// batch/txn.
+func (r *Replica) executeReadOnlyBatchWithServersideRefreshes(
+	ctx context.Context,
+	rw storage.ReadWriter,
+	rec batcheval.EvalContext,
+	ba *roachpb.BatchRequest,
+	latchSpans *spanset.SpanSet,
+) (br *roachpb.BatchResponse, res result.Result, pErr *roachpb.Error) {
+	log.Event(ctx, "executing read-only batch")
+
+	for retries := 0; ; retries++ {
+		if retries > 0 {
+			log.VEventf(ctx, 2, "server-side retry of batch")
+		}
+		br, res, pErr = evaluateBatch(ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, ba, true /* readOnly */)
+
+		// If we can retry, set a higher batch timestamp and continue.
+		// Allow one retry only.
+		if pErr == nil || retries > 0 || !canDoServersideRetry(ctx, pErr, ba, br, latchSpans, nil /* deadline */) {
+			break
+		}
+	}
+
+	if pErr != nil {
+		// Failed read-only batches can't have any Result except for what's
+		// whitelisted here.
+		res.Local = result.LocalResult{
+			EncounteredIntents: res.Local.DetachEncounteredIntents(),
+			Metrics:            res.Local.Metrics,
+		}
+		return nil, res, pErr
+	}
+	return br, res, nil
+}
+
+func (r *Replica) handleReadOnlyLocalEvalResult(
+	ctx context.Context, ba *roachpb.BatchRequest, lResult result.LocalResult,
+) *roachpb.Error {
+	// Fields for which no action is taken in this method are zeroed so that
+	// they don't trigger an assertion at the end of the method (which checks
+	// that all fields were handled).
+	{
+		lResult.Reply = nil
+	}
+
+	if lResult.AcquiredLocks != nil {
+		// These will all be unreplicated locks.
+		for i := range lResult.AcquiredLocks {
+			r.concMgr.OnLockAcquired(ctx, &lResult.AcquiredLocks[i])
+		}
+		lResult.AcquiredLocks = nil
+	}
+
+	if lResult.MaybeWatchForMerge {
+		// A merge is (likely) about to be carried out, and this replica needs
+		// to block all traffic until the merge either commits or aborts. See
+		// docs/tech-notes/range-merges.md.
+		if err := r.maybeWatchForMerge(ctx); err != nil {
+			return roachpb.NewError(err)
+		}
+		lResult.MaybeWatchForMerge = false
 	}
 
 	if !lResult.IsZero() {

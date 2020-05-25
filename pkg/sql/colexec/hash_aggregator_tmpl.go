@@ -25,13 +25,16 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
+
+// Remove unused warning.
+var _ = execgen.UNSAFEGET
 
 // {{/*
 
@@ -44,15 +47,71 @@ var _ bytes.Buffer
 var _ tree.Operator
 
 // Dummy import to pull in "math" package.
-var _ int = math.MaxInt16
+var _ = math.MaxInt16
+
+// Dummy import to pull in "coldataext" package.
+var _ coldataext.Datum
+
+// Dummy import to pull in "typeconv" package.
+var _ = typeconv.DatumVecCanonicalTypeFamily
+
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
 
 // _ASSIGN_NE is the template function for assigning the result of comparing
 // the second input to the third input into the first input.
-func _ASSIGN_NE(_, _, _ interface{}) int {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN_NE(_, _, _, _, _, _ interface{}) int {
+	colexecerror.InternalError("")
 }
 
 // */}}
+
+// {{/*
+func _POPULATE_SELS(b coldata.Batch, hashBuffer []uint64, _BATCH_HAS_SELECTION bool) { // */}}
+	// {{define "populateSels" -}}
+	for selIdx, hashCode := range hashBuffer {
+		selsSlot := -1
+		for slot, hash := range op.scratch.hashCodeForSelsSlot {
+			if hash == hashCode {
+				// We have already seen a tuple with the same hashCode
+				// previously, so we will append into the same sels slot.
+				selsSlot = slot
+				break
+			}
+		}
+		if selsSlot < 0 {
+			// This is the first tuple in hashBuffer with this hashCode, so we
+			// will add this tuple to the next available sels slot.
+			selsSlot = len(op.scratch.hashCodeForSelsSlot)
+			op.scratch.hashCodeForSelsSlot = append(op.scratch.hashCodeForSelsSlot, hashCode)
+		}
+		// {{if .BatchHasSelection}}
+		op.scratch.sels[selsSlot] = append(op.scratch.sels[selsSlot], batchSelection[selIdx])
+		// {{else}}
+		op.scratch.sels[selsSlot] = append(op.scratch.sels[selsSlot], selIdx)
+		// {{end}}
+	}
+	// {{end}}
+	// {{/*
+} // */}}
+
+// populateSels populates intermediate selection vectors (stored in
+// op.scratch.sels) for each hash code present in b. hashBuffer must contain
+// the hash codes for all of the tuples in b.
+func (op *hashAggregator) populateSels(b coldata.Batch, hashBuffer []uint64) {
+	// Note: we don't need to reset any of the slices in op.scratch.sels since
+	// they all are of zero length here (see the comment for op.scratch.sels
+	// for context).
+	op.scratch.hashCodeForSelsSlot = op.scratch.hashCodeForSelsSlot[:0]
+	if batchSelection := b.Selection(); batchSelection != nil {
+		_POPULATE_SELS(b, hashBuffer, true)
+	} else {
+		_POPULATE_SELS(b, hashBuffer, false)
+	}
+}
 
 // {{/*
 func _MATCH_LOOP(
@@ -91,7 +150,7 @@ func _MATCH_LOOP(
 		rhsVal := execgen.UNSAFEGET(rhsCol, rowIdx)
 
 		var cmp bool
-		_ASSIGN_NE(cmp, lhsVal, rhsVal)
+		_ASSIGN_NE(cmp, lhsVal, rhsVal, _, lhsCol, rhsCol)
 		diff[selIdx] = diff[selIdx] || cmp
 	}
 
@@ -108,69 +167,83 @@ func _MATCH_LOOP(
 // This slice need to be allocated to be at at least as big as sel and set to
 // all false. diff will be reset to all false when match returns. This is to
 // avoid additional slice allocation.
+// - firstDefiniteMatch indicates whether we know that tuple with index sel[0]
+//   matches the key of the aggregation function and whether we can short
+//   circuit probing that tuple.
 // NOTE: the return vector will reuse the memory allocated for the selection
 //       vector.
 func (v hashAggFuncs) match(
 	sel []int,
 	b coldata.Batch,
 	keyCols []uint32,
-	keyTypes []coltypes.T,
+	keyTypes []*types.T,
+	keyCanonicalTypeFamilies []types.Family,
 	keyMapping coldata.Batch,
 	diff []bool,
+	firstDefiniteMatch bool,
 ) (bool, []int) {
 	// We want to directly write to the selection vector to avoid extra
 	// allocation.
 	b.SetSelection(true)
-	matched := b.Selection()
-	matched = matched[:0]
+	matched := b.Selection()[:0]
 
 	aggKeyIdx := v.keyIdx
 
-	for keyIdx, colIdx := range keyCols {
-		lhs := keyMapping.ColVec(keyIdx)
-		lhsHasNull := lhs.MaybeHasNulls()
+	if firstDefiniteMatch {
+		matched = append(matched, sel[0])
+		sel = sel[1:]
+		diff = diff[:len(diff)-1]
+	}
 
-		rhs := b.ColVec(int(colIdx))
-		rhsHasNull := rhs.MaybeHasNulls()
+	if len(sel) > 0 {
+		for keyIdx, colIdx := range keyCols {
+			lhs := keyMapping.ColVec(keyIdx)
+			lhsHasNull := lhs.MaybeHasNulls()
 
-		keyTyp := keyTypes[keyIdx]
+			rhs := b.ColVec(int(colIdx))
+			rhsHasNull := rhs.MaybeHasNulls()
 
-		switch keyTyp {
-		// {{range .}}
-		case _TYPES_T:
-			lhsCol := lhs._TemplateType()
-			rhsCol := rhs._TemplateType()
-			if lhsHasNull {
-				lhsNull := lhs.Nulls().NullAt(v.keyIdx)
-				if rhsHasNull {
-					_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, true, true)
-				} else {
-					_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, true, false)
+			switch keyCanonicalTypeFamilies[keyIdx] {
+			// {{range .}}
+			case _CANONICAL_TYPE_FAMILY:
+				switch keyTypes[keyIdx].Width() {
+				// {{range .WidthOverloads}}
+				case _TYPE_WIDTH:
+					lhsCol := lhs.TemplateType()
+					rhsCol := rhs.TemplateType()
+					if lhsHasNull {
+						lhsNull := lhs.Nulls().NullAt(v.keyIdx)
+						if rhsHasNull {
+							_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, true, true)
+						} else {
+							_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, true, false)
+						}
+					} else {
+						if rhsHasNull {
+							_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, false, true)
+						} else {
+							_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, false, false)
+						}
+					}
+					// {{end}}
 				}
-			} else {
-				if rhsHasNull {
-					_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, false, true)
-				} else {
-					_MATCH_LOOP(sel, lhs, rhs, aggKeyIdx, lhsNull, diff, false, false)
-				}
+				// {{end}}
+			default:
+				colexecerror.InternalError(fmt.Sprintf("unhandled type %s", keyTypes[keyIdx]))
 			}
-		// {{end}}
-		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %d", keyTyp))
 		}
 	}
 
 	remaining := sel[:0]
-	anyMatched := false
-
-	for selIdx, isDiff := range diff {
-		if isDiff {
-			remaining = append(remaining, sel[selIdx])
+	for selIdx, tupleIdx := range sel {
+		if diff[selIdx] {
+			remaining = append(remaining, tupleIdx)
 		} else {
-			matched = append(matched, sel[selIdx])
+			matched = append(matched, tupleIdx)
 		}
 	}
 
+	anyMatched := false
 	if len(matched) > 0 {
 		b.SetLength(len(matched))
 		anyMatched = true

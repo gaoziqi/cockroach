@@ -28,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -46,7 +46,7 @@ func TestCleanupSchemaObjects(t *testing.T) {
 
 	_, err = conn.ExecContext(ctx, `
 SET experimental_enable_temp_tables=true;
-SET experimental_serial_normalization='sql_sequence';
+SET serial_normalization='sql_sequence';
 CREATE TEMP TABLE a (a SERIAL, c INT);
 ALTER TABLE a ADD COLUMN b SERIAL;
 CREATE TEMP SEQUENCE a_sequence;
@@ -95,10 +95,12 @@ INSERT INTO perm_table VALUES (DEFAULT, 1);
 	require.NoError(
 		t,
 		kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			execCfg := s.ExecutorConfig().(ExecutorConfig)
 			err = cleanupSchemaObjects(
 				ctx,
-				s.ExecutorConfig().(ExecutorConfig).Settings,
+				execCfg.Settings,
 				txn,
+				execCfg.Codec,
 				s.InternalExecutor().(*InternalExecutor),
 				namesToID["defaultdb"],
 				schemaName,
@@ -161,7 +163,7 @@ func TestTemporaryObjectCleaner(t *testing.T) {
 			},
 		},
 	)
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	// Start and close two temporary schemas.
 	for _, dbID := range []int{0, 1} {
@@ -212,4 +214,57 @@ func TestTemporaryObjectCleaner(t *testing.T) {
 	sqlDB.QueryRow(t, "SELECT count(*) FROM t").Scan(&tRowCount)
 	require.Equal(t, 1, tRowCount)
 	require.NoError(t, db.Close())
+}
+
+// TestTemporarySchemaDropDatabase tests having a temporary schema on one session
+// whilst dropping a database on another session will have the database drop
+// succeed.
+func TestTemporarySchemaDropDatabase(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	numNodes := 3
+	tc := serverutils.StartTestCluster(
+		t,
+		numNodes,
+		base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				UseDatabase: "defaultdb",
+			},
+		},
+	)
+	defer tc.Stopper().Stop(context.Background())
+
+	// Create a database to drop that has a temporary table inside.
+	{
+		db := tc.ServerConn(0)
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE DATABASE drop_me`)
+		sqlDB.Exec(t, `USE drop_me`)
+		sqlDB.Exec(t, `SET experimental_enable_temp_tables=true`)
+		sqlDB.Exec(t, `CREATE TEMP TABLE t (x INT)`)
+	}
+
+	// On another session, only leave the schema behind.
+	{
+		db := tc.ServerConn(1)
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `USE drop_me`)
+		sqlDB.Exec(t, `SET experimental_enable_temp_tables=true`)
+		sqlDB.Exec(t, `CREATE TEMP TABLE t2 (x INT)`)
+		sqlDB.Exec(t, `DROP TABLE t2`)
+	}
+
+	// On another session, drop the database.
+	{
+		db := tc.ServerConn(2)
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `DROP DATABASE drop_me CASCADE`)
+
+		var tempObjectCount int
+		sqlDB.QueryRow(
+			t,
+			`SELECT count(1) FROM system.namespace WHERE name LIKE 'pg_temp%' OR name IN ('t', 't2')`,
+		).Scan(&tempObjectCount)
+		assert.Equal(t, 0, tempObjectCount)
+	}
 }

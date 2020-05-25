@@ -31,26 +31,14 @@ var FollowerReadsEnabled = settings.RegisterPublicBoolSetting(
 	true,
 )
 
-// canServeFollowerRead tests, when a range lease could not be
-// acquired, whether the read only batch can be served as a follower
-// read despite the error.
+// canServeFollowerRead tests, when a range lease could not be acquired, whether
+// the batch can be served as a follower read despite the error. Only
+// non-locking, read-only requests can be served as follower reads. The batch
+// must be composed exclusively only this kind of request to be accepted as a
+// follower read.
 func (r *Replica) canServeFollowerRead(
 	ctx context.Context, ba *roachpb.BatchRequest, pErr *roachpb.Error,
 ) *roachpb.Error {
-	// There's no known reason that a non-VOTER_FULL replica couldn't serve follower
-	// reads (or RangeFeed), but as of the time of writing, these are expected
-	// to be short-lived, so it's not worth working out the edge-cases. Revisit if
-	// we add long-lived learners or feel that incoming/outgoing voters also need
-	// to be able to serve follower reads.
-	repDesc, err := r.GetReplicaDescriptor()
-	if err != nil {
-		return roachpb.NewError(err)
-	}
-	if typ := repDesc.GetType(); typ != roachpb.VOTER_FULL {
-		log.Eventf(ctx, "%s replicas cannot serve follower reads", typ)
-		return pErr
-	}
-
 	canServeFollowerRead := false
 	if lErr, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); ok &&
 		lErr.LeaseHolder != nil && lErr.Lease.Type() == roachpb.LeaseEpoch &&
@@ -58,12 +46,27 @@ func (r *Replica) canServeFollowerRead(
 		(ba.Txn == nil || !ba.Txn.IsLocking()) && // followerreadsccl.txnCanPerformFollowerRead
 		FollowerReadsEnabled.Get(&r.store.cfg.Settings.SV) {
 
+		// There's no known reason that a non-VOTER_FULL replica couldn't serve follower
+		// reads (or RangeFeed), but as of the time of writing, these are expected
+		// to be short-lived, so it's not worth working out the edge-cases. Revisit if
+		// we add long-lived learners or feel that incoming/outgoing voters also need
+		// to be able to serve follower reads.
+		repDesc, err := r.GetReplicaDescriptor()
+		if err != nil {
+			return roachpb.NewError(err)
+		}
+		if typ := repDesc.GetType(); typ != roachpb.VOTER_FULL {
+			log.Eventf(ctx, "%s replicas cannot serve follower reads", typ)
+			return pErr
+		}
+
 		ts := ba.Timestamp
 		if ba.Txn != nil {
 			ts.Forward(ba.Txn.MaxTimestamp)
 		}
 
-		canServeFollowerRead = ts.LessEq(r.maxClosed(ctx))
+		maxClosed, _ := r.maxClosed(ctx)
+		canServeFollowerRead = ts.LessEq(maxClosed)
 		if !canServeFollowerRead {
 			// We can't actually serve the read based on the closed timestamp.
 			// Signal the clients that we want an update so that future requests can succeed.
@@ -91,6 +94,7 @@ func (r *Replica) canServeFollowerRead(
 	// TODO(tschottdorf): once a read for a timestamp T has been served, the replica may
 	// serve reads for that and smaller timestamps forever.
 	log.Event(ctx, "serving via follower read")
+	r.store.metrics.FollowerReadsCount.Inc(1)
 	return nil
 }
 
@@ -101,15 +105,22 @@ func (r *Replica) canServeFollowerRead(
 // start time of the current lease because leasePostApply bumps the timestamp
 // cache forward to at least the new lease start time. Using this combination
 // allows the closed timestamp mechanism to be robust to lease transfers.
-func (r *Replica) maxClosed(ctx context.Context) hlc.Timestamp {
+// If the ok return value is false, the Replica is a member of a range which
+// uses an expiration-based lease. Expiration-based leases do not support the
+// closed timestamp subsystem. A zero-value timestamp will be returned if ok
+// is false.
+func (r *Replica) maxClosed(ctx context.Context) (_ hlc.Timestamp, ok bool) {
 	r.mu.RLock()
 	lai := r.mu.state.LeaseAppliedIndex
 	lease := *r.mu.state.Lease
 	initialMaxClosed := r.mu.initialMaxClosed
 	r.mu.RUnlock()
+	if lease.Expiration != nil {
+		return hlc.Timestamp{}, false
+	}
 	maxClosed := r.store.cfg.ClosedTimestamp.Provider.MaxClosed(
 		lease.Replica.NodeID, r.RangeID, ctpb.Epoch(lease.Epoch), ctpb.LAI(lai))
 	maxClosed.Forward(lease.Start)
 	maxClosed.Forward(initialMaxClosed)
-	return maxClosed
+	return maxClosed, true
 }

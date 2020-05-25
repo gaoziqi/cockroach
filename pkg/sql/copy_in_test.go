@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/lib/pq"
 )
 
@@ -38,7 +39,7 @@ func TestCopyNullInfNaN(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -57,7 +58,9 @@ func TestCopyNullInfNaN(t *testing.T) {
 			e DECIMAL NULL,
 			u UUID NULL,
 			ip INET NULL,
-			tz TIMESTAMPTZ NULL
+			tz TIMESTAMPTZ NULL,
+			geography GEOGRAPHY NULL,
+			geometry GEOMETRY NULL
 		);
 	`); err != nil {
 		t.Fatal(err)
@@ -70,16 +73,16 @@ func TestCopyNullInfNaN(t *testing.T) {
 
 	stmt, err := txn.Prepare(pq.CopyIn(
 		"t", "i", "f", "s", "b", "d", "t", "ttz",
-		"ts", "n", "o", "e", "u", "ip", "tz"))
+		"ts", "n", "o", "e", "u", "ip", "tz", "geography", "geometry"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	input := [][]interface{}{
-		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
 	}
 
 	for _, in := range input {
@@ -135,7 +138,7 @@ func TestCopyRandom(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -153,7 +156,9 @@ func TestCopyRandom(t *testing.T) {
 			b BYTES,
 			u UUID,
 			ip INET,
-			tz TIMESTAMPTZ
+			tz TIMESTAMPTZ,
+			geography GEOGRAPHY NULL,
+			geometry GEOMETRY NULL
 		);
 		SET extra_float_digits = 3; -- to preserve floats entirely
 	`); err != nil {
@@ -165,7 +170,7 @@ func TestCopyRandom(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "ttz", "ts", "s", "b", "u", "ip", "tz"))
+	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "ttz", "ts", "s", "b", "u", "ip", "tz", "geography", "geometry"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,6 +191,8 @@ func TestCopyRandom(t *testing.T) {
 		types.Uuid,
 		types.INet,
 		types.TimestampTZ,
+		types.Geography,
+		types.Geometry,
 	}
 
 	var inputs [][]interface{}
@@ -250,11 +257,11 @@ func TestCopyRandom(t *testing.T) {
 			case time.Time:
 				var dt tree.NodeFormatter
 				if typs[i].Family() == types.TimeFamily {
-					dt = tree.MakeDTime(timeofday.FromTime(d))
+					dt = tree.MakeDTime(timeofday.FromTimeAllow2400(d))
 				} else if typs[i].Family() == types.TimeTZFamily {
-					dt = tree.NewDTimeTZFromTime(d)
+					dt = tree.NewDTimeTZ(timetz.MakeTimeTZFromTimeAllow2400(d))
 				} else {
-					dt = tree.MakeDTimestamp(d, time.Microsecond)
+					dt = tree.MustMakeDTimestamp(d, time.Microsecond)
 				}
 				ds = tree.AsStringWithFlags(dt, tree.FmtBareStrings)
 			}
@@ -270,7 +277,7 @@ func TestCopyError(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -325,7 +332,7 @@ func TestCopyOne(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -359,7 +366,7 @@ func TestCopyInProgress(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -392,7 +399,7 @@ func TestCopyTransaction(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -445,7 +452,7 @@ func TestCopyFKCheck(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	db.SetMaxOpenConns(1)
 	r := sqlutils.MakeSQLRunner(db)

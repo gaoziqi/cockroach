@@ -26,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const testKeySize = 1024
@@ -283,7 +283,7 @@ func TestUseCerts(t *testing.T) {
 		DisableWebSessionAuthentication: true,
 	}
 	s, _, db := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Insecure mode.
 	clientContext := testutils.NewNodeTestBaseContext()
@@ -369,7 +369,7 @@ func TestUseSplitCACerts(t *testing.T) {
 		DisableWebSessionAuthentication: true,
 	}
 	s, _, db := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Insecure mode.
 	clientContext := testutils.NewNodeTestBaseContext()
@@ -489,7 +489,7 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 		DisableWebSessionAuthentication: true,
 	}
 	s, _, db := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Insecure mode.
 	clientContext := testutils.NewNodeTestBaseContext()

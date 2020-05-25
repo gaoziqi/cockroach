@@ -100,11 +100,11 @@ func (m *Outbox) SetFlowCtx(flowCtx *execinfra.FlowCtx) {
 }
 
 // Init initializes the Outbox.
-func (m *Outbox) Init(typs []types.T) {
+func (m *Outbox) Init(typs []*types.T) {
 	if typs == nil {
 		// We check for nil to detect uninitialized cases; but we support 0-length
 		// rows.
-		typs = make([]types.T, 0)
+		typs = make([]*types.T, 0)
 	}
 	m.RowChannel.InitWithNumSenders(typs, 1)
 	m.encoder.Init(typs)
@@ -207,6 +207,7 @@ func (m *Outbox) mainLoop(ctx context.Context) error {
 	ctx, span = execinfra.ProcessorSpan(ctx, "outbox")
 	if span != nil && tracing.IsRecording(span) {
 		m.statsCollectionEnabled = true
+		span.SetTag(execinfrapb.FlowIDTagKey, m.flowCtx.ID.String())
 		span.SetTag(execinfrapb.StreamIDTagKey, m.streamID)
 	}
 	// spanFinished specifies whether we called tracing.FinishSpan on the span.

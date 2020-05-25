@@ -90,6 +90,8 @@ type operatorExpr interface {
 var _ operatorExpr = &AndExpr{}
 var _ operatorExpr = &OrExpr{}
 var _ operatorExpr = &NotExpr{}
+var _ operatorExpr = &IsNullExpr{}
+var _ operatorExpr = &IsNotNullExpr{}
 var _ operatorExpr = &BinaryExpr{}
 var _ operatorExpr = &UnaryExpr{}
 var _ operatorExpr = &ComparisonExpr{}
@@ -261,6 +263,64 @@ func (node *NotExpr) TypedInnerExpr() TypedExpr {
 	return node.Expr.(TypedExpr)
 }
 
+// IsNullExpr represents an IS NULL expression. This is equivalent to IS NOT
+// DISTINCT FROM NULL, except when the input is a tuple.
+type IsNullExpr struct {
+	Expr Expr
+
+	typeAnnotation
+}
+
+func (*IsNullExpr) operatorExpr() {}
+
+// Format implements the NodeFormatter interface.
+func (node *IsNullExpr) Format(ctx *FmtCtx) {
+	exprFmtWithParen(ctx, node.Expr)
+	ctx.WriteString(" IS NULL")
+}
+
+// NewTypedIsNullExpr returns a new IsNullExpr that is verified to be
+// well-typed.
+func NewTypedIsNullExpr(expr TypedExpr) *IsNullExpr {
+	node := &IsNullExpr{Expr: expr}
+	node.typ = types.Bool
+	return node
+}
+
+// TypedInnerExpr returns the IsNullExpr's inner expression as a TypedExpr.
+func (node *IsNullExpr) TypedInnerExpr() TypedExpr {
+	return node.Expr.(TypedExpr)
+}
+
+// IsNotNullExpr represents an IS NOT NULL expression. This is equivalent to IS
+// DISTINCT FROM NULL, except when the input is a tuple.
+type IsNotNullExpr struct {
+	Expr Expr
+
+	typeAnnotation
+}
+
+func (*IsNotNullExpr) operatorExpr() {}
+
+// Format implements the NodeFormatter interface.
+func (node *IsNotNullExpr) Format(ctx *FmtCtx) {
+	exprFmtWithParen(ctx, node.Expr)
+	ctx.WriteString(" IS NOT NULL")
+}
+
+// NewTypedIsNotNullExpr returns a new IsNotNullExpr that is verified to be
+// well-typed.
+func NewTypedIsNotNullExpr(expr TypedExpr) *IsNotNullExpr {
+	node := &IsNotNullExpr{Expr: expr}
+	node.typ = types.Bool
+	return node
+}
+
+// TypedInnerExpr returns the IsNotNullExpr's inner expression as a TypedExpr.
+func (node *IsNotNullExpr) TypedInnerExpr() TypedExpr {
+	return node.Expr.(TypedExpr)
+}
+
 // ParenExpr represents a parenthesized expression.
 type ParenExpr struct {
 	Expr Expr
@@ -421,9 +481,12 @@ func (*ComparisonExpr) operatorExpr() {}
 // Format implements the NodeFormatter interface.
 func (node *ComparisonExpr) Format(ctx *FmtCtx) {
 	opStr := node.Operator.String()
-	if node.Operator == IsDistinctFrom && (node.Right == DNull || node.Right == DBoolTrue || node.Right == DBoolFalse) {
+	// IS and IS NOT are equivalent to IS NOT DISTINCT FROM and IS DISTINCT
+	// FROM, respectively, when the RHS is true or false. We prefer the less
+	// verbose IS and IS NOT in those cases.
+	if node.Operator == IsDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
 		opStr = "IS NOT"
-	} else if node.Operator == IsNotDistinctFrom && (node.Right == DNull || node.Right == DBoolTrue || node.Right == DBoolFalse) {
+	} else if node.Operator == IsNotDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
 		opStr = "IS"
 	}
 	if node.Operator.hasSubOperator() {
@@ -514,7 +577,7 @@ func (node *ComparisonExpr) memoizeFn() {
 			//   x = ANY(SELECT y FROM t)
 			//   x = ANY(1,2)
 			if len(rightRet.TupleContents()) > 0 {
-				rightRet = &rightRet.TupleContents()[0]
+				rightRet = rightRet.TupleContents()[0]
 			} else {
 				rightRet = leftRet
 			}
@@ -598,12 +661,24 @@ func (node *RangeCond) TypedTo() TypedExpr {
 type IsOfTypeExpr struct {
 	Not   bool
 	Expr  Expr
-	Types []*types.T
+	Types []ResolvableTypeReference
+
+	resolvedTypes []*types.T
 
 	typeAnnotation
 }
 
 func (*IsOfTypeExpr) operatorExpr() {}
+
+// ResolvedTypes returns a slice of resolved types corresponding
+// to the Types slice of unresolved types. It may only be accessed
+// after typechecking.
+func (node *IsOfTypeExpr) ResolvedTypes() []*types.T {
+	if node.resolvedTypes == nil {
+		panic("ResolvedTypes called on an IsOfTypeExpr before typechecking")
+	}
+	return node.resolvedTypes
+}
 
 // Format implements the NodeFormatter interface.
 func (node *IsOfTypeExpr) Format(ctx *FmtCtx) {
@@ -617,7 +692,7 @@ func (node *IsOfTypeExpr) Format(ctx *FmtCtx) {
 		if i > 0 {
 			ctx.WriteString(", ")
 		}
-		ctx.Buffer.WriteString(t.SQLString())
+		ctx.FormatTypeReference(t)
 	}
 	ctx.WriteByte(')')
 }
@@ -1151,6 +1226,8 @@ func (UnaryOperator) operator() {}
 const (
 	UnaryMinus UnaryOperator = iota
 	UnaryComplement
+	UnarySqrt
+	UnaryCbrt
 
 	NumUnaryOperators
 )
@@ -1160,6 +1237,8 @@ var _ = NumUnaryOperators
 var unaryOpName = [...]string{
 	UnaryMinus:      "-",
 	UnaryComplement: "~",
+	UnarySqrt:       "|/",
+	UnaryCbrt:       "||/",
 }
 
 func (i UnaryOperator) String() string {
@@ -1225,9 +1304,12 @@ type FuncExpr struct {
 	Filter    Expr
 	WindowDef *WindowDef
 
-	// OrderBy is used for aggregations that specify an order:
-	// array_agg(col1 ORDER BY col2)
+	// AggType is used to specify the type of aggregation.
+	AggType AggType
+	// OrderBy is used for aggregations which specify an order. This same field
+	// is used for any type of aggregation.
 	OrderBy OrderBy
+
 	typeAnnotation
 	fnProps *FunctionProperties
 	fn      *Overload
@@ -1308,6 +1390,20 @@ var funcTypeName = [...]string{
 	AllFuncType:      "ALL",
 }
 
+// AggType specifies the type of aggregation.
+type AggType int
+
+// FuncExpr.AggType
+const (
+	_ AggType = iota
+	// GeneralAgg is used for general-purpose aggregate functions.
+	// array_agg(col1 ORDER BY col2)
+	GeneralAgg
+	// OrderedSetAgg is used for ordered-set aggregate functions.
+	// percentile_disc(fraction) WITHIN GROUP (ORDER BY col1)
+	OrderedSetAgg
+)
+
 // Format implements the NodeFormatter interface.
 func (node *FuncExpr) Format(ctx *FmtCtx) {
 	var typ string
@@ -1324,7 +1420,7 @@ func (node *FuncExpr) Format(ctx *FmtCtx) {
 	ctx.WriteByte('(')
 	ctx.WriteString(typ)
 	ctx.FormatNode(&node.Exprs)
-	if len(node.OrderBy) > 0 {
+	if node.AggType == GeneralAgg && len(node.OrderBy) > 0 {
 		ctx.WriteByte(' ')
 		ctx.FormatNode(&node.OrderBy)
 	}
@@ -1339,6 +1435,11 @@ func (node *FuncExpr) Format(ctx *FmtCtx) {
 				ctx.Buffer.WriteString(node.typ.SQLString())
 			}
 		}
+	}
+	if node.AggType == OrderedSetAgg && len(node.OrderBy) > 0 {
+		ctx.WriteString(" WITHIN GROUP (")
+		ctx.FormatNode(&node.OrderBy)
+		ctx.WriteString(")")
 	}
 	if node.Filter != nil {
 		ctx.WriteString(" FILTER (WHERE ")
@@ -1418,7 +1519,7 @@ const (
 // CastExpr represents a CAST(expr AS type) expression.
 type CastExpr struct {
 	Expr Expr
-	Type *types.T
+	Type ResolvableTypeReference
 
 	typeAnnotation
 	SyntaxMode castSyntaxMode
@@ -1429,10 +1530,10 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 	switch node.SyntaxMode {
 	case CastPrepend:
 		// This is a special case for things like INTERVAL '1s'. These only work
-		// with string constats; if the underlying expression was changed, we fall
+		// with string constants; if the underlying expression was changed, we fall
 		// back to the short syntax.
 		if _, ok := node.Expr.(*StrVal); ok {
-			ctx.WriteString(node.Type.SQLString())
+			ctx.FormatTypeReference(node.Type)
 			ctx.WriteByte(' ')
 			ctx.FormatNode(node.Expr)
 			break
@@ -1441,36 +1542,36 @@ func (node *CastExpr) Format(ctx *FmtCtx) {
 	case CastShort:
 		exprFmtWithParen(ctx, node.Expr)
 		ctx.WriteString("::")
-		ctx.WriteString(node.Type.SQLString())
+		ctx.FormatTypeReference(node.Type)
 	default:
 		ctx.WriteString("CAST(")
 		ctx.FormatNode(node.Expr)
 		ctx.WriteString(" AS ")
-		if node.Type.Family() == types.CollatedStringFamily {
+		if typ, ok := GetStaticallyKnownType(node.Type); ok && typ.Family() == types.CollatedStringFamily {
 			// Need to write closing parentheses before COLLATE clause, so create
 			// equivalent string type without the locale.
 			strTyp := types.MakeScalar(
 				types.StringFamily,
-				node.Type.Oid(),
-				node.Type.Precision(),
-				node.Type.Width(),
+				typ.Oid(),
+				typ.Precision(),
+				typ.Width(),
 				"", /* locale */
 			)
 			ctx.WriteString(strTyp.SQLString())
 			ctx.WriteString(") COLLATE ")
-			lex.EncodeLocaleName(&ctx.Buffer, node.Type.Locale())
+			lex.EncodeLocaleName(&ctx.Buffer, typ.Locale())
 		} else {
-			ctx.WriteString(node.Type.SQLString())
+			ctx.FormatTypeReference(node.Type)
 			ctx.WriteByte(')')
 		}
 	}
 }
 
 // NewTypedCastExpr returns a new CastExpr that is verified to be well-typed.
-func NewTypedCastExpr(expr TypedExpr, typ *types.T) (*CastExpr, error) {
+func NewTypedCastExpr(expr TypedExpr, typ *types.T) *CastExpr {
 	node := &CastExpr{Expr: expr, Type: typ, SyntaxMode: CastShort}
 	node.typ = typ
-	return node, nil
+	return node
 }
 
 type castInfo struct {
@@ -1485,12 +1586,15 @@ var (
 		types.Timestamp, types.TimestampTZ, types.Date, types.Interval, types.Oid, types.VarBit})
 	floatCastTypes = annotateCast(types.Float, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
 		types.Timestamp, types.TimestampTZ, types.Date, types.Interval})
-	decimalCastTypes = annotateCast(types.Decimal, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
+	geographyCastTypes = annotateCast(types.Geography, []*types.T{types.Unknown, types.String, types.Geography, types.Geometry})
+	geometryCastTypes  = annotateCast(types.Geometry, []*types.T{types.Unknown, types.String, types.Geography, types.Geometry})
+	decimalCastTypes   = annotateCast(types.Decimal, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
 		types.Timestamp, types.TimestampTZ, types.Date, types.Interval})
 	stringCastTypes = annotateCast(types.String, []*types.T{types.Unknown, types.Bool, types.Int, types.Float, types.Decimal, types.String, types.AnyCollatedString,
 		types.VarBit,
 		types.AnyArray, types.AnyTuple,
-		types.Bytes, types.Timestamp, types.TimestampTZ, types.Interval, types.Uuid, types.Date, types.Time, types.TimeTZ, types.Oid, types.INet, types.Jsonb})
+		types.Geometry, types.Geography,
+		types.Bytes, types.Timestamp, types.TimestampTZ, types.Interval, types.Uuid, types.Date, types.Time, types.TimeTZ, types.Oid, types.INet, types.Jsonb, types.AnyEnum})
 	bytesCastTypes = annotateCast(types.Bytes, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Bytes, types.Uuid})
 	dateCastTypes  = annotateCast(types.Date, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Date, types.Timestamp, types.TimestampTZ, types.Int})
 	timeCastTypes  = annotateCast(types.Time, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.Time, types.TimeTZ,
@@ -1503,6 +1607,7 @@ var (
 	inetCastTypes      = annotateCast(types.INet, []*types.T{types.Unknown, types.String, types.AnyCollatedString, types.INet})
 	arrayCastTypes     = annotateCast(types.AnyArray, []*types.T{types.Unknown, types.String})
 	jsonCastTypes      = annotateCast(types.Jsonb, []*types.T{types.Unknown, types.String, types.Jsonb})
+	enumCastTypes      = annotateCast(types.AnyEnum, []*types.T{types.Unknown, types.String, types.AnyEnum})
 )
 
 // validCastTypes returns a set of types that can be cast into the provided type.
@@ -1524,6 +1629,10 @@ func validCastTypes(t *types.T) []castInfo {
 		return bytesCastTypes
 	case types.DateFamily:
 		return dateCastTypes
+	case types.GeographyFamily:
+		return geographyCastTypes
+	case types.GeometryFamily:
+		return geometryCastTypes
 	case types.TimeFamily:
 		return timeCastTypes
 	case types.TimeTZFamily:
@@ -1541,9 +1650,9 @@ func validCastTypes(t *types.T) []castInfo {
 	case types.OidFamily:
 		return oidCastTypes
 	case types.ArrayFamily:
-		ret := make([]castInfo, len(arrayCastTypes))
-		copy(ret, arrayCastTypes)
-		return ret
+		return arrayCastTypes
+	case types.EnumFamily:
+		return enumCastTypes
 	default:
 		return nil
 	}
@@ -1584,7 +1693,7 @@ const (
 // AnnotateTypeExpr represents a ANNOTATE_TYPE(expr, type) expression.
 type AnnotateTypeExpr struct {
 	Expr Expr
-	Type *types.T
+	Type ResolvableTypeReference
 
 	SyntaxMode annotateSyntaxMode
 }
@@ -1593,11 +1702,13 @@ type AnnotateTypeExpr struct {
 func (node *AnnotateTypeExpr) Format(ctx *FmtCtx) {
 	if ctx.HasFlags(FmtPGAttrdefAdbin) {
 		ctx.FormatNode(node.Expr)
-		switch node.Type.Family() {
-		case types.StringFamily, types.CollatedStringFamily:
-			// Postgres formats strings using a cast afterward. Let's do the same.
-			ctx.WriteString("::")
-			ctx.WriteString(node.Type.SQLString())
+		if typ, ok := GetStaticallyKnownType(node.Type); ok {
+			switch typ.Family() {
+			case types.StringFamily, types.CollatedStringFamily:
+				// Postgres formats strings using a cast afterward. Let's do the same.
+				ctx.WriteString("::")
+				ctx.WriteString(typ.SQLString())
+			}
 		}
 		return
 	}
@@ -1605,13 +1716,13 @@ func (node *AnnotateTypeExpr) Format(ctx *FmtCtx) {
 	case AnnotateShort:
 		exprFmtWithParen(ctx, node.Expr)
 		ctx.WriteString(":::")
-		ctx.WriteString(node.Type.SQLString())
+		ctx.FormatTypeReference(node.Type)
 
 	default:
 		ctx.WriteString("ANNOTATE_TYPE(")
 		ctx.FormatNode(node.Expr)
 		ctx.WriteString(", ")
-		ctx.WriteString(node.Type.SQLString())
+		ctx.FormatTypeReference(node.Type)
 		ctx.WriteByte(')')
 	}
 }
@@ -1685,7 +1796,7 @@ func NewTypedColumnAccessExpr(expr TypedExpr, colName string, colIdx int) *Colum
 		ColName:        colName,
 		ByIndex:        colName == "",
 		ColIndex:       colIdx,
-		typeAnnotation: typeAnnotation{typ: &expr.ResolvedType().TupleContents()[colIdx]},
+		typeAnnotation: typeAnnotation{typ: expr.ResolvedType().TupleContents()[colIdx]},
 	}
 }
 
@@ -1722,6 +1833,8 @@ func (node *DTime) String() string            { return AsString(node) }
 func (node *DTimeTZ) String() string          { return AsString(node) }
 func (node *DDecimal) String() string         { return AsString(node) }
 func (node *DFloat) String() string           { return AsString(node) }
+func (node *DGeography) String() string       { return AsString(node) }
+func (node *DGeometry) String() string        { return AsString(node) }
 func (node *DInt) String() string             { return AsString(node) }
 func (node *DInterval) String() string        { return AsString(node) }
 func (node *DJSON) String() string            { return AsString(node) }
@@ -1746,6 +1859,8 @@ func (node *IsOfTypeExpr) String() string     { return AsString(node) }
 func (node *Name) String() string             { return AsString(node) }
 func (node *UnrestrictedName) String() string { return AsString(node) }
 func (node *NotExpr) String() string          { return AsString(node) }
+func (node *IsNullExpr) String() string       { return AsString(node) }
+func (node *IsNotNullExpr) String() string    { return AsString(node) }
 func (node *NullIfExpr) String() string       { return AsString(node) }
 func (node *NumVal) String() string           { return AsString(node) }
 func (node *OrExpr) String() string           { return AsString(node) }

@@ -24,10 +24,10 @@ count                      ·                   ·
                 │          mergeJoinOrder      +"(a=a)"
                 ├── scan   ·                   ·
                 │          table               abc@primary
-                │          spans               ALL
+                │          spans               FULL SCAN
                 └── scan   ·                   ·
 ·                          table               abc@primary
-·                          spans               ALL
+·                          spans               FULL SCAN
 
 # Update from another table.
 statement ok
@@ -53,10 +53,10 @@ count                          ·                  ·
                      │         left cols are key  ·
                      ├── scan  ·                  ·
                      │         table              abc@primary
-                     │         spans              ALL
+                     │         spans              FULL SCAN
                      └── scan  ·                  ·
 ·                              table              new_abc@primary
-·                              spans              ALL
+·                              spans              FULL SCAN
 
 # Returning old values.
 query TTT
@@ -88,44 +88,44 @@ render                          ·                   ·
                      │          mergeJoinOrder      +"(a=a)"
                      ├── scan   ·                   ·
                      │          table               abc@primary
-                     │          spans               ALL
+                     │          spans               FULL SCAN
                      └── scan   ·                   ·
 ·                               table               abc@primary
-·                               spans               ALL
+·                               spans               FULL SCAN
 
 # Check if RETURNING * returns everything
 query TTTTT
 EXPLAIN (VERBOSE) UPDATE abc SET b = old.b + 1, c = old.c + 2 FROM abc AS old WHERE abc.a = old.a RETURNING *
 ----
-·                          distributed         false        ·                                       ·
-·                          vectorized          false        ·                                       ·
-run                        ·                   ·            (a, b, c, a, b, c)                      ·
- └── update                ·                   ·            (a, b, c, a, b, c)                      ·
-      │                    table               abc          ·                                       ·
-      │                    set                 b, c         ·                                       ·
-      │                    strategy            updater      ·                                       ·
-      │                    auto commit         ·            ·                                       ·
-      └── render           ·                   ·            (a, b, c, column10, column11, a, b, c)  ·
-           │               render 0            a            ·                                       ·
-           │               render 1            b            ·                                       ·
-           │               render 2            c            ·                                       ·
-           │               render 3            b + 1        ·                                       ·
-           │               render 4            c + 2        ·                                       ·
-           │               render 5            a            ·                                       ·
-           │               render 6            b            ·                                       ·
-           │               render 7            c            ·                                       ·
-           └── merge-join  ·                   ·            (a, b, c, a, b, c)                      ·
-                │          type                inner        ·                                       ·
-                │          equality            (a) = (a)    ·                                       ·
-                │          left cols are key   ·            ·                                       ·
-                │          right cols are key  ·            ·                                       ·
-                │          mergeJoinOrder      +"(a=a)"     ·                                       ·
-                ├── scan   ·                   ·            (a, b, c)                               +a
-                │          table               abc@primary  ·                                       ·
-                │          spans               ALL          ·                                       ·
-                └── scan   ·                   ·            (a, b, c)                               +a
-·                          table               abc@primary  ·                                       ·
-·                          spans               ALL          ·                                       ·
+·                          distributed         false        ·                                 ·
+·                          vectorized          false        ·                                 ·
+run                        ·                   ·            (a, b, c, a, b, c)                ·
+ └── update                ·                   ·            (a, b, c, a, b, c)                ·
+      │                    table               abc          ·                                 ·
+      │                    set                 b, c         ·                                 ·
+      │                    strategy            updater      ·                                 ·
+      │                    auto commit         ·            ·                                 ·
+      └── render           ·                   ·            (a, b, c, b_new, c_new, a, b, c)  ·
+           │               render 0            a            ·                                 ·
+           │               render 1            b            ·                                 ·
+           │               render 2            c            ·                                 ·
+           │               render 3            b + 1        ·                                 ·
+           │               render 4            c + 2        ·                                 ·
+           │               render 5            a            ·                                 ·
+           │               render 6            b            ·                                 ·
+           │               render 7            c            ·                                 ·
+           └── merge-join  ·                   ·            (a, b, c, a, b, c)                ·
+                │          type                inner        ·                                 ·
+                │          equality            (a) = (a)    ·                                 ·
+                │          left cols are key   ·            ·                                 ·
+                │          right cols are key  ·            ·                                 ·
+                │          mergeJoinOrder      +"(a=a)"     ·                                 ·
+                ├── scan   ·                   ·            (a, b, c)                         +a
+                │          table               abc@primary  ·                                 ·
+                │          spans               FULL SCAN    ·                                 ·
+                └── scan   ·                   ·            (a, b, c)                         +a
+·                          table               abc@primary  ·                                 ·
+·                          spans               FULL SCAN    ·                                 ·
 
 # Update values of table from values expression
 query TTT
@@ -177,17 +177,17 @@ count                               ·                   ·
                      │              equality            (a) = (a)
                      ├── scan       ·                   ·
                      │              table               ab@primary
-                     │              spans               ALL
+                     │              spans               FULL SCAN
                      └── hash-join  ·                   ·
                           │         type                inner
                           │         equality            (a) = (a)
                           │         right cols are key  ·
                           ├── scan  ·                   ·
                           │         table               ac@primary
-                          │         spans               ALL
+                          │         spans               FULL SCAN
                           └── scan  ·                   ·
 ·                                   table               abc@primary
-·                                   spans               ALL
+·                                   spans               FULL SCAN
 
 # Make sure UPDATE ... FROM works with LATERAL.
 query TTT
@@ -218,14 +218,14 @@ run                                 ·                   ·
                      │              equality            (a) = (a)
                      ├── scan       ·                   ·
                      │              table               ab@primary
-                     │              spans               ALL
+                     │              spans               FULL SCAN
                      └── hash-join  ·                   ·
                           │         type                inner
                           │         equality            (a) = (a)
                           │         right cols are key  ·
                           ├── scan  ·                   ·
                           │         table               ac@primary
-                          │         spans               ALL
+                          │         spans               FULL SCAN
                           └── scan  ·                   ·
 ·                                   table               abc@primary
-·                                   spans               ALL
+·                                   spans               FULL SCAN

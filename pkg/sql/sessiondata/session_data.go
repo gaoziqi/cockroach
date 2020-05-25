@@ -15,6 +15,9 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 )
 
 // SessionData contains session parameters. They are all user-configurable.
@@ -27,15 +30,35 @@ type SessionData struct {
 	// Database indicates the "current" database for the purpose of
 	// resolving names. See searchAndQualifyDatabase() for details.
 	Database string
+	// DefaultTxnPriority indicates the default priority of newly created
+	// transactions.
+	// NOTE: we'd prefer to use tree.UserPriority here, but doing so would
+	// introduce a package dependency cycle.
+	DefaultTxnPriority int
 	// DefaultReadOnly indicates the default read-only status of newly created
 	// transactions.
 	DefaultReadOnly bool
 	// DistSQLMode indicates whether to run queries using the distributed
 	// execution engine.
 	DistSQLMode DistSQLExecMode
-	// OptimizerFKs indicates whether we should use the new paths to plan foreign
+	// OptimizerFKChecks indicates whether we should use the new paths to plan foreign
 	// key checks in the optimizer.
-	OptimizerFKs bool
+	OptimizerFKChecks bool
+	// OptimizerFKCascades indicates whether we should use the new paths to plan foreign
+	// key cascades in the optimizer.
+	OptimizerFKCascades bool
+	// OptimizerFKCascadesLimit is the maximum number of cascading operations that
+	// are run for a single query.
+	OptimizerFKCascadesLimit int
+	// OptimizerUseHistograms indicates whether we should use histograms for
+	// cardinality estimation in the optimizer.
+	OptimizerUseHistograms bool
+	// OptimizerUseMultiColStats indicates whether we should use multi-column
+	// statistics for cardinality estimation in the optimizer.
+	OptimizerUseMultiColStats bool
+	// PartialIndexes indicates whether creation of partial indexes are allowed.
+	// TODO(mgartner): remove this once partial indexes are fully supported.
+	PartialIndexes bool
 	// SerialNormalizationMode indicates how to handle the SERIAL pseudo-type.
 	SerialNormalizationMode SerialNormalizationMode
 	// SearchPath is a list of namespaces to search builtins in.
@@ -99,6 +122,9 @@ type SessionData struct {
 	// InsertFastPath is true if the fast path for insert (with VALUES input) may
 	// be used.
 	InsertFastPath bool
+	// NoticeDisplaySeverity indicates the level of Severity to send notices for the given
+	// session.
+	NoticeDisplaySeverity pgnotice.DisplaySeverity
 }
 
 // DataConversionConfig contains the parameters that influence
@@ -109,7 +135,7 @@ type DataConversionConfig struct {
 
 	// BytesEncodeFormat indicates how to encode byte arrays when converting
 	// to string.
-	BytesEncodeFormat BytesEncodeFormat
+	BytesEncodeFormat lex.BytesEncodeFormat
 
 	// ExtraFloatDigits indicates the number of digits beyond the
 	// standard number to use for float conversions.
@@ -161,47 +187,6 @@ func (c *DataConversionConfig) Equals(other *DataConversionConfig) bool {
 		return false
 	}
 	return true
-}
-
-// BytesEncodeFormat controls which format to use for BYTES->STRING
-// conversions.
-type BytesEncodeFormat int
-
-const (
-	// BytesEncodeHex uses the hex format: e'abc\n'::BYTES::STRING -> '\x61626312'.
-	// This is the default, for compatibility with PostgreSQL.
-	BytesEncodeHex BytesEncodeFormat = iota
-	// BytesEncodeEscape uses the escaped format: e'abc\n'::BYTES::STRING -> 'abc\012'.
-	BytesEncodeEscape
-	// BytesEncodeBase64 uses base64 encoding.
-	BytesEncodeBase64
-)
-
-func (f BytesEncodeFormat) String() string {
-	switch f {
-	case BytesEncodeHex:
-		return "hex"
-	case BytesEncodeEscape:
-		return "escape"
-	case BytesEncodeBase64:
-		return "base64"
-	default:
-		return fmt.Sprintf("invalid (%d)", f)
-	}
-}
-
-// BytesEncodeFormatFromString converts a string into a BytesEncodeFormat.
-func BytesEncodeFormatFromString(val string) (_ BytesEncodeFormat, ok bool) {
-	switch strings.ToUpper(val) {
-	case "HEX":
-		return BytesEncodeHex, true
-	case "ESCAPE":
-		return BytesEncodeEscape, true
-	case "BASE64":
-		return BytesEncodeBase64, true
-	default:
-		return -1, false
-	}
 }
 
 // DistSQLExecMode controls if and when the Executor distributes queries.
@@ -264,33 +249,27 @@ type VectorizeExecMode int64
 const (
 	// VectorizeOff means that columnar execution is disabled.
 	VectorizeOff VectorizeExecMode = iota
-	// Vectorize192Auto means that that any supported queries that use only
+	// Vectorize201Auto means that that any supported queries that use only
 	// streaming operators (i.e. those that do not require any buffering) will
-	// be run using the columnar execution.
-	// TODO(asubiotto): This was the auto setting for 19.2 and is kept around
-	// as an escape hatch. Remove in 20.2.
-	Vectorize192Auto
+	// be run using the columnar execution. If any part of a query is not
+	// supported by the vectorized execution engine, the whole query will fall
+	// back to row execution.
+	// This is the default setting in 20.1.
+	Vectorize201Auto
 	// VectorizeOn means that any supported queries will be run using the
 	// columnar execution.
 	VectorizeOn
 	// VectorizeExperimentalAlways means that we attempt to vectorize all
 	// queries; unsupported queries will fail. Mostly used for testing.
 	VectorizeExperimentalAlways
-	// VectorizeAuto means that any supported queries that use only streaming
-	// operators or buffering operators that can spill to disk or are marked as
-	// buffering an amount not proportional to the input size will be run using
-	// columnar execution.
-	VectorizeAuto
 )
 
 func (m VectorizeExecMode) String() string {
 	switch m {
 	case VectorizeOff:
 		return "off"
-	case Vectorize192Auto:
-		return "192auto"
-	case VectorizeAuto:
-		return "auto"
+	case Vectorize201Auto:
+		return "201auto"
 	case VectorizeOn:
 		return "on"
 	case VectorizeExperimentalAlways:
@@ -307,10 +286,8 @@ func VectorizeExecModeFromString(val string) (VectorizeExecMode, bool) {
 	switch strings.ToUpper(val) {
 	case "OFF":
 		m = VectorizeOff
-	case "192AUTO":
-		m = Vectorize192Auto
-	case "AUTO":
-		m = VectorizeAuto
+	case "201AUTO":
+		m = Vectorize201Auto
 	case "ON":
 		m = VectorizeOn
 	case "EXPERIMENTAL_ALWAYS":

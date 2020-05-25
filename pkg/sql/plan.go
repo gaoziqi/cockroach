@@ -16,6 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -157,6 +159,7 @@ type planNodeReadingOwnWrites interface {
 var _ planNode = &alterIndexNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
+var _ planNode = &alterTypeNode{}
 var _ planNode = &bufferNode{}
 var _ planNode = &cancelQueriesNode{}
 var _ planNode = &cancelSessionsNode{}
@@ -166,6 +169,7 @@ var _ planNode = &createIndexNode{}
 var _ planNode = &createSequenceNode{}
 var _ planNode = &createStatsNode{}
 var _ planNode = &createTableNode{}
+var _ planNode = &createTypeNode{}
 var _ planNode = &CreateRoleNode{}
 var _ planNode = &createViewNode{}
 var _ planNode = &delayedNode{}
@@ -176,6 +180,7 @@ var _ planNode = &dropDatabaseNode{}
 var _ planNode = &dropIndexNode{}
 var _ planNode = &dropSequenceNode{}
 var _ planNode = &dropTableNode{}
+var _ planNode = &dropTypeNode{}
 var _ planNode = &DropRoleNode{}
 var _ planNode = &dropViewNode{}
 var _ planNode = &errorIfRowsNode{}
@@ -224,9 +229,6 @@ var _ planNode = &virtualTableNode{}
 var _ planNode = &windowNode{}
 var _ planNode = &zeroNode{}
 
-var _ planNodeFastPath = &CreateRoleNode{}
-var _ planNodeFastPath = &DropRoleNode{}
-var _ planNodeFastPath = &alterRoleNode{}
 var _ planNodeFastPath = &deleteRangeNode{}
 var _ planNodeFastPath = &rowCountNode{}
 var _ planNodeFastPath = &serializeNode{}
@@ -236,11 +238,14 @@ var _ planNodeFastPath = &controlJobsNode{}
 var _ planNodeReadingOwnWrites = &alterIndexNode{}
 var _ planNodeReadingOwnWrites = &alterSequenceNode{}
 var _ planNodeReadingOwnWrites = &alterTableNode{}
+var _ planNodeReadingOwnWrites = &alterTypeNode{}
 var _ planNodeReadingOwnWrites = &createIndexNode{}
 var _ planNodeReadingOwnWrites = &createSequenceNode{}
 var _ planNodeReadingOwnWrites = &createTableNode{}
+var _ planNodeReadingOwnWrites = &createTypeNode{}
 var _ planNodeReadingOwnWrites = &createViewNode{}
 var _ planNodeReadingOwnWrites = &changePrivilegesNode{}
+var _ planNodeReadingOwnWrites = &dropTypeNode{}
 var _ planNodeReadingOwnWrites = &setZoneConfigNode{}
 
 // planNodeRequireSpool serves as marker for nodes whose parent must
@@ -278,8 +283,7 @@ type planTop struct {
 	// stmt is a reference to the current statement (AST and other metadata).
 	stmt *Statement
 
-	// plan is the top-level node of the logical plan.
-	plan planNode
+	planComponents
 
 	// mem/catalog retains the memo and catalog that were used to create the
 	// plan.
@@ -292,13 +296,6 @@ type planTop struct {
 	// This is (currently) used by CREATE VIEW.
 	// TODO(knz): Remove this in favor of a better encapsulated mechanism.
 	deps planDependencies
-
-	// subqueryPlans contains all the sub-query plans.
-	subqueryPlans []subquery
-
-	// postqueryPlans contains all the plans for subqueries that are to be
-	// executed after the main query (for example, foreign key checks).
-	postqueryPlans []postquery
 
 	// auditEvents becomes non-nil if any of the descriptors used by
 	// current statement is causing an auditing event. See exec_log.go.
@@ -315,27 +312,46 @@ type planTop struct {
 	avoidBuffering bool
 
 	instrumentation planInstrumentation
+
+	// If we are collecting query diagnostics, flow diagrams are saved here.
+	distSQLDiagrams []execinfrapb.FlowDiagram
 }
 
-// postquery is a query tree that is executed after the main one. It can only
-// return an error (for example, foreign key violation).
-type postquery struct {
+// planComponents groups together the various components of the entire query
+// plan.
+type planComponents struct {
+	// subqueryPlans contains all the sub-query plans.
+	subqueryPlans []subquery
+
+	// plan for the main query.
+	main planNode
+
+	// cascades contains metadata for all cascades.
+	cascades []cascadeMetadata
+
+	// checkPlans contains all the plans for queries that are to be executed after
+	// the main query (for example, foreign key checks).
+	checkPlans []checkPlan
+}
+
+type cascadeMetadata struct {
+	exec.Cascade
+	// plan for the cascade. This plan is not populated upfront; it is created
+	// only when it needs to run, after the main query (and previous cascades).
 	plan planNode
 }
 
-// init resets planTop to point to a given statement; used at the start of the
-// planning process.
-func (p *planTop) init(stmt *Statement, appStats *appStats) {
-	*p = planTop{stmt: stmt}
-	p.instrumentation.init(appStats)
+// checkPlan is a query tree that is executed after the main one. It can only
+// return an error (for example, foreign key violation).
+type checkPlan struct {
+	plan planNode
 }
 
-// close ensures that the plan's resources have been deallocated.
-func (p *planTop) close(ctx context.Context) {
-	if p.plan != nil {
-		p.instrumentation.savePlanInfo(ctx, p)
-		p.plan.Close(ctx)
-		p.plan = nil
+// close calls Close on all plan trees.
+func (p *planComponents) close(ctx context.Context) {
+	if p.main != nil {
+		p.main.Close(ctx)
+		p.main = nil
 	}
 
 	for i := range p.subqueryPlans {
@@ -347,12 +363,34 @@ func (p *planTop) close(ctx context.Context) {
 		}
 	}
 
-	for i := range p.postqueryPlans {
-		if p.postqueryPlans[i].plan != nil {
-			p.postqueryPlans[i].plan.Close(ctx)
-			p.postqueryPlans[i].plan = nil
+	for i := range p.cascades {
+		if p.cascades[i].plan != nil {
+			p.cascades[i].plan.Close(ctx)
+			p.cascades[i].plan = nil
 		}
 	}
+
+	for i := range p.checkPlans {
+		if p.checkPlans[i].plan != nil {
+			p.checkPlans[i].plan.Close(ctx)
+			p.checkPlans[i].plan = nil
+		}
+	}
+}
+
+// init resets planTop to point to a given statement; used at the start of the
+// planning process.
+func (p *planTop) init(stmt *Statement, appStats *appStats) {
+	*p = planTop{stmt: stmt}
+	p.instrumentation.init(appStats)
+}
+
+// close ensures that the plan's resources have been deallocated.
+func (p *planTop) close(ctx context.Context) {
+	if p.main != nil {
+		p.instrumentation.savePlanInfo(ctx, p)
+	}
+	p.planComponents.close(ctx)
 }
 
 // formatOptPlan returns a visual representation of the optimizer plan that was
@@ -505,6 +543,6 @@ func (pi *planInstrumentation) savePlanInfo(ctx context.Context, curPlan *planTo
 	}
 
 	if pi.savePlanString {
-		pi.planString = planToString(ctx, curPlan.plan, curPlan.subqueryPlans, curPlan.postqueryPlans)
+		pi.planString = planToString(ctx, curPlan)
 	}
 }

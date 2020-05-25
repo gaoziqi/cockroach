@@ -17,7 +17,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -92,16 +92,9 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 		emptySum:     13621293256077144893,
 		populatedSum: 13375098491754757572,
 	},
-	reflect.TypeOf(&roachpb.RangeDescriptor{}): {
+	reflect.TypeOf(&kvserverpb.Liveness{}): {
 		populatedConstructor: func(r *rand.Rand) protoutil.Message {
-			return roachpb.NewPopulatedRangeDescriptor(r, false)
-		},
-		emptySum:     5524024218313206949,
-		populatedSum: 16763861375349929891,
-	},
-	reflect.TypeOf(&storagepb.Liveness{}): {
-		populatedConstructor: func(r *rand.Rand) protoutil.Message {
-			return storagepb.NewPopulatedLiveness(r, false)
+			return kvserverpb.NewPopulatedLiveness(r, false)
 		},
 		emptySum:     892800390935990883,
 		populatedSum: 16231745342114354146,
@@ -120,7 +113,7 @@ var belowRaftGoldenProtos = map[reflect.Type]fixture{
 }
 
 func init() {
-	if storage.DefaultStorageEngine != enginepb.EngineTypeRocksDB && storage.DefaultStorageEngine != enginepb.EngineTypeDefault {
+	if storage.DefaultStorageEngine != enginepb.EngineTypeRocksDB {
 		// These are marshaled below Raft by the Pebble merge operator. The Pebble
 		// merge operator can be called below Raft whenever a Pebble Iterator is
 		// used. Note that we only see these protos marshaled below Raft when the

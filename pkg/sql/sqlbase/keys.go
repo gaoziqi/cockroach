@@ -19,13 +19,39 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+const (
+	// DefaultDatabaseName is the name ofthe default CockroachDB database used
+	// for connections without a current db set.
+	DefaultDatabaseName = "defaultdb"
+
+	// PgDatabaseName is the name of the default postgres system database.
+	PgDatabaseName = "postgres"
+)
+
+// DefaultUserDBs is a set of the databases which are present in a new cluster.
+var DefaultUserDBs = map[string]struct{}{
+	DefaultDatabaseName: {},
+	PgDatabaseName:      {},
+}
+
+// MaxDefaultDescriptorID is the maximum ID of a descriptor that exists in a
+// new cluster.
+var MaxDefaultDescriptorID = keys.MaxReservedDescID + ID(len(DefaultUserDBs))
+
+// IsDefaultCreatedDescriptor returns whether or not a given descriptor ID is
+// present at the time of starting a cluster.
+func IsDefaultCreatedDescriptor(descID ID) bool {
+	return descID <= MaxDefaultDescriptorID
+}
+
 // MakeNameMetadataKey returns the key for the name, as expected by
 // versions >= 20.1.
 // Pass name == "" in order to generate the prefix key to use to scan over all
 // of the names for the specified parentID.
-func MakeNameMetadataKey(parentID ID, parentSchemaID ID, name string) roachpb.Key {
-	k := keys.MakeTablePrefix(uint32(NamespaceTable.ID))
-	k = encoding.EncodeUvarintAscending(k, uint64(NamespaceTable.PrimaryIndex.ID))
+func MakeNameMetadataKey(
+	codec keys.SQLCodec, parentID ID, parentSchemaID ID, name string,
+) roachpb.Key {
+	k := codec.IndexPrefix(uint32(NamespaceTable.ID), uint32(NamespaceTable.PrimaryIndex.ID))
 	k = encoding.EncodeUvarintAscending(k, uint64(parentID))
 	k = encoding.EncodeUvarintAscending(k, uint64(parentSchemaID))
 	if name != "" {
@@ -37,8 +63,10 @@ func MakeNameMetadataKey(parentID ID, parentSchemaID ID, name string) roachpb.Ke
 
 // DecodeNameMetadataKey returns the components that make up the
 // NameMetadataKey for version >= 20.1.
-func DecodeNameMetadataKey(k roachpb.Key) (parentID ID, parentSchemaID ID, name string, err error) {
-	k, _, err = keys.DecodeTablePrefix(k)
+func DecodeNameMetadataKey(
+	codec keys.SQLCodec, k roachpb.Key,
+) (parentID ID, parentSchemaID ID, name string, err error) {
+	k, _, err = codec.DecodeTablePrefix(k)
 	if err != nil {
 		return 0, 0, "", err
 	}
@@ -77,9 +105,9 @@ func DecodeNameMetadataKey(k roachpb.Key) (parentID ID, parentSchemaID ID, name 
 // MakeDeprecatedNameMetadataKey returns the key for a name, as expected by
 // versions < 20.1. Pass name == "" in order to generate the prefix key to use
 // to scan over all of the names for the specified parentID.
-func MakeDeprecatedNameMetadataKey(parentID ID, name string) roachpb.Key {
-	k := keys.MakeTablePrefix(uint32(DeprecatedNamespaceTable.ID))
-	k = encoding.EncodeUvarintAscending(k, uint64(DeprecatedNamespaceTable.PrimaryIndex.ID))
+func MakeDeprecatedNameMetadataKey(codec keys.SQLCodec, parentID ID, name string) roachpb.Key {
+	k := codec.IndexPrefix(
+		uint32(DeprecatedNamespaceTable.ID), uint32(DeprecatedNamespaceTable.PrimaryIndex.ID))
 	k = encoding.EncodeUvarintAscending(k, uint64(parentID))
 	if name != "" {
 		k = encoding.EncodeBytesAscending(k, []byte(name))
@@ -89,13 +117,13 @@ func MakeDeprecatedNameMetadataKey(parentID ID, name string) roachpb.Key {
 }
 
 // MakeAllDescsMetadataKey returns the key for all descriptors.
-func MakeAllDescsMetadataKey() roachpb.Key {
-	return keys.DescMetadataPrefix()
+func MakeAllDescsMetadataKey(codec keys.SQLCodec) roachpb.Key {
+	return codec.DescMetadataPrefix()
 }
 
 // MakeDescMetadataKey returns the key for the descriptor.
-func MakeDescMetadataKey(descID ID) roachpb.Key {
-	return keys.DescMetadataKey(uint32(descID))
+func MakeDescMetadataKey(codec keys.SQLCodec, descID ID) roachpb.Key {
+	return codec.DescMetadataKey(uint32(descID))
 }
 
 // IndexKeyValDirs returns the corresponding encoding.Directions for all the

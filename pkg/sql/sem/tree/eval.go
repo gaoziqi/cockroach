@@ -23,6 +23,8 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -55,13 +57,21 @@ var (
 	errDecOutOfRange   = pgerror.New(pgcode.NumericValueOutOfRange, "decimal out of range")
 
 	// ErrDivByZero is reported on a division by zero.
-	ErrDivByZero = pgerror.New(pgcode.DivisionByZero, "division by zero")
+	ErrDivByZero       = pgerror.New(pgcode.DivisionByZero, "division by zero")
+	errSqrtOfNegNumber = pgerror.New(pgcode.InvalidArgumentForPowerFunction, "cannot take square root of a negative number")
 	// ErrZeroModulus is reported when computing the rest of a division by zero.
 	ErrZeroModulus = pgerror.New(pgcode.DivisionByZero, "zero modulus")
 
 	big10E6  = big.NewInt(1e6)
 	big10E10 = big.NewInt(1e10)
 )
+
+// NewCannotMixBitArraySizesError creates an error for the case when a bitwise
+// aggregate function is called on bit arrays with different sizes.
+func NewCannotMixBitArraySizesError(op string) error {
+	return pgerror.Newf(pgcode.StringDataLengthMismatch,
+		"cannot %s bit strings of different sizes", op)
+}
 
 // UnaryOp is a unary operator.
 type UnaryOp struct {
@@ -170,6 +180,42 @@ var UnaryOps = unaryOpFixups(map[UnaryOperator]unaryOpOverload{
 			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
 				ipAddr := MustBeDIPAddr(d).IPAddr
 				return NewDIPAddr(DIPAddr{ipAddr.Complement()}), nil
+			},
+		},
+	},
+
+	UnarySqrt: {
+		&UnaryOp{
+			Typ:        types.Float,
+			ReturnType: types.Float,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				return Sqrt(float64(*d.(*DFloat)))
+			},
+		},
+		&UnaryOp{
+			Typ:        types.Decimal,
+			ReturnType: types.Decimal,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				dec := &d.(*DDecimal).Decimal
+				return DecimalSqrt(dec)
+			},
+		},
+	},
+
+	UnaryCbrt: {
+		&UnaryOp{
+			Typ:        types.Float,
+			ReturnType: types.Float,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				return Cbrt(float64(*d.(*DFloat)))
+			},
+		},
+		&UnaryOp{
+			Typ:        types.Decimal,
+			ReturnType: types.Decimal,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				dec := &d.(*DDecimal).Decimal
+				return DecimalCbrt(dec)
 			},
 		},
 	},
@@ -382,11 +428,6 @@ func getJSONPath(j DJSON, ary DArray) (Datum, error) {
 	return &DJSON{result}, nil
 }
 
-func newCannotMixBitArraySizesError(op string) error {
-	return pgerror.Newf(pgcode.StringDataLengthMismatch,
-		"cannot %s bit strings of different sizes", op)
-}
-
 // BinOps contains the binary operations indexed by operation type.
 var BinOps = map[BinaryOperator]binOpOverload{
 	Bitand: {
@@ -406,7 +447,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				lhs := MustBeDBitArray(left)
 				rhs := MustBeDBitArray(right)
 				if lhs.BitLen() != rhs.BitLen() {
-					return nil, newCannotMixBitArraySizesError("AND")
+					return nil, NewCannotMixBitArraySizesError("AND")
 				}
 				return &DBitArray{
 					BitArray: bitarray.And(lhs.BitArray, rhs.BitArray),
@@ -443,7 +484,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				lhs := MustBeDBitArray(left)
 				rhs := MustBeDBitArray(right)
 				if lhs.BitLen() != rhs.BitLen() {
-					return nil, newCannotMixBitArraySizesError("OR")
+					return nil, NewCannotMixBitArraySizesError("OR")
 				}
 				return &DBitArray{
 					BitArray: bitarray.Or(lhs.BitArray, rhs.BitArray),
@@ -480,7 +521,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				lhs := MustBeDBitArray(left)
 				rhs := MustBeDBitArray(right)
 				if lhs.BitLen() != rhs.BitLen() {
-					return nil, newCannotMixBitArraySizesError("XOR")
+					return nil, NewCannotMixBitArraySizesError("XOR")
 				}
 				return &DBitArray{
 					BitArray: bitarray.Xor(lhs.BitArray, rhs.BitArray),
@@ -584,7 +625,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := time.Duration(*right.(*DTime)) * time.Microsecond
-				return MakeDTimestamp(leftTime.Add(t), time.Microsecond), nil
+				return MakeDTimestamp(leftTime.Add(t), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -597,7 +638,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := time.Duration(*left.(*DTime)) * time.Microsecond
-				return MakeDTimestamp(rightTime.Add(t), time.Microsecond), nil
+				return MakeDTimestamp(rightTime.Add(t), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -610,7 +651,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := leftTime.Add(right.(*DTimeTZ).ToDuration())
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -623,7 +664,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := rightTime.Add(left.(*DTimeTZ).ToDuration())
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -670,7 +711,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Timestamp,
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return MakeDTimestamp(duration.Add(
-					left.(*DTimestamp).Time, right.(*DInterval).Duration), time.Microsecond), nil
+					left.(*DTimestamp).Time, right.(*DInterval).Duration), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -679,7 +720,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Timestamp,
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return MakeDTimestamp(duration.Add(
-					right.(*DTimestamp).Time, left.(*DInterval).Duration), time.Microsecond), nil
+					right.(*DTimestamp).Time, left.(*DInterval).Duration), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -689,7 +730,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				// Convert time to be in the given timezone, as math relies on matching timezones..
 				t := duration.Add(left.(*DTimestampTZ).Time.In(ctx.GetLocation()), right.(*DInterval).Duration)
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -699,7 +740,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				// Convert time to be in the given timezone, as math relies on matching timezones..
 				t := duration.Add(right.(*DTimestampTZ).Time.In(ctx.GetLocation()), left.(*DInterval).Duration)
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -720,7 +761,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := duration.Add(leftTime, right.(*DInterval).Duration)
-				return MakeDTimestamp(t, time.Microsecond), nil
+				return MakeDTimestamp(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -733,7 +774,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := duration.Add(rightTime, left.(*DInterval).Duration)
-				return MakeDTimestamp(t, time.Microsecond), nil
+				return MakeDTimestamp(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -857,7 +898,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := time.Duration(*right.(*DTime)) * time.Microsecond
-				return MakeDTimestamp(leftTime.Add(-1*t), time.Microsecond), nil
+				return MakeDTimestamp(leftTime.Add(-1*t), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -896,7 +937,11 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				// These two quantities aren't directly comparable. Convert the
 				// TimestampTZ to a timestamp first.
-				nanos := left.(*DTimestamp).Sub(right.(*DTimestampTZ).stripTimeZone(ctx).Time).Nanoseconds()
+				stripped, err := right.(*DTimestampTZ).stripTimeZone(ctx)
+				if err != nil {
+					return nil, err
+				}
+				nanos := left.(*DTimestamp).Sub(stripped.Time).Nanoseconds()
 				return &DInterval{Duration: duration.MakeDuration(nanos, 0, 0)}, nil
 			},
 		},
@@ -907,7 +952,11 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				// These two quantities aren't directly comparable. Convert the
 				// TimestampTZ to a timestamp first.
-				nanos := left.(*DTimestampTZ).stripTimeZone(ctx).Sub(right.(*DTimestamp).Time).Nanoseconds()
+				stripped, err := left.(*DTimestampTZ).stripTimeZone(ctx)
+				if err != nil {
+					return nil, err
+				}
+				nanos := stripped.Sub(right.(*DTimestamp).Time).Nanoseconds()
 				return &DInterval{Duration: duration.MakeDuration(nanos, 0, 0)}, nil
 			},
 		},
@@ -936,7 +985,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Timestamp,
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return MakeDTimestamp(duration.Add(
-					left.(*DTimestamp).Time, right.(*DInterval).Duration.Mul(-1)), time.Microsecond), nil
+					left.(*DTimestamp).Time, right.(*DInterval).Duration.Mul(-1)), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -948,7 +997,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					left.(*DTimestampTZ).Time.In(ctx.GetLocation()),
 					right.(*DInterval).Duration.Mul(-1),
 				)
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -961,7 +1010,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := duration.Add(leftTime, right.(*DInterval).Duration.Mul(-1))
-				return MakeDTimestamp(t, time.Microsecond), nil
+				return MakeDTimestamp(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -1763,6 +1812,16 @@ func cmpOpFixups(cmpOps map[ComparisonOperator]cmpOpOverload) map[ComparisonOper
 			RightType: types.MakeArray(t),
 			Fn:        cmpOpScalarEQFn,
 		})
+		cmpOps[LE] = append(cmpOps[LE], &CmpOp{
+			LeftType:  types.MakeArray(t),
+			RightType: types.MakeArray(t),
+			Fn:        cmpOpScalarLEFn,
+		})
+		cmpOps[LT] = append(cmpOps[LT], &CmpOp{
+			LeftType:  types.MakeArray(t),
+			RightType: types.MakeArray(t),
+			Fn:        cmpOpScalarLTFn,
+		})
 
 		cmpOps[IsNotDistinctFrom] = append(cmpOps[IsNotDistinctFrom], &CmpOp{
 			LeftType:     types.MakeArray(t),
@@ -1824,12 +1883,15 @@ func makeIsFn(a, b *types.T) *CmpOp {
 var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 	EQ: {
 		// Single-type comparisons.
+		makeEqFn(types.AnyEnum, types.AnyEnum),
 		makeEqFn(types.Bool, types.Bool),
 		makeEqFn(types.Bytes, types.Bytes),
 		makeEqFn(types.Date, types.Date),
 		makeEqFn(types.Decimal, types.Decimal),
 		makeEqFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeEqFn(types.Float, types.Float),
+		makeEqFn(types.Geography, types.Geography),
+		makeEqFn(types.Geometry, types.Geometry),
 		makeEqFn(types.INet, types.INet),
 		makeEqFn(types.Int, types.Int),
 		makeEqFn(types.Interval, types.Interval),
@@ -1871,12 +1933,15 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 
 	LT: {
 		// Single-type comparisons.
+		makeLtFn(types.AnyEnum, types.AnyEnum),
 		makeLtFn(types.Bool, types.Bool),
 		makeLtFn(types.Bytes, types.Bytes),
 		makeLtFn(types.Date, types.Date),
 		makeLtFn(types.Decimal, types.Decimal),
 		makeLtFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeLtFn(types.Float, types.Float),
+		makeLtFn(types.Geography, types.Geography),
+		makeLtFn(types.Geometry, types.Geometry),
 		makeLtFn(types.INet, types.INet),
 		makeLtFn(types.Int, types.Int),
 		makeLtFn(types.Interval, types.Interval),
@@ -1917,12 +1982,15 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 
 	LE: {
 		// Single-type comparisons.
+		makeLeFn(types.AnyEnum, types.AnyEnum),
 		makeLeFn(types.Bool, types.Bool),
 		makeLeFn(types.Bytes, types.Bytes),
 		makeLeFn(types.Date, types.Date),
 		makeLeFn(types.Decimal, types.Decimal),
 		makeLeFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeLeFn(types.Float, types.Float),
+		makeLeFn(types.Geography, types.Geography),
+		makeLeFn(types.Geometry, types.Geometry),
 		makeLeFn(types.INet, types.INet),
 		makeLeFn(types.Int, types.Int),
 		makeLeFn(types.Interval, types.Interval),
@@ -1971,12 +2039,15 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 			isPreferred: true,
 		},
 		// Single-type comparisons.
+		makeIsFn(types.AnyEnum, types.AnyEnum),
 		makeIsFn(types.Bool, types.Bool),
 		makeIsFn(types.Bytes, types.Bytes),
 		makeIsFn(types.Date, types.Date),
 		makeIsFn(types.Decimal, types.Decimal),
 		makeIsFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeIsFn(types.Float, types.Float),
+		makeIsFn(types.Geography, types.Geography),
+		makeIsFn(types.Geometry, types.Geometry),
 		makeIsFn(types.INet, types.INet),
 		makeIsFn(types.Int, types.Int),
 		makeIsFn(types.Interval, types.Interval),
@@ -2021,6 +2092,7 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 	},
 
 	In: {
+		makeEvalTupleIn(types.AnyEnum),
 		makeEvalTupleIn(types.Bool),
 		makeEvalTupleIn(types.Bytes),
 		makeEvalTupleIn(types.Date),
@@ -2028,6 +2100,8 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 		makeEvalTupleIn(types.AnyCollatedString),
 		makeEvalTupleIn(types.AnyTuple),
 		makeEvalTupleIn(types.Float),
+		makeEvalTupleIn(types.Geography),
+		makeEvalTupleIn(types.Geometry),
 		makeEvalTupleIn(types.INet),
 		makeEvalTupleIn(types.Int),
 		makeEvalTupleIn(types.Interval),
@@ -2705,6 +2779,19 @@ type SequenceOperators interface {
 	SetSequenceValue(ctx context.Context, seqName *TableName, newVal int64, isCalled bool) error
 }
 
+// TenantOperator is capable of interacting with tenant state, allowing SQL
+// builtin functions to create and destroy tenants. The methods will return
+// errors when run by any tenant other than the system tenant.
+type TenantOperator interface {
+	// CreateTenant attempts to install a new tenant in the system. It returns
+	// an error if the tenant already exists.
+	CreateTenant(ctx context.Context, tenantID uint64, tenantInfo []byte) error
+
+	// DestroyTenant attempts to uninstall an existing tenant from the system.
+	// It returns an error if the tenant does not exist.
+	DestroyTenant(ctx context.Context, tenantID uint64) error
+}
+
 // EvalContextTestingKnobs contains test knobs.
 type EvalContextTestingKnobs struct {
 	// AssertFuncExprReturnTypes indicates whether FuncExpr evaluations
@@ -2762,8 +2849,9 @@ type EvalContext struct {
 
 	Settings    *cluster.Settings
 	ClusterID   uuid.UUID
-	NodeID      roachpb.NodeID
 	ClusterName string
+	NodeID      *base.SQLIDContainer
+	Codec       keys.SQLCodec
 
 	// Locality contains the location of the current node as a set of user-defined
 	// key/value pairs, ordered from most inclusive to least inclusive. If there
@@ -2820,6 +2908,14 @@ type EvalContext struct {
 
 	Sequence SequenceOperators
 
+	Tenant TenantOperator
+
+	// DistSQLTypeResolver is a type resolver used during execution of DistSQL
+	// flows. It is limited to only provide access to types via ID, meaning that
+	// it cannot perform resolution of qualified names into types. It will be nil
+	// when not in the context of a DistSQL flow.
+	DistSQLTypeResolver TypeReferenceResolver
+
 	// The transaction in which the statement is executing.
 	Txn *kv.Txn
 	// A handle to the database.
@@ -2842,6 +2938,16 @@ type EvalContext struct {
 	TestingKnobs EvalContextTestingKnobs
 
 	Mon *mon.BytesMonitor
+
+	// SingleDatumAggMemAccount is a memory account that all aggregate builtins
+	// that store a single datum will share to account for the memory needed to
+	// perform the aggregation (i.e. memory not reported by AggregateFunc.Size
+	// method). This memory account exists so that such aggregate functions
+	// could "batch" their reservations - otherwise, we end up a situation
+	// where each aggregate function struct grows its own memory account by
+	// tiny amount, yet the account reserves a lot more resulting in
+	// significantly overestimating the memory usage.
+	SingleDatumAggMemAccount *mon.BoundAccount
 }
 
 // MakeTestingEvalContext returns an EvalContext that includes a MemoryMonitor.
@@ -2863,9 +2969,11 @@ func MakeTestingEvalContext(st *cluster.Settings) EvalContext {
 // EvalContext so do not start or close the memory monitor.
 func MakeTestingEvalContextWithMon(st *cluster.Settings, monitor *mon.BytesMonitor) EvalContext {
 	ctx := EvalContext{
+		Codec:       keys.SystemSQLCodec,
 		Txn:         &kv.Txn{},
 		SessionData: &sessiondata.SessionData{},
 		Settings:    st,
+		NodeID:      base.TestingIDContainer,
 	}
 	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	ctx.Mon = monitor
@@ -2951,6 +3059,11 @@ func TimestampToDecimal(ts hlc.Timestamp) *DDecimal {
 	val.Mul(val, big10E10)
 	val.Add(val, big.NewInt(int64(ts.Logical)))
 
+	// val must be positive. If it was set to a negative value above,
+	// transfer the sign to res.Negative.
+	res.Negative = val.Sign() < 0
+	val.Abs(val)
+
 	// Shift 10 decimals to the right, so that the logical
 	// field appears as fractional part.
 	res.Decimal.Exponent = -10
@@ -2961,7 +3074,7 @@ func TimestampToDecimal(ts hlc.Timestamp) *DDecimal {
 // inexact DTimestamp by dropping the logical counter and using the wall
 // time at the microsecond precision.
 func TimestampToInexactDTimestamp(ts hlc.Timestamp) *DTimestamp {
-	return MakeDTimestamp(timeutil.Unix(0, ts.WallTime), time.Microsecond)
+	return MustMakeDTimestamp(timeutil.Unix(0, ts.WallTime), time.Microsecond)
 }
 
 // GetRelativeParseTime implements ParseTimeContext.
@@ -2981,7 +3094,7 @@ func (ctx *EvalContext) GetTxnTimestamp(precision time.Duration) *DTimestampTZ {
 	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
 		panic(errors.AssertionFailedf("zero transaction timestamp in EvalContext"))
 	}
-	return MakeDTimestampTZ(ctx.GetRelativeParseTime(), precision)
+	return MustMakeDTimestampTZ(ctx.GetRelativeParseTime(), precision)
 }
 
 // GetTxnTimestampNoZone retrieves the current transaction timestamp as per
@@ -2995,7 +3108,7 @@ func (ctx *EvalContext) GetTxnTimestampNoZone(precision time.Duration) *DTimesta
 	// Move the time to UTC, but keeping the location's time.
 	t := ctx.GetRelativeParseTime()
 	_, offsetSecs := t.Zone()
-	return MakeDTimestamp(t.Add(time.Second*time.Duration(offsetSecs)).In(time.UTC), precision)
+	return MustMakeDTimestamp(t.Add(time.Second*time.Duration(offsetSecs)).In(time.UTC), precision)
 }
 
 // GetTxnTime retrieves the current transaction time as per
@@ -3207,7 +3320,7 @@ func queryOidWithJoin(
 			info.tableName, info.nameCol, info.tableName, joinClause, queryCol, additionalWhere),
 		d)
 	if err != nil {
-		if _, ok := errors.UnwrapAll(err).(*MultipleResultsError); ok {
+		if errors.HasType(err, (*MultipleResultsError)(nil)) {
 			return nil, pgerror.Newf(pgcode.AmbiguousAlias,
 				"more than one %s named %s", info.objName, d)
 		}
@@ -3237,7 +3350,7 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 		return d, nil
 	}
 	d = UnwrapDatum(ctx, d)
-	return PerformCast(ctx, d, expr.Type)
+	return PerformCast(ctx, d, expr.ResolvedType())
 }
 
 // PerformCast performs a cast from the provided Datum to the specified
@@ -3251,7 +3364,16 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 				return d, nil
 			}
 			var a DBitArray
-			a.BitArray = v.BitArray.ToWidth(uint(t.Width()))
+			switch t.Oid() {
+			case oid.T_varbit:
+				// VARBITs do not have padding attached.
+				a.BitArray = v.BitArray.Clone()
+				if uint(t.Width()) < a.BitArray.BitLen() {
+					a.BitArray = a.BitArray.ToWidth(uint(t.Width()))
+				}
+			default:
+				a.BitArray = v.BitArray.Clone().ToWidth(uint(t.Width()))
+			}
 			return &a, nil
 		case *DInt:
 			return NewDBitArrayFromInt(int64(*v), uint(t.Width()))
@@ -3363,6 +3485,14 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			return res, nil
 		}
 
+	case types.EnumFamily:
+		switch v := d.(type) {
+		case *DString:
+			return MakeDEnumFromLogicalRepresentation(t, string(*v))
+		case *DEnum:
+			return d, nil
+		}
+
 	case types.FloatFamily:
 		switch v := d.(type) {
 		case *DBool:
@@ -3453,6 +3583,12 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			return nil, err
 		}
 		if !unset {
+			// dd.Coeff must be positive. If it was set to a negative value
+			// above, transfer the sign to dd.Negative.
+			if dd.Coeff.Sign() < 0 {
+				dd.Negative = true
+				dd.Coeff.Abs(&dd.Coeff)
+			}
 			err = LimitDecimalWidth(&dd.Decimal, int(t.Precision()), int(t.Scale()))
 			return &dd, err
 		}
@@ -3467,12 +3603,16 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 				ctx.SessionData.DataConversion.GetFloatPrec(), 64)
 		case *DBool, *DInt, *DDecimal:
 			s = d.String()
-		case *DTimestamp, *DDate, *DTime, *DTimeTZ:
+		case *DTimestamp, *DDate, *DTime, *DTimeTZ, *DGeography, *DGeometry:
 			s = AsStringWithFlags(d, FmtBareStrings)
 		case *DTimestampTZ:
 			// Convert to context timezone for correct display.
+			ts, err := MakeDTimestampTZ(t.In(ctx.GetLocation()), time.Microsecond)
+			if err != nil {
+				return nil, err
+			}
 			s = AsStringWithFlags(
-				MakeDTimestampTZ(t.In(ctx.GetLocation()), time.Microsecond),
+				ts,
 				FmtBareStrings,
 			)
 		case *DTuple:
@@ -3499,6 +3639,8 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			s = t.String()
 		case *DJSON:
 			s = t.JSON.String()
+		case *DEnum:
+			s = t.LogicalRep
 		}
 		switch t.Family() {
 		case types.StringFamily:
@@ -3555,6 +3697,61 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			return d, nil
 		}
 
+	case types.GeographyFamily:
+		switch d := d.(type) {
+		case *DString:
+			return ParseDGeography(string(*d))
+		case *DCollatedString:
+			return ParseDGeography(d.Contents)
+		case *DGeography:
+			if err := geo.GeospatialTypeFitsColumnMetadata(
+				d.Geography,
+				t.InternalType.GeoMetadata.SRID,
+				t.InternalType.GeoMetadata.Shape,
+			); err != nil {
+				return nil, err
+			}
+			return d, nil
+		case *DGeometry:
+			g, err := d.AsGeography()
+			if err != nil {
+				return nil, err
+			}
+			if err := geo.GeospatialTypeFitsColumnMetadata(
+				g,
+				t.InternalType.GeoMetadata.SRID,
+				t.InternalType.GeoMetadata.Shape,
+			); err != nil {
+				return nil, err
+			}
+			return &DGeography{g}, nil
+		}
+	case types.GeometryFamily:
+		switch d := d.(type) {
+		case *DString:
+			return ParseDGeometry(string(*d))
+		case *DCollatedString:
+			return ParseDGeometry(d.Contents)
+		case *DGeometry:
+			if err := geo.GeospatialTypeFitsColumnMetadata(
+				d.Geometry,
+				t.InternalType.GeoMetadata.SRID,
+				t.InternalType.GeoMetadata.Shape,
+			); err != nil {
+				return nil, err
+			}
+			return d, nil
+		case *DGeography:
+			if err := geo.GeospatialTypeFitsColumnMetadata(
+				d.Geography,
+				t.InternalType.GeoMetadata.SRID,
+				t.InternalType.GeoMetadata.Shape,
+			); err != nil {
+				return nil, err
+			}
+			return &DGeometry{d.AsGeometry()}, nil
+		}
+
 	case types.DateFamily:
 		switch d := d.(type) {
 		case *DString:
@@ -3588,7 +3785,11 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			return MakeDTime(timeofday.FromTime(d.Time).Round(roundTo)), nil
 		case *DTimestampTZ:
 			// Strip time zone. Times don't carry their location.
-			return MakeDTime(timeofday.FromTime(d.stripTimeZone(ctx).Time).Round(roundTo)), nil
+			stripped, err := d.stripTimeZone(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return MakeDTime(timeofday.FromTime(stripped.Time).Round(roundTo)), nil
 		case *DInterval:
 			return MakeDTime(timeofday.Min.Add(d.Duration).Round(roundTo)), nil
 		}
@@ -3618,14 +3819,21 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			return ParseDTimestamp(ctx, d.Contents, roundTo)
 		case *DDate:
 			t, err := d.ToTime()
-			return MakeDTimestamp(t, roundTo), err
+			if err != nil {
+				return nil, err
+			}
+			return MakeDTimestamp(t, roundTo)
 		case *DInt:
-			return MakeDTimestamp(timeutil.Unix(int64(*d), 0), roundTo), nil
+			return MakeDTimestamp(timeutil.Unix(int64(*d), 0), roundTo)
 		case *DTimestamp:
-			return d.Round(roundTo), nil
+			return d.Round(roundTo)
 		case *DTimestampTZ:
 			// Strip time zone. Timestamps don't carry their location.
-			return d.stripTimeZone(ctx).Round(roundTo), nil
+			stripped, err := d.stripTimeZone(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return stripped.Round(roundTo)
 		}
 
 	case types.TimestampTZFamily:
@@ -3638,17 +3846,20 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 			return ParseDTimestampTZ(ctx, d.Contents, roundTo)
 		case *DDate:
 			t, err := d.ToTime()
+			if err != nil {
+				return nil, err
+			}
 			_, before := t.Zone()
 			_, after := t.In(ctx.GetLocation()).Zone()
-			return MakeDTimestampTZ(t.Add(time.Duration(before-after)*time.Second), roundTo), err
+			return MakeDTimestampTZ(t.Add(time.Duration(before-after)*time.Second), roundTo)
 		case *DTimestamp:
 			_, before := d.Time.Zone()
 			_, after := d.Time.In(ctx.GetLocation()).Zone()
-			return MakeDTimestampTZ(d.Time.Add(time.Duration(before-after)*time.Second), roundTo), nil
+			return MakeDTimestampTZ(d.Time.Add(time.Duration(before-after)*time.Second), roundTo)
 		case *DInt:
-			return MakeDTimestampTZ(timeutil.Unix(int64(*d), 0), roundTo), nil
+			return MakeDTimestampTZ(timeutil.Unix(int64(*d), 0), roundTo)
 		case *DTimestampTZ:
-			return d.Round(roundTo), nil
+			return d.Round(roundTo)
 		}
 
 	case types.IntervalFamily:
@@ -3845,7 +4056,7 @@ func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
 				return &DOid{
 					semanticType: t,
 					DInt:         DInt(id),
-					name:         tn.TableName.String(),
+					name:         tn.ObjectName.String(),
 				}, nil
 			default:
 				return queryOid(ctx, t, NewDString(s))
@@ -4107,7 +4318,7 @@ func (expr *IsOfTypeExpr) Eval(ctx *EvalContext) (Datum, error) {
 	}
 	datumTyp := d.ResolvedType()
 
-	for _, t := range expr.Types {
+	for _, t := range expr.ResolvedTypes() {
 		if datumTyp.Equivalent(t) {
 			return MakeDBool(DBool(!expr.Not)), nil
 		}
@@ -4129,6 +4340,48 @@ func (expr *NotExpr) Eval(ctx *EvalContext) (Datum, error) {
 		return nil, err
 	}
 	return MakeDBool(!v), nil
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *IsNullExpr) Eval(ctx *EvalContext) (Datum, error) {
+	d, err := expr.Expr.(TypedExpr).Eval(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if d == DNull {
+		return MakeDBool(true), nil
+	}
+	if t, ok := d.(*DTuple); ok {
+		// A tuple IS NULL if all elements are NULL.
+		for _, tupleDatum := range t.D {
+			if tupleDatum != DNull {
+				return MakeDBool(false), nil
+			}
+		}
+		return MakeDBool(true), nil
+	}
+	return MakeDBool(false), nil
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *IsNotNullExpr) Eval(ctx *EvalContext) (Datum, error) {
+	d, err := expr.Expr.(TypedExpr).Eval(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if d == DNull {
+		return MakeDBool(false), nil
+	}
+	if t, ok := d.(*DTuple); ok {
+		// A tuple IS NOT NULL if all elements are not NULL.
+		for _, tupleDatum := range t.D {
+			if tupleDatum == DNull {
+				return MakeDBool(false), nil
+			}
+		}
+		return MakeDBool(true), nil
+	}
+	return MakeDBool(true), nil
 }
 
 // Eval implements the TypedExpr interface.
@@ -4372,6 +4625,21 @@ func (t *DInterval) Eval(_ *EvalContext) (Datum, error) {
 }
 
 // Eval implements the TypedExpr interface.
+func (t *DGeography) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
+}
+
+// Eval implements the TypedExpr interface.
+func (t *DGeometry) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
+}
+
+// Eval implements the TypedExpr interface.
+func (t *DEnum) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
+}
+
+// Eval implements the TypedExpr interface.
 func (t *DJSON) Eval(_ *EvalContext) (Datum, error) {
 	return t, nil
 }
@@ -4446,7 +4714,7 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 		// type for the placeholder. In this case, we cast the expression to
 		// the desired type.
 		// TODO(jordan): introduce a restriction on what casts are allowed here.
-		cast := &CastExpr{Expr: e, Type: typ}
+		cast := NewTypedCastExpr(e, typ)
 		return cast.Eval(ctx)
 	}
 	return e.Eval(ctx)
@@ -5364,9 +5632,39 @@ func (c *CallbackValueGenerator) Next(ctx context.Context) (bool, error) {
 }
 
 // Values is part of the ValueGenerator interface.
-func (c *CallbackValueGenerator) Values() Datums {
-	return Datums{NewDInt(DInt(c.val))}
+func (c *CallbackValueGenerator) Values() (Datums, error) {
+	return Datums{NewDInt(DInt(c.val))}, nil
 }
 
 // Close is part of the ValueGenerator interface.
 func (c *CallbackValueGenerator) Close() {}
+
+// Sqrt returns the square root of x.
+func Sqrt(x float64) (*DFloat, error) {
+	if x < 0.0 {
+		return nil, errSqrtOfNegNumber
+	}
+	return NewDFloat(DFloat(math.Sqrt(x))), nil
+}
+
+// DecimalSqrt returns the square root of x.
+func DecimalSqrt(x *apd.Decimal) (*DDecimal, error) {
+	if x.Sign() < 0 {
+		return nil, errSqrtOfNegNumber
+	}
+	dd := &DDecimal{}
+	_, err := DecimalCtx.Sqrt(&dd.Decimal, x)
+	return dd, err
+}
+
+// Cbrt returns the cube root of x.
+func Cbrt(x float64) (*DFloat, error) {
+	return NewDFloat(DFloat(math.Cbrt(x))), nil
+}
+
+// DecimalCbrt returns the cube root of x.
+func DecimalCbrt(x *apd.Decimal) (*DDecimal, error) {
+	dd := &DDecimal{}
+	_, err := DecimalCtx.Cbrt(&dd.Decimal, x)
+	return dd, err
+}

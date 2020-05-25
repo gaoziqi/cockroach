@@ -60,7 +60,7 @@ function ProblemRangeList(props: {
         {
           _.map(ids, id => {
             return (
-              <Link key={id} className="problems-link" to={`reports/range/${id}`}>
+              <Link key={id} className="problems-link" to={`/reports/range/${id}`}>
                 {id}
               </Link>
             );
@@ -89,14 +89,14 @@ export class ProblemRanges extends React.Component<ProblemRangesProps, {}> {
     props.refreshProblemRanges(problemRangeRequestFromProps(props));
   }
 
-  componentWillMount() {
+  componentDidMount() {
     // Refresh nodes status query when mounting.
     this.refresh();
   }
 
-  componentWillReceiveProps(nextProps: ProblemRangesProps) {
-    if (this.props.location !== nextProps.location) {
-      this.refresh(nextProps);
+  componentDidUpdate(prevProps: ProblemRangesProps) {
+    if (!_.isEqual(this.props.location, prevProps.location)) {
+      this.refresh(this.props);
     }
   }
 

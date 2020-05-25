@@ -18,6 +18,8 @@ import (
 	"io/ioutil"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -28,11 +30,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/vfs"
-	"github.com/pkg/errors"
 )
 
 // MVCCKeyCompare compares cockroach keys, including the MVCC timestamps.
@@ -92,7 +94,7 @@ var MVCCComparer = &pebble.Comparer{
 		return pebble.DefaultComparer.AbbreviatedKey(key)
 	},
 
-	Format: func(k []byte) fmt.Formatter {
+	FormatKey: func(k []byte) fmt.Formatter {
 		decoded, err := DecodeMVCCKey(k)
 		if err != nil {
 			return mvccKeyFormatter{err: err}
@@ -249,21 +251,34 @@ func (t *pebbleTimeBoundPropCollector) Name() string {
 	return "TimeBoundTblPropCollectorFactory"
 }
 
+var _ pebble.NeedCompacter = &pebbleDeleteRangeCollector{}
+
 // pebbleDeleteRangeCollector marks an sstable for compaction that contains a
 // range tombstone.
-type pebbleDeleteRangeCollector struct{}
+type pebbleDeleteRangeCollector struct {
+	numRangeTombstones int
+}
 
-func (pebbleDeleteRangeCollector) Add(key pebble.InternalKey, value []byte) error {
-	// TODO(peter): track whether a range tombstone is present. Need to extend
-	// the TablePropertyCollector interface.
+func (c *pebbleDeleteRangeCollector) Add(key pebble.InternalKey, value []byte) error {
+	if key.Kind() == pebble.InternalKeyKindRangeDelete {
+		c.numRangeTombstones++
+	}
 	return nil
 }
 
-func (pebbleDeleteRangeCollector) Finish(userProps map[string]string) error {
+// NeedCompact implements the pebble.NeedCompacter interface.
+func (c *pebbleDeleteRangeCollector) NeedCompact() bool {
+	// NB: Mark any file containing range deletions as requiring a
+	// compaction. This ensures that range deletions are quickly compacted out
+	// of existence.
+	return c.numRangeTombstones > 0
+}
+
+func (*pebbleDeleteRangeCollector) Finish(userProps map[string]string) error {
 	return nil
 }
 
-func (pebbleDeleteRangeCollector) Name() string {
+func (*pebbleDeleteRangeCollector) Name() string {
 	// This constant needs to match the one used by the RocksDB version of this
 	// table property collector. DO NOT CHANGE.
 	return "DeleteRangeTblPropCollectorFactory"
@@ -345,12 +360,12 @@ type pebbleLogger struct {
 func (l pebbleLogger) Infof(format string, args ...interface{}) {
 	if pebbleLog != nil {
 		pebbleLog.LogfDepth(l.ctx, l.depth, format, args...)
-		// Only log INFO logs to the normal CockroachDB log at --v=3 and above.
-		if !log.V(3) {
-			return
-		}
+		return
 	}
-	log.InfofDepth(l.ctx, l.depth, format, args...)
+	// Only log INFO logs to the normal CockroachDB log at --v=3 and above.
+	if log.V(3) {
+		log.InfofDepth(l.ctx, l.depth, format, args...)
+	}
 }
 
 func (l pebbleLogger) Fatalf(format string, args ...interface{}) {
@@ -406,6 +421,44 @@ var _ Engine = &Pebble{}
 // code does not depend on CCL code.
 var NewEncryptedEnvFunc func(fs vfs.FS, fr *PebbleFileRegistry, dbDir string, readOnly bool, optionBytes []byte) (vfs.FS, EncryptionStatsHandler, error)
 
+// ResolveEncryptedEnvOptions fills in cfg.Opts.FS with an encrypted vfs if this
+// store has encryption-at-rest enabled. Also returns the associated file
+// registry and EncryptionStatsHandler.
+func ResolveEncryptedEnvOptions(
+	cfg *PebbleConfig,
+) (*PebbleFileRegistry, EncryptionStatsHandler, error) {
+	fileRegistry := &PebbleFileRegistry{FS: cfg.Opts.FS, DBDir: cfg.Dir, ReadOnly: cfg.Opts.ReadOnly}
+	if cfg.UseFileRegistry {
+		if err := fileRegistry.Load(); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		if err := fileRegistry.checkNoRegistryFile(); err != nil {
+			return nil, nil, fmt.Errorf("encryption was used on this store before, but no encryption flags " +
+				"specified. You need a CCL build and must fully specify the --enterprise-encryption flag")
+		}
+		fileRegistry = nil
+	}
+
+	var statsHandler EncryptionStatsHandler
+	if len(cfg.ExtraOptions) > 0 {
+		// Encryption is enabled.
+		if !cfg.UseFileRegistry {
+			return nil, nil, fmt.Errorf("file registry is needed to support encryption")
+		}
+		if NewEncryptedEnvFunc == nil {
+			return nil, nil, fmt.Errorf("encryption is enabled but no function to create the encrypted env")
+		}
+		var err error
+		cfg.Opts.FS, statsHandler, err =
+			NewEncryptedEnvFunc(cfg.Opts.FS, fileRegistry, cfg.Dir, cfg.Opts.ReadOnly, cfg.ExtraOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return fileRegistry, statsHandler, nil
+}
+
 // NewPebble creates a new Pebble instance, at the specified path.
 func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 	// pebble.Open also calls EnsureDefaults, but only after doing a clone. Call
@@ -439,34 +492,9 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (*Pebble, error) {
 		}
 	}
 
-	fileRegistry := &PebbleFileRegistry{FS: cfg.Opts.FS, DBDir: cfg.Dir, ReadOnly: cfg.Opts.ReadOnly}
-	if cfg.UseFileRegistry {
-		if err := fileRegistry.Load(); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := fileRegistry.checkNoRegistryFile(); err != nil {
-			return nil, fmt.Errorf("encryption was used on this store before, but no encryption flags " +
-				"specified. You need a CCL build and must fully specify the --enterprise-encryption flag")
-		}
-		fileRegistry = nil
-	}
-
-	var statsHandler EncryptionStatsHandler
-	if len(cfg.ExtraOptions) > 0 {
-		// Encryption is enabled.
-		if !cfg.UseFileRegistry {
-			return nil, fmt.Errorf("file registry is needed to support encryption")
-		}
-		if NewEncryptedEnvFunc == nil {
-			return nil, fmt.Errorf("encryption is enabled but no function to create the encrypted env")
-		}
-		var err error
-		cfg.Opts.FS, statsHandler, err =
-			NewEncryptedEnvFunc(cfg.Opts.FS, fileRegistry, cfg.Dir, cfg.Opts.ReadOnly, cfg.ExtraOptions)
-		if err != nil {
-			return nil, err
-		}
+	fileRegistry, statsHandler, err := ResolveEncryptedEnvOptions(&cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	// The context dance here is done so that we have a clean context without
@@ -595,7 +623,7 @@ func (p *Pebble) Get(key MVCCKey) ([]byte, error) {
 		ret = retCopy
 		closer.Close()
 	}
-	if err == pebble.ErrNotFound || len(ret) == 0 {
+	if errors.Is(err, pebble.ErrNotFound) || len(ret) == 0 {
 		return nil, nil
 	}
 	return ret, err
@@ -627,7 +655,7 @@ func (p *Pebble) GetProto(
 		closer.Close()
 		return true, keyBytes, valBytes, err
 	}
-	if err == pebble.ErrNotFound {
+	if errors.Is(err, pebble.ErrNotFound) {
 		return false, 0, 0, nil
 	}
 	return false, 0, 0, err
@@ -746,6 +774,15 @@ func (p *Pebble) Flush() error {
 // GetStats implements the Engine interface.
 func (p *Pebble) GetStats() (*Stats, error) {
 	m := p.db.Metrics()
+
+	// Aggregate compaction stats across levels.
+	var ingestedBytes, compactedBytesRead, compactedBytesWritten int64
+	for _, lm := range m.Levels {
+		ingestedBytes += int64(lm.BytesIngested)
+		compactedBytesRead += int64(lm.BytesRead)
+		compactedBytesWritten += int64(lm.BytesCompacted)
+	}
+
 	return &Stats{
 		BlockCacheHits:                 m.BlockCache.Hits,
 		BlockCacheMisses:               m.BlockCache.Misses,
@@ -755,7 +792,11 @@ func (p *Pebble) GetStats() (*Stats, error) {
 		BloomFilterPrefixUseful:        m.Filter.Hits,
 		MemtableTotalSize:              int64(m.MemTable.Size),
 		Flushes:                        m.Flush.Count,
+		FlushedBytes:                   int64(m.Levels[0].BytesFlushed),
 		Compactions:                    m.Compact.Count,
+		IngestedBytes:                  ingestedBytes,
+		CompactedBytesRead:             compactedBytesRead,
+		CompactedBytesWritten:          compactedBytesWritten,
 		TableReadersMemEstimate:        m.TableCache.Size,
 		PendingCompactionBytesEstimate: int64(m.Compact.EstimatedDebt),
 		L0FileCount:                    m.Levels[0].NumFiles,
@@ -773,7 +814,10 @@ func (p *Pebble) GetEncryptionRegistries() (*EncryptionRegistries, error) {
 		}
 	}
 	if p.fileRegistry != nil {
-		rv.FileRegistry = []byte(p.fileRegistry.getRegistryCopy().String())
+		rv.FileRegistry, err = protoutil.Marshal(p.fileRegistry.getRegistryCopy())
+		if err != nil {
+			return nil, err
+		}
 	}
 	return rv, nil
 }
@@ -793,14 +837,28 @@ func (p *Pebble) GetEnvStats() (*EnvStats, error) {
 		return nil, err
 	}
 	fr := p.fileRegistry.getRegistryCopy()
-	if fr != nil {
-		stats.TotalFiles = uint64(len(fr.Files))
-	}
 	activeKeyID, err := p.statsHandler.GetActiveDataKeyID()
 	if err != nil {
 		return nil, err
 	}
-	for _, entry := range fr.Files {
+
+	m := p.db.Metrics()
+	stats.TotalFiles = 3 /* CURRENT, MANIFEST, OPTIONS */
+	stats.TotalFiles += uint64(m.WAL.Files + m.Table.ZombieCount + m.WAL.ObsoleteFiles)
+	stats.TotalBytes = m.WAL.Size + m.Table.ZombieSize
+	for _, l := range m.Levels {
+		stats.TotalFiles += uint64(l.NumFiles)
+		stats.TotalBytes += l.Size
+	}
+
+	sstSizes := make(map[pebble.FileNum]uint64)
+	for _, ssts := range p.db.SSTables() {
+		for _, sst := range ssts {
+			sstSizes[sst.FileNum] = sst.Size
+		}
+	}
+
+	for filePath, entry := range fr.Files {
 		keyID, err := p.statsHandler.GetKeyIDFromSettings(entry.EncryptionSettings)
 		if err != nil {
 			return nil, err
@@ -808,9 +866,21 @@ func (p *Pebble) GetEnvStats() (*EnvStats, error) {
 		if len(keyID) == 0 {
 			keyID = "plain"
 		}
-		if keyID == activeKeyID {
-			stats.ActiveKeyFiles++
+		if keyID != activeKeyID {
+			continue
 		}
+		stats.ActiveKeyFiles++
+
+		filename := p.fs.PathBase(filePath)
+		numStr := strings.TrimSuffix(filename, ".sst")
+		if len(numStr) == len(filename) {
+			continue // not a sstable
+		}
+		u, err := strconv.ParseUint(numStr, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "parsing filename %q", errors.Safe(filename))
+		}
+		stats.ActiveKeyBytes += sstSizes[pebble.FileNum(u)]
 	}
 	return stats, nil
 }
@@ -909,49 +979,32 @@ func (p *Pebble) WriteFile(filename string, data []byte) error {
 	return err
 }
 
-// DeleteFile implements the FS interface.
-func (p *Pebble) DeleteFile(filename string) error {
+// Remove implements the FS interface.
+func (p *Pebble) Remove(filename string) error {
 	return p.fs.Remove(filename)
 }
 
-// DeleteDirAndFiles implements the Engine interface.
-func (p *Pebble) DeleteDirAndFiles(dir string) error {
-	// TODO(itsbilal): Implement FS.RemoveAll then call that here instead.
-	files, err := p.fs.List(dir)
+// RemoveDirAndFiles implements the Engine interface.
+func (p *Pebble) RemoveDirAndFiles(dir string) error {
+	// NB RemoveAll does not return an error if dir does not exist, but we want
+	// RemoveDirAndFiles to return an error in that case to match the RocksDB
+	// behavior.
+	_, err := p.fs.Stat(dir)
 	if err != nil {
 		return err
 	}
-
-	// Recurse through all files, calling DeleteFile or DeleteDirAndFiles as
-	// appropriate.
-	for _, filename := range files {
-		path := p.fs.PathJoin(dir, filename)
-		stat, err := p.fs.Stat(path)
-		if err != nil {
-			return err
-		}
-
-		if stat.IsDir() {
-			err = p.DeleteDirAndFiles(path)
-		} else {
-			err = p.DeleteFile(path)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return p.fs.RemoveAll(dir)
 }
 
-// LinkFile implements the FS interface.
-func (p *Pebble) LinkFile(oldname, newname string) error {
+// Link implements the FS interface.
+func (p *Pebble) Link(oldname, newname string) error {
 	return p.fs.Link(oldname, newname)
 }
 
 var _ fs.FS = &Pebble{}
 
-// CreateFile implements the FS interface.
-func (p *Pebble) CreateFile(name string) (fs.File, error) {
+// Create implements the FS interface.
+func (p *Pebble) Create(name string) (fs.File, error) {
 	// TODO(peter): On RocksDB, the MemEnv allows creating a file when the parent
 	// directory does not exist. Various tests in the storage package depend on
 	// this because they are accidentally creating the required directory on the
@@ -963,8 +1016,8 @@ func (p *Pebble) CreateFile(name string) (fs.File, error) {
 	return p.fs.Create(name)
 }
 
-// CreateFileWithSync implements the FS interface.
-func (p *Pebble) CreateFileWithSync(name string, bytesPerSync int) (fs.File, error) {
+// CreateWithSync implements the FS interface.
+func (p *Pebble) CreateWithSync(name string, bytesPerSync int) (fs.File, error) {
 	// TODO(peter): On RocksDB, the MemEnv allows creating a file when the parent
 	// directory does not exist. Various tests in the storage package depend on
 	// this because they are accidentally creating the required directory on the
@@ -980,8 +1033,8 @@ func (p *Pebble) CreateFileWithSync(name string, bytesPerSync int) (fs.File, err
 	return vfs.NewSyncingFile(f, vfs.SyncingFileOptions{BytesPerSync: bytesPerSync}), nil
 }
 
-// OpenFile implements the FS interface.
-func (p *Pebble) OpenFile(name string) (fs.File, error) {
+// Open implements the FS interface.
+func (p *Pebble) Open(name string) (fs.File, error) {
 	return p.fs.Open(name)
 }
 
@@ -990,23 +1043,23 @@ func (p *Pebble) OpenDir(name string) (fs.File, error) {
 	return p.fs.OpenDir(name)
 }
 
-// RenameFile implements the FS interface.
-func (p *Pebble) RenameFile(oldname, newname string) error {
+// Rename implements the FS interface.
+func (p *Pebble) Rename(oldname, newname string) error {
 	return p.fs.Rename(oldname, newname)
 }
 
-// CreateDir implements the FS interface.
-func (p *Pebble) CreateDir(name string) error {
+// MkdirAll implements the FS interface.
+func (p *Pebble) MkdirAll(name string) error {
 	return p.fs.MkdirAll(name, 0755)
 }
 
-// DeleteDir implements the FS interface.
-func (p *Pebble) DeleteDir(name string) error {
+// RemoveDir implements the FS interface.
+func (p *Pebble) RemoveDir(name string) error {
 	return p.fs.Remove(name)
 }
 
-// ListDir implements the FS interface.
-func (p *Pebble) ListDir(name string) ([]string, error) {
+// List implements the FS interface.
+func (p *Pebble) List(name string) ([]string, error) {
 	return p.fs.List(name)
 }
 
@@ -1203,7 +1256,7 @@ func (p *pebbleSnapshot) Get(key MVCCKey) ([]byte, error) {
 		ret = retCopy
 		closer.Close()
 	}
-	if err == pebble.ErrNotFound || len(ret) == 0 {
+	if errors.Is(err, pebble.ErrNotFound) || len(ret) == 0 {
 		return nil, nil
 	}
 	return ret, err
@@ -1227,7 +1280,7 @@ func (p *pebbleSnapshot) GetProto(
 		closer.Close()
 		return true, keyBytes, valBytes, err
 	}
-	if err == pebble.ErrNotFound {
+	if errors.Is(err, pebble.ErrNotFound) {
 		return false, 0, 0, nil
 	}
 	return false, 0, 0, err

@@ -132,13 +132,16 @@ type Memo struct {
 
 	// The following are selected fields from SessionData which can affect
 	// planning. We need to cross-check these before reusing a cached memo.
-	dataConversion    sessiondata.DataConversionConfig
-	reorderJoinsLimit int
-	zigzagJoinEnabled bool
-	optimizerFKs      bool
-	safeUpdates       bool
-	saveTablesPrefix  string
-	insertFastPath    bool
+	dataConversion      sessiondata.DataConversionConfig
+	reorderJoinsLimit   int
+	zigzagJoinEnabled   bool
+	optimizerFKChecks   bool
+	optimizerFKCascades bool
+	useHistograms       bool
+	useMultiColStats    bool
+	safeUpdates         bool
+	saveTablesPrefix    string
+	insertFastPath      bool
 
 	// curID is the highest currently in-use scalar expression ID.
 	curID opt.ScalarID
@@ -168,7 +171,10 @@ func (m *Memo) Init(evalCtx *tree.EvalContext) {
 	m.dataConversion = evalCtx.SessionData.DataConversion
 	m.reorderJoinsLimit = evalCtx.SessionData.ReorderJoinsLimit
 	m.zigzagJoinEnabled = evalCtx.SessionData.ZigzagJoinEnabled
-	m.optimizerFKs = evalCtx.SessionData.OptimizerFKs
+	m.optimizerFKChecks = evalCtx.SessionData.OptimizerFKChecks
+	m.optimizerFKCascades = evalCtx.SessionData.OptimizerFKCascades
+	m.useHistograms = evalCtx.SessionData.OptimizerUseHistograms
+	m.useMultiColStats = evalCtx.SessionData.OptimizerUseMultiColStats
 	m.safeUpdates = evalCtx.SessionData.SafeUpdates
 	m.saveTablesPrefix = evalCtx.SessionData.SaveTablesPrefix
 	m.insertFastPath = evalCtx.SessionData.InsertFastPath
@@ -275,7 +281,10 @@ func (m *Memo) IsStale(
 	if !m.dataConversion.Equals(&evalCtx.SessionData.DataConversion) ||
 		m.reorderJoinsLimit != evalCtx.SessionData.ReorderJoinsLimit ||
 		m.zigzagJoinEnabled != evalCtx.SessionData.ZigzagJoinEnabled ||
-		m.optimizerFKs != evalCtx.SessionData.OptimizerFKs ||
+		m.optimizerFKChecks != evalCtx.SessionData.OptimizerFKChecks ||
+		m.optimizerFKCascades != evalCtx.SessionData.OptimizerFKCascades ||
+		m.useHistograms != evalCtx.SessionData.OptimizerUseHistograms ||
+		m.useMultiColStats != evalCtx.SessionData.OptimizerUseMultiColStats ||
 		m.safeUpdates != evalCtx.SessionData.SafeUpdates ||
 		m.saveTablesPrefix != evalCtx.SessionData.SaveTablesPrefix ||
 		m.insertFastPath != evalCtx.SessionData.InsertFastPath {

@@ -15,20 +15,15 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func TestComputeStatsForKeySpan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	storeCfg := kvserver.TestStoreConfig(nil /* clock */)
-	storeCfg.TestingKnobs.DisableMergeQueue = true
-	mtc := &multiTestContext{
-		storeConfig: &storeCfg,
-	}
+	mtc := &multiTestContext{}
 	defer mtc.Stop()
 	mtc.Start(t, 3)
 
@@ -58,7 +53,7 @@ func TestComputeStatsForKeySpan(t *testing.T) {
 	// Create some keys across the ranges.
 	incKeys := []string{"b", "bb", "bbb", "d", "dd", "h"}
 	for _, k := range incKeys {
-		if _, err := mtc.dbs[0].Inc(context.TODO(), []byte(k), 5); err != nil {
+		if _, err := mtc.dbs[0].Inc(context.Background(), []byte(k), 5); err != nil {
 			t.Fatal(err)
 		}
 	}

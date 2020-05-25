@@ -240,6 +240,12 @@ Dumps the data as of the specified timestamp. Formats supported are the same
 as the timestamp type.`,
 	}
 
+	DumpAll = FlagInfo{
+		Name: "dump-all",
+		Description: `
+Dumps all databases, for each non-system database provides dump of all available tables.`,
+	}
+
 	Execute = FlagInfo{
 		Name:      "execute",
 		Shorthand: "e",
@@ -271,8 +277,8 @@ Reveal the SQL statements sent implicitly by the command-line utility.`,
 Simplify the SQL CLI to ease troubleshooting of CockroachDB
 issues. This echoes sent SQL, removes the database name and txn status
 from the prompt, and forces behavior to become independent on current
-transaction state. Equivalent to --echo-sql, \unset check_syntax,
-\unset smart_prompt, and \set prompt1 %n@%M>.`,
+transaction state. Equivalent to --echo-sql, \unset check_syntax and
+\set prompt1 %n@%M>.`,
 	}
 
 	SafeUpdates = FlagInfo{
@@ -367,6 +373,17 @@ or both forms can be used together, for example:
   --join=localhost:1234,localhost:2345 --join=localhost:3456
 
 </PRE>`,
+	}
+
+	JoinPreferSRVRecords = FlagInfo{
+		Name: "experimental-dns-srv",
+		Description: `
+When enabled, the node will first attempt to fetch SRV records
+from DNS for every name specified with --join. If a valid
+SRV record is found, that information is used instead
+of regular DNS A/AAAA lookups.
+This feature is experimental and may be removed or modified
+in a later version.`,
 	}
 
 	ListenAddr = FlagInfo{
@@ -504,6 +521,15 @@ If left unspecified, the address part defaults to the setting of
 --listen-addr. The port number defaults to 8080.
 An IPv6 address can also be specified with the notation [...], for
 example [::1]:8080 or [fe80::f6f2:::]:8080.`,
+	}
+
+	UnencryptedLocalhostHTTP = FlagInfo{
+		Name: "unencrypted-localhost-http",
+		Description: `
+When specified, restricts HTTP connections to localhost-only and disables
+TLS for the HTTP interface. The hostname part of --http-addr, if specified,
+is then ignored. This flag is intended for use to facilitate
+local testing without requiring certificate setups in web browsers.`,
 	}
 
 	LocalityAdvertiseAddr = FlagInfo{
@@ -662,6 +688,20 @@ fields.
 		Name:        "ca-key",
 		EnvVar:      "COCKROACH_CA_KEY",
 		Description: `Path to the CA key.`,
+	}
+
+	ClockDevice = FlagInfo{
+		Name: "clock-device",
+		Description: `
+Override HLC to use PTP hardware clock user space API when querying for current time.
+The value corresponds to the clock device to be used. This is currently only tested
+and supported on Linux.
+<PRE>
+
+  --clock-device=/dev/ptp0
+
+</PRE>
+`,
 	}
 
 	MaxOffset = FlagInfo{
@@ -875,9 +915,11 @@ If specified, print the system config contents. Beware that the output will be
 long and not particularly human-readable.`,
 	}
 
-	Decommission = FlagInfo{
-		Name:        "decommission",
-		Description: `Deprecated: use 'node decommission' instead.`,
+	DrainWait = FlagInfo{
+		Name: "drain-wait",
+		Description: `
+When non-zero, wait for the specified amount of time for the node to
+drain all active client connections and migrate away range leases.`,
 	}
 
 	Wait = FlagInfo{
@@ -1020,6 +1062,12 @@ Start with an empty database: avoid pre-loading a default dataset in
 the demo shell.`,
 	}
 
+	GeoLibsDir = FlagInfo{
+		Name: "geo-libs",
+		Description: `
+The location where all libraries for Geospatial operations is located.`,
+	}
+
 	Global = FlagInfo{
 		Name: "global",
 		Description: `
@@ -1101,5 +1149,21 @@ Addresses for network benchmark.`,
 		Name: "latency",
 		Description: `
 Latency or throughput mode.`,
+	}
+
+	ZipNodes = FlagInfo{
+		Name: "nodes",
+		Description: `
+List of nodes to include. Can be specified as a comma-delimited
+list of node IDs or ranges of node IDs, for example: 5,10-20,23.
+The default is to include all nodes.`,
+	}
+
+	ZipExcludeNodes = FlagInfo{
+		Name: "exclude-nodes",
+		Description: `
+List of nodes to exclude. Can be specified as a comma-delimited
+list of node IDs or ranges of node IDs, for example: 5,10-20,23.
+The default is to not exclude any node.`,
 	}
 )

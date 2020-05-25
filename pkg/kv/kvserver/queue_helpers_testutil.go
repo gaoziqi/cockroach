@@ -14,7 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Code in this file is for testing usage only. It is exported only because it
@@ -45,7 +45,7 @@ func forceScanAndProcess(s *Store, q *baseQueue) error {
 
 func mustForceScanAndProcess(ctx context.Context, s *Store, q *baseQueue) {
 	if err := forceScanAndProcess(s, q); err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 }
 

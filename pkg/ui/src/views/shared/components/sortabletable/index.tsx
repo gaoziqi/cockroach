@@ -8,12 +8,20 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import classNames from "classnames";
-import _ from "lodash";
-import getHighlightedText from "oss/src/util/highlightedText";
 import React from "react";
+import classNames from "classnames";
+import getHighlightedText from "src/util/highlightedText";
+import map from "lodash/map";
+import isUndefined from "lodash/isUndefined";
+import times from "lodash/times";
+
 import { DrawerComponent } from "../drawer";
+import { trackTableSort } from "src/util/analytics";
+
 import "./sortabletable.styl";
+import { Spin, Icon } from "antd";
+import SpinIcon from "src/components/icon/spin";
+import { Empty, IEmptyProps } from "src/components/empty";
 
 /**
  * SortableColumn describes the contents a single column of a
@@ -71,6 +79,11 @@ interface TableProps {
   drawer?: boolean;
   firstCellBordered?: boolean;
   renderNoResult?: React.ReactNode;
+  loading?: boolean;
+  loadingLabel?: string;
+  // empty state for table
+  empty?: boolean;
+  emptyProps?: IEmptyProps;
 }
 
 export interface ExpandableConfig {
@@ -172,7 +185,7 @@ export class SortableTable extends React.Component<TableProps> {
         }}
       >
         {expandableConfig ? this.expansionControl(expanded) : null}
-        {_.map(columns, (c: SortableColumn, colIndex: number) => {
+        {map(columns, (c: SortableColumn, colIndex: number) => {
           return (
             <td className={classNames("sort-table__cell", { "sort-table__cell--header": firstCellBordered && colIndex === 0 }, c.className)} key={colIndex}>
               {c.cell(rowIndex)}
@@ -234,24 +247,28 @@ export class SortableTable extends React.Component<TableProps> {
   }
 
   render() {
-    const { sortSetting, columns, expandableConfig, drawer, firstCellBordered, count, renderNoResult } = this.props;
+    const { sortSetting, columns, expandableConfig, drawer, firstCellBordered, count, renderNoResult, className, loading, loadingLabel, empty, emptyProps } = this.props;
     const { visible, drawerData } = this.state;
+    if (empty) {
+      return <Empty {...emptyProps}/>;
+    }
     return (
-      <React.Fragment>
-        <table className={classNames("sort-table", this.props.className)}>
+      <div className="cl-table-wrapper">
+        <table className={classNames("sort-table", className)}>
           <thead>
             <tr className="sort-table__row sort-table__row--header">
               {expandableConfig ? <th className="sort-table__cell" /> : null}
-              {_.map(columns, (c: SortableColumn, colIndex: number) => {
+              {map(columns, (c: SortableColumn, colIndex: number) => {
                 const classes = ["sort-table__cell"];
                 const style = {
                   textAlign: c.titleAlign,
                 };
                 let onClick: (e: any) => void = undefined;
 
-                if (!_.isUndefined(c.sortKey)) {
+                if (!isUndefined(c.sortKey)) {
                   classes.push("sort-table__cell--sortable");
                   onClick = () => {
+                    trackTableSort(className, c, sortSetting);
                     this.clickSort(c.sortKey);
                   };
                   if (c.sortKey === sortSetting.sortKey) {
@@ -268,16 +285,22 @@ export class SortableTable extends React.Component<TableProps> {
                 return (
                   <th className={classNames(classes)} key={colIndex} onClick={onClick} style={style}>
                     {c.title}
-                    {!_.isUndefined(c.sortKey) && <span className="sortable__actions" />}
+                    {!isUndefined(c.sortKey) && <span className="sortable__actions" />}
                   </th>
                 );
               })}
             </tr>
           </thead>
           <tbody>
-            {_.times(this.props.count, this.renderRow)}
+            {!loading && times(this.props.count, this.renderRow)}
           </tbody>
         </table>
+        {loading && (
+          <div className="table__loading">
+            <Spin className="table__loading--spin" indicator={<Icon component={SpinIcon} spin />} />
+            {loadingLabel && <span className="table__loading--label">{loadingLabel}</span>}
+          </div>
+        )}
         {drawer && (
           <DrawerComponent visible={visible} onClose={this.onClose} data={drawerData} details>
             <span className="drawer__content">{getHighlightedText(drawerData.statement, drawerData.search, true)}</span>
@@ -288,7 +311,7 @@ export class SortableTable extends React.Component<TableProps> {
             {renderNoResult}
           </div>
         )}
-      </React.Fragment>
+      </div>
     );
   }
 }

@@ -198,7 +198,7 @@ func (r *resumingHTTPReader) sendRequest(
 
 		log.Errorf(r.ctx, "HTTP:Req error: err=%s (attempt %d)", err, attempt)
 
-		if _, ok := err.(*retryableHTTPError); !ok {
+		if !errors.HasType(err, (*retryableHTTPError)(nil)) {
 			return
 		}
 	}
@@ -266,7 +266,7 @@ func (h *httpStorage) WriteFile(ctx context.Context, basename string, content io
 }
 
 func (h *httpStorage) ListFiles(_ context.Context, _ string) ([]string, error) {
-	return nil, errors.New(`http storage does not support listing files`)
+	return nil, errors.Mark(errors.New("http storage does not support listing"), ErrListingUnsupported)
 }
 
 func (h *httpStorage) Delete(ctx context.Context, basename string) error {

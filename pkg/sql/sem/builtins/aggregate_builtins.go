@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/arith"
+	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -116,63 +117,68 @@ var aggregates = map[string]builtinDefinition{
 				},
 				newArrayAggregate,
 				"Aggregates the selected values into an array.",
+				tree.VolatilityImmutable,
 			)
 		})),
 
 	"avg": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Int}, types.Decimal, newIntAvgAggregate,
-			"Calculates the average of the selected values."),
+			"Calculates the average of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Float}, types.Float, newFloatAvgAggregate,
-			"Calculates the average of the selected values."),
+			"Calculates the average of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Decimal}, types.Decimal, newDecimalAvgAggregate,
-			"Calculates the average of the selected values."),
+			"Calculates the average of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Interval}, types.Interval, newIntervalAvgAggregate,
-			"Calculates the average of the selected values."),
+			"Calculates the average of the selected values.", tree.VolatilityImmutable),
 	),
 
 	"bit_and": makeBuiltin(aggProps(),
-		makeAggOverload([]*types.T{types.Int}, types.Int, newBitAndAggregate,
-			"Calculates the bitwise AND of all non-null input values, or null if none."),
+		makeAggOverload([]*types.T{types.Int}, types.Int, newIntBitAndAggregate,
+			"Calculates the bitwise AND of all non-null input values, or null if none.", tree.VolatilityImmutable),
+		makeAggOverload([]*types.T{types.VarBit}, types.VarBit, newBitBitAndAggregate,
+			"Calculates the bitwise AND of all non-null input values, or null if none.", tree.VolatilityImmutable),
 	),
 
 	"bit_or": makeBuiltin(aggProps(),
-		makeAggOverload([]*types.T{types.Int}, types.Int, newBitOrAggregate,
-			"Calculates the bitwise OR of all non-null input values, or null if none."),
+		makeAggOverload([]*types.T{types.Int}, types.Int, newIntBitOrAggregate,
+			"Calculates the bitwise OR of all non-null input values, or null if none.", tree.VolatilityImmutable),
+		makeAggOverload([]*types.T{types.VarBit}, types.VarBit, newBitBitOrAggregate,
+			"Calculates the bitwise OR of all non-null input values, or null if none.", tree.VolatilityImmutable),
 	),
 
 	"bool_and": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Bool}, types.Bool, newBoolAndAggregate,
-			"Calculates the boolean value of `AND`ing all selected values."),
+			"Calculates the boolean value of `AND`ing all selected values.", tree.VolatilityImmutable),
 	),
 
 	"bool_or": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Bool}, types.Bool, newBoolOrAggregate,
-			"Calculates the boolean value of `OR`ing all selected values."),
+			"Calculates the boolean value of `OR`ing all selected values.", tree.VolatilityImmutable),
 	),
 
 	"concat_agg": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.String}, types.String, newStringConcatAggregate,
-			"Concatenates all selected values."),
+			"Concatenates all selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Bytes}, types.Bytes, newBytesConcatAggregate,
-			"Concatenates all selected values."),
+			"Concatenates all selected values.", tree.VolatilityImmutable),
 		// TODO(eisen): support collated strings when the type system properly
 		// supports parametric types.
 	),
 
 	"corr": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Float, types.Float}, types.Float, newCorrAggregate,
-			"Calculates the correlation coefficient of the selected values."),
+			"Calculates the correlation coefficient of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Int, types.Int}, types.Float, newCorrAggregate,
-			"Calculates the correlation coefficient of the selected values."),
+			"Calculates the correlation coefficient of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Float, types.Int}, types.Float, newCorrAggregate,
-			"Calculates the correlation coefficient of the selected values."),
+			"Calculates the correlation coefficient of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Int, types.Float}, types.Float, newCorrAggregate,
-			"Calculates the correlation coefficient of the selected values."),
+			"Calculates the correlation coefficient of the selected values.", tree.VolatilityImmutable),
 	),
 
 	"count": makeBuiltin(aggPropsNullableArgs(),
 		makeAggOverload([]*types.T{types.Any}, types.Int, newCountAggregate,
-			"Calculates the number of selected elements."),
+			"Calculates the number of selected elements.", tree.VolatilityImmutable),
 	),
 
 	"count_rows": makeBuiltin(aggProps(),
@@ -188,57 +194,58 @@ var aggregates = map[string]builtinDefinition{
 					},
 				)
 			},
-			Info: "Calculates the number of rows.",
+			Info:       "Calculates the number of rows.",
+			Volatility: tree.VolatilityImmutable,
 		},
 	),
 
 	"every": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Bool}, types.Bool, newBoolAndAggregate,
-			"Calculates the boolean value of `AND`ing all selected values."),
+			"Calculates the boolean value of `AND`ing all selected values.", tree.VolatilityImmutable),
 	),
 
 	"max": collectOverloads(aggProps(), types.Scalar,
 		func(t *types.T) tree.Overload {
 			return makeAggOverload([]*types.T{t}, t, newMaxAggregate,
-				"Identifies the maximum selected value.")
+				"Identifies the maximum selected value.", tree.VolatilityImmutable)
 		}),
 
 	"min": collectOverloads(aggProps(), types.Scalar,
 		func(t *types.T) tree.Overload {
 			return makeAggOverload([]*types.T{t}, t, newMinAggregate,
-				"Identifies the minimum selected value.")
+				"Identifies the minimum selected value.", tree.VolatilityImmutable)
 		}),
 
 	"string_agg": makeBuiltin(aggPropsNullableArgs(),
 		makeAggOverload([]*types.T{types.String, types.String}, types.String, newStringConcatAggregate,
-			"Concatenates all selected values using the provided delimiter."),
+			"Concatenates all selected values using the provided delimiter.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Bytes, types.Bytes}, types.Bytes, newBytesConcatAggregate,
-			"Concatenates all selected values using the provided delimiter."),
+			"Concatenates all selected values using the provided delimiter.", tree.VolatilityImmutable),
 	),
 
 	"sum_int": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Int}, types.Int, newSmallIntSumAggregate,
-			"Calculates the sum of the selected values."),
+			"Calculates the sum of the selected values.", tree.VolatilityImmutable),
 	),
 
 	"sum": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Int}, types.Decimal, newIntSumAggregate,
-			"Calculates the sum of the selected values."),
+			"Calculates the sum of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Float}, types.Float, newFloatSumAggregate,
-			"Calculates the sum of the selected values."),
+			"Calculates the sum of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Decimal}, types.Decimal, newDecimalSumAggregate,
-			"Calculates the sum of the selected values."),
+			"Calculates the sum of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Interval}, types.Interval, newIntervalSumAggregate,
-			"Calculates the sum of the selected values."),
+			"Calculates the sum of the selected values.", tree.VolatilityImmutable),
 	),
 
 	"sqrdiff": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Int}, types.Decimal, newIntSqrDiffAggregate,
-			"Calculates the sum of squared differences from the mean of the selected values."),
+			"Calculates the sum of squared differences from the mean of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Decimal}, types.Decimal, newDecimalSqrDiffAggregate,
-			"Calculates the sum of squared differences from the mean of the selected values."),
+			"Calculates the sum of squared differences from the mean of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Float}, types.Float, newFloatSqrDiffAggregate,
-			"Calculates the sum of squared differences from the mean of the selected values."),
+			"Calculates the sum of squared differences from the mean of the selected values.", tree.VolatilityImmutable),
 	),
 
 	// final_(variance|stddev) computes the global (variance|standard deviation)
@@ -258,12 +265,14 @@ var aggregates = map[string]builtinDefinition{
 			types.Decimal,
 			newDecimalFinalVarianceAggregate,
 			"Calculates the variance from the selected locally-computed squared difference values.",
+			tree.VolatilityImmutable,
 		),
 		makeAggOverload(
 			[]*types.T{types.Float, types.Float, types.Int},
 			types.Float,
 			newFloatFinalVarianceAggregate,
 			"Calculates the variance from the selected locally-computed squared difference values.",
+			tree.VolatilityImmutable,
 		),
 	)),
 
@@ -274,48 +283,45 @@ var aggregates = map[string]builtinDefinition{
 			types.Decimal,
 			newDecimalFinalStdDevAggregate,
 			"Calculates the standard deviation from the selected locally-computed squared difference values.",
+			tree.VolatilityImmutable,
 		),
 		makeAggOverload(
 			[]*types.T{types.Float, types.Float, types.Int},
 			types.Float,
 			newFloatFinalStdDevAggregate,
 			"Calculates the standard deviation from the selected locally-computed squared difference values.",
+			tree.VolatilityImmutable,
 		),
 	)),
 
 	"variance": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Int}, types.Decimal, newIntVarianceAggregate,
-			"Calculates the variance of the selected values."),
+			"Calculates the variance of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Decimal}, types.Decimal, newDecimalVarianceAggregate,
-			"Calculates the variance of the selected values."),
+			"Calculates the variance of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Float}, types.Float, newFloatVarianceAggregate,
-			"Calculates the variance of the selected values."),
+			"Calculates the variance of the selected values.", tree.VolatilityImmutable),
 	),
 
-	"stddev": makeBuiltin(aggProps(),
-		makeAggOverload([]*types.T{types.Int}, types.Decimal, newIntStdDevAggregate,
-			"Calculates the standard deviation of the selected values."),
-		makeAggOverload([]*types.T{types.Decimal}, types.Decimal, newDecimalStdDevAggregate,
-			"Calculates the standard deviation of the selected values."),
-		makeAggOverload([]*types.T{types.Float}, types.Float, newFloatStdDevAggregate,
-			"Calculates the standard deviation of the selected values."),
-	),
+	// stddev is a historical alias for stddev_samp.
+	"stddev":      makeStdDevBuiltin(),
+	"stddev_samp": makeStdDevBuiltin(),
 
 	"xor_agg": makeBuiltin(aggProps(),
 		makeAggOverload([]*types.T{types.Bytes}, types.Bytes, newBytesXorAggregate,
-			"Calculates the bitwise XOR of the selected values."),
+			"Calculates the bitwise XOR of the selected values.", tree.VolatilityImmutable),
 		makeAggOverload([]*types.T{types.Int}, types.Int, newIntXorAggregate,
-			"Calculates the bitwise XOR of the selected values."),
+			"Calculates the bitwise XOR of the selected values.", tree.VolatilityImmutable),
 	),
 
 	"json_agg": makeBuiltin(aggPropsNullableArgs(),
 		makeAggOverload([]*types.T{types.Any}, types.Jsonb, newJSONAggregate,
-			"Aggregates values as a JSON or JSONB array."),
+			"Aggregates values as a JSON or JSONB array.", tree.VolatilityStable),
 	),
 
 	"jsonb_agg": makeBuiltin(aggPropsNullableArgs(),
 		makeAggOverload([]*types.T{types.Any}, types.Jsonb, newJSONAggregate,
-			"Aggregates values as a JSON or JSONB array."),
+			"Aggregates values as a JSON or JSONB array.", tree.VolatilityStable),
 	),
 
 	"json_object_agg":  makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 33285, Class: tree.AggregateClass, Impure: true}),
@@ -327,7 +333,94 @@ var aggregates = map[string]builtinDefinition{
 			tree.IdentityReturnType(0),
 			newAnyNotNullAggregate,
 			"Returns an arbitrary not-NULL value, or NULL if none exists.",
+			tree.VolatilityImmutable,
 		))),
+
+	// Ordered-set aggregations.
+	"percentile_disc": makeBuiltin(aggProps(),
+		makeAggOverloadWithReturnType(
+			[]*types.T{types.Float},
+			func(args []tree.TypedExpr) *types.T { return tree.UnknownReturnType },
+			builtinMustNotRun,
+			"Discrete percentile: returns the first input value whose position in the ordering equals or "+
+				"exceeds the specified fraction.",
+			tree.VolatilityImmutable),
+		makeAggOverloadWithReturnType(
+			[]*types.T{types.FloatArray},
+			func(args []tree.TypedExpr) *types.T { return tree.UnknownReturnType },
+			builtinMustNotRun,
+			"Discrete percentile: returns input values whose position in the ordering equals or "+
+				"exceeds the specified fractions.",
+			tree.VolatilityImmutable),
+	),
+	"percentile_disc_impl": makePrivate(collectOverloads(aggProps(), types.Scalar,
+		func(t *types.T) tree.Overload {
+			return makeAggOverload([]*types.T{types.Float, t}, t, newPercentileDiscAggregate,
+				"Implementation of percentile_disc.",
+				tree.VolatilityImmutable)
+		},
+		func(t *types.T) tree.Overload {
+			return makeAggOverload([]*types.T{types.FloatArray, t}, types.MakeArray(t), newPercentileDiscAggregate,
+				"Implementation of percentile_disc.",
+				tree.VolatilityImmutable)
+		},
+	)),
+	"percentile_cont": makeBuiltin(aggProps(),
+		makeAggOverload(
+			[]*types.T{types.Float},
+			types.Float,
+			builtinMustNotRun,
+			"Continuous percentile: returns a float corresponding to the specified fraction in the ordering, "+
+				"interpolating between adjacent input floats if needed.",
+			tree.VolatilityImmutable),
+		makeAggOverload(
+			[]*types.T{types.Float},
+			types.Interval,
+			builtinMustNotRun,
+			"Continuous percentile: returns an interval corresponding to the specified fraction in the ordering, "+
+				"interpolating between adjacent input intervals if needed.",
+			tree.VolatilityImmutable),
+		makeAggOverload(
+			[]*types.T{types.FloatArray},
+			types.MakeArray(types.Float),
+			builtinMustNotRun,
+			"Continuous percentile: returns floats corresponding to the specified fractions in the ordering, "+
+				"interpolating between adjacent input floats if needed.",
+			tree.VolatilityImmutable),
+		makeAggOverload(
+			[]*types.T{types.FloatArray},
+			types.MakeArray(types.Interval),
+			builtinMustNotRun,
+			"Continuous percentile: returns intervals corresponding to the specified fractions in the ordering, "+
+				"interpolating between adjacent input intervals if needed.",
+			tree.VolatilityImmutable),
+	),
+	"percentile_cont_impl": makePrivate(makeBuiltin(aggProps(),
+		makeAggOverload(
+			[]*types.T{types.Float, types.Float},
+			types.Float,
+			newPercentileContAggregate,
+			"Implementation of percentile_cont.",
+			tree.VolatilityImmutable),
+		makeAggOverload(
+			[]*types.T{types.Float, types.Interval},
+			types.Interval,
+			newPercentileContAggregate,
+			"Implementation of percentile_cont.",
+			tree.VolatilityImmutable),
+		makeAggOverload(
+			[]*types.T{types.FloatArray, types.Float},
+			types.MakeArray(types.Float),
+			newPercentileContAggregate,
+			"Implementation of percentile_cont.",
+			tree.VolatilityImmutable),
+		makeAggOverload(
+			[]*types.T{types.FloatArray, types.Interval},
+			types.MakeArray(types.Interval),
+			newPercentileContAggregate,
+			"Implementation of percentile_cont.",
+			tree.VolatilityImmutable),
+	)),
 }
 
 // AnyNotNull is the name of the aggregate returned by NewAnyNotNullAggregate.
@@ -343,12 +436,14 @@ func makeAggOverload(
 	ret *types.T,
 	f func([]*types.T, *tree.EvalContext, tree.Datums) tree.AggregateFunc,
 	info string,
+	volatility tree.Volatility,
 ) tree.Overload {
 	return makeAggOverloadWithReturnType(
 		in,
 		tree.FixedReturnType(ret),
 		f,
 		info,
+		volatility,
 	)
 }
 
@@ -357,6 +452,7 @@ func makeAggOverloadWithReturnType(
 	retType tree.ReturnTyper,
 	f func([]*types.T, *tree.EvalContext, tree.Datums) tree.AggregateFunc,
 	info string,
+	volatility tree.Volatility,
 ) tree.Overload {
 	argTypes := make(tree.ArgTypes, len(in))
 	for i, typ := range in {
@@ -373,13 +469,13 @@ func makeAggOverloadWithReturnType(
 		WindowFunc: func(params []*types.T, evalCtx *tree.EvalContext) tree.WindowFunc {
 			aggWindowFunc := f(params, evalCtx, nil /* arguments */)
 			switch w := aggWindowFunc.(type) {
-			case *MinAggregate:
+			case *minAggregate:
 				min := &slidingWindowFunc{}
 				min.sw = makeSlidingWindow(evalCtx, func(evalCtx *tree.EvalContext, a, b tree.Datum) int {
 					return -a.Compare(evalCtx, b)
 				})
 				return min
-			case *MaxAggregate:
+			case *maxAggregate:
 				max := &slidingWindowFunc{}
 				max.sw = makeSlidingWindow(evalCtx, func(evalCtx *tree.EvalContext, a, b tree.Datum) int {
 					return a.Compare(evalCtx, b)
@@ -405,8 +501,25 @@ func makeAggOverloadWithReturnType(
 				},
 			)
 		},
-		Info: info,
+		Info:       info,
+		Volatility: volatility,
 	}
+}
+
+func makeStdDevBuiltin() builtinDefinition {
+	return makeBuiltin(aggProps(),
+		makeAggOverload([]*types.T{types.Int}, types.Decimal, newIntStdDevAggregate,
+			"Calculates the standard deviation of the selected values.", tree.VolatilityImmutable),
+		makeAggOverload([]*types.T{types.Decimal}, types.Decimal, newDecimalStdDevAggregate,
+			"Calculates the standard deviation of the selected values.", tree.VolatilityImmutable),
+		makeAggOverload([]*types.T{types.Float}, types.Float, newFloatStdDevAggregate,
+			"Calculates the standard deviation of the selected values.", tree.VolatilityImmutable),
+	)
+}
+
+// builtinMustNotRun panics and indicates that a builtin cannot be run.
+func builtinMustNotRun(_ []*types.T, _ *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
+	panic(fmt.Sprint("builtin must be overridden and cannot be run directly"))
 }
 
 var _ tree.AggregateFunc = &arrayAggregate{}
@@ -414,8 +527,8 @@ var _ tree.AggregateFunc = &avgAggregate{}
 var _ tree.AggregateFunc = &corrAggregate{}
 var _ tree.AggregateFunc = &countAggregate{}
 var _ tree.AggregateFunc = &countRowsAggregate{}
-var _ tree.AggregateFunc = &MaxAggregate{}
-var _ tree.AggregateFunc = &MinAggregate{}
+var _ tree.AggregateFunc = &maxAggregate{}
+var _ tree.AggregateFunc = &minAggregate{}
 var _ tree.AggregateFunc = &smallIntSumAggregate{}
 var _ tree.AggregateFunc = &intSumAggregate{}
 var _ tree.AggregateFunc = &decimalSumAggregate{}
@@ -437,16 +550,20 @@ var _ tree.AggregateFunc = &boolOrAggregate{}
 var _ tree.AggregateFunc = &bytesXorAggregate{}
 var _ tree.AggregateFunc = &intXorAggregate{}
 var _ tree.AggregateFunc = &jsonAggregate{}
-var _ tree.AggregateFunc = &bitAndAggregate{}
-var _ tree.AggregateFunc = &bitOrAggregate{}
+var _ tree.AggregateFunc = &intBitAndAggregate{}
+var _ tree.AggregateFunc = &bitBitAndAggregate{}
+var _ tree.AggregateFunc = &intBitOrAggregate{}
+var _ tree.AggregateFunc = &bitBitOrAggregate{}
+var _ tree.AggregateFunc = &percentileDiscAggregate{}
+var _ tree.AggregateFunc = &percentileContAggregate{}
 
 const sizeOfArrayAggregate = int64(unsafe.Sizeof(arrayAggregate{}))
 const sizeOfAvgAggregate = int64(unsafe.Sizeof(avgAggregate{}))
 const sizeOfCorrAggregate = int64(unsafe.Sizeof(corrAggregate{}))
 const sizeOfCountAggregate = int64(unsafe.Sizeof(countAggregate{}))
 const sizeOfCountRowsAggregate = int64(unsafe.Sizeof(countRowsAggregate{}))
-const sizeOfMaxAggregate = int64(unsafe.Sizeof(MaxAggregate{}))
-const sizeOfMinAggregate = int64(unsafe.Sizeof(MinAggregate{}))
+const sizeOfMaxAggregate = int64(unsafe.Sizeof(maxAggregate{}))
+const sizeOfMinAggregate = int64(unsafe.Sizeof(minAggregate{}))
 const sizeOfSmallIntSumAggregate = int64(unsafe.Sizeof(smallIntSumAggregate{}))
 const sizeOfIntSumAggregate = int64(unsafe.Sizeof(intSumAggregate{}))
 const sizeOfDecimalSumAggregate = int64(unsafe.Sizeof(decimalSumAggregate{}))
@@ -468,11 +585,104 @@ const sizeOfBoolOrAggregate = int64(unsafe.Sizeof(boolOrAggregate{}))
 const sizeOfBytesXorAggregate = int64(unsafe.Sizeof(bytesXorAggregate{}))
 const sizeOfIntXorAggregate = int64(unsafe.Sizeof(intXorAggregate{}))
 const sizeOfJSONAggregate = int64(unsafe.Sizeof(jsonAggregate{}))
-const sizeOfBitAndAggregate = int64(unsafe.Sizeof(bitAndAggregate{}))
-const sizeOfBitOrAggregate = int64(unsafe.Sizeof(bitOrAggregate{}))
+const sizeOfIntBitAndAggregate = int64(unsafe.Sizeof(intBitAndAggregate{}))
+const sizeOfBitBitAndAggregate = int64(unsafe.Sizeof(bitBitAndAggregate{}))
+const sizeOfIntBitOrAggregate = int64(unsafe.Sizeof(intBitOrAggregate{}))
+const sizeOfBitBitOrAggregate = int64(unsafe.Sizeof(bitBitOrAggregate{}))
+const sizeOfPercentileDiscAggregate = int64(unsafe.Sizeof(percentileDiscAggregate{}))
+const sizeOfPercentileContAggregate = int64(unsafe.Sizeof(percentileContAggregate{}))
+
+// singleDatumAggregateBase is a utility struct that helps aggregate builtins
+// that store a single datum internally track their memory usage related to
+// that single datum.
+// It will reuse tree.EvalCtx.SingleDatumAggMemAccount when non-nil and will
+// *not* close that account upon its closure; if it is nil, then a new memory
+// account will be created specifically for this struct and that account will
+// be closed upon this struct's closure.
+type singleDatumAggregateBase struct {
+	mode singleDatumAggregateBaseMode
+	acc  *mon.BoundAccount
+	// accountedFor indicates how much memory (in bytes) have been registered
+	// with acc.
+	accountedFor int64
+}
+
+// singleDatumAggregateBaseMode indicates the mode in which
+// singleDatumAggregateBase operates with regards to resetting and closing
+// behaviors.
+type singleDatumAggregateBaseMode int
+
+const (
+	// sharedSingleDatumAggregateBaseMode is a mode in which the memory account
+	// will be grown and shrunk according the corresponding aggregate builtin's
+	// memory usage, but the account will never be cleared or closed. In this
+	// mode, singleDatumAggregateBaseMode is *not* responsible for closing the
+	// memory account.
+	sharedSingleDatumAggregateBaseMode singleDatumAggregateBaseMode = iota
+	// nonSharedSingleDatumAggregateBaseMode is a mode in which the memory
+	// account is "owned" by singleDatumAggregateBase, so the account can be
+	// cleared and closed by it. In fact, singleDatumAggregateBase is
+	// responsible for the account's closure.
+	nonSharedSingleDatumAggregateBaseMode
+)
+
+// makeSingleDatumAggregateBase makes a new singleDatumAggregateBase. If
+// evalCtx has non-nil SingleDatumAggMemAccount field, then that memory account
+// will be used by the new struct which will operate in "shared" mode
+func makeSingleDatumAggregateBase(evalCtx *tree.EvalContext) singleDatumAggregateBase {
+	if evalCtx.SingleDatumAggMemAccount == nil {
+		newAcc := evalCtx.Mon.MakeBoundAccount()
+		return singleDatumAggregateBase{
+			mode: nonSharedSingleDatumAggregateBaseMode,
+			acc:  &newAcc,
+		}
+	}
+	return singleDatumAggregateBase{
+		mode: sharedSingleDatumAggregateBaseMode,
+		acc:  evalCtx.SingleDatumAggMemAccount,
+	}
+}
+
+// updateMemoryUsage updates the memory account to reflect the new memory
+// usage. If any memory has been previously registered with this struct, then
+// the account is updated only by the delta between previous and new usages,
+// otherwise, it is grown by newUsage.
+func (b *singleDatumAggregateBase) updateMemoryUsage(ctx context.Context, newUsage int64) error {
+	if err := b.acc.Grow(ctx, newUsage-b.accountedFor); err != nil {
+		return err
+	}
+	b.accountedFor = newUsage
+	return nil
+}
+
+func (b *singleDatumAggregateBase) reset(ctx context.Context) {
+	switch b.mode {
+	case sharedSingleDatumAggregateBaseMode:
+		b.acc.Shrink(ctx, b.accountedFor)
+		b.accountedFor = 0
+	case nonSharedSingleDatumAggregateBaseMode:
+		b.acc.Clear(ctx)
+	default:
+		panic(errors.Errorf("unexpected singleDatumAggregateBaseMode: %d", b.mode))
+	}
+}
+
+func (b *singleDatumAggregateBase) close(ctx context.Context) {
+	switch b.mode {
+	case sharedSingleDatumAggregateBaseMode:
+		b.acc.Shrink(ctx, b.accountedFor)
+		b.accountedFor = 0
+	case nonSharedSingleDatumAggregateBaseMode:
+		b.acc.Close(ctx)
+	default:
+		panic(errors.Errorf("unexpected singleDatumAggregateBaseMode: %d", b.mode))
+	}
+}
 
 // See NewAnyNotNullAggregate.
 type anyNotNullAggregate struct {
+	singleDatumAggregateBase
+
 	val tree.Datum
 }
 
@@ -492,18 +702,26 @@ type anyNotNullAggregate struct {
 //
 //  - for query optimization, when moving aggregations across left joins (which
 //    add NULL values).
-func NewAnyNotNullAggregate(*tree.EvalContext, tree.Datums) tree.AggregateFunc {
-	return &anyNotNullAggregate{val: tree.DNull}
+func NewAnyNotNullAggregate(evalCtx *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
+	return &anyNotNullAggregate{
+		singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx),
+		val:                      tree.DNull,
+	}
 }
 
-func newAnyNotNullAggregate(_ []*types.T, _ *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
-	return &anyNotNullAggregate{val: tree.DNull}
+func newAnyNotNullAggregate(
+	_ []*types.T, evalCtx *tree.EvalContext, datums tree.Datums,
+) tree.AggregateFunc {
+	return NewAnyNotNullAggregate(evalCtx, datums)
 }
 
 // Add sets the value to the passed datum.
-func (a *anyNotNullAggregate) Add(_ context.Context, datum tree.Datum, _ ...tree.Datum) error {
+func (a *anyNotNullAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datum) error {
 	if a.val == tree.DNull && datum != tree.DNull {
 		a.val = datum
+		if err := a.updateMemoryUsage(ctx, int64(datum.Size())); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -514,10 +732,15 @@ func (a *anyNotNullAggregate) Result() (tree.Datum, error) {
 }
 
 // Reset implements tree.AggregateFunc interface.
-func (a *anyNotNullAggregate) Reset(context.Context) {}
+func (a *anyNotNullAggregate) Reset(ctx context.Context) {
+	a.val = tree.DNull
+	a.reset(ctx)
+}
 
 // Close is no-op in aggregates using constant space.
-func (a *anyNotNullAggregate) Close(context.Context) {}
+func (a *anyNotNullAggregate) Close(ctx context.Context) {
+	a.close(ctx)
+}
 
 // Size is part of the tree.AggregateFunc interface.
 func (a *anyNotNullAggregate) Size() int64 {
@@ -526,6 +749,9 @@ func (a *anyNotNullAggregate) Size() int64 {
 
 type arrayAggregate struct {
 	arr *tree.DArray
+	// Note that we do not embed singleDatumAggregateBase struct to help with
+	// memory accounting because arrayAggregate stores multiple datums inside
+	// of arr.
 	acc mon.BoundAccount
 }
 
@@ -650,19 +876,20 @@ func (a *avgAggregate) Size() int64 {
 }
 
 type concatAggregate struct {
+	singleDatumAggregateBase
+
 	forBytes   bool
 	sawNonNull bool
 	delimiter  string // used for non window functions
 	result     bytes.Buffer
-	acc        mon.BoundAccount
 }
 
 func newBytesConcatAggregate(
 	_ []*types.T, evalCtx *tree.EvalContext, arguments tree.Datums,
 ) tree.AggregateFunc {
 	concatAgg := &concatAggregate{
-		forBytes: true,
-		acc:      evalCtx.Mon.MakeBoundAccount(),
+		singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx),
+		forBytes:                 true,
 	}
 	if len(arguments) == 1 && arguments[0] != tree.DNull {
 		concatAgg.delimiter = string(tree.MustBeDBytes(arguments[0]))
@@ -676,7 +903,7 @@ func newStringConcatAggregate(
 	_ []*types.T, evalCtx *tree.EvalContext, arguments tree.Datums,
 ) tree.AggregateFunc {
 	concatAgg := &concatAggregate{
-		acc: evalCtx.Mon.MakeBoundAccount(),
+		singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx),
 	}
 	if len(arguments) == 1 && arguments[0] != tree.DNull {
 		concatAgg.delimiter = string(tree.MustBeDString(arguments[0]))
@@ -706,9 +933,6 @@ func (a *concatAggregate) Add(ctx context.Context, datum tree.Datum, others ...t
 			panic(fmt.Sprintf("too many other datums passed in, expected < 2, got %d", len(others)))
 		}
 		if len(delimiter) > 0 {
-			if err := a.acc.Grow(ctx, int64(len(delimiter))); err != nil {
-				return err
-			}
 			a.result.WriteString(delimiter)
 		}
 	}
@@ -718,10 +942,10 @@ func (a *concatAggregate) Add(ctx context.Context, datum tree.Datum, others ...t
 	} else {
 		arg = string(tree.MustBeDString(datum))
 	}
-	if err := a.acc.Grow(ctx, int64(len(arg))); err != nil {
+	a.result.WriteString(arg)
+	if err := a.updateMemoryUsage(ctx, int64(a.result.Cap())); err != nil {
 		return err
 	}
-	a.result.WriteString(arg)
 	return nil
 }
 
@@ -738,15 +962,17 @@ func (a *concatAggregate) Result() (tree.Datum, error) {
 }
 
 // Reset implements tree.AggregateFunc interface.
-func (a *concatAggregate) Reset(context.Context) {
+func (a *concatAggregate) Reset(ctx context.Context) {
 	a.sawNonNull = false
 	a.result.Reset()
+	// Note that a.result.Reset() does *not* release already allocated memory,
+	// so we do not reset singleDatumAggregateBase.
 }
 
 // Close allows the aggregate to release the memory it requested during
 // operation.
 func (a *concatAggregate) Close(ctx context.Context) {
-	a.acc.Close(ctx)
+	a.close(ctx)
 }
 
 // Size is part of the tree.AggregateFunc interface.
@@ -754,17 +980,17 @@ func (a *concatAggregate) Size() int64 {
 	return sizeOfConcatAggregate
 }
 
-type bitAndAggregate struct {
+type intBitAndAggregate struct {
 	sawNonNull bool
 	result     int64
 }
 
-func newBitAndAggregate(_ []*types.T, _ *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
-	return &bitAndAggregate{}
+func newIntBitAndAggregate(_ []*types.T, _ *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
+	return &intBitAndAggregate{}
 }
 
 // Add inserts one value into the running bitwise AND.
-func (a *bitAndAggregate) Add(_ context.Context, datum tree.Datum, _ ...tree.Datum) error {
+func (a *intBitAndAggregate) Add(_ context.Context, datum tree.Datum, _ ...tree.Datum) error {
 	if datum == tree.DNull {
 		return nil
 	}
@@ -782,7 +1008,7 @@ func (a *bitAndAggregate) Add(_ context.Context, datum tree.Datum, _ ...tree.Dat
 }
 
 // Result returns the bitwise AND.
-func (a *bitAndAggregate) Result() (tree.Datum, error) {
+func (a *intBitAndAggregate) Result() (tree.Datum, error) {
 	if !a.sawNonNull {
 		return tree.DNull, nil
 	}
@@ -790,30 +1016,87 @@ func (a *bitAndAggregate) Result() (tree.Datum, error) {
 }
 
 // Reset implements tree.AggregateFunc interface.
-func (a *bitAndAggregate) Reset(context.Context) {
+func (a *intBitAndAggregate) Reset(context.Context) {
 	a.sawNonNull = false
 	a.result = 0
 }
 
 // Close is part of the tree.AggregateFunc interface.
-func (a *bitAndAggregate) Close(context.Context) {}
+func (a *intBitAndAggregate) Close(context.Context) {}
 
 // Size is part of the tree.AggregateFunc interface.
-func (a *bitAndAggregate) Size() int64 {
-	return sizeOfBitAndAggregate
+func (a *intBitAndAggregate) Size() int64 {
+	return sizeOfIntBitAndAggregate
 }
 
-type bitOrAggregate struct {
+type bitBitAndAggregate struct {
+	sawNonNull bool
+	result     bitarray.BitArray
+}
+
+func newBitBitAndAggregate(_ []*types.T, _ *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
+	return &bitBitAndAggregate{}
+}
+
+// Add inserts one value into the running bitwise AND.
+func (a *bitBitAndAggregate) Add(_ context.Context, datum tree.Datum, _ ...tree.Datum) error {
+	if datum == tree.DNull {
+		return nil
+	}
+	bits := &tree.MustBeDBitArray(datum).BitArray
+	if !a.sawNonNull {
+		// This is the first non-null datum, so we simply store
+		// the provided value for the aggregation.
+		a.result = *bits
+		a.sawNonNull = true
+		return nil
+	}
+	// If the length of the current bit array is different from that of the
+	// stored value, we return an error.
+	if a.result.BitLen() != bits.BitLen() {
+		return tree.NewCannotMixBitArraySizesError("AND")
+	}
+	// This is not the first non-null datum, so we actually AND it with the
+	// aggregate so far.
+	a.result = bitarray.And(a.result, *bits)
+	return nil
+}
+
+// Result returns the bitwise AND.
+func (a *bitBitAndAggregate) Result() (tree.Datum, error) {
+	if !a.sawNonNull {
+		return tree.DNull, nil
+	}
+	return &tree.DBitArray{BitArray: a.result}, nil
+}
+
+// Reset implements tree.AggregateFunc interface.
+func (a *bitBitAndAggregate) Reset(context.Context) {
+	a.sawNonNull = false
+	a.result = bitarray.BitArray{}
+}
+
+// Close is part of the tree.AggregateFunc interface.
+func (a *bitBitAndAggregate) Close(context.Context) {}
+
+// Size is part of the tree.AggregateFunc interface.
+func (a *bitBitAndAggregate) Size() int64 {
+	return sizeOfBitBitAndAggregate
+}
+
+type intBitOrAggregate struct {
 	sawNonNull bool
 	result     int64
 }
 
-func newBitOrAggregate(_ []*types.T, _ *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
-	return &bitOrAggregate{}
+func newIntBitOrAggregate(_ []*types.T, _ *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
+	return &intBitOrAggregate{}
 }
 
 // Add inserts one value into the running bitwise OR.
-func (a *bitOrAggregate) Add(_ context.Context, datum tree.Datum, otherArgs ...tree.Datum) error {
+func (a *intBitOrAggregate) Add(
+	_ context.Context, datum tree.Datum, otherArgs ...tree.Datum,
+) error {
 	if datum == tree.DNull {
 		return nil
 	}
@@ -831,7 +1114,7 @@ func (a *bitOrAggregate) Add(_ context.Context, datum tree.Datum, otherArgs ...t
 }
 
 // Result returns the bitwise OR.
-func (a *bitOrAggregate) Result() (tree.Datum, error) {
+func (a *intBitOrAggregate) Result() (tree.Datum, error) {
 	if !a.sawNonNull {
 		return tree.DNull, nil
 	}
@@ -839,17 +1122,74 @@ func (a *bitOrAggregate) Result() (tree.Datum, error) {
 }
 
 // Reset implements tree.AggregateFunc interface.
-func (a *bitOrAggregate) Reset(context.Context) {
+func (a *intBitOrAggregate) Reset(context.Context) {
 	a.sawNonNull = false
 	a.result = 0
 }
 
 // Close is part of the tree.AggregateFunc interface.
-func (a *bitOrAggregate) Close(context.Context) {}
+func (a *intBitOrAggregate) Close(context.Context) {}
 
 // Size is part of the tree.AggregateFunc interface.
-func (a *bitOrAggregate) Size() int64 {
-	return sizeOfBitOrAggregate
+func (a *intBitOrAggregate) Size() int64 {
+	return sizeOfIntBitOrAggregate
+}
+
+type bitBitOrAggregate struct {
+	sawNonNull bool
+	result     bitarray.BitArray
+}
+
+func newBitBitOrAggregate(_ []*types.T, _ *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
+	return &bitBitOrAggregate{}
+}
+
+// Add inserts one value into the running bitwise OR.
+func (a *bitBitOrAggregate) Add(
+	_ context.Context, datum tree.Datum, otherArgs ...tree.Datum,
+) error {
+	if datum == tree.DNull {
+		return nil
+	}
+	bits := &tree.MustBeDBitArray(datum).BitArray
+	if !a.sawNonNull {
+		// This is the first non-null datum, so we simply store
+		// the provided value for the aggregation.
+		a.result = *bits
+		a.sawNonNull = true
+		return nil
+	}
+	// If the length of the current bit array is different from that of the
+	// stored value, we return an error.
+	if a.result.BitLen() != bits.BitLen() {
+		return tree.NewCannotMixBitArraySizesError("OR")
+	}
+	// This is not the first non-null datum, so we actually OR it with the
+	// aggregate so far.
+	a.result = bitarray.Or(a.result, *bits)
+	return nil
+}
+
+// Result returns the bitwise OR.
+func (a *bitBitOrAggregate) Result() (tree.Datum, error) {
+	if !a.sawNonNull {
+		return tree.DNull, nil
+	}
+	return &tree.DBitArray{BitArray: a.result}, nil
+}
+
+// Reset implements tree.AggregateFunc interface.
+func (a *bitBitOrAggregate) Reset(context.Context) {
+	a.sawNonNull = false
+	a.result = bitarray.BitArray{}
+}
+
+// Close is part of the tree.AggregateFunc interface.
+func (a *bitBitOrAggregate) Close(context.Context) {}
+
+// Size is part of the tree.AggregateFunc interface.
+func (a *bitBitOrAggregate) Size() int64 {
+	return sizeOfBitBitOrAggregate
 }
 
 type boolAndAggregate struct {
@@ -1128,41 +1468,37 @@ func (a *countRowsAggregate) Size() int64 {
 	return sizeOfCountRowsAggregate
 }
 
-// MaxAggregate keeps track of the largest value passed to Add.
-type MaxAggregate struct {
-	max     tree.Datum
-	evalCtx *tree.EvalContext
+// maxAggregate keeps track of the largest value passed to Add.
+type maxAggregate struct {
+	singleDatumAggregateBase
 
-	acc               mon.BoundAccount
-	datumSize         uintptr
+	max               tree.Datum
+	evalCtx           *tree.EvalContext
 	variableDatumSize bool
 }
 
 func newMaxAggregate(
 	params []*types.T, evalCtx *tree.EvalContext, _ tree.Datums,
 ) tree.AggregateFunc {
-	sz, variable := tree.DatumTypeSize(params[0])
-	// If the datum type has a fixed size, it will be included in the size
-	// reported by Size(). Otherwise it will be accounted for in Add(). This
-	// avoids doing unnecessary memory accounting work for fixed-size datums.
-	if variable {
-		sz = 0
-	}
-	return &MaxAggregate{
-		evalCtx:           evalCtx,
-		acc:               evalCtx.Mon.MakeBoundAccount(),
-		datumSize:         sz,
-		variableDatumSize: variable,
+	_, variable := tree.DatumTypeSize(params[0])
+	// If the datum type has a variable size, the memory account will be
+	// updated accordingly on every change to the current "max" value, but if
+	// it has a fixed size, the memory account will be updated only on the
+	// first non-null datum.
+	return &maxAggregate{
+		singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx),
+		evalCtx:                  evalCtx,
+		variableDatumSize:        variable,
 	}
 }
 
 // Add sets the max to the larger of the current max or the passed datum.
-func (a *MaxAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datum) error {
+func (a *maxAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datum) error {
 	if datum == tree.DNull {
 		return nil
 	}
 	if a.max == nil {
-		if err := a.acc.ResizeTo(ctx, int64(datum.Size())); err != nil {
+		if err := a.updateMemoryUsage(ctx, int64(datum.Size())); err != nil {
 			return err
 		}
 		a.max = datum
@@ -1172,7 +1508,7 @@ func (a *MaxAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datu
 	if c < 0 {
 		a.max = datum
 		if a.variableDatumSize {
-			if err := a.acc.ResizeTo(ctx, int64(datum.Size())); err != nil {
+			if err := a.updateMemoryUsage(ctx, int64(datum.Size())); err != nil {
 				return err
 			}
 		}
@@ -1181,7 +1517,7 @@ func (a *MaxAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datu
 }
 
 // Result returns the largest value passed to Add.
-func (a *MaxAggregate) Result() (tree.Datum, error) {
+func (a *maxAggregate) Result() (tree.Datum, error) {
 	if a.max == nil {
 		return tree.DNull, nil
 	}
@@ -1189,56 +1525,52 @@ func (a *MaxAggregate) Result() (tree.Datum, error) {
 }
 
 // Reset implements tree.AggregateFunc interface.
-func (a *MaxAggregate) Reset(ctx context.Context) {
+func (a *maxAggregate) Reset(ctx context.Context) {
 	a.max = nil
+	a.reset(ctx)
 }
 
 // Close is part of the tree.AggregateFunc interface.
-func (a *MaxAggregate) Close(ctx context.Context) {
-	a.acc.Close(ctx)
+func (a *maxAggregate) Close(ctx context.Context) {
+	a.close(ctx)
 }
 
 // Size is part of the tree.AggregateFunc interface.
-func (a *MaxAggregate) Size() int64 {
-	return sizeOfMaxAggregate + int64(a.datumSize)
+func (a *maxAggregate) Size() int64 {
+	return sizeOfMaxAggregate
 }
 
-// MinAggregate keeps track of the smallest value passed to Add.
-type MinAggregate struct {
-	min     tree.Datum
-	evalCtx *tree.EvalContext
+// minAggregate keeps track of the smallest value passed to Add.
+type minAggregate struct {
+	singleDatumAggregateBase
 
-	acc               mon.BoundAccount
-	datumSize         uintptr
+	min               tree.Datum
+	evalCtx           *tree.EvalContext
 	variableDatumSize bool
 }
 
 func newMinAggregate(
 	params []*types.T, evalCtx *tree.EvalContext, _ tree.Datums,
 ) tree.AggregateFunc {
-	sz, variable := tree.DatumTypeSize(params[0])
-	// If the datum type has a fixed size, it will be included in the size
-	// reported by Size(). Otherwise it will be accounted for in Add(). This
-	// avoids doing unnecessary memory accounting work for fixed-size datums.
-	if variable {
-		// Datum size will be accounted for in the Add method.
-		sz = 0
-	}
-	return &MinAggregate{
-		evalCtx:           evalCtx,
-		acc:               evalCtx.Mon.MakeBoundAccount(),
-		datumSize:         sz,
-		variableDatumSize: variable,
+	_, variable := tree.DatumTypeSize(params[0])
+	// If the datum type has a variable size, the memory account will be
+	// updated accordingly on every change to the current "min" value, but if
+	// it has a fixed size, the memory account will be updated only on the
+	// first non-null datum.
+	return &minAggregate{
+		singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx),
+		evalCtx:                  evalCtx,
+		variableDatumSize:        variable,
 	}
 }
 
 // Add sets the min to the smaller of the current min or the passed datum.
-func (a *MinAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datum) error {
+func (a *minAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datum) error {
 	if datum == tree.DNull {
 		return nil
 	}
 	if a.min == nil {
-		if err := a.acc.ResizeTo(ctx, int64(datum.Size())); err != nil {
+		if err := a.updateMemoryUsage(ctx, int64(datum.Size())); err != nil {
 			return err
 		}
 		a.min = datum
@@ -1248,7 +1580,7 @@ func (a *MinAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datu
 	if c > 0 {
 		a.min = datum
 		if a.variableDatumSize {
-			if err := a.acc.ResizeTo(ctx, int64(datum.Size())); err != nil {
+			if err := a.updateMemoryUsage(ctx, int64(datum.Size())); err != nil {
 				return err
 			}
 		}
@@ -1257,7 +1589,7 @@ func (a *MinAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datu
 }
 
 // Result returns the smallest value passed to Add.
-func (a *MinAggregate) Result() (tree.Datum, error) {
+func (a *minAggregate) Result() (tree.Datum, error) {
 	if a.min == nil {
 		return tree.DNull, nil
 	}
@@ -1265,18 +1597,19 @@ func (a *MinAggregate) Result() (tree.Datum, error) {
 }
 
 // Reset implements tree.AggregateFunc interface.
-func (a *MinAggregate) Reset(context.Context) {
+func (a *minAggregate) Reset(ctx context.Context) {
 	a.min = nil
+	a.reset(ctx)
 }
 
 // Close is part of the tree.AggregateFunc interface.
-func (a *MinAggregate) Close(ctx context.Context) {
-	a.acc.Close(ctx)
+func (a *minAggregate) Close(ctx context.Context) {
+	a.close(ctx)
 }
 
 // Size is part of the tree.AggregateFunc interface.
-func (a *MinAggregate) Size() int64 {
-	return sizeOfMinAggregate + int64(a.datumSize)
+func (a *minAggregate) Size() int64 {
+	return sizeOfMinAggregate
 }
 
 type smallIntSumAggregate struct {
@@ -1326,6 +1659,8 @@ func (a *smallIntSumAggregate) Size() int64 {
 }
 
 type intSumAggregate struct {
+	singleDatumAggregateBase
+
 	// Either the `intSum` and `decSum` fields contains the
 	// result. Which one is used is determined by the `large` field
 	// below.
@@ -1334,11 +1669,10 @@ type intSumAggregate struct {
 	tmpDec      apd.Decimal
 	large       bool
 	seenNonNull bool
-	acc         mon.BoundAccount
 }
 
 func newIntSumAggregate(_ []*types.T, evalCtx *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
-	return &intSumAggregate{acc: evalCtx.Mon.MakeBoundAccount()}
+	return &intSumAggregate{singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx)}
 }
 
 // Add adds the value of the passed datum to the sum.
@@ -1371,7 +1705,7 @@ func (a *intSumAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.D
 			if err != nil {
 				return err
 			}
-			if err := a.acc.ResizeTo(ctx, int64(tree.SizeOfDecimal(a.decSum))); err != nil {
+			if err := a.updateMemoryUsage(ctx, int64(tree.SizeOfDecimal(a.decSum))); err != nil {
 				return err
 			}
 		}
@@ -1396,9 +1730,10 @@ func (a *intSumAggregate) Result() (tree.Datum, error) {
 
 // Reset implements tree.AggregateFunc interface.
 func (a *intSumAggregate) Reset(context.Context) {
-	// We choose not to reset apd.Decimal's since they will be set to appropriate
-	// values when overflow occurs - we simply force the aggregate to use Go
-	// types (at least, at first).
+	// We choose not to reset apd.Decimal's since they will be set to
+	// appropriate values when overflow occurs - we simply force the aggregate
+	// to use Go types (at least, at first). That's why we also not reset the
+	// singleDatumAggregateBase.
 	a.seenNonNull = false
 	a.intSum = 0
 	a.large = false
@@ -1406,7 +1741,7 @@ func (a *intSumAggregate) Reset(context.Context) {
 
 // Close is part of the tree.AggregateFunc interface.
 func (a *intSumAggregate) Close(ctx context.Context) {
-	a.acc.Close(ctx)
+	a.close(ctx)
 }
 
 // Size is part of the tree.AggregateFunc interface.
@@ -1415,15 +1750,16 @@ func (a *intSumAggregate) Size() int64 {
 }
 
 type decimalSumAggregate struct {
+	singleDatumAggregateBase
+
 	sum        apd.Decimal
 	sawNonNull bool
-	acc        mon.BoundAccount
 }
 
 func newDecimalSumAggregate(
 	_ []*types.T, evalCtx *tree.EvalContext, _ tree.Datums,
 ) tree.AggregateFunc {
-	return &decimalSumAggregate{acc: evalCtx.Mon.MakeBoundAccount()}
+	return &decimalSumAggregate{singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx)}
 }
 
 // Add adds the value of the passed datum to the sum.
@@ -1437,7 +1773,7 @@ func (a *decimalSumAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tr
 		return err
 	}
 
-	if err := a.acc.ResizeTo(ctx, int64(tree.SizeOfDecimal(a.sum))); err != nil {
+	if err := a.updateMemoryUsage(ctx, int64(tree.SizeOfDecimal(a.sum))); err != nil {
 		return err
 	}
 
@@ -1459,12 +1795,12 @@ func (a *decimalSumAggregate) Result() (tree.Datum, error) {
 func (a *decimalSumAggregate) Reset(ctx context.Context) {
 	a.sum.SetFinite(0, 0)
 	a.sawNonNull = false
-	a.acc.Empty(ctx)
+	a.reset(ctx)
 }
 
 // Close is part of the tree.AggregateFunc interface.
 func (a *decimalSumAggregate) Close(ctx context.Context) {
-	a.acc.Close(ctx)
+	a.close(ctx)
 }
 
 // Size is part of the tree.AggregateFunc interface.
@@ -1681,6 +2017,8 @@ func (a *floatSqrDiffAggregate) Size() int64 {
 }
 
 type decimalSqrDiffAggregate struct {
+	singleDatumAggregateBase
+
 	// Variables used across iterations.
 	ed      *apd.ErrDecimal
 	count   apd.Decimal
@@ -1690,15 +2028,13 @@ type decimalSqrDiffAggregate struct {
 	// Variables used as scratch space within iterations.
 	delta apd.Decimal
 	tmp   apd.Decimal
-
-	acc mon.BoundAccount
 }
 
 func newDecimalSqrDiff(evalCtx *tree.EvalContext) decimalSqrDiff {
 	ed := apd.MakeErrDecimal(tree.IntermediateCtx)
 	return &decimalSqrDiffAggregate{
-		ed:  &ed,
-		acc: evalCtx.Mon.MakeBoundAccount(),
+		singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx),
+		ed:                       &ed,
 	}
 }
 
@@ -1737,12 +2073,12 @@ func (a *decimalSqrDiffAggregate) Add(
 	a.ed.Sub(&a.tmp, d, &a.mean)
 	a.ed.Add(&a.sqrDiff, &a.sqrDiff, a.ed.Mul(&a.delta, &a.delta, &a.tmp))
 
-	size := tree.SizeOfDecimal(a.count) +
+	size := int64(tree.SizeOfDecimal(a.count) +
 		tree.SizeOfDecimal(a.mean) +
 		tree.SizeOfDecimal(a.sqrDiff) +
 		tree.SizeOfDecimal(a.delta) +
-		tree.SizeOfDecimal(a.tmp)
-	if err := a.acc.ResizeTo(ctx, int64(size)); err != nil {
+		tree.SizeOfDecimal(a.tmp))
+	if err := a.updateMemoryUsage(ctx, size); err != nil {
 		return err
 	}
 
@@ -1762,15 +2098,16 @@ func (a *decimalSqrDiffAggregate) Result() (tree.Datum, error) {
 }
 
 // Reset implements tree.AggregateFunc interface.
-func (a *decimalSqrDiffAggregate) Reset(context.Context) {
+func (a *decimalSqrDiffAggregate) Reset(ctx context.Context) {
 	a.count.SetFinite(0, 0)
 	a.mean.SetFinite(0, 0)
 	a.sqrDiff.SetFinite(0, 0)
+	a.reset(ctx)
 }
 
 // Close is part of the tree.AggregateFunc interface.
 func (a *decimalSqrDiffAggregate) Close(ctx context.Context) {
-	a.acc.Close(ctx)
+	a.close(ctx)
 }
 
 // Size is part of the tree.AggregateFunc interface.
@@ -1856,6 +2193,8 @@ func (a *floatSumSqrDiffsAggregate) Size() int64 {
 }
 
 type decimalSumSqrDiffsAggregate struct {
+	singleDatumAggregateBase
+
 	// Variables used across iterations.
 	ed      *apd.ErrDecimal
 	count   apd.Decimal
@@ -1867,15 +2206,13 @@ type decimalSumSqrDiffsAggregate struct {
 	tmpMean  apd.Decimal
 	delta    apd.Decimal
 	tmp      apd.Decimal
-
-	acc mon.BoundAccount
 }
 
 func newDecimalSumSqrDiffs(evalCtx *tree.EvalContext) decimalSqrDiff {
 	ed := apd.MakeErrDecimal(tree.IntermediateCtx)
 	return &decimalSumSqrDiffsAggregate{
-		ed:  &ed,
-		acc: evalCtx.Mon.MakeBoundAccount(),
+		singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx),
+		ed:                       &ed,
 	}
 }
 
@@ -1934,14 +2271,14 @@ func (a *decimalSumSqrDiffsAggregate) Add(
 	// Update running mean.
 	a.ed.Add(&a.mean, &a.mean, &a.tmp)
 
-	size := tree.SizeOfDecimal(a.count) +
+	size := int64(tree.SizeOfDecimal(a.count) +
 		tree.SizeOfDecimal(a.mean) +
 		tree.SizeOfDecimal(a.sqrDiff) +
 		tree.SizeOfDecimal(a.tmpCount) +
 		tree.SizeOfDecimal(a.tmpMean) +
 		tree.SizeOfDecimal(a.delta) +
-		tree.SizeOfDecimal(a.tmp)
-	if err := a.acc.ResizeTo(ctx, int64(size)); err != nil {
+		tree.SizeOfDecimal(a.tmp))
+	if err := a.updateMemoryUsage(ctx, size); err != nil {
 		return err
 	}
 
@@ -1957,15 +2294,16 @@ func (a *decimalSumSqrDiffsAggregate) Result() (tree.Datum, error) {
 }
 
 // Reset implements tree.AggregateFunc interface.
-func (a *decimalSumSqrDiffsAggregate) Reset(context.Context) {
+func (a *decimalSumSqrDiffsAggregate) Reset(ctx context.Context) {
 	a.count.SetFinite(0, 0)
 	a.mean.SetFinite(0, 0)
 	a.sqrDiff.SetFinite(0, 0)
+	a.reset(ctx)
 }
 
 // Close is part of the tree.AggregateFunc interface.
 func (a *decimalSumSqrDiffsAggregate) Close(ctx context.Context) {
-	a.acc.Close(ctx)
+	a.close(ctx)
 }
 
 // Size is part of the tree.AggregateFunc interface.
@@ -2239,21 +2577,28 @@ func (a *decimalStdDevAggregate) Size() int64 {
 }
 
 type bytesXorAggregate struct {
+	singleDatumAggregateBase
+
 	sum        []byte
 	sawNonNull bool
 }
 
-func newBytesXorAggregate(_ []*types.T, _ *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
-	return &bytesXorAggregate{}
+func newBytesXorAggregate(
+	_ []*types.T, evalCtx *tree.EvalContext, _ tree.Datums,
+) tree.AggregateFunc {
+	return &bytesXorAggregate{singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx)}
 }
 
 // Add inserts one value into the running xor.
-func (a *bytesXorAggregate) Add(_ context.Context, datum tree.Datum, _ ...tree.Datum) error {
+func (a *bytesXorAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Datum) error {
 	if datum == tree.DNull {
 		return nil
 	}
 	t := []byte(*datum.(*tree.DBytes))
 	if !a.sawNonNull {
+		if err := a.updateMemoryUsage(ctx, int64(len(t))); err != nil {
+			return err
+		}
 		a.sum = append([]byte(nil), t...)
 	} else if len(a.sum) != len(t) {
 		return pgerror.Newf(pgcode.InvalidParameterValue,
@@ -2277,13 +2622,16 @@ func (a *bytesXorAggregate) Result() (tree.Datum, error) {
 }
 
 // Reset implements tree.AggregateFunc interface.
-func (a *bytesXorAggregate) Reset(context.Context) {
+func (a *bytesXorAggregate) Reset(ctx context.Context) {
 	a.sum = nil
 	a.sawNonNull = false
+	a.reset(ctx)
 }
 
 // Close is part of the tree.AggregateFunc interface.
-func (a *bytesXorAggregate) Close(context.Context) {}
+func (a *bytesXorAggregate) Close(ctx context.Context) {
+	a.close(ctx)
+}
 
 // Size is part of the tree.AggregateFunc interface.
 func (a *bytesXorAggregate) Size() int64 {
@@ -2333,18 +2681,19 @@ func (a *intXorAggregate) Size() int64 {
 }
 
 type jsonAggregate struct {
+	singleDatumAggregateBase
+
 	loc        *time.Location
 	builder    *json.ArrayBuilderWithCounter
-	acc        mon.BoundAccount
 	sawNonNull bool
 }
 
 func newJSONAggregate(_ []*types.T, evalCtx *tree.EvalContext, _ tree.Datums) tree.AggregateFunc {
 	return &jsonAggregate{
-		loc:        evalCtx.GetLocation(),
-		builder:    json.NewArrayBuilderWithCounter(),
-		acc:        evalCtx.Mon.MakeBoundAccount(),
-		sawNonNull: false,
+		singleDatumAggregateBase: makeSingleDatumAggregateBase(evalCtx),
+		loc:                      evalCtx.GetLocation(),
+		builder:                  json.NewArrayBuilderWithCounter(),
+		sawNonNull:               false,
 	}
 }
 
@@ -2354,9 +2703,8 @@ func (a *jsonAggregate) Add(ctx context.Context, datum tree.Datum, _ ...tree.Dat
 	if err != nil {
 		return err
 	}
-	oldSize := a.builder.Size()
 	a.builder.Add(j)
-	if err = a.acc.Grow(ctx, int64(a.builder.Size()-oldSize)); err != nil {
+	if err = a.updateMemoryUsage(ctx, int64(a.builder.Size())); err != nil {
 		return err
 	}
 	a.sawNonNull = true
@@ -2374,17 +2722,280 @@ func (a *jsonAggregate) Result() (tree.Datum, error) {
 // Reset implements tree.AggregateFunc interface.
 func (a *jsonAggregate) Reset(ctx context.Context) {
 	a.builder = json.NewArrayBuilderWithCounter()
-	a.acc.Empty(ctx)
 	a.sawNonNull = false
+	a.reset(ctx)
 }
 
 // Close allows the aggregate to release the memory it requested during
 // operation.
 func (a *jsonAggregate) Close(ctx context.Context) {
-	a.acc.Close(ctx)
+	a.close(ctx)
 }
 
 // Size is part of the tree.AggregateFunc interface.
 func (a *jsonAggregate) Size() int64 {
 	return sizeOfJSONAggregate
+}
+
+// validateInputFractions validates that the inputs are expected and returns an
+// array containing either a single fraction or multiple fractions.
+func validateInputFractions(datum tree.Datum) ([]float64, bool, error) {
+	fractions := make([]float64, 0)
+	singleInput := false
+
+	validate := func(fraction float64) error {
+		if fraction < 0 || fraction > 1.0 {
+			return pgerror.Newf(pgcode.NumericValueOutOfRange,
+				"percentile value %f is not between 0 and 1", fraction)
+		}
+		return nil
+	}
+
+	if datum.ResolvedType().Identical(types.Float) {
+		fraction := float64(tree.MustBeDFloat(datum))
+		singleInput = true
+		if err := validate(fraction); err != nil {
+			return nil, false, err
+		}
+		fractions = append(fractions, fraction)
+	} else if datum.ResolvedType().Equivalent(types.FloatArray) {
+		fractionsDatum := tree.MustBeDArray(datum)
+		for _, f := range fractionsDatum.Array {
+			fraction := float64(tree.MustBeDFloat(f))
+			if err := validate(fraction); err != nil {
+				return nil, false, err
+			}
+			fractions = append(fractions, fraction)
+		}
+	} else {
+		panic(fmt.Sprintf("unexpected input type, %s", datum.ResolvedType()))
+	}
+	return fractions, singleInput, nil
+}
+
+type percentileDiscAggregate struct {
+	arr *tree.DArray
+	// Note that we do not embed singleDatumAggregateBase struct to help with
+	// memory accounting because percentileDiscAggregate stores multiple datums
+	// inside of arr.
+	acc mon.BoundAccount
+	// We need singleInput to differentiate whether the input was a single
+	// fraction, or an array of fractions.
+	singleInput bool
+	fractions   []float64
+}
+
+func newPercentileDiscAggregate(
+	params []*types.T, evalCtx *tree.EvalContext, _ tree.Datums,
+) tree.AggregateFunc {
+	return &percentileDiscAggregate{
+		arr: tree.NewDArray(params[1]),
+		acc: evalCtx.Mon.MakeBoundAccount(),
+	}
+}
+
+// Add stores the input percentile and all the values to calculate the discrete percentile.
+func (a *percentileDiscAggregate) Add(
+	ctx context.Context, datum tree.Datum, others ...tree.Datum,
+) error {
+	if len(a.fractions) == 0 && datum != tree.DNull {
+		fractions, singleInput, err := validateInputFractions(datum)
+		if err != nil {
+			return err
+		}
+		a.fractions = fractions
+		a.singleInput = singleInput
+	}
+
+	if len(others) == 1 && others[0] != tree.DNull {
+		if err := a.acc.Grow(ctx, int64(others[0].Size())); err != nil {
+			return err
+		}
+		return a.arr.Append(others[0])
+	} else if len(others) != 1 {
+		panic(fmt.Sprintf("unexpected number of other datums passed in, expected 1, got %d", len(others)))
+	}
+	return nil
+}
+
+// Result finds the discrete percentile.
+func (a *percentileDiscAggregate) Result() (tree.Datum, error) {
+	// Return null if there are no values.
+	if a.arr.Len() == 0 {
+		return tree.DNull, nil
+	}
+
+	if len(a.fractions) > 0 {
+		res := tree.NewDArray(a.arr.ParamTyp)
+		for _, fraction := range a.fractions {
+			// If zero fraction is specified then give the first index, otherwise account
+			// for row index which uses zero-based indexing.
+			if fraction == 0.0 {
+				if err := res.Append(a.arr.Array[0]); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			// Use math.Ceil since we want the first value whose position equals or
+			// exceeds the specified fraction.
+			rowIndex := int(math.Ceil(fraction*float64(a.arr.Len()))) - 1
+			if err := res.Append(a.arr.Array[rowIndex]); err != nil {
+				return nil, err
+			}
+		}
+
+		if a.singleInput {
+			return res.Array[0], nil
+		}
+		return res, nil
+	}
+	panic(fmt.Sprint("input must either be a single fraction, or an array of fractions"))
+}
+
+// Reset implements tree.AggregateFunc interface.
+func (a *percentileDiscAggregate) Reset(ctx context.Context) {
+	a.arr = tree.NewDArray(a.arr.ParamTyp)
+	a.acc.Empty(ctx)
+	a.singleInput = false
+	a.fractions = a.fractions[:0]
+}
+
+// Close allows the aggregate to release the memory it requested during
+// operation.
+func (a *percentileDiscAggregate) Close(ctx context.Context) {
+	a.acc.Close(ctx)
+}
+
+// Size is part of the tree.AggregateFunc interface.
+func (a *percentileDiscAggregate) Size() int64 {
+	return sizeOfPercentileDiscAggregate
+}
+
+type percentileContAggregate struct {
+	arr *tree.DArray
+	// Note that we do not embed singleDatumAggregateBase struct to help with
+	// memory accounting because percentileContAggregate stores multiple datums
+	// inside of arr.
+	acc mon.BoundAccount
+	// We need singleInput to differentiate whether the input was a single
+	// fraction, or an array of fractions.
+	singleInput bool
+	fractions   []float64
+}
+
+func newPercentileContAggregate(
+	params []*types.T, evalCtx *tree.EvalContext, _ tree.Datums,
+) tree.AggregateFunc {
+	return &percentileContAggregate{
+		arr: tree.NewDArray(params[1]),
+		acc: evalCtx.Mon.MakeBoundAccount(),
+	}
+}
+
+// Add stores the input percentile and all the values to calculate the continuous percentile.
+func (a *percentileContAggregate) Add(
+	ctx context.Context, datum tree.Datum, others ...tree.Datum,
+) error {
+	if len(a.fractions) == 0 && datum != tree.DNull {
+		fractions, singleInput, err := validateInputFractions(datum)
+		if err != nil {
+			return err
+		}
+		a.fractions = fractions
+		a.singleInput = singleInput
+	}
+
+	if len(others) == 1 && others[0] != tree.DNull {
+		if err := a.acc.Grow(ctx, int64(others[0].Size())); err != nil {
+			return err
+		}
+		return a.arr.Append(others[0])
+	} else if len(others) != 1 {
+		panic(fmt.Sprintf("unexpected number of other datums passed in, expected 1, got %d", len(others)))
+	}
+	return nil
+}
+
+// Result finds the continuous percentile.
+func (a *percentileContAggregate) Result() (tree.Datum, error) {
+	// Return null if there are no values.
+	if a.arr.Len() == 0 {
+		return tree.DNull, nil
+	}
+	// The following is the formula for calculating the continuous percentile:
+	// RN = (1 + (fraction * (frameSize - 1))
+	// CRN = Ceil(RN)
+	// FRN = Floor(RN)
+	// If (CRN = FRN = RN) then the result is:
+	//   (value at row RN)
+	// Otherwise the result is:
+	//   (CRN - RN) * (value at row FRN) +
+	//   (RN - FRN) * (value at row CRN)
+	// Adapted from:
+	//   https://docs.oracle.com/cd/B19306_01/server.102/b14200/functions110.htm
+	// If the input specified was a single fraction, then return a single value.
+	if len(a.fractions) > 0 {
+		res := tree.NewDArray(a.arr.ParamTyp)
+		for _, fraction := range a.fractions {
+			rowNumber := 1.0 + (fraction * (float64(a.arr.Len()) - 1.0))
+			ceilRowNumber := int(math.Ceil(rowNumber))
+			floorRowNumber := int(math.Floor(rowNumber))
+
+			if a.arr.ParamTyp.Identical(types.Float) {
+				var target float64
+				if rowNumber == float64(ceilRowNumber) && rowNumber == float64(floorRowNumber) {
+					target = float64(tree.MustBeDFloat(a.arr.Array[int(rowNumber)-1]))
+				} else {
+					floorValue := float64(tree.MustBeDFloat(a.arr.Array[floorRowNumber-1]))
+					ceilValue := float64(tree.MustBeDFloat(a.arr.Array[ceilRowNumber-1]))
+					target = (float64(ceilRowNumber)-rowNumber)*floorValue +
+						(rowNumber-float64(floorRowNumber))*ceilValue
+				}
+				if err := res.Append(tree.NewDFloat(tree.DFloat(target))); err != nil {
+					return nil, err
+				}
+			} else if a.arr.ParamTyp.Family() == types.IntervalFamily {
+				var target *tree.DInterval
+				if rowNumber == float64(ceilRowNumber) && rowNumber == float64(floorRowNumber) {
+					target = tree.MustBeDInterval(a.arr.Array[int(rowNumber)-1])
+				} else {
+					floorValue := tree.MustBeDInterval(a.arr.Array[floorRowNumber-1]).AsFloat64()
+					ceilValue := tree.MustBeDInterval(a.arr.Array[ceilRowNumber-1]).AsFloat64()
+					targetDuration := duration.FromFloat64(
+						(float64(ceilRowNumber)-rowNumber)*floorValue +
+							(rowNumber-float64(floorRowNumber))*ceilValue)
+					target = tree.NewDInterval(targetDuration, types.DefaultIntervalTypeMetadata)
+				}
+				if err := res.Append(target); err != nil {
+					return nil, err
+				}
+			} else {
+				panic(fmt.Sprintf("argument type must be float or interval, got %s", a.arr.ParamTyp.String()))
+			}
+		}
+		if a.singleInput {
+			return res.Array[0], nil
+		}
+		return res, nil
+	}
+	panic(fmt.Sprint("input must either be a single fraction, or an array of fractions"))
+}
+
+// Reset implements tree.AggregateFunc interface.
+func (a *percentileContAggregate) Reset(ctx context.Context) {
+	a.arr = tree.NewDArray(a.arr.ParamTyp)
+	a.acc.Empty(ctx)
+	a.singleInput = false
+	a.fractions = a.fractions[:0]
+}
+
+// Close allows the aggregate to release the memory it requested during
+// operation.
+func (a *percentileContAggregate) Close(ctx context.Context) {
+	a.acc.Close(ctx)
+}
+
+// Size is part of the tree.AggregateFunc interface.
+func (a *percentileContAggregate) Size() int64 {
+	return sizeOfPercentileContAggregate
 }

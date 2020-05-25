@@ -17,7 +17,7 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 )
 
 type booleanAggTmplInfo struct {
@@ -31,7 +31,7 @@ func (b booleanAggTmplInfo) AssignBoolOp(target, l, r string) string {
 	case false:
 		return fmt.Sprintf("%s = %s || %s", target, l, r)
 	default:
-		execerror.VectorizedInternalPanic("unsupported boolean agg type")
+		colexecerror.InternalError("unsupported boolean agg type")
 		// This code is unreachable, but the compiler cannot infer that.
 		return ""
 	}
@@ -68,8 +68,8 @@ func genBooleanAgg(wr io.Writer) error {
 
 	s := string(t)
 
-	s = strings.Replace(s, "_OP_TYPE", "{{.OpType}}", -1)
-	s = strings.Replace(s, "_DEFAULT_VAL", "{{.DefaultVal}}", -1)
+	s = strings.ReplaceAll(s, "_OP_TYPE", "{{.OpType}}")
+	s = strings.ReplaceAll(s, "_DEFAULT_VAL", "{{.DefaultVal}}")
 
 	accumulateBoolean := makeFunctionRegex("_ACCUMULATE_BOOLEAN", 3)
 	s = accumulateBoolean.ReplaceAllString(s, `{{template "accumulateBoolean" buildDict "Global" .}}`)

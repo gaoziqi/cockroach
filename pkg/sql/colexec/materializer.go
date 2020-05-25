@@ -15,11 +15,13 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // Materializer converts an Operator input into a execinfra.RowSource.
@@ -27,7 +29,8 @@ type Materializer struct {
 	execinfra.ProcessorBase
 	NonExplainable
 
-	input Operator
+	input colexecbase.Operator
+	typs  []*types.T
 
 	da sqlbase.DatumAlloc
 
@@ -38,6 +41,10 @@ type Materializer struct {
 	curIdx int
 	// batch is the current Batch the Materializer is processing.
 	batch coldata.Batch
+	// colvecs is the unwrapped batch.
+	colvecs []coldata.Vec
+	// sel is the selection vector on the batch.
+	sel []int
 
 	// row is the memory used for the output row.
 	row sqlbase.EncDatumRow
@@ -53,6 +60,10 @@ type Materializer struct {
 	// ctxCancel in that it will cancel all components of the Materializer's flow,
 	// including those started asynchronously.
 	cancelFlow func() context.CancelFunc
+
+	// closers is a slice of IdempotentClosers that should be Closed on
+	// termination.
+	closers []IdempotentCloser
 }
 
 const materializerProcName = "materializer"
@@ -68,25 +79,31 @@ const materializerProcName = "materializer"
 // the context of the flow (i.e. it is Flow.ctxCancel). It should only be
 // non-nil in case of a root Materializer (i.e. not when we're wrapping a row
 // source).
+// NOTE: the constructor does *not* take in an execinfrapb.PostProcessSpec
+// because we expect input to handle that for us.
 func NewMaterializer(
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
-	input Operator,
-	typs []types.T,
-	post *execinfrapb.PostProcessSpec,
+	input colexecbase.Operator,
+	typs []*types.T,
 	output execinfra.RowReceiver,
 	metadataSourcesQueue []execinfrapb.MetadataSource,
+	toClose []IdempotentCloser,
 	outputStatsToTrace func(),
 	cancelFlow func() context.CancelFunc,
 ) (*Materializer, error) {
 	m := &Materializer{
-		input: input,
-		row:   make(sqlbase.EncDatumRow, len(typs)),
+		input:   input,
+		typs:    typs,
+		row:     make(sqlbase.EncDatumRow, len(typs)),
+		closers: toClose,
 	}
 
 	if err := m.ProcessorBase.Init(
 		m,
-		post,
+		// input must have handled any post-processing itself, so we pass in
+		// an empty post-processing spec.
+		&execinfrapb.PostProcessSpec{},
 		typs,
 		flowCtx,
 		processorID,
@@ -122,7 +139,7 @@ func (m *Materializer) Child(nth int, verbose bool) execinfra.OpNode {
 	if nth == 0 {
 		return m.input
 	}
-	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid index %d", nth))
+	colexecerror.InternalError(fmt.Sprintf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }
@@ -153,28 +170,29 @@ func (m *Materializer) next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadat
 				return nil, m.DrainHelper()
 			}
 			m.curIdx = 0
+			m.colvecs = m.batch.ColVecs()
+			m.sel = m.batch.Selection()
 		}
-		sel := m.batch.Selection()
-
 		rowIdx := m.curIdx
-		if sel != nil {
-			rowIdx = sel[m.curIdx]
+		if m.sel != nil {
+			rowIdx = m.sel[m.curIdx]
 		}
 		m.curIdx++
 
-		typs := m.OutputTypes()
-		for colIdx := 0; colIdx < len(typs); colIdx++ {
-			col := m.batch.ColVec(colIdx)
-			m.row[colIdx].Datum = PhysicalTypeColElemToDatum(col, rowIdx, m.da, &typs[colIdx])
+		for colIdx, typ := range m.typs {
+			m.row[colIdx].Datum = PhysicalTypeColElemToDatum(m.colvecs[colIdx], rowIdx, &m.da, typ)
 		}
-		return m.ProcessRowHelper(m.row), nil
+		// Note that there is no post-processing to be done in the
+		// materializer, so we do not use ProcessRowHelper and emit the row
+		// directly.
+		return m.row, nil
 	}
 	return nil, m.DrainHelper()
 }
 
 // Next is part of the execinfra.RowSource interface.
 func (m *Materializer) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
-	if err := execerror.CatchVectorizedRuntimeError(m.nextAdapter); err != nil {
+	if err := colexecerror.CatchVectorizedRuntimeError(m.nextAdapter); err != nil {
 		m.MoveToDraining(err)
 		return nil, m.DrainHelper()
 	}
@@ -186,6 +204,13 @@ func (m *Materializer) InternalClose() bool {
 	if m.ProcessorBase.InternalClose() {
 		if m.cancelFlow != nil {
 			m.cancelFlow()()
+		}
+		for _, closer := range m.closers {
+			if err := closer.IdempotentClose(m.Ctx); err != nil {
+				if log.V(1) {
+					log.Infof(m.Ctx, "error closing Closer: %v", err)
+				}
+			}
 		}
 		return true
 	}

@@ -20,11 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSavepoints(t *testing.T) {
@@ -32,6 +34,7 @@ func TestSavepoints(t *testing.T) {
 
 	ctx := context.Background()
 	abortKey := roachpb.Key("abort")
+	errKey := roachpb.Key("injectErr")
 
 	datadriven.Walk(t, "testdata/savepoints", func(t *testing.T, path string) {
 		// We want to inject txn abort errors in some cases.
@@ -41,11 +44,15 @@ func TestSavepoints(t *testing.T) {
 		params := base.TestServerArgs{}
 		var doAbort int64
 		params.Knobs.Store = &kvserver.StoreTestingKnobs{
-			EvalKnobs: storagebase.BatchEvalTestingKnobs{
-				TestingEvalFilter: func(args storagebase.FilterArgs) *roachpb.Error {
-					if atomic.LoadInt64(&doAbort) != 0 && args.Req.Header().Key.Equal(abortKey) {
+			EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
+				TestingEvalFilter: func(args kvserverbase.FilterArgs) *roachpb.Error {
+					key := args.Req.Header().Key
+					if atomic.LoadInt64(&doAbort) != 0 && key.Equal(abortKey) {
 						return roachpb.NewErrorWithTxn(
 							roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_UNKNOWN), args.Hdr.Txn)
+					}
+					if key.Equal(errKey) {
+						return roachpb.NewErrorf("injected error")
 					}
 					return nil
 				},
@@ -92,6 +99,13 @@ func TestSavepoints(t *testing.T) {
 				fmt.Fprintf(&buf, "synthetic error: %v\n", retryErr)
 				fmt.Fprintf(&buf, "epoch: %d -> %d\n", epochBefore, epochAfter)
 
+			// inject-error runs a Get with an untyped error injected into request
+			// evaluation.
+			case "inject-error":
+				_, err := txn.Get(ctx, errKey)
+				require.Regexp(t, "injected error", err.Error())
+				fmt.Fprint(&buf, "injected error\n")
+
 			case "abort":
 				prevID := txn.ID()
 				atomic.StoreInt64(&doAbort, 1)
@@ -109,6 +123,28 @@ func TestSavepoints(t *testing.T) {
 					roachpb.Key(td.CmdArgs[0].Key),
 					[]byte(td.CmdArgs[1].Key)); err != nil {
 					fmt.Fprintf(&buf, "(%T) %v\n", err, err)
+				}
+
+			// cput takes <key> <value> <expected value>. The expected value can be
+			// "nil".
+			case "cput":
+				expS := td.CmdArgs[2].Key
+				var expVal *roachpb.Value
+				if expS != "nil" {
+					val := roachpb.MakeValueFromBytes([]byte(expS))
+					expVal = &val
+				}
+				if err := txn.CPut(ctx,
+					roachpb.Key(td.CmdArgs[0].Key),
+					[]byte(td.CmdArgs[1].Key),
+					expVal,
+				); err != nil {
+					if errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
+						// Print an easier to match message.
+						fmt.Fprintf(&buf, "(%T) unexpected value\n", err)
+					} else {
+						fmt.Fprintf(&buf, "(%T) %v\n", err, err)
+					}
 				}
 
 			case "get":

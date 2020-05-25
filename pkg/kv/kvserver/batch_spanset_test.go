@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func TestSpanSetBatchBoundaries(t *testing.T) {
@@ -223,7 +223,7 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 	t.Run("reverse scans", func(t *testing.T) {
 		iter := spanset.NewIterator(eng.NewIterator(storage.IterOptions{UpperBound: roachpb.KeyMax}), &ss)
 		defer iter.Close()
-		iter.SeekLT(outsideKey)
+		iter.SeekLT(outsideKey4)
 		if _, err := iter.Valid(); !isReadSpanErr(err) {
 			t.Fatalf("SeekLT: unexpected error %v", err)
 		}

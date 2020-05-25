@@ -28,15 +28,18 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
+
+// Remove unused warning.
+var _ = execgen.UNSAFEGET
 
 // {{/*
 
@@ -60,14 +63,20 @@ var _ tree.Datum
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
 
-// _GOTYPESLICE is the template Go type slice variable for this operator. It
-// will be replaced by the Go slice representation for each type in coltypes.T, for
-// example []int64 for coltypes.Int64.
+// Dummy import to pull in "coldataext" package.
+var _ coldataext.Datum
+
+// _GOTYPESLICE is the template variable.
 type _GOTYPESLICE interface{}
 
-// _TYPES_T is the template type variable for coltypes.T. It will be replaced by
-// coltypes.Foo for each type Foo in the coltypes.T type.
-const _TYPES_T = coltypes.Unhandled
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
+
+// _DIR_ENUM is the template variable.
+const _DIR_ENUM = 0
 
 // _ISNULL is the template type variable for whether the sorter handles nulls
 // or not. It will be replaced by the appropriate boolean.
@@ -75,62 +84,73 @@ const _ISNULL = false
 
 // _ASSIGN_LT is the template equality function for assigning the first input
 // to the result of the second input < the third input.
-func _ASSIGN_LT(_, _, _ string) bool {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN_LT(_, _, _, _, _, _ string) bool {
+	colexecerror.InternalError("")
 }
 
 // */}}
 
-func isSorterSupported(t coltypes.T, dir execinfrapb.Ordering_Column_Direction) bool {
-	switch t {
-	// {{range $typ, $ := . }} {{/* for each type */}}
-	case _TYPES_T:
-		switch dir {
-		// {{range (index . true).Overloads}} {{/* for each direction */}}
-		case _DIR_ENUM:
-			return true
-		// {{end}}
-		default:
-			return false
+func isSorterSupported(t *types.T, dir execinfrapb.Ordering_Column_Direction) bool {
+	// {{range .}}
+	// {{if .Nulls}}
+	switch dir {
+	// {{range .DirOverloads}}
+	case _DIR_ENUM:
+		switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
+		// {{range .FamilyOverloads}}
+		case _CANONICAL_TYPE_FAMILY:
+			switch t.Width() {
+			// {{range .WidthOverloads}}
+			case _TYPE_WIDTH:
+				return true
+				// {{end}}
+			}
+			// {{end}}
 		}
-	// {{end}}
-	default:
-		return false
+		// {{end}}
 	}
+	// {{end}}
+	// {{end}}
+	return false
 }
 
 func newSingleSorter(
-	t coltypes.T, dir execinfrapb.Ordering_Column_Direction, hasNulls bool,
+	t *types.T, dir execinfrapb.Ordering_Column_Direction, hasNulls bool,
 ) colSorter {
-	switch t {
-	// {{range $typ, $ := . }} {{/* for each type */}}
-	case _TYPES_T:
-		switch hasNulls {
-		// {{range $isNull, $ := . }} {{/* for null vs not null */}}
-		case _ISNULL:
-			switch dir {
-			// {{range .Overloads}} {{/* for each direction */}}
-			case _DIR_ENUM:
-				return &sort_TYPE_DIR_HANDLES_NULLSOp{}
-			// {{end}}
-			default:
-				execerror.VectorizedInternalPanic("nulls switch failed")
+	switch hasNulls {
+	// {{range .}}
+	// {{$nulls := .Nulls}}
+	case _ISNULL:
+		switch dir {
+		// {{range .DirOverloads}}
+		// {{$dir := .DirString}}
+		case _DIR_ENUM:
+			switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
+			// {{range .FamilyOverloads}}
+			case _CANONICAL_TYPE_FAMILY:
+				switch t.Width() {
+				// {{range .WidthOverloads}}
+				case _TYPE_WIDTH:
+					return &sort_TYPE_DIR_HANDLES_NULLSOp{}
+					// {{end}}
+				}
+				// {{end}}
 			}
 			// {{end}}
-		default:
-			execerror.VectorizedInternalPanic("nulls switch failed")
 		}
-	// {{end}}
-	default:
-		execerror.VectorizedInternalPanic("nulls switch failed")
+		// {{end}}
 	}
+	colexecerror.InternalError("isSorterSupported should have caught this")
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
 }
 
-// {{range $typ, $ := . }} {{/* for each type */}}
-// {{range . }} {{/* for null vs not null */}}
-// {{range .Overloads}} {{/* for each direction */}}
+// {{range .}}
+// {{$nulls := .Nulls}}
+// {{range .DirOverloads}}
+// {{$dir := .DirString}}
+// {{range .FamilyOverloads}}
+// {{range .WidthOverloads}}
 
 type sort_TYPE_DIR_HANDLES_NULLSOp struct {
 	sortCol       _GOTYPESLICE
@@ -140,7 +160,7 @@ type sort_TYPE_DIR_HANDLES_NULLSOp struct {
 }
 
 func (s *sort_TYPE_DIR_HANDLES_NULLSOp) init(col coldata.Vec, order []int) {
-	s.sortCol = col._TemplateType()
+	s.sortCol = col.TemplateType()
 	s.nulls = col.Nulls()
 	s.order = order
 }
@@ -152,7 +172,7 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sort(ctx context.Context) {
 
 func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sortPartitions(ctx context.Context, partitions []int) {
 	if len(partitions) < 1 {
-		execerror.VectorizedInternalPanic(fmt.Sprintf("invalid partitions list %v", partitions))
+		colexecerror.InternalError(fmt.Sprintf("invalid partitions list %v", partitions))
 	}
 	order := s.order
 	for i, partitionStart := range partitions {
@@ -169,10 +189,10 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sortPartitions(ctx context.Context, part
 }
 
 func (s *sort_TYPE_DIR_HANDLES_NULLSOp) Less(i, j int) bool {
-	// {{ if eq .Nulls true }}
+	// {{if $nulls}}
 	n1 := s.nulls.MaybeHasNulls() && s.nulls.NullAt(s.order[i])
 	n2 := s.nulls.MaybeHasNulls() && s.nulls.NullAt(s.order[j])
-	// {{ if eq .DirString "Asc" }}
+	// {{if eq $dir "Asc"}}
 	// If ascending, nulls always sort first, so we encode that logic here.
 	if n1 && n2 {
 		return false
@@ -181,7 +201,7 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) Less(i, j int) bool {
 	} else if n2 {
 		return false
 	}
-	// {{ else if eq .DirString "Desc" }}
+	// {{else if eq $dir "Desc"}}
 	// If descending, nulls always sort last, so we encode that logic here.
 	if n1 && n2 {
 		return false
@@ -196,7 +216,7 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) Less(i, j int) bool {
 	// We always indirect via the order vector.
 	arg1 := execgen.UNSAFEGET(s.sortCol, s.order[i])
 	arg2 := execgen.UNSAFEGET(s.sortCol, s.order[j])
-	_ASSIGN_LT(lt, arg1, arg2)
+	_ASSIGN_LT(lt, arg1, arg2, _, s.sortCol, s.sortCol)
 	return lt
 }
 
@@ -209,6 +229,7 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) Len() int {
 	return len(s.order)
 }
 
+// {{end}}
 // {{end}}
 // {{end}}
 // {{end}}

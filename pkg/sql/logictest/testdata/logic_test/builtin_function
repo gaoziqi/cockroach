@@ -1,3 +1,9 @@
+# 3node-tenant fails due to:
+# https://github.com/cockroachdb/cockroach/issues/48375
+# Specifically, a status server is unavailable when attempting to set a zone
+# config.
+# LogicTest: !3node-tenant
+
 statement ok
 CREATE TABLE foo (a int)
 
@@ -224,6 +230,86 @@ SELECT substring('f(oabaroob' from '\(o(.)b' for '+')
 query error unknown signature: substring\(\)
 SELECT substring()
 
+# Adding testcases for substring against bit array.
+
+query TTT
+SELECT substring(B'11110000', 0), substring(B'11110000', -1), substring(B'11110000', 5)
+----
+11110000 11110000 0000
+
+query TTT
+SELECT substring(B'11110000', 8), substring(B'11110000', 10), substring(B'', 0)
+----
+0  ·  ·
+
+query TTT
+SELECT substring('11100011'::bit(8), 4), substring('11100011'::bit(6), 4), substring(B'', 0, 1)
+----
+00011 000  ·
+
+query TTT
+SELECT substring(B'11110000', 0, 4), substring(B'11110000', -1, 4), substring(B'11110000', 5, 10)
+----
+111 11 0000
+
+query TTT
+SELECT substring(B'11110000', 8, 1), substring(B'11110000', 8, 0), substring(B'11110000', 10, 5)
+----
+0  ·  ·
+
+query TT
+SELECT substring('11100011'::bit(10), 4, 10), substring('11100011'::bit(8), 1, 8)
+----
+0001100 11100011
+
+query TTT
+SELECT substring(B'10001000' FOR 4 FROM 0), substring(B'10001000' FROM 0 FOR 4), substring(B'10001000' FOR 4)
+----
+100 100 1000
+
+query error substring\(\): negative bit subarray length -1 not allowed
+SELECT substring('11100011'::bit(10), 4, -1)
+
+# Adding testcases for substring against byte array.
+
+query TT
+SELECT substring(b'abc', 0), substring(b'\x61\x62\x63', -1)
+----
+abc abc
+
+query TT
+SELECT substring(b'abc', 3), substring(b'abc', 5)
+----
+c  ·
+
+query T
+SELECT substring('abc'::bytea, 0)
+----
+abc
+
+query TT
+SELECT substring(b'\x61\x62\x63', 0, 4), substring(b'abc', -1, 4)
+----
+abc ab
+
+query TTT
+SELECT substring(b'abc', 3, 1), substring(b'abc', 3, 0), substring(b'abc', 4, 3)
+----
+c  ·  ·
+
+query T
+SELECT substring('abc'::bytea, 0, 4)
+----
+abc
+
+query TTT
+SELECT substring(b'abc' FOR 3 FROM 1), substring(b'abc' FROM 1 FOR 3), substring(b'abc' FOR 3)
+----
+abc abc abc
+
+query error substring\(\): negative byte subarray length -1 not allowed
+SELECT substring('11100011'::bytea, 4, -1)
+
 query error unknown signature: concat_ws\(\)
 SELECT concat_ws()
 
@@ -378,6 +464,31 @@ query I
 SELECT strpos('💩high', 'ig')
 ----
 3
+
+query III
+SELECT strpos(B'00001111', B'1111'), strpos(B'', B''), strpos(B'0000111', B'1111')
+----
+5 1 0
+
+query I
+SELECT strpos('000001'::varbit, '1'::varbit)
+----
+6
+
+query I
+SELECT position(B'100' in B'100101')
+----
+1
+
+query III
+SELECT strpos(b'\x61\145aabc', b'abc'), strpos(b'', b''), strpos(b'ttt\x61\x61c', b'abc')
+----
+4 1 0
+
+query I
+SELECT position('\x616263'::bytea in 'abc'::bytea)
+----
+1
 
 query I
 SELECT position('ig' in 'high')
@@ -1431,21 +1542,21 @@ query error pq: cos\(\): cannot use "\*" in this context
 SELECT cos(*) FROM system.namespace
 
 # Don't panic with invalid names (#8045)
-query error cannot use "nonexistent.\*" without a FROM clause
+query error no data source matches pattern: nonexistent.\*
 SELECT TRIM(TRAILING nonexistent.*[1])
 
 query error rtrim\(\): cannot subscript type tuple
 SELECT TRIM(TRAILING foo.*[1]) FROM (VALUES (1)) AS foo(x)
 
 # Don't panic with invalid names (#8044)
-query error cannot use "nonexistent.\*" without a FROM clause
+query error no data source matches pattern: nonexistent.\*
 SELECT OVERLAY(nonexistent.* PLACING 'string' FROM 'string')
 
 query error unknown signature
 SELECT OVERLAY(foo.* PLACING 'string' FROM 'string') FROM (VALUES (1)) AS foo(x)
 
 # Don't panic with invalid names (#8023)
-query error cannot use "nonexistent.\*" without a FROM clause
+query error no data source matches pattern: nonexistent.\*
 SELECT nonexistent.* IS NOT TRUE
 
 query error unsupported comparison operator: <tuple{int AS x}> IS DISTINCT FROM <bool>
@@ -1773,7 +1884,7 @@ SELECT from_uuid(b'f00d')
 query T
 SELECT pg_catalog.pg_typeof(sign(1:::decimal))
 ----
-decimal
+numeric
 
 query T
 VALUES (pg_typeof(1:::int)),
@@ -1786,15 +1897,15 @@ VALUES (pg_typeof(1:::int)),
        (pg_typeof(b'a':::bytes)),
        (pg_typeof(array[1,2,3]))
 ----
-int
-string
-bool
+bigint
+text
+boolean
 unknown
 interval
 date
-timestamptz
-bytes
-int[]
+timestamp with time zone
+bytea
+bigint[]
 
 query T
 VALUES (format_type('anyelement'::regtype, -1)),
@@ -2527,33 +2638,6 @@ SELECT timezone('UTC+6', '1970-01-01 01:00'::timestamptz)
 ----
 1969-12-31 22:00:00 +0000 +0000
 
-# These test the reciprocal works the other way around.
-# TODO(otan): delete these after 20.1.
-query T
-SELECT timezone('1970-01-01 01:00', 'UTC+6')
-----
-1969-12-31 22:00:00 +0000 +0000
-
-query T
-SELECT timezone('1970-01-01 01:00'::time, 'UTC+6')
-----
-0000-01-01 22:00:00 -0600 -0600
-
-query T
-SELECT timezone('1970-01-01 01:00'::timetz, 'UTC+6')
-----
-0000-01-01 22:00:00 -0600 -0600
-
-query T
-SELECT timezone('1970-01-01 01:00'::timestamp, 'UTC+6')
-----
-1970-01-01 04:00:00 -0300 -0300
-
-query T
-SELECT timezone('1970-01-01 01:00'::timestamptz, 'UTC+6')
-----
-1969-12-31 22:00:00 +0000 +0000
-
 statement ok
 SET TIME ZONE +0
 
@@ -2563,3 +2647,99 @@ query T
 SELECT getdatabaseencoding()
 ----
 UTF8
+
+subtest get_bit
+
+query I rowsort
+SELECT get_bit(B'100101110101', 3) UNION SELECT get_bit(B'100101110101', 2)
+----
+1
+0
+
+query I rowsort
+SELECT get_bit('000000'::varbit, 5) UNION SELECT get_bit('1111111'::varbit, 5)
+----
+1
+0
+
+query error get_bit\(\): GetBitAtIndex: bit index 10 out of valid range \(0..4\)
+SELECT get_bit(B'10110', 10)
+
+query error get_bit\(\): GetBitAtIndex: bit index 0 out of valid range \(0..-1\)
+SELECT get_bit(B'', 0);
+
+# Binary representation of 'l' is 01101100
+# Binary representation of \o145 is 01100101
+# Binary representation of \x61\x62\x6C are 01100001 01100010 01101100
+
+query I rowsort
+SELECT get_bit(b'\145\x6C\l', 0) UNION SELECT get_bit(b'\145\x6C\l', 13)
+----
+0
+1
+
+query I rowsort
+SELECT get_bit(b'\145', 7) UNION SELECT get_bit(b'\145', 0)
+----
+1
+0
+
+query I rowsort
+SELECT get_bit('\x6162'::bytea, 7) UNION SELECT get_bit('\x6162'::bytea, 12)
+----
+1
+0
+
+query error get_bit\(\): bit index 8 out of valid range \(0..7\)
+SELECT get_bit(b'\x61', 8)
+
+query error get_bit\(\): bit index 0 out of valid range \(0..-1\)
+SELECT get_bit(b'', 0)
+
+subtest set_bit
+
+query T rowsort
+SELECT set_bit(B'1101010', 0, 0) UNION SELECT set_bit(B'1101010', 2, 1)
+----
+0101010
+1111010
+
+query T rowsort
+SELECT set_bit('000000'::varbit, 5, 1) UNION SELECT set_bit('111111'::varbit, 5, 0)
+----
+000001
+111110
+
+query error set_bit\(\): SetBitAtIndex: bit index 10 out of valid range \(0..6\)
+SELECT set_bit(B'1101010', 10, 1)
+
+query error set_bit\(\): new bit must be 0 or 1.
+SELECT set_bit(B'1001010', 0, 2)
+
+query error set_bit\(\): SetBitAtIndex: bit index 0 out of valid range \(0..-1\)
+SELECT set_bit(B'', 0, 1)
+
+# Binary representation of 'a' 'b' 'c' 'f' 'l'  are 01100001 01100010 01100011 01100110 01101100
+# Binary representation of \o145 is 1100101
+# Binary representation of \x61\x62\x66\x6C are 01100001 01100010 01100110 01101100
+
+query T rowsort
+SELECT set_bit(b'ab', 6, 1) UNION SELECT set_bit(b'\x61\x66', 15, 0)
+----
+cb
+af
+
+query T rowsort
+SELECT set_bit('a'::bytea, 5, 0) UNION SELECT set_bit('\x6162'::bytea, 13, 1)
+----
+a
+af
+
+query error set_bit\(\): bit index 16 out of valid range \(0..15\)
+SELECT set_bit(b'ac', 16, 0)
+
+query error set_bit\(\): bit index 0 out of valid range \(0..-1\)
+SELECT set_bit(b'', 0, 1)
+
+query error set_bit\(\): new bit must be 0 or 1.
+SELECT set_bit(b'\145\x6C\l', 0, 2)

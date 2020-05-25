@@ -32,7 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 )
@@ -42,7 +42,7 @@ const staticNodeID = 1
 func TestNodedialerPositive(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, _, _, _, nd := setUpNodedialerTest(t, staticNodeID)
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	// Ensure that dialing works.
 	breaker := nd.GetCircuitBreaker(1, rpc.DefaultClass)
 	assert.True(t, breaker.Ready())
@@ -108,7 +108,7 @@ func TestDialNoBreaker(t *testing.T) {
 func TestConcurrentCancellationAndTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, _, _, _, nd := setUpNodedialerTest(t, staticNodeID)
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	ctx := context.Background()
 	breaker := nd.GetCircuitBreaker(staticNodeID, rpc.DefaultClass)
 	// Test that when a context is canceled during dialing we always return that
@@ -129,8 +129,7 @@ func TestConcurrentCancellationAndTimeout(t *testing.T) {
 			time.Sleep(randDuration(time.Millisecond))
 			_, err := nd.Dial(iCtx, 1, rpc.DefaultClass)
 			if err != nil &&
-				err != context.Canceled &&
-				err != context.DeadlineExceeded {
+				!errors.IsAny(err, context.Canceled, context.DeadlineExceeded) {
 				t.Errorf("got an unexpected error from Dial: %v", err)
 			}
 			wg.Done()
@@ -143,7 +142,7 @@ func TestConcurrentCancellationAndTimeout(t *testing.T) {
 func TestResolverErrorsTrip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, rpcCtx, _, _, _ := setUpNodedialerTest(t, staticNodeID)
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	boom := fmt.Errorf("boom")
 	nd := New(rpcCtx, func(id roachpb.NodeID) (net.Addr, error) {
 		return nil, boom
@@ -157,7 +156,7 @@ func TestResolverErrorsTrip(t *testing.T) {
 func TestDisconnectsTrip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper, _, ln, hb, nd := setUpNodedialerTest(t, staticNodeID)
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	ctx := context.Background()
 	breaker := nd.GetCircuitBreaker(staticNodeID, rpc.DefaultClass)
 
@@ -178,9 +177,7 @@ func TestDisconnectsTrip(t *testing.T) {
 	errChan := make(chan error, N)
 	shouldTrip := func(err error) bool {
 		return err != nil &&
-			err != context.DeadlineExceeded &&
-			err != context.Canceled &&
-			errors.Cause(err) != circuit.ErrBreakerOpen
+			!errors.IsAny(err, context.DeadlineExceeded, context.Canceled, circuit.ErrBreakerOpen)
 	}
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
@@ -240,7 +237,7 @@ func setUpNodedialerTest(
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	// Create an rpc Context and then
 	rpcCtx = newTestContext(clock, stopper)
-	rpcCtx.NodeID.Set(context.TODO(), nodeID)
+	rpcCtx.NodeID.Set(context.Background(), nodeID)
 	_, ln, hb = newTestServer(t, clock, stopper, true /* useHeartbeat */)
 	nd = New(rpcCtx, newSingleNodeResolver(nodeID, ln.Addr()))
 	testutils.SucceedsSoon(t, func() error {
@@ -298,7 +295,7 @@ func newTestContext(clock *hlc.Clock, stopper *stop.Stopper) *rpc.Context {
 	// Ensure that tests using this test context and restart/shut down
 	// their servers do not inadvertently start talking to servers from
 	// unrelated concurrent tests.
-	rctx.ClusterID.Set(context.TODO(), uuid.MakeV4())
+	rctx.ClusterID.Set(context.Background(), uuid.MakeV4())
 
 	return rctx
 }

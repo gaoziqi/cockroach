@@ -17,9 +17,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -28,76 +28,55 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Mock typing context for the typechecker.
-type mockTypeContext struct {
-	typs []types.T
-}
-
-func (p *mockTypeContext) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
-	return tree.DNull.Eval(ctx)
-}
-
-func (p *mockTypeContext) IndexedVarResolvedType(idx int) *types.T {
-	return &p.typs[idx]
-}
-
-func (p *mockTypeContext) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	n := tree.Name(fmt.Sprintf("$%d", idx))
-	return &n
-}
-
 func TestBasicBuiltinFunctions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// Trick to get the init() for the builtins package to run.
 	_ = builtins.AllBuiltinNames
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	flowCtx := &execinfra.FlowCtx{
+		EvalCtx: &evalCtx,
+		Cfg: &execinfra.ServerConfig{
+			Settings: st,
+		},
+	}
 
 	testCases := []struct {
 		desc         string
 		expr         string
 		inputCols    []int
 		inputTuples  tuples
-		inputTypes   []types.T
-		outputTypes  []types.T
+		inputTypes   []*types.T
 		outputTuples tuples
 	}{
 		{
 			desc:         "AbsVal",
 			expr:         "abs(@1)",
 			inputCols:    []int{0},
-			inputTuples:  tuples{{1}, {-1}},
-			inputTypes:   []types.T{*types.Int},
-			outputTuples: tuples{{1, 1}, {-1, 1}},
-			outputTypes:  []types.T{*types.Int, *types.Int},
+			inputTuples:  tuples{{1}, {-2}},
+			inputTypes:   []*types.T{types.Int},
+			outputTuples: tuples{{1, 1}, {-2, 2}},
 		},
 		{
 			desc:         "StringLen",
 			expr:         "length(@1)",
 			inputCols:    []int{0},
 			inputTuples:  tuples{{"Hello"}, {"The"}},
-			inputTypes:   []types.T{*types.String},
+			inputTypes:   []*types.T{types.String},
 			outputTuples: tuples{{"Hello", 5}, {"The", 3}},
-			outputTypes:  []types.T{*types.String, *types.Int},
 		},
 	}
-
-	tctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 			runTests(t, []tuples{tc.inputTuples}, tc.outputTuples, orderedVerifier,
-				func(input []Operator) (Operator, error) {
-					expr, err := parser.ParseExpr(tc.expr)
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					p := &mockTypeContext{typs: tc.inputTypes}
-					typedExpr, err := tree.TypeCheck(expr, &tree.SemaContext{IVarContainer: p}, types.Any)
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					return NewBuiltinFunctionOperator(testAllocator, tctx, typedExpr.(*tree.FuncExpr), tc.outputTypes, tc.inputCols, 1, input[0])
+				func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+					return createTestProjectingOperator(
+						ctx, flowCtx, input[0], tc.inputTypes,
+						tc.expr, false, /* canFallbackToRowexec */
+					)
 				})
 		})
 	}
@@ -105,9 +84,17 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 
 func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls bool) {
 	ctx := context.Background()
-	tctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	flowCtx := &execinfra.FlowCtx{
+		EvalCtx: &evalCtx,
+		Cfg: &execinfra.ServerConfig{
+			Settings: st,
+		},
+	}
 
-	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Int64})
+	batch := testAllocator.NewMemBatch([]*types.T{types.Int})
 	col := batch.ColVec(0).Int64()
 
 	for i := 0; i < coldata.BatchSize(); i++ {
@@ -136,20 +123,14 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 		}
 	}
 
-	source := NewRepeatableBatchSource(testAllocator, batch)
-	source.Init()
-
-	expr, err := parser.ParseExpr("abs(@1)")
-	if err != nil {
-		b.Fatal(err)
-	}
-	p := &mockTypeContext{typs: []types.T{*types.Int}}
-	typedExpr, err := tree.TypeCheck(expr, &tree.SemaContext{IVarContainer: p}, types.Any)
-	if err != nil {
-		b.Fatal(err)
-	}
-	op, err := NewBuiltinFunctionOperator(testAllocator, tctx, typedExpr.(*tree.FuncExpr), []types.T{*types.Int}, []int{0}, 1, source)
+	typs := []*types.T{types.Int}
+	source := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
+	op, err := createTestProjectingOperator(
+		ctx, flowCtx, source, typs,
+		"abs(@1)" /* projectingExpr */, false, /* canFallbackToRowexec */
+	)
 	require.NoError(b, err)
+	op.Init()
 
 	b.SetBytes(int64(8 * coldata.BatchSize()))
 	b.ResetTimer()
@@ -175,7 +156,9 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 	ctx := context.Background()
 	tctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 
-	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Bytes, coltypes.Int64, coltypes.Int64})
+	typs := []*types.T{types.String, types.Int, types.Int}
+	batch := testAllocator.NewMemBatch(typs)
+	outputIdx := 3
 	bCol := batch.ColVec(0).Bytes()
 	sCol := batch.ColVec(1).Int64()
 	eCol := batch.ColVec(2).Int64()
@@ -185,14 +168,15 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 		eCol[i] = 4
 	}
 	batch.SetLength(coldata.BatchSize())
-	source := NewRepeatableBatchSource(testAllocator, batch)
+	var source colexecbase.Operator
+	source = colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
+	source = newVectorTypeEnforcer(testAllocator, source, types.Bytes, outputIdx)
 
 	// Set up the default operator.
 	expr, err := parser.ParseExpr("substring(@1, @2, @3)")
 	if err != nil {
 		b.Fatal(err)
 	}
-	typs := []types.T{*types.String, *types.Int, *types.Int}
 	inputCols := []int{0, 1, 2}
 	p := &mockTypeContext{typs: typs}
 	typedExpr, err := tree.TypeCheck(expr, &tree.SemaContext{IVarContainer: p}, types.Any)
@@ -200,23 +184,22 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 		b.Fatal(err)
 	}
 	defaultOp := &defaultBuiltinFuncOperator{
-		OneInputNode:   NewOneInputNode(source),
-		allocator:      testAllocator,
-		evalCtx:        tctx,
-		funcExpr:       typedExpr.(*tree.FuncExpr),
-		outputIdx:      3,
-		columnTypes:    typs,
-		outputType:     types.String,
-		outputPhysType: coltypes.Bytes,
-		converter:      typeconv.GetDatumToPhysicalFn(types.String),
-		row:            make(tree.Datums, 3),
-		argumentCols:   inputCols,
+		OneInputNode: NewOneInputNode(source),
+		allocator:    testAllocator,
+		evalCtx:      tctx,
+		funcExpr:     typedExpr.(*tree.FuncExpr),
+		outputIdx:    outputIdx,
+		columnTypes:  typs,
+		outputType:   types.String,
+		converter:    getDatumToPhysicalFn(types.String),
+		row:          make(tree.Datums, outputIdx),
+		argumentCols: inputCols,
 	}
 	defaultOp.Init()
 
 	// Set up the specialized substring operator.
 	specOp := newSubstringOperator(
-		testAllocator, typs, inputCols, 3 /* outputIdx */, source,
+		testAllocator, typs, inputCols, outputIdx, source,
 	)
 	specOp.Init()
 
@@ -227,7 +210,7 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 			b := defaultOp.Next(ctx)
 			// Due to the flat byte updates, we have to reset the output
 			// bytes col after each next call.
-			b.ColVec(3).Bytes().Reset()
+			b.ColVec(outputIdx).Bytes().Reset()
 		}
 	})
 
@@ -238,7 +221,7 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 			b := specOp.Next(ctx)
 			// Due to the flat byte updates, we have to reset the output
 			// bytes col after each next call.
-			b.ColVec(3).Bytes().Reset()
+			b.ColVec(outputIdx).Bytes().Reset()
 		}
 	})
 }

@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -41,13 +42,13 @@ var virtualSequenceOpts = tree.SequenceOptions{
 
 // processSerialInColumnDef analyzes a column definition and determines
 // whether to use a sequence if the requested type is SERIAL-like.
-// If a sequence must be created, it returns an ObjectName to use
+// If a sequence must be created, it returns an TableName to use
 // to create the new sequence and the DatabaseDescriptor of the
 // parent database where it should be created.
 // The ColumnTableDef is not mutated in-place; instead a new one is returned.
 func (p *planner) processSerialInColumnDef(
-	ctx context.Context, d *tree.ColumnTableDef, tableName *ObjectName,
-) (*tree.ColumnTableDef, *DatabaseDescriptor, *ObjectName, tree.SequenceOptions, error) {
+	ctx context.Context, d *tree.ColumnTableDef, tableName *TableName,
+) (*tree.ColumnTableDef, *DatabaseDescriptor, *TableName, tree.SequenceOptions, error) {
 	if !d.IsSerial {
 		// Column is not SERIAL: nothing to do.
 		return d, nil, nil, nil, nil
@@ -88,8 +89,12 @@ func (p *planner) processSerialInColumnDef(
 	// Clear the IsSerial bit now that it's been remapped.
 	newSpec.IsSerial = false
 
+	defType, err := tree.ResolveType(d.Type, p.semaCtx.GetTypeResolver())
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 	telemetry.Inc(sqltelemetry.SerialColumnNormalizationCounter(
-		d.Type.Name(), serialNormalizationMode.String()))
+		defType.Name(), serialNormalizationMode.String()))
 
 	if serialNormalizationMode == sessiondata.SerialUsesRowID {
 		// We're not constructing a sequence for this SERIAL column.
@@ -111,17 +116,20 @@ func (p *planner) processSerialInColumnDef(
 	// Here and below we skip the cache because name resolution using
 	// the cache does not work (well) if the txn retries and the
 	// descriptor was written already in an early txn attempt.
-	dbDesc, err := p.ResolveUncachedDatabase(ctx, seqName)
+	un := seqName.ToUnresolvedObjectName()
+	dbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, un)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	seqName.ObjectNamePrefix = prefix
+
 	// Now skip over all names that are already taken.
-	nameBase := seqName.TableName
+	nameBase := seqName.ObjectName
 	for i := 0; ; i++ {
 		if i > 0 {
-			seqName.TableName = tree.Name(fmt.Sprintf("%s%d", nameBase, i))
+			seqName.ObjectName = tree.Name(fmt.Sprintf("%s%d", nameBase, i))
 		}
-		res, err := p.ResolveUncachedTableDescriptor(ctx, seqName, false /*required*/, ResolveAnyDescType)
+		res, err := p.ResolveUncachedTableDescriptor(ctx, seqName, false /*required*/, resolver.ResolveAnyDescType)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
@@ -156,7 +164,7 @@ func (p *planner) processSerialInColumnDef(
 // This is currently used by bulk I/O import statements which do not
 // (yet?) support customization of the SERIAL behavior.
 func SimplifySerialInColumnDefWithRowID(
-	ctx context.Context, d *tree.ColumnTableDef, tableName *ObjectName,
+	ctx context.Context, d *tree.ColumnTableDef, tableName *TableName,
 ) error {
 	if !d.IsSerial {
 		// Column is not SERIAL: nothing to do.
@@ -182,7 +190,7 @@ func SimplifySerialInColumnDefWithRowID(
 	return nil
 }
 
-func assertValidSerialColumnDef(d *tree.ColumnTableDef, tableName *ObjectName) error {
+func assertValidSerialColumnDef(d *tree.ColumnTableDef, tableName *TableName) error {
 	if d.HasDefaultExpr() {
 		// SERIAL implies a new default expression, we can't have one to
 		// start with. This is the error produced by pg in such case.

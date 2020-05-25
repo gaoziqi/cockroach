@@ -25,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 	"golang.org/x/net/trace"
 )
 
@@ -219,10 +219,17 @@ func (t *Tracer) StartSpan(
 
 	var sso opentracing.StartSpanOptions
 	var recordable bool
+	var logTags *logtags.Buffer
 	for _, o := range opts {
-		o.Apply(&sso)
-		if _, ok := o.(recordableOption); ok {
+		switch to := o.(type) {
+		case recordableOption:
 			recordable = true
+		case *logTagsOption:
+			// NOTE: calling logTagsOption.Apply() would be functionally equivalent,
+			// but less efficient.
+			logTags = (*logtags.Buffer)(to)
+		default:
+			o.Apply(&sso)
 		}
 	}
 
@@ -273,6 +280,7 @@ func (t *Tracer) StartSpan(
 		tracer:    t,
 		operation: operationName,
 		startTime: sso.StartTime,
+		logTags:   logTags,
 	}
 	if s.startTime.IsZero() {
 		s.startTime = time.Now()
@@ -286,14 +294,6 @@ func (t *Tracer) StartSpan(
 		s.TraceID = parentCtx.TraceID
 	}
 	s.SpanID = uint64(rand.Int63())
-
-	if shadowTr != nil {
-		var parentShadowCtx opentracing.SpanContext
-		if hasParent {
-			parentShadowCtx = parentCtx.shadowCtx
-		}
-		linkShadowSpan(s, shadowTr, parentShadowCtx, parentType)
-	}
 
 	// Start recording if necessary.
 	if recordingGroup != nil {
@@ -324,6 +324,14 @@ func (t *Tracer) StartSpan(
 	// x/net/trace, or recordings.
 	for k, v := range s.mu.Baggage {
 		s.SetTag(k, v)
+	}
+
+	if shadowTr != nil {
+		var parentShadowCtx opentracing.SpanContext
+		if hasParent {
+			parentShadowCtx = parentCtx.shadowCtx
+		}
+		linkShadowSpan(s, shadowTr, parentShadowCtx, parentType)
 	}
 
 	return s
@@ -370,7 +378,7 @@ func (t *Tracer) StartRootSpan(
 		tracer:    t,
 		operation: opName,
 		startTime: time.Now(),
-		startTags: logTags,
+		logTags:   logTags,
 	}
 	s.mu.duration = -1
 
@@ -426,7 +434,7 @@ func StartChildSpan(
 		operation:    opName,
 		startTime:    time.Now(),
 		parentSpanID: pSpan.SpanID,
-		startTags:    logTags,
+		logTags:      logTags,
 	}
 
 	// Copy baggage from parent.
@@ -457,11 +465,11 @@ func StartChildSpan(
 	if pSpan.netTr != nil {
 		s.netTr = trace.New("tracing", opName)
 		s.netTr.SetMaxEvents(maxLogsPerSpan)
-		if startTags := s.startTags; startTags != nil {
+		if startTags := s.logTags; startTags != nil {
 			tags := startTags.Get()
 			for i := range tags {
 				tag := &tags[i]
-				s.netTr.LazyPrintf("%s:%v", tag.Key(), tag.Value())
+				s.netTr.LazyPrintf("%s:%v", tagName(tag.Key()), tag.Value())
 			}
 		}
 	}
@@ -831,7 +839,7 @@ func ContextWithRecordingSpan(
 ) (retCtx context.Context, getRecording func() Recording, cancel func()) {
 	tr := NewTracer()
 	sp := tr.StartSpan(opName, Recordable, LogTagsFromCtx(ctx))
-	StartRecording(sp, SingleNodeRecording)
+	StartRecording(sp, SnowballRecording)
 	ctx, cancelCtx := context.WithCancel(ctx)
 	ctx = opentracing.ContextWithSpan(ctx, sp)
 

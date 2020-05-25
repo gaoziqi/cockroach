@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // tableComments stores the comment data for a table.
@@ -138,7 +138,7 @@ func showForeignKeyConstraint(
 	dbPrefix string,
 	originTable *sqlbase.TableDescriptor,
 	fk *sqlbase.ForeignKeyConstraint,
-	lCtx *internalLookupCtx,
+	lCtx simpleSchemaResolver,
 ) error {
 	var refNames []string
 	var originNames []string
@@ -226,7 +226,11 @@ func showFamilyClause(desc *sqlbase.TableDescriptor, f *tree.FmtCtx) {
 				activeColumnNames = append(activeColumnNames, fam.ColumnNames[i])
 			}
 		}
-		f.WriteString(",\n\tFAMILY ")
+		if len(desc.VisibleColumns()) == 0 {
+			f.WriteString("FAMILY ")
+		} else {
+			f.WriteString(",\n\tFAMILY ")
+		}
 		formatQuoteNames(&f.Buffer, fam.Name)
 		f.WriteString(" (")
 		formatQuoteNames(&f.Buffer, activeColumnNames...)
@@ -241,7 +245,7 @@ func showFamilyClause(desc *sqlbase.TableDescriptor, f *tree.FmtCtx) {
 // it is equal to the given dbPrefix. This allows us to elide the prefix
 // when the given index is interleaved in a table of the current database.
 func showCreateInterleave(
-	idx *sqlbase.IndexDescriptor, buf *bytes.Buffer, dbPrefix string, lCtx *internalLookupCtx,
+	idx *sqlbase.IndexDescriptor, buf *bytes.Buffer, dbPrefix string, lCtx simpleSchemaResolver,
 ) error {
 	if len(idx.Interleave.Ancestors) == 0 {
 		return nil
@@ -251,7 +255,7 @@ func showCreateInterleave(
 	var err error
 	var parentName tree.TableName
 	if lCtx != nil {
-		parentName, err = lCtx.getParentAsTableName(parentTableID, dbPrefix)
+		parentName, err = getParentAsTableName(lCtx, parentTableID, dbPrefix)
 		if err != nil {
 			return err
 		}
@@ -278,6 +282,7 @@ func showCreateInterleave(
 // index, if applicable.
 func ShowCreatePartitioning(
 	a *sqlbase.DatumAlloc,
+	codec keys.SQLCodec,
 	tableDesc *sqlbase.TableDescriptor,
 	idxDesc *sqlbase.IndexDescriptor,
 	partDesc *sqlbase.PartitioningDescriptor,
@@ -330,7 +335,7 @@ func ShowCreatePartitioning(
 				buf.WriteString(`, `)
 			}
 			tuple, _, err := sqlbase.DecodePartitionTuple(
-				a, tableDesc, idxDesc, partDesc, values, fakePrefixDatums)
+				a, codec, tableDesc, idxDesc, partDesc, values, fakePrefixDatums)
 			if err != nil {
 				return err
 			}
@@ -338,7 +343,7 @@ func ShowCreatePartitioning(
 		}
 		buf.WriteString(`)`)
 		if err := ShowCreatePartitioning(
-			a, tableDesc, idxDesc, &part.Subpartitioning, buf, indent+1,
+			a, codec, tableDesc, idxDesc, &part.Subpartitioning, buf, indent+1,
 			colOffset+int(partDesc.NumColumns),
 		); err != nil {
 			return err
@@ -354,14 +359,14 @@ func ShowCreatePartitioning(
 		buf.WriteString(part.Name)
 		buf.WriteString(" VALUES FROM ")
 		fromTuple, _, err := sqlbase.DecodePartitionTuple(
-			a, tableDesc, idxDesc, partDesc, part.FromInclusive, fakePrefixDatums)
+			a, codec, tableDesc, idxDesc, partDesc, part.FromInclusive, fakePrefixDatums)
 		if err != nil {
 			return err
 		}
 		buf.WriteString(fromTuple.String())
 		buf.WriteString(" TO ")
 		toTuple, _, err := sqlbase.DecodePartitionTuple(
-			a, tableDesc, idxDesc, partDesc, part.ToExclusive, fakePrefixDatums)
+			a, codec, tableDesc, idxDesc, partDesc, part.ToExclusive, fakePrefixDatums)
 		if err != nil {
 			return err
 		}

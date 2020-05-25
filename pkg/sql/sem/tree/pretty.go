@@ -621,9 +621,16 @@ func (node *With) docRow(p *PrettyCfg) pretty.TableRow {
 	}
 	d := make([]pretty.Doc, len(node.CTEList))
 	for i, cte := range node.CTEList {
+		asString := "AS"
+		if cte.Mtr.Set {
+			if !cte.Mtr.Materialize {
+				asString += " NOT"
+			}
+			asString += " MATERIALIZED"
+		}
 		d[i] = p.nestUnder(
 			p.Doc(&cte.Name),
-			p.bracketKeyword("AS", " (", p.Doc(cte.Stmt), ")", ""),
+			p.bracketKeyword(asString, " (", p.Doc(cte.Stmt), ")", ""),
 		)
 	}
 	kw := "WITH"
@@ -691,12 +698,16 @@ func (node *FuncExpr) doc(p *PrettyCfg) pretty.Doc {
 			)
 		}
 
-		if len(node.OrderBy) > 0 {
+		if node.AggType == GeneralAgg && len(node.OrderBy) > 0 {
 			args = pretty.ConcatSpace(args, node.OrderBy.doc(p))
 		}
 		d = pretty.Concat(d, p.bracket("(", args, ")"))
 	} else {
 		d = pretty.Concat(d, pretty.Text("()"))
+	}
+	if node.AggType == OrderedSetAgg && len(node.OrderBy) > 0 {
+		args := node.OrderBy.doc(p)
+		d = pretty.Concat(d, p.bracket("WITHIN GROUP (", args, ")"))
 	}
 	if node.Filter != nil {
 		d = pretty.Fold(pretty.ConcatSpace,
@@ -847,9 +858,12 @@ func (p *PrettyCfg) peelCompOperand(e Expr) Expr {
 
 func (node *ComparisonExpr) doc(p *PrettyCfg) pretty.Doc {
 	opStr := node.Operator.String()
-	if node.Operator == IsDistinctFrom && (node.Right == DNull || node.Right == DBoolTrue || node.Right == DBoolFalse) {
+	// IS and IS NOT are equivalent to IS NOT DISTINCT FROM and IS DISTINCT
+	// FROM, respectively, when the RHS is true or false. We prefer the less
+	// verbose IS and IS NOT in those cases.
+	if node.Operator == IsDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
 		opStr = "IS NOT"
-	} else if node.Operator == IsNotDistinctFrom && (node.Right == DNull || node.Right == DBoolTrue || node.Right == DBoolFalse) {
+	} else if node.Operator == IsNotDistinctFrom && (node.Right == DBoolTrue || node.Right == DBoolFalse) {
 		opStr = "IS"
 	}
 	opDoc := pretty.Keyword(opStr)
@@ -979,10 +993,12 @@ func (node *CastExpr) doc(p *PrettyCfg) pretty.Doc {
 		}
 		fallthrough
 	case CastShort:
-		switch node.Type.Family() {
-		case types.JsonFamily:
-			if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
-				return p.jsonCast(sv, "::", node.Type)
+		if typ, ok := GetStaticallyKnownType(node.Type); ok {
+			switch typ.Family() {
+			case types.JsonFamily:
+				if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
+					return p.jsonCast(sv, "::", typ)
+				}
 			}
 		}
 		return pretty.Fold(pretty.Concat,
@@ -991,15 +1007,15 @@ func (node *CastExpr) doc(p *PrettyCfg) pretty.Doc {
 			typ,
 		)
 	default:
-		if node.Type.Family() == types.CollatedStringFamily {
+		if nTyp, ok := GetStaticallyKnownType(node.Type); ok && nTyp.Family() == types.CollatedStringFamily {
 			// COLLATE clause needs to go after CAST expression, so create
 			// equivalent string type without the locale to get name of string
 			// type without the COLLATE.
 			strTyp := types.MakeScalar(
 				types.StringFamily,
-				node.Type.Oid(),
-				node.Type.Precision(),
-				node.Type.Width(),
+				nTyp.Oid(),
+				nTyp.Precision(),
+				nTyp.Width(),
 				"", /* locale */
 			)
 			typ = pretty.Text(strTyp.SQLString())
@@ -1020,11 +1036,11 @@ func (node *CastExpr) doc(p *PrettyCfg) pretty.Doc {
 			),
 		)
 
-		if node.Type.Family() == types.CollatedStringFamily {
+		if nTyp, ok := GetStaticallyKnownType(node.Type); ok && nTyp.Family() == types.CollatedStringFamily {
 			ret = pretty.Fold(pretty.ConcatSpace,
 				ret,
 				pretty.Keyword("COLLATE"),
-				pretty.Text(node.Type.Locale()))
+				pretty.Text(nTyp.Locale()))
 		}
 		return ret
 	}
@@ -1229,6 +1245,9 @@ func (node *CreateView) doc(p *PrettyCfg) pretty.Doc {
 	//     SELECT ...
 	//
 	title := pretty.Keyword("CREATE")
+	if node.Replace {
+		title = pretty.ConcatSpace(title, pretty.Keyword("OR REPLACE"))
+	}
 	if node.Temporary {
 		title = pretty.ConcatSpace(title, pretty.Keyword("TEMPORARY"))
 	}
@@ -1486,6 +1505,7 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
+	//    [WHERE ...]
 	//
 	title := make([]pretty.Doc, 0, 6)
 	title = append(title, pretty.Keyword("CREATE"))
@@ -1496,6 +1516,9 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 		title = append(title, pretty.Keyword("INVERTED"))
 	}
 	title = append(title, pretty.Keyword("INDEX"))
+	if node.Concurrently {
+		title = append(title, pretty.Keyword("CONCURRENTLY"))
+	}
 	if node.IfNotExists {
 		title = append(title, pretty.Keyword("IF NOT EXISTS"))
 	}
@@ -1525,6 +1548,9 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	if node.PartitionBy != nil {
 		clauses = append(clauses, p.Doc(node.PartitionBy))
 	}
+	if node.Predicate != nil {
+		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
+	}
 	return p.nestUnder(
 		pretty.Fold(pretty.ConcatSpace, title...),
 		pretty.Group(pretty.Stack(clauses...)))
@@ -1539,6 +1565,20 @@ func (node *FamilyTableDef) doc(p *PrettyCfg) pretty.Doc {
 		d = pretty.ConcatSpace(d, p.Doc(&node.Name))
 	}
 	return pretty.ConcatSpace(d, p.bracket("(", p.Doc(&node.Columns), ")"))
+}
+
+func (node *LikeTableDef) doc(p *PrettyCfg) pretty.Doc {
+	d := pretty.Keyword("LIKE")
+	d = pretty.ConcatSpace(d, p.Doc(&node.Name))
+	for _, opt := range node.Options {
+		word := "INCLUDING"
+		if opt.Excluded {
+			word = "EXCLUDING"
+		}
+		d = pretty.ConcatSpace(d, pretty.Keyword(word))
+		d = pretty.ConcatSpace(d, pretty.Keyword(opt.Opt.String()))
+	}
+	return d
 }
 
 func (node *IndexElem) doc(p *PrettyCfg) pretty.Doc {
@@ -1569,6 +1609,7 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
+	//    [WHERE ...]
 	//
 	title := pretty.Keyword("INDEX")
 	if node.Name != "" {
@@ -1595,6 +1636,9 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.PartitionBy != nil {
 		clauses = append(clauses, p.Doc(node.PartitionBy))
 	}
+	if node.Predicate != nil {
+		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
+	}
 
 	if len(clauses) == 0 {
 		return title
@@ -1609,6 +1653,7 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
+	//    [WHERE ...]
 	//
 	// or (no constraint name):
 	//
@@ -1616,6 +1661,7 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
+	//    [WHERE ...]
 	//
 	clauses := make([]pretty.Doc, 0, 5)
 	var title pretty.Doc
@@ -1643,6 +1689,9 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	}
 	if node.PartitionBy != nil {
 		clauses = append(clauses, p.Doc(node.PartitionBy))
+	}
+	if node.Predicate != nil {
+		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
 
 	if len(clauses) == 0 {
@@ -2010,16 +2059,21 @@ func (node *Export) doc(p *PrettyCfg) pretty.Doc {
 
 func (node *Explain) doc(p *PrettyCfg) pretty.Doc {
 	d := pretty.Keyword("EXPLAIN")
-	if len(node.Options) > 0 {
-		var opts []pretty.Doc
-		for _, opt := range node.Options {
-			upperCaseOpt := strings.ToUpper(opt)
-			if upperCaseOpt == "ANALYZE" {
-				d = pretty.ConcatSpace(d, pretty.Keyword("ANALYZE"))
-			} else {
-				opts = append(opts, pretty.Keyword(upperCaseOpt))
-			}
+	// ANALYZE is a special case because it is a statement implemented as an
+	// option to EXPLAIN.
+	if node.Flags[ExplainFlagAnalyze] {
+		d = pretty.ConcatSpace(d, pretty.Keyword("ANALYZE"))
+	}
+	var opts []pretty.Doc
+	if node.Mode != ExplainPlan {
+		opts = append(opts, pretty.Keyword(node.Mode.String()))
+	}
+	for f := ExplainFlag(1); f <= numExplainFlags; f++ {
+		if f != ExplainFlagAnalyze && node.Flags[f] {
+			opts = append(opts, pretty.Keyword(f.String()))
 		}
+	}
+	if len(opts) > 0 {
 		d = pretty.ConcatSpace(
 			d,
 			p.bracket("(", p.commaSeparated(opts...), ")"),
@@ -2028,8 +2082,14 @@ func (node *Explain) doc(p *PrettyCfg) pretty.Doc {
 	return p.nestUnder(d, p.Doc(node.Statement))
 }
 
-func (node *ExplainBundle) doc(p *PrettyCfg) pretty.Doc {
-	d := pretty.Keyword("EXPLAIN BUNDLE")
+func (node *ExplainAnalyzeDebug) doc(p *PrettyCfg) pretty.Doc {
+	d := pretty.ConcatSpace(
+		pretty.ConcatSpace(
+			pretty.Keyword("EXPLAIN"),
+			pretty.Keyword("ANALYZE"),
+		),
+		p.bracket("(", pretty.Keyword("DEBUG"), ")"),
+	)
 	return p.nestUnder(d, p.Doc(node.Statement))
 }
 
@@ -2037,6 +2097,20 @@ func (node *NotExpr) doc(p *PrettyCfg) pretty.Doc {
 	return p.nestUnder(
 		pretty.Keyword("NOT"),
 		p.exprDocWithParen(node.Expr),
+	)
+}
+
+func (node *IsNullExpr) doc(p *PrettyCfg) pretty.Doc {
+	return pretty.ConcatSpace(
+		p.exprDocWithParen(node.Expr),
+		pretty.Keyword("IS NULL"),
+	)
+}
+
+func (node *IsNotNullExpr) doc(p *PrettyCfg) pretty.Doc {
+	return pretty.ConcatSpace(
+		p.exprDocWithParen(node.Expr),
+		pretty.Keyword("IS NOT NULL"),
 	)
 }
 
@@ -2121,10 +2195,12 @@ func (node *Execute) docTable(p *PrettyCfg) []pretty.TableRow {
 
 func (node *AnnotateTypeExpr) doc(p *PrettyCfg) pretty.Doc {
 	if node.SyntaxMode == AnnotateShort {
-		switch node.Type.Family() {
-		case types.JsonFamily:
-			if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
-				return p.jsonCast(sv, ":::", node.Type)
+		if typ, ok := GetStaticallyKnownType(node.Type); ok {
+			switch typ.Family() {
+			case types.JsonFamily:
+				if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
+					return p.jsonCast(sv, ":::", typ)
+				}
 			}
 		}
 	}

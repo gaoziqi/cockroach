@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -38,11 +38,11 @@ type Config struct {
 	Settings           *cluster.Settings
 	DB                 *kv.DB
 	Clock              *hlc.Clock
-	Gossip             *gossip.Gossip
+	Gossip             gossip.DeprecatedGossip
 	Spans              []roachpb.Span
 	Targets            jobspb.ChangefeedTargets
 	Sink               EventBufferWriter
-	LeaseMgr           *sql.LeaseManager
+	LeaseMgr           *lease.Manager
 	Metrics            *Metrics
 	MM                 *mon.BytesMonitor
 	WithDiff           bool
@@ -276,16 +276,15 @@ func (f *kvFeed) runUntilTableEvent(
 	// buffer, its seems that we could do this without having to destroy and
 	// recreate the rangefeeds.
 	err = g.Wait()
-	switch err := err.(type) {
-	case nil:
+	if err == nil {
 		log.Fatalf(ctx, "feed exited with no error and no scan boundary")
 		return hlc.Timestamp{}, nil // unreachable
-	case *errBoundaryReached:
+	} else if tErr := (*errBoundaryReached)(nil); errors.As(err, &tErr) {
 		// TODO(ajwerner): iterate the spans and add a Resolved timestamp.
 		// We'll need to do this to ensure that a resolved timestamp propagates
 		// when we're trying to exit.
-		return err.Timestamp().Prev(), nil
-	default:
+		return tErr.Timestamp().Prev(), nil
+	} else {
 		return hlc.Timestamp{}, err
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -99,8 +100,10 @@ type scope struct {
 	ctes map[string]*cteSource
 
 	// context is the current context in the SQL query (e.g., "SELECT" or
-	// "HAVING"). It is used for error messages.
-	context string
+	// "HAVING"). It is used for error messages and to identify scoping errors
+	// (e.g., aggregates are not allowed in the FROM clause of their own query
+	// level).
+	context exprKind
 
 	// atRoot is whether we are currently at a root context.
 	atRoot bool
@@ -114,9 +117,61 @@ type cteSource struct {
 	originalExpr tree.Statement
 	bindingProps *props.Relational
 	expr         memo.RelExpr
+	mtr          tree.MaterializeClause
 	// If set, this function is called when a CTE is referenced. It can throw an
 	// error.
 	onRef func()
+}
+
+// exprKind is used to represent the kind of the current expression in the
+// SQL query.
+type exprKind int8
+
+const (
+	exprKindNone exprKind = iota
+	exprKindAlterTableSplitAt
+	exprKindDistinctOn
+	exprKindFrom
+	exprKindGroupBy
+	exprKindHaving
+	exprKindLateralJoin
+	exprKindLimit
+	exprKindOffset
+	exprKindOn
+	exprKindOrderBy
+	exprKindReturning
+	exprKindSelect
+	exprKindValues
+	exprKindWhere
+	exprKindWindowFrameStart
+	exprKindWindowFrameEnd
+)
+
+var exprKindName = [...]string{
+	exprKindNone:              "",
+	exprKindAlterTableSplitAt: "ALTER TABLE SPLIT AT",
+	exprKindDistinctOn:        "DISTINCT ON",
+	exprKindFrom:              "FROM",
+	exprKindGroupBy:           "GROUP BY",
+	exprKindHaving:            "HAVING",
+	exprKindLateralJoin:       "LATERAL JOIN",
+	exprKindLimit:             "LIMIT",
+	exprKindOffset:            "OFFSET",
+	exprKindOn:                "ON",
+	exprKindOrderBy:           "ORDER BY",
+	exprKindReturning:         "RETURNING",
+	exprKindSelect:            "SELECT",
+	exprKindValues:            "VALUES",
+	exprKindWhere:             "WHERE",
+	exprKindWindowFrameStart:  "WINDOW FRAME START",
+	exprKindWindowFrameEnd:    "WINDOW FRAME END",
+}
+
+func (k exprKind) String() string {
+	if k < 0 || k > exprKind(len(exprKindName)-1) {
+		return fmt.Sprintf("exprKind(%d)", k)
+	}
+	return exprKindName[k]
 }
 
 // initGrouping initializes the groupby information for this scope.
@@ -388,7 +443,7 @@ func (s *scope) resolveType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 // desired type.
 func (s *scope) resolveAndRequireType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 	expr = s.walkExprTree(expr)
-	texpr, err := tree.TypeCheckAndRequire(expr, s.builder.semaCtx, desired, s.context)
+	texpr, err := tree.TypeCheckAndRequire(expr, s.builder.semaCtx, desired, s.context.String())
 	if err != nil {
 		panic(err)
 	}
@@ -401,11 +456,7 @@ func (s *scope) resolveAndRequireType(expr tree.Expr, desired *types.T) tree.Typ
 // and can be cast to any other type.
 func (s *scope) ensureNullType(texpr tree.TypedExpr, desired *types.T) tree.TypedExpr {
 	if desired.Family() != types.AnyFamily && texpr.ResolvedType().Family() == types.UnknownFamily {
-		var err error
-		texpr, err = tree.NewTypedCastExpr(texpr, desired)
-		if err != nil {
-			panic(err)
-		}
+		texpr = tree.NewTypedCastExpr(texpr, desired)
 	}
 	return texpr
 }
@@ -482,7 +533,7 @@ func (s *scope) removeHiddenCols() {
 // isAnonymousTable returns true if the table name of the first column
 // in this scope is empty.
 func (s *scope) isAnonymousTable() bool {
-	return len(s.cols) > 0 && s.cols[0].table.TableName == ""
+	return len(s.cols) > 0 && s.cols[0].table.ObjectName == ""
 }
 
 // setTableAlias qualifies the names of all columns in this scope with the
@@ -569,6 +620,7 @@ func (s *scope) endAggFunc(cols opt.ColSet) (g *groupby) {
 
 	for curr := s; curr != nil; curr = curr.parent {
 		if cols.Len() == 0 || cols.Intersects(curr.colSet()) {
+			curr.verifyAggregateContext()
 			if curr.groupby == nil {
 				curr.initGrouping()
 			}
@@ -577,6 +629,25 @@ func (s *scope) endAggFunc(cols opt.ColSet) (g *groupby) {
 	}
 
 	panic(errors.AssertionFailedf("aggregate function is not allowed in this context"))
+}
+
+// verifyAggregateContext checks that the current scope is allowed to contain
+// aggregate functions.
+func (s *scope) verifyAggregateContext() {
+	switch s.context {
+	case exprKindLateralJoin:
+		panic(pgerror.Newf(pgcode.Grouping,
+			"aggregate functions are not allowed in FROM clause of their own query level",
+		))
+
+	case exprKindOn:
+		panic(pgerror.Newf(pgcode.Grouping,
+			"aggregate functions are not allowed in JOIN conditions",
+		))
+
+	case exprKindWhere:
+		panic(tree.NewInvalidFunctionUsageError(tree.AggregateClass, s.context.String()))
+	}
 }
 
 // scope implements the tree.Visitor interface so that it can walk through
@@ -630,7 +701,7 @@ func (s *scope) FindSourceProvidingColumn(
 				continue
 			}
 
-			if col.table.TableName == "" && !col.hidden {
+			if col.table.ObjectName == "" && !col.hidden {
 				if candidateFromAnonSource != nil {
 					moreThanOneCandidateFromAnonSource = true
 					break
@@ -735,7 +806,7 @@ func (s *scope) FindSourceMatchingName(
 // - a request for "kv" is matched by a source named "db1.public.kv"
 // - a request for "public.kv" is not matched by a source named just "kv"
 func sourceNameMatches(srcName tree.TableName, toFind tree.TableName) bool {
-	if srcName.TableName != toFind.TableName {
+	if srcName.ObjectName != toFind.ObjectName {
 		return false
 	}
 	if toFind.ExplicitSchema {
@@ -844,6 +915,11 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 			break
 		}
 
+		if isSQLFn(def) {
+			expr = s.replaceSQLFn(t, def)
+			break
+		}
+
 	case *tree.ArrayFlatten:
 		if s.builder.AllowUnsupportedExpr {
 			// TODO(rytaft): Temporary fix for #24171 and #24170.
@@ -917,7 +993,7 @@ func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf 
 	// context.
 	defer s.builder.semaCtx.Properties.Restore(s.builder.semaCtx.Properties)
 
-	s.builder.semaCtx.Properties.Require(s.context,
+	s.builder.semaCtx.Properties.Require(s.context.String(),
 		tree.RejectAggregates|tree.RejectWindowApplications|tree.RejectNestedGenerators)
 
 	expr := f.Walk(s)
@@ -947,6 +1023,24 @@ func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf 
 	return srf
 }
 
+// isOrderedSetAggregate returns if the input function definition is an
+// ordered-set aggregate, and the overridden function definition if so.
+func isOrderedSetAggregate(def *tree.FunctionDefinition) (*tree.FunctionDefinition, bool) {
+	// The impl functions are private because they should never be run directly.
+	// Thus, they need to be marked as non-private before using them.
+	switch def {
+	case tree.FunDefs["percentile_disc"]:
+		newDef := *tree.FunDefs["percentile_disc_impl"]
+		newDef.Private = false
+		return &newDef, true
+	case tree.FunDefs["percentile_cont"]:
+		newDef := *tree.FunDefs["percentile_cont_impl"]
+		newDef.Private = false
+		return &newDef, true
+	}
+	return def, false
+}
+
 // replaceAggregate returns an aggregateInfo that can be used to replace a raw
 // aggregate function. When an aggregateInfo is encountered during the build
 // process, it is replaced with a reference to the column returned by the
@@ -969,7 +1063,31 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 	s.builder.semaCtx.Properties.Require("aggregate",
 		tree.RejectNestedAggregates|tree.RejectWindowApplications|tree.RejectGenerators)
 
-	expr := f.Walk(s)
+	// Make a copy of f so we can modify it if needed.
+	fCopy := *f
+	// Override ordered-set aggregates to use their impl counterparts.
+	if orderedSetDef, found := isOrderedSetAggregate(def); found {
+		// Ensure that the aggregation is well formed.
+		if f.AggType != tree.OrderedSetAgg || len(f.OrderBy) != 1 {
+			panic(pgerror.Newf(
+				pgcode.InvalidFunctionDefinition,
+				"ordered-set aggregations must have a WITHIN GROUP clause containing one ORDER BY column"))
+		}
+
+		// Override function definition.
+		def = orderedSetDef
+		fCopy.Func.FunctionReference = orderedSetDef
+
+		// Copy Exprs slice.
+		oldExprs := f.Exprs
+		fCopy.Exprs = make(tree.Exprs, len(oldExprs))
+		copy(fCopy.Exprs, oldExprs)
+
+		// Add implicit column to the input expressions.
+		fCopy.Exprs = append(fCopy.Exprs, fCopy.OrderBy[0].Expr.(tree.TypedExpr))
+	}
+
+	expr := fCopy.Walk(s)
 
 	// We need to do this check here to ensure that we check the usage of special
 	// functions with the right error message.
@@ -1014,7 +1132,7 @@ func (s *scope) lookupWindowDef(name tree.Name) *tree.WindowDef {
 	panic(pgerror.Newf(pgcode.UndefinedObject, "window %q does not exist", name))
 }
 
-func (s *scope) constructWindowDef(def tree.WindowDef) *tree.WindowDef {
+func (s *scope) constructWindowDef(def tree.WindowDef) tree.WindowDef {
 	switch {
 	case def.RefName != "":
 		// SELECT rank() OVER (w) FROM t WINDOW w AS (...)
@@ -1023,14 +1141,16 @@ func (s *scope) constructWindowDef(def tree.WindowDef) *tree.WindowDef {
 		if err != nil {
 			panic(err)
 		}
-		return &result
+		return result
+
 	case def.Name != "":
 		// SELECT rank() OVER w FROM t WINDOW w AS (...)
 		// Note the lack of parens around w, compared to the first case.
 		// We use the referenced window specification directly, without modification.
-		return s.lookupWindowDef(def.Name)
+		return *s.lookupWindowDef(def.Name)
+
 	default:
-		return &def
+		return def
 	}
 }
 
@@ -1049,9 +1169,12 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 	s.builder.semaCtx.Properties.Require("window",
 		tree.RejectNestedWindowFunctions)
 
-	f.WindowDef = s.constructWindowDef(*f.WindowDef)
+	// Make a copy of f so we can modify the WindowDef.
+	fCopy := *f
+	newWindowDef := s.constructWindowDef(*f.WindowDef)
+	fCopy.WindowDef = &newWindowDef
 
-	expr := f.Walk(s)
+	expr := fCopy.Walk(s)
 
 	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
 	if err != nil {
@@ -1076,17 +1199,25 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 	)
 	s.builder.semaCtx.Properties.Derived.InWindowFunc = true
 
-	for i, e := range f.WindowDef.Partitions {
+	oldPartitions := f.WindowDef.Partitions
+	f.WindowDef.Partitions = make(tree.Exprs, len(oldPartitions))
+	for i, e := range oldPartitions {
 		typedExpr := s.resolveType(e, types.Any)
 		f.WindowDef.Partitions[i] = typedExpr
 	}
-	for i, e := range f.WindowDef.OrderBy {
-		if e.OrderType != tree.OrderByColumn {
+
+	oldOrderBy := f.WindowDef.OrderBy
+	f.WindowDef.OrderBy = make(tree.OrderBy, len(oldOrderBy))
+	for i := range oldOrderBy {
+		ord := *oldOrderBy[i]
+		if ord.OrderType != tree.OrderByColumn {
 			panic(errOrderByIndexInWindow)
 		}
-		typedExpr := s.resolveType(e.Expr, types.Any)
-		f.WindowDef.OrderBy[i].Expr = typedExpr
+		typedExpr := s.resolveType(ord.Expr, types.Any)
+		ord.Expr = typedExpr
+		f.WindowDef.OrderBy[i] = &ord
 	}
+
 	if f.WindowDef.Frame != nil {
 		if err := analyzeWindowFrame(s, f.WindowDef); err != nil {
 			panic(err)
@@ -1118,6 +1249,40 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 	return &info
 }
 
+// replaceSQLFn replaces a tree.SQLClass function with a sqlFnInfo struct. See
+// comments above tree.SQLClass and sqlFnInfo for details.
+func (s *scope) replaceSQLFn(f *tree.FuncExpr, def *tree.FunctionDefinition) tree.Expr {
+	// We need to save and restore the previous value of the field in
+	// semaCtx in case we are recursively called within a subquery
+	// context.
+	defer s.builder.semaCtx.Properties.Restore(s.builder.semaCtx.Properties)
+
+	s.builder.semaCtx.Properties.Require("SQL function", tree.RejectSpecial)
+
+	expr := f.Walk(s)
+	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
+	if err != nil {
+		panic(err)
+	}
+
+	f = typedFunc.(*tree.FuncExpr)
+	args := make(memo.ScalarListExpr, len(f.Exprs))
+	for i, arg := range f.Exprs {
+		args[i] = s.builder.buildScalar(arg.(tree.TypedExpr), s, nil, nil, nil)
+	}
+
+	info := sqlFnInfo{
+		FuncExpr: f,
+		def: memo.FunctionPrivate{
+			Name:       def.Name,
+			Properties: &def.FunctionProperties,
+			Overload:   f.ResolvedOverload(),
+		},
+		args: args,
+	}
+	return &info
+}
+
 var (
 	errOrderByIndexInWindow = pgerror.New(pgcode.FeatureNotSupported, "ORDER BY INDEX in window definition is not supported")
 )
@@ -1142,11 +1307,14 @@ func analyzeWindowFrame(s *scope, windowDef *tree.WindowDef) error {
 			// At least one of the bounds is of type 'value' PRECEDING or 'value' FOLLOWING.
 			// We require ordering on a single column that supports addition/subtraction.
 			if len(windowDef.OrderBy) != 1 {
-				return pgerror.Newf(pgcode.Windowing, "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
+				return pgerror.Newf(pgcode.Windowing,
+					"RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
 			}
 			requiredType = windowDef.OrderBy[0].Expr.(tree.TypedExpr).ResolvedType()
 			if !types.IsAdditiveType(requiredType) {
-				return pgerror.Newf(pgcode.Windowing, fmt.Sprintf("RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s", requiredType))
+				return pgerror.Newf(pgcode.Windowing,
+					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s",
+					log.Safe(requiredType))
 			}
 			if types.IsDateTimeType(requiredType) {
 				// Spec: for datetime ordering columns, the required type is an 'interval'.
@@ -1165,13 +1333,13 @@ func analyzeWindowFrame(s *scope, windowDef *tree.WindowDef) error {
 	}
 	if startBound != nil && startBound.OffsetExpr != nil {
 		oldContext := s.context
-		s.context = "WINDOW FRAME START"
+		s.context = exprKindWindowFrameStart
 		startBound.OffsetExpr = s.resolveAndRequireType(startBound.OffsetExpr, requiredType)
 		s.context = oldContext
 	}
 	if endBound != nil && endBound.OffsetExpr != nil {
 		oldContext := s.context
-		s.context = "WINDOW FRAME END"
+		s.context = exprKindWindowFrameEnd
 		endBound.OffsetExpr = s.resolveAndRequireType(endBound.OffsetExpr, requiredType)
 		s.context = oldContext
 	}
@@ -1332,7 +1500,7 @@ func (s *scope) newAmbiguousColumnError(
 	for i := range s.cols {
 		col := &s.cols[i]
 		if col.name == n && (allowHidden || !col.hidden) {
-			if col.table.TableName == "" && !col.hidden {
+			if col.table.ObjectName == "" && !col.hidden {
 				if moreThanOneCandidateFromAnonSource {
 					// Only print first anonymous source, since other(s) are identical.
 					fmtCandidate(col.table)
@@ -1365,7 +1533,7 @@ func newAmbiguousSourceError(tn *tree.TableName) error {
 	}
 	return pgerror.Newf(pgcode.AmbiguousAlias,
 		"ambiguous source name: %q (within database %q)",
-		tree.ErrString(&tn.TableName), tree.ErrString(&tn.CatalogName))
+		tree.ErrString(&tn.ObjectName), tree.ErrString(&tn.CatalogName))
 }
 
 func (s *scope) String() string {

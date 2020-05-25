@@ -49,8 +49,9 @@ type planObserver struct {
 	// expr is invoked for each expression field in each node.
 	expr func(verbosity observeVerbosity, nodeName, fieldName string, n int, expr tree.Expr)
 
-	// spans is invoked for spans embbeded in each node.
-	spans func(nodeName, fieldName string, index *sqlbase.IndexDescriptor, spans []roachpb.Span)
+	// spans is invoked for spans embedded in each node. hardLimitSet indicates
+	// whether the node will "touch" a limited number of rows.
+	spans func(nodeName, fieldName string, index *sqlbase.IndexDescriptor, spans []roachpb.Span, hardLimitSet bool)
 
 	// attr is invoked for non-expression metadata in each node.
 	attr func(nodeName, fieldName, attr string)
@@ -173,7 +174,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			}
 		}
 		if v.observer.spans != nil {
-			v.observer.spans(name, "spans", n.index, n.spans)
+			v.observer.spans(name, "spans", n.index, n.spans, n.hardLimit != 0)
 		}
 		if v.observer.attr != nil {
 			// Only print out "parallel" when it makes sense. i.e. don't print if
@@ -287,6 +288,24 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		}
 		if v.observer.expr != nil && n.onCond != nil && n.onCond != tree.DBoolTrue {
 			v.expr(name, "pred", -1, n.onCond)
+		}
+		n.input = v.visit(n.input)
+
+	case *vTableLookupJoinNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "table", fmt.Sprintf("%s@%s", n.table.Name, n.index.Name))
+			v.observer.attr(name, "type", joinTypeStr(n.joinType))
+			var b bytes.Buffer
+			b.WriteByte('(')
+			inputCols := planColumns(n.input)
+			b.WriteString(inputCols[n.eqCol].Name)
+			b.WriteString(") = (")
+			b.WriteString(n.index.ColumnNames[0])
+			b.WriteByte(')')
+			v.observer.attr(name, "equality", b.String())
+		}
+		if v.observer.expr != nil && n.pred.onCond != nil && n.pred.onCond != tree.DBoolTrue {
+			v.expr(name, "pred", -1, n.pred.onCond)
 		}
 		n.input = v.visit(n.input)
 
@@ -598,7 +617,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			}
 		}
 		if v.observer.spans != nil {
-			v.observer.spans(name, "spans", &n.desc.PrimaryIndex, n.spans)
+			v.observer.spans(name, "spans", &n.desc.PrimaryIndex, n.spans, false /* hardLimitSet */)
 		}
 
 	case *serializeNode:
@@ -632,13 +651,16 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 	case *delayedNode:
 		if v.observer.attr != nil {
 			v.observer.attr(name, "source", n.name)
+			if n.indexConstraint != nil {
+				v.observer.attr(name, "constraint", n.indexConstraint.String())
+			}
 		}
 		if n.plan != nil {
 			n.plan = v.visit(n.plan)
 		}
 
 	case *explainDistSQLNode:
-		n.plan = v.visit(n.plan)
+		n.plan.main = v.visit(n.plan.main)
 
 	case *explainVecNode:
 		n.plan = v.visit(n.plan)
@@ -662,7 +684,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		n.plan = v.visit(n.plan)
 
 	case *explainPlanNode:
-		n.plan = v.visit(n.plan)
+		n.plan.main = v.visit(n.plan.main)
 
 	case *cancelQueriesNode:
 		n.rows = v.visit(n.rows)
@@ -838,6 +860,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&alterIndexNode{}):        "alter index",
 	reflect.TypeOf(&alterSequenceNode{}):     "alter sequence",
 	reflect.TypeOf(&alterTableNode{}):        "alter table",
+	reflect.TypeOf(&alterTypeNode{}):         "alter type",
 	reflect.TypeOf(&alterRoleNode{}):         "alter role",
 	reflect.TypeOf(&applyJoinNode{}):         "apply-join",
 	reflect.TypeOf(&bufferNode{}):            "buffer node",
@@ -855,6 +878,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&createSchemaNode{}):      "create schema",
 	reflect.TypeOf(&createStatsNode{}):       "create statistics",
 	reflect.TypeOf(&createTableNode{}):       "create table",
+	reflect.TypeOf(&createTypeNode{}):        "create type",
 	reflect.TypeOf(&CreateRoleNode{}):        "create user/role",
 	reflect.TypeOf(&createViewNode{}):        "create view",
 	reflect.TypeOf(&delayedNode{}):           "virtual table",
@@ -865,6 +889,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&dropIndexNode{}):         "drop index",
 	reflect.TypeOf(&dropSequenceNode{}):      "drop sequence",
 	reflect.TypeOf(&dropTableNode{}):         "drop table",
+	reflect.TypeOf(&dropTypeNode{}):          "drop type",
 	reflect.TypeOf(&DropRoleNode{}):          "drop user/role",
 	reflect.TypeOf(&dropViewNode{}):          "drop view",
 	reflect.TypeOf(&errorIfRowsNode{}):       "error if rows",
@@ -920,6 +945,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&upsertNode{}):            "upsert",
 	reflect.TypeOf(&valuesNode{}):            "values",
 	reflect.TypeOf(&virtualTableNode{}):      "virtual table values",
+	reflect.TypeOf(&vTableLookupJoinNode{}):  "virtual-table-lookup-join",
 	reflect.TypeOf(&windowNode{}):            "window",
 	reflect.TypeOf(&zeroNode{}):              "norows",
 	reflect.TypeOf(&zigzagJoinNode{}):        "zigzag-join",

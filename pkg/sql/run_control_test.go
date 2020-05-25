@@ -46,7 +46,7 @@ func TestCancelSelectQuery(t *testing.T) {
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	conn1 = tc.ServerConn(0)
 	conn2 = tc.ServerConn(1)
@@ -124,7 +124,7 @@ func TestCancelDistSQLQuery(t *testing.T) {
 				},
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	conn1 = tc.ServerConn(0)
 	conn2 = tc.ServerConn(1)
@@ -181,7 +181,7 @@ func TestCancelDistSQLQuery(t *testing.T) {
 }
 
 func testCancelSession(t *testing.T, hasActiveSession bool) {
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	numNodes := 2
 	tc := serverutils.StartTestCluster(t, numNodes,
@@ -268,14 +268,14 @@ func testCancelSession(t *testing.T, hasActiveSession bool) {
 		_, err = conn1.ExecContext(ctx, "SELECT 1")
 	}
 
-	if err != gosqldriver.ErrBadConn {
+	if !errors.Is(err, gosqldriver.ErrBadConn) {
 		t.Fatalf("session not canceled; actual error: %s", err)
 	}
 }
 
 func TestCancelMultipleSessions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	tc := serverutils.StartTestCluster(t, 2, /* numNodes */
 		base.TestClusterArgs{
@@ -310,7 +310,7 @@ func TestCancelMultipleSessions(t *testing.T) {
 	// Verify that the connections on node 1 are closed.
 	for i := 0; i < 2; i++ {
 		_, err := conns[i].ExecContext(ctx, "SELECT 1")
-		if err != gosqldriver.ErrBadConn {
+		if !errors.Is(err, gosqldriver.ErrBadConn) {
 			t.Fatalf("session %d not canceled; actual error: %s", i, err)
 		}
 	}
@@ -333,7 +333,7 @@ func TestCancelIfExists(t *testing.T) {
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	conn := tc.ServerConn(0)
 
@@ -353,7 +353,7 @@ func TestCancelIfExists(t *testing.T) {
 }
 
 func isClientsideQueryCanceledErr(err error) bool {
-	if pqErr, ok := errors.UnwrapAll(err).(*pq.Error); ok {
+	if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
 		return pqErr.Code == pgcode.QueryCanceled
 	}
 	return pgerror.GetPGCode(err) == pgcode.QueryCanceled

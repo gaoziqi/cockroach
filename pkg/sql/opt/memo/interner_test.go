@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"golang.org/x/tools/container/intsets"
@@ -34,12 +33,12 @@ func TestInterner(t *testing.T) {
 	json2, _ := tree.ParseDJSON(`{"a": 5, "b": [1, 2]}`)
 	json3, _ := tree.ParseDJSON(`[1, 2]`)
 
-	tupTyp1 := types.MakeLabeledTuple([]types.T{*types.Int, *types.String}, []string{"a", "b"})
-	tupTyp2 := types.MakeLabeledTuple([]types.T{*types.Int, *types.String}, []string{"a", "b"})
-	tupTyp3 := types.MakeTuple([]types.T{*types.Int, *types.String})
-	tupTyp4 := types.MakeTuple([]types.T{*types.Int, *types.String, *types.Bool})
-	tupTyp5 := types.MakeLabeledTuple([]types.T{*types.Int, *types.String}, []string{"c", "d"})
-	tupTyp6 := types.MakeLabeledTuple([]types.T{*types.String, *types.Int}, []string{"c", "d"})
+	tupTyp1 := types.MakeLabeledTuple([]*types.T{types.Int, types.String}, []string{"a", "b"})
+	tupTyp2 := types.MakeLabeledTuple([]*types.T{types.Int, types.String}, []string{"a", "b"})
+	tupTyp3 := types.MakeTuple([]*types.T{types.Int, types.String})
+	tupTyp4 := types.MakeTuple([]*types.T{types.Int, types.String, types.Bool})
+	tupTyp5 := types.MakeLabeledTuple([]*types.T{types.Int, types.String}, []string{"c", "d"})
+	tupTyp6 := types.MakeLabeledTuple([]*types.T{types.String, types.Int}, []string{"c", "d"})
 
 	tup1 := tree.NewDTuple(tupTyp1, tree.NewDInt(100), tree.NewDString("foo"))
 	tup2 := tree.NewDTuple(tupTyp2, tree.NewDInt(100), tree.NewDString("foo"))
@@ -75,14 +74,21 @@ func TestInterner(t *testing.T) {
 	coll3, _ := tree.NewDCollatedString("foo", "en_US", &tree.CollationEnvironment{})
 	coll4, _ := tree.NewDCollatedString("food", "en_US", &tree.CollationEnvironment{})
 
-	tz1 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
-	tz2 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
-	tz3 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 124, time.UTC), 0)
-	tz4 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 124, time.FixedZone("PDT", -7)), 0)
+	tz1 := tree.MustMakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
+	tz2 := tree.MustMakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
+	tz3 := tree.MustMakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 124, time.UTC), 0)
+	tz4 := tree.MustMakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 124, time.FixedZone("PDT", -7)), 0)
 
-	explain1 := tree.ExplainOptions{Mode: tree.ExplainPlan, Flags: util.MakeFastIntSet(1, 2)}
-	explain2 := tree.ExplainOptions{Mode: tree.ExplainOpt, Flags: util.MakeFastIntSet(1, 2)}
-	explain3 := tree.ExplainOptions{Mode: tree.ExplainOpt, Flags: util.MakeFastIntSet(1, 2, 3)}
+	explain1 := tree.ExplainOptions{Mode: tree.ExplainPlan}
+	explain1.Flags[1] = true
+	explain1.Flags[2] = true
+	explain2 := tree.ExplainOptions{Mode: tree.ExplainOpt}
+	explain2.Flags[1] = true
+	explain2.Flags[2] = true
+	explain3 := tree.ExplainOptions{Mode: tree.ExplainOpt}
+	explain3.Flags[1] = true
+	explain3.Flags[2] = true
+	explain3.Flags[3] = true
 
 	scanNode := &ScanExpr{}
 	andExpr := &AndExpr{}

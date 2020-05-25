@@ -15,7 +15,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -29,9 +31,13 @@ func nextUUID(counter *uint32) uuid.UUID {
 }
 
 func scanTimestamp(t *testing.T, d *datadriven.TestData) hlc.Timestamp {
+	return scanTimestampWithName(t, d, "ts")
+}
+
+func scanTimestampWithName(t *testing.T, d *datadriven.TestData, name string) hlc.Timestamp {
 	var ts hlc.Timestamp
 	var tsS string
-	d.ScanArgs(t, "ts", &tsS)
+	d.ScanArgs(t, name, &tsS)
 	parts := strings.Split(tsS, ",")
 
 	// Find the wall time part.
@@ -53,7 +59,23 @@ func scanTimestamp(t *testing.T, d *datadriven.TestData) hlc.Timestamp {
 	return ts
 }
 
-func scanSingleRequest(t *testing.T, d *datadriven.TestData, line string) roachpb.Request {
+func scanLockDurability(t *testing.T, d *datadriven.TestData) lock.Durability {
+	var durS string
+	d.ScanArgs(t, "dur", &durS)
+	switch durS {
+	case "r":
+		return lock.Replicated
+	case "u":
+		return lock.Unreplicated
+	default:
+		d.Fatalf(t, "unknown lock durability: %s", durS)
+		return 0
+	}
+}
+
+func scanSingleRequest(
+	t *testing.T, d *datadriven.TestData, line string, txns map[string]*roachpb.Transaction,
+) roachpb.Request {
 	cmd, cmdArgs, err := datadriven.ParseLine(line)
 	if err != nil {
 		d.Fatalf(t, "error parsing single request: %v", err)
@@ -75,15 +97,28 @@ func scanSingleRequest(t *testing.T, d *datadriven.TestData, line string) roachp
 		}
 		return v
 	}
+	maybeGetSeq := func() enginepb.TxnSeq {
+		s, ok := fields["seq"]
+		if !ok {
+			return 0
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			d.Fatalf(t, "could not parse seq num: %v", err)
+		}
+		return enginepb.TxnSeq(n)
+	}
 
 	switch cmd {
 	case "get":
 		var r roachpb.GetRequest
+		r.Sequence = maybeGetSeq()
 		r.Key = roachpb.Key(mustGetField("key"))
 		return &r
 
 	case "scan":
 		var r roachpb.ScanRequest
+		r.Sequence = maybeGetSeq()
 		r.Key = roachpb.Key(mustGetField("key"))
 		if v, ok := fields["endkey"]; ok {
 			r.EndKey = roachpb.Key(v)
@@ -92,8 +127,16 @@ func scanSingleRequest(t *testing.T, d *datadriven.TestData, line string) roachp
 
 	case "put":
 		var r roachpb.PutRequest
+		r.Sequence = maybeGetSeq()
 		r.Key = roachpb.Key(mustGetField("key"))
 		r.Value.SetString(mustGetField("value"))
+		return &r
+
+	case "resolve-intent":
+		var r roachpb.ResolveIntentRequest
+		r.IntentTxn = txns[mustGetField("txn")].TxnMeta
+		r.Key = roachpb.Key(mustGetField("key"))
+		r.Status = parseTxnStatus(t, d, mustGetField("status"))
 		return &r
 
 	case "request-lease":
@@ -109,15 +152,31 @@ func scanSingleRequest(t *testing.T, d *datadriven.TestData, line string) roachp
 func scanTxnStatus(t *testing.T, d *datadriven.TestData) (roachpb.TransactionStatus, string) {
 	var statusStr string
 	d.ScanArgs(t, "status", &statusStr)
-	switch statusStr {
-	case "committed":
-		return roachpb.COMMITTED, "committing"
-	case "aborted":
-		return roachpb.ABORTED, "aborting"
-	case "pending":
-		return roachpb.PENDING, "increasing timestamp of"
+	status := parseTxnStatus(t, d, statusStr)
+	var verb string
+	switch status {
+	case roachpb.COMMITTED:
+		verb = "committing"
+	case roachpb.ABORTED:
+		verb = "aborting"
+	case roachpb.PENDING:
+		verb = "increasing timestamp of"
 	default:
-		d.Fatalf(t, "unknown txn statusStr: %s", statusStr)
-		return 0, ""
+		d.Fatalf(t, "unknown txn status: %s", status)
+	}
+	return status, verb
+}
+
+func parseTxnStatus(t *testing.T, d *datadriven.TestData, s string) roachpb.TransactionStatus {
+	switch s {
+	case "committed":
+		return roachpb.COMMITTED
+	case "aborted":
+		return roachpb.ABORTED
+	case "pending":
+		return roachpb.PENDING
+	default:
+		d.Fatalf(t, "unknown txn status: %s", s)
+		return 0
 	}
 }

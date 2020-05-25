@@ -18,8 +18,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // ExpandDataSourceGlob is a utility function that expands a tree.TablePattern
@@ -37,7 +38,7 @@ func ExpandDataSourceGlob(
 		return []DataSourceName{name}, nil
 
 	case *tree.AllTablesSelector:
-		schema, _, err := catalog.ResolveSchema(ctx, flags, &p.TableNamePrefix)
+		schema, _, err := catalog.ResolveSchema(ctx, flags, &p.ObjectNamePrefix)
 		if err != nil {
 			return nil, err
 		}
@@ -53,7 +54,7 @@ func ExpandDataSourceGlob(
 func ResolveTableIndex(
 	ctx context.Context, catalog Catalog, flags Flags, name *tree.TableIndexName,
 ) (Index, DataSourceName, error) {
-	if name.Table.TableName != "" {
+	if name.Table.ObjectName != "" {
 		ds, tn, err := catalog.ResolveDataSource(ctx, flags, &name.Table)
 		if err != nil {
 			return nil, DataSourceName{}, err
@@ -61,7 +62,7 @@ func ResolveTableIndex(
 		table, ok := ds.(Table)
 		if !ok {
 			return nil, DataSourceName{}, pgerror.Newf(
-				pgcode.WrongObjectType, "%q is not a table", name.Table.TableName,
+				pgcode.WrongObjectType, "%q is not a table", name.Table.ObjectName,
 			)
 		}
 		if name.Index == "" {
@@ -79,7 +80,7 @@ func ResolveTableIndex(
 	}
 
 	// We have to search for a table that has an index with the given name.
-	schema, _, err := catalog.ResolveSchema(ctx, flags, &name.Table.TableNamePrefix)
+	schema, _, err := catalog.ResolveSchema(ctx, flags, &name.Table.ObjectNamePrefix)
 	if err != nil {
 		return nil, DataSourceName{}, err
 	}
@@ -241,6 +242,23 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 		c := child.Child("partition by list prefixes")
 		for i := range partPrefixes {
 			c.Child(partPrefixes[i].String())
+		}
+	}
+	if n := idx.InterleaveAncestorCount(); n > 0 {
+		c := child.Child("interleave ancestors")
+		for i := 0; i < n; i++ {
+			table, index, numKeyCols := idx.InterleaveAncestor(i)
+			c.Childf(
+				"table=%d index=%d (%d key column%s)",
+				table, index, numKeyCols, util.Pluralize(int64(numKeyCols)),
+			)
+		}
+	}
+	if n := idx.InterleavedByCount(); n > 0 {
+		c := child.Child("interleaved by")
+		for i := 0; i < n; i++ {
+			table, index := idx.InterleavedBy(i)
+			c.Childf("table=%d index=%d", table, index)
 		}
 	}
 }

@@ -18,10 +18,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
+	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
+// TODO(tbg): remove this test. Use the harness in versionupgrade.go
+// to make a much better one, much more easily.
 func registerVersion(r *testRegistry) {
 	runVersion := func(ctx context.Context, t *test, c *cluster, version string) {
 		nodes := c.spec.NodeCount - 1

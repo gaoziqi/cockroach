@@ -17,13 +17,13 @@ import (
 	"reflect"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
 )
@@ -412,15 +412,6 @@ func (h *hasher) HashColumnID(val opt.ColumnID) {
 	h.HashUint64(uint64(val))
 }
 
-func (h *hasher) HashFastIntSet(val util.FastIntSet) {
-	hash := h.hash
-	for c, ok := val.Next(0); ok; c, ok = val.Next(c + 1) {
-		hash ^= internHash(c)
-		hash *= prime64
-	}
-	h.hash = hash
-}
-
 func (h *hasher) HashColSet(val opt.ColSet) {
 	hash := h.hash
 	for c, ok := val.Next(0); ok; c, ok = val.Next(c + 1) {
@@ -493,9 +484,22 @@ func (h *hasher) HashJoinFlags(val JoinFlags) {
 	h.HashUint64(uint64(val))
 }
 
+func (h *hasher) HashFKCascades(val FKCascades) {
+	for i := range val {
+		h.HashUint64(uint64(reflect.ValueOf(val[i].Builder).Pointer()))
+	}
+}
+
 func (h *hasher) HashExplainOptions(val tree.ExplainOptions) {
-	h.HashFastIntSet(val.Flags)
 	h.HashUint64(uint64(val.Mode))
+	hash := h.hash
+	for i, val := range val.Flags {
+		if val {
+			hash ^= internHash(uint64(i))
+			hash *= prime64
+		}
+	}
+	h.hash = hash
 }
 
 func (h *hasher) HashStatementType(val tree.StatementType) {
@@ -552,6 +556,10 @@ func (h *hasher) HashLockingItem(val *tree.LockingItem) {
 		h.HashByte(byte(val.Strength))
 		h.HashByte(byte(val.WaitPolicy))
 	}
+}
+
+func (h *hasher) HashGeoRelationshipType(val geoindex.RelationshipType) {
+	h.HashUint64(uint64(val))
 }
 
 func (h *hasher) HashRelExpr(val RelExpr) {
@@ -634,6 +642,11 @@ func (h *hasher) HashOpaqueMetadata(val opt.OpaqueMetadata) {
 
 func (h *hasher) HashPointer(val unsafe.Pointer) {
 	h.HashUint64(uint64(uintptr(val)))
+}
+
+func (h *hasher) HashMaterializeClause(val tree.MaterializeClause) {
+	h.HashBool(val.Set)
+	h.HashBool(val.Materialize)
 }
 
 // ----------------------------------------------------------------------
@@ -834,8 +847,21 @@ func (h *hasher) IsJoinFlagsEqual(l, r JoinFlags) bool {
 	return l == r
 }
 
+func (h *hasher) IsFKCascadesEqual(l, r FKCascades) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		// It's sufficient to compare the CascadeBuilder instances.
+		if l[i].Builder != r[i].Builder {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *hasher) IsExplainOptionsEqual(l, r tree.ExplainOptions) bool {
-	return l.Mode == r.Mode && l.Flags.Equals(r.Flags)
+	return l == r
 }
 
 func (h *hasher) IsStatementTypeEqual(l, r tree.StatementType) bool {
@@ -881,6 +907,10 @@ func (h *hasher) IsLockingItemEqual(l, r *tree.LockingItem) bool {
 		return l == r
 	}
 	return l.Strength == r.Strength && l.WaitPolicy == r.WaitPolicy
+}
+
+func (h *hasher) IsGeoRelationshipTypeEqual(l, r geoindex.RelationshipType) bool {
+	return l == r
 }
 
 func (h *hasher) IsPointerEqual(l, r unsafe.Pointer) bool {
@@ -1009,6 +1039,10 @@ func (h *hasher) IsOpaqueMetadataEqual(l, r opt.OpaqueMetadata) bool {
 	return l == r
 }
 
+func (h *hasher) IsMaterializeClauseEqual(l, r tree.MaterializeClause) bool {
+	return l.Set == r.Set && l.Materialize == r.Materialize
+}
+
 // encodeDatum turns the given datum into an encoded string of bytes. If two
 // datums are equivalent, then their encoded bytes will be identical.
 // Conversely, if two datums are not equivalent, then their encoded bytes will
@@ -1018,7 +1052,7 @@ func encodeDatum(b []byte, val tree.Datum) []byte {
 	// work, because the encoding does not uniquely represent some values which
 	// should not be considered equivalent by the interner (e.g. decimal values
 	// 1.0 and 1.00).
-	if !sqlbase.DatumTypeHasCompositeKeyEncoding(val.ResolvedType()) {
+	if !sqlbase.HasCompositeKeyEncoding(val.ResolvedType()) {
 		var err error
 		b, err = sqlbase.EncodeTableKey(b, val, encoding.Ascending)
 		if err == nil {

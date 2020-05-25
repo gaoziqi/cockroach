@@ -19,10 +19,6 @@ import (
 )
 
 const (
-	// DuplicateUpsertErrText is error text used when a row is modified twice by
-	// an upsert statement.
-	DuplicateUpsertErrText = "UPSERT or INSERT...ON CONFLICT command cannot affect row a second time"
-
 	txnAbortedMsg = "current transaction is aborted, commands ignored " +
 		"until end of transaction block"
 	txnCommittedMsg = "current transaction is committed, commands ignored " +
@@ -94,6 +90,24 @@ func NewInvalidWildcardError(name string) error {
 		"%q does not match any valid database or schema", name)
 }
 
+// NewUndefinedObjectError returns the correct undefined object error based on
+// the kind of object that was requested.
+func NewUndefinedObjectError(name tree.NodeFormatter, kind tree.DesiredObjectKind) error {
+	switch kind {
+	case tree.TableObject:
+		return NewUndefinedRelationError(name)
+	case tree.TypeObject:
+		return NewUndefinedTypeError(name)
+	default:
+		return errors.AssertionFailedf("unknown object kind %d", kind)
+	}
+}
+
+// NewUndefinedTypeError creates an error that represents a missing type.
+func NewUndefinedTypeError(name tree.NodeFormatter) error {
+	return pgerror.Newf(pgcode.UndefinedObject, "type %q does not exist", tree.ErrString(name))
+}
+
 // NewUndefinedRelationError creates an error that represents a missing database table or view.
 func NewUndefinedRelationError(name tree.NodeFormatter) error {
 	return pgerror.Newf(pgcode.UndefinedTable,
@@ -105,6 +119,11 @@ func NewUndefinedColumnError(name string) error {
 	return pgerror.Newf(pgcode.UndefinedColumn, "column %q does not exist", name)
 }
 
+// NewColumnAlreadyExistsError creates an error for a preexisting column.
+func NewColumnAlreadyExistsError(name, relation string) error {
+	return pgerror.Newf(pgcode.DuplicateColumn, "column %q of relation %q already exists", name, relation)
+}
+
 // NewDatabaseAlreadyExistsError creates an error for a preexisting database.
 func NewDatabaseAlreadyExistsError(name string) error {
 	return pgerror.Newf(pgcode.DuplicateDatabase, "database %q already exists", name)
@@ -113,6 +132,11 @@ func NewDatabaseAlreadyExistsError(name string) error {
 // NewRelationAlreadyExistsError creates an error for a preexisting relation.
 func NewRelationAlreadyExistsError(name string) error {
 	return pgerror.Newf(pgcode.DuplicateRelation, "relation %q already exists", name)
+}
+
+// NewTypeAlreadyExistsError creates an error for a preexisting type.
+func NewTypeAlreadyExistsError(name string) error {
+	return pgerror.Newf(pgcode.DuplicateObject, "type %q already exists", name)
 }
 
 // IsRelationAlreadyExistsError checks whether this is an error for a preexisting relation.
@@ -126,26 +150,22 @@ func NewWrongObjectTypeError(name tree.NodeFormatter, desiredObjType string) err
 		tree.ErrString(name), desiredObjType)
 }
 
-// NewSyntaxError creates a syntax error.
-func NewSyntaxError(msg string) error {
-	return pgerror.New(pgcode.Syntax, msg)
+// NewSyntaxErrorf creates a syntax error.
+func NewSyntaxErrorf(format string, args ...interface{}) error {
+	return pgerror.Newf(pgcode.Syntax, format, args...)
 }
 
-// NewDependentObjectError creates a dependent object error.
-func NewDependentObjectError(msg string) error {
-	return pgerror.New(pgcode.DependentObjectsStillExist, msg)
-}
-
-// NewDependentObjectErrorWithHint creates a dependent object error with a hint
-func NewDependentObjectErrorWithHint(msg string, hint string) error {
-	err := pgerror.New(pgcode.DependentObjectsStillExist, msg)
-	return errors.WithHint(err, hint)
+// NewDependentObjectErrorf creates a dependent object error.
+func NewDependentObjectErrorf(format string, args ...interface{}) error {
+	return pgerror.Newf(pgcode.DependentObjectsStillExist, format, args...)
 }
 
 // NewRangeUnavailableError creates an unavailable range error.
 func NewRangeUnavailableError(
 	rangeID roachpb.RangeID, origErr error, nodeIDs ...roachpb.NodeID,
 ) error {
+	// TODO(knz): This could should really use errors.Wrap or
+	// errors.WithSecondaryError.
 	return pgerror.Newf(pgcode.RangeUnavailable,
 		"key range id:%d is unavailable; missing nodes: %s. Original error: %v",
 		rangeID, nodeIDs, origErr)
@@ -180,6 +200,11 @@ func IsOutOfMemoryError(err error) bool {
 // IsUndefinedColumnError checks whether this is an undefined column error.
 func IsUndefinedColumnError(err error) bool {
 	return errHasCode(err, pgcode.UndefinedColumn)
+}
+
+// IsUndefinedRelationError checks whether this is an undefined relation error.
+func IsUndefinedRelationError(err error) bool {
+	return errHasCode(err, pgcode.UndefinedTable)
 }
 
 func errHasCode(err error, code ...string) bool {

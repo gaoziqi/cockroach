@@ -21,8 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -33,7 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -97,7 +96,7 @@ type Config struct {
 	DB                   *kv.DB
 	Stopper              *stop.Stopper
 	AmbientCtx           log.AmbientContext
-	TestingKnobs         storagebase.IntentResolverTestingKnobs
+	TestingKnobs         kvserverbase.IntentResolverTestingKnobs
 	RangeDescriptorCache kvbase.RangeDescriptorCache
 
 	TaskLimit                    int
@@ -115,14 +114,15 @@ type IntentResolver struct {
 	clock        *hlc.Clock
 	db           *kv.DB
 	stopper      *stop.Stopper
-	testingKnobs storagebase.IntentResolverTestingKnobs
+	testingKnobs kvserverbase.IntentResolverTestingKnobs
 	ambientCtx   log.AmbientContext
 	sem          *quotapool.IntPool // semaphore to limit async goroutines
 
 	rdc kvbase.RangeDescriptorCache
 
-	gcBatcher *requestbatcher.RequestBatcher
-	irBatcher *requestbatcher.RequestBatcher
+	gcBatcher      *requestbatcher.RequestBatcher
+	irBatcher      *requestbatcher.RequestBatcher
+	irRangeBatcher *requestbatcher.RequestBatcher
 
 	mu struct {
 		syncutil.Mutex
@@ -211,6 +211,18 @@ func New(c Config) *IntentResolver {
 		Stopper:         c.Stopper,
 		Sender:          c.DB.NonTransactionalSender(),
 	})
+	ir.irRangeBatcher = requestbatcher.New(requestbatcher.Config{
+		Name:            "intent_resolver_ir_range_batcher",
+		MaxMsgsPerBatch: intentResolutionBatchSize,
+		// NOTE: Allow each request sent in a batch to touch up to twice as
+		// many keys as messages in the batch to avoid pagination if only a
+		// few ResolveIntentRange requests touch multiple intents.
+		MaxKeysPerBatchReq: 2 * intentResolverBatchSize,
+		MaxWait:            c.MaxIntentResolutionBatchWait,
+		MaxIdle:            c.MaxIntentResolutionBatchIdle,
+		Stopper:            c.Stopper,
+		Sender:             c.DB.NonTransactionalSender(),
+	})
 	return ir
 }
 
@@ -250,7 +262,7 @@ func updateIntentTxnStatus(
 			// It must have been skipped.
 			continue
 		}
-		up := roachpb.MakeLockUpdateWithDur(&pushee, roachpb.Span{Key: intent.Key}, lock.Replicated)
+		up := roachpb.MakeLockUpdate(&pushee, roachpb.Span{Key: intent.Key})
 		results = append(results, up)
 	}
 	return results
@@ -393,7 +405,7 @@ func (ir *IntentResolver) runAsyncTask(
 		taskFn,
 	)
 	if err != nil {
-		if err == stop.ErrThrottled {
+		if errors.Is(err, stop.ErrThrottled) {
 			ir.Metrics.IntentResolverAsyncThrottled.Inc(1)
 			if allowSyncProcessing {
 				// A limited task was not available. Rather than waiting for
@@ -425,7 +437,7 @@ func (ir *IntentResolver) CleanupIntentsAsync(
 				return err
 			})
 		if err != nil && ir.every.ShouldLog() {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 	})
 }
@@ -521,7 +533,7 @@ func (ir *IntentResolver) CleanupTxnIntentsAsync(
 				return
 			}
 			defer release()
-			intents := roachpb.AsLockUpdates(et.Txn, et.Txn.LockSpans, lock.Replicated)
+			intents := roachpb.AsLockUpdates(et.Txn, et.Txn.LockSpans)
 			if err := ir.cleanupFinishedTxnIntents(ctx, rangeID, et.Txn, intents, now, et.Poison, nil); err != nil {
 				if ir.every.ShouldLog() {
 					log.Warningf(ctx, "failed to cleanup transaction intents: %v", err)
@@ -787,44 +799,37 @@ func (ir *IntentResolver) ResolveIntents(
 	log.Eventf(ctx, "resolving intents")
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	type resolveReq struct {
-		rangeID roachpb.RangeID
-		req     roachpb.Request
-	}
-	var resolveReqs []resolveReq
-	var resolveRangeReqs []roachpb.Request
+
+	respChan := make(chan requestbatcher.Response, len(intents))
 	for _, intent := range intents {
+		rangeID := ir.lookupRangeID(ctx, intent.Key)
+		var req roachpb.Request
+		var batcher *requestbatcher.RequestBatcher
 		if len(intent.EndKey) == 0 {
-			resolveReqs = append(resolveReqs,
-				resolveReq{
-					rangeID: ir.lookupRangeID(ctx, intent.Key),
-					req: &roachpb.ResolveIntentRequest{
-						RequestHeader:  roachpb.RequestHeaderFromSpan(intent.Span),
-						IntentTxn:      intent.Txn,
-						Status:         intent.Status,
-						Poison:         opts.Poison,
-						IgnoredSeqNums: intent.IgnoredSeqNums,
-					},
-				})
+			req = &roachpb.ResolveIntentRequest{
+				RequestHeader:  roachpb.RequestHeaderFromSpan(intent.Span),
+				IntentTxn:      intent.Txn,
+				Status:         intent.Status,
+				Poison:         opts.Poison,
+				IgnoredSeqNums: intent.IgnoredSeqNums,
+			}
+			batcher = ir.irBatcher
 		} else {
-			resolveRangeReqs = append(resolveRangeReqs, &roachpb.ResolveIntentRangeRequest{
+			req = &roachpb.ResolveIntentRangeRequest{
 				RequestHeader:  roachpb.RequestHeaderFromSpan(intent.Span),
 				IntentTxn:      intent.Txn,
 				Status:         intent.Status,
 				Poison:         opts.Poison,
 				MinTimestamp:   opts.MinTimestamp,
 				IgnoredSeqNums: intent.IgnoredSeqNums,
-			})
+			}
+			batcher = ir.irRangeBatcher
 		}
-	}
-
-	respChan := make(chan requestbatcher.Response, len(resolveReqs))
-	for _, req := range resolveReqs {
-		if err := ir.irBatcher.SendWithChan(ctx, respChan, req.rangeID, req.req); err != nil {
+		if err := batcher.SendWithChan(ctx, respChan, rangeID, req); err != nil {
 			return roachpb.NewError(err)
 		}
 	}
-	for seen := 0; seen < len(resolveReqs); seen++ {
+	for seen := 0; seen < len(intents); seen++ {
 		select {
 		case resp := <-respChan:
 			if resp.Err != nil {
@@ -835,29 +840,6 @@ func (ir *IntentResolver) ResolveIntents(
 			return roachpb.NewError(ctx.Err())
 		}
 	}
-
-	// Resolve spans differently. We don't know how many intents will be
-	// swept up with each request, so we limit the spanning resolve
-	// requests to a maximum number of keys and resume as necessary.
-	for _, req := range resolveRangeReqs {
-		for {
-			b := &kv.Batch{}
-			b.Header.MaxSpanRequestKeys = intentResolverBatchSize
-			b.AddRawRequest(req)
-			if err := ir.db.Run(ctx, b); err != nil {
-				return b.MustPErr()
-			}
-			// Check response to see if it must be resumed.
-			resp := b.RawResponse().Responses[0].GetInner().(*roachpb.ResolveIntentRangeResponse)
-			if resp.ResumeSpan == nil {
-				break
-			}
-			reqCopy := *(req.(*roachpb.ResolveIntentRangeRequest))
-			reqCopy.SetSpan(*resp.ResumeSpan)
-			req = &reqCopy
-		}
-	}
-
 	return nil
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -30,10 +31,12 @@ type createSequenceNode struct {
 }
 
 func (p *planner) CreateSequence(ctx context.Context, n *tree.CreateSequence) (planNode, error) {
-	dbDesc, err := p.ResolveUncachedDatabase(ctx, &n.Name)
+	un := n.Name.ToUnresolvedObjectName()
+	dbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, un)
 	if err != nil {
 		return nil, err
 	}
+	n.Name.ObjectNamePrefix = prefix
 
 	if err := p.CheckPrivilege(ctx, dbDesc, privilege.CREATE); err != nil {
 		return nil, err
@@ -75,12 +78,12 @@ func doCreateSequence(
 	context string,
 	dbDesc *DatabaseDescriptor,
 	schemaID sqlbase.ID,
-	name *ObjectName,
+	name *TableName,
 	isTemporary bool,
 	opts tree.SequenceOptions,
 	jobDesc string,
 ) error {
-	id, err := GenerateUniqueDescID(params.ctx, params.p.ExecCfg().DB)
+	id, err := catalogkv.GenerateUniqueDescID(params.ctx, params.p.ExecCfg().DB, params.p.ExecCfg().Codec)
 	if err != nil {
 		return err
 	}
@@ -116,7 +119,7 @@ func doCreateSequence(
 		dbDesc.ID,
 		schemaID,
 		name.Table(),
-	).Key()
+	).Key(params.ExecCfg().Codec)
 	if err = params.p.createDescriptorWithID(
 		params.ctx, key, id, &desc, params.EvalContext().Settings, jobDesc,
 	); err != nil {
@@ -124,14 +127,14 @@ func doCreateSequence(
 	}
 
 	// Initialize the sequence value.
-	seqValueKey := keys.MakeSequenceKey(uint32(id))
+	seqValueKey := params.ExecCfg().Codec.SequenceKey(uint32(id))
 	b := &kv.Batch{}
 	b.Inc(seqValueKey, desc.SequenceOpts.Start-desc.SequenceOpts.Increment)
 	if err := params.p.txn.Run(params.ctx, b); err != nil {
 		return err
 	}
 
-	if err := desc.Validate(params.ctx, params.p.txn); err != nil {
+	if err := desc.Validate(params.ctx, params.p.txn, params.ExecCfg().Codec); err != nil {
 		return err
 	}
 
@@ -142,7 +145,7 @@ func doCreateSequence(
 		params.p.txn,
 		EventLogCreateSequence,
 		int32(desc.ID),
-		int32(params.extendedEvalCtx.NodeID),
+		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 		struct {
 			SequenceName string
 			Statement    string
@@ -154,11 +157,6 @@ func doCreateSequence(
 func (*createSequenceNode) Next(runParams) (bool, error) { return false, nil }
 func (*createSequenceNode) Values() tree.Datums          { return tree.Datums{} }
 func (*createSequenceNode) Close(context.Context)        {}
-
-const (
-	sequenceColumnID   = 1
-	sequenceColumnName = "value"
-)
 
 // MakeSequenceTableDesc creates a sequence descriptor.
 func MakeSequenceTableDesc(
@@ -185,25 +183,25 @@ func MakeSequenceTableDesc(
 	// Mimic a table with one column, "value".
 	desc.Columns = []sqlbase.ColumnDescriptor{
 		{
-			ID:   1,
-			Name: sequenceColumnName,
-			Type: *types.Int,
+			ID:   sqlbase.SequenceColumnID,
+			Name: sqlbase.SequenceColumnName,
+			Type: types.Int,
 		},
 	}
 	desc.PrimaryIndex = sqlbase.IndexDescriptor{
 		ID:               keys.SequenceIndexID,
 		Name:             sqlbase.PrimaryKeyIndexName,
-		ColumnIDs:        []sqlbase.ColumnID{sqlbase.ColumnID(1)},
-		ColumnNames:      []string{sequenceColumnName},
+		ColumnIDs:        []sqlbase.ColumnID{sqlbase.SequenceColumnID},
+		ColumnNames:      []string{sqlbase.SequenceColumnName},
 		ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
 	}
 	desc.Families = []sqlbase.ColumnFamilyDescriptor{
 		{
 			ID:              keys.SequenceColumnFamilyID,
-			ColumnIDs:       []sqlbase.ColumnID{1},
-			ColumnNames:     []string{sequenceColumnName},
+			ColumnIDs:       []sqlbase.ColumnID{sqlbase.SequenceColumnID},
+			ColumnNames:     []string{sqlbase.SequenceColumnName},
 			Name:            "primary",
-			DefaultColumnID: sequenceColumnID,
+			DefaultColumnID: sqlbase.SequenceColumnID,
 		},
 	}
 

@@ -21,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -30,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func insertTableStat(
@@ -148,7 +149,7 @@ func initTestData(
 			RowCount:      32,
 			DistinctCount: 30,
 			NullCount:     0,
-			HistogramData: &HistogramData{ColumnType: *types.Int, Buckets: []HistogramData_Bucket{
+			HistogramData: &HistogramData{ColumnType: types.Int, Buckets: []HistogramData_Bucket{
 				{NumEq: 3, NumRange: 30, UpperBound: encoding.EncodeVarintAscending(nil, 3000)}},
 			},
 		},
@@ -225,7 +226,13 @@ func TestCacheBasic(t *testing.T) {
 	// Create a cache and iteratively query the cache for each tableID. This
 	// will result in the cache getting populated. When the stats cache size is
 	// exceeded, entries should be evicted according to the LRU policy.
-	sc := NewTableStatisticsCache(2 /* cacheSize */, s.GossipI().(*gossip.Gossip), db, ex)
+	sc := NewTableStatisticsCache(
+		2, /* cacheSize */
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		db,
+		ex,
+		keys.SystemSQLCodec,
+	)
 	for _, tableID := range tableIDs {
 		if err := checkStatsForTable(ctx, sc, expectedStats[tableID], tableID); err != nil {
 			t.Fatal(err)
@@ -256,6 +263,40 @@ func TestCacheBasic(t *testing.T) {
 	}
 }
 
+func TestCacheUserDefinedTypes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+USE t;
+CREATE TYPE t AS ENUM ('hello');
+CREATE TABLE tt (x t PRIMARY KEY);
+INSERT INTO tt VALUES ('hello');
+CREATE STATISTICS s FROM tt;
+`); err != nil {
+		t.Fatal(err)
+	}
+	_ = kvDB
+	// Make a stats cache.
+	sc := NewTableStatisticsCache(
+		1,
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		kvDB,
+		s.InternalExecutor().(sqlutil.InternalExecutor),
+		keys.SystemSQLCodec,
+	)
+	tbl := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "tt")
+	// Get stats for our table. We are ensuring here that the access to the stats
+	// for tt properly hydrates the user defined type t before access.
+	_, err := sc.GetTableStats(ctx, tbl.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestCacheWait verifies that when a table gets invalidated, we only retrieve
 // the stats one time, even if there are multiple callers asking for them.
 func TestCacheWait(t *testing.T) {
@@ -278,8 +319,13 @@ func TestCacheWait(t *testing.T) {
 		tableIDs = append(tableIDs, tableID)
 	}
 	sort.Sort(tableIDs)
-
-	sc := NewTableStatisticsCache(len(tableIDs), s.GossipI().(*gossip.Gossip), db, ex)
+	sc := NewTableStatisticsCache(
+		len(tableIDs), /* cacheSize */
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		db,
+		ex,
+		keys.SystemSQLCodec,
+	)
 	for _, tableID := range tableIDs {
 		if err := checkStatsForTable(ctx, sc, expectedStats[tableID], tableID); err != nil {
 			t.Fatal(err)

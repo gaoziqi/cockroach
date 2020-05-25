@@ -12,14 +12,13 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // unionNode is a planNode whose rows are the result of one of three set
@@ -113,9 +112,6 @@ func (p *planner) newUnionNode(
 		if !(l.Typ.Equivalent(r.Typ) || l.Typ.Family() == types.UnknownFamily || r.Typ.Family() == types.UnknownFamily) {
 			return nil, pgerror.Newf(pgcode.DatatypeMismatch,
 				"%v types %s and %s cannot be matched", typ, l.Typ, r.Typ)
-		}
-		if l.Hidden != r.Hidden {
-			return nil, fmt.Errorf("%v types cannot be matched", typ)
 		}
 		if l.Typ.Family() == types.UnknownFamily {
 			unionColumns[i].Typ = r.Typ

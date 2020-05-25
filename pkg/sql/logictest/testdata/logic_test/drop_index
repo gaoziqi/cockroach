@@ -170,12 +170,12 @@ users       foo         true        2             id           ASC        false 
 statement ok
 CREATE VIEW v2 AS SELECT name FROM v
 
-query T
+query TTT
 SHOW TABLES
 ----
-users
-v
-v2
+public  users  table
+public  v      view
+public  v2     view
 
 statement ok
 GRANT ALL ON users to testuser
@@ -199,10 +199,10 @@ SHOW INDEXES FROM users
 table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit
 users       primary     false       1             id           ASC        false    false
 
-query T
+query TTT
 SHOW TABLES
 ----
-users
+public  users  table
 
 # Test the syntax without a '@'
 
@@ -314,3 +314,12 @@ fk1  CREATE TABLE fk1 (
      x INT8 NULL,
      FAMILY "primary" (x, rowid)
 )
+
+# test that notices are generated on index drops
+subtest notice_on_drop_index
+
+query T noticetrace
+CREATE TABLE drop_index_test(a int); CREATE INDEX drop_index_test_index ON drop_index_test(a); DROP INDEX drop_index_test_index
+----
+NOTICE: the data for dropped indexes is reclaimed asynchronously
+HINT: The reclamation delay can be customized in the zone configuration for the table.

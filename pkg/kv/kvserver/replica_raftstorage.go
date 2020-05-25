@@ -18,11 +18,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -31,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )
@@ -272,7 +272,7 @@ func term(
 	// entries() accepts a `nil` sideloaded storage and will skip inlining of
 	// sideloaded entries. We only need the term, so this is what we do.
 	ents, err := entries(ctx, rsl, reader, rangeID, eCache, nil /* sideloaded */, i, i+1, math.MaxUint64 /* maxBytes */)
-	if err == raft.ErrCompacted {
+	if errors.Is(err, raft.ErrCompacted) {
 		ts, _, err := rsl.LoadRaftTruncatedState(ctx, reader)
 		if err != nil {
 			return 0, err
@@ -450,7 +450,7 @@ type OutgoingSnapshot struct {
 	// The complete range iterator for the snapshot to stream.
 	Iter *rditer.ReplicaDataIterator
 	// The replica state within the snapshot.
-	State storagepb.ReplicaState
+	State kvserverpb.ReplicaState
 	// Allows access the the original Replica's sideloaded storage. Note that
 	// this isn't a snapshot of the sideloaded storage congruent with EngineSnap
 	// or RaftSnap -- a log truncation could have removed files from the
@@ -482,7 +482,7 @@ type IncomingSnapshot struct {
 	// The Raft log entries for this snapshot.
 	LogEntries [][]byte
 	// The replica state at the time the snapshot was generated (never nil).
-	State *storagepb.ReplicaState
+	State *kvserverpb.ReplicaState
 	//
 	// When true, this snapshot contains an unreplicated TruncatedState. When
 	// false, the TruncatedState is replicated (see the reference below) and the
@@ -577,10 +577,10 @@ func snapshot(
 // They are managed by the caller, including cleaning up obsolete on-disk
 // payloads in case the log tail is replaced.
 //
-// NOTE: This method takes a storage.Writer because reads are unnecessary when
+// NOTE: This method takes a engine.Writer because reads are unnecessary when
 // prevLastIndex is 0 and prevLastTerm is invalidLastTerm. In the case where
 // reading is necessary (I.E. entries are getting overwritten or deleted), a
-// storage.ReadWriter must be passed in.
+// engine.ReadWriter must be passed in.
 func (r *Replica) append(
 	ctx context.Context,
 	writer storage.Writer,
@@ -606,11 +606,11 @@ func (r *Replica) append(
 		if ent.Index > prevLastIndex {
 			err = storage.MVCCBlindPut(ctx, writer, &diff, key, hlc.Timestamp{}, value, nil /* txn */)
 		} else {
-			// We type assert `writer` to also be an storage.ReadWriter only in
+			// We type assert `writer` to also be an engine.ReadWriter only in
 			// the case where we're replacing existing entries.
 			eng, ok := writer.(storage.ReadWriter)
 			if !ok {
-				panic("expected writer to be a storage.ReadWriter when overwriting log entries")
+				panic("expected writer to be a engine.ReadWriter when overwriting log entries")
 			}
 			err = storage.MVCCPut(ctx, eng, &diff, key, hlc.Timestamp{}, value, nil /* txn */)
 		}
@@ -623,11 +623,11 @@ func (r *Replica) append(
 	lastTerm := entries[len(entries)-1].Term
 	// Delete any previously appended log entries which never committed.
 	if prevLastIndex > 0 {
-		// We type assert `writer` to also be an storage.ReadWriter only in the
+		// We type assert `writer` to also be an engine.ReadWriter only in the
 		// case where we're deleting existing entries.
 		eng, ok := writer.(storage.ReadWriter)
 		if !ok {
-			panic("expected writer to be a storage.ReadWriter when deleting log entries")
+			panic("expected writer to be a engine.ReadWriter when deleting log entries")
 		}
 		for i := lastIndex + 1; i <= prevLastIndex; i++ {
 			// Note that the caller is in charge of deleting any sideloaded payloads
@@ -1066,21 +1066,14 @@ func (r *Replica) clearSubsumedReplicaDiskData(
 			subsumedReplSSTFile := &storage.MemFile{}
 			subsumedReplSST := storage.MakeIngestionSSTWriter(subsumedReplSSTFile)
 			defer subsumedReplSST.Close()
-			unconstrainedSpan := roachpb.Span{Key: keyRanges[i].End.Key, EndKey: totalKeyRanges[i].End.Key}
-			span, empty, err := rditer.ConstrainToKeys(r.Engine(), unconstrainedSpan)
-			if err != nil {
-				return errors.Wrapf(err, "error constraining width of range deletion tombstone")
-			}
-			if !empty {
-				if err := storage.ClearRangeWithHeuristic(
-					r.store.Engine(),
-					&subsumedReplSST,
-					span.Key,
-					span.EndKey,
-				); err != nil {
-					subsumedReplSST.Close()
-					return err
-				}
+			if err := storage.ClearRangeWithHeuristic(
+				r.store.Engine(),
+				&subsumedReplSST,
+				keyRanges[i].End.Key,
+				totalKeyRanges[i].End.Key,
+			); err != nil {
+				subsumedReplSST.Close()
+				return err
 			}
 			if err := subsumedReplSST.Finish(); err != nil {
 				return err
@@ -1187,7 +1180,7 @@ const (
 )
 
 func encodeRaftCommand(
-	version raftCommandEncodingVersion, commandID storagebase.CmdIDKey, command []byte,
+	version raftCommandEncodingVersion, commandID kvserverbase.CmdIDKey, command []byte,
 ) []byte {
 	b := make([]byte, raftCommandPrefixLen+len(command))
 	encodeRaftCommandPrefix(b[:raftCommandPrefixLen], version, commandID)
@@ -1196,7 +1189,7 @@ func encodeRaftCommand(
 }
 
 func encodeRaftCommandPrefix(
-	b []byte, version raftCommandEncodingVersion, commandID storagebase.CmdIDKey,
+	b []byte, version raftCommandEncodingVersion, commandID kvserverbase.CmdIDKey,
 ) {
 	if len(commandID) != raftCommandIDLen {
 		panic(fmt.Sprintf("invalid command ID length; %d != %d", len(commandID), raftCommandIDLen))
@@ -1213,10 +1206,10 @@ func encodeRaftCommandPrefix(
 // is not empty (which indicates a dummy entry generated by raft rather
 // than a real command). Usage is mostly internal to the storage package
 // but is exported for use by debugging tools.
-func DecodeRaftCommand(data []byte) (storagebase.CmdIDKey, []byte) {
+func DecodeRaftCommand(data []byte) (kvserverbase.CmdIDKey, []byte) {
 	v := raftCommandEncodingVersion(data[0] & raftCommandNoSplitMask)
 	if v != raftVersionStandard && v != raftVersionSideloaded {
 		panic(fmt.Sprintf("unknown command encoding version %v", data[0]))
 	}
-	return storagebase.CmdIDKey(data[1 : 1+raftCommandIDLen]), data[1+raftCommandIDLen:]
+	return kvserverbase.CmdIDKey(data[1 : 1+raftCommandIDLen]), data[1+raftCommandIDLen:]
 }

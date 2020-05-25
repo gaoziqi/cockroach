@@ -20,10 +20,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow/colrpc"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -35,8 +37,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,6 +52,14 @@ var (
 	consumerClosed    = shutdownScenario{"ConsumerClosed"}
 	shutdownScenarios = []shutdownScenario{consumerDone, consumerClosed}
 )
+
+type callbackCloser struct {
+	closeCb func() error
+}
+
+func (c callbackCloser) IdempotentClose(_ context.Context) error {
+	return c.closeCb()
+}
 
 // TestVectorizedFlowShutdown tests that closing the materializer correctly
 // closes all the infrastructure corresponding to the flow ending in that
@@ -134,12 +145,11 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				var (
 					err             error
 					wg              sync.WaitGroup
-					typs            = []coltypes.T{coltypes.Int64}
-					semtyps         = []types.T{*types.Int}
-					hashRouterInput = colexec.NewRandomDataOp(
+					typs            = []*types.T{types.Int}
+					hashRouterInput = coldatatestutils.NewRandomDataOp(
 						testAllocator,
 						rng,
-						colexec.RandomDataOpArgs{
+						coldatatestutils.RandomDataOpArgs{
 							DeterministicTyps: typs,
 							// Set a high number of batches to ensure that the HashRouter is
 							// very far from being finished when the flow is shut down.
@@ -151,55 +161,72 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					numInboxes                  = numHashRouterOutputs + 3
 					inboxes                     = make([]*colrpc.Inbox, 0, numInboxes+1)
 					handleStreamErrCh           = make([]chan error, numInboxes+1)
-					synchronizerInputs          = make([]colexec.Operator, 0, numInboxes)
+					synchronizerInputs          = make([]colexecbase.Operator, 0, numInboxes)
 					materializerMetadataSources = make([]execinfrapb.MetadataSource, 0, numInboxes+1)
 					streamID                    = 0
 					addAnotherRemote            = rng.Float64() < 0.5
 				)
 
 				// Create an allocator for each output.
-				allocators := make([]*colexec.Allocator, numHashRouterOutputs)
+				allocators := make([]*colmem.Allocator, numHashRouterOutputs)
+				diskAccounts := make([]*mon.BoundAccount, numHashRouterOutputs)
 				for i := range allocators {
 					acc := testMemMonitor.MakeBoundAccount()
 					defer acc.Close(ctxRemote)
-					allocators[i] = colexec.NewAllocator(ctxRemote, &acc)
+					allocators[i] = colmem.NewAllocator(ctxRemote, &acc, testColumnFactory)
+					diskAcc := testDiskMonitor.MakeBoundAccount()
+					diskAccounts[i] = &diskAcc
+					defer diskAcc.Close(ctxRemote)
 				}
-				hashRouter, hashRouterOutputs := colexec.NewHashRouter(allocators, hashRouterInput, typs, []uint32{0}, 64<<20 /* 64 MiB */, queueCfg, &colexec.TestingSemaphore{}, testDiskAcc)
+				hashRouter, hashRouterOutputs := colexec.NewHashRouter(
+					allocators, hashRouterInput, typs, []uint32{0}, 64<<20, /* 64 MiB */
+					queueCfg, &colexecbase.TestingSemaphore{}, diskAccounts,
+				)
 				for i := 0; i < numInboxes; i++ {
 					inboxMemAccount := testMemMonitor.MakeBoundAccount()
 					defer inboxMemAccount.Close(ctxLocal)
 					inbox, err := colrpc.NewInbox(
-						colexec.NewAllocator(ctxLocal, &inboxMemAccount), typs, execinfrapb.StreamID(streamID),
+						colmem.NewAllocator(ctxLocal, &inboxMemAccount, testColumnFactory), typs, execinfrapb.StreamID(streamID),
 					)
 					require.NoError(t, err)
 					inboxes = append(inboxes, inbox)
 					materializerMetadataSources = append(materializerMetadataSources, inbox)
-					synchronizerInputs = append(synchronizerInputs, colexec.Operator(inbox))
+					synchronizerInputs = append(synchronizerInputs, colexecbase.Operator(inbox))
 				}
 				synchronizer := colexec.NewParallelUnorderedSynchronizer(synchronizerInputs, typs, &wg)
 				flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 
+				// idToClosed keeps track of whether Close was called for a given id.
+				idToClosed := struct {
+					syncutil.Mutex
+					mapping map[int]bool
+				}{}
+				idToClosed.mapping = make(map[int]bool)
 				runOutboxInbox := func(
 					ctx context.Context,
 					cancelFn context.CancelFunc,
 					outboxMemAcc *mon.BoundAccount,
-					outboxInput colexec.Operator,
+					outboxInput colexecbase.Operator,
 					inbox *colrpc.Inbox,
 					id int,
 					outboxMetadataSources []execinfrapb.MetadataSource,
 				) {
-					outbox, err := colrpc.NewOutbox(
-						colexec.NewAllocator(ctx, outboxMemAcc),
-						outboxInput,
-						typs,
-						append(outboxMetadataSources,
-							execinfrapb.CallbackMetadataSource{
-								DrainMetaCb: func(ctx context.Context) []execinfrapb.ProducerMetadata {
-									return []execinfrapb.ProducerMetadata{{Err: errors.Errorf("%d", id)}}
-								},
+					idToClosed.Lock()
+					idToClosed.mapping[id] = false
+					idToClosed.Unlock()
+					outbox, err := colrpc.NewOutbox(colmem.NewAllocator(ctx, outboxMemAcc, testColumnFactory), outboxInput, typs,
+						append(outboxMetadataSources, execinfrapb.CallbackMetadataSource{
+							DrainMetaCb: func(ctx context.Context) []execinfrapb.ProducerMetadata {
+								return []execinfrapb.ProducerMetadata{{Err: errors.Errorf("%d", id)}}
 							},
-						),
-					)
+						},
+						), []colexec.IdempotentCloser{callbackCloser{closeCb: func() error {
+							idToClosed.Lock()
+							idToClosed.mapping[id] = true
+							idToClosed.Unlock()
+							return nil
+						}}})
+
 					require.NoError(t, err)
 					wg.Add(1)
 					go func(id int) {
@@ -238,22 +265,22 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					} else {
 						sourceMemAccount := testMemMonitor.MakeBoundAccount()
 						defer sourceMemAccount.Close(ctxRemote)
-						remoteAllocator := colexec.NewAllocator(ctxRemote, &sourceMemAccount)
+						remoteAllocator := colmem.NewAllocator(ctxRemote, &sourceMemAccount, testColumnFactory)
 						batch := remoteAllocator.NewMemBatch(typs)
 						batch.SetLength(coldata.BatchSize())
-						runOutboxInbox(ctxRemote, cancelRemote, &outboxMemAccount, colexec.NewRepeatableBatchSource(remoteAllocator, batch), inboxes[i], streamID, outboxMetadataSources)
+						runOutboxInbox(ctxRemote, cancelRemote, &outboxMemAccount, colexecbase.NewRepeatableBatchSource(remoteAllocator, batch, typs), inboxes[i], streamID, outboxMetadataSources)
 					}
 					streamID++
 				}
 
-				var materializerInput colexec.Operator
+				var materializerInput colexecbase.Operator
 				ctxAnotherRemote, cancelAnotherRemote := context.WithCancel(context.Background())
 				if addAnotherRemote {
 					// Add another "remote" node to the flow.
 					inboxMemAccount := testMemMonitor.MakeBoundAccount()
 					defer inboxMemAccount.Close(ctxAnotherRemote)
 					inbox, err := colrpc.NewInbox(
-						colexec.NewAllocator(ctxAnotherRemote, &inboxMemAccount),
+						colmem.NewAllocator(ctxAnotherRemote, &inboxMemAccount, testColumnFactory),
 						typs, execinfrapb.StreamID(streamID),
 					)
 					require.NoError(t, err)
@@ -271,14 +298,18 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				}
 
 				ctxLocal, cancelLocal := context.WithCancel(ctxLocal)
+				materializerCalledClose := false
 				materializer, err := colexec.NewMaterializer(
 					flowCtx,
 					1, /* processorID */
 					materializerInput,
-					semtyps,
-					&execinfrapb.PostProcessSpec{},
+					typs,
 					nil, /* output */
 					materializerMetadataSources,
+					[]colexec.IdempotentCloser{callbackCloser{closeCb: func() error {
+						materializerCalledClose = true
+						return nil
+					}}}, /* toClose */
 					nil, /* outputStatsToTrace */
 					func() context.CancelFunc { return cancelLocal },
 				)
@@ -329,6 +360,11 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					}
 				}
 				wg.Wait()
+				// Ensure all the outboxes called Close.
+				for id, closed := range idToClosed.mapping {
+					require.True(t, closed, "outbox with ID %d did not call Close on closers", id)
+				}
+				require.True(t, materializerCalledClose)
 			})
 		}
 	}

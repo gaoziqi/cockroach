@@ -1,3 +1,4 @@
+# LogicTest: !3node-tenant
 # Disable automatic stats to avoid flakiness (sometimes causes retry errors).
 statement ok
 SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
@@ -167,8 +168,8 @@ CREATE INDEX child_name_collision_auto_index_fk_id ON child_name_collision (othe
 # Testing the unusual case where an index already exists that has the same name
 # as the index to be auto-generated when adding a fk constraint to an empty
 # table (but the existing index is not on the referencing column), in which
-# case the ALTER TABLE will fail due to the name collision.
-statement error duplicate index name: "child_name_collision_auto_index_fk_id"
+# case the ALTER TABLE generate another unique name for the index.
+statement ok
 ALTER TABLE child_name_collision ADD CONSTRAINT fk_id FOREIGN KEY (parent_id) references parent_name_collision
 
 statement ok
@@ -1777,7 +1778,7 @@ COMMIT
 # namespace entries could block the schema resolution after the rollback (schema
 # resolution uses different transactions to do its reads). We've fixed it by having those
 # other transactions run at high priority, thus pushing the intents out of their way.
-subtest no_schemachange_deadlock_after_savepoint_rollback
+subtest no_table_schemachange_deadlock_after_savepoint_rollback
 
 statement ok
 begin; savepoint s; create table t(x int); rollback to savepoint s;
@@ -1787,3 +1788,72 @@ select * from t;
 
 statement ok
 commit;
+
+subtest no_database_schemachange_deadlock_after_savepoint_rollback
+
+statement ok
+begin; savepoint s; create database d46224; rollback to savepoint s;
+
+query error  relation "d46224.t" does not exist
+select * from d46224.t;
+
+statement ok
+commit;
+
+# Test that adding a self-referencing foreign key to a table in the same
+# transaction which creates the table is okay. In the past this created an
+# infinite loop.
+subtest create_and_add_self_referencing_fk_in_same_txn
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE self_ref_fk (id INT8 PRIMARY KEY, parent_id INT8);
+
+statement ok
+ALTER TABLE "self_ref_fk" ADD CONSTRAINT fk_self_ref_fk__parent_id FOREIGN KEY (parent_id) REFERENCES self_ref_fk (id) ON DELETE CASCADE;
+
+# Test that the constraint is enforced in this transaction. Create a savepoint
+# so that we can rollback the error and commit the transaction.
+
+statement ok
+SAVEPOINT fk_violation;
+
+statement error insert on table "self_ref_fk" violates foreign key constraint "fk_self_ref_fk__parent_id"
+INSERT INTO self_ref_fk VALUES (2, 1);
+
+statement ok
+ROLLBACK TO SAVEPOINT fk_violation;
+
+statement ok
+COMMIT;
+
+# Ensure that the constraint is enforced after the transaction commits.
+
+query error insert on table "self_ref_fk" violates foreign key constraint "fk_self_ref_fk__parent_id"
+INSERT INTO self_ref_fk VALUES (2, 1);
+
+# Add some data and ensure the constraint is applied.
+
+statement ok
+INSERT INTO self_ref_fk VALUES (1, NULL), (2, 1), (3, 2);
+
+query II rowsort
+SELECT * FROM self_ref_fk
+----
+1 NULL
+2 1
+3 2
+
+# Check that the cascade delete takes effect and there are now no rows.
+
+statement ok
+DELETE FROM self_ref_fk WHERE id = 1;
+
+query II rowsort
+SELECT * FROM self_ref_fk;
+----
+
+statement ok
+DROP TABLE self_ref_fk;

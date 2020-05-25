@@ -36,25 +36,19 @@ const replicationConstraintsReportID reportID = 1
 // the cluster's data.
 type ConstraintReport map[ConstraintStatusKey]ConstraintStatus
 
-// ReplicationConstraintStatsReportSaver manages the content and the saving of the report.
+// replicationConstraintStatsReportSaver deals with saving a ConstrainReport to
+// the database. The idea is for it to be used to save new version of the report
+// over and over. It maintains the previously-saved version of the report in
+// order to speed-up the saving of the next one.
 type replicationConstraintStatsReportSaver struct {
 	previousVersion     ConstraintReport
 	lastGenerated       time.Time
 	lastUpdatedRowCount int
-
-	constraints ConstraintReport
 }
 
 // makeReplicationConstraintStatusReportSaver creates a new report saver.
 func makeReplicationConstraintStatusReportSaver() replicationConstraintStatsReportSaver {
-	return replicationConstraintStatsReportSaver{
-		constraints: ConstraintReport{},
-	}
-}
-
-// resetReport resets the report to an empty state.
-func (r *replicationConstraintStatsReportSaver) resetReport() {
-	r.constraints = ConstraintReport{}
+	return replicationConstraintStatsReportSaver{}
 }
 
 // LastUpdatedRowCount is the count of the rows that were touched during the last save.
@@ -119,56 +113,37 @@ func (k ConstraintStatusKey) Less(other ConstraintStatusKey) bool {
 	return k.Constraint.Less(other.Constraint)
 }
 
-// MakeConstraintRepr creates a canonical string representation for a
-// constraint. The constraint is identified by the group it belongs to and the
-// index within the group.
-func MakeConstraintRepr(constraintGroup zonepb.Constraints, constraintIdx int) ConstraintRepr {
-	cstr := constraintGroup.Constraints[constraintIdx].String()
-	if constraintGroup.NumReplicas == 0 {
-		return ConstraintRepr(cstr)
-	}
-	return ConstraintRepr(fmt.Sprintf("%q:%d", cstr, constraintGroup.NumReplicas))
-}
-
 // AddViolation add a constraint that is being violated for a given range. Each call
 // will increase the number of ranges that failed.
-func (r *replicationConstraintStatsReportSaver) AddViolation(
-	z ZoneKey, t ConstraintType, c ConstraintRepr,
-) {
+func (r ConstraintReport) AddViolation(z ZoneKey, t ConstraintType, c ConstraintRepr) {
 	k := ConstraintStatusKey{
 		ZoneKey:       z,
 		ViolationType: t,
 		Constraint:    c,
 	}
-	if _, ok := r.constraints[k]; !ok {
-		r.constraints[k] = ConstraintStatus{}
+	if _, ok := r[k]; !ok {
+		r[k] = ConstraintStatus{}
 	}
-	cRep := r.constraints[k]
+	cRep := r[k]
 	cRep.FailRangeCount++
-	r.constraints[k] = cRep
+	r[k] = cRep
 }
 
-// EnsureEntry us used to add an entry to the report even if there is no violation.
-func (r *replicationConstraintStatsReportSaver) EnsureEntry(
-	z ZoneKey, t ConstraintType, c ConstraintRepr,
-) {
+// ensureEntry us used to add an entry to the report even if there is no violation.
+func (r ConstraintReport) ensureEntry(z ZoneKey, t ConstraintType, c ConstraintRepr) {
 	k := ConstraintStatusKey{
 		ZoneKey:       z,
 		ViolationType: t,
 		Constraint:    c,
 	}
-	if _, ok := r.constraints[k]; !ok {
-		r.constraints[k] = ConstraintStatus{}
+	if _, ok := r[k]; !ok {
+		r[k] = ConstraintStatus{}
 	}
 }
 
-func (r *replicationConstraintStatsReportSaver) ensureEntries(
-	key ZoneKey, zone *zonepb.ZoneConfig,
-) {
-	for _, group := range zone.Constraints {
-		for i := range group.Constraints {
-			r.EnsureEntry(key, Constraint, MakeConstraintRepr(group, i))
-		}
+func (r ConstraintReport) ensureEntries(key ZoneKey, zone *zonepb.ZoneConfig) {
+	for _, conjunction := range zone.Constraints {
+		r.ensureEntry(key, Constraint, ConstraintRepr(conjunction.String()))
 	}
 	for i, sz := range zone.Subzones {
 		szKey := ZoneKey{ZoneID: key.ZoneID, SubzoneID: base.SubzoneIDFromIndex(i)}
@@ -217,11 +192,6 @@ func (r *replicationConstraintStatsReportSaver) loadPreviousVersion(
 	return nil
 }
 
-func (r *replicationConstraintStatsReportSaver) updatePreviousVersion() {
-	r.previousVersion = r.constraints
-	r.constraints = make(ConstraintReport, len(r.previousVersion))
-}
-
 func (r *replicationConstraintStatsReportSaver) updateTimestamp(
 	ctx context.Context, ex sqlutil.InternalExecutor, txn *kv.Txn, reportTS time.Time,
 ) error {
@@ -244,11 +214,17 @@ func (r *replicationConstraintStatsReportSaver) updateTimestamp(
 	return err
 }
 
-// Save the report.
+// Save the report in the database.
 //
+// report should not be used by the caller any more after this call; the callee
+// takes ownership.
 // reportTS is the time that will be set in the updated_at column for every row.
 func (r *replicationConstraintStatsReportSaver) Save(
-	ctx context.Context, reportTS time.Time, db *kv.DB, ex sqlutil.InternalExecutor,
+	ctx context.Context,
+	report ConstraintReport,
+	reportTS time.Time,
+	db *kv.DB,
+	ex sqlutil.InternalExecutor,
 ) error {
 	r.lastUpdatedRowCount = 0
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -262,7 +238,7 @@ func (r *replicationConstraintStatsReportSaver) Save(
 			return err
 		}
 
-		for k, zoneCons := range r.constraints {
+		for k, zoneCons := range report {
 			if err := r.upsertConstraintStatus(
 				ctx, reportTS, txn, k, zoneCons.FailRangeCount, db, ex,
 			); err != nil {
@@ -271,7 +247,7 @@ func (r *replicationConstraintStatsReportSaver) Save(
 		}
 
 		for key := range r.previousVersion {
-			if _, ok := r.constraints[key]; !ok {
+			if _, ok := report[key]; !ok {
 				_, err := ex.Exec(
 					ctx,
 					"delete-old-replication-constraint-stats",
@@ -297,7 +273,7 @@ func (r *replicationConstraintStatsReportSaver) Save(
 	}
 
 	r.lastGenerated = reportTS
-	r.updatePreviousVersion()
+	r.previousVersion = report
 
 	return nil
 }
@@ -365,28 +341,26 @@ type constraintConformanceVisitor struct {
 	cfg           *config.SystemConfig
 	storeResolver StoreResolver
 
-	report   *replicationConstraintStatsReportSaver
+	// report is the output of the visitor. visit*() methods populate it.
+	// After visiting all the ranges, it can be retrieved with Report().
+	report   ConstraintReport
 	visitErr bool
 
 	// prevZoneKey and prevConstraints maintain state from one range to the next.
 	// This state can be reused when a range is covered by the same zone config as
 	// the previous one. Reusing it speeds up the report generation.
 	prevZoneKey     ZoneKey
-	prevConstraints []zonepb.Constraints
+	prevConstraints []zonepb.ConstraintsConjunction
 }
 
 var _ rangeVisitor = &constraintConformanceVisitor{}
 
 func makeConstraintConformanceVisitor(
-	ctx context.Context,
-	cfg *config.SystemConfig,
-	storeResolver StoreResolver,
-	saver *replicationConstraintStatsReportSaver,
+	ctx context.Context, cfg *config.SystemConfig, storeResolver StoreResolver,
 ) constraintConformanceVisitor {
 	v := constraintConformanceVisitor{
 		cfg:           cfg,
 		storeResolver: storeResolver,
-		report:        saver,
 	}
 	v.reset(ctx)
 	return v
@@ -397,12 +371,19 @@ func (v *constraintConformanceVisitor) failed() bool {
 	return v.visitErr
 }
 
+// Report returns the ConstraintReport that was populated by previous visit*()
+// calls.
+func (v *constraintConformanceVisitor) Report() ConstraintReport {
+	return v.report
+}
+
 // reset is part of the rangeVisitor interface.
 func (v *constraintConformanceVisitor) reset(ctx context.Context) {
-	v.visitErr = false
-	v.prevZoneKey = ZoneKey{}
-	v.prevConstraints = nil
-	v.report.resetReport()
+	*v = constraintConformanceVisitor{
+		cfg:           v.cfg,
+		storeResolver: v.storeResolver,
+		report:        make(ConstraintReport, len(v.report)),
+	}
 
 	// Iterate through all the zone configs to create report entries for all the
 	// zones that have constraints. Otherwise, just iterating through the ranges
@@ -434,7 +415,7 @@ func (v *constraintConformanceVisitor) visitNewZone(
 	}()
 
 	// Find the applicable constraints, which may be inherited.
-	var constraints []zonepb.Constraints
+	var constraints []zonepb.ConstraintsConjunction
 	var zKey ZoneKey
 	_, err := visitZones(ctx, r, v.cfg, ignoreSubzonePlaceholders,
 		func(_ context.Context, zone *zonepb.ZoneConfig, key ZoneKey) bool {
@@ -457,17 +438,62 @@ func (v *constraintConformanceVisitor) visitNewZone(
 // visitSameZone is part of the rangeVisitor interface.
 func (v *constraintConformanceVisitor) visitSameZone(
 	ctx context.Context, r *roachpb.RangeDescriptor,
-) (retErr error) {
+) {
 	v.countRange(ctx, r, v.prevZoneKey, v.prevConstraints)
-	return nil
 }
 
 func (v *constraintConformanceVisitor) countRange(
-	ctx context.Context, r *roachpb.RangeDescriptor, key ZoneKey, constraints []zonepb.Constraints,
+	ctx context.Context,
+	r *roachpb.RangeDescriptor,
+	key ZoneKey,
+	constraints []zonepb.ConstraintsConjunction,
 ) {
 	storeDescs := v.storeResolver(r)
-	violated := processRange(ctx, storeDescs, constraints)
+	violated := getViolations(ctx, storeDescs, constraints)
 	for _, c := range violated {
 		v.report.AddViolation(key, Constraint, c)
 	}
+}
+
+// getViolations returns the list of constraints violated by a range. The range
+// is represented by the descriptors of the replicas' stores.
+func getViolations(
+	ctx context.Context,
+	storeDescs []roachpb.StoreDescriptor,
+	constraintConjunctions []zonepb.ConstraintsConjunction,
+) []ConstraintRepr {
+	var res []ConstraintRepr
+	// Evaluate all zone constraints for the stores (i.e. replicas) of the given range.
+	for _, conjunction := range constraintConjunctions {
+		replicasRequiredToMatch := int(conjunction.NumReplicas)
+		if replicasRequiredToMatch == 0 {
+			replicasRequiredToMatch = len(storeDescs)
+		}
+		for _, c := range conjunction.Constraints {
+			if !constraintSatisfied(c, replicasRequiredToMatch, storeDescs) {
+				res = append(res, ConstraintRepr(conjunction.String()))
+				break
+			}
+		}
+	}
+	return res
+}
+
+// constraintSatisfied checks that a range (represented by its replicas' stores)
+// satisfies a constraint.
+func constraintSatisfied(
+	c zonepb.Constraint, replicasRequiredToMatch int, storeDescs []roachpb.StoreDescriptor,
+) bool {
+	passCount := 0
+	for _, storeDesc := range storeDescs {
+		// Consider stores for which we have no information to pass everything.
+		if storeDesc.StoreID == 0 {
+			passCount++
+			continue
+		}
+		if zonepb.StoreSatisfiesConstraint(storeDesc, c) {
+			passCount++
+		}
+	}
+	return replicasRequiredToMatch <= passCount
 }

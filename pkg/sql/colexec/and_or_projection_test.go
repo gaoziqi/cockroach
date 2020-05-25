@@ -16,14 +16,14 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/stretchr/testify/require"
 )
 
 type andOrTestCase struct {
@@ -194,30 +194,20 @@ func TestAndOrOps(t *testing.T) {
 				runner(
 					t,
 					[]tuples{tc.tuples},
-					[][]coltypes.T{{coltypes.Bool, coltypes.Bool}},
+					[][]*types.T{{types.Bool, types.Bool}},
 					tc.expected,
 					orderedVerifier,
-					func(input []Operator) (Operator, error) {
-						spec := &execinfrapb.ProcessorSpec{
-							Input: []execinfrapb.InputSyncSpec{{ColumnTypes: []types.T{*types.Bool, *types.Bool}}},
-							Core: execinfrapb.ProcessorCoreUnion{
-								Noop: &execinfrapb.NoopCoreSpec{},
-							},
-							Post: execinfrapb.PostProcessSpec{
-								RenderExprs: []execinfrapb.Expression{{Expr: fmt.Sprintf("@1 %s @2", test.operation)}},
-							},
-						}
-						args := NewColOperatorArgs{
-							Spec:                spec,
-							Inputs:              input,
-							StreamingMemAccount: testMemAcc,
-						}
-						args.TestingKnobs.UseStreamingMemAccountForBuffering = true
-						result, err := NewColOperator(ctx, flowCtx, args)
+					func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+						projOp, err := createTestProjectingOperator(
+							ctx, flowCtx, input[0], []*types.T{types.Bool, types.Bool},
+							fmt.Sprintf("@1 %s @2", test.operation), false, /* canFallbackToRowexec */
+						)
 						if err != nil {
 							return nil, err
 						}
-						return result.Op, nil
+						// We will project out the first two columns in order
+						// to have test cases be less verbose.
+						return NewSimpleProjectOp(projOp, 3 /* numInputCols */, []uint32{2}), nil
 					})
 			}
 		})
@@ -239,7 +229,7 @@ func benchmarkLogicalProjOp(
 	}
 	rng, _ := randutil.NewPseudoRand()
 
-	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Bool, coltypes.Bool})
+	batch := testAllocator.NewMemBatch([]*types.T{types.Bool, types.Bool})
 	col1 := batch.ColVec(0).Bool()
 	col2 := batch.ColVec(0).Bool()
 	for i := 0; i < coldata.BatchSize(); i++ {
@@ -266,29 +256,13 @@ func benchmarkLogicalProjOp(
 			sel[i] = i
 		}
 	}
-	input := NewRepeatableBatchSource(testAllocator, batch)
-
-	spec := &execinfrapb.ProcessorSpec{
-		Input: []execinfrapb.InputSyncSpec{{ColumnTypes: []types.T{*types.Bool, *types.Bool}}},
-		Core: execinfrapb.ProcessorCoreUnion{
-			Noop: &execinfrapb.NoopCoreSpec{},
-		},
-		Post: execinfrapb.PostProcessSpec{
-			RenderExprs: []execinfrapb.Expression{{Expr: fmt.Sprintf("@1 %s @2", operation)}},
-		},
-	}
-
-	args := NewColOperatorArgs{
-		Spec:                spec,
-		Inputs:              []Operator{input},
-		StreamingMemAccount: testMemAcc,
-	}
-	args.TestingKnobs.UseStreamingMemAccountForBuffering = true
-	result, err := NewColOperator(ctx, flowCtx, args)
-	if err != nil {
-		b.Fatal(err)
-	}
-	logicalProjOp := result.Op
+	typs := []*types.T{types.Bool, types.Bool}
+	input := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
+	logicalProjOp, err := createTestProjectingOperator(
+		ctx, flowCtx, input, typs,
+		fmt.Sprintf("@1 %s @2", operation), false, /* canFallbackToRowexec */
+	)
+	require.NoError(b, err)
 	logicalProjOp.Init()
 
 	b.SetBytes(int64(8 * coldata.BatchSize()))

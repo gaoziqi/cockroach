@@ -25,13 +25,6 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func checkFrom(expr tree.Expr, inScope *scope) {
-	if len(inScope.cols) == 0 {
-		panic(pgerror.Newf(pgcode.InvalidName,
-			"cannot use %q without a FROM clause", tree.ErrString(expr)))
-	}
-}
-
 // windowAggregateFrame() returns a frame that any aggregate built as a window
 // can use.
 func windowAggregateFrame() memo.WindowFrame {
@@ -88,10 +81,6 @@ func (b *Builder) expandStar(
 		tTuple, isTuple := texpr.(*tree.Tuple)
 
 		aliases = typ.TupleLabels()
-		for i := len(aliases); i < len(typ.TupleContents()); i++ {
-			// Add aliases for all the non-named columns in the tuple.
-			aliases = append(aliases, "?column?")
-		}
 		exprs = make([]tree.TypedExpr, len(typ.TupleContents()))
 		for i := range typ.TupleContents() {
 			if isTuple {
@@ -99,29 +88,36 @@ func (b *Builder) expandStar(
 				exprs[i] = tTuple.Exprs[i].(tree.TypedExpr)
 			} else {
 				// Can't de-tuplify:
-				// either (Expr).* -> (Expr).a, (Expr).b, (Expr).c if there are enough labels,
-				// or (Expr).* -> (Expr).@1, (Expr).@2, (Expr).@3 if labels are missing.
+				// either (Expr).* -> (Expr).a, (Expr).b, (Expr).c if there are enough
+				// labels, or (Expr).* -> (Expr).@1, (Expr).@2, (Expr).@3 if labels are
+				// missing.
 				//
 				// We keep the labels if available so that the column name
 				// generation still produces column label "x" for, e.g. (E).x.
 				colName := ""
-				if i < len(typ.TupleContents()) {
+				if i < len(aliases) {
 					colName = aliases[i]
 				}
+				// NewTypedColumnAccessExpr expects colName to be empty if the tuple
+				// should be accessed by index.
 				exprs[i] = tree.NewTypedColumnAccessExpr(texpr, colName, i)
 			}
 		}
+		for i := len(aliases); i < len(typ.TupleContents()); i++ {
+			// Add aliases for all the non-named columns in the tuple.
+			aliases = append(aliases, "?column?")
+		}
 
 	case *tree.AllColumnsSelector:
-		checkFrom(expr, inScope)
-		src, _, err := t.Resolve(b.ctx, inScope)
+		src, srcMeta, err := t.Resolve(b.ctx, inScope)
 		if err != nil {
 			panic(err)
 		}
-		exprs = make([]tree.TypedExpr, 0, len(inScope.cols))
-		aliases = make([]string, 0, len(inScope.cols))
-		for i := range inScope.cols {
-			col := &inScope.cols[i]
+		refScope := srcMeta.(*scope)
+		exprs = make([]tree.TypedExpr, 0, len(refScope.cols))
+		aliases = make([]string, 0, len(refScope.cols))
+		for i := range refScope.cols {
+			col := &refScope.cols[i]
 			if col.table == *src && !col.hidden {
 				exprs = append(exprs, col)
 				aliases = append(aliases, string(col.name))
@@ -129,7 +125,10 @@ func (b *Builder) expandStar(
 		}
 
 	case tree.UnqualifiedStar:
-		checkFrom(expr, inScope)
+		if len(inScope.cols) == 0 {
+			panic(pgerror.Newf(pgcode.InvalidName,
+				"cannot use %q without a FROM clause", tree.ErrString(expr)))
+		}
 		exprs = make([]tree.TypedExpr, 0, len(inScope.cols))
 		aliases = make([]string, 0, len(inScope.cols))
 		for i := range inScope.cols {
@@ -427,13 +426,17 @@ func colsToColList(cols []scopeColumn) opt.ColList {
 
 // resolveAndBuildScalar is used to build a scalar with a required type.
 func (b *Builder) resolveAndBuildScalar(
-	expr tree.Expr, requiredType *types.T, context string, flags tree.SemaRejectFlags, inScope *scope,
+	expr tree.Expr,
+	requiredType *types.T,
+	context exprKind,
+	flags tree.SemaRejectFlags,
+	inScope *scope,
 ) opt.ScalarExpr {
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
 	// context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
-	b.semaCtx.Properties.Require(context, flags)
+	b.semaCtx.Properties.Require(context.String(), flags)
 
 	inScope.context = context
 	texpr := inScope.resolveAndRequireType(expr, requiredType)
@@ -457,7 +460,7 @@ func resolveTemporaryStatus(name *tree.TableName, explicitTemp bool) bool {
 // CREATE privilege, then resolveSchemaForCreate raises an error.
 func (b *Builder) resolveSchemaForCreate(name *tree.TableName) (cat.Schema, cat.SchemaName) {
 	flags := cat.Flags{AvoidDescriptorCaches: true}
-	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, &name.TableNamePrefix)
+	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, &name.ObjectNamePrefix)
 	if err != nil {
 		// Remap invalid schema name error text so that it references the catalog
 		// object that could not be created.

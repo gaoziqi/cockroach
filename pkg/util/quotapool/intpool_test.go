@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -103,7 +103,7 @@ func TestQuotaPoolContextCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("context cancellation did not unblock acquisitions within 5s")
 	case err := <-errCh:
-		if err != context.Canceled {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected context cancellation error, got %v", err)
 		}
 	}
@@ -147,7 +147,7 @@ func TestQuotaPoolClose(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("quota pool closing did not unblock acquisitions within 5s")
 		case err := <-resCh:
-			if _, isErrClosed := err.(*quotapool.ErrClosed); !isErrClosed {
+			if !errors.HasType(err, (*quotapool.ErrClosed)(nil)) {
 				t.Fatal(err)
 			}
 		}
@@ -159,7 +159,7 @@ func TestQuotaPoolClose(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("quota pool closing did not unblock acquisitions within 5s")
 	case err := <-resCh:
-		if _, isErrClosed := err.(*quotapool.ErrClosed); !isErrClosed {
+		if !errors.HasType(err, (*quotapool.ErrClosed)(nil)) {
 			t.Fatal(err)
 		}
 	}
@@ -194,7 +194,7 @@ func TestQuotaPoolCanceledAcquisitions(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("context cancellations did not unblock acquisitions within 5s")
 		case err := <-errCh:
-			if err != context.Canceled {
+			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("expected context cancellation error, got %v", err)
 			}
 		}
@@ -303,6 +303,33 @@ func TestQuotaPoolCappedAcquisition(t *testing.T) {
 	if q := qp.ApproximateQuota(); q != quota {
 		t.Fatalf("expected quota: %d, got: %d", quota, q)
 	}
+}
+
+// TestQuotaPoolZeroCapacity verifies that a non-noop acquisition request on a
+// pool with zero capacity is immediately rejected, regardless of whether the
+// request is permitted to wait or not.
+func TestQuotaPoolZeroCapacity(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const quota = 0
+	qp := quotapool.NewIntPool("test", quota)
+	ctx := context.Background()
+
+	failed, err := qp.Acquire(ctx, 1)
+	require.Equal(t, quotapool.ErrNotEnoughQuota, err)
+	require.Nil(t, failed)
+
+	failed, err = qp.TryAcquire(ctx, 1)
+	require.Equal(t, quotapool.ErrNotEnoughQuota, err)
+	require.Nil(t, failed)
+
+	acq1, err := qp.Acquire(ctx, 0)
+	require.NoError(t, err)
+	acq1.Release()
+
+	acq2, err := qp.TryAcquire(ctx, 0)
+	require.NoError(t, err)
+	acq2.Release()
 }
 
 func TestOnAcquisition(t *testing.T) {

@@ -26,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/tracker"
 )
@@ -203,7 +203,11 @@ func newTruncateDecision(ctx context.Context, r *Replica) (truncateDecision, err
 	log.Eventf(ctx, "raft status before lastUpdateTimes check: %+v", raftStatus.Progress)
 	log.Eventf(ctx, "lastUpdateTimes: %+v", r.mu.lastUpdateTimes)
 	updateRaftProgressFromActivity(
-		ctx, raftStatus.Progress, r.descRLocked().Replicas().All(), r.mu.lastUpdateTimes, now,
+		ctx, raftStatus.Progress, r.descRLocked().Replicas().All(),
+		func(replicaID roachpb.ReplicaID) bool {
+			return r.mu.lastUpdateTimes.isFollowerActiveSince(
+				ctx, replicaID, now, r.store.cfg.RangeLeaseActiveDuration())
+		},
 	)
 	log.Eventf(ctx, "raft status after lastUpdateTimes check: %+v", raftStatus.Progress)
 	r.mu.RUnlock()
@@ -233,8 +237,7 @@ func updateRaftProgressFromActivity(
 	ctx context.Context,
 	prs map[uint64]tracker.Progress,
 	replicas []roachpb.ReplicaDescriptor,
-	lastUpdate lastUpdateTimesMap,
-	now time.Time,
+	replicaActive func(roachpb.ReplicaID) bool,
 ) {
 	for _, replDesc := range replicas {
 		replicaID := replDesc.ReplicaID
@@ -242,7 +245,7 @@ func updateRaftProgressFromActivity(
 		if !ok {
 			continue
 		}
-		pr.RecentActive = lastUpdate.isFollowerActive(ctx, replicaID, now)
+		pr.RecentActive = replicaActive(replicaID)
 		// Override this field for safety since we don't use it. Instead, we use
 		// pendingSnapshotIndex from above which is also populated for preemptive
 		// snapshots.
@@ -277,6 +280,10 @@ func (input truncateDecisionInput) LogTooLarge() bool {
 	return input.LogSize > input.MaxLogSize
 }
 
+// truncateDecision describes a truncation decision.
+// Beware: when extending this struct, be sure to adjust .String()
+// so that it is guaranteed to not contain any PII or confidential
+// cluster data.
 type truncateDecision struct {
 	Input       truncateDecisionInput
 	CommitIndex uint64
@@ -318,6 +325,9 @@ func (td *truncateDecision) NumNewRaftSnapshots() int {
 	return td.raftSnapshotsForIndex(td.NewFirstIndex) - td.raftSnapshotsForIndex(td.Input.FirstIndex)
 }
 
+// String returns a representation for the decision.
+// It is guaranteed to not return PII or confidential
+// information from the cluster.
 func (td *truncateDecision) String() string {
 	var buf strings.Builder
 	_, _ = fmt.Fprintf(&buf, "should truncate: %t [", td.ShouldTruncate())
@@ -462,21 +472,50 @@ func computeTruncateDecision(input truncateDecisionInput) truncateDecision {
 		decision.ChosenVia = truncatableIndexChosenViaFirstIndex
 	}
 
-	// Invariants: NewFirstIndex >= FirstIndex
-	//             NewFirstIndex <= LastIndex (if != 10)
-	//             NewFirstIndex <= CommitIndex (if != 10)
+	// We've inherited the unfortunate semantics for {First,Last}Index from
+	// raft.Storage. Specifically, both {First,Last}Index are inclusive, so
+	// there's no way to represent an empty log. The way we've initialized
+	// repl.FirstIndex is to set it to the first index in the possibly-empty log
+	// (TruncatedState.Index + 1), and allowing LastIndex to fall behind it when
+	// the log is empty (TruncatedState.Index). The initialization is done when
+	// minting a new replica from either the truncated state of incoming
+	// snapshot, or using the default initial log index. This makes for the
+	// confusing situation where FirstIndex > LastIndex. We can detect this
+	// special empty log case by comparing checking if
+	// `FirstIndex == LastIndex + 1` (`logEmpty` below). Similar to this, we can
+	// have the case that `FirstIndex = CommitIndex + 1` when there are no
+	// committed entries (which we check for in `noCommittedEntries` below).
+	// Having done that (i.e. if the raft log is not empty, and there are
+	// committed entries), we can assert on the following invariants:
 	//
-	// For uninit'ed replicas we can have NewFirstIndex > input.LastIndex, more
-	// specifically NewFirstIndex = input.LastIndex + 1. NewFirstIndex is set to
-	// TruncatedState.Index + 1, and for an unit'ed replica, input.LastIndex is
-	// simply 10. This is what informs the `input.LastIndex == 10` conditional
-	// below. The same reasoning holds for NewFirstIndex and
-	// decision.CommitIndex.
-	valid := (decision.NewFirstIndex >= input.FirstIndex) &&
-		(decision.NewFirstIndex <= input.LastIndex || input.LastIndex == 10) &&
-		(decision.NewFirstIndex <= decision.CommitIndex || decision.CommitIndex == 10)
+	//         FirstIndex    <= LastIndex                                    (0)
+	//         NewFirstIndex >= FirstIndex                                   (1)
+	//         NewFirstIndex <= LastIndex                                    (2)
+	//         NewFirstIndex <= CommitIndex                                  (3)
+	//
+	// (1) asserts that we're not regressing our FirstIndex
+	// (2) asserts that our we don't truncate past the last index we can
+	//     truncate away, and
+	// (3) is similar to (2) in that we assert that we're not truncating past
+	//     the last known CommitIndex.
+	//
+	// TODO(irfansharif): We should consider cleaning up this mess around
+	// {First,Last,Commit}Index by using a sentinel value to represent an empty
+	// log (like we do with `invalidLastTerm`). It'd be extra nice if we could
+	// safeguard access by relying on the type system to force callers to
+	// consider the empty case. Something like
+	// https://github.com/nvanbenschoten/optional could help us emulate an
+	// `option<uint64>` type if we care enough.
+	logEmpty := input.FirstIndex == input.LastIndex+1
+	noCommittedEntries := input.FirstIndex == input.RaftStatus.Commit+1
+
+	logIndexValid := logEmpty ||
+		(decision.NewFirstIndex >= input.FirstIndex) && (decision.NewFirstIndex <= input.LastIndex)
+	commitIndexValid := noCommittedEntries ||
+		(decision.NewFirstIndex <= decision.CommitIndex)
+	valid := logIndexValid && commitIndexValid
 	if !valid {
-		err := fmt.Sprintf("invalid truncation decision; output = %d, input: [%d, %d], commit idx = %d",
+		err := fmt.Sprintf("invalid truncation decision: output = %d, input: [%d, %d], commit idx = %d",
 			decision.NewFirstIndex, input.FirstIndex, input.LastIndex, decision.CommitIndex)
 		panic(err)
 	}
@@ -492,7 +531,7 @@ func (rlq *raftLogQueue) shouldQueue(
 ) (shouldQ bool, priority float64) {
 	decision, err := newTruncateDecision(ctx, r)
 	if err != nil {
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "%v", err)
 		return false, 0
 	}
 
@@ -568,9 +607,9 @@ func (rlq *raftLogQueue) process(ctx context.Context, r *Replica, _ *config.Syst
 	// Can and should the raft logs be truncated?
 	if decision.ShouldTruncate() {
 		if n := decision.NumNewRaftSnapshots(); log.V(1) || n > 0 && rlq.logSnapshots.ShouldProcess(timeutil.Now()) {
-			log.Info(ctx, decision.String())
+			log.Infof(ctx, "%v", log.Safe(decision.String()))
 		} else {
-			log.VEvent(ctx, 1, decision.String())
+			log.VEventf(ctx, 1, "%v", log.Safe(decision.String()))
 		}
 		b := &kv.Batch{}
 		b.AddRawRequest(&roachpb.TruncateLogRequest{
@@ -583,7 +622,7 @@ func (rlq *raftLogQueue) process(ctx context.Context, r *Replica, _ *config.Syst
 		}
 		r.store.metrics.RaftLogTruncated.Inc(int64(decision.NumTruncatableIndexes()))
 	} else {
-		log.VEventf(ctx, 3, decision.String())
+		log.VEventf(ctx, 3, "%s", log.Safe(decision.String()))
 	}
 	return nil
 }

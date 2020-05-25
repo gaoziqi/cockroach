@@ -51,13 +51,13 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	// Update the table name to include catalog and schema if not provided.
 	tc.qualifyTableName(&stmt.Table)
 
-	tab := &Table{TabID: tc.nextStableID(), TabName: stmt.Table, Catalog: tc}
-
 	// Assume that every table in the "system" or "information_schema" catalog
 	// is a virtual table. This is a simplified assumption for testing purposes.
 	if stmt.Table.CatalogName == "system" || stmt.Table.SchemaName == "information_schema" {
-		tab.IsVirtual = true
+		return tc.createVirtualTable(stmt)
 	}
+
+	tab := &Table{TabID: tc.nextStableID(), TabName: stmt.Table, Catalog: tc}
 
 	// TODO(andyk): For now, just remember that the table was interleaved. In the
 	// future, it may be necessary to extract additional metadata.
@@ -77,31 +77,29 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 
 	// If there is no primary index, add the hidden rowid column.
 	hasPrimaryIndex := false
-	if !tab.IsVirtual {
-		for _, def := range stmt.Defs {
-			switch def := def.(type) {
-			case *tree.ColumnTableDef:
-				if def.PrimaryKey.IsPrimaryKey {
-					hasPrimaryIndex = true
-				}
+	for _, def := range stmt.Defs {
+		switch def := def.(type) {
+		case *tree.ColumnTableDef:
+			if def.PrimaryKey.IsPrimaryKey {
+				hasPrimaryIndex = true
+			}
 
-			case *tree.UniqueConstraintTableDef:
-				if def.PrimaryKey {
-					hasPrimaryIndex = true
-				}
+		case *tree.UniqueConstraintTableDef:
+			if def.PrimaryKey {
+				hasPrimaryIndex = true
 			}
 		}
+	}
 
-		if !hasPrimaryIndex {
-			rowid := &Column{
-				Ordinal:     tab.ColumnCount(),
-				Name:        "rowid",
-				Type:        types.Int,
-				Hidden:      true,
-				DefaultExpr: &uniqueRowIDString,
-			}
-			tab.Columns = append(tab.Columns, rowid)
+	if !hasPrimaryIndex {
+		rowid := &Column{
+			Ordinal:     tab.ColumnCount(),
+			Name:        "rowid",
+			Type:        types.Int,
+			Hidden:      true,
+			DefaultExpr: &uniqueRowIDString,
 		}
+		tab.Columns = append(tab.Columns, rowid)
 	}
 
 	// Add any mutation columns (after any hidden rowid column).
@@ -130,13 +128,10 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 				}
 			}
 		}
-	} else if !tab.IsVirtual {
+	} else {
 		tab.addPrimaryColumnIndex("rowid")
 	}
 	if stmt.PartitionBy != nil {
-		if len(tab.Indexes) == 0 {
-			panic("cannot partition virtual table")
-		}
 		tab.Indexes[0].partitionBy = stmt.PartitionBy
 	}
 
@@ -169,7 +164,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 			if def.Unique {
 				tab.addIndex(
 					&tree.IndexTableDef{
-						Name:    tree.Name(fmt.Sprintf("%s_%s_key", stmt.Table.TableName, def.Name)),
+						Name:    tree.Name(fmt.Sprintf("%s_%s_key", stmt.Table.ObjectName, def.Name)),
 						Columns: tree.IndexElemList{{Column: def.Name}},
 					},
 					uniqueIndex,
@@ -212,6 +207,40 @@ OuterLoop:
 	return tab
 }
 
+func (tc *Catalog) createVirtualTable(stmt *tree.CreateTable) *Table {
+	tab := &Table{
+		TabID:     tc.nextStableID(),
+		TabName:   stmt.Table,
+		Catalog:   tc,
+		IsVirtual: true,
+	}
+
+	// Add the dummy PK column.
+	tab.Columns = []*Column{{
+		Ordinal:  0,
+		Hidden:   true,
+		Nullable: false,
+		Name:     "crdb_internal_vtable_pk",
+		Type:     types.Int,
+	}}
+
+	for _, def := range stmt.Defs {
+		switch def := def.(type) {
+		case *tree.ColumnTableDef:
+			tab.addColumn(def)
+		}
+	}
+
+	tab.Families = []*Family{{FamName: "primary", Ordinal: 0, table: tab}}
+	for colOrd, col := range tab.Columns {
+		tab.Families[0].Columns = append(tab.Families[0].Columns,
+			cat.FamilyColumn{Column: col, Ordinal: colOrd})
+	}
+
+	tab.addPrimaryColumnIndex(tab.Columns[0].Name)
+	return tab
+}
+
 // CreateTableAs creates a table in the catalog with the given name and
 // columns. It should be used for creating a table from the CREATE TABLE <name>
 // AS <query> syntax. In addition to the provided columns, CreateTableAs adds a
@@ -247,7 +276,7 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 	}
 
 	var targetTable *Table
-	if d.Table.TableName == tab.Name() {
+	if d.Table.ObjectName == tab.Name() {
 		targetTable = tab
 	} else {
 		targetTable = tc.Table(&d.Table)
@@ -352,10 +381,9 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 	col := &Column{
 		Ordinal:  tt.ColumnCount(),
 		Name:     string(def.Name),
-		Type:     def.Type,
+		Type:     tree.MustBeStaticallyKnownType(def.Type),
 		Nullable: nullable,
 	}
-	col.ColType = *def.Type
 
 	// Look for name suffixes indicating this is a mutation column.
 	if name, ok := extractWriteOnlyColumn(def); ok {

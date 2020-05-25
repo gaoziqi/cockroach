@@ -124,7 +124,7 @@ SUBTESTS :=
 LINTTIMEOUT := 20m
 
 ## Test timeout to use for regular tests.
-TESTTIMEOUT := 20m
+TESTTIMEOUT := 30m
 
 ## Test timeout to use for race tests.
 RACETIMEOUT := 30m
@@ -193,7 +193,7 @@ help: ## Print help for targets with comments.
 		"make testccllogic" "Run all CCL SQL logic tests." \
 		"make testoptlogic" "Run all opt exec builder SQL logic tests." \
 		"make testbaselogic" "Run all the baseSQL SQL logic tests." \
-		"make testlogic FILES='prepare fk'" "Run the logic tests in the files named prepare and fk." \
+		"make testlogic FILES='prepare|fk'" "Run the logic tests in the files named prepare and fk (the full path is not required)." \
 		"make testlogic FILES=fk SUBTESTS='20042|20045'" "Run the logic tests within subtests 20042 and 20045 in the file named fk." \
 		"make testlogic TESTCONFIG=local" "Run the logic tests for the cluster configuration 'local'." \
 		"make fuzz" "Run all fuzz tests for 12m each (or whatever the default TESTTIMEOUT is)." \
@@ -436,6 +436,7 @@ JEMALLOC_SRC_DIR := $(C_DEPS_DIR)/jemalloc
 PROTOBUF_SRC_DIR := $(C_DEPS_DIR)/protobuf
 ROCKSDB_SRC_DIR  := $(C_DEPS_DIR)/rocksdb
 SNAPPY_SRC_DIR   := $(C_DEPS_DIR)/snappy
+GEOS_SRC_DIR     := $(C_DEPS_DIR)/geos
 LIBEDIT_SRC_DIR  := $(C_DEPS_DIR)/libedit
 LIBROACH_SRC_DIR := $(C_DEPS_DIR)/libroach
 KRB5_SRC_DIR     := $(C_DEPS_DIR)/krb5
@@ -464,6 +465,7 @@ JEMALLOC_DIR := $(BUILD_DIR)/jemalloc$(if $(use-msan),_msan)
 PROTOBUF_DIR := $(BUILD_DIR)/protobuf$(if $(use-msan),_msan)
 ROCKSDB_DIR  := $(BUILD_DIR)/rocksdb$(if $(use-msan),_msan)$(if $(use-stdmalloc),_stdmalloc)$(if $(ENABLE_ROCKSDB_ASSERTIONS),_assert)
 SNAPPY_DIR   := $(BUILD_DIR)/snappy$(if $(use-msan),_msan)
+GEOS_DIR     := $(BUILD_DIR)/geos$(if $(use-msan),_msan)
 LIBEDIT_DIR  := $(BUILD_DIR)/libedit$(if $(use-msan),_msan)
 LIBROACH_DIR := $(BUILD_DIR)/libroach$(if $(use-msan),_msan)$(if $(ENABLE_LIBROACH_ASSERTIONS),_assert)
 KRB5_DIR     := $(BUILD_DIR)/krb5$(if $(use-msan),_msan)
@@ -479,11 +481,19 @@ LIBEDIT     := $(LIBEDIT_DIR)/src/.libs/libedit.a
 LIBROACH    := $(LIBROACH_DIR)/libroach.a
 LIBROACHCCL := $(LIBROACH_DIR)/libroachccl.a
 LIBKRB5     := $(KRB5_DIR)/lib/libgssapi_krb5.a
-PROTOC 		 := $(PROTOC_DIR)/protoc
+PROTOC      := $(PROTOC_DIR)/protoc
+
+DYN_LIB_DIR := lib
+DYN_EXT     := so
+ifdef host-is-macos
+DYN_EXT     := dylib
+endif
+
+LIBGEOS     := $(DYN_LIB_DIR)/libgeos.$(DYN_EXT)
 
 C_LIBS_COMMON = \
 	$(if $(use-stdmalloc),,$(LIBJEMALLOC)) \
-	$(if $(target-is-windows),,$(LIBEDIT)) \
+	$(if $(target-is-windows),,$(LIBEDIT) $(LIBGEOS)) \
 	$(LIBPROTOBUF) $(LIBSNAPPY) $(LIBROCKSDB)
 C_LIBS_OSS = $(C_LIBS_COMMON) $(LIBROACH)
 C_LIBS_CCL = $(C_LIBS_COMMON) $(LIBCRYPTOPP) $(LIBROACHCCL)
@@ -539,7 +549,7 @@ $(BASE_CGO_FLAGS_FILES): Makefile build/defs.mk.sig | bin/.submodules-initialize
 	@echo >> $@
 	@echo 'package $(if $($(@D)-package),$($(@D)-package),$(notdir $(@D)))' >> $@
 	@echo >> $@
-	@echo '// #cgo CPPFLAGS: $(addprefix -I,$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS))' >> $@
+	@echo '// #cgo CPPFLAGS: $(addprefix -I,$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS) $(GEOS_DIR)/capi)' >> $@
 	@echo '// #cgo LDFLAGS: $(addprefix -L,$(CRYPTOPP_DIR) $(PROTOBUF_DIR) $(JEMALLOC_DIR)/lib $(SNAPPY_DIR) $(LIBEDIT_DIR)/src/.libs $(ROCKSDB_DIR) $(LIBROACH_DIR) $(KRB_DIR))' >> $@
 	@echo 'import "C"' >> $@
 
@@ -642,8 +652,7 @@ $(ROCKSDB_DIR)/Makefile: $(C_DEPS_DIR)/rocksdb-rebuild | bin/.submodules-initial
 	  -DSNAPPY_LIBRARIES=$(LIBSNAPPY) -DSNAPPY_INCLUDE_DIR="$(SNAPPY_SRC_DIR);$(SNAPPY_DIR)" -DWITH_SNAPPY=ON \
 	  $(if $(use-stdmalloc),,-DJEMALLOC_LIBRARIES=$(LIBJEMALLOC) -DJEMALLOC_INCLUDE_DIR=$(JEMALLOC_DIR)/include -DWITH_JEMALLOC=ON) \
 	  -DCMAKE_BUILD_TYPE=$(if $(ENABLE_ROCKSDB_ASSERTIONS),Debug,Release) \
-	  -DFAIL_ON_WARNINGS=$(if $(findstring windows,$(XGOOS)),0,1) \
-	  -DUSE_RTTI=1
+	  -DUSE_RTTI=1 -DFAIL_ON_WARNINGS=0
 
 $(SNAPPY_DIR)/Makefile: $(C_DEPS_DIR)/snappy-rebuild | bin/.submodules-initialized
 	rm -rf $(SNAPPY_DIR)
@@ -652,6 +661,18 @@ $(SNAPPY_DIR)/Makefile: $(C_DEPS_DIR)/snappy-rebuild | bin/.submodules-initializ
 	@# $(C_DEPS_DIR)/snappy-rebuild. See above for rationale.
 	cd $(SNAPPY_DIR) && cmake $(xcmake-flags) $(SNAPPY_SRC_DIR) \
 	  -DCMAKE_BUILD_TYPE=Release
+
+$(GEOS_DIR)/Makefile: $(C_DEPS_DIR)/geos-rebuild | bin/.submodules-initialized
+	rm -rf $(GEOS_DIR)
+	mkdir -p $(GEOS_DIR)
+	@# NOTE: If you change the CMake flags below, bump the version in
+	@# $(C_DEPS_DIR)/geos-rebuild. See above for rationale.
+	cd $(GEOS_DIR) && \
+	  cmake $(xcmake-flags) $(GEOS_SRC_DIR) -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-fPIC -DCMAKE_CXX_FLAGS=-fPIC
+	@# Copy geos/export.h to the capi include directory to avoid needing multiple include
+	@# directories.
+	mkdir $(GEOS_DIR)/capi/geos
+	cp $(GEOS_SRC_DIR)/include/geos/export.h $(GEOS_DIR)/capi/geos
 
 $(LIBEDIT_SRC_DIR)/configure.ac: | bin/.submodules-initialized
 
@@ -723,6 +744,11 @@ $(LIBPROTOBUF): $(PROTOBUF_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 $(LIBSNAPPY): $(SNAPPY_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 	@uptodate $@ $(SNAPPY_SRC_DIR) || $(MAKE) --no-print-directory -C $(SNAPPY_DIR) snappy
 
+$(LIBGEOS): $(GEOS_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
+	@uptodate $@ $(GEOS_SRC_DIR) || $(MAKE) --no-print-directory -C $(GEOS_DIR) geos_c
+	mkdir -p $(DYN_LIB_DIR)
+	ln -sf $(GEOS_DIR)/lib/lib{geos,geos_c}.$(DYN_EXT) $(DYN_LIB_DIR)
+
 $(LIBEDIT): $(LIBEDIT_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 	@uptodate $@ $(LIBEDIT_SRC_DIR) || $(MAKE) --no-print-directory -C $(LIBEDIT_DIR)/src
 
@@ -741,13 +767,14 @@ $(LIBKRB5): $(KRB5_DIR)/Makefile bin/uptodate .ALWAYS_REBUILD
 	@uptodate $@ $(KRB5_SRC_DIR)/src || $(MAKE) --no-print-directory -C $(KRB5_DIR)
 
 # Convenient names for maintainers. Not used by other targets in the Makefile.
-.PHONY: protoc libcryptopp libjemalloc libprotobuf libsnappy librocksdb libroach libroachccl libkrb5
+.PHONY: protoc libcryptopp libjemalloc libprotobuf libsnappy libgeos librocksdb libroach libroachccl libkrb5
 protoc:      $(PROTOC)
 libcryptopp: $(LIBCRYPTOPP)
 libedit:     $(LIBEDIT)
 libjemalloc: $(LIBJEMALLOC)
 libprotobuf: $(LIBPROTOBUF)
 libsnappy:   $(LIBSNAPPY)
+libgeos:     $(LIBGEOS)
 librocksdb:  $(LIBROCKSDB)
 libroach:    $(LIBROACH)
 libroachccl: $(LIBROACHCCL)
@@ -801,19 +828,23 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/count_agg.eg.go \
   pkg/sql/colexec/distinct.eg.go \
   pkg/sql/colexec/hashjoiner.eg.go \
-  pkg/sql/colexec/hashtable.eg.go \
+  pkg/sql/colexec/hashtable_distinct.eg.go \
+  pkg/sql/colexec/hashtable_full_default.eg.go \
+  pkg/sql/colexec/hashtable_full_deleting.eg.go \
   pkg/sql/colexec/hash_aggregator.eg.go \
   pkg/sql/colexec/hash_utils.eg.go \
   pkg/sql/colexec/like_ops.eg.go \
   pkg/sql/colexec/mergejoinbase.eg.go \
+  pkg/sql/colexec/mergejoiner_exceptall.eg.go \
   pkg/sql/colexec/mergejoiner_fullouter.eg.go \
   pkg/sql/colexec/mergejoiner_inner.eg.go \
+  pkg/sql/colexec/mergejoiner_intersectall.eg.go \
   pkg/sql/colexec/mergejoiner_leftanti.eg.go \
   pkg/sql/colexec/mergejoiner_leftouter.eg.go \
   pkg/sql/colexec/mergejoiner_leftsemi.eg.go \
   pkg/sql/colexec/mergejoiner_rightouter.eg.go \
   pkg/sql/colexec/min_max_agg.eg.go \
-  pkg/sql/colexec/orderedsynchronizer.eg.go \
+  pkg/sql/colexec/ordered_synchronizer.eg.go \
   pkg/sql/colexec/overloads_test_utils.eg.go \
   pkg/sql/colexec/proj_const_left_ops.eg.go \
   pkg/sql/colexec/proj_const_right_ops.eg.go \
@@ -993,14 +1024,15 @@ stress stressrace:
 .PHONY: roachprod-stress roachprod-stressrace
 roachprod-stress roachprod-stressrace: bin/roachprod-stress
 	# The bootstrap target creates, among other things, ./bin/stress.
+	@if [ -z "$(CLUSTER)" ]; then \
+		echo "ERROR: missing or empty CLUSTER; create one via:"; \
+		echo "roachprod create \$$USER-stress -n 20 --gce-machine-type=n1-standard-8 --local-ssd=false"; \
+		exit 1; \
+	fi
 	build/builder.sh make bin/.bootstrap
 	build/builder.sh mkrelease amd64-linux-gnu test GOFLAGS="$(GOFLAGS)" TESTFLAGS="-v -c -o $(notdir $(patsubst %/,%,$(PKG))).test" PKG=$(PKG)
-	@if [ -z "$(CLUSTER)" ]; then \
-	  echo "ERROR: missing or empty CLUSTER"; \
-	else \
-	  bin/roachprod-stress $(CLUSTER) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) $(STRESSFLAGS) -- \
-	    -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
-	fi
+	bin/roachprod-stress $(CLUSTER) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) $(STRESSFLAGS) -- \
+	  -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
 
 testlogic: testbaselogic testoptlogic testccllogic
 
@@ -1076,7 +1108,7 @@ lint lintshort: TESTTIMEOUT := $(LINTTIMEOUT)
 .PHONY: lint
 lint: override TAGS += lint
 lint: ## Run all style checkers and linters.
-lint: bin/returncheck bin/roachvet
+lint: bin/returncheck bin/roachvet bin/optfmt
 	@if [ -t 1 ]; then echo '$(yellow)NOTE: `make lint` is very slow! Perhaps `make lintshort`?$(term-reset)'; fi
 	@# Run 'go build -i' to ensure we have compiled object files available for all
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
@@ -1087,7 +1119,7 @@ lint: bin/returncheck bin/roachvet
 .PHONY: lintshort
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
-lintshort: bin/roachvet
+lintshort: bin/roachvet bin/optfmt
 	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
@@ -1572,6 +1604,7 @@ clean-c-deps:
 	rm -rf $(PROTOBUF_DIR)
 	rm -rf $(ROCKSDB_DIR)
 	rm -rf $(SNAPPY_DIR)
+	rm -rf $(GEOS_DIR)
 	rm -rf $(LIBROACH_DIR)
 	rm -rf $(KRB5_DIR)
 
@@ -1582,6 +1615,7 @@ unsafe-clean-c-deps:
 	git -C $(PROTOBUF_SRC_DIR) clean -dxf
 	git -C $(ROCKSDB_SRC_DIR)  clean -dxf
 	git -C $(SNAPPY_SRC_DIR)   clean -dxf
+	git -C $(GEOS_SRC_DIR)     clean -dxf
 	git -C $(LIBROACH_SRC_DIR) clean -dxf
 	git -C $(KRB5_SRC_DIR)     clean -dxf
 
@@ -1631,6 +1665,7 @@ bins = \
   bin/protoc-gen-gogoroach \
   bin/publish-artifacts \
   bin/publish-provisional-artifacts \
+  bin/optfmt \
   bin/optgen \
   bin/returncheck \
   bin/roachvet \
@@ -1651,6 +1686,7 @@ testbins = \
 # Mappings for binaries that don't live in pkg/cmd.
 execgen-package = ./pkg/sql/colexec/execgen/cmd/execgen
 langgen-package = ./pkg/sql/opt/optgen/cmd/langgen
+optfmt-package = ./pkg/sql/opt/optgen/cmd/optfmt
 optgen-package = ./pkg/sql/opt/optgen/cmd/optgen
 logictest-package = ./pkg/sql/logictest
 logictestccl-package = ./pkg/ccl/logictestccl

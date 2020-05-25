@@ -77,6 +77,7 @@ func initCLIDefaults() {
 	cliCtx.cmdTimeout = 0 // no timeout
 	cliCtx.clientConnHost = ""
 	cliCtx.clientConnPort = base.DefaultPort
+	cliCtx.certPrincipalMap = nil
 	cliCtx.sqlConnURL = ""
 	cliCtx.sqlConnUser = ""
 	cliCtx.sqlConnPasswd = ""
@@ -91,8 +92,11 @@ func initCLIDefaults() {
 	sqlCtx.debugMode = false
 	sqlCtx.echo = false
 
+	zipCtx.nodes = nodeSelection{}
+
 	dumpCtx.dumpMode = dumpBoth
 	dumpCtx.asOf = ""
+	dumpCtx.dumpAll = false
 
 	debugCtx.startKey = storage.NilKey
 	debugCtx.endKey = storage.MVCCKeyMax
@@ -104,10 +108,13 @@ func initCLIDefaults() {
 	debugCtx.maxResults = 1000
 	debugCtx.ballastSize = base.SizeSpec{InBytes: 1000000000}
 
+	serverCfg.GoroutineDumpDirName = ""
+	serverCfg.HeapProfileDirName = ""
 	serverCfg.ReadyFn = nil
 	serverCfg.DelayedBootstrapFn = nil
 	serverCfg.SocketFile = ""
 	serverCfg.JoinList = nil
+	serverCfg.JoinPreferSRVRecords = false
 	serverCfg.DefaultZoneConfig = zonepb.DefaultZoneConfig()
 	serverCfg.DefaultSystemZoneConfig = zonepb.DefaultSystemZoneConfig()
 	// Attempt to default serverCfg.SQLMemoryPoolSize to 25% if possible.
@@ -119,14 +126,15 @@ func initCLIDefaults() {
 	startCtx.serverSSLCertsDir = base.DefaultCertsDirectory
 	startCtx.serverCertPrincipalMap = nil
 	startCtx.serverListenAddr = ""
+	startCtx.unencryptedLocalhostHTTP = false
 	startCtx.tempDir = ""
 	startCtx.externalIODir = ""
 	startCtx.listeningURLFile = ""
 	startCtx.pidFile = ""
 	startCtx.inBackground = false
-	startCtx.backtraceOutputDir = ""
+	startCtx.geoLibsDir = "/usr/local/lib"
 
-	quitCtx.serverDecommission = false
+	quitCtx.drainWait = 10 * time.Minute
 
 	nodeCtx.nodeDecommissionWait = nodeDecommissionWaitAll
 	nodeCtx.statusShowRanges = false
@@ -163,7 +171,8 @@ func initCLIDefaults() {
 	demoCtx.disableTelemetry = false
 	demoCtx.disableLicenseAcquisition = false
 	demoCtx.transientCluster = nil
-	demoCtx.insecure = true
+	demoCtx.insecure = false
+	demoCtx.geoLibsDir = "/usr/local/lib"
 
 	authCtx.validityPeriod = 1 * time.Hour
 
@@ -208,6 +217,9 @@ type cliContext struct {
 
 	// clientConnPort is the port name/number to use to connect to a server.
 	clientConnPort string
+
+	// certPrincipalMap is the cert-principal:db-principal map.
+	certPrincipalMap []string
 
 	// for CLI commands that use the SQL interface, these parameters
 	// determine how to connect to the server.
@@ -258,6 +270,12 @@ var sqlCtx = struct {
 	debugMode bool
 }{cliContext: &cliCtx}
 
+// zipCtx captures the command-line parameters of the `zip` command.
+// Defaults set by InitCLIDefaults() above.
+var zipCtx struct {
+	nodes nodeSelection
+}
+
 // dumpCtx captures the command-line parameters of the `dump` command.
 // Defaults set by InitCLIDefaults() above.
 var dumpCtx struct {
@@ -266,6 +284,9 @@ var dumpCtx struct {
 
 	// asOf determines the time stamp at which the dump should be taken.
 	asOf string
+
+	// dumpAll determines whenever we going to dump all databases
+	dumpAll bool
 }
 
 // authCtx captures the command-line parameters of the `auth-session`
@@ -297,6 +318,10 @@ var startCtx struct {
 	serverCertPrincipalMap []string
 	serverListenAddr       string
 
+	// if specified, this forces the HTTP listen addr to localhost
+	// and disables TLS on the HTTP listener.
+	unencryptedLocalhostHTTP bool
+
 	// temporary directory to use to spill computation results to disk.
 	tempDir string
 
@@ -319,14 +344,17 @@ var startCtx struct {
 	// logging settings specific to file logging.
 	logDir log.DirName
 
-	// directory to use for logging backtrace outputs.
-	backtraceOutputDir string
+	// geoLibsDir is used to specify locations of the GEOS library.
+	geoLibsDir string
 }
 
-// quitCtx captures the command-line parameters of the `quit` command.
+// quitCtx captures the command-line parameters of the `quit` and
+// `node drain` commands.
 // Defaults set by InitCLIDefaults() above.
 var quitCtx struct {
-	serverDecommission bool
+	// drainWait is the amount of time to wait for the server
+	// to drain. Set to 0 to disable a timeout (let the server decide).
+	drainWait time.Duration
 }
 
 // nodeCtx captures the command-line parameters of the `node` command.
@@ -382,4 +410,5 @@ var demoCtx struct {
 	simulateLatency           bool
 	transientCluster          *transientCluster
 	insecure                  bool
+	geoLibsDir                string
 }

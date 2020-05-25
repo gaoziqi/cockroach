@@ -20,12 +20,16 @@
 package colexec
 
 import (
+	"unsafe"
+
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 // {{/*
@@ -37,37 +41,48 @@ var _ apd.Decimal
 // Dummy import to pull in "tree" package.
 var _ tree.Datum
 
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
+
 // _ASSIGN_DIV_INT64 is the template division function for assigning the first
 // input to the result of the second input / the third input, where the third
 // input is an int64.
-func _ASSIGN_DIV_INT64(_, _, _ string) {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN_DIV_INT64(_, _, _, _, _, _ string) {
+	colexecerror.InternalError("")
 }
 
 // _ASSIGN_ADD is the template addition function for assigning the first input
 // to the result of the second input + the third input.
-func _ASSIGN_ADD(_, _, _ string) {
-	execerror.VectorizedInternalPanic("")
+func _ASSIGN_ADD(_, _, _, _, _, _ string) {
+	colexecerror.InternalError("")
 }
 
 // */}}
 
-func newAvgAgg(t coltypes.T) (aggregateFunc, error) {
-	switch t {
+func newAvgAggAlloc(
+	allocator *colmem.Allocator, t *types.T, allocSize int64,
+) (aggregateFuncAlloc, error) {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
-	case _TYPES_T:
-		return &avg_TYPEAgg{}, nil
-	// {{end}}
-	default:
-		return nil, errors.Errorf("unsupported avg agg type %s", t)
+	case _CANONICAL_TYPE_FAMILY:
+		switch t.Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			return &avg_TYPEAggAlloc{allocator: allocator, allocSize: allocSize}, nil
+			// {{end}}
+		}
+		// {{end}}
 	}
+	return nil, errors.Errorf("unsupported avg agg type %s", t.Name())
 }
 
 // {{range .}}
+// {{range .WidthOverloads}}
 
 type avg_TYPEAgg struct {
-	done bool
-
 	groups  []bool
 	scratch struct {
 		curIdx int
@@ -90,9 +105,11 @@ type avg_TYPEAgg struct {
 
 var _ aggregateFunc = &avg_TYPEAgg{}
 
+const sizeOfAvg_TYPEAgg = int64(unsafe.Sizeof(avg_TYPEAgg{}))
+
 func (a *avg_TYPEAgg) Init(groups []bool, v coldata.Vec) {
 	a.groups = groups
-	a.scratch.vec = v._TemplateType()
+	a.scratch.vec = v.TemplateType()
 	a.scratch.nulls = v.Nulls()
 	a.Reset()
 }
@@ -103,7 +120,6 @@ func (a *avg_TYPEAgg) Reset() {
 	a.scratch.curCount = 0
 	a.scratch.foundNonNullForCurrentGroup = false
 	a.scratch.nulls.UnsetNulls()
-	a.done = false
 }
 
 func (a *avg_TYPEAgg) CurrentOutputIndex() int {
@@ -118,25 +134,9 @@ func (a *avg_TYPEAgg) SetOutputIndex(idx int) {
 }
 
 func (a *avg_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	if a.done {
-		return
-	}
 	inputLen := b.Length()
-	if inputLen == 0 {
-		// The aggregation is finished. Flush the last value. If we haven't found
-		// any non-nulls for this group so far, the output for this group should be
-		// NULL.
-		if !a.scratch.foundNonNullForCurrentGroup {
-			a.scratch.nulls.SetNull(a.scratch.curIdx)
-		} else {
-			_ASSIGN_DIV_INT64(a.scratch.vec[a.scratch.curIdx], a.scratch.curSum, a.scratch.curCount)
-		}
-		a.scratch.curIdx++
-		a.done = true
-		return
-	}
 	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
-	col, nulls := vec._TemplateType(), vec.Nulls()
+	col, nulls := vec.TemplateType(), vec.Nulls()
 	if nulls.MaybeHasNulls() {
 		if sel != nil {
 			sel = sel[:inputLen]
@@ -164,10 +164,41 @@ func (a *avg_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	}
 }
 
+func (a *avg_TYPEAgg) Flush() {
+	// The aggregation is finished. Flush the last value. If we haven't found
+	// any non-nulls for this group so far, the output for this group should be
+	// NULL.
+	if !a.scratch.foundNonNullForCurrentGroup {
+		a.scratch.nulls.SetNull(a.scratch.curIdx)
+	} else {
+		_ASSIGN_DIV_INT64(a.scratch.vec[a.scratch.curIdx], a.scratch.curSum, a.scratch.curCount, a.scratch.vec, _, _)
+	}
+	a.scratch.curIdx++
+}
+
 func (a *avg_TYPEAgg) HandleEmptyInputScalar() {
 	a.scratch.nulls.SetNull(0)
 }
 
+type avg_TYPEAggAlloc struct {
+	allocator *colmem.Allocator
+	allocSize int64
+	aggFuncs  []avg_TYPEAgg
+}
+
+var _ aggregateFuncAlloc = &avg_TYPEAggAlloc{}
+
+func (a *avg_TYPEAggAlloc) newAggFunc() aggregateFunc {
+	if len(a.aggFuncs) == 0 {
+		a.allocator.AdjustMemoryUsage(sizeOfAvg_TYPEAgg * a.allocSize)
+		a.aggFuncs = make([]avg_TYPEAgg, a.allocSize)
+	}
+	f := &a.aggFuncs[0]
+	a.aggFuncs = a.aggFuncs[1:]
+	return f
+}
+
+// {{end}}
 // {{end}}
 
 // {{/*
@@ -187,7 +218,7 @@ func _ACCUMULATE_AVG(a *_AGG_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS bo
 				a.scratch.nulls.SetNull(a.scratch.curIdx)
 			} else {
 				// {{with .Global}}
-				_ASSIGN_DIV_INT64(a.scratch.vec[a.scratch.curIdx], a.scratch.curSum, a.scratch.curCount)
+				_ASSIGN_DIV_INT64(a.scratch.vec[a.scratch.curIdx], a.scratch.curSum, a.scratch.curCount, a.scratch.vec, _, _)
 				// {{end}}
 			}
 		}
@@ -201,18 +232,18 @@ func _ACCUMULATE_AVG(a *_AGG_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS bo
 		// We only need to reset this flag if there are nulls. If there are no
 		// nulls, this will be updated unconditionally below.
 		// */}}
-		// {{ if .HasNulls }}
+		// {{if .HasNulls}}
 		a.scratch.foundNonNullForCurrentGroup = false
-		// {{ end }}
+		// {{end}}
 	}
 	var isNull bool
-	// {{ if .HasNulls }}
+	// {{if .HasNulls}}
 	isNull = nulls.NullAt(i)
-	// {{ else }}
+	// {{else}}
 	isNull = false
-	// {{ end }}
+	// {{end}}
 	if !isNull {
-		_ASSIGN_ADD(a.scratch.curSum, a.scratch.curSum, col[i])
+		_ASSIGN_ADD(a.scratch.curSum, a.scratch.curSum, col[i], _, _, col)
 		a.scratch.curCount++
 		a.scratch.foundNonNullForCurrentGroup = true
 	}

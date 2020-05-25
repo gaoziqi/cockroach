@@ -27,10 +27,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -41,8 +41,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
-	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft/raftpb"
 	"golang.org/x/time/rate"
 )
@@ -53,7 +53,7 @@ func entryEq(l, r raftpb.Entry) error {
 	}
 	_, lData := DecodeRaftCommand(l.Data)
 	_, rData := DecodeRaftCommand(r.Data)
-	var lc, rc storagepb.RaftCommand
+	var lc, rc kvserverpb.RaftCommand
 	if err := protoutil.Unmarshal(lData, &lc); err != nil {
 		return errors.Wrap(err, "unmarshalling LHS")
 	}
@@ -67,10 +67,10 @@ func entryEq(l, r raftpb.Entry) error {
 }
 
 func mkEnt(
-	v raftCommandEncodingVersion, index, term uint64, as *storagepb.ReplicatedEvalResult_AddSSTable,
+	v raftCommandEncodingVersion, index, term uint64, as *kvserverpb.ReplicatedEvalResult_AddSSTable,
 ) raftpb.Entry {
 	cmdIDKey := strings.Repeat("x", raftCommandIDLen)
-	var cmd storagepb.RaftCommand
+	var cmd kvserverpb.RaftCommand
 	cmd.ReplicatedEvalResult.AddSSTable = as
 	b, err := protoutil.Marshal(&cmd)
 	if err != nil {
@@ -78,7 +78,7 @@ func mkEnt(
 	}
 	var ent raftpb.Entry
 	ent.Index, ent.Term = index, term
-	ent.Data = encodeRaftCommand(v, storagebase.CmdIDKey(cmdIDKey), b)
+	ent.Data = encodeRaftCommand(v, kvserverbase.CmdIDKey(cmdIDKey), b)
 	return ent
 }
 
@@ -200,7 +200,7 @@ func testSideloadingSideloadedStorage(
 			},
 		},
 	} {
-		if err := test.fun(); err != test.err {
+		if err := test.fun(); !errors.Is(err, test.err) {
 			t.Fatalf("%d: expected %v, got %v", n, test.err, err)
 		}
 		if err := ss.Clear(ctx); err != nil {
@@ -266,7 +266,7 @@ func testSideloadingSideloadedStorage(
 			}
 			// Indexes below are gone.
 			for _, i := range payloads[:n] {
-				if _, err := ss.Get(ctx, i, term); err != errSideloadedFileNotFound {
+				if _, err := ss.Get(ctx, i, term); !errors.Is(err, errSideloadedFileNotFound) {
 					t.Fatalf("%d.%d: %+v", n, i, err)
 				}
 			}
@@ -403,11 +403,11 @@ func TestRaftSSTableSideloadingInline(t *testing.T) {
 		expTrace string
 	}
 
-	sstFat := storagepb.ReplicatedEvalResult_AddSSTable{
+	sstFat := kvserverpb.ReplicatedEvalResult_AddSSTable{
 		Data:  []byte("foo"),
 		CRC32: 0, // not checked
 	}
-	sstThin := storagepb.ReplicatedEvalResult_AddSSTable{
+	sstThin := kvserverpb.ReplicatedEvalResult_AddSSTable{
 		CRC32: 0, // not checked
 	}
 
@@ -501,7 +501,7 @@ func TestRaftSSTableSideloadingInline(t *testing.T) {
 func TestRaftSSTableSideloadingSideload(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	addSST := storagepb.ReplicatedEvalResult_AddSSTable{
+	addSST := kvserverpb.ReplicatedEvalResult_AddSSTable{
 		Data: []byte("foo"), CRC32: 0, // not checked
 	}
 
@@ -627,7 +627,7 @@ func testRaftSSTableSideloadingProposal(t *testing.T, engineInMem, mockSideloade
 		}
 		stopper.AddCloser(tc.engine)
 	}
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.Start(t, stopper)
 
 	ctx, collect, cancel := tracing.ContextWithRecordingSpan(context.Background(), "test-recording")
@@ -833,7 +833,7 @@ func TestRaftSSTableSideloadingSnapshot(t *testing.T) {
 		}
 
 		var ent raftpb.Entry
-		var cmd storagepb.RaftCommand
+		var cmd kvserverpb.RaftCommand
 		var finalEnt raftpb.Entry
 		for _, entryBytes := range mockSender.logEntries {
 			if err := protoutil.Unmarshal(entryBytes, &ent); err != nil {
@@ -951,7 +951,7 @@ func TestRaftSSTableSideloadingSnapshot(t *testing.T) {
 			tc.repl.store.Engine().NewBatch,
 			func() {},
 		)
-		if _, ok := errors.Cause(err).(*errMustRetrySnapshotDueToTruncation); !ok {
+		if !errors.HasType(err, (*errMustRetrySnapshotDueToTruncation)(nil)) {
 			t.Fatal(err)
 		}
 	}()
@@ -963,7 +963,7 @@ func TestRaftSSTableSideloadingTruncation(t *testing.T) {
 
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.Start(t, stopper)
 	makeInMemSideloaded(tc.repl)
 	ctx := context.Background()

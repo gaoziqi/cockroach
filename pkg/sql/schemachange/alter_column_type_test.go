@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -40,7 +41,7 @@ func TestColumnConversions(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		return t
+		return tree.MustBeStaticallyKnownType(t)
 	}
 
 	// columnConversionInfo is where we document conversions that
@@ -100,20 +101,20 @@ func TestColumnConversions(t *testing.T) {
 
 		"TIME": {
 			"TIME":    ColumnConversionTrivial,
-			"TIME(5)": ColumnConversionValidate,
+			"TIME(5)": ColumnConversionGeneral,
 			"TIME(6)": ColumnConversionTrivial,
 		},
 		"TIMETZ": {
 			"TIMETZ":    ColumnConversionTrivial,
-			"TIMETZ(5)": ColumnConversionValidate,
+			"TIMETZ(5)": ColumnConversionGeneral,
 			"TIMETZ(6)": ColumnConversionTrivial,
 		},
 		"TIMESTAMP": {
 			"TIMESTAMP":      ColumnConversionTrivial,
-			"TIMESTAMP(5)":   ColumnConversionValidate,
+			"TIMESTAMP(5)":   ColumnConversionGeneral,
 			"TIMESTAMP(6)":   ColumnConversionTrivial,
 			"TIMESTAMPTZ":    ColumnConversionTrivial,
-			"TIMESTAMPTZ(5)": ColumnConversionValidate,
+			"TIMESTAMPTZ(5)": ColumnConversionGeneral,
 			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
 		},
 		"TIMESTAMP(0)": {
@@ -125,35 +126,35 @@ func TestColumnConversions(t *testing.T) {
 			"TIMESTAMPTZ":    ColumnConversionTrivial,
 		},
 		"TIMESTAMP(3)": {
-			"TIMESTAMP(0)": ColumnConversionValidate,
-			"TIMESTAMP(1)": ColumnConversionValidate,
+			"TIMESTAMP(0)": ColumnConversionGeneral,
+			"TIMESTAMP(1)": ColumnConversionGeneral,
 			"TIMESTAMP(3)": ColumnConversionTrivial,
 			"TIMESTAMP(6)": ColumnConversionTrivial,
 			"TIMESTAMP":    ColumnConversionTrivial,
 
-			"TIMESTAMPTZ(0)": ColumnConversionValidate,
-			"TIMESTAMPTZ(1)": ColumnConversionValidate,
+			"TIMESTAMPTZ(0)": ColumnConversionGeneral,
+			"TIMESTAMPTZ(1)": ColumnConversionGeneral,
 			"TIMESTAMPTZ(3)": ColumnConversionTrivial,
 			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
 			"TIMESTAMPTZ":    ColumnConversionTrivial,
 		},
 		"TIMESTAMPTZ": {
 			"TIMESTAMP":      ColumnConversionTrivial,
-			"TIMESTAMP(5)":   ColumnConversionValidate,
+			"TIMESTAMP(5)":   ColumnConversionGeneral,
 			"TIMESTAMP(6)":   ColumnConversionTrivial,
 			"TIMESTAMPTZ":    ColumnConversionTrivial,
-			"TIMESTAMPTZ(5)": ColumnConversionValidate,
+			"TIMESTAMPTZ(5)": ColumnConversionGeneral,
 			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
 		},
 		"TIMESTAMPTZ(3)": {
-			"TIMESTAMP(0)": ColumnConversionValidate,
-			"TIMESTAMP(1)": ColumnConversionValidate,
+			"TIMESTAMP(0)": ColumnConversionGeneral,
+			"TIMESTAMP(1)": ColumnConversionGeneral,
 			"TIMESTAMP(3)": ColumnConversionTrivial,
 			"TIMESTAMP(6)": ColumnConversionTrivial,
 			"TIMESTAMP":    ColumnConversionTrivial,
 
-			"TIMESTAMPTZ(0)": ColumnConversionValidate,
-			"TIMESTAMPTZ(1)": ColumnConversionValidate,
+			"TIMESTAMPTZ(0)": ColumnConversionGeneral,
+			"TIMESTAMPTZ(1)": ColumnConversionGeneral,
 			"TIMESTAMPTZ(3)": ColumnConversionTrivial,
 			"TIMESTAMPTZ(6)": ColumnConversionTrivial,
 			"TIMESTAMPTZ":    ColumnConversionTrivial,

@@ -43,7 +43,7 @@ func (n *unsplitNode) Next(params runParams) (bool, error) {
 	}
 
 	row := n.rows.Values()
-	rowKey, err := getRowKey(n.tableDesc, n.index, row)
+	rowKey, err := getRowKey(params.ExecCfg().Codec, n.tableDesc, n.index, row)
 	if err != nil {
 		return false, err
 	}
@@ -94,7 +94,9 @@ func (n *unsplitAllNode) startExec(params runParams) error {
 		WHERE
 			database_name=$1 AND table_name=$2 AND index_name=$3 AND split_enforced_until IS NOT NULL
 	`
-	dbDesc, err := sqlbase.GetDatabaseDescFromID(params.ctx, params.p.txn, n.tableDesc.ParentID)
+	dbDesc, err := sqlbase.GetDatabaseDescFromID(
+		params.ctx, params.p.txn, params.ExecCfg().Codec, n.tableDesc.ParentID,
+	)
 	if err != nil {
 		return err
 	}

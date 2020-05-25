@@ -34,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -104,7 +104,7 @@ func TestTxnCoordSenderBeginTransaction(t *testing.T) {
 func TestTxnCoordSenderKeyRanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	ranges := []struct {
 		start, end roachpb.Key
 	}{
@@ -534,8 +534,8 @@ func TestTxnCoordSenderAddLockOnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	{
-		err, ok := txn.CPut(ctx, key, []byte("x"), strToValue("born to fail")).(*roachpb.ConditionFailedError)
-		if !ok {
+		err := txn.CPut(ctx, key, []byte("x"), strToValue("born to fail"))
+		if !errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
 			t.Fatal(err)
 		}
 	}
@@ -553,7 +553,7 @@ func TestTxnCoordSenderAddLockOnError(t *testing.T) {
 
 func assertTransactionRetryError(t *testing.T, e error) {
 	t.Helper()
-	if retErr, ok := e.(*roachpb.TransactionRetryWithProtoRefreshError); ok {
+	if retErr := (*roachpb.TransactionRetryWithProtoRefreshError)(nil); errors.As(e, &retErr) {
 		if !testutils.IsError(retErr, "TransactionRetryError") {
 			t.Fatalf("expected the cause to be TransactionRetryError, but got %s",
 				retErr)
@@ -564,7 +564,7 @@ func assertTransactionRetryError(t *testing.T, e error) {
 }
 
 func assertTransactionAbortedError(t *testing.T, e error) {
-	if retErr, ok := e.(*roachpb.TransactionRetryWithProtoRefreshError); ok {
+	if retErr := (*roachpb.TransactionRetryWithProtoRefreshError)(nil); errors.As(e, &retErr) {
 		if !testutils.IsError(retErr, "TransactionAbortedError") {
 			t.Fatalf("expected the cause to be TransactionAbortedError, but got %s",
 				retErr)
@@ -646,7 +646,7 @@ func TestTxnCoordSenderGCWithAmbiguousResultErr(t *testing.T) {
 		key := roachpb.Key("a")
 		are := roachpb.NewAmbiguousResultError("very ambiguous")
 		knobs := &kvserver.StoreTestingKnobs{
-			TestingResponseFilter: func(ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+			TestingResponseFilter: func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
 				for _, req := range ba.Requests {
 					if putReq, ok := req.GetInner().(*roachpb.PutRequest); ok && putReq.Key.Equal(key) {
 						return roachpb.NewError(are)
@@ -907,7 +907,7 @@ func TestTxnMultipleCoord(t *testing.T) {
 
 	// Verify presence of both locks.
 	tcs := txn.Sender().(*TxnCoordSender)
-	refreshSpans := tcs.interceptorAlloc.txnSpanRefresher.refreshSpans
+	refreshSpans := tcs.interceptorAlloc.txnSpanRefresher.refreshFootprint.asSlice()
 	require.Equal(t, []roachpb.Span{{Key: key}, {Key: key2}}, refreshSpans)
 
 	ba := txn.NewBatch()
@@ -1072,7 +1072,7 @@ func TestTxnCommit(t *testing.T) {
 	value := []byte("value")
 
 	// Test a write txn commit.
-	if err := s.DB.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := s.DB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		key := []byte("key-commit")
 		return txn.Put(ctx, key, value)
 	}); err != nil {
@@ -1081,7 +1081,7 @@ func TestTxnCommit(t *testing.T) {
 	checkTxnMetrics(t, metrics, "commit txn", 1 /* commits */, 0 /* commits1PC */, 0, 0)
 
 	// Test a read-only txn.
-	if err := s.DB.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := s.DB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		key := []byte("key-commit")
 		_, err := txn.Get(ctx, key)
 		return err
@@ -1100,7 +1100,7 @@ func TestTxnOnePhaseCommit(t *testing.T) {
 
 	value := []byte("value")
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	if err := s.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		key := []byte("key-commit")
 		b := txn.NewBatch()
@@ -1135,7 +1135,7 @@ func TestTxnAbortCount(t *testing.T) {
 
 	intentionalErrText := "intentional error to cause abort"
 	// Test aborted transaction.
-	if err := s.DB.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := s.DB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		key := []byte("key-abort")
 
 		if err := txn.Put(ctx, key, value); err != nil {
@@ -1216,7 +1216,7 @@ func TestTxnDurations(t *testing.T) {
 	const incr int64 = 1000
 	for i := 0; i < puts; i++ {
 		key := roachpb.Key(fmt.Sprintf("key-txn-durations-%d", i))
-		if err := s.DB.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+		if err := s.DB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 			if err := txn.Put(ctx, key, []byte("val")); err != nil {
 				return err
 			}
@@ -1710,7 +1710,7 @@ func TestAbortReadOnlyTransaction(t *testing.T) {
 		sender,
 	)
 	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock)
-	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		return errors.New("foo")
 	}); err == nil {
 		t.Fatal("expected error on abort")
@@ -1858,7 +1858,7 @@ func TestTransactionKeyNotChangedInRestart(t *testing.T) {
 	)
 	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock)
 
-	if err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	if err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		defer func() { attempt++ }()
 		b := txn.NewBatch()
 		b.Put(keys[attempt], "b")
@@ -1977,7 +1977,7 @@ func TestConcurrentTxnRequestsProhibited(t *testing.T) {
 		})
 		return g.Wait()
 	})
-	require.Error(t, err, "concurrent txn use detected")
+	require.Regexp(t, "concurrent txn use detected", err)
 }
 
 // TestTxnRequestTxnTimestamp verifies response txn timestamp is
@@ -2276,7 +2276,7 @@ func TestLeafTxnClientRejectError(t *testing.T) {
 	// test is interested in demonstrating is that it's not a
 	// TransactionRetryWithProtoRefreshError.
 	_, err := leafTxn.Get(ctx, roachpb.Key("a"))
-	if _, ok := err.(*roachpb.UnhandledRetryableError); !ok {
+	if !errors.HasType(err, (*roachpb.UnhandledRetryableError)(nil)) {
 		t.Fatalf("expected UnhandledRetryableError(TransactionAbortedError), got: (%T) %v", err, err)
 	}
 }

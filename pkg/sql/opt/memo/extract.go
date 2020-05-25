@@ -295,49 +295,19 @@ func ExtractConstColumns(
 	return fixedCols
 }
 
-// ExtractValuesFromFilter returns a map of constant columns, to the values
-// they're constrained to.
-func ExtractValuesFromFilter(on FiltersExpr, cols opt.ColSet) map[opt.ColumnID]tree.Datum {
-	vals := make(map[opt.ColumnID]tree.Datum)
+// ExtractValueForConstColumn returns the constant value of a column returned by
+// ExtractConstColumns.
+func ExtractValueForConstColumn(
+	on FiltersExpr, mem *Memo, evalCtx *tree.EvalContext, col opt.ColumnID,
+) tree.Datum {
 	for i := range on {
-		ok, col, val := extractConstEquality(on[i].Condition)
-		if !ok || !cols.Contains(col) {
-			continue
-		}
-		vals[col] = val
-	}
-	return vals
-}
-
-// ExtractConstantFilter returns a map of columns to the filters that constrain
-// value to a constant.
-func ExtractConstantFilter(on FiltersExpr, cols opt.ColSet) map[opt.ColumnID]FiltersItem {
-	vals := make(map[opt.ColumnID]FiltersItem)
-	for i := range on {
-		ok, col, _ := extractConstEquality(on[i].Condition)
-		if !ok || !cols.Contains(col) {
-			continue
-		}
-		vals[col] = on[i]
-	}
-	return vals
-}
-
-// extractConstEquality extracts a column that's being equated to a constant
-// value if possible.
-func extractConstEquality(condition opt.ScalarExpr) (bool, opt.ColumnID, tree.Datum) {
-	// TODO(justin): this is error-prone because this logic is different from the
-	// constraint logic. Extract these values directly from the constraints.
-	switch condition.(type) {
-	case *EqExpr, *IsExpr:
-		// Only check the left side - the variable is always on the left side
-		// due to the CommuteVar norm rule.
-		if leftVar, ok := condition.Child(0).(*VariableExpr); ok {
-			if CanExtractConstDatum(condition.Child(1)) {
-				return true, leftVar.Col, ExtractConstDatum(condition.Child(1))
+		scalar := on[i]
+		scalarProps := scalar.ScalarProps()
+		if scalarProps.Constraints != nil {
+			if val := scalarProps.Constraints.ExtractValueForConstCol(evalCtx, col); val != nil {
+				return val
 			}
 		}
 	}
-
-	return false, 0, nil
+	return nil
 }

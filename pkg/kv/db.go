@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // KeyValue represents a single key/value pair. This is similar to
@@ -182,7 +182,7 @@ type DBContext struct {
 	UserPriority roachpb.UserPriority
 	// NodeID provides the node ID for setting the gateway node and avoiding
 	// clock uncertainty for root transactions started at the gateway.
-	NodeID *base.NodeIDContainer
+	NodeID *base.SQLIDContainer
 	// Stopper is used for async tasks.
 	Stopper *stop.Stopper
 }
@@ -190,10 +190,12 @@ type DBContext struct {
 // DefaultDBContext returns (a copy of) the default options for
 // NewDBWithContext.
 func DefaultDBContext() DBContext {
+	var c base.NodeIDContainer
 	return DBContext{
 		UserPriority: roachpb.NormalUserPriority,
-		NodeID:       &base.NodeIDContainer{},
-		Stopper:      stop.NewStopper(),
+		// TODO(tbg): this is ugly. Force callers to pass in an SQLIDContainer.
+		NodeID:  base.NewSQLIDContainer(0, &c, true /* exposed */),
+		Stopper: stop.NewStopper(),
 	}
 }
 
@@ -682,7 +684,11 @@ func (db *DB) Run(ctx context.Context, b *Batch) error {
 
 // NewTxn creates a new RootTxn.
 func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
-	txn := NewTxn(ctx, db, db.ctx.NodeID.Get())
+	// Observed timestamps don't work with multi-tenancy. See:
+	//
+	// https://github.com/cockroachdb/cockroach/issues/48008
+	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
+	txn := NewTxn(ctx, db, nodeID)
 	txn.SetDebugName(debugName)
 	return txn
 }
@@ -696,7 +702,11 @@ func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) err
 	// TODO(radu): we should open a tracing Span here (we need to figure out how
 	// to use the correct tracer).
 
-	txn := NewTxn(ctx, db, db.ctx.NodeID.Get())
+	// Observed timestamps don't work with multi-tenancy. See:
+	//
+	// https://github.com/cockroachdb/cockroach/issues/48008
+	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
+	txn := NewTxn(ctx, db, nodeID)
 	txn.SetDebugName("unnamed")
 	err := txn.exec(ctx, func(ctx context.Context, txn *Txn) error {
 		return retryable(ctx, txn)
@@ -707,7 +717,7 @@ func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) err
 	// Terminate TransactionRetryWithProtoRefreshError here, so it doesn't cause a higher-level
 	// txn to be retried. We don't do this in any of the other functions in DB; I
 	// guess we should.
-	if _, ok := err.(*roachpb.TransactionRetryWithProtoRefreshError); ok {
+	if errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) {
 		return errors.Wrapf(err, "terminated retryable error")
 	}
 	return err
@@ -791,8 +801,8 @@ func IncrementValRetryable(ctx context.Context, db *DB, key roachpb.Key, inc int
 	var res KeyValue
 	for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
 		res, err = db.Inc(ctx, key, inc)
-		switch err.(type) {
-		case *roachpb.UnhandledRetryableError, *roachpb.AmbiguousResultError:
+		if errors.HasType(err, (*roachpb.UnhandledRetryableError)(nil)) ||
+			errors.HasType(err, (*roachpb.AmbiguousResultError)(nil)) {
 			continue
 		}
 		break

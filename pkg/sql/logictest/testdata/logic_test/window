@@ -1,4 +1,4 @@
-# LogicTest: local local-vec fakedist fakedist-metadata fakedist-vec fakedist-vec-disk 5node-local 5node-dist 5node-dist-metadata 5node-dist-disk
+# LogicTest: default-configs !3node-tenant 5node-default-configs
 
 statement ok
 CREATE TABLE kv (
@@ -1319,10 +1319,10 @@ SELECT k, lead(k, w) OVER (PARTITION BY v ORDER BY w, k) FROM kv ORDER BY 1
 10  NULL
 11  NULL
 
-query error unknown signature: lag\(int, int, string\)
+query error pq: lag\(\): could not parse "FOO" as type int
 SELECT k, lag(k, 1, 'FOO') OVER () FROM kv ORDER BY 1
 
-query error unknown signature: lead\(int, int, string\)
+query error pq: lead\(\): could not parse "FOO" as type int
 SELECT k, lead(k, 1, 'FOO') OVER () FROM kv ORDER BY 1
 
 query error unknown signature: lag\(int, int, string\)
@@ -1734,7 +1734,7 @@ SELECT k, last_value(v) OVER (PARTITION BY k) FROM kv ORDER BY 1
 10  4
 11  NULL
 
-query error unknown signature: nth_value\(int, string\)
+query error pq: nth_value\(\): could not parse "FOO" as type int
 SELECT k, nth_value(v, 'FOO') OVER () FROM kv ORDER BY 1
 
 query error argument of nth_value\(\) must be greater than zero
@@ -3686,6 +3686,123 @@ ORDER BY
 
 # Check that telemetry is being collected on the window functions' usage.
 query B
-SELECT count(*) = 26 FROM crdb_internal.feature_usage WHERE feature_name LIKE 'sql.plan.window_function%' AND usage_count > 0
+SELECT count(*) >= 26 FROM crdb_internal.feature_usage WHERE feature_name LIKE 'sql.plan.window_function%' AND usage_count > 0
 ----
 true
+
+statement ok
+DROP TABLE t; CREATE TABLE t (a INT, b INT, c INT PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES
+  (0, 1, 0),
+  (1, 1, 1),
+  (0, 2, 2),
+  (1, 2, 3)
+
+# We sort the output on all queries with row_number window function to get
+# deterministic results.
+query III
+SELECT a, b, row_number() OVER (ORDER BY a, b) FROM t ORDER BY a, b
+----
+0 1 1
+0 2 2
+1 1 3
+1 2 4
+
+query III
+SELECT a, b, row_number() OVER (PARTITION BY a ORDER BY b) FROM t ORDER BY a, b
+----
+0 1 1
+0 2 2
+1 1 1
+1 2 2
+
+query III
+SELECT a, b, row_number() OVER (PARTITION BY a, b) FROM t ORDER BY a, b
+----
+0 1 1
+0 2 1
+1 1 1
+1 2 1
+
+query III rowsort
+SELECT a, b, rank() OVER () FROM t
+----
+0 1 1
+0 2 1
+1 1 1
+1 2 1
+
+query III rowsort
+SELECT a, b, rank() OVER (ORDER BY a) FROM t
+----
+0 1 1
+0 2 1
+1 1 3
+1 2 3
+
+query IIII rowsort
+SELECT a, b, c, rank() OVER (PARTITION BY a ORDER BY c) FROM t
+----
+0 1 0 1
+0 2 2 2
+1 1 1 1
+1 2 3 2
+
+query III rowsort
+SELECT a, b, dense_rank() OVER () FROM t
+----
+0 1 1
+0 2 1
+1 1 1
+1 2 1
+
+query III rowsort
+SELECT a, b, dense_rank() OVER (ORDER BY a) FROM t
+----
+0 1 1
+0 2 1
+1 1 2
+1 2 2
+
+query IIII rowsort
+SELECT a, b, c, dense_rank() OVER (PARTITION BY a ORDER BY c) FROM t
+----
+0 1 0 1
+0 2 2 2
+1 1 1 1
+1 2 3 2
+
+query IIIIRR rowsort
+SELECT a, b, rank() OVER w, dense_rank() OVER w, percent_rank() OVER w, cume_dist() OVER w FROM t WINDOW w AS ()
+----
+0  1  1  1  0  1
+1  1  1  1  0  1
+0  2  1  1  0  1
+1  2  1  1  0  1
+
+query IIIIRR rowsort
+SELECT a, b, rank() OVER w, dense_rank() OVER w, percent_rank() OVER w, cume_dist() OVER w FROM t WINDOW w AS (PARTITION BY a)
+----
+0  1  1  1  0  1
+0  2  1  1  0  1
+1  1  1  1  0  1
+1  2  1  1  0  1
+
+
+query IIIIRR rowsort
+SELECT a, b, rank() OVER w, dense_rank() OVER w, percent_rank() OVER w, cume_dist() OVER w FROM t WINDOW w AS (ORDER BY a)
+----
+0  1  1  1  0                  0.5
+0  2  1  1  0                  0.5
+1  1  3  2  0.666666666666667  1
+1  2  3  2  0.666666666666667  1
+
+query IIIIRR rowsort
+SELECT a, b, rank() OVER w, dense_rank() OVER w, percent_rank() OVER w, cume_dist() OVER w FROM t WINDOW w AS (PARTITION BY a ORDER BY b)
+----
+0  1  1  1  0  0.5
+0  2  2  2  1  1
+1  1  1  1  0  0.5
+1  2  2  2  1  1

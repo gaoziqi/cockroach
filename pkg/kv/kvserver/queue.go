@@ -19,12 +19,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/causer"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -33,7 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -202,8 +201,7 @@ var (
 )
 
 func isExpectedQueueError(err error) bool {
-	cause := errors.Cause(err)
-	return err == nil || cause == errQueueDisabled
+	return err == nil || errors.Is(err, errQueueDisabled)
 }
 
 // shouldQueueAgain is a helper function to determine whether the
@@ -242,7 +240,7 @@ type replicaInQueue interface {
 	IsDestroyed() (DestroyReason, error)
 	Desc() *roachpb.RangeDescriptor
 	maybeInitializeRaftGroup(context.Context)
-	redirectOnOrAcquireLease(context.Context) (storagepb.LeaseStatus, hlc.Timestamp, *roachpb.Error)
+	redirectOnOrAcquireLease(context.Context) (kvserverpb.LeaseStatus, *roachpb.Error)
 	IsLeaseValid(roachpb.Lease, hlc.Timestamp) bool
 	GetLease() (roachpb.Lease, roachpb.Lease)
 }
@@ -564,18 +562,21 @@ type queueHelper interface {
 // is not available, the 'wait' parameter decides whether to wait or to return
 // as a noop. Note that if the system is quiescing, fn may never be called in-
 // dependent of the value of 'wait'.
+//
+// The caller is responsible for ensuring that opName does not contain PII.
+// (Best is to pass a constant string.)
 func (bq *baseQueue) Async(
 	ctx context.Context, opName string, wait bool, fn func(ctx context.Context, h queueHelper),
 ) {
 	if log.V(3) {
-		log.InfofDepth(ctx, 2, opName)
+		log.InfofDepth(ctx, 2, "%s", log.Safe(opName))
 	}
 	opName += " (" + bq.name + ")"
 	if err := bq.store.stopper.RunLimitedAsyncTask(context.Background(), opName, bq.addOrMaybeAddSem, wait,
 		func(ctx context.Context) {
 			fn(ctx, baseQueueHelper{bq})
 		}); err != nil && bq.addLogN.ShouldLog() {
-		log.Infof(ctx, "rate limited in %s: %s", opName, err)
+		log.Infof(ctx, "rate limited in %s: %s", log.Safe(opName), err)
 	}
 }
 
@@ -932,7 +933,7 @@ func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) er
 			// order to be processed, check whether this replica has range lease
 			// and renew or acquire if necessary.
 			if bq.needsLease {
-				if _, _, pErr := repl.redirectOnOrAcquireLease(ctx); pErr != nil {
+				if _, pErr := repl.redirectOnOrAcquireLease(ctx); pErr != nil {
 					switch v := pErr.GetDetail().(type) {
 					case *roachpb.NotLeaseHolderError, *roachpb.RangeNotFoundError:
 						log.VEventf(ctx, 3, "%s; skipping", v)
@@ -959,30 +960,19 @@ func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) er
 }
 
 type benignError struct {
-	error
+	cause error
 }
 
-var _ causer.Causer = &benignError{}
-
-func (be *benignError) Cause() error {
-	return be.error
-}
+func (be *benignError) Error() string { return be.cause.Error() }
+func (be *benignError) Cause() error  { return be.cause }
 
 func isBenign(err error) bool {
-	return causer.Visit(err, func(err error) bool {
-		_, ok := err.(*benignError)
-		return ok
-	})
+	return errors.HasType(err, (*benignError)(nil))
 }
 
 func isPurgatoryError(err error) (purgatoryError, bool) {
 	var purgErr purgatoryError
-	ok := causer.Visit(err, func(err error) bool {
-		var ok bool
-		purgErr, ok = err.(purgatoryError)
-		return ok
-	})
-	return purgErr, ok
+	return purgErr, errors.As(err, &purgErr)
 }
 
 // assertInvariants codifies the guarantees upheld by the data structures in the
@@ -1086,7 +1076,7 @@ func (bq *baseQueue) finishProcessingReplica(
 
 		// If not a benign or purgatory error, log.
 		if !benign {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 		}
 	}
 
@@ -1111,7 +1101,7 @@ func (bq *baseQueue) addToPurgatoryLocked(
 	}
 
 	if log.V(1) {
-		log.Info(ctx, errors.Wrap(purgErr, "purgatory"))
+		log.Infof(ctx, "purgatory: %v", purgErr)
 	}
 
 	if _, found := bq.mu.replicas[repl.GetRangeID()]; found {

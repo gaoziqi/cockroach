@@ -10,6 +10,7 @@ package backupccl
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
@@ -19,8 +20,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -50,8 +53,15 @@ func showBackupPlanHook(
 		return nil, nil, nil, false, err
 	}
 
-	expected := map[string]sql.KVStringOptValidate{backupOptEncPassphrase: sql.KVStringOptRequireValue}
+	expected := map[string]sql.KVStringOptValidate{
+		backupOptEncPassphrase:  sql.KVStringOptRequireValue,
+		backupOptWithPrivileges: sql.KVStringOptRequireNoValue,
+	}
 	optsFn, err := p.TypeAsStringOpts(backup.Options, expected)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	opts, err := optsFn()
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -63,7 +73,7 @@ func showBackupPlanHook(
 	case tree.BackupFileDetails:
 		shower = backupShowerFiles
 	default:
-		shower = backupShowerDefault(ctx, p, backup.ShouldIncludeSchemas)
+		shower = backupShowerDefault(ctx, p, backup.ShouldIncludeSchemas, opts)
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -72,11 +82,6 @@ func showBackupPlanHook(
 		defer tracing.FinishSpan(span)
 
 		str, err := toFn()
-		if err != nil {
-			return err
-		}
-
-		opts, err := optsFn()
 		if err != nil {
 			return err
 		}
@@ -99,7 +104,14 @@ func showBackupPlanHook(
 
 		incPaths, err := findPriorBackups(ctx, store)
 		if err != nil {
-			return err
+			if errors.Is(err, cloud.ErrListingUnsupported) {
+				// If we do not support listing, we have to just assume there are none
+				// and show the specified base.
+				log.Warningf(ctx, "storage sink %T does not support listing, only resolving the base backup", store)
+				incPaths = nil
+			} else {
+				return err
+			}
 		}
 
 		manifests := make([]BackupManifest, len(incPaths)+1)
@@ -123,12 +135,16 @@ func showBackupPlanHook(
 		// display them anyway, because we don't have the referenced table names,
 		// etc.
 		if err := maybeUpgradeTableDescsInBackupManifests(
-			ctx, manifests, true, /*skipFKsWithNoMatchingTable*/
+			ctx, manifests, p.ExecCfg().Codec, true, /*skipFKsWithNoMatchingTable*/
 		); err != nil {
 			return err
 		}
 
-		for _, row := range shower.fn(manifests) {
+		datums, err := shower.fn(manifests)
+		if err != nil {
+			return err
+		}
+		for _, row := range datums {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -143,10 +159,10 @@ func showBackupPlanHook(
 
 type backupShower struct {
 	header sqlbase.ResultColumns
-	fn     func([]BackupManifest) []tree.Datums
+	fn     func([]BackupManifest) ([]tree.Datums, error)
 }
 
-func backupShowerHeaders(showSchemas bool) sqlbase.ResultColumns {
+func backupShowerHeaders(showSchemas bool, opts map[string]string) sqlbase.ResultColumns {
 	baseHeaders := sqlbase.ResultColumns{
 		{Name: "database_name", Typ: types.String},
 		{Name: "table_name", Typ: types.String},
@@ -154,17 +170,23 @@ func backupShowerHeaders(showSchemas bool) sqlbase.ResultColumns {
 		{Name: "end_time", Typ: types.Timestamp},
 		{Name: "size_bytes", Typ: types.Int},
 		{Name: "rows", Typ: types.Int},
+		{Name: "is_full_cluster", Typ: types.Bool},
 	}
 	if showSchemas {
 		baseHeaders = append(baseHeaders, sqlbase.ResultColumn{Name: "create_statement", Typ: types.String})
 	}
+	if _, shouldShowPrivleges := opts[backupOptWithPrivileges]; shouldShowPrivleges {
+		baseHeaders = append(baseHeaders, sqlbase.ResultColumn{Name: "privileges", Typ: types.String})
+	}
 	return baseHeaders
 }
 
-func backupShowerDefault(ctx context.Context, p sql.PlanHookState, showSchemas bool) backupShower {
+func backupShowerDefault(
+	ctx context.Context, p sql.PlanHookState, showSchemas bool, opts map[string]string,
+) backupShower {
 	return backupShower{
-		header: backupShowerHeaders(showSchemas),
-		fn: func(manifests []BackupManifest) []tree.Datums {
+		header: backupShowerHeaders(showSchemas, opts),
+		fn: func(manifests []BackupManifest) ([]tree.Datums, error) {
 			var rows []tree.Datums
 			for _, manifest := range manifests {
 				descs := make(map[sqlbase.ID]string)
@@ -191,8 +213,15 @@ func backupShowerDefault(ctx context.Context, p sql.PlanHookState, showSchemas b
 					descSizes[sqlbase.ID(tableID)] = s
 				}
 				start := tree.DNull
+				end, err := tree.MakeDTimestamp(timeutil.Unix(0, manifest.EndTime.WallTime), time.Nanosecond)
+				if err != nil {
+					return nil, err
+				}
 				if manifest.StartTime.WallTime != 0 {
-					start = tree.MakeDTimestamp(timeutil.Unix(0, manifest.StartTime.WallTime), time.Nanosecond)
+					start, err = tree.MakeDTimestamp(timeutil.Unix(0, manifest.StartTime.WallTime), time.Nanosecond)
+					if err != nil {
+						return nil, err
+					}
 				}
 				var row tree.Datums
 				for _, descriptor := range manifest.Descriptors {
@@ -202,24 +231,67 @@ func backupShowerDefault(ctx context.Context, p sql.PlanHookState, showSchemas b
 							tree.NewDString(dbName),
 							tree.NewDString(table.Name),
 							start,
-							tree.MakeDTimestamp(timeutil.Unix(0, manifest.EndTime.WallTime), time.Nanosecond),
+							end,
 							tree.NewDInt(tree.DInt(descSizes[table.ID].DataSize)),
 							tree.NewDInt(tree.DInt(descSizes[table.ID].Rows)),
+							tree.MakeDBool(manifest.DescriptorCoverage == tree.AllDescriptors),
 						}
 						if showSchemas {
-							schema, err := p.ShowCreate(ctx, dbName, manifest.Descriptors, table, sql.OmitMissingFKClausesFromCreate)
+							displayOptions := sql.ShowCreateDisplayOptions{
+								FKDisplayMode:  sql.OmitMissingFKClausesFromCreate,
+								IgnoreComments: true,
+							}
+							schema, err := p.ShowCreate(ctx, dbName, manifest.Descriptors, table, displayOptions)
 							if err != nil {
 								continue
 							}
 							row = append(row, tree.NewDString(schema))
 						}
+						if _, shouldShowPrivileges := opts[backupOptWithPrivileges]; shouldShowPrivileges {
+							row = append(row, tree.NewDString(showPrivileges(descriptor)))
+						}
 						rows = append(rows, row)
 					}
 				}
 			}
-			return rows
+			return rows, nil
 		},
 	}
+}
+
+func showPrivileges(descriptor sqlbase.Descriptor) string {
+	var privStringBuilder strings.Builder
+	var privDesc *sqlbase.PrivilegeDescriptor
+	if db := descriptor.GetDatabase(); db != nil {
+		privDesc = db.GetPrivileges()
+	} else if table := descriptor.Table(hlc.Timestamp{}); table != nil {
+		privDesc = table.GetPrivileges()
+	}
+	if privDesc == nil {
+		return ""
+	}
+	for _, userPriv := range privDesc.Show() {
+		user := userPriv.User
+		privs := userPriv.Privileges
+		privStringBuilder.WriteString("GRANT ")
+		if len(privs) == 0 {
+			continue
+		}
+
+		for j, priv := range privs {
+			if j != 0 {
+				privStringBuilder.WriteString(", ")
+			}
+			privStringBuilder.WriteString(priv)
+		}
+		privStringBuilder.WriteString(" ON ")
+		privStringBuilder.WriteString(descriptor.GetName())
+		privStringBuilder.WriteString(" TO ")
+		privStringBuilder.WriteString(user)
+		privStringBuilder.WriteString("; ")
+	}
+
+	return privStringBuilder.String()
 }
 
 var backupShowerRanges = backupShower{
@@ -230,7 +302,7 @@ var backupShowerRanges = backupShower{
 		{Name: "end_key", Typ: types.Bytes},
 	},
 
-	fn: func(manifests []BackupManifest) (rows []tree.Datums) {
+	fn: func(manifests []BackupManifest) (rows []tree.Datums, err error) {
 		for _, manifest := range manifests {
 			for _, span := range manifest.Spans {
 				rows = append(rows, tree.Datums{
@@ -241,7 +313,7 @@ var backupShowerRanges = backupShower{
 				})
 			}
 		}
-		return rows
+		return rows, nil
 	},
 }
 
@@ -256,7 +328,7 @@ var backupShowerFiles = backupShower{
 		{Name: "rows", Typ: types.Int},
 	},
 
-	fn: func(manifests []BackupManifest) (rows []tree.Datums) {
+	fn: func(manifests []BackupManifest) (rows []tree.Datums, err error) {
 		for _, manifest := range manifests {
 			for _, file := range manifest.Files {
 				rows = append(rows, tree.Datums{
@@ -270,7 +342,7 @@ var backupShowerFiles = backupShower{
 				})
 			}
 		}
-		return rows
+		return rows, nil
 	},
 }
 

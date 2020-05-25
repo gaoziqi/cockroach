@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -30,7 +29,7 @@ func TestColumnarizeMaterialize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// TODO(jordan,asubiotto): add randomness to this test as more types are supported.
-	typs := []types.T{*types.Int, *types.Int}
+	typs := []*types.T{types.Int, types.Int}
 	nRows := 10000
 	nCols := 2
 	rows := sqlbase.MakeIntRows(nRows, nCols)
@@ -54,9 +53,9 @@ func TestColumnarizeMaterialize(t *testing.T) {
 		1, /* processorID */
 		c,
 		typs,
-		&execinfrapb.PostProcessSpec{},
 		nil, /* output */
 		nil, /* metadataSourcesQueue */
+		nil, /* toClose */
 		nil, /* outputStatsToTrace */
 		nil, /* cancelFlow */
 	)
@@ -93,16 +92,16 @@ func TestMaterializeTypes(t *testing.T) {
 
 	// TODO(andyk): Make sure to add more types here. Consider iterating over
 	// types.OidToTypes list and also using randomly generated EncDatums.
-	types := []types.T{
-		*types.Bool,
-		*types.Int,
-		*types.Float,
-		*types.Decimal,
-		*types.Date,
-		*types.String,
-		*types.Bytes,
-		*types.Name,
-		*types.Oid,
+	typs := []*types.T{
+		types.Bool,
+		types.Int,
+		types.Float,
+		types.Decimal,
+		types.Date,
+		types.String,
+		types.Bytes,
+		types.Name,
+		types.Oid,
 	}
 	inputRow := sqlbase.EncDatumRow{
 		sqlbase.EncDatum{Datum: tree.DBoolTrue},
@@ -115,7 +114,7 @@ func TestMaterializeTypes(t *testing.T) {
 		sqlbase.EncDatum{Datum: tree.NewDName("aloha")},
 		sqlbase.EncDatum{Datum: tree.NewDOid(59)},
 	}
-	input := execinfra.NewRepeatableRowSource(types, sqlbase.EncDatumRows{inputRow})
+	input := execinfra.NewRepeatableRowSource(typs, sqlbase.EncDatumRows{inputRow})
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
@@ -130,7 +129,7 @@ func TestMaterializeTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outputToInputColIdx := make([]int, len(types))
+	outputToInputColIdx := make([]int, len(typs))
 	for i := range outputToInputColIdx {
 		outputToInputColIdx[i] = i
 	}
@@ -138,10 +137,10 @@ func TestMaterializeTypes(t *testing.T) {
 		flowCtx,
 		1, /* processorID */
 		c,
-		types,
-		&execinfrapb.PostProcessSpec{},
+		typs,
 		nil, /* output */
 		nil, /* metadataSourcesQueue */
+		nil, /* toClose */
 		nil, /* outputStatsToTrace */
 		nil, /* cancelFlow */
 	)
@@ -167,7 +166,7 @@ func TestMaterializeTypes(t *testing.T) {
 }
 
 func BenchmarkColumnarizeMaterialize(b *testing.B) {
-	types := []types.T{*types.Int, *types.Int}
+	types := []*types.T{types.Int, types.Int}
 	nRows := 10000
 	nCols := 2
 	rows := sqlbase.MakeIntRows(nRows, nCols)
@@ -193,9 +192,9 @@ func BenchmarkColumnarizeMaterialize(b *testing.B) {
 			1, /* processorID */
 			c,
 			types,
-			&execinfrapb.PostProcessSpec{},
 			nil, /* output */
 			nil, /* metadataSourcesQueue */
+			nil, /* toClose */
 			nil, /* outputStatsToTrace */
 			nil, /* cancelFlow */
 		)

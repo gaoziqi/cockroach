@@ -7,7 +7,8 @@ source "$(dirname "${0}")/teamcity-support.sh"
 tc_prepare
 
 tc_start_block "Prepare environment for compose tests"
-type=$(go env GOOS)
+# Disable global -json flag.
+type=$(GOFLAGS=; go env GOOS)
 tc_end_block "Prepare environment for compose tests"
 
 tc_start_block "Compile CockroachDB"
@@ -17,7 +18,7 @@ rm artifacts/compose-compile.log
 tc_end_block "Compile CockroachDB"
 
 tc_start_block "Compile compose tests"
-run build/builder.sh mkrelease "$type" -Otarget testbuild PKG=./pkg/compose
+run build/builder.sh mkrelease "$type" -Otarget testbuild PKG=./pkg/compose TAGS=compose
 tc_end_block "Compile compose tests"
 
 tc_start_block "Run compose tests"

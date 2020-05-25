@@ -1,7 +1,273 @@
+# This test times out when run with 3node-tenant.
+# LogicTest: !3node-tenant
+
 # The tests in this file target the new optimizer-driven FK paths (with
 # fall back on the legacy paths for unsupported cases).
 statement ok
 SET optimizer_foreign_keys = true
+
+statement ok
+SET experimental_optimizer_foreign_key_cascades = true
+
+# Tests for the experimental opt-driven cascades.
+subtest OptDriven
+
+# Single delete cascade.
+statement ok
+CREATE TABLE parent (p INT PRIMARY KEY);
+CREATE TABLE child (
+  c INT PRIMARY KEY,
+  p INT NOT NULL REFERENCES parent(p) ON DELETE CASCADE
+);
+INSERT INTO parent VALUES (1), (2);
+INSERT INTO child VALUES (1, 1), (2, 2), (10, 1), (20, 2);
+
+query II rowsort
+SELECT * FROM child
+----
+1   1
+2   2
+10  1
+20  2
+
+statement ok
+DELETE FROM parent WHERE p >= 2
+
+query II rowsort
+SELECT * FROM child
+----
+1   1
+10  1
+
+statement ok
+DELETE FROM parent WHERE p <= 2
+
+query II
+SELECT * FROM child
+----
+
+# Delete cascade which itself has a check.
+statement ok
+CREATE TABLE grandchild (
+  g INT PRIMARY KEY,
+  c INT REFERENCES child(c)
+);
+INSERT INTO parent VALUES (1), (2);
+INSERT INTO child VALUES (10, 1), (11, 1), (20, 2), (21, 2);
+INSERT INTO grandchild VALUES (100, 10), (101, 10), (110, 11);
+
+statement ok
+DELETE FROM parent WHERE p = 2
+
+statement error delete on table "child" violates foreign key constraint "fk_c_ref_child" on table "grandchild"\nDETAIL: Key \(c\)\=\(1[01]\) is still referenced from table "grandchild"
+DELETE FROM parent WHERE p = 1
+
+statement ok
+DELETE FROM grandchild WHERE c = 10
+
+statement error delete on table "child" violates foreign key constraint "fk_c_ref_child" on table "grandchild"\nDETAIL: Key \(c\)=\(11\) is still referenced from table "grandchild"
+DELETE FROM parent WHERE p = 1
+
+statement ok
+DELETE FROM grandchild WHERE c = 11
+
+statement ok
+DELETE FROM parent WHERE p = 1
+
+statement ok
+DROP TABLE grandchild
+
+# Delete cascade which itself has a cascade.
+statement ok
+CREATE TABLE grandchild (
+  g INT PRIMARY KEY,
+  c INT REFERENCES child(c) ON DELETE CASCADE
+);
+INSERT INTO parent VALUES (1), (2);
+INSERT INTO child VALUES (10, 1), (11, 1), (20, 2), (21, 2);
+INSERT INTO grandchild VALUES (100, 10), (101, 10), (110, 11), (200, 20)
+
+statement ok
+DELETE FROM parent WHERE p = 1
+
+query II rowsort
+SELECT * FROM child
+----
+20  2
+21  2
+
+query II rowsort
+SELECT * FROM grandchild
+----
+200  20
+
+statement ok
+DELETE FROM parent WHERE p = 2
+
+query II
+SELECT * FROM child
+----
+
+query II
+SELECT * FROM grandchild
+----
+
+statement ok
+DROP TABLE grandchild;
+DROP TABLE child;
+DROP TABLE parent
+
+# Delete cascade with multiple columns and multiple child tables.
+statement ok
+CREATE TABLE parent_multi (pa INT, pb INT, pc INT, UNIQUE INDEX (pa,pb,pc));
+CREATE TABLE child_multi_1 (
+  c INT,
+  a INT,
+  b INT,
+  FOREIGN KEY (a,b,c) REFERENCES parent_multi(pa,pb,pc) ON DELETE CASCADE
+);
+CREATE TABLE child_multi_2 (
+  b INT,
+  c INT,
+  a INT,
+  FOREIGN KEY (a,b,c) REFERENCES parent_multi(pa,pb,pc) ON DELETE CASCADE
+)
+
+statement ok
+INSERT INTO parent_multi VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300), (NULL, NULL, NULL);
+INSERT INTO child_multi_1(a,b,c) VALUES (1, 10, 100), (2, 20, 200), (1, 10, 100), (2, 20, 200), (NULL, NULL, NULL);
+INSERT INTO child_multi_2(a,b,c) VALUES (2, 20, 200), (3, 30, 300)
+
+query III rowsort
+SELECT * FROM parent_multi
+----
+1     10    100
+2     20    200
+3     30    300
+NULL  NULL  NULL
+
+query III rowsort
+SELECT a,b,c FROM child_multi_1
+----
+1     10    100
+2     20    200
+1     10    100
+2     20    200
+NULL  NULL  NULL
+
+query III rowsort
+SELECT a,b,c FROM child_multi_2
+----
+2  20  200
+3  30  300
+
+statement ok
+DELETE FROM parent_multi WHERE pa = 1
+
+query III rowsort
+SELECT * FROM parent_multi
+----
+2     20    200
+3     30    300
+NULL  NULL  NULL
+
+query III rowsort
+SELECT a,b,c FROM child_multi_1
+----
+2     20    200
+2     20    200
+NULL  NULL  NULL
+
+query III rowsort
+SELECT a,b,c FROM child_multi_2
+----
+2  20  200
+3  30  300
+
+statement ok
+DELETE FROM parent_multi WHERE pb = 20
+
+query III rowsort
+SELECT * FROM parent_multi
+----
+3     30    300
+NULL  NULL  NULL
+
+query III rowsort
+SELECT a,b,c FROM child_multi_1
+----
+NULL  NULL  NULL
+
+query III rowsort
+SELECT a,b,c FROM child_multi_2
+----
+3  30  300
+
+# Deleting NULLs should not cause any changes in a child.
+statement ok
+DELETE FROM parent_multi WHERE pa IS NULL
+
+query III rowsort
+SELECT * FROM parent_multi
+----
+3  30  300
+
+query III rowsort
+SELECT a,b,c FROM child_multi_1
+----
+NULL  NULL  NULL
+
+query III rowsort
+SELECT a,b,c FROM child_multi_2
+----
+3  30  300
+
+statement ok
+DROP TABLE child_multi_1;
+DROP TABLE child_multi_2;
+DROP TABLE parent_multi
+
+# Self-referencing cascade.
+statement ok
+CREATE TABLE self (a INT PRIMARY KEY, b INT REFERENCES self(a) ON DELETE CASCADE)
+
+statement ok
+INSERT INTO self VALUES (1, NULL);
+INSERT INTO self SELECT x, x-1 FROM generate_series(2, 10) AS g(x)
+
+statement ok
+DELETE FROM self WHERE a = 4
+
+query II rowsort
+SELECT * FROM self
+----
+1   NULL
+2   1
+3   2
+
+statement ok
+DELETE FROM self WHERE a = 1
+
+query II
+SELECT * FROM self
+----
+
+# Test cascade limit setting.
+statement ok
+INSERT INTO self VALUES (1, NULL);
+INSERT INTO self SELECT x, x-1 FROM generate_series(2, 20) AS g(x)
+
+statement ok
+SET foreign_key_cascades_limit = 10
+
+statement error cascades limit \(10\) reached
+DELETE FROM self WHERE a = 1
+
+statement ok
+RESET foreign_key_cascades_limit
+
+statement ok
+DROP TABLE self
 
 subtest AllCascadingActions
 ### A test of all cascading actions in their most basic form.
@@ -38,7 +304,7 @@ SELECT * FROM b;
 1 2 3 4 5 6 7 8 9 10
 
 # 1. ON DELETE NO ACTION
-statement error pq: foreign key violation: values \[1\] in columns \[id\] referenced in table "b"
+statement error pq: delete on table "a" violates foreign key constraint "fk_delete_no_action_ref_a" on table "b"\nDETAIL: Key \(id\)=\(1\) is still referenced from table "b"\.
 DELETE FROM a WHERE id = 1;
 
 # 2. ON UPDATE NO ACTION
@@ -46,7 +312,7 @@ statement error pq: foreign key violation: values \[2\] in columns \[id\] refere
 UPDATE a SET id = 1000 WHERE id = 2;
 
 # 3. ON DELETE RESTRICT
-statement error pq: foreign key violation: values \[3\] in columns \[id\] referenced in table "b"
+statement error pq: delete on table "a" violates foreign key constraint "fk_delete_restrict_ref_a" on table "b"\nDETAIL: Key \(id\)=\(3\) is still referenced from table "b"\.
 DELETE FROM a WHERE id = 3;
 
 # 4. ON UPDATE RESTRICT
@@ -500,7 +766,7 @@ INSERT INTO c2 VALUES
 INSERT INTO d VALUES ('d-pk1-c2-pk4-b1-pk2', 'c2-pk4-b1-pk2');
 
 # ON DELETE CASCADE
-statement error pq: foreign key violation: values \['c2-pk4-b1-pk2'\] in columns \[id\] referenced in table "d"
+statement error delete on table "c2" violates foreign key constraint "fk_delete_restrict_ref_c2" on table "d"\nDETAIL: Key \(id\)=\('c2-pk4-b1-pk2'\) is still referenced from table "d"\.
 DELETE FROM a WHERE id = 'a-pk1';
 
 # Clean up after the test.
@@ -671,7 +937,7 @@ SELECT
 2 1 2 1 1 2
 
 # ON DELETE CASCADE
-statement error pq: foreign key violation: values \['pk1'\] in columns \[id\] referenced in table "c3"
+statement error delete on table "b2" violates foreign key constraint "fk_id_ref_b2" on table "c3"\nDETAIL: Key \(id\)=\('pk1'\) is still referenced from table "c3"\.
 DELETE FROM a WHERE id = 'pk1';
 
 # Clean up after the test.
@@ -2695,7 +2961,7 @@ INSERT INTO b3 VALUES ('b3-pk1', 'delete_me'), ('b3-pk2', 'untouched');
 INSERT INTO b4 VALUES ('b4-pk1', 'delete_me'), ('b4-pk2', 'delete_me');
 
 # ON DELETE CASCADE, which should fail since the value 'missing' is not in a.
-statement error pq: foreign key violation: value \['missing'\] not found in a@primary \[id\]
+statement error pq: update on table "b3" violates foreign key constraint "fk_delete_set_default_ref_a"\nDETAIL: Key \(delete_set_default\)=\('missing'\) is not present in table "a"\.
 DELETE FROM a WHERE id = 'delete_me';
 
 # Clean up after the test.
@@ -2860,7 +3126,7 @@ INSERT INTO c3 VALUES
 # This query expects to cascade the deletion in a into b1 and b2, but not into
 # the c tables which have ON DELETE SET DEFAULT instead. And ultimately fail
 # since the default value 'missing' is not present in b1.
-statement error pq: foreign key violation: value \['missing'\] not found in b1@primary \[id\]
+statement error pq: update on table "c2" violates foreign key constraint "fk_delete_set_default_ref_b1"\nDETAIL: Key \(delete_set_default\)=\('missing'\) is not present in table "b1"\.
 DELETE FROM a WHERE id = 'a-pk1';
 
 # Clean up after the test.

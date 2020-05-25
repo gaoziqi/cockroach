@@ -12,10 +12,12 @@ package execbuilder
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -59,12 +61,13 @@ func (b *Builder) buildMutationInput(
 
 	if p.WithID != 0 {
 		label := fmt.Sprintf("buffer %d", p.WithID)
-		input.root, err = b.factory.ConstructBuffer(input.root, label)
+		bufferNode, err := b.factory.ConstructBuffer(input.root, label)
 		if err != nil {
 			return execPlan{}, err
 		}
 
-		b.addBuiltWithExpr(p.WithID, input.outputCols, input.root)
+		b.addBuiltWithExpr(p.WithID, input.outputCols, bufferNode)
+		input.root = bufferNode
 	}
 	return input, nil
 }
@@ -96,7 +99,7 @@ func (b *Builder) buildInsert(ins *memo.InsertExpr) (execPlan, error) {
 		insertOrds,
 		returnOrds,
 		checkOrds,
-		b.allowAutoCommit && len(ins.Checks) == 0,
+		b.allowAutoCommit && len(ins.Checks) == 0 && len(ins.FKCascades) == 0,
 		disableExecFKs,
 	)
 	if err != nil {
@@ -176,7 +179,7 @@ func (b *Builder) tryBuildFastPathInsert(ins *memo.InsertExpr) (_ execPlan, ok b
 		}
 
 		out := &fkChecks[i]
-		out.InsertCols = make([]exec.ColumnOrdinal, len(lookupJoin.KeyCols))
+		out.InsertCols = make([]exec.TableColumnOrdinal, len(lookupJoin.KeyCols))
 		findCol := func(cols opt.ColList, col opt.ColumnID) int {
 			res, ok := cols.Find(col)
 			if !ok {
@@ -189,7 +192,7 @@ func (b *Builder) tryBuildFastPathInsert(ins *memo.InsertExpr) (_ execPlan, ok b
 			// column in the mutation input.
 			withColOrd := findCol(withScan.OutCols, keyCol)
 			inputCol := withScan.InCols[withColOrd]
-			out.InsertCols[i] = exec.ColumnOrdinal(findCol(ins.InsertCols, inputCol))
+			out.InsertCols[i] = exec.TableColumnOrdinal(findCol(ins.InsertCols, inputCol))
 		}
 
 		out.ReferencedTable = md.Table(lookupJoin.Table)
@@ -318,7 +321,7 @@ func (b *Builder) buildUpdate(upd *memo.UpdateExpr) (execPlan, error) {
 		returnColOrds,
 		checkOrds,
 		passthroughCols,
-		b.allowAutoCommit && len(upd.Checks) == 0,
+		b.allowAutoCommit && len(upd.Checks) == 0 && len(upd.FKCascades) == 0,
 		disableExecFKs,
 	)
 	if err != nil {
@@ -374,9 +377,9 @@ func (b *Builder) buildUpsert(ups *memo.UpsertExpr) (execPlan, error) {
 	// Construct the Upsert node.
 	md := b.mem.Metadata()
 	tab := md.Table(ups.Table)
-	canaryCol := exec.ColumnOrdinal(-1)
+	canaryCol := exec.NodeColumnOrdinal(-1)
 	if ups.CanaryCol != 0 {
-		canaryCol = input.getColumnOrdinal(ups.CanaryCol)
+		canaryCol = input.getNodeColumnOrdinal(ups.CanaryCol)
 	}
 	insertColOrds := ordinalSetFromColList(ups.InsertCols)
 	fetchColOrds := ordinalSetFromColList(ups.FetchCols)
@@ -393,7 +396,7 @@ func (b *Builder) buildUpsert(ups *memo.UpsertExpr) (execPlan, error) {
 		updateColOrds,
 		returnColOrds,
 		checkOrds,
-		b.allowAutoCommit && len(ups.Checks) == 0,
+		b.allowAutoCommit && len(ups.Checks) == 0 && len(ups.FKCascades) == 0,
 		disableExecFKs,
 	)
 	if err != nil {
@@ -417,8 +420,8 @@ func (b *Builder) buildUpsert(ups *memo.UpsertExpr) (execPlan, error) {
 
 func (b *Builder) buildDelete(del *memo.DeleteExpr) (execPlan, error) {
 	// Check for the fast-path delete case that can use a range delete.
-	if b.canUseDeleteRange(del) {
-		return b.buildDeleteRange(del)
+	if ep, ok, err := b.tryBuildDeleteRange(del); err != nil || ok {
+		return ep, err
 	}
 
 	// Ensure that order of input columns matches order of target table columns.
@@ -444,7 +447,7 @@ func (b *Builder) buildDelete(del *memo.DeleteExpr) (execPlan, error) {
 		tab,
 		fetchColOrds,
 		returnColOrds,
-		b.allowAutoCommit && len(del.Checks) == 0,
+		b.allowAutoCommit && len(del.Checks) == 0 && len(del.FKCascades) == 0,
 		disableExecFKs,
 	)
 	if err != nil {
@@ -452,6 +455,10 @@ func (b *Builder) buildDelete(del *memo.DeleteExpr) (execPlan, error) {
 	}
 
 	if err := b.buildFKChecks(del.Checks); err != nil {
+		return execPlan{}, err
+	}
+
+	if err := b.buildFKCascades(del.WithID, del.FKCascades); err != nil {
 		return execPlan{}, err
 	}
 
@@ -464,59 +471,189 @@ func (b *Builder) buildDelete(del *memo.DeleteExpr) (execPlan, error) {
 	return ep, nil
 }
 
-// canUseDeleteRange checks whether a logical Delete operator can be implemented
-// by a fast delete range execution operator. This logic should be kept in sync
-// with canDeleteFast.
-func (b *Builder) canUseDeleteRange(del *memo.DeleteExpr) bool {
+// tryBuildDeleteRange attempts to construct a fast DeleteRange execution for a
+// logical Delete operator, checking all required conditions. See
+// exec.Factory.ConstructDeleteRange.
+func (b *Builder) tryBuildDeleteRange(del *memo.DeleteExpr) (_ execPlan, ok bool, _ error) {
 	// If rows need to be returned from the Delete operator (i.e. RETURNING
 	// clause), no fast path is possible, because row values must be fetched.
 	if del.NeedResults() {
-		return false
+		return execPlan{}, false, nil
+	}
+
+	// Check for simple Scan input operator without a limit; anything else is not
+	// supported by a range delete.
+	if scan, ok := del.Input.(*memo.ScanExpr); !ok || scan.HardLimit != 0 {
+		return execPlan{}, false, nil
 	}
 
 	tab := b.mem.Metadata().Table(del.Table)
 	if tab.DeletableIndexCount() > 1 {
 		// Any secondary index prevents fast path, because separate delete batches
 		// must be formulated to delete rows from them.
-		return false
+		return execPlan{}, false, nil
 	}
-	if tab.IsInterleaved() {
-		// There is a separate fast path for interleaved tables in sql/delete.go.
-		return false
+
+	primaryIdx := tab.Index(cat.PrimaryIndex)
+
+	// If the table is interleaved in another table, we cannot use the fast path.
+	if primaryIdx.InterleaveAncestorCount() > 0 {
+		return execPlan{}, false, nil
 	}
+
+	if primaryIdx.InterleavedByCount() > 0 {
+		return b.tryBuildDeleteRangeOnInterleaving(del, tab)
+	}
+
+	// No other tables interleaved inside this table. We can use the fast path
+	// if this table is not referenced by any foreign keys (because the
+	// integrity of those references must be checked).
 	if tab.InboundForeignKeyCount() > 0 {
-		// If the table is referenced by other tables' foreign keys, no fast path
-		// is possible, because the integrity of those references must be checked.
-		return false
+		return execPlan{}, false, nil
 	}
 
-	// Check for simple Scan input operator without a limit; anything else is not
-	// supported by a range delete.
-	if scan, ok := del.Input.(*memo.ScanExpr); !ok || scan.HardLimit != 0 {
-		return false
+	ep, err := b.buildDeleteRange(del, nil /* interleavedTables */)
+	if err != nil {
+		return execPlan{}, false, err
+	}
+	return ep, true, nil
+}
+
+// tryBuildDeleteRangeOnInterleaving attempts to construct a fast DeleteRange
+// execution for a logical Delete operator when the table is at the root of an
+// interleaving hierarchy.
+//
+// We can use DeleteRange only when foreign keys are set up such that a deletion
+// of a row cascades into deleting all interleaved rows with the same prefix.
+// More specifically, the following conditions must apply:
+//  - none of the tables in the hierarchy have secondary indexes;
+//  - none of the tables in the hierarchy are referenced by any tables outside
+//    the hierarchy;
+//  - all foreign key references between tables in the hierarchy have columns
+//    that match the interleaving;
+//  - all tables in the interleaving hierarchy have at least an ON DELETE
+//    CASCADE foreign key reference to an ancestor.
+//
+func (b *Builder) tryBuildDeleteRangeOnInterleaving(
+	del *memo.DeleteExpr, root cat.Table,
+) (_ execPlan, ok bool, _ error) {
+	// To check the conditions above, we explore the entire hierarchy using
+	// breadth-first search.
+	queue := make([]cat.Table, 0, root.Index(cat.PrimaryIndex).InterleavedByCount())
+	tables := make(map[cat.StableID]cat.Table)
+	tables[root.ID()] = root
+	queue = append(queue, root)
+	for queuePos := 0; queuePos < len(queue); queuePos++ {
+		currTab := queue[queuePos]
+
+		if currTab.DeletableIndexCount() > 1 {
+			return execPlan{}, false, nil
+		}
+
+		currIdx := currTab.Index(cat.PrimaryIndex)
+		for i, n := 0, currIdx.InterleavedByCount(); i < n; i++ {
+			// We don't care about the index ID because we bail if any of the tables
+			// have any secondary indexes anyway.
+			tableID, _ := currIdx.InterleavedBy(i)
+			if tab, ok := tables[tableID]; ok {
+				err := errors.AssertionFailedf("multiple interleave paths to table %s", tab.Name())
+				return execPlan{}, false, err
+			}
+			ds, _, err := b.catalog.ResolveDataSourceByID(context.TODO(), cat.Flags{}, tableID)
+			if err != nil {
+				return execPlan{}, false, err
+			}
+			child := ds.(cat.Table)
+			tables[tableID] = child
+			queue = append(queue, child)
+		}
 	}
 
-	return true
+	// Verify that there are no "inbound" foreign key references from outside the
+	// hierarchy and that all foreign key references between tables in the hierarchy
+	// match the interleaving (i.e. a prefix of the PK of the child references the
+	// PK of the ancestor).
+	for _, parent := range queue {
+		for i, n := 0, parent.InboundForeignKeyCount(); i < n; i++ {
+			fk := parent.InboundForeignKey(i)
+			child, ok := tables[fk.OriginTableID()]
+			if !ok {
+				// Foreign key from a table outside of the hierarchy.
+				return execPlan{}, false, nil
+			}
+			childIdx := child.Index(cat.PrimaryIndex)
+			parentIdx := parent.Index(cat.PrimaryIndex)
+			numCols := fk.ColumnCount()
+			if parentIdx.KeyColumnCount() != numCols || childIdx.KeyColumnCount() < numCols {
+				return execPlan{}, false, nil
+			}
+			for i := 0; i < numCols; i++ {
+				if fk.OriginColumnOrdinal(child, i) != childIdx.Column(i).Ordinal {
+					return execPlan{}, false, nil
+				}
+				if fk.ReferencedColumnOrdinal(parent, i) != parentIdx.Column(i).Ordinal {
+					return execPlan{}, false, nil
+				}
+			}
+		}
+	}
+
+	// Finally, verify that each table (except for the root) has an ON DELETE
+	// CASCADE foreign key reference to another table in the hierarchy.
+	for _, tab := range queue[1:] {
+		found := false
+		for i, n := 0, tab.OutboundForeignKeyCount(); i < n; i++ {
+			fk := tab.OutboundForeignKey(i)
+			if fk.DeleteReferenceAction() == tree.Cascade && tables[fk.ReferencedTableID()] != nil {
+				// Note that we must have already checked above that this foreign key matches
+				// the interleaving.
+				found = true
+				break
+			}
+		}
+		if !found {
+			return execPlan{}, false, nil
+		}
+	}
+
+	ep, err := b.buildDeleteRange(del, queue[1:])
+	if err != nil {
+		return execPlan{}, false, err
+	}
+	return ep, true, nil
 }
 
 // buildDeleteRange constructs a DeleteRange operator that deletes contiguous
-// rows in the primary index. canUseDeleteRange should have already been called.
-func (b *Builder) buildDeleteRange(del *memo.DeleteExpr) (execPlan, error) {
-	// canUseDeleteRange has already validated that input is a Scan operator.
+// rows in the primary index; the caller must have already checked the
+// conditions which allow use of DeleteRange.
+func (b *Builder) buildDeleteRange(
+	del *memo.DeleteExpr, interleavedTables []cat.Table,
+) (execPlan, error) {
+	// tryBuildDeleteRange has already validated that input is a Scan operator.
 	scan := del.Input.(*memo.ScanExpr)
 	tab := b.mem.Metadata().Table(scan.Table)
 	needed, _ := b.getColumns(scan.Cols, scan.Table)
-	// Calculate the maximum number of keys that the scan could return by
-	// multiplying the number of possible result rows by the number of column
-	// families of the table. The execbuilder needs this information to determine
-	// whether or not allowAutoCommit can be enabled.
-	maxKeys := int(b.indexConstraintMaxResults(scan)) * tab.FamilyCount()
+	maxKeys := 0
+	if len(interleavedTables) == 0 {
+		// Calculate the maximum number of keys that the scan could return by
+		// multiplying the number of possible result rows by the number of column
+		// families of the table. The factory uses this information to determine
+		// whether to allow autocommit.
+		// We don't do this if there are interleaved children, as we don't know how
+		// many children rows may be in range.
+		maxKeys = int(b.indexConstraintMaxResults(scan)) * tab.FamilyCount()
+	}
+	// Other mutations only allow auto-commit if there are no FK checks or
+	// cascades. In this case, we won't actually execute anything for the checks
+	// or cascades - if we got this far, we determined that the FKs match the
+	// interleaving hierarchy and a delete range is sufficient.
 	root, err := b.factory.ConstructDeleteRange(
 		tab,
 		needed,
 		scan.Constraint,
+		interleavedTables,
 		maxKeys,
-		b.allowAutoCommit && len(del.Checks) == 0,
+		b.allowAutoCommit,
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -539,7 +676,7 @@ func appendColsWhenPresent(dst, src opt.ColList) opt.ColList {
 // column ID in the given list. This is used with mutation operators, which
 // maintain lists that correspond to the target table, with zero column IDs
 // indicating columns that are not involved in the mutation.
-func ordinalSetFromColList(colList opt.ColList) exec.ColumnOrdinalSet {
+func ordinalSetFromColList(colList opt.ColList) util.FastIntSet {
 	var res util.FastIntSet
 	if colList == nil {
 		return res
@@ -595,7 +732,7 @@ func (b *Builder) buildFKChecks(checks memo.FKChecksExpr) error {
 		mkErr := func(row tree.Datums) error {
 			keyVals := make(tree.Datums, len(c.KeyCols))
 			for i, col := range c.KeyCols {
-				keyVals[i] = row[query.getColumnOrdinal(col)]
+				keyVals[i] = row[query.getNodeColumnOrdinal(col)]
 			}
 			return mkFKCheckErr(md, c, keyVals)
 		}
@@ -603,7 +740,7 @@ func (b *Builder) buildFKChecks(checks memo.FKChecksExpr) error {
 		if err != nil {
 			return err
 		}
-		b.postqueries = append(b.postqueries, node)
+		b.checks = append(b.checks, node)
 	}
 	return nil
 }
@@ -622,7 +759,7 @@ func mkFKCheckErr(md *opt.Metadata, c *memo.FKChecksItem, keyVals tree.Datums) e
 		//   DETAIL: Key (child_p)=(2) is not present in table "parent".
 		fk := origin.Table.OutboundForeignKey(c.FKOrdinal)
 		fmt.Fprintf(&msg, "%s on table ", c.OpName)
-		lex.EncodeEscapedSQLIdent(&msg, string(origin.Alias.TableName))
+		lex.EncodeEscapedSQLIdent(&msg, string(origin.Alias.ObjectName))
 		msg.WriteString(" violates foreign key constraint ")
 		lex.EncodeEscapedSQLIdent(&msg, fk.Name())
 
@@ -653,7 +790,7 @@ func mkFKCheckErr(md *opt.Metadata, c *memo.FKChecksItem, keyVals tree.Datums) e
 			details.WriteString("MATCH FULL does not allow mixing of null and nonnull key values.")
 		} else {
 			details.WriteString(") is not present in table ")
-			lex.EncodeEscapedSQLIdent(&details, string(referenced.Alias.TableName))
+			lex.EncodeEscapedSQLIdent(&details, string(referenced.Alias.ObjectName))
 			details.WriteByte('.')
 		}
 	} else {
@@ -663,11 +800,11 @@ func mkFKCheckErr(md *opt.Metadata, c *memo.FKChecksItem, keyVals tree.Datums) e
 		//   DETAIL: Key (p)=(1) is still referenced from table "child".
 		fk := referenced.Table.InboundForeignKey(c.FKOrdinal)
 		fmt.Fprintf(&msg, "%s on table ", c.OpName)
-		lex.EncodeEscapedSQLIdent(&msg, string(referenced.Alias.TableName))
+		lex.EncodeEscapedSQLIdent(&msg, string(referenced.Alias.ObjectName))
 		msg.WriteString(" violates foreign key constraint ")
 		lex.EncodeEscapedSQLIdent(&msg, fk.Name())
 		msg.WriteString(" on table ")
-		lex.EncodeEscapedSQLIdent(&msg, string(origin.Alias.TableName))
+		lex.EncodeEscapedSQLIdent(&msg, string(origin.Alias.ObjectName))
 
 		details.WriteString("Key (")
 		for i := 0; i < fk.ColumnCount(); i++ {
@@ -685,14 +822,28 @@ func mkFKCheckErr(md *opt.Metadata, c *memo.FKChecksItem, keyVals tree.Datums) e
 			details.WriteString(d.String())
 		}
 		details.WriteString(") is still referenced from table ")
-		lex.EncodeEscapedSQLIdent(&details, string(origin.Alias.TableName))
+		lex.EncodeEscapedSQLIdent(&details, string(origin.Alias.ObjectName))
 		details.WriteByte('.')
 	}
 
 	return errors.WithDetail(
-		pgerror.New(pgcode.ForeignKeyViolation, msg.String()),
+		pgerror.Newf(pgcode.ForeignKeyViolation, "%s", msg.String()),
 		details.String(),
 	)
+}
+
+func (b *Builder) buildFKCascades(withID opt.WithID, cascades memo.FKCascades) error {
+	if len(cascades) == 0 {
+		return nil
+	}
+	cb, err := makeCascadeBuilder(b, withID)
+	if err != nil {
+		return err
+	}
+	for i := range cascades {
+		b.cascades = append(b.cascades, cb.setupCascade(&cascades[i]))
+	}
+	return nil
 }
 
 // canAutoCommit determines if it is safe to auto commit the mutation contained

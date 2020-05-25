@@ -33,11 +33,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -56,11 +55,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/tool"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/kr/pretty"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -140,7 +139,7 @@ func OpenEngine(dir string, stopper *stop.Stopper, opts OpenEngineOptions) (stor
 	}
 
 	var db storage.Engine
-	storageEngine := resolveStorageEngineType(storage.DefaultStorageEngine, storageConfig.Dir)
+	storageEngine := resolveStorageEngineType(context.Background(), storage.DefaultStorageEngine, storageConfig)
 
 	switch storageEngine {
 	case enginepb.EngineTypePebble:
@@ -807,7 +806,7 @@ func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
 			}
 			output = append(output, fmt.Sprintf("%q: %+v", key, desc))
 		} else if strings.HasPrefix(key, gossip.KeyNodeLivenessPrefix) {
-			var liveness storagepb.Liveness
+			var liveness kvserverpb.Liveness
 			if err := protoutil.Unmarshal(bytes, &liveness); err != nil {
 				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
 			}
@@ -864,7 +863,7 @@ func runTimeSeriesDump(cmd *cobra.Command, args []string) error {
 	tsClient := tspb.NewTimeSeriesClient(conn)
 	stream, err := tsClient.Dump(context.Background(), &tspb.DumpRequest{})
 	if err != nil {
-		log.Fatal(context.Background(), err)
+		log.Fatalf(context.Background(), "%v", err)
 	}
 
 	var name, source string
@@ -1107,7 +1106,7 @@ func removeDeadReplicas(
 			return nil, errors.Wrap(err, "loading MVCCStats")
 		}
 		err = storage.MVCCPutProto(ctx, batch, &ms, key, clock.Now(), nil /* txn */, &desc)
-		if wiErr, ok := err.(*roachpb.WriteIntentError); ok {
+		if wiErr := (*roachpb.WriteIntentError)(nil); errors.As(err, &wiErr) {
 			if len(wiErr.Intents) != 1 {
 				return nil, errors.Errorf("expected 1 intent, found %d: %s", len(wiErr.Intents), wiErr)
 			}
@@ -1134,10 +1133,9 @@ func removeDeadReplicas(
 				return nil, err
 			}
 			update := roachpb.LockUpdate{
-				Span:       roachpb.Span{Key: intent.Key},
-				Txn:        intent.Txn,
-				Status:     roachpb.ABORTED,
-				Durability: lock.Replicated,
+				Span:   roachpb.Span{Key: intent.Key},
+				Txn:    intent.Txn,
+				Status: roachpb.ABORTED,
 			}
 			if _, err := storage.MVCCResolveWriteIntent(ctx, batch, &ms, update); err != nil {
 				return nil, err
@@ -1241,15 +1239,39 @@ process that has failed and cannot restart.
 	RunE: usageAndErr,
 }
 
+// mvccValueFormatter is an fmt.Formatter for MVCC values.
+type mvccValueFormatter struct {
+	kv  storage.MVCCKeyValue
+	err error
+}
+
+// Format implements the fmt.Formatter interface.
+func (m mvccValueFormatter) Format(f fmt.State, c rune) {
+	if m.err != nil {
+		errors.FormatError(m.err, f, c)
+		return
+	}
+	fmt.Fprint(f, kvserver.SprintKeyValue(m.kv, false /* printKey */))
+}
+
 func init() {
 	DebugCmd.AddCommand(debugCmds...)
 
-	pebbleTool := tool.New()
+	// Note: we hook up FormatValue here in order to avoid a circular dependency
+	// between kvserver and storage.
+	storage.MVCCComparer.FormatValue = func(key, value []byte) fmt.Formatter {
+		decoded, err := storage.DecodeMVCCKey(key)
+		if err != nil {
+			return mvccValueFormatter{err: err}
+		}
+		return mvccValueFormatter{kv: storage.MVCCKeyValue{Key: decoded, Value: value}}
+	}
+
 	// To be able to read Cockroach-written RocksDB manifests/SSTables, comparator
 	// and merger functions must be specified to pebble that match the ones used
 	// to write those files.
-	pebbleTool.RegisterMerger(storage.MVCCMerger)
-	pebbleTool.RegisterComparer(storage.MVCCComparer)
+	pebbleTool := tool.New(tool.Mergers(storage.MVCCMerger),
+		tool.DefaultComparer(storage.MVCCComparer))
 	debugPebbleCmd.AddCommand(pebbleTool.Commands...)
 	DebugCmd.AddCommand(debugPebbleCmd)
 

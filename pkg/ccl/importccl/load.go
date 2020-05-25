@@ -37,7 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // TestingGetDescriptorFromDB is a wrapper for getDescriptorFromDB.
@@ -59,13 +59,13 @@ func getDescriptorFromDB(
 		tableName   string
 		extraClause string
 	}{
-		{"system.namespace", `AND n."parentSchemaID" = 0`},
-		{"system.namespace_deprecated", ""},
+		{fmt.Sprintf("[%d AS n]", keys.NamespaceTableID), `AND "parentSchemaID" = 0`},
+		{fmt.Sprintf("[%d AS n]", keys.DeprecatedNamespaceTableID), ""},
 	} {
 		if err := db.QueryRow(
 			fmt.Sprintf(`SELECT
 			d.descriptor
-		FROM %s n INNER JOIN system.descriptor d ON n.id = d.id
+		FROM %s INNER JOIN system.descriptor d ON n.id = d.id
 		WHERE n."parentID" = $1 %s
 		AND n.name = $2`,
 				t.tableName,
@@ -74,7 +74,7 @@ func getDescriptorFromDB(
 			keys.RootNamespaceID,
 			dbName,
 		).Scan(&dbDescBytes); err != nil {
-			if err == gosql.ErrNoRows {
+			if errors.Is(err, gosql.ErrNoRows) {
 				continue
 			}
 			return nil, errors.Wrap(err, "fetch database descriptor")
@@ -113,6 +113,7 @@ func Load(
 	evalCtx := &tree.EvalContext{}
 	evalCtx.SetTxnTimestamp(curTime)
 	evalCtx.SetStmtTimestamp(curTime)
+	evalCtx.Codec = keys.TODOSQLCodec
 
 	blobClientFactory := blobs.TestBlobServiceClient(writeToDir)
 	conf, err := cloud.ExternalStorageConfFromURI(uri)
@@ -223,7 +224,7 @@ func Load(
 			}
 
 			ri, err = row.MakeInserter(
-				ctx, nil, tableDesc, tableDesc.Columns, row.SkipFKs, nil /* fkTables */, &sqlbase.DatumAlloc{},
+				ctx, nil, evalCtx.Codec, tableDesc, tableDesc.Columns, row.SkipFKs, nil /* fkTables */, &sqlbase.DatumAlloc{},
 			)
 			if err != nil {
 				return backupccl.BackupManifest{}, errors.Wrap(err, "make row inserter")
@@ -346,7 +347,7 @@ func insertStmtToKVs(
 				return errors.Errorf("unsupported expr: %q", expr)
 			}
 			var err error
-			insertRow[i], err = c.ResolveAsType(nil, &tableDesc.Columns[i].Type)
+			insertRow[i], err = c.ResolveAsType(nil, tableDesc.Columns[i].Type)
 			if err != nil {
 				return err
 			}
@@ -384,7 +385,7 @@ func writeSST(
 	}
 
 	filename := fmt.Sprintf("load-%d.sst", rand.Int63())
-	log.Info(ctx, "writesst ", filename)
+	log.Infof(ctx, "writesst %s", filename)
 
 	sstFile := &storage.MemFile{}
 	sst := storage.MakeBackupSSTWriter(sstFile)

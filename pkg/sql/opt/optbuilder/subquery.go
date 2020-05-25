@@ -87,14 +87,7 @@ func (s *subquery) TypeCheck(_ *tree.SemaContext, desired *types.T) (tree.TypedE
 	}
 
 	// Convert desired to an array of desired types for building the subquery.
-	var desiredTypes []*types.T
-	tupleContents := desired.TupleContents()
-	if tupleContents != nil {
-		desiredTypes = make([]*types.T, len(tupleContents))
-		for i := range desiredTypes {
-			desiredTypes[i] = &tupleContents[i]
-		}
-	}
+	desiredTypes := desired.TupleContents()
 
 	// Build the subquery. We cannot build the subquery earlier because we do
 	// not know the desired types until TypeCheck is called.
@@ -164,10 +157,10 @@ func (s *subquery) TypeCheck(_ *tree.SemaContext, desired *types.T) (tree.TypedE
 	if len(s.cols) == 1 {
 		s.typ = s.cols[0].typ
 	} else {
-		contents := make([]types.T, len(s.cols))
+		contents := make([]*types.T, len(s.cols))
 		labels := make([]string, len(s.cols))
 		for i := range s.cols {
-			contents[i] = *s.cols[i].typ
+			contents[i] = s.cols[i].typ
 			labels[i] = string(s.cols[i].name)
 		}
 		s.typ = types.MakeLabeledTuple(contents, labels)
@@ -184,7 +177,7 @@ func (s *subquery) TypeCheck(_ *tree.SemaContext, desired *types.T) (tree.TypedE
 		// subquery works with the current type checking code, but seems
 		// semantically incorrect. A tuple represents a fixed number of
 		// elements. Instead, we should introduce a new vtuple type.
-		s.typ = types.MakeTuple([]types.T{*s.typ})
+		s.typ = types.MakeTuple([]*types.T{s.typ})
 	}
 
 	return s, nil
@@ -217,7 +210,9 @@ func (s *subquery) buildSubquery(desiredTypes []*types.T) {
 	defer func() { s.scope.builder.subquery = outer }()
 	s.scope.builder.subquery = s
 
-	outScope := s.scope.builder.buildStmt(s.Subquery.Select, desiredTypes, s.scope)
+	// We must push() here so that the columns in s.scope are correctly identified
+	// as outer columns.
+	outScope := s.scope.builder.buildStmt(s.Subquery.Select, desiredTypes, s.scope.push())
 	ord := outScope.ordering
 
 	// Treat the subquery result as an anonymous data source (i.e. column names
@@ -278,10 +273,10 @@ func (b *Builder) buildSubqueryProjection(
 		// projection.
 		cols := make(tree.Exprs, len(s.cols))
 		els := make(memo.ScalarListExpr, len(s.cols))
-		contents := make([]types.T, len(s.cols))
+		contents := make([]*types.T, len(s.cols))
 		for i := range s.cols {
 			cols[i] = &s.cols[i]
-			contents[i] = *s.cols[i].ResolvedType()
+			contents[i] = s.cols[i].ResolvedType()
 			els[i] = b.factory.ConstructVariable(s.cols[i].id)
 		}
 		typ := types.MakeTuple(contents)

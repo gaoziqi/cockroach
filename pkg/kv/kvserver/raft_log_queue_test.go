@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/tracker"
@@ -353,6 +353,8 @@ func TestUpdateRaftStatusActivity(t *testing.T) {
 
 	now := timeutil.Now()
 
+	inactivityThreashold := time.Second
+
 	tcs := []testCase{
 		// No data, no crash.
 		{},
@@ -372,8 +374,8 @@ func TestUpdateRaftStatusActivity(t *testing.T) {
 			replicas: []roachpb.ReplicaDescriptor{{ReplicaID: 1}, {ReplicaID: 2}, {ReplicaID: 3}},
 			prs:      []tracker.Progress{{RecentActive: false}, {RecentActive: true}},
 			lastUpdate: map[roachpb.ReplicaID]time.Time{
-				1: now.Add(-1 * MaxQuotaReplicaLivenessDuration / 2),
-				2: now.Add(-1 - MaxQuotaReplicaLivenessDuration),
+				1: now.Add(-1 * inactivityThreashold / 2),
+				2: now.Add(-1 - inactivityThreashold),
 				3: now,
 			},
 			now: now,
@@ -394,7 +396,12 @@ func TestUpdateRaftStatusActivity(t *testing.T) {
 			for i, pr := range tc.exp {
 				expPRs[uint64(i+1)] = pr
 			}
-			updateRaftProgressFromActivity(ctx, prs, tc.replicas, tc.lastUpdate, tc.now)
+			updateRaftProgressFromActivity(ctx, prs, tc.replicas,
+				func(replicaID roachpb.ReplicaID) bool {
+					return tc.lastUpdate.isFollowerActiveSince(ctx, replicaID, tc.now, inactivityThreashold)
+				},
+			)
+
 			assert.Equal(t, expPRs, prs)
 		})
 	}
@@ -403,7 +410,7 @@ func TestUpdateRaftStatusActivity(t *testing.T) {
 func TestNewTruncateDecisionMaxSize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	cfg := TestStoreConfig(hlc.NewClock(hlc.NewManualClock(123).UnixNano, time.Nanosecond))
 	const exp = 1881
@@ -436,7 +443,7 @@ func TestNewTruncateDecision(t *testing.T) {
 	t.Skip("https://github.com/cockroachdb/cockroach/issues/38584")
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	store, _ := createTestStore(t,
 		testStoreOpts{
 			// This test was written before test stores could start with more than one
@@ -687,7 +694,7 @@ func TestTruncateLog(t *testing.T) {
 	cfg := TestStoreConfig(nil)
 	cfg.TestingKnobs.DisableRaftLogQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.StartWithStoreConfig(t, stopper, cfg)
 
 	// Populate the log with 10 entries. Save the LastIndex after each write.
@@ -737,7 +744,7 @@ func TestTruncateLog(t *testing.T) {
 	tc.repl.mu.Lock()
 	_, err = tc.repl.raftEntriesLocked(indexes[4], indexes[9], math.MaxUint64)
 	tc.repl.mu.Unlock()
-	if err != raft.ErrCompacted {
+	if !errors.Is(err, raft.ErrCompacted) {
 		t.Errorf("expected ErrCompacted, got %s", err)
 	}
 
@@ -756,7 +763,7 @@ func TestTruncateLog(t *testing.T) {
 	tc.repl.mu.Lock()
 	_, err = tc.repl.raftTermRLocked(indexes[3])
 	tc.repl.mu.Unlock()
-	if err != raft.ErrCompacted {
+	if !errors.Is(err, raft.ErrCompacted) {
 		t.Errorf("expected ErrCompacted, got %s", err)
 	}
 
@@ -853,7 +860,7 @@ func TestTruncateLogRecompute(t *testing.T) {
 	cfg := TestStoreConfig(nil)
 	cfg.TestingKnobs.DisableRaftLogQueue = true
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	tc.StartWithStoreConfig(t, stopper, cfg)
 
 	key := roachpb.Key("a")

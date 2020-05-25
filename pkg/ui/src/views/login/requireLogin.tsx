@@ -20,28 +20,28 @@ interface RequireLoginProps {
 }
 
 class RequireLogin extends React.Component<RouteComponentProps & RequireLoginProps> {
-  componentWillMount() {
+  componentDidMount() {
     this.checkLogin();
   }
 
-  componentWillReceiveProps() {
+  componentDidUpdate() {
     this.checkLogin();
   }
 
   checkLogin() {
     const { location, history } = this.props;
 
-    if (!this.hasAccess()) {
+    if (!this.hideLoginPage()) {
       history.push(getLoginPage(location));
     }
   }
 
-  hasAccess() {
-    return this.props.loginState.hasAccess();
+  hideLoginPage() {
+    return this.props.loginState.hideLoginPage();
   }
 
   render() {
-    if (!this.hasAccess()) {
+    if (!this.hideLoginPage()) {
       return null;
     }
 

@@ -1,5 +1,3 @@
-# LogicTest: local fakedist
-
 # ------------------------------------------------------------------------------
 # Create a simple schema that models customers and orders. Each customer has an
 # id (c_id), and has zero or more orders that are related via a foreign key of
@@ -384,6 +382,49 @@ SELECT *
 FROM c
 WHERE (SELECT o_id FROM o WHERE o.c_id=c.c_id AND ship='WY')=4;
 ----
+
+# Try to find customers other than customer #2 that have at most one order that
+# is shipping to 'CA'. However, since there is more than one order shipping to
+# 'CA' corresponding to customers other than #2, this attempt fails with an
+# error.
+query error more than one row returned by a subquery used as an expression
+SELECT * FROM c WHERE c_id=(SELECT c_id FROM o WHERE ship='CA' AND c.c_id<>2)
+
+# Find customers other than customer #1 that have at most one order that is
+# shipping to 'CA' and a billing state equal to 'TX'. Since there is only one
+# other customer who is shipping to 'CA', and this customer has only a single
+# order, this attempt is successful.
+query IT
+SELECT * FROM c WHERE c_id=(SELECT c_id FROM o WHERE ship='CA' AND c_id<>1 AND bill='TX')
+----
+2  TX
+
+# Find customers with billing state equal to 'FL' that have at most one order
+# that is shipping to 'WA'. Since there is only one order shipping to 'WA', this
+# attempt is successful.
+query IT
+SELECT * FROM c WHERE c_id=(SELECT c_id FROM o WHERE ship='WA' AND bill='FL')
+----
+6  FL
+
+# Try to find customers that have at most one order that is also shipping to
+# 'WA'. However, since there are customers that have more than one order, this
+# attempt fails with an error.
+query error more than one row returned by a subquery used as an expression
+SELECT * FROM c WHERE (SELECT ship FROM o WHERE o.c_id=c.c_id AND ship IS NOT NULL)='WA'
+
+# Add clause to filter out customers that have more than one order. Find
+# remaining customers with at least one order shipping to 'WA'.
+query IT
+SELECT *
+FROM c
+WHERE (
+  SELECT ship
+  FROM o
+  WHERE o.c_id=c.c_id AND ship IS NOT NULL AND (SELECT count(*) FROM o WHERE o.c_id=c.c_id)<=1
+)='WA'
+----
+6  FL
 
 # ------------------------------------------------------------------------------
 # Subqueries in projection lists.
@@ -1018,10 +1059,11 @@ SELECT
   jsonb_array_elements( (SELECT gg.data->'members' FROM groups gg WHERE gg.data->>'name' = g.data->>'name') )
 FROM
   groups g
+ORDER BY g.data->>'name'
 ----
-Group 1	{"name": "admin", "type": "USER"}
-Group 1	{"name": "user", "type": "USER"}
-Group 2	{"name": "admin2", "type": "USER"}
+Group 1  {"name": "admin", "type": "USER"}
+Group 1  {"name": "user", "type": "USER"}
+Group 2  {"name": "admin2", "type": "USER"}
 
 query TT
 SELECT
@@ -1039,6 +1081,7 @@ FROM
                 gg.data->>'name' = g.data->>'name'
         )
     ) AS members
+ORDER BY g.data->>'name'
 ----
 Group 1  {"name": "admin", "type": "USER"}
 Group 1  {"name": "user", "type": "USER"}
@@ -1215,3 +1258,42 @@ WHERE
 2  {CA}
 4  {WY}
 6  {WA}
+
+# Regression test for #48638.
+statement ok
+CREATE TABLE IF NOT EXISTS t_48638 (
+  key INTEGER NOT NULL,
+  value INTEGER NOT NULL,
+  PRIMARY KEY (key, value))
+
+statement ok
+INSERT INTO t_48638 values (1, 4);
+INSERT INTO t_48638 values (4, 3);
+INSERT INTO t_48638 values (3, 2);
+INSERT INTO t_48638 values (4, 1);
+INSERT INTO t_48638 values (1, 2);
+INSERT INTO t_48638 values (6, 5);
+INSERT INTO t_48638 values (7, 8);
+
+query II rowsort
+SELECT *
+FROM t_48638
+WHERE key IN (
+  WITH v AS (
+    SELECT
+      level1.value AS value, level1.key AS level1, level2.key AS level2, level3.key AS level3
+    FROM
+      t_48638 AS level2
+      RIGHT JOIN (SELECT * FROM t_48638 WHERE value = 4) AS level1 ON level1.value = level2.key
+      LEFT JOIN (SELECT * FROM t_48638) AS level3 ON level3.key = level2.value
+  )
+  SELECT v.level1 FROM v WHERE v.level1 IS NOT NULL
+  UNION ALL SELECT v.level2 FROM v WHERE v.level2 IS NOT NULL
+  UNION ALL SELECT v.level3 FROM v WHERE v.level3 IS NOT NULL
+)
+----
+1  2
+1  4
+3  2
+4  1
+4  3

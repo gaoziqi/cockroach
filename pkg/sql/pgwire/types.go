@@ -64,30 +64,6 @@ func pgTypeForParserType(t *types.T) pgType {
 	}
 }
 
-var resultOidMap = map[oid.Oid]oid.Oid{
-	oid.T_bit:      oid.T_varbit,
-	oid.T__bit:     oid.T__varbit,
-	oid.T_bpchar:   oid.T_text,
-	oid.T__bpchar:  oid.T__text,
-	oid.T_char:     oid.T_text,
-	oid.T__char:    oid.T__text,
-	oid.T_varchar:  oid.T_text,
-	oid.T__varchar: oid.T__text,
-}
-
-// mapResultOid maps an Oid value returned by the server to an Oid value that is
-// backwards-compatible with previous versions of CRDB. See this issue for more
-// details: https://github.com/cockroachdb/cockroach/issues/36811
-//
-// TODO(andyk): Remove this once issue #36811 is resolved.
-func mapResultOid(o oid.Oid) oid.Oid {
-	mapped := resultOidMap[o]
-	if mapped != 0 {
-		return mapped
-	}
-	return o
-}
-
 func (b *writeBuffer) writeTextDatum(
 	ctx context.Context, d tree.Datum, conv sessiondata.DataConversionConfig,
 ) {
@@ -161,6 +137,16 @@ func (b *writeBuffer) writeTextDatum(
 		b.putInt32(int32(len(s)))
 		b.write(s)
 
+	case *tree.DGeography:
+		s := v.Geography.EWKBHex()
+		b.putInt32(int32(len(s)))
+		b.write([]byte(s))
+
+	case *tree.DGeometry:
+		s := v.Geometry.EWKBHex()
+		b.putInt32(int32(len(s)))
+		b.write([]byte(s))
+
 	case *tree.DTimestamp:
 		// Start at offset 4 because `putInt32` clobbers the first 4 bytes.
 		s := formatTs(v.Time, nil, b.putbuf[4:4])
@@ -191,6 +177,10 @@ func (b *writeBuffer) writeTextDatum(
 
 	case *tree.DOid:
 		b.writeLengthPrefixedDatum(v)
+
+	case *tree.DEnum:
+		// Enums are serialized with their logical representation.
+		b.writeLengthPrefixedString(v.LogicalRep)
 
 	default:
 		b.setError(errors.Errorf("unsupported type %T", d))
@@ -404,6 +394,9 @@ func (b *writeBuffer) writeBinaryDatum(
 			b.setError(errors.Errorf("error encoding inet to pgBinary: %v", v.IPAddr))
 		}
 
+	case *tree.DEnum:
+		b.writeLengthPrefixedString(v.LogicalRep)
+
 	case *tree.DString:
 		b.writeLengthPrefixedString(string(*v))
 
@@ -448,6 +441,14 @@ func (b *writeBuffer) writeBinaryDatum(
 			subWriter.writeBinaryDatum(ctx, elem, sessionLoc, oid)
 		}
 		b.writeLengthPrefixedBuffer(&subWriter.wrapped)
+
+	case *tree.DGeography:
+		b.putInt32(int32(len(v.EWKB())))
+		b.write(v.EWKB())
+
+	case *tree.DGeometry:
+		b.putInt32(int32(len(v.EWKB())))
+		b.write(v.EWKB())
 
 	case *tree.DArray:
 		if v.ParamTyp.Family() == types.ArrayFamily {
@@ -499,12 +500,17 @@ const (
 	pgDateFormat              = "2006-01-02"
 	pgTimeStampFormatNoOffset = pgDateFormat + " " + pgTimeFormat
 	pgTimeStampFormat         = pgTimeStampFormatNoOffset + "-07:00"
+	pgTime2400Format          = "24:00:00"
 )
 
 // formatTime formats t into a format lib/pq understands, appending to the
 // provided tmp buffer and reallocating if needed. The function will then return
 // the resulting buffer.
 func formatTime(t timeofday.TimeOfDay, tmp []byte) []byte {
+	// time.Time's AppendFormat does not recognize 2400, so special case it accordingly.
+	if t == timeofday.Time2400 {
+		return []byte(pgTime2400Format)
+	}
 	return t.ToTime().AppendFormat(tmp, pgTimeFormat)
 }
 
@@ -514,7 +520,16 @@ func formatTime(t timeofday.TimeOfDay, tmp []byte) []byte {
 // Note it does not understand the "second" component of the offset as lib/pq
 // cannot parse it.
 func formatTimeTZ(t timetz.TimeTZ, tmp []byte) []byte {
-	return t.ToTime().AppendFormat(tmp, pgTimeTZFormat)
+	ret := t.ToTime().AppendFormat(tmp, pgTimeTZFormat)
+	// time.Time's AppendFormat does not recognize 2400, so special case it accordingly.
+	if t.TimeOfDay == timeofday.Time2400 {
+		// It instead reads 00:00:00. Replace that text.
+		var newRet []byte
+		newRet = append(newRet, pgTime2400Format...)
+		newRet = append(newRet, ret[len(pgTime2400Format):]...)
+		ret = newRet
+	}
+	return ret
 }
 
 func formatTs(t time.Time, offset *time.Location, tmp []byte) (b []byte) {

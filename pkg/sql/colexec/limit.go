@@ -14,12 +14,14 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 )
 
 // limitOp is an operator that implements limit, returning only the first n
 // tuples from its input.
 type limitOp struct {
 	OneInputNode
+	closerHelper
 
 	limit int
 
@@ -29,11 +31,11 @@ type limitOp struct {
 	done bool
 }
 
-var _ Operator = &limitOp{}
+var _ colexecbase.Operator = &limitOp{}
 var _ closableOperator = &limitOp{}
 
 // NewLimitOp returns a new limit operator with the given limit.
-func NewLimitOp(input Operator, limit int) Operator {
+func NewLimitOp(input colexecbase.Operator, limit int) colexecbase.Operator {
 	c := &limitOp{
 		OneInputNode: NewOneInputNode(input),
 		limit:        limit,
@@ -64,17 +66,17 @@ func (c *limitOp) Next(ctx context.Context) coldata.Batch {
 	return bat
 }
 
-// Close is a temporary method to support the specific case in which an upstream
-// operator must be Closed (e.g. an external sorter) to assert a certain state
-// during tests.
-// TODO(asubiotto): This method only exists because an external sorter is
-//  wrapped with a limit op when doing a top K sort and some tests that don't
-//  exhaust the sorter (e.g. allNullsInjection) need to close the operator
-//  explicitly. This should be removed once we have a better way of closing
-//  operators even when they are not exhausted.
-func (c *limitOp) Close(ctx context.Context) error {
-	if c, ok := c.input.(closer); ok {
-		return c.Close(ctx)
+// Close closes the limitOp's input.
+// TODO(asubiotto): Remove this method. It only exists so that we can call Close
+//  from some runTests subtests when not draining the input fully. The test
+//  should pass in the testing.T object used so that the caller can decide to
+//  explicitly close the input after checking the test.
+func (c *limitOp) IdempotentClose(ctx context.Context) error {
+	if !c.close() {
+		return nil
+	}
+	if closer, ok := c.input.(IdempotentCloser); ok {
+		return closer.IdempotentClose(ctx)
 	}
 	return nil
 }

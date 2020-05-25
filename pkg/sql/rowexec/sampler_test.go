@@ -35,13 +35,13 @@ func runSampler(
 		rows[i] = sqlbase.EncDatumRow{sqlbase.IntEncDatum(i)}
 	}
 	in := distsqlutils.NewRowBuffer(sqlbase.OneIntCol, rows, distsqlutils.RowBufferArgs{})
-	outTypes := []types.T{
-		*types.Int, // original column
-		*types.Int, // rank
-		*types.Int, // sketch index
-		*types.Int, // num rows
-		*types.Int, // null vals
-		*types.Bytes,
+	outTypes := []*types.T{
+		types.Int, // original column
+		types.Int, // rank
+		types.Int, // sketch index
+		types.Int, // num rows
+		types.Int, // null vals
+		types.Bytes,
 	}
 
 	out := distsqlutils.NewRowBuffer(outTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
@@ -189,20 +189,23 @@ func TestSamplerSketch(t *testing.T) {
 		{-1, 1},
 		{-1, 3},
 		{1, -1},
+		{2, 8},
+		{-1, 1},
+		{-1, -1},
 	}
-	cardinalities := []int{3, 9}
-	numNulls := []int{2, 1}
+	cardinalities := []int{3, 9, 12}
+	numNulls := []int{4, 2, 1}
 
 	rows := sqlbase.GenEncDatumRowsInt(inputRows)
 	in := distsqlutils.NewRowBuffer(sqlbase.TwoIntCols, rows, distsqlutils.RowBufferArgs{})
-	outTypes := []types.T{
-		*types.Int,   // original column
-		*types.Int,   // original column
-		*types.Int,   // rank
-		*types.Int,   // sketch index
-		*types.Int,   // num rows
-		*types.Int,   // null vals
-		*types.Bytes, // sketch data
+	outTypes := []*types.T{
+		types.Int,   // original column
+		types.Int,   // original column
+		types.Int,   // rank
+		types.Int,   // sketch index
+		types.Int,   // num rows
+		types.Int,   // null vals
+		types.Bytes, // sketch data
 	}
 
 	out := distsqlutils.NewRowBuffer(outTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
@@ -225,6 +228,10 @@ func TestSamplerSketch(t *testing.T) {
 			{
 				SketchType: execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
 				Columns:    []uint32{1},
+			},
+			{
+				SketchType: execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
+				Columns:    []uint32{0, 1},
 			},
 		},
 	}
@@ -249,9 +256,9 @@ func TestSamplerSketch(t *testing.T) {
 		rows = append(rows, row)
 	}
 
-	// We expect one sampled row and two sketch rows.
-	if len(rows) != 3 {
-		t.Fatalf("expected 3 rows, got %v\n", rows.String(outTypes))
+	// We expect one sampled row and three sketch rows.
+	if len(rows) != 4 {
+		t.Fatalf("expected 4 rows, got %v\n", rows.String(outTypes))
 	}
 	rows = rows[1:]
 

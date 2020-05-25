@@ -20,7 +20,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/version"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Owner is a valid entry for the Owners field of a roachtest. They should be
@@ -54,12 +54,14 @@ var roachtestOwners = map[Owner]OwnerMetadata{
 	OwnerCDC:          {SlackRoom: `cdc`, ContactEmail: `ajwerner@cockroachlabs.com`},
 	OwnerKV:           {SlackRoom: `kv`, ContactEmail: `andrei@cockroachlabs.com`},
 	OwnerPartitioning: {SlackRoom: `partitioning`, ContactEmail: `andrei@cockroachlabs.com`},
-	OwnerSQLExec:      {SlackRoom: `sql-execution-team`, ContactEmail: `jordan@cockroachlabs.com`},
+	OwnerSQLExec:      {SlackRoom: `sql-execution-team`, ContactEmail: `alfonso@cockroachlabs.com`},
 	OwnerSQLSchema:    {SlackRoom: `sql-schema`, ContactEmail: `lucy@cockroachlabs.com`},
 	OwnerStorage:      {SlackRoom: `storage`, ContactEmail: `peter@cockroachlabs.com`},
 	// Only for use in roachtest package unittests.
 	`unittest`: {},
 }
+
+const defaultTag = "default"
 
 type testRegistry struct {
 	m map[string]*testSpec
@@ -133,6 +135,10 @@ func (r *testRegistry) prepareSpec(spec *testSpec) error {
 	if _, ok := roachtestOwners[spec.Owner]; !ok {
 		return fmt.Errorf(`%s: unknown owner [%s]`, spec.Name, spec.Owner)
 	}
+	if len(spec.Tags) == 0 {
+		spec.Tags = []string{defaultTag}
+	}
+	spec.Tags = append(spec.Tags, "owner-"+string(spec.Owner))
 
 	return nil
 }
@@ -211,8 +217,8 @@ func newFilter(filter []string) *testFilter {
 	}
 
 	if len(tag) == 0 {
-		tag = []string{"default"}
-		rawTag = []string{"tag:default"}
+		tag = []string{defaultTag}
+		rawTag = []string{"tag:" + defaultTag}
 	}
 
 	makeRE := func(strs []string) *regexp.Regexp {

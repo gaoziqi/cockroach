@@ -16,21 +16,22 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 // WaitForJob waits for the specified job ID to terminate.
@@ -102,8 +103,8 @@ func RunJob(
 // BulkOpResponseFilter creates a blocking response filter for the responses
 // related to bulk IO/backup/restore/import: Export, Import and AddSSTable. See
 // discussion on RunJob for where this might be useful.
-func BulkOpResponseFilter(allowProgressIota *chan struct{}) storagebase.ReplicaResponseFilter {
-	return func(ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+func BulkOpResponseFilter(allowProgressIota *chan struct{}) kvserverbase.ReplicaResponseFilter {
+	return func(_ context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
 		for _, ru := range br.Responses {
 			switch ru.GetInner().(type) {
 			case *roachpb.ExportResponse, *roachpb.ImportResponse, *roachpb.AddSSTableResponse:
@@ -158,7 +159,7 @@ func verifySystemJob(
 	if expectedStatus != statusString {
 		return errors.Errorf("job %d: expected status %v, got %v", offset, expectedStatus, statusString)
 	}
-	if expectedRunningStatus != runningStatusString {
+	if expectedRunningStatus != "" && expectedRunningStatus != runningStatusString {
 		return errors.Errorf("job %d: expected running status %v, got %v",
 			offset, expectedRunningStatus, runningStatusString)
 	}
@@ -189,6 +190,34 @@ func VerifySystemJob(
 	expected jobs.Record,
 ) error {
 	return verifySystemJob(t, db, offset, filterType, string(expectedStatus), "", expected)
+}
+
+// GetJobFormatVersion returns the format version of a schema change job.
+// Will fail the test if the jobID does not reference a schema change job.
+func GetJobFormatVersion(
+	t testing.TB, db *sqlutils.SQLRunner,
+) jobspb.SchemaChangeDetailsFormatVersion {
+	rows := db.QueryStr(t, "SELECT * FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE' AND description <> 'updating privileges' ORDER BY created DESC LIMIT 1")
+	if len(rows) != 1 {
+		t.Fatal("expected exactly one row when checking the format version")
+	}
+	jobID, err := strconv.Atoi(rows[0][0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payloadBytes []byte
+	db.QueryRow(t, `SELECT payload FROM system.jobs WHERE id = $1`, jobID).Scan(&payloadBytes)
+
+	payload := &jobspb.Payload{}
+	if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
+		t.Fatal(err)
+	}
+	// Lease is always nil in 19.2.
+	payload.Lease = nil
+
+	details := payload.GetSchemaChange()
+	return details.FormatVersion
 }
 
 // GetJobID gets a particular job's ID.

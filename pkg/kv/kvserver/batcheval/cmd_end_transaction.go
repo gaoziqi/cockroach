@@ -21,12 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -70,7 +69,12 @@ func declareKeysEndTxn(
 		header.Txn.AssertInitialized(context.TODO())
 		minTxnTS = header.Txn.MinTimestamp
 		abortSpanAccess := spanset.SpanReadOnly
-		if !et.Commit && et.Poison {
+		if !et.Commit {
+			// Rollback EndTxn requests may write to the abort span, either if
+			// their Poison flag is set, in which case they will add an abort
+			// span entry, or if their Poison flag is not set and an abort span
+			// entry already exists on this Range, in which case they will clear
+			// that entry.
 			abortSpanAccess = spanset.SpanReadWrite
 		}
 		latchSpans.AddNonMVCC(abortSpanAccess, roachpb.Span{
@@ -223,6 +227,12 @@ func EndTxn(
 		// not suffered regression.
 		switch reply.Txn.Status {
 		case roachpb.COMMITTED:
+			// This can happen if the coordinator had left the transaction in the
+			// implicitly committed state, and is now coming to clean it up. Someone
+			// else must have performed the STAGING->COMMITTED transition in the
+			// meantime. The TransactionStatusError is going to be handled by the
+			// txnCommitter interceptor.
+			log.VEventf(ctx, 2, "transaction found to be already committed")
 			return result.Result{}, roachpb.NewTransactionCommittedStatusError()
 
 		case roachpb.ABORTED:
@@ -272,18 +282,11 @@ func EndTxn(
 		reply.Txn.Update(h.Txn)
 	}
 
-	var pd result.Result
-
 	// Attempt to commit or abort the transaction per the args.Commit parameter.
 	if args.Commit {
 		if retry, reason, extraMsg := IsEndTxnTriggeringRetryError(reply.Txn, args); retry {
 			return result.Result{}, roachpb.NewTransactionRetryError(reason, extraMsg)
 		}
-		// Update the read timestamp in case we've essentially refreshed. This
-		// update is important because reply.Txn.ReadTimestamp will make its way
-		// into BatchResponse.Timestamp, which is used to update the timestamp
-		// cache.
-		reply.Txn.ReadTimestamp = reply.Txn.WriteTimestamp
 
 		// If the transaction needs to be staged as part of an implicit commit
 		// before being explicitly committed, write the staged transaction
@@ -308,27 +311,6 @@ func EndTxn(
 
 		// Else, the transaction can be explicitly committed.
 		reply.Txn.Status = roachpb.COMMITTED
-
-		// Merge triggers must run before lock resolution as the merge trigger
-		// itself contains intents, in the RightData snapshot, that will be owned
-		// and thus resolved by the new range.
-		//
-		// While it might seem cleaner to simply rely on asynchronous lock
-		// resolution here, these locks must be resolved synchronously. We
-		// maintain the invariant that there are no locks on local range
-		// descriptors that belong to committed transactions. This allows nodes,
-		// during startup, to infer that any lingering intents belong to in-progress
-		// transactions and thus the pre-intent value can safely be used.
-		if mt := args.InternalCommitTrigger.GetMergeTrigger(); mt != nil {
-			mergeResult, err := mergeTrigger(ctx, cArgs.EvalCtx, readWriter.(storage.Batch),
-				ms, mt, reply.Txn.WriteTimestamp)
-			if err != nil {
-				return result.Result{}, err
-			}
-			if err := pd.MergeAndDestroy(mergeResult); err != nil {
-				return result.Result{}, err
-			}
-		}
 	} else {
 		reply.Txn.Status = roachpb.ABORTED
 	}
@@ -345,18 +327,6 @@ func EndTxn(
 	}
 	if err := updateFinalizedTxn(ctx, readWriter, ms, key, args, reply.Txn, externalLocks); err != nil {
 		return result.Result{}, err
-	}
-
-	// Run the rest of the commit triggers if successfully committed.
-	if reply.Txn.Status == roachpb.COMMITTED {
-		triggerResult, err := RunCommitTrigger(ctx, cArgs.EvalCtx, readWriter.(storage.Batch),
-			ms, args, reply.Txn)
-		if err != nil {
-			return result.Result{}, roachpb.NewReplicaCorruptionError(err)
-		}
-		if err := pd.MergeAndDestroy(triggerResult); err != nil {
-			return result.Result{}, err
-		}
 	}
 
 	// Note: there's no need to clear the AbortSpan state if we've successfully
@@ -384,10 +354,29 @@ func EndTxn(
 	txnResult := result.FromEndTxn(reply.Txn, false /* alwaysReturn */, args.Poison)
 	txnResult.Local.UpdatedTxns = []*roachpb.Transaction{reply.Txn}
 	txnResult.Local.ResolvedLocks = resolvedLocks
-	if err := pd.MergeAndDestroy(txnResult); err != nil {
-		return result.Result{}, err
+
+	// Run the rest of the commit triggers if successfully committed.
+	if reply.Txn.Status == roachpb.COMMITTED {
+		triggerResult, err := RunCommitTrigger(
+			ctx, cArgs.EvalCtx, readWriter.(storage.Batch), ms, args, reply.Txn,
+		)
+		if err != nil {
+			return result.Result{}, roachpb.NewReplicaCorruptionError(err)
+		}
+		if err := txnResult.MergeAndDestroy(triggerResult); err != nil {
+			return result.Result{}, err
+		}
+	} else if reply.Txn.Status == roachpb.ABORTED {
+		// If this is the system config span and we're aborted, add a trigger to
+		// potentially gossip now that we've removed an intent. This is important
+		// to deal with cases where previously committed values were not gossipped
+		// due to an outstanding intent.
+		if cArgs.EvalCtx.ContainsKey(keys.SystemConfigSpan.Key) {
+			txnResult.Local.MaybeGossipSystemConfigIfHaveFailure = true
+		}
 	}
-	return pd, nil
+
+	return txnResult, nil
 }
 
 // IsEndTxnExceedingDeadline returns true if the transaction exceeded its
@@ -487,11 +476,11 @@ func resolveLocalLocks(
 				externalLocks = append(externalLocks, span)
 				return nil
 			}
-			update := roachpb.MakeLockUpdateWithDur(txn, span, lock.Replicated)
+			update := roachpb.MakeLockUpdate(txn, span)
 			if len(span.EndKey) == 0 {
 				// For single-key lock updates, do a KeyAddress-aware check of
 				// whether it's contained in our Range.
-				if !storagebase.ContainsKey(desc, span.Key) {
+				if !kvserverbase.ContainsKey(desc, span.Key) {
 					externalLocks = append(externalLocks, span)
 					return nil
 				}
@@ -509,7 +498,7 @@ func resolveLocalLocks(
 			// For update ranges, cut into parts inside and outside our key
 			// range. Resolve locally inside, delegate the rest. In particular,
 			// an update range for range-local data is correctly considered local.
-			inSpan, outSpans := storagebase.IntersectSpan(span, desc)
+			inSpan, outSpans := kvserverbase.IntersectSpan(span, desc)
 			externalLocks = append(externalLocks, outSpans...)
 			if inSpan != nil {
 				update.Span = *inSpan
@@ -610,6 +599,9 @@ func RunCommitTrigger(
 		*ms = newMS
 		return trigger, err
 	}
+	if mt := ct.GetMergeTrigger(); mt != nil {
+		return mergeTrigger(ctx, rec, batch, ms, mt, txn.WriteTimestamp)
+	}
 	if crt := ct.GetChangeReplicasTrigger(); crt != nil {
 		// TODO(tbg): once we support atomic replication changes, check that
 		// crt.Added() and crt.Removed() don't intersect (including mentioning
@@ -657,10 +649,6 @@ func RunCommitTrigger(
 		}
 		return pd, nil
 	}
-	if ct.GetMergeTrigger() != nil {
-		// Merge triggers were handled earlier, before lock resolution.
-		return result.Result{}, nil
-	}
 	if sbt := ct.GetStickyBitTrigger(); sbt != nil {
 		newDesc := *rec.Desc()
 		if sbt.StickyBit != (hlc.Timestamp{}) {
@@ -669,7 +657,7 @@ func RunCommitTrigger(
 			newDesc.StickyBit = nil
 		}
 		var res result.Result
-		res.Replicated.State = &storagepb.ReplicaState{
+		res.Replicated.State = &kvserverpb.ReplicaState{
 			Desc: &newDesc,
 		}
 		return res, nil
@@ -1037,7 +1025,7 @@ func splitTriggerHelper(
 	}
 
 	var pd result.Result
-	pd.Replicated.Split = &storagepb.Split{
+	pd.Replicated.Split = &kvserverpb.Split{
 		SplitTrigger: *split,
 		// NB: the RHSDelta is identical to the stats for the newly created right
 		// hand side range (i.e. it goes from zero to its stats).
@@ -1095,7 +1083,7 @@ func mergeTrigger(
 	}
 
 	var pd result.Result
-	pd.Replicated.Merge = &storagepb.Merge{
+	pd.Replicated.Merge = &kvserverpb.Merge{
 		MergeTrigger: *merge,
 	}
 	return pd, nil
@@ -1133,10 +1121,10 @@ func changeReplicasTrigger(
 		desc.NextReplicaID = change.DeprecatedNextReplicaID
 	}
 
-	pd.Replicated.State = &storagepb.ReplicaState{
+	pd.Replicated.State = &kvserverpb.ReplicaState{
 		Desc: &desc,
 	}
-	pd.Replicated.ChangeReplicas = &storagepb.ChangeReplicas{
+	pd.Replicated.ChangeReplicas = &kvserverpb.ChangeReplicas{
 		ChangeReplicasTrigger: *change,
 	}
 

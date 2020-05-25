@@ -42,7 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	// register some workloads for TestWorkload
 	_ "github.com/cockroachdb/cockroach/pkg/workload/examples"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -142,8 +142,8 @@ func newCLITest(params cliTestParams) cliTest {
 		}
 		c.TestServer = s.(*server.TestServer)
 
-		log.Infof(context.TODO(), "server started at %s", c.ServingRPCAddr())
-		log.Infof(context.TODO(), "SQL listener at %s", c.ServingSQLAddr())
+		log.Infof(context.Background(), "server started at %s", c.ServingRPCAddr())
+		log.Infof(context.Background(), "SQL listener at %s", c.ServingSQLAddr())
 	}
 
 	baseCfg.User = security.NodeUser
@@ -171,7 +171,7 @@ func setCLIDefaultsForTests() {
 // stopServer stops the test server.
 func (c *cliTest) stopServer() {
 	if c.TestServer != nil {
-		log.Infof(context.TODO(), "stopping server at %s / %s",
+		log.Infof(context.Background(), "stopping server at %s / %s",
 			c.ServingRPCAddr(), c.ServingSQLAddr())
 		select {
 		case <-c.Stopper().ShouldStop():
@@ -179,7 +179,7 @@ func (c *cliTest) stopServer() {
 			// called Stop(). We just need to wait.
 			<-c.Stopper().IsStopped()
 		default:
-			c.Stopper().Stop(context.TODO())
+			c.Stopper().Stop(context.Background())
 		}
 	}
 }
@@ -188,7 +188,7 @@ func (c *cliTest) stopServer() {
 // have changed after this method returns.
 func (c *cliTest) restartServer(params cliTestParams) {
 	c.stopServer()
-	log.Info(context.TODO(), "restarting server")
+	log.Info(context.Background(), "restarting server")
 	s, err := serverutils.StartServerRaw(base.TestServerArgs{
 		Insecure:    params.insecure,
 		SSLCertsDir: c.certsDir,
@@ -198,7 +198,7 @@ func (c *cliTest) restartServer(params cliTestParams) {
 		c.fail(err)
 	}
 	c.TestServer = s.(*server.TestServer)
-	log.Infof(context.TODO(), "restarted server at %s / %s",
+	log.Infof(context.Background(), "restarted server at %s / %s",
 		c.ServingRPCAddr(), c.ServingSQLAddr())
 }
 
@@ -212,7 +212,7 @@ func (c *cliTest) cleanup() {
 	// Restore stderr.
 	stderr = log.OrigStderr
 
-	log.Info(context.TODO(), "stopping server and cleaning up CLI test")
+	log.Info(context.Background(), "stopping server and cleaning up CLI test")
 
 	c.stopServer()
 
@@ -413,10 +413,10 @@ func Example_demo() {
 		{`demo`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`},
 		{`demo`, `startrek`, `-e`, `show databases`},
 		{`demo`, `startrek`, `-e`, `show databases`, `--format=table`},
-		// Test that if we start with --insecure=false we can perform
+		// Test that if we start with --insecure we cannot perform
 		// commands that require a secure cluster.
-		{`demo`, `--insecure=false`, `-e`, `CREATE USER test WITH PASSWORD 'testpass'`},
 		{`demo`, `-e`, `CREATE USER test WITH PASSWORD 'testpass'`},
+		{`demo`, `--insecure`, `-e`, `CREATE USER test WITH PASSWORD 'testpass'`},
 		{`demo`, `--geo-partitioned-replicas`, `--disable-demo-license`},
 	}
 	setCLIDefaultsForTests()
@@ -471,9 +471,9 @@ func Example_demo() {
 	//   startrek
 	//   system
 	// (4 rows)
-	// demo --insecure=false -e CREATE USER test WITH PASSWORD 'testpass'
-	// CREATE ROLE 1
 	// demo -e CREATE USER test WITH PASSWORD 'testpass'
+	// CREATE ROLE
+	// demo --insecure -e CREATE USER test WITH PASSWORD 'testpass'
 	// ERROR: setting or updating a password is not supported in insecure mode
 	// SQLSTATE: 28P01
 	// demo --geo-partitioned-replicas --disable-demo-license
@@ -1351,7 +1351,7 @@ func Example_misc_table() {
 	//   render    |             |
 	//    └── scan |             |
 	//             | table       | t@primary
-	//             | spans       | ALL
+	//             | spans       | FULL SCAN
 	// (6 rows)
 }
 
@@ -1387,11 +1387,11 @@ Available Commands:
   start-single-node start a single-node cluster
   init              initialize a cluster
   cert              create ca, node, and client certs
-  quit              drain and shutdown node
+  quit              drain and shut down a node
 
   sql               open a sql shell
   auth-session      log in and out of HTTP sessions
-  node              list, inspect or remove nodes
+  node              list, inspect, drain or remove nodes
   dump              dump sql tables
 
   nodelocal         upload and delete nodelocal files
@@ -2024,11 +2024,6 @@ func Example_dump_no_visible_columns() {
 	// sql -e create table t(x int); set sql_safe_updates=false; alter table t drop x
 	// ALTER TABLE
 	// dump defaultdb
-	// CREATE TABLE t (,
-	// 	FAMILY "primary" (rowid)
+	// CREATE TABLE t (FAMILY "primary" (rowid)
 	// );
-	// ERROR: table "defaultdb.public.t" has no visible columns
-	// HINT: To proceed with the dump, either omit this table from the list of tables to dump, drop the table, or add some visible columns.
-	// --
-	// See: https://github.com/cockroachdb/cockroach/issues/37768
 }

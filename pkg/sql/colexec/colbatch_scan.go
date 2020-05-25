@@ -14,14 +14,17 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // TODO(yuzefovich): reading the data through a pair of colBatchScan and
@@ -35,7 +38,7 @@ import (
 // colBatchScan is the exec.Operator implementation of TableReader. It reads a table
 // from kv, presenting it as coldata.Batches via the exec.Operator interface.
 type colBatchScan struct {
-	ZeroInputNode
+	colexecbase.ZeroInputNode
 	spans     roachpb.Spans
 	flowCtx   *execinfra.FlowCtx
 	rf        *cFetcher
@@ -48,7 +51,7 @@ type colBatchScan struct {
 	init bool
 }
 
-var _ Operator = &colBatchScan{}
+var _ colexecbase.Operator = &colBatchScan{}
 
 func (s *colBatchScan) Init() {
 	s.ctx = context.Background()
@@ -60,17 +63,17 @@ func (s *colBatchScan) Init() {
 		s.ctx, s.flowCtx.Txn, s.spans,
 		limitBatches, s.limitHint, s.flowCtx.TraceKV,
 	); err != nil {
-		execerror.VectorizedInternalPanic(err)
+		colexecerror.InternalError(err)
 	}
 }
 
 func (s *colBatchScan) Next(ctx context.Context) coldata.Batch {
 	bat, err := s.rf.NextBatch(ctx)
 	if err != nil {
-		execerror.VectorizedInternalPanic(err)
+		colexecerror.InternalError(err)
 	}
 	if bat.Selection() != nil {
-		execerror.VectorizedInternalPanic("unexpectedly a selection vector is set on the batch coming from CFetcher")
+		colexecerror.InternalError("unexpectedly a selection vector is set on the batch coming from CFetcher")
 	}
 	return bat
 }
@@ -85,9 +88,12 @@ func (s *colBatchScan) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 	}
 	var trailingMeta []execinfrapb.ProducerMetadata
 	if !s.flowCtx.Local {
-		ranges := execinfra.MisplannedRanges(ctx, s.rf.GetRangesInfo(), s.flowCtx.NodeID)
-		if ranges != nil {
-			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
+		nodeID, ok := s.flowCtx.NodeID.OptionalNodeID()
+		if ok {
+			ranges := execinfra.MisplannedRanges(ctx, s.rf.GetRangesInfo(), nodeID)
+			if ranges != nil {
+				trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
+			}
 		}
 	}
 	if tfs := execinfra.GetLeafTxnFinalState(ctx, s.flowCtx.Txn); tfs != nil {
@@ -98,12 +104,13 @@ func (s *colBatchScan) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 
 // newColBatchScan creates a new colBatchScan operator.
 func newColBatchScan(
-	allocator *Allocator,
+	allocator *colmem.Allocator,
 	flowCtx *execinfra.FlowCtx,
 	spec *execinfrapb.TableReaderSpec,
 	post *execinfrapb.PostProcessSpec,
 ) (*colBatchScan, error) {
-	if flowCtx.NodeID == 0 {
+	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
+	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
 		return nil, errors.Errorf("attempting to create a colBatchScan with uninitialized NodeID")
 	}
 
@@ -111,12 +118,20 @@ func newColBatchScan(
 
 	returnMutations := spec.Visibility == execinfrapb.ScanVisibility_PUBLIC_AND_NOT_PUBLIC
 	typs := spec.Table.ColumnTypesWithMutations(returnMutations)
+	evalCtx := flowCtx.NewEvalCtx()
+	// Before we can safely use types from the table descriptor, we need to
+	// make sure they are hydrated. In row execution engine it is done during
+	// the processor initialization, but neither colBatchScan nor cFetcher are
+	// processors, so we need to do the hydration ourselves.
+	if err := execinfrapb.HydrateTypeSlice(evalCtx, typs); err != nil {
+		return nil, err
+	}
 	helper := execinfra.ProcOutputHelper{}
 	if err := helper.Init(
 		post,
 		typs,
-		flowCtx.NewEvalCtx(),
-		nil,
+		evalCtx,
+		nil, /* output */
 	); err != nil {
 		return nil, err
 	}
@@ -126,8 +141,8 @@ func newColBatchScan(
 	columnIdxMap := spec.Table.ColumnIdxMapWithMutations(returnMutations)
 	fetcher := cFetcher{}
 	if _, _, err := initCRowFetcher(
-		allocator, &fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap, spec.Reverse,
-		neededColumns, spec.IsCheck, spec.Visibility, spec.LockingStrength,
+		flowCtx.Codec(), allocator, &fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap,
+		spec.Reverse, neededColumns, spec.IsCheck, spec.Visibility, spec.LockingStrength,
 	); err != nil {
 		return nil, err
 	}
@@ -148,7 +163,8 @@ func newColBatchScan(
 
 // initCRowFetcher initializes a row.cFetcher. See initRowFetcher.
 func initCRowFetcher(
-	allocator *Allocator,
+	codec keys.SQLCodec,
+	allocator *colmem.Allocator,
 	fetcher *cFetcher,
 	desc *sqlbase.TableDescriptor,
 	indexIdx int,
@@ -178,7 +194,7 @@ func initCRowFetcher(
 		ValNeededForCol:  valNeededForCol,
 	}
 	if err := fetcher.Init(
-		allocator, reverseScan, lockStr, true /* returnRangeInfo */, isCheck, tableArgs,
+		codec, allocator, reverseScan, lockStr, true /* returnRangeInfo */, isCheck, tableArgs,
 	); err != nil {
 		return nil, false, err
 	}

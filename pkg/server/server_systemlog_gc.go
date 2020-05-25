@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -92,7 +92,7 @@ func (s *Server) gcSystemLog(
 		var rowsAffected int64
 		err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			var err error
-			row, err := s.internalExecutor.QueryRowEx(
+			row, err := s.sqlServer.internalExecutor.QueryRowEx(
 				ctx,
 				table+"-gc",
 				txn,

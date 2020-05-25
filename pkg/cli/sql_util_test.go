@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/errors"
 )
 
 func TestConnRecover(t *testing.T) {
@@ -54,7 +55,7 @@ func TestConnRecover(t *testing.T) {
 	// and starts delivering ErrBadConn. We don't know the timing of
 	// this however.
 	testutils.SucceedsSoon(t, func() error {
-		if sqlRows, err := conn.Query(`SELECT 1`, nil); err != driver.ErrBadConn {
+		if sqlRows, err := conn.Query(`SELECT 1`, nil); !errors.Is(err, driver.ErrBadConn) {
 			return fmt.Errorf("expected ErrBadConn, got %v", err)
 		} else if err == nil {
 			if closeErr := sqlRows.Close(); closeErr != nil {
@@ -78,7 +79,7 @@ func TestConnRecover(t *testing.T) {
 
 	// Ditto from Query().
 	testutils.SucceedsSoon(t, func() error {
-		if err := conn.Exec(`SELECT 1`, nil); err != driver.ErrBadConn {
+		if err := conn.Exec(`SELECT 1`, nil); !errors.Is(err, driver.ErrBadConn) {
 			return fmt.Errorf("expected ErrBadConn, got %v", err)
 		}
 		return nil
@@ -150,7 +151,6 @@ SET
 
 	expectedRows := [][]string{
 		{`parentID`, `INT8`, `false`, `NULL`, ``, `{primary}`, `false`},
-		{`parentSchemaID`, `INT8`, `false`, `NULL`, ``, `{primary}`, `false`},
 		{`name`, `STRING`, `false`, `NULL`, ``, `{primary}`, `false`},
 		{`id`, `INT8`, `true`, `NULL`, ``, `{}`, `false`},
 	}
@@ -164,13 +164,12 @@ SET
 	}
 
 	expected = `
-   column_name   | data_type | is_nullable | column_default | generation_expression |  indices  | is_hidden
------------------+-----------+-------------+----------------+-----------------------+-----------+------------
-  parentID       | INT8      |    false    | NULL           |                       | {primary} |   false
-  parentSchemaID | INT8      |    false    | NULL           |                       | {primary} |   false
-  name           | STRING    |    false    | NULL           |                       | {primary} |   false
-  id             | INT8      |    true     | NULL           |                       | {}        |   false
-(4 rows)
+  column_name | data_type | is_nullable | column_default | generation_expression |  indices  | is_hidden
+--------------+-----------+-------------+----------------+-----------------------+-----------+------------
+  parentID    | INT8      |    false    | NULL           |                       | {primary} |   false
+  name        | STRING    |    false    | NULL           |                       | {primary} |   false
+  id          | INT8      |    true     | NULL           |                       | {}        |   false
+(3 rows)
 `
 
 	if a, e := b.String(), expected[1:]; a != e {

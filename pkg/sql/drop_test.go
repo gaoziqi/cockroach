@@ -15,6 +15,7 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math/rand"
+	"regexp"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -30,15 +32,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
+	"github.com/opentracing/opentracing-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -88,44 +96,12 @@ func descExists(sqlDB *gosql.DB, exists bool, id sqlbase.ID) error {
 	return nil
 }
 
-// Set the GC TTL to 0 for the given table ID. One must make sure to disable
-// strict GC TTL enforcement when using this.
-func addImmediateGCZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (zonepb.ZoneConfig, error) {
-	cfg := zonepb.DefaultZoneConfig()
-	cfg.GC.TTLSeconds = 0
-	buf, err := protoutil.Marshal(&cfg)
-	if err != nil {
-		return cfg, err
-	}
-	_, err = sqlDB.Exec(`UPSERT INTO system.zones VALUES ($1, $2)`, id, buf)
-	return cfg, err
-}
-
-func disableGCTTLStrictEnforcement(t *testing.T, db *gosql.DB) (cleanup func()) {
-	_, err := db.Exec(`SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = false`)
-	require.NoError(t, err)
-	return func() {
-		_, err := db.Exec(`SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = DEFAULT`)
-		require.NoError(t, err)
-	}
-}
-
-func addDefaultZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (zonepb.ZoneConfig, error) {
-	cfg := zonepb.DefaultZoneConfig()
-	buf, err := protoutil.Marshal(&cfg)
-	if err != nil {
-		return cfg, err
-	}
-	_, err = sqlDB.Exec(`UPSERT INTO system.zones VALUES ($1, $2)`, id, buf)
-	return cfg, err
-}
-
 func TestDropDatabase(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
 	// Fix the column families so the key counts below don't change if the
 	// family heuristics are updated.
@@ -137,7 +113,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 		t.Fatal(err)
 	}
 
-	dbNameKey := sqlbase.NewDatabaseKey("t").Key()
+	dbNameKey := sqlbase.NewDatabaseKey("t").Key(keys.SystemSQLCodec)
 	r, err := kvDB.Get(ctx, dbNameKey)
 	if err != nil {
 		t.Fatal(err)
@@ -145,14 +121,14 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	if !r.Exists() {
 		t.Fatalf(`database "t" does not exist`)
 	}
-	dbDescKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(r.ValueInt()))
+	dbDescKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(r.ValueInt()))
 	desc := &sqlbase.Descriptor{}
 	if err := kvDB.GetProto(ctx, dbDescKey, desc); err != nil {
 		t.Fatal(err)
 	}
 	dbDesc := desc.GetDatabase()
 
-	tbNameKey := sqlbase.NewPublicTableKey(dbDesc.ID, "kv").Key()
+	tbNameKey := sqlbase.NewPublicTableKey(dbDesc.ID, "kv").Key(keys.SystemSQLCodec)
 	gr, err := kvDB.Get(ctx, tbNameKey)
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +136,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	if !gr.Exists() {
 		t.Fatalf(`table "kv" does not exist`)
 	}
-	tbDescKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(gr.ValueInt()))
+	tbDescKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(gr.ValueInt()))
 	ts, err := kvDB.GetProtoTs(ctx, tbDescKey, desc)
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +163,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 		t.Fatal(err)
 	}
 
-	tableSpan := tbDesc.TableSpan()
+	tableSpan := tbDesc.TableSpan(keys.SystemSQLCodec)
 	tests.CheckKeyCount(t, kvDB, tableSpan, 6)
 
 	if _, err := sqlDB.Exec(`DROP DATABASE t RESTRICT`); !testutils.IsError(err,
@@ -230,12 +206,16 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 		t.Fatal(err)
 	}
 
-	// Job still running, waiting for GC.
-	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
-	// Maybe this test API should use an offset starting from the most recent job
-	// instead.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifySystemJob(t, sqlRun, 4, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
+	// There are no more namespace entries referencing this database as its
+	// parent.
+	namespaceQuery := fmt.Sprintf(`SELECT * FROM system.namespace WHERE "parentID"  = %d`, dbDesc.ID)
+	sqlRun.CheckQueryResults(t, namespaceQuery, [][]string{})
+
+	// Job still running, waiting for GC.
+	// TODO (lucy): Maybe this test API should use an offset starting
+	// from the most recent job instead.
+	if err := jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    security.RootUser,
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: sqlbase.IDs{
@@ -251,8 +231,8 @@ func TestDropDatabaseEmpty(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -261,7 +241,7 @@ CREATE DATABASE t;
 	}
 
 	dKey := sqlbase.NewDatabaseKey("t")
-	r, err := kvDB.Get(ctx, dKey.Key())
+	r, err := kvDB.Get(ctx, dKey.Key(keys.SystemSQLCodec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +250,7 @@ CREATE DATABASE t;
 	}
 	dbID := sqlbase.ID(r.ValueInt())
 
-	if cfg, err := addDefaultZoneConfig(sqlDB, dbID); err != nil {
+	if cfg, err := sqltestutils.AddDefaultZoneConfig(sqlDB, dbID); err != nil {
 		t.Fatal(err)
 	} else if err := zoneExists(sqlDB, &cfg, dbID); err != nil {
 		t.Fatal(err)
@@ -297,12 +277,12 @@ func TestDropDatabaseDeleteData(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
-	// TTL into the system with addImmediateGCZoneConfig.
-	defer disableGCTTLStrictEnforcement(t, sqlDB)()
+	// TTL into the system with AddImmediateGCZoneConfig.
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
 
 	// Fix the column families so the key counts below don't change if the
 	// family heuristics are updated.
@@ -317,14 +297,14 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	}
 
 	dKey := sqlbase.NewDatabaseKey("t")
-	r, err := kvDB.Get(ctx, dKey.Key())
+	r, err := kvDB.Get(ctx, dKey.Key(keys.SystemSQLCodec))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !r.Exists() {
 		t.Fatalf(`database "t" does not exist`)
 	}
-	dbDescKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(r.ValueInt()))
+	dbDescKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(r.ValueInt()))
 	desc := &sqlbase.Descriptor{}
 	if err := kvDB.GetProto(ctx, dbDescKey, desc); err != nil {
 		t.Fatal(err)
@@ -332,14 +312,14 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	dbDesc := desc.GetDatabase()
 
 	tKey := sqlbase.NewPublicTableKey(dbDesc.ID, "kv")
-	gr, err := kvDB.Get(ctx, tKey.Key())
+	gr, err := kvDB.Get(ctx, tKey.Key(keys.SystemSQLCodec))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !gr.Exists() {
 		t.Fatalf(`table "kv" does not exist`)
 	}
-	tbDescKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(gr.ValueInt()))
+	tbDescKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(gr.ValueInt()))
 	ts, err := kvDB.GetProtoTs(ctx, tbDescKey, desc)
 	if err != nil {
 		t.Fatal(err)
@@ -347,26 +327,26 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	tbDesc := desc.Table(ts)
 
 	t2Key := sqlbase.NewPublicTableKey(dbDesc.ID, "kv2")
-	gr2, err := kvDB.Get(ctx, t2Key.Key())
+	gr2, err := kvDB.Get(ctx, t2Key.Key(keys.SystemSQLCodec))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !gr2.Exists() {
 		t.Fatalf(`table "kv2" does not exist`)
 	}
-	tb2DescKey := sqlbase.MakeDescMetadataKey(sqlbase.ID(gr2.ValueInt()))
+	tb2DescKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(gr2.ValueInt()))
 	ts, err = kvDB.GetProtoTs(ctx, tb2DescKey, desc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tb2Desc := desc.Table(ts)
 
-	tableSpan := tbDesc.TableSpan()
-	table2Span := tb2Desc.TableSpan()
+	tableSpan := tbDesc.TableSpan(keys.SystemSQLCodec)
+	table2Span := tb2Desc.TableSpan(keys.SystemSQLCodec)
 	tests.CheckKeyCount(t, kvDB, tableSpan, 6)
 	tests.CheckKeyCount(t, kvDB, table2Span, 6)
 
-	if _, err := addDefaultZoneConfig(sqlDB, dbDesc.ID); err != nil {
+	if _, err := sqltestutils.AddDefaultZoneConfig(sqlDB, dbDesc.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -382,10 +362,9 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	tests.CheckKeyCount(t, kvDB, tableSpan, 6)
 	tests.CheckKeyCount(t, kvDB, table2Span, 6)
 
-	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
-	// Maybe this test API should use an offset starting from the most recent job
-	// instead.
-	const migrationJobOffset = 4
+	// TODO (lucy): Maybe this test API should use an offset starting
+	// from the most recent job instead.
+	const migrationJobOffset = 0
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    security.RootUser,
@@ -399,7 +378,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 
 	// Push a new zone config for the table with TTL=0 so the data is
 	// deleted immediately.
-	if _, err := addImmediateGCZoneConfig(sqlDB, tbDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tbDesc.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -430,10 +409,10 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		})
 	})
 
-	if _, err := addImmediateGCZoneConfig(sqlDB, tb2Desc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tb2Desc.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := addImmediateGCZoneConfig(sqlDB, dbDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, dbDesc.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -479,7 +458,7 @@ func TestShowTablesAfterRecreateDatabase(t *testing.T) {
 		},
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -529,40 +508,39 @@ func TestDropIndex(t *testing.T) {
 		},
 	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
-	// TTL into the system with addImmediateGCZoneConfig.
-	defer disableGCTTLStrictEnforcement(t, sqlDB)()
+	// TTL into the system with AddImmediateGCZoneConfig.
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
 
 	numRows := 2*chunkSize + 1
 	if err := tests.CreateKVTable(sqlDB, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(), 3*numRows)
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(keys.SystemSQLCodec), 3*numRows)
 	idx, _, err := tableDesc.FindIndexByName("foo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(idx.ID)
+	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, idx.ID)
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 	if _, err := sqlDB.Exec(`DROP INDEX t.kv@foo`); err != nil {
 		t.Fatal(err)
 	}
 
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	if _, _, err := tableDesc.FindIndexByName("foo"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
 	// Index data hasn't been deleted.
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
-	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(), 3*numRows)
+	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(keys.SystemSQLCodec), 3*numRows)
 
-	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
-	// Maybe this test API should use an offset starting from the most recent job
-	// instead.
-	const migrationJobOffset = 4
+	// TODO (lucy): Maybe this test API should use an offset starting
+	// from the most recent job instead.
+	const migrationJobOffset = 0
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset+1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    security.RootUser,
@@ -578,18 +556,18 @@ func TestDropIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	newIdx, _, err := tableDesc.FindIndexByName("foo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	newIdxSpan := tableDesc.IndexSpan(newIdx.ID)
+	newIdxSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, newIdx.ID)
 	tests.CheckKeyCount(t, kvDB, newIdxSpan, numRows)
-	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(), 4*numRows)
+	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(keys.SystemSQLCodec), 4*numRows)
 
 	clearIndexAttempt = true
 	// Add a zone config for the table.
-	if _, err := addImmediateGCZoneConfig(sqlDB, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -619,7 +597,7 @@ func TestDropIndex(t *testing.T) {
 
 	tests.CheckKeyCount(t, kvDB, newIdxSpan, numRows)
 	tests.CheckKeyCount(t, kvDB, indexSpan, 0)
-	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(), 3*numRows)
+	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(keys.SystemSQLCodec), 3*numRows)
 }
 
 func TestDropIndexWithZoneConfigOSS(t *testing.T) {
@@ -640,12 +618,12 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	if err := tests.CreateKVTable(sqlDBRaw, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	indexDesc, _, err := tableDesc.FindIndexByName("foo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(indexDesc.ID)
+	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, indexDesc.ID)
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 
 	// Hack in zone configs for the primary and secondary indexes. (You need a CCL
@@ -679,7 +657,7 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	// TODO(benesch): Run scrub here. It can't currently handle the way t.kv
 	// declares column families.
 
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	if _, _, err := tableDesc.FindIndexByName("foo"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
@@ -695,13 +673,13 @@ func TestDropIndexInterleaved(t *testing.T) {
 		},
 	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	numRows := 2*chunkSize + 1
 	tests.CreateKVInterleavedTable(t, sqlDB, numRows)
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	tableSpan := tableDesc.TableSpan()
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
 
 	tests.CheckKeyCount(t, kvDB, tableSpan, 3*numRows)
 
@@ -711,7 +689,7 @@ func TestDropIndexInterleaved(t *testing.T) {
 	tests.CheckKeyCount(t, kvDB, tableSpan, 2*numRows)
 
 	// Ensure that index is not active.
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "intlv")
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "intlv")
 	if _, _, err := tableDesc.FindIndexByName("intlv_idx"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
@@ -723,16 +701,16 @@ func TestDropTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
 	numRows := 2*sql.TableTruncateChunkSize + 1
 	if err := tests.CreateKVTable(sqlDB, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	nameKey := sqlbase.NewPublicTableKey(keys.MinNonPredefinedUserDescID, "kv").Key()
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	nameKey := sqlbase.NewPublicTableKey(keys.MinNonPredefinedUserDescID, "kv").Key(keys.SystemSQLCodec)
 	gr, err := kvDB.Get(ctx, nameKey)
 
 	if err != nil {
@@ -744,7 +722,7 @@ func TestDropTable(t *testing.T) {
 	}
 
 	// Add a zone config for the table.
-	cfg, err := addDefaultZoneConfig(sqlDB, tableDesc.ID)
+	cfg, err := sqltestutils.AddDefaultZoneConfig(sqlDB, tableDesc.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -753,7 +731,7 @@ func TestDropTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tableSpan := tableDesc.TableSpan()
+	tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
 	tests.CheckKeyCount(t, kvDB, tableSpan, 3*numRows)
 	if _, err := sqlDB.Exec(`DROP TABLE t.kv`); err != nil {
 		t.Fatal(err)
@@ -776,7 +754,7 @@ func TestDropTable(t *testing.T) {
 
 	// Job still running, waiting for GC.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifySystemJob(t, sqlRun, 5, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
+	if err := jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    security.RootUser,
 		Description: `DROP TABLE t.public.kv`,
 		DescriptorIDs: sqlbase.IDs{
@@ -812,12 +790,12 @@ func TestDropTableDeleteData(t *testing.T) {
 	defer gcjob.SetSmallMaxGCIntervalForTest()()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
-	ctx := context.TODO()
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
-	// TTL into the system with addImmediateGCZoneConfig.
-	defer disableGCTTLStrictEnforcement(t, sqlDB)()
+	// TTL into the system with AddImmediateGCZoneConfig.
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
 
 	const numRows = 2*sql.TableTruncateChunkSize + 1
 	const numKeys = 3 * numRows
@@ -829,9 +807,9 @@ func TestDropTableDeleteData(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		descs = append(descs, sqlbase.GetTableDescriptor(kvDB, "t", tableName))
+		descs = append(descs, sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName))
 
-		nameKey := sqlbase.NewPublicTableKey(keys.MinNonPredefinedUserDescID, tableName).Key()
+		nameKey := sqlbase.NewPublicTableKey(keys.MinNonPredefinedUserDescID, tableName).Key(keys.SystemSQLCodec)
 		gr, err := kvDB.Get(ctx, nameKey)
 		if err != nil {
 			t.Fatal(err)
@@ -840,7 +818,7 @@ func TestDropTableDeleteData(t *testing.T) {
 			t.Fatalf("Name entry %q does not exist", nameKey)
 		}
 
-		tableSpan := descs[i].TableSpan()
+		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
 		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
 
 		if _, err := sqlDB.Exec(fmt.Sprintf(`DROP TABLE t.%s`, tableName)); err != nil {
@@ -848,10 +826,9 @@ func TestDropTableDeleteData(t *testing.T) {
 		}
 	}
 
-	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
-	// Maybe this test API should use an offset starting from the most recent job
-	// instead.
-	const migrationJobOffset = 4
+	// TODO (lucy): Maybe this test API should use an offset starting
+	// from the most recent job instead.
+	const migrationJobOffset = 0
 
 	// Data hasn't been GC-ed.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
@@ -859,7 +836,7 @@ func TestDropTableDeleteData(t *testing.T) {
 		if err := descExists(sqlDB, true, descs[i].ID); err != nil {
 			t.Fatal(err)
 		}
-		tableSpan := descs[i].TableSpan()
+		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
 		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
 
 		if err := jobutils.VerifySystemJob(t, sqlRun, 2*i+1+migrationJobOffset, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
@@ -875,7 +852,7 @@ func TestDropTableDeleteData(t *testing.T) {
 
 	// The closure pushes a zone config reducing the TTL to 0 for descriptor i.
 	pushZoneCfg := func(i int) {
-		if _, err := addImmediateGCZoneConfig(sqlDB, descs[i].ID); err != nil {
+		if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, descs[i].ID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -888,7 +865,7 @@ func TestDropTableDeleteData(t *testing.T) {
 
 			return zoneExists(sqlDB, nil, descs[i].ID)
 		})
-		tableSpan := descs[i].TableSpan()
+		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
 		tests.CheckKeyCount(t, kvDB, tableSpan, 0)
 
 		// Ensure that the job is marked as succeeded.
@@ -927,7 +904,7 @@ func TestDropTableDeleteData(t *testing.T) {
 			checkTableGCed(i)
 		} else {
 			// Data still present for tables past barrier.
-			tableSpan := descs[i].TableSpan()
+			tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
 			tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
 		}
 	}
@@ -947,7 +924,7 @@ func writeTableDesc(ctx context.Context, db *kv.DB, tableDesc *sqlbase.TableDesc
 			return err
 		}
 		tableDesc.ModificationTime = txn.CommitTimestamp()
-		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(tableDesc.ID), sqlbase.WrapDescriptor(tableDesc))
+		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), sqlbase.WrapDescriptor(tableDesc))
 	})
 }
 
@@ -975,21 +952,21 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(sqlDBRaw)
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
-	// TTL into the system with addImmediateGCZoneConfig.
-	defer disableGCTTLStrictEnforcement(t, sqlDBRaw)()
+	// TTL into the system with AddImmediateGCZoneConfig.
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDBRaw)()
 
 	const numRows = 100
 	sqlutils.CreateTable(t, sqlDBRaw, "t", "a INT", numRows, sqlutils.ToRowFn(sqlutils.RowIdxFn))
 
 	// Give the table an old format version.
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	tableDesc.FormatVersion = sqlbase.FamilyFormatVersion
 	tableDesc.Version++
 	if err := writeTableDesc(ctx, kvDB, tableDesc); err != nil {
 		t.Fatal(err)
 	}
 
-	tableSpan := tableDesc.TableSpan()
+	tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
 	tests.CheckKeyCount(t, kvDB, tableSpan, numRows)
 
 	sqlDB.Exec(t, `DROP TABLE test.t`)
@@ -997,7 +974,7 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	// Simulate a migration upgrading the table descriptor's format version after
 	// the table has been dropped but before the truncation has occurred.
 	var err error
-	tableDesc, err = sqlbase.GetTableDescFromID(ctx, kvDB.NewTxn(ctx, ""), tableDesc.ID)
+	tableDesc, err = sqlbase.GetTableDescFromID(ctx, kvDB.NewTxn(ctx, ""), keys.SystemSQLCodec, tableDesc.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1011,7 +988,7 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	}
 
 	// Set TTL so the data is deleted immediately.
-	if _, err := addImmediateGCZoneConfig(sqlDBRaw, tableDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDBRaw, tableDesc.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1032,14 +1009,14 @@ func TestDropTableInterleavedDeleteData(t *testing.T) {
 	defer gcjob.SetSmallMaxGCIntervalForTest()()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	numRows := 2*sql.TableTruncateChunkSize + 1
 	tests.CreateKVInterleavedTable(t, sqlDB, numRows)
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	tableDescInterleaved := sqlbase.GetTableDescriptor(kvDB, "t", "intlv")
-	tableSpan := tableDesc.TableSpan()
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	tableDescInterleaved := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "intlv")
+	tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
 
 	tests.CheckKeyCount(t, kvDB, tableSpan, 3*numRows)
 	if _, err := sqlDB.Exec(`DROP TABLE t.intlv`); err != nil {
@@ -1054,7 +1031,7 @@ func TestDropTableInterleavedDeleteData(t *testing.T) {
 		t.Fatalf("different error than expected: %v", err)
 	}
 
-	if _, err := addImmediateGCZoneConfig(sqlDB, tableDescInterleaved.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDescInterleaved.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1069,7 +1046,7 @@ func TestDropTableInTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -1116,13 +1093,13 @@ func TestDropDatabaseAfterDropTable(t *testing.T) {
 		},
 	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if err := tests.CreateKVTable(sqlDB, "kv", 100); err != nil {
 		t.Fatal(err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 
 	if _, err := sqlDB.Exec(`DROP TABLE t.kv`); err != nil {
 		t.Fatal(err)
@@ -1133,12 +1110,11 @@ func TestDropDatabaseAfterDropTable(t *testing.T) {
 	}
 
 	// Job still running, waiting for draining names.
-	// TODO (lucy): The offset of +4 accounts for unrelated startup migrations.
-	// Maybe this test API should use an offset starting from the most recent job
-	// instead.
+	// TODO (lucy): Maybe this test API should use an offset starting
+	// from the most recent job instead.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifySystemJob(
-		t, sqlRun, 5, jobspb.TypeSchemaChange, jobs.StatusSucceeded,
+		t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.StatusSucceeded,
 		jobs.Record{
 			Username:    security.RootUser,
 			Description: "DROP TABLE t.public.kv",
@@ -1155,7 +1131,7 @@ func TestDropAndCreateTable(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.UseDatabase = "test"
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)
@@ -1205,7 +1181,7 @@ func TestCommandsWhileTableBeingDropped(t *testing.T) {
 		},
 	}
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sql := `
 CREATE DATABASE test;
@@ -1259,7 +1235,7 @@ func TestDropNameReuse(t *testing.T) {
 	}
 
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sql := `
 CREATE DATABASE test;
@@ -1289,4 +1265,135 @@ CREATE VIEW test.acol(a) AS SELECT a FROM test.t;
 		_, err := db.Exec(`CREATE TABLE test.t(a INT PRIMARY KEY);`)
 		return err
 	})
+}
+
+// TestDropIndexHandlesRetriableErrors is a regression test against #48474.
+// The bug was that retriable errors, which are generally possible, were being
+// treated as assertion failures.
+func TestDropIndexHandlesRetriableErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	rf := newDynamicRequestFilter()
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
+					TestingRequestFilter: rf.filter,
+				},
+			},
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	// What we want to do is have a transaction which does the planning work to
+	// drop an index. Then we want to expose the execution of the DROP INDEX to
+	// an error when retrieving the mutable table descriptor. We'll do this by
+	// injecting a ReadWithinUncertainty error underneath the DROP INDEX
+	// after planning has concluded.
+
+	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY, j INT, INDEX j_idx (j))")
+
+	var tableID uint32
+	tdb.QueryRow(t, `
+SELECT
+    table_id
+FROM
+    crdb_internal.tables
+WHERE
+    name = $1 AND database_name = current_database();`,
+		"foo").Scan(&tableID)
+
+	// Start the user transaction and enable tracing as we'll use the trace
+	// to determine when planning has concluded.
+	txn, err := tc.ServerConn(0).Begin()
+	require.NoError(t, err)
+	_, err = txn.Exec("SET TRACING = on")
+	require.NoError(t, err)
+	// Let's find out our transaction ID for our transaction by running a query.
+	// We'll also use this query to install a refresh span over the table data.
+	// Inject a request filter to snag the transaction ID.
+	tablePrefix := keys.SystemSQLCodec.TablePrefix(tableID)
+	tableSpan := roachpb.Span{
+		Key:    tablePrefix,
+		EndKey: tablePrefix.PrefixEnd(),
+	}
+	var filterState struct {
+		syncutil.Mutex
+		txnID uuid.UUID
+	}
+	getTxnID := func() uuid.UUID {
+		filterState.Lock()
+		defer filterState.Unlock()
+		return filterState.txnID
+	}
+	rf.setFilter(func(ctx context.Context, request roachpb.BatchRequest) *roachpb.Error {
+		if request.Txn == nil || request.Txn.Name != sql.SQLTxnName {
+			return nil
+		}
+		filterState.Lock()
+		defer filterState.Unlock()
+		if filterState.txnID != (uuid.UUID{}) {
+			return nil
+		}
+		if scanRequest, ok := request.GetArg(roachpb.Scan); ok {
+			scan := scanRequest.(*roachpb.ScanRequest)
+			if scan.Span().Overlaps(tableSpan) {
+				filterState.txnID = request.Txn.ID
+			}
+		}
+		return nil
+	})
+
+	// Run the scan of the table to activate the filter as well as add the
+	// refresh span over the table data.
+	var trash int
+	require.Equal(t, gosql.ErrNoRows,
+		txn.QueryRow("SELECT * FROM foo").Scan(&trash))
+	rf.setFilter(nil)
+	require.NotEqual(t, uuid.UUID{}, getTxnID())
+
+	// Perform a write after the above read so that a refresh will fail and
+	// observe its timestamp.
+	tdb.Exec(t, "INSERT INTO foo VALUES (1)")
+	var afterInsertStr string
+	tdb.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&afterInsertStr)
+	afterInsert, err := sql.ParseHLC(afterInsertStr)
+	require.NoError(t, err)
+
+	// Now set up a filter to detect when the DROP INDEX execution will begin
+	// and inject an error forcing a refresh above the conflicting write which
+	// will fail. We'll want to ensure that we get a retriable error.
+	// Use the below pattern to detect when the user transaction has finished
+	// planning and is now executing.
+	dropIndexPlanningEndsRE := regexp.MustCompile("(?s)planning starts: DROP INDEX.*planning ends")
+	rf.setFilter(func(ctx context.Context, request roachpb.BatchRequest) *roachpb.Error {
+		if request.Txn == nil {
+			return nil
+		}
+		filterState.Lock()
+		defer filterState.Unlock()
+		if filterState.txnID != request.Txn.ID {
+			return nil
+		}
+		sp := opentracing.SpanFromContext(ctx)
+		rec := tracing.GetRecording(sp)
+		if !dropIndexPlanningEndsRE.MatchString(rec.String()) {
+			return nil
+		}
+		if getRequest, ok := request.GetArg(roachpb.Get); ok {
+			put := getRequest.(*roachpb.GetRequest)
+			if put.Key.Equal(sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(tableID))) {
+				filterState.txnID = uuid.UUID{}
+				return roachpb.NewError(roachpb.NewReadWithinUncertaintyIntervalError(
+					request.Txn.ReadTimestamp, afterInsert, request.Txn))
+			}
+		}
+		return nil
+	})
+
+	_, err = txn.Exec("DROP INDEX foo@j_idx")
+	require.Truef(t, isRetryableErr(err), "drop index error: %v", err)
+	require.NoError(t, txn.Rollback())
 }

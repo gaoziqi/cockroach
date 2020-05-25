@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -54,10 +54,9 @@ func makeMutationTest(
 // in the table equals e.
 func (mt mutationTest) checkTableSize(e int) {
 	// Check that there are no hidden values
-	tablePrefix := keys.MakeTablePrefix(uint32(mt.tableDesc.ID))
-	tableStartKey := roachpb.Key(tablePrefix)
+	tableStartKey := keys.SystemSQLCodec.TablePrefix(uint32(mt.tableDesc.ID))
 	tableEndKey := tableStartKey.PrefixEnd()
-	if kvs, err := mt.kvDB.Scan(context.TODO(), tableStartKey, tableEndKey, 0); err != nil {
+	if kvs, err := mt.kvDB.Scan(context.Background(), tableStartKey, tableEndKey, 0); err != nil {
 		mt.Error(err)
 	} else if len(kvs) != e {
 		mt.Errorf("expected %d key value pairs, but got %d", e, len(kvs))
@@ -86,8 +85,8 @@ func (mt mutationTest) makeMutationsActive() {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
-		context.TODO(),
-		sqlbase.MakeDescMetadataKey(mt.tableDesc.ID),
+		context.Background(),
+		sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, mt.tableDesc.ID),
 		sqlbase.WrapDescriptor(mt.tableDesc),
 	); err != nil {
 		mt.Fatal(err)
@@ -144,8 +143,8 @@ func (mt mutationTest) writeMutation(m sqlbase.DescriptorMutation) {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
-		context.TODO(),
-		sqlbase.MakeDescMetadataKey(mt.tableDesc.ID),
+		context.Background(),
+		sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, mt.tableDesc.ID),
 		sqlbase.WrapDescriptor(mt.tableDesc),
 	); err != nil {
 		mt.Fatal(err)
@@ -165,11 +164,11 @@ func TestUpsertWithColumnMutationAndNotNullDefault(t *testing.T) {
 
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
-	defer sql.TestDisableTableLeases()()
+	defer lease.TestingDisableTableLeases()()
 	// Disable external processing of mutations.
 	params, _ := tests.CreateTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop(context.TODO())
+	defer server.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -181,7 +180,7 @@ ALTER TABLE t.test ADD COLUMN i VARCHAR NOT NULL DEFAULT 'i';
 	}
 
 	// read table descriptor
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mTest := makeMutationTest(t, kvDB, sqlDB, tableDesc)
 	// Add column "i" as a mutation in delete/write.
@@ -222,11 +221,11 @@ func TestOperationsWithColumnMutation(t *testing.T) {
 
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
-	defer sql.TestDisableTableLeases()()
+	defer lease.TestingDisableTableLeases()()
 	// Disable external processing of mutations.
 	params, _ := tests.CreateTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop(context.TODO())
+	defer server.Stopper().Stop(context.Background())
 
 	// Fix the column families so the key counts below don't change if the
 	// family heuristics are updated.
@@ -240,7 +239,7 @@ CREATE INDEX allidx ON t.test (k, v);
 	}
 
 	// read table descriptor
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mTest := makeMutationTest(t, kvDB, sqlDB, tableDesc)
 
@@ -255,7 +254,7 @@ CREATE INDEX allidx ON t.test (k, v);
 					// Init table to start state.
 					mTest.Exec(t, `TRUNCATE TABLE t.test`)
 					// read table descriptor
-					mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+					mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 					initRows := [][]string{{"a", "z", "q"}}
 					for _, row := range initRows {
@@ -336,15 +335,9 @@ CREATE INDEX allidx ON t.test (k, v);
 						afterDefaultInsert = [][]string{{"a", "z", "q"}, {"default", "NULL", "i"}}
 						// The default value of "i" for column "i" is written.
 						afterInsert = [][]string{{"a", "z", "q"}, {"c", "x", "i"}}
-						if useUpsert {
-							// Update is not a noop for column "i".
-							afterUpdate = [][]string{{"a", "u", "q"}, {"c", "x", "i"}}
-							afterPKUpdate = [][]string{{"a", "u", "q"}, {"d", "x", "i"}}
-						} else {
-							// Update is a noop for column "i".
-							afterUpdate = [][]string{{"a", "u", "q"}, {"c", "x", "i"}}
-							afterPKUpdate = [][]string{{"a", "u", "q"}, {"d", "x", "i"}}
-						}
+						// Upsert/update sets column "i" to default value of "i".
+						afterUpdate = [][]string{{"a", "u", "i"}, {"c", "x", "i"}}
+						afterPKUpdate = [][]string{{"a", "u", "i"}, {"d", "x", "i"}}
 						// Delete also deletes column "i".
 						afterDelete = [][]string{{"d", "x", "i"}}
 						afterDeleteKeys = 4
@@ -493,11 +486,11 @@ func TestOperationsWithIndexMutation(t *testing.T) {
 	// table descriptor but don't do anything, which is what we want.
 
 	// The descriptor changes made must have an immediate effect.
-	defer sql.TestDisableTableLeases()()
+	defer lease.TestingDisableTableLeases()()
 	// Disable external processing of mutations.
 	params, _ := tests.CreateTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop(context.TODO())
+	defer server.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -507,7 +500,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 	}
 
 	// read table descriptor
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mTest := makeMutationTest(t, kvDB, sqlDB, tableDesc)
 
@@ -522,7 +515,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 				t.Fatal(err)
 			}
 			// read table descriptor
-			mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+			mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 			initRows := [][]string{{"a", "z"}, {"b", "y"}}
 			for _, row := range initRows {
@@ -640,10 +633,10 @@ func TestOperationsWithColumnAndIndexMutation(t *testing.T) {
 
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
-	defer sql.TestDisableTableLeases()()
+	defer lease.TestingDisableTableLeases()()
 	params, _ := tests.CreateTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop(context.TODO())
+	defer server.Stopper().Stop(context.Background())
 
 	// Create a table with column i and an index on v and i. Fix the column
 	// families so the key counts below don't change if the family heuristics
@@ -658,7 +651,7 @@ CREATE INDEX allidx ON t.test (k, v);
 	}
 
 	// read table descriptor
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mTest := makeMutationTest(t, kvDB, sqlDB, tableDesc)
 
@@ -686,7 +679,7 @@ CREATE INDEX allidx ON t.test (k, v);
 				}
 
 				// read table descriptor
-				mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+				mTest.tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 				initRows := [][]string{{"a", "z", "q"}, {"b", "y", "r"}}
 				for _, row := range initRows {
@@ -768,14 +761,20 @@ CREATE INDEX allidx ON t.test (k, v);
 				// Make column "i" and index "foo" live.
 				mTest.makeMutationsActive()
 
-				// The update to column "v" is seen; there is no effect on column "i".
-				mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "u", "q"}, {"b", "y", "r"}, {"c", "x", "NULL"}})
+				if state == sqlbase.DescriptorMutation_DELETE_ONLY {
+					// Mutation column "i" is not updated.
+					mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "u", "q"}, {"b", "y", "r"}, {"c", "x", "NULL"}})
+				} else {
+					// Mutation column "i" is set to its default value (NULL).
+					mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "u", "NULL"}, {"b", "y", "r"}, {"c", "x", "NULL"}})
+				}
+
 				if idxState == sqlbase.DescriptorMutation_DELETE_ONLY {
 					// Index entry for row "a" is deleted.
 					mTest.CheckQueryResults(t, indexQuery, [][]string{{"r"}})
 				} else {
-					// No change in index "foo"
-					mTest.CheckQueryResults(t, indexQuery, [][]string{{"NULL"}, {"q"}, {"r"}})
+					// Index "foo" has NULL "i" value for row "a".
+					mTest.CheckQueryResults(t, indexQuery, [][]string{{"NULL"}, {"NULL"}, {"r"}})
 				}
 
 				// Add index "foo" as a mutation.
@@ -788,19 +787,34 @@ CREATE INDEX allidx ON t.test (k, v);
 				// Make column "i" and index "foo" live.
 				mTest.makeMutationsActive()
 				// Row "b" is deleted.
-				mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "u", "q"}, {"c", "x", "NULL"}})
+				if state == sqlbase.DescriptorMutation_DELETE_ONLY {
+					mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "u", "q"}, {"c", "x", "NULL"}})
+				} else {
+					mTest.CheckQueryResults(t, starQuery, [][]string{{"a", "u", "NULL"}, {"c", "x", "NULL"}})
+				}
+
 				// numKVs is the number of expected key-values. We start with the number
 				// of non-NULL values above.
-				numKVs := 7
+				numKVs := 6
+				if state == sqlbase.DescriptorMutation_DELETE_ONLY {
+					// In DELETE_ONLY case, the "q" value is not set to NULL above.
+					numKVs++
+				}
+
 				if idxState == sqlbase.DescriptorMutation_DELETE_ONLY {
-					// Index entry for row "b" is deleted.
+					// Index entry for row "a" is deleted.
 					mTest.CheckQueryResults(t, indexQuery, [][]string{})
 				} else {
-					// Index entry for row "b" is deleted.
-					mTest.CheckQueryResults(t, indexQuery, [][]string{{"NULL"}, {"q"}})
+					// Index entry for row "a" is deleted.
+					if state == sqlbase.DescriptorMutation_DELETE_ONLY {
+						mTest.CheckQueryResults(t, indexQuery, [][]string{{"NULL"}, {"q"}})
+					} else {
+						mTest.CheckQueryResults(t, indexQuery, [][]string{{"NULL"}, {"NULL"}})
+					}
 					// We have two index values.
 					numKVs += 2
 				}
+
 				// Check that there are no hidden KV values for row "b", and column
 				// "i" for row "b" was deleted. Also check that the index values are
 				// all accounted for.
@@ -817,7 +831,7 @@ func TestSchemaChangeCommandsWithPendingMutations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
-	defer sql.TestDisableTableLeases()()
+	defer lease.TestingDisableTableLeases()()
 	// Disable external processing of mutations.
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
@@ -828,7 +842,7 @@ func TestSchemaChangeCommandsWithPendingMutations(t *testing.T) {
 		},
 	}
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop(context.TODO())
+	defer server.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -838,7 +852,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	}
 
 	// Read table descriptor
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	mt := makeMutationTest(t, kvDB, sqlDB, tableDesc)
 
@@ -855,14 +869,14 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	// "foo" is being added.
 	mt.writeIndexMutation("foo", sqlbase.DescriptorMutation{Direction: sqlbase.DescriptorMutation_ADD})
 	if _, err := sqlDB.Exec(`CREATE INDEX foo ON t.test (c)`); !testutils.IsError(err,
-		`duplicate: index "foo" in the middle of being added, not yet public`) {
+		`relation "foo" already exists`) {
 		t.Fatal(err)
 	}
 	// Make "foo" live.
 	mt.makeMutationsActive()
 	// Add column DROP mutation "b"
 	mt.writeColumnMutation("b", sqlbase.DescriptorMutation{Direction: sqlbase.DescriptorMutation_DROP})
-	if _, err := sqlDB.Exec(`CREATE INDEX bar ON t.test (b)`); !testutils.IsError(err, `index "bar" contains unknown column "b"`) {
+	if _, err := sqlDB.Exec(`CREATE INDEX bar ON t.test (b)`); !testutils.IsError(err, `column "b" does not exist`) {
 		t.Fatal(err)
 	}
 	// Make "b" live.
@@ -904,7 +918,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	// "b" is being added.
 	mt.writeColumnMutation("b", sqlbase.DescriptorMutation{Direction: sqlbase.DescriptorMutation_ADD})
 	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD b CHAR`); !testutils.IsError(err,
-		`duplicate: column "b" in the middle of being added, not yet public`) {
+		`pq: duplicate: column "b" in the middle of being added, not yet public`) {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.Exec(`ALTER TABLE t.test DROP b`); !testutils.IsError(err, `column "b" in the middle of being added, try again later`) {
@@ -968,7 +982,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	mt.Exec(t, `ALTER TABLE t.test RENAME COLUMN c TO d`)
 	// The mutation in the table descriptor has changed and we would like
 	// to update our copy to make it live.
-	mt.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	mt.tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Make "ufo" live.
 	mt.makeMutationsActive()
@@ -992,7 +1006,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 
 	// The mutation in the table descriptor has changed and we would like
 	// to update our copy to make it live.
-	mt.tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	mt.tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Make column "e" live.
 	mt.makeMutationsActive()
@@ -1035,7 +1049,7 @@ func TestTableMutationQueue(t *testing.T) {
 		},
 	}
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop(context.TODO())
+	defer server.Stopper().Stop(context.Background())
 
 	// Create a table with column i and an index on v and i.
 	if _, err := sqlDB.Exec(`
@@ -1073,7 +1087,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR UNIQUE);
 	}
 
 	// read table descriptor
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	expected := []struct {
 		name  string
@@ -1130,7 +1144,7 @@ func TestAddingFKs(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
 		CREATE DATABASE t;
@@ -1142,12 +1156,12 @@ func TestAddingFKs(t *testing.T) {
 	}
 
 	// Step the referencing table back to the ADD state.
-	ordersDesc := sqlbase.GetTableDescriptor(kvDB, "t", "orders")
+	ordersDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "orders")
 	ordersDesc.State = sqlbase.TableDescriptor_ADD
 	ordersDesc.Version++
 	if err := kvDB.Put(
-		context.TODO(),
-		sqlbase.MakeDescMetadataKey(ordersDesc.ID),
+		context.Background(),
+		sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, ordersDesc.ID),
 		sqlbase.WrapDescriptor(ordersDesc),
 	); err != nil {
 		t.Fatal(err)

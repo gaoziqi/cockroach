@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -27,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // lookupFlow returns the registered flow with the given ID. If no such flow is
@@ -41,7 +40,7 @@ func lookupFlow(fr *FlowRegistry, fid execinfrapb.FlowID, timeout time.Duration)
 	if entry.flow != nil {
 		return entry.flow
 	}
-	entry = fr.waitForFlowLocked(context.TODO(), fid, timeout)
+	entry = fr.waitForFlowLocked(context.Background(), fid, timeout)
 	if entry == nil {
 		return nil
 	}
@@ -71,7 +70,7 @@ func lookupStreamInfo(
 
 func TestFlowRegistry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	reg := NewFlowRegistry(roachpb.NodeID(0))
+	reg := NewFlowRegistry(0)
 
 	id1 := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	f1 := &FlowBase{}
@@ -210,7 +209,7 @@ func TestFlowRegistry(t *testing.T) {
 // are propagated to their consumers and future attempts to connect them fail.
 func TestStreamConnectionTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	reg := NewFlowRegistry(roachpb.NodeID(0))
+	reg := NewFlowRegistry(0)
 
 	jiffy := time.Nanosecond
 
@@ -226,7 +225,7 @@ func TestStreamConnectionTimeout(t *testing.T) {
 		streamID1: {receiver: RowInboundStreamHandler{consumer}, waitGroup: wg},
 	}
 	if err := reg.RegisterFlow(
-		context.TODO(), id1, f1, inboundStreams, jiffy,
+		context.Background(), id1, f1, inboundStreams, jiffy,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +255,7 @@ func TestStreamConnectionTimeout(t *testing.T) {
 	}
 	defer cleanup()
 
-	_, _, _, err = reg.ConnectInboundStream(context.TODO(), id1, streamID1, serverStream, jiffy)
+	_, _, _, err = reg.ConnectInboundStream(context.Background(), id1, streamID1, serverStream, jiffy)
 	if !testutils.IsError(err, "came too late") {
 		t.Fatalf("expected %q, got: %v", "came too late", err)
 	}
@@ -264,7 +263,7 @@ func TestStreamConnectionTimeout(t *testing.T) {
 	// Unregister the flow. Subsequent attempts to connect a stream should result
 	// in a different error than before.
 	reg.UnregisterFlow(id1)
-	_, _, _, err = reg.ConnectInboundStream(context.TODO(), id1, streamID1, serverStream, jiffy)
+	_, _, _, err = reg.ConnectInboundStream(context.Background(), id1, streamID1, serverStream, jiffy)
 	if !testutils.IsError(err, "not found") {
 		t.Fatalf("expected %q, got: %v", "not found", err)
 	}
@@ -278,7 +277,7 @@ func TestStreamConnectionTimeout(t *testing.T) {
 func TestHandshake(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	reg := NewFlowRegistry(roachpb.NodeID(0))
+	reg := NewFlowRegistry(0)
 
 	tests := []struct {
 		name                   string
@@ -309,7 +308,7 @@ func TestHandshake(t *testing.T) {
 				// async because the consumer is not yet there and ConnectInboundStream
 				// is blocking.
 				if _, _, _, err := reg.ConnectInboundStream(
-					context.TODO(), flowID, streamID, serverStream, time.Hour,
+					context.Background(), flowID, streamID, serverStream, time.Hour,
 				); err != nil {
 					t.Error(err)
 				}
@@ -323,7 +322,7 @@ func TestHandshake(t *testing.T) {
 					streamID: {receiver: RowInboundStreamHandler{consumer}, waitGroup: wg},
 				}
 				if err := reg.RegisterFlow(
-					context.TODO(), flowID, f1, inboundStreams, time.Hour, /* timeout */
+					context.Background(), flowID, f1, inboundStreams, time.Hour, /* timeout */
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -376,8 +375,8 @@ func TestHandshake(t *testing.T) {
 func TestFlowRegistryDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
-	reg := NewFlowRegistry(roachpb.NodeID(0))
+	ctx := context.Background()
+	reg := NewFlowRegistry(0)
 
 	flow := &FlowBase{}
 	id := execinfrapb.FlowID{UUID: uuid.MakeV4()}
@@ -396,7 +395,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 		registerFlow(t, id)
 		drainDone := make(chan struct{})
 		go func() {
-			reg.Drain(math.MaxInt64 /* flowDrainWait */, 0 /* minFlowDrainWait */)
+			reg.Drain(math.MaxInt64 /* flowDrainWait */, 0 /* minFlowDrainWait */, nil /* reporter */)
 			drainDone <- struct{}{}
 		}()
 		// Be relatively sure that the FlowRegistry is draining.
@@ -409,7 +408,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 	// DrainTimeout verifies that Drain returns once the timeout expires.
 	t.Run("DrainTimeout", func(t *testing.T) {
 		registerFlow(t, id)
-		reg.Drain(0 /* flowDrainWait */, 0 /* minFlowDrainWait */)
+		reg.Drain(0 /* flowDrainWait */, 0 /* minFlowDrainWait */, nil /* reporter */)
 		reg.UnregisterFlow(id)
 		reg.Undrain()
 	})
@@ -420,7 +419,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 		registerFlow(t, id)
 		drainDone := make(chan struct{})
 		go func() {
-			reg.Drain(math.MaxInt64 /* flowDrainWait */, 0 /* minFlowDrainWait */)
+			reg.Drain(math.MaxInt64 /* flowDrainWait */, 0 /* minFlowDrainWait */, nil /* reporter */)
 			drainDone <- struct{}{}
 		}()
 		// Be relatively sure that the FlowRegistry is draining.
@@ -463,7 +462,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 		}
 		defer func() { reg.testingRunBeforeDrainSleep = nil }()
 		go func() {
-			reg.Drain(math.MaxInt64 /* flowDrainWait */, 0 /* minFlowDrainWait */)
+			reg.Drain(math.MaxInt64 /* flowDrainWait */, 0 /* minFlowDrainWait */, nil /* reporter */)
 			drainDone <- struct{}{}
 		}()
 		if err := <-errChan; err != nil {
@@ -491,7 +490,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 		minFlowDrainWait := 10 * time.Millisecond
 		start := timeutil.Now()
 		go func() {
-			reg.Drain(math.MaxInt64 /* flowDrainWait */, minFlowDrainWait)
+			reg.Drain(math.MaxInt64 /* flowDrainWait */, minFlowDrainWait, nil /* reporter */)
 			drainDone <- struct{}{}
 		}()
 		// Be relatively sure that the FlowRegistry is draining.
@@ -651,7 +650,7 @@ func TestFlowCancelPartiallyBlocked(t *testing.T) {
 	// flow canceled error.
 
 	_, meta := right.Next()
-	if meta.Err != sqlbase.QueryCanceledError {
+	if !errors.Is(meta.Err, sqlbase.QueryCanceledError) {
 		t.Fatal("expected query canceled, found", meta.Err)
 	}
 
@@ -660,7 +659,7 @@ func TestFlowCancelPartiallyBlocked(t *testing.T) {
 
 	_, _ = left.Next()
 	_, meta = left.Next()
-	if meta.Err != sqlbase.QueryCanceledError {
+	if !errors.Is(meta.Err, sqlbase.QueryCanceledError) {
 		t.Fatal("expected query canceled, found", meta.Err)
 	}
 }

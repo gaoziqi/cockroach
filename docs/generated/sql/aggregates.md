@@ -27,6 +27,10 @@
 </span></td></tr>
 <tr><td><a name="array_agg"></a><code>array_agg(arg1: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a>[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
 </span></td></tr>
+<tr><td><a name="array_agg"></a><code>array_agg(arg1: geography) &rarr; geography[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
+</span></td></tr>
+<tr><td><a name="array_agg"></a><code>array_agg(arg1: geometry) &rarr; geometry[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
+</span></td></tr>
 <tr><td><a name="array_agg"></a><code>array_agg(arg1: oid) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
 </span></td></tr>
 <tr><td><a name="array_agg"></a><code>array_agg(arg1: timetz) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Aggregates the selected values into an array.</p>
@@ -43,7 +47,11 @@
 </span></td></tr>
 <tr><td><a name="bit_and"></a><code>bit_and(arg1: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the bitwise AND of all non-null input values, or null if none.</p>
 </span></td></tr>
+<tr><td><a name="bit_and"></a><code>bit_and(arg1: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates the bitwise AND of all non-null input values, or null if none.</p>
+</span></td></tr>
 <tr><td><a name="bit_or"></a><code>bit_or(arg1: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the bitwise OR of all non-null input values, or null if none.</p>
+</span></td></tr>
+<tr><td><a name="bit_or"></a><code>bit_or(arg1: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates the bitwise OR of all non-null input values, or null if none.</p>
 </span></td></tr>
 <tr><td><a name="bool_and"></a><code>bool_and(arg1: <a href="bool.html">bool</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Calculates the boolean value of <code>AND</code>ing all selected values.</p>
 </span></td></tr>
@@ -97,6 +105,10 @@
 </span></td></tr>
 <tr><td><a name="max"></a><code>max(arg1: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
 </span></td></tr>
+<tr><td><a name="max"></a><code>max(arg1: geography) &rarr; geography</code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
+</span></td></tr>
+<tr><td><a name="max"></a><code>max(arg1: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
+</span></td></tr>
 <tr><td><a name="max"></a><code>max(arg1: jsonb) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
 </span></td></tr>
 <tr><td><a name="max"></a><code>max(arg1: oid) &rarr; oid</code></td><td><span class="funcdesc"><p>Identifies the maximum selected value.</p>
@@ -131,6 +143,10 @@
 </span></td></tr>
 <tr><td><a name="min"></a><code>min(arg1: <a href="uuid.html">uuid</a>) &rarr; <a href="uuid.html">uuid</a></code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
 </span></td></tr>
+<tr><td><a name="min"></a><code>min(arg1: geography) &rarr; geography</code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
+</span></td></tr>
+<tr><td><a name="min"></a><code>min(arg1: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
+</span></td></tr>
 <tr><td><a name="min"></a><code>min(arg1: jsonb) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
 </span></td></tr>
 <tr><td><a name="min"></a><code>min(arg1: oid) &rarr; oid</code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
@@ -138,6 +154,18 @@
 <tr><td><a name="min"></a><code>min(arg1: timetz) &rarr; timetz</code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
 </span></td></tr>
 <tr><td><a name="min"></a><code>min(arg1: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Identifies the minimum selected value.</p>
+</span></td></tr>
+<tr><td><a name="percentile_cont"></a><code>percentile_cont(arg1: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Continuous percentile: returns a float corresponding to the specified fraction in the ordering, interpolating between adjacent input floats if needed.</p>
+</span></td></tr>
+<tr><td><a name="percentile_cont"></a><code>percentile_cont(arg1: <a href="float.html">float</a>) &rarr; <a href="interval.html">interval</a></code></td><td><span class="funcdesc"><p>Continuous percentile: returns an interval corresponding to the specified fraction in the ordering, interpolating between adjacent input intervals if needed.</p>
+</span></td></tr>
+<tr><td><a name="percentile_cont"></a><code>percentile_cont(arg1: <a href="float.html">float</a>[]) &rarr; <a href="float.html">float</a>[]</code></td><td><span class="funcdesc"><p>Continuous percentile: returns floats corresponding to the specified fractions in the ordering, interpolating between adjacent input floats if needed.</p>
+</span></td></tr>
+<tr><td><a name="percentile_cont"></a><code>percentile_cont(arg1: <a href="float.html">float</a>[]) &rarr; <a href="interval.html">interval</a>[]</code></td><td><span class="funcdesc"><p>Continuous percentile: returns intervals corresponding to the specified fractions in the ordering, interpolating between adjacent input intervals if needed.</p>
+</span></td></tr>
+<tr><td><a name="percentile_disc"></a><code>percentile_disc(arg1: <a href="float.html">float</a>) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Discrete percentile: returns the first input value whose position in the ordering equals or exceeds the specified fraction.</p>
+</span></td></tr>
+<tr><td><a name="percentile_disc"></a><code>percentile_disc(arg1: <a href="float.html">float</a>[]) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Discrete percentile: returns input values whose position in the ordering equals or exceeds the specified fractions.</p>
 </span></td></tr>
 <tr><td><a name="sqrdiff"></a><code>sqrdiff(arg1: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the sum of squared differences from the mean of the selected values.</p>
 </span></td></tr>
@@ -150,6 +178,12 @@
 <tr><td><a name="stddev"></a><code>stddev(arg1: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates the standard deviation of the selected values.</p>
 </span></td></tr>
 <tr><td><a name="stddev"></a><code>stddev(arg1: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the standard deviation of the selected values.</p>
+</span></td></tr>
+<tr><td><a name="stddev_samp"></a><code>stddev_samp(arg1: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the standard deviation of the selected values.</p>
+</span></td></tr>
+<tr><td><a name="stddev_samp"></a><code>stddev_samp(arg1: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates the standard deviation of the selected values.</p>
+</span></td></tr>
+<tr><td><a name="stddev_samp"></a><code>stddev_samp(arg1: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the standard deviation of the selected values.</p>
 </span></td></tr>
 <tr><td><a name="string_agg"></a><code>string_agg(arg1: <a href="bytes.html">bytes</a>, arg2: <a href="bytes.html">bytes</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Concatenates all selected values using the provided delimiter.</p>
 </span></td></tr>

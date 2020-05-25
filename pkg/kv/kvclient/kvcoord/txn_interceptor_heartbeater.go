@@ -184,7 +184,7 @@ func (*txnHeartbeater) populateLeafInputState(*roachpb.LeafTxnInputState) {}
 func (*txnHeartbeater) populateLeafFinalState(*roachpb.LeafTxnFinalState) {}
 
 // importLeafFinalState is part of the txnInterceptor interface.
-func (*txnHeartbeater) importLeafFinalState(*roachpb.LeafTxnFinalState) {}
+func (*txnHeartbeater) importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) {}
 
 // epochBumpedLocked is part of the txnInterceptor interface.
 func (h *txnHeartbeater) epochBumpedLocked() {}
@@ -287,9 +287,12 @@ func (h *txnHeartbeater) heartbeat(ctx context.Context) bool {
 	}
 
 	if h.mu.txn.Status != roachpb.PENDING {
-		log.Fatalf(ctx,
-			"txn committed or aborted but heartbeat loop hasn't been signaled to stop. txn: %s",
-			h.mu.txn)
+		if h.mu.txn.Status == roachpb.COMMITTED {
+			log.Fatalf(ctx, "txn committed but heartbeat loop hasn't been signaled to stop: %s", h.mu.txn)
+		}
+		// If the transaction is aborted, there's no point in heartbeating. The
+		// client needs to send a rollback.
+		return false
 	}
 
 	// Clone the txn in order to put it in the heartbeat request.
@@ -397,7 +400,7 @@ func (h *txnHeartbeater) abortTxnAsyncLocked(ctx context.Context) {
 			}
 		},
 	); err != nil {
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "%v", err)
 	}
 }
 

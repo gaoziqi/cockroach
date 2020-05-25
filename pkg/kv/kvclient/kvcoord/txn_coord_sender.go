@@ -172,7 +172,7 @@ type txnInterceptor interface {
 
 	// importLeafFinalState updates any internal state held inside the
 	// interceptor from the given LeafTxn final state.
-	importLeafFinalState(*roachpb.LeafTxnFinalState)
+	importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState)
 
 	// epochBumpedLocked resets the interceptor in the case of a txn epoch
 	// increment.
@@ -217,10 +217,6 @@ func newRootTxnCoordSender(
 	// txnLockGatekeeper at the bottom of the stack to connect it with the
 	// TxnCoordSender's wrapped sender. First, each of the interceptor objects
 	// is initialized.
-	var riGen RangeIteratorGen
-	if ds, ok := tcf.wrapped.(*DistSender); ok {
-		riGen = ds.rangeIteratorGen
-	}
 	tcs.interceptorAlloc.txnHeartbeater.init(
 		tcf.AmbientContext,
 		tcs.stopper,
@@ -241,7 +237,7 @@ func newRootTxnCoordSender(
 		clock:   tcs.clock,
 		txn:     &tcs.mu.txn,
 	}
-	tcs.initCommonInterceptors(tcf, txn, kv.RootTxn, riGen)
+	tcs.initCommonInterceptors(tcf, txn, kv.RootTxn)
 
 	// Once the interceptors are initialized, piece them all together in the
 	// correct order.
@@ -279,8 +275,12 @@ func newRootTxnCoordSender(
 }
 
 func (tc *TxnCoordSender) initCommonInterceptors(
-	tcf *TxnCoordSenderFactory, txn *roachpb.Transaction, typ kv.TxnType, riGen RangeIteratorGen,
+	tcf *TxnCoordSenderFactory, txn *roachpb.Transaction, typ kv.TxnType,
 ) {
+	var riGen rangeIteratorFactory
+	if ds, ok := tcf.wrapped.(*DistSender); ok {
+		riGen.ds = ds
+	}
 	tc.interceptorAlloc.txnPipeliner = txnPipeliner{
 		st:    tcf.st,
 		riGen: riGen,
@@ -288,13 +288,16 @@ func (tc *TxnCoordSender) initCommonInterceptors(
 	tc.interceptorAlloc.txnSpanRefresher = txnSpanRefresher{
 		st:    tcf.st,
 		knobs: &tcf.testingKnobs,
+		riGen: riGen,
 		// We can only allow refresh span retries on root transactions
 		// because those are the only places where we have all of the
 		// refresh spans. If this is a leaf, as in a distributed sql flow,
 		// we need to propagate the error to the root for an epoch restart.
-		canAutoRetry:                    typ == kv.RootTxn,
-		autoRetryCounter:                tc.metrics.AutoRetries,
-		refreshSpanBytesExceededCounter: tc.metrics.RefreshSpanBytesExceeded,
+		canAutoRetry:                  typ == kv.RootTxn,
+		refreshSuccess:                tc.metrics.RefreshSuccess,
+		refreshFail:                   tc.metrics.RefreshFail,
+		refreshFailWithCondensedSpans: tc.metrics.RefreshFailWithCondensedSpans,
+		refreshMemoryLimitExceeded:    tc.metrics.RefreshMemoryLimitExceeded,
 	}
 	tc.interceptorAlloc.txnLockGatekeeper = txnLockGatekeeper{
 		wrapped:                 tc.wrapped,
@@ -348,11 +351,7 @@ func newLeafTxnCoordSender(
 	// txnLockGatekeeper at the bottom of the stack to connect it with the
 	// TxnCoordSender's wrapped sender. First, each of the interceptor objects
 	// is initialized.
-	var riGen RangeIteratorGen
-	if ds, ok := tcf.wrapped.(*DistSender); ok {
-		riGen = ds.rangeIteratorGen
-	}
-	tcs.initCommonInterceptors(tcf, txn, kv.LeafTxn, riGen)
+	tcs.initCommonInterceptors(tcf, txn, kv.LeafTxn)
 
 	// Per-interceptor leaf initialization. If/when more interceptors
 	// need leaf initialization, this should be turned into an interface
@@ -781,21 +780,50 @@ func (tc *TxnCoordSender) updateStateLocked(
 		return roachpb.NewError(tc.handleRetryableErrLocked(ctx, pErr))
 	}
 
-	// This is the non-retriable error case. The client is expected to send a
-	// rollback.
-	if errTxn := pErr.GetTxn(); errTxn != nil {
+	// This is the non-retriable error case.
+
+	// Most errors cause the transaction to not accept further requests (except a
+	// rollback), but some errors are safe to allow continuing (in particular
+	// ConditionFailedError). In particular, SQL can recover by rolling back to a
+	// savepoint.
+	if roachpb.ErrPriority(pErr.GetDetail()) != roachpb.ErrorScoreUnambiguousError {
 		tc.mu.txnState = txnError
 		tc.mu.storedErr = roachpb.NewError(&roachpb.TxnAlreadyEncounteredErrorError{
 			PrevError: pErr.String(),
 		})
-		tc.mu.txn.Update(errTxn)
-		if errTxn.Status != roachpb.PENDING {
-			// We only expect TransactionAbortedError to carry an aborted txn.
-			log.Errorf(ctx, "programming error: ABORTED txn in error: %s. txn: %s", pErr, errTxn)
-			tc.cleanupTxnLocked(ctx)
+	}
+
+	// Update our transaction with any information the error has.
+	if errTxn := pErr.GetTxn(); errTxn != nil {
+		if errTxn.Status == roachpb.COMMITTED {
+			sanityCheckCommittedErr(ctx, pErr, ba)
 		}
+		tc.mu.txn.Update(errTxn)
 	}
 	return pErr
+}
+
+// sanityCheckCommittedErr verifies the circumstances in which we're receiving
+// an error indicating a COMMITTED transaction. Only rollbacks should be
+// encountering such errors. Marking a transaction as explicitly-committed can
+// also encounter these errors, but those errors don't make it to the
+// TxnCoordSender.
+func sanityCheckCommittedErr(ctx context.Context, pErr *roachpb.Error, ba roachpb.BatchRequest) {
+	errTxn := pErr.GetTxn()
+	if errTxn == nil || errTxn.Status != roachpb.COMMITTED {
+		// We shouldn't have been called.
+		return
+	}
+	// The only case in which an error can have a COMMITTED transaction in it is
+	// when the request was a rollback. Rollbacks can race with commits if a
+	// context timeout expires while a commit request is in flight.
+	if ba.IsSingleAbortTxnRequest() {
+		return
+	}
+	// Finding out about our transaction being committed indicates a serious bug.
+	// Requests are not supposed to be sent on transactions after they are
+	// committed.
+	log.Fatalf(ctx, "transaction unexpectedly committed: %s. ba: %s. txn: %s.", pErr, ba, errTxn)
 }
 
 // setTxnAnchorKey sets the key at which to anchor the transaction record. The
@@ -854,6 +882,13 @@ func (tc *TxnCoordSender) SetDebugName(name string) {
 		panic("cannot change the debug name of a running transaction")
 	}
 	tc.mu.txn.Name = name
+}
+
+// String is part of the client.TxnSender interface.
+func (tc *TxnCoordSender) String() string {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.mu.txn.String()
 }
 
 // ReadTimestamp is part of the client.TxnSender interface.
@@ -1071,7 +1106,7 @@ func (tc *TxnCoordSender) UpdateRootWithLeafFinalState(
 
 	tc.mu.txn.Update(&tfs.Txn)
 	for _, reqInt := range tc.interceptorStack {
-		reqInt.importLeafFinalState(tfs)
+		reqInt.importLeafFinalState(ctx, tfs)
 	}
 }
 

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 image=cockroachdb/builder
-version=20200115-154509
+version=20200421-180956
 
 function init() {
   docker build --tag="${image}" "$(dirname "${0}")/builder"
@@ -42,7 +42,8 @@ if [ "$(uname)" = "Darwin" ]; then
   cached_volume_mode=:cached
 fi
 
-GOPATH=$(go env GOPATH)
+# We don't want this to emit -json output.
+GOPATH=$(GOFLAGS=; go env GOPATH)
 gopath0=${GOPATH%%:*}
 gocache=${GOCACHEPATH-$gopath0}
 
@@ -120,16 +121,15 @@ vols="${vols} --volume=${HOME}/.yarn-cache:${container_home}/.yarn-cache${cached
 
 # If we're running in an environment that's using git alternates, like TeamCity,
 # we must mount the path to the real git objects for git to work in the container.
-alternates_file=${cockroach_toplevel}/.git/objects/info/alternates
-if test -e "${alternates_file}"; then
-  alternates_path=$(cat "${alternates_file}")
-  vols="${vols} --volume=${alternates_path}:${alternates_path}${cached_volume_mode}"
-fi
+# alternates_file=${cockroach_toplevel}/.git/objects/info/alternates
+# if test -e "${alternates_file}"; then
+#   alternates_path=$(cat "${alternates_file}")
+#   vols="${vols} --volume=${alternates_path}:${alternates_path}${cached_volume_mode}"
+# fi
 
-backtrace_dir=${cockroach_toplevel}/../../cockroachlabs/backtrace
-if test -d "${backtrace_dir}"; then
-  vols="${vols} --volume=${backtrace_dir}:/opt/backtrace${cached_volume_mode}"
-  vols="${vols} --volume=${backtrace_dir}/cockroach.cf:${container_home}/.coroner.cf${cached_volume_mode}"
+teamcity_alternates="/home/agent/system/git/"
+if test -d "${teamcity_alternates}"; then
+    vols="${vols} --volume=${teamcity_alternates}:${teamcity_alternates}${cached_volume_mode}"
 fi
 
 if [ "${BUILDER_HIDE_GOPATH_SRC:-}" != "1" ]; then
@@ -143,6 +143,8 @@ vols="${vols} --volume=${cockroach_toplevel}:/go/src/github.com/cockroachdb/cock
 # are nested, as they are here.)
 mkdir -p "${cockroach_toplevel}"/bin{.docker_amd64,}
 vols="${vols} --volume=${cockroach_toplevel}/bin.docker_amd64:/go/src/github.com/cockroachdb/cockroach/bin${delegated_volume_mode}"
+mkdir -p "${cockroach_toplevel}"/lib{.docker_amd64,}
+vols="${vols} --volume=${cockroach_toplevel}/lib.docker_amd64:/go/src/github.com/cockroachdb/cockroach/lib${delegated_volume_mode}"
 
 mkdir -p "${gocache}"/docker/bin
 vols="${vols} --volume=${gocache}/docker/bin:/go/bin${delegated_volume_mode}"

@@ -78,7 +78,7 @@ func splitSQLSemicolon(data []byte, atEOF bool) (advance int, token []byte, err 
 func (p *postgreStream) Next() (interface{}, error) {
 	if p.copy != nil {
 		row, err := p.copy.Next()
-		if err == errCopyDone {
+		if errors.Is(err, errCopyDone) {
 			p.copy = nil
 			return errCopyDone, nil
 		}
@@ -125,8 +125,8 @@ func (p *postgreStream) Next() (interface{}, error) {
 		}
 	}
 	if err := p.s.Err(); err != nil {
-		if err == bufio.ErrTooLong {
-			err = errors.New("line too long")
+		if errors.Is(err, bufio.ErrTooLong) {
+			err = errors.HandledWithMessage(err, "line too long")
 		}
 		return nil, err
 	}
@@ -178,7 +178,7 @@ func (regclassRewriter) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Exp
 			if len(t.Exprs) > 0 {
 				switch e := t.Exprs[0].(type) {
 				case *tree.CastExpr:
-					if e.Type.Oid() == oid.T_regclass {
+					if typ, ok := tree.GetStaticallyKnownType(e.Type); ok && typ.Oid() == oid.T_regclass {
 						// tree.Visitor says we should make a copy, but since copyNode is unexported
 						// and there's no planner here, I think it's safe to directly modify the
 						// statement here.
@@ -275,7 +275,7 @@ func readPostgresCreateTable(
 				}
 				for _, constraint := range constraints {
 					if err := sql.ResolveFK(
-						evalCtx.Ctx(), nil /* txn */, fks.resolver, desc, constraint, backrefs, sql.NewTable, tree.ValidationDefault, p.ExecCfg().Settings,
+						evalCtx.Ctx(), nil /* txn */, fks.resolver, desc, constraint, backrefs, sql.NewTable, tree.ValidationDefault, evalCtx,
 					); err != nil {
 						return nil, err
 					}
@@ -635,7 +635,7 @@ func (m *pgDumpReader) readFile(
 			if seq == nil {
 				break
 			}
-			key, val, err := sql.MakeSequenceKeyVal(seq.Desc, val, isCalled)
+			key, val, err := sql.MakeSequenceKeyVal(keys.TODOSQLCodec, seq.Desc, val, isCalled)
 			if err != nil {
 				return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 			}

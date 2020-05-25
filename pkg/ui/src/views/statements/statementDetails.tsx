@@ -47,7 +47,8 @@ import classNames from "classnames";
 import {
   selectDiagnosticsReportsCountByStatementFingerprint,
 } from "src/redux/statements/statementsSelectors";
-import { Button, BackIcon } from "oss/src/components/button";
+import { Button, BackIcon } from "src/components/button";
+import { trackSubnavSelection } from "src/util/analytics";
 
 const { TabPane } = Tabs;
 
@@ -165,12 +166,12 @@ export class StatementDetails extends React.Component<StatementDetailsProps, Sta
     });
   }
 
-  componentWillMount() {
+  componentDidMount() {
     this.props.refreshStatements();
     this.props.refreshStatementDiagnosticsRequests();
   }
 
-  componentWillReceiveProps() {
+  componentDidUpdate() {
     this.props.refreshStatements();
     this.props.refreshStatementDiagnosticsRequests();
   }
@@ -248,8 +249,8 @@ export class StatementDetails extends React.Component<StatementDetailsProps, Sta
     const logicalPlan = stats.sensitive_info && stats.sensitive_info.most_recent_plan_description;
     const duration = (v: number) => Duration(v * 1e9);
     return (
-      <Tabs defaultActiveKey="1" className="cockroach--tabs">
-        <TabPane tab="Overview" key="1">
+      <Tabs defaultActiveKey="1" className="cockroach--tabs" onChange={trackSubnavSelection}>
+        <TabPane tab="Overview" key="overview">
           <Row gutter={16}>
             <Col className="gutter-row" span={16}>
               <SqlBox value={ statement } />
@@ -324,10 +325,10 @@ export class StatementDetails extends React.Component<StatementDetailsProps, Sta
             </Col>
           </Row>
         </TabPane>
-        <TabPane tab={`Diagnostics ${diagnosticsCount > 0 ? `(${diagnosticsCount})` : ""}`} key="2">
+        <TabPane tab={`Diagnostics ${diagnosticsCount > 0 ? `(${diagnosticsCount})` : ""}`} key="diagnostics">
           <DiagnosticsView statementFingerprint={statement} />
         </TabPane>
-        <TabPane tab="Logical Plan" key="3">
+        <TabPane tab="Logical Plan" key="logical-plan">
           <SummaryCard>
             <PlanView
               title="Logical Plan"
@@ -335,7 +336,7 @@ export class StatementDetails extends React.Component<StatementDetailsProps, Sta
             />
           </SummaryCard>
         </TabPane>
-        <TabPane tab="Execution Stats" key="4">
+        <TabPane tab="Execution Stats" key="execution-stats">
           <SummaryCard>
             <h2 className="base-heading summary--card__title">
               Execution Latency By Phase
@@ -466,31 +467,43 @@ function fractionMatching(stats: ExecutionStatistics[], predicate: (stmt: Execut
   return { numerator, denominator };
 }
 
-function filterByRouterParamsPredicate(match: Match<any>): (stat: ExecutionStatistics) => boolean {
+function filterByRouterParamsPredicate(match: Match<any>, internalAppNamePrefix: string): (stat: ExecutionStatistics) => boolean {
   const statement = getMatchParamByName(match, statementAttr);
   const implicitTxn = (getMatchParamByName(match, implicitTxnAttr) === "true");
   let app = getMatchParamByName(match, appAttr);
 
+  const filterByStatementAndImplicitTxn = (stmt: ExecutionStatistics) =>
+    stmt.statement === statement && stmt.implicit_txn === implicitTxn;
+
   if (!app) {
-    return (stmt: ExecutionStatistics) => stmt.statement === statement && stmt.implicit_txn === implicitTxn;
+    return filterByStatementAndImplicitTxn;
   }
 
   if (app === "(unset)") {
     app = "";
   }
-  return (stmt: ExecutionStatistics) => stmt.statement === statement && stmt.implicit_txn === implicitTxn && stmt.app === app;
+
+  if (app === "(internal)") {
+    return (stmt: ExecutionStatistics) =>
+      filterByStatementAndImplicitTxn(stmt) && stmt.app.startsWith(internalAppNamePrefix);
+  }
+
+  return (stmt: ExecutionStatistics) =>
+    filterByStatementAndImplicitTxn(stmt) && stmt.app === app;
 }
 
 export const selectStatement = createSelector(
-  (state: StatementsState) => state.cachedData.statements.data && state.cachedData.statements.data.statements,
+  (state: StatementsState) => state.cachedData.statements,
   (_state: StatementsState, props: RouteComponentProps) => props,
-  (statements, props) => {
+  (statementsState, props) => {
+    const statements = statementsState.data?.statements;
     if (!statements) {
       return null;
     }
 
+    const internalAppNamePrefix = statementsState.data?.internal_app_name_prefix;
     const flattened = flattenStatementStats(statements);
-    const results = _.filter(flattened, filterByRouterParamsPredicate(props.match));
+    const results = _.filter(flattened, filterByRouterParamsPredicate(props.match, internalAppNamePrefix));
     const statement = getMatchParamByName(props.match, statementAttr);
     return {
       statement,

@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -34,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft/raftpb"
@@ -1046,14 +1044,6 @@ func TestLeaseEqual(t *testing.T) {
 	}
 }
 
-func TestLeaseFuzzNullability(t *testing.T) {
-	var l Lease
-	protoutil.Walk(&l, protoutil.ZeroInsertingVisitor)
-	if l.Expiration == nil {
-		t.Fatal("unexpectedly nil expiration")
-	}
-}
-
 func TestSpanOverlaps(t *testing.T) {
 	sA := Span{Key: []byte("a")}
 	sD := Span{Key: []byte("d")}
@@ -1682,9 +1672,8 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 				learner,
 				repl3,
 			},
-			NextReplicaID:        10,
-			Generation:           proto.Int64(5),
-			GenerationComparable: proto.Bool(true),
+			NextReplicaID: 10,
+			Generation:    5,
 		},
 	}
 	act := crt.String()
@@ -1926,13 +1915,11 @@ func TestAsLockUpdates(t *testing.T) {
 	txn.Status = COMMITTED
 	txn.IgnoredSeqNums = []enginepb.IgnoredSeqNumRange{{Start: 0, End: 0}}
 
-	dur := lock.Unreplicated
 	spans := []Span{{Key: Key("a"), EndKey: Key("b")}}
-	for _, intent := range AsLockUpdates(&txn, spans, dur) {
+	for _, intent := range AsLockUpdates(&txn, spans) {
 		require.Equal(t, txn.Status, intent.Status)
 		require.Equal(t, txn.IgnoredSeqNums, intent.IgnoredSeqNums)
 		require.Equal(t, txn.TxnMeta, intent.Txn)
-		require.Equal(t, dur, intent.Durability)
 	}
 }
 

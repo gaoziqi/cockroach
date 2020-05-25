@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -31,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // RangefeedEnabled is a cluster setting that enables rangefeed requests.
@@ -130,8 +130,8 @@ func (i iteratorWithCloser) Close() {
 func (r *Replica) RangeFeed(
 	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) *roachpb.Error {
-	if !RangefeedEnabled.Get(&r.store.cfg.Settings.SV) {
-		return roachpb.NewErrorf("rangefeeds require the kv.rangefeed.enabled setting. See " +
+	if !r.isSystemRange() && !RangefeedEnabled.Get(&r.store.cfg.Settings.SV) {
+		return roachpb.NewErrorf("rangefeeds require the kv.rangefeed.enabled setting. See %s",
 			base.DocsURL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 	}
 	ctx := r.AnnotateCtx(stream.Context())
@@ -440,7 +440,7 @@ func (r *Replica) numRangefeedRegistrations() int {
 // the state of the Replica before the operations in the logical op log are
 // applied. No-op if a rangefeed is not active. Requires raftMu to be locked.
 func (r *Replica) populatePrevValsInLogicalOpLogRaftMuLocked(
-	ctx context.Context, ops *storagepb.LogicalOpLog, prevReader storage.Reader,
+	ctx context.Context, ops *kvserverpb.LogicalOpLog, prevReader storage.Reader,
 ) {
 	p, filter := r.getRangefeedProcessorAndFilter()
 	if p == nil {
@@ -498,7 +498,7 @@ func (r *Replica) populatePrevValsInLogicalOpLogRaftMuLocked(
 // them to the rangefeed processor. No-op if a rangefeed is not active. Requires
 // raftMu to be locked.
 func (r *Replica) handleLogicalOpLogRaftMuLocked(
-	ctx context.Context, ops *storagepb.LogicalOpLog, reader storage.Reader,
+	ctx context.Context, ops *kvserverpb.LogicalOpLog, reader storage.Reader,
 ) {
 	p, filter := r.getRangefeedProcessorAndFilter()
 	if p == nil {
@@ -595,7 +595,7 @@ func (r *Replica) handleClosedTimestampUpdateRaftMuLocked(ctx context.Context) {
 	}
 
 	// Determine what the maximum closed timestamp is for this replica.
-	closedTS := r.maxClosed(ctx)
+	closedTS, _ := r.maxClosed(ctx)
 
 	// If the closed timestamp is sufficiently stale, signal that we want an
 	// update to the leaseholder so that it will eventually begin to progress
@@ -657,7 +657,7 @@ func (r *Replica) ensureClosedTimestampStarted(ctx context.Context) *roachpb.Err
 	// Make sure there's a leaseholder. If there's no leaseholder, there's no
 	// closed timestamp updates.
 	var leaseholderNodeID roachpb.NodeID
-	_, _, err := r.redirectOnOrAcquireLease(ctx)
+	_, err := r.redirectOnOrAcquireLease(ctx)
 	if err == nil {
 		// We have the lease. Request is essentially a wrapper for calling EmitMLAI
 		// on a remote node, so cut out the middleman.

@@ -15,10 +15,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvfeed"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
@@ -26,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -50,12 +54,13 @@ type emitEntry struct {
 // returns a closure that may be repeatedly called to advance the changefeed.
 // The returned closure is not threadsafe.
 func kvsToRows(
-	leaseMgr *sql.LeaseManager,
+	codec keys.SQLCodec,
+	leaseMgr *lease.Manager,
 	details jobspb.ChangefeedDetails,
 	inputFn func(context.Context) (kvfeed.Event, error),
 ) func(context.Context) ([]emitEntry, error) {
 	_, withDiff := details.Opts[changefeedbase.OptDiff]
-	rfCache := newRowFetcherCache(leaseMgr)
+	rfCache := newRowFetcherCache(codec, leaseMgr)
 
 	var kvs row.SpanKVFetcher
 	appendEmitEntryForKV := func(
@@ -371,13 +376,34 @@ func emitResolvedTimestamp(
 	return nil
 }
 
+// createProtectedTimestampRecord will create a record to protect the spans for
+// this changefeed at the resolved timestamp. The progress struct will be
+// updated to refer to this new protected timestamp record.
+func createProtectedTimestampRecord(
+	ctx context.Context,
+	pts protectedts.Storage,
+	txn *kv.Txn,
+	jobID int64,
+	targets jobspb.ChangefeedTargets,
+	resolved hlc.Timestamp,
+	progress *jobspb.ChangefeedProgress,
+) error {
+	progress.ProtectedTimestampRecord = uuid.MakeV4()
+	log.VEventf(ctx, 2, "creating protected timestamp %v at %v",
+		progress.ProtectedTimestampRecord, resolved)
+	spansToProtect := makeSpansToProtect(targets)
+	rec := jobsprotectedts.MakeRecord(
+		progress.ProtectedTimestampRecord, jobID, resolved, spansToProtect)
+	return pts.Protect(ctx, txn, rec)
+}
+
 func makeSpansToProtect(targets jobspb.ChangefeedTargets) []roachpb.Span {
 	// NB: We add 1 because we're also going to protect system.descriptors.
 	// We protect system.descriptors because a changefeed needs all of the history
 	// of table descriptors to version data.
 	spansToProtect := make([]roachpb.Span, 0, len(targets)+1)
 	addTablePrefix := func(id uint32) {
-		tablePrefix := roachpb.Key(keys.MakeTablePrefix(id))
+		tablePrefix := keys.TODOSQLCodec.TablePrefix(id)
 		spansToProtect = append(spansToProtect, roachpb.Span{
 			Key:    tablePrefix,
 			EndKey: tablePrefix.PrefixEnd(),

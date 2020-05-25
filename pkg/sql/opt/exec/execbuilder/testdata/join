@@ -19,10 +19,10 @@ render          ·            ·
       │         equality     (x) = (x)
       ├── scan  ·            ·
       │         table        onecolumn@primary
-      │         spans        ALL
+      │         spans        FULL SCAN
       └── scan  ·            ·
 ·               table        twocolumn@primary
-·               spans        ALL
+·               spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT * FROM twocolumn AS a JOIN twocolumn AS b ON a.x = b.y
@@ -34,10 +34,10 @@ hash-join  ·            ·
  │         equality     (x) = (y)
  ├── scan  ·            ·
  │         table        twocolumn@primary
- │         spans        ALL
+ │         spans        FULL SCAN
  └── scan  ·            ·
 ·          table        twocolumn@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT * FROM twocolumn AS a JOIN twocolumn AS b ON a.x = 44
@@ -49,10 +49,10 @@ render           ·            ·
       │          type         cross
       ├── scan   ·            ·
       │          table        twocolumn@primary
-      │          spans        ALL
+      │          spans        FULL SCAN
       └── scan   ·            ·
 ·                table        twocolumn@primary
-·                spans        ALL
+·                spans        FULL SCAN
 ·                filter       x = 44
 
 query TTT
@@ -65,10 +65,10 @@ hash-join  ·            ·
  │         equality     (x) = (y)
  ├── scan  ·            ·
  │         table        onecolumn@primary
- │         spans        ALL
+ │         spans        FULL SCAN
  └── scan  ·            ·
 ·          table        twocolumn@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT * FROM onecolumn JOIN twocolumn ON onecolumn.x = twocolumn.y
@@ -80,10 +80,10 @@ hash-join  ·            ·
  │         equality     (x) = (y)
  ├── scan  ·            ·
  │         table        onecolumn@primary
- │         spans        ALL
+ │         spans        FULL SCAN
  └── scan  ·            ·
 ·          table        twocolumn@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 query TTT
 EXPLAIN SELECT * FROM
@@ -105,19 +105,19 @@ limit                ·            ·
       │    │         equality     (x) = (x)
       │    ├── scan  ·            ·
       │    │         table        onecolumn@primary
-      │    │         spans        ALL
+      │    │         spans        FULL SCAN
       │    └── scan  ·            ·
       │              table        twocolumn@primary
-      │              spans        ALL
+      │              spans        FULL SCAN
       └── hash-join  ·            ·
            │         type         inner
            │         equality     (x) = (x)
            ├── scan  ·            ·
            │         table        onecolumn@primary
-           │         spans        ALL
+           │         spans        FULL SCAN
            └── scan  ·            ·
 ·                    table        twocolumn@primary
-·                    spans        ALL
+·                    spans        FULL SCAN
 
 # The following queries verify that only the necessary columns are scanned.
 query TTTTT
@@ -129,10 +129,10 @@ cross-join  ·            ·                  (x, y)  ·
  │          type         cross              ·       ·
  ├── scan   ·            ·                  (x)     ·
  │          table        twocolumn@primary  ·       ·
- │          spans        ALL                ·       ·
+ │          spans        FULL SCAN          ·       ·
  └── scan   ·            ·                  (y)     ·
 ·           table        twocolumn@primary  ·       ·
-·           spans        ALL                ·       ·
+·           spans        FULL SCAN          ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT b.y FROM (twocolumn AS a JOIN twocolumn AS b USING(x))
@@ -146,10 +146,10 @@ render          ·            ·                  (y)        ·
       │         equality     (x) = (x)          ·          ·
       ├── scan  ·            ·                  (x)        ·
       │         table        twocolumn@primary  ·          ·
-      │         spans        ALL                ·          ·
+      │         spans        FULL SCAN          ·          ·
       └── scan  ·            ·                  (x, y)     ·
 ·               table        twocolumn@primary  ·          ·
-·               spans        ALL                ·          ·
+·               spans        FULL SCAN          ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT b.y FROM (twocolumn AS a JOIN twocolumn AS b ON a.x = b.x)
@@ -163,10 +163,10 @@ render          ·            ·                  (y)        ·
       │         equality     (x) = (x)          ·          ·
       ├── scan  ·            ·                  (x)        ·
       │         table        twocolumn@primary  ·          ·
-      │         spans        ALL                ·          ·
+      │         spans        FULL SCAN          ·          ·
       └── scan  ·            ·                  (x, y)     ·
 ·               table        twocolumn@primary  ·          ·
-·               spans        ALL                ·          ·
+·               spans        FULL SCAN          ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT a.x FROM (twocolumn AS a JOIN twocolumn AS b ON a.x < b.y)
@@ -180,10 +180,10 @@ render           ·            ·                  (x)     ·
       │          pred         x < y              ·       ·
       ├── scan   ·            ·                  (x)     ·
       │          table        twocolumn@primary  ·       ·
-      │          spans        ALL                ·       ·
+      │          spans        FULL SCAN          ·       ·
       └── scan   ·            ·                  (y)     ·
 ·                table        twocolumn@primary  ·       ·
-·                spans        ALL                ·       ·
+·                spans        FULL SCAN          ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM (SELECT x, 2 two FROM onecolumn) NATURAL FULL JOIN (SELECT x, y+1 plus1 FROM twocolumn)
@@ -202,13 +202,13 @@ render               ·            ·                  (x, two, plus1)     ·
       │    │         render 1     x                  ·                   ·
       │    └── scan  ·            ·                  (x)                 ·
       │              table        onecolumn@primary  ·                   ·
-      │              spans        ALL                ·                   ·
+      │              spans        FULL SCAN          ·                   ·
       └── render     ·            ·                  (plus1, x)          ·
            │         render 0     y + 1              ·                   ·
            │         render 1     x                  ·                   ·
            └── scan  ·            ·                  (x, y)              ·
 ·                    table        twocolumn@primary  ·                   ·
-·                    spans        ALL                ·                   ·
+·                    spans        FULL SCAN          ·                   ·
 
 # Ensure that the ordering information for the result of joins is sane. (#12037)
 query TTTTT
@@ -312,94 +312,145 @@ SELECT level, node_type, field, description FROM [EXPLAIN (VERBOSE) SELECT
            pos.n
   ] WHERE node_type <> 'values' AND field <> 'size'
 ----
-0   ·              distributed  false
-0   ·              vectorized   false
-0   render         ·            ·
-0   ·              render 0     pktable_cat
-0   ·              render 1     nspname
-0   ·              render 2     relname
-0   ·              render 3     attname
-0   ·              render 4     pktable_cat
-0   ·              render 5     nspname
-0   ·              render 6     relname
-0   ·              render 7     attname
-0   ·              render 8     generate_series
-0   ·              render 9     update_rule
-0   ·              render 10    delete_rule
-0   ·              render 11    conname
-0   ·              render 12    relname
-0   ·              render 13    deferrability
-1   sort           ·            ·
-1   ·              order        +nspname,+relname,+conname,+generate_series
-2   render         ·            ·
-2   ·              render 0     CAST(NULL AS STRING)
-2   ·              render 1     CASE confupdtype WHEN 'c' THEN 0 WHEN 'n' THEN 2 WHEN 'd' THEN 4 WHEN 'r' THEN 1 WHEN 'a' THEN 3 END
-2   ·              render 2     CASE confdeltype WHEN 'c' THEN 0 WHEN 'n' THEN 2 WHEN 'd' THEN 4 WHEN 'r' THEN 1 WHEN 'a' THEN 3 END
-2   ·              render 3     CASE WHEN condeferrable AND condeferred THEN 5 WHEN condeferrable THEN 6 ELSE 7 END
-2   ·              render 4     nspname
-2   ·              render 5     relname
-2   ·              render 6     attname
-2   ·              render 7     nspname
-2   ·              render 8     relname
-2   ·              render 9     attname
-2   ·              render 10    conname
-2   ·              render 11    generate_series
-2   ·              render 12    relname
-3   hash-join      ·            ·
-3   ·              type         inner
-3   ·              equality     (refobjid) = (oid)
-4   hash-join      ·            ·
-4   ·              type         inner
-4   ·              equality     (oid) = (objid)
-5   cross-join     ·            ·
-5   ·              type         inner
-5   ·              pred         (attnum = confkey[generate_series]) AND (attnum = conkey[generate_series])
-6   hash-join      ·            ·
-6   ·              type         inner
-6   ·              equality     (oid, oid) = (confrelid, conrelid)
-7   hash-join      ·            ·
-7   ·              type         inner
-7   ·              equality     (oid) = (attrelid)
-8   hash-join      ·            ·
-8   ·              type         inner
-8   ·              equality     (oid) = (relnamespace)
-9   hash-join      ·            ·
-9   ·              type         inner
-9   ·              equality     (attrelid) = (oid)
-10  cross-join     ·            ·
-10  ·              type         cross
-11  virtual table  ·            ·
-11  ·              source       ·
-11  filter         ·            ·
-11  ·              filter       nspname = 'public'
-12  virtual table  ·            ·
-12  ·              source       ·
-10  hash-join      ·            ·
-10  ·              type         inner
-10  ·              equality     (oid) = (relnamespace)
-11  virtual table  ·            ·
-11  ·              source       ·
-11  virtual table  ·            ·
-11  ·              source       ·
-9   filter         ·            ·
-9   ·              filter       relname = 'orders'
-10  virtual table  ·            ·
-10  ·              source       ·
-8   virtual table  ·            ·
-8   ·              source       ·
-7   filter         ·            ·
-7   ·              filter       contype = 'f'
-8   virtual table  ·            ·
-8   ·              source       ·
-6   project set    ·            ·
-6   ·              render 0     generate_series(1, 32)
-7   emptyrow       ·            ·
-5   virtual table  ·            ·
-5   ·              source       ·
-4   filter         ·            ·
-4   ·              filter       relkind = 'i'
-5   virtual table  ·            ·
-5   ·              source       ·
+0   ·              distributed         false
+0   ·              vectorized          false
+0   render         ·                   ·
+0   ·              render 0            pktable_cat
+0   ·              render 1            nspname
+0   ·              render 2            relname
+0   ·              render 3            attname
+0   ·              render 4            pktable_cat
+0   ·              render 5            nspname
+0   ·              render 6            relname
+0   ·              render 7            attname
+0   ·              render 8            generate_series
+0   ·              render 9            update_rule
+0   ·              render 10           delete_rule
+0   ·              render 11           conname
+0   ·              render 12           relname
+0   ·              render 13           deferrability
+1   sort           ·                   ·
+1   ·              order               +nspname,+relname,+conname,+generate_series
+2   render         ·                   ·
+2   ·              render 0            CAST(NULL AS STRING)
+2   ·              render 1            CASE confupdtype WHEN 'c' THEN 0 WHEN 'n' THEN 2 WHEN 'd' THEN 4 WHEN 'r' THEN 1 WHEN 'a' THEN 3 END
+2   ·              render 2            CASE confdeltype WHEN 'c' THEN 0 WHEN 'n' THEN 2 WHEN 'd' THEN 4 WHEN 'r' THEN 1 WHEN 'a' THEN 3 END
+2   ·              render 3            CASE WHEN condeferrable AND condeferred THEN 5 WHEN condeferrable THEN 6 ELSE 7 END
+2   ·              render 4            nspname
+2   ·              render 5            relname
+2   ·              render 6            attname
+2   ·              render 7            nspname
+2   ·              render 8            relname
+2   ·              render 9            attname
+2   ·              render 10           conname
+2   ·              render 11           generate_series
+2   ·              render 12           relname
+3   hash-join      ·                   ·
+3   ·              type                inner
+3   ·              equality            (refobjid) = (oid)
+3   ·              right cols are key  ·
+4   hash-join      ·                   ·
+4   ·              type                inner
+4   ·              equality            (objid) = (oid)
+5   render         ·                   ·
+5   ·              render 0            objid
+5   ·              render 1            refobjid
+6   virtual table  ·                   ·
+6   ·              source              pg_depend@primary
+5   cross-join     ·                   ·
+5   ·              type                inner
+5   ·              pred                (attnum = confkey[generate_series]) AND (attnum = conkey[generate_series])
+6   hash-join      ·                   ·
+6   ·              type                inner
+6   ·              equality            (oid, oid) = (confrelid, conrelid)
+6   ·              right cols are key  ·
+7   hash-join      ·                   ·
+7   ·              type                inner
+7   ·              equality            (oid) = (attrelid)
+7   ·              right cols are key  ·
+8   hash-join      ·                   ·
+8   ·              type                inner
+8   ·              equality            (oid) = (relnamespace)
+9   cross-join     ·                   ·
+9   ·              type                cross
+10  hash-join      ·                   ·
+10  ·              type                inner
+10  ·              equality            (oid) = (relnamespace)
+11  render         ·                   ·
+11  ·              render 0            oid
+11  ·              render 1            nspname
+12  virtual table  ·                   ·
+12  ·              source              pg_namespace@primary
+11  merge-join     ·                   ·
+11  ·              type                inner
+11  ·              equality            (oid) = (attrelid)
+11  ·              left cols are key   ·
+11  ·              right cols are key  ·
+11  ·              mergeJoinOrder      +"(oid=attrelid)"
+12  sort           ·                   ·
+12  ·              order               +oid
+13  render         ·                   ·
+13  ·              render 0            oid
+13  ·              render 1            relname
+13  ·              render 2            relnamespace
+14  virtual table  ·                   ·
+14  ·              source              pg_class@pg_class_oid_idx
+12  sort           ·                   ·
+12  ·              order               +attrelid
+13  render         ·                   ·
+13  ·              render 0            attrelid
+13  ·              render 1            attname
+13  ·              render 2            attnum
+14  virtual table  ·                   ·
+14  ·              source              pg_attribute@pg_attribute_attrelid_idx
+10  filter         ·                   ·
+10  ·              filter              nspname = 'public'
+11  render         ·                   ·
+11  ·              render 0            oid
+11  ·              render 1            nspname
+12  virtual table  ·                   ·
+12  ·              source              pg_namespace@primary
+9   filter         ·                   ·
+9   ·              filter              relname = 'orders'
+10  render         ·                   ·
+10  ·              render 0            oid
+10  ·              render 1            relname
+10  ·              render 2            relnamespace
+11  virtual table  ·                   ·
+11  ·              source              pg_class@primary
+8   render         ·                   ·
+8   ·              render 0            attrelid
+8   ·              render 1            attname
+8   ·              render 2            attnum
+9   virtual table  ·                   ·
+9   ·              source              pg_attribute@primary
+7   filter         ·                   ·
+7   ·              filter              contype = 'f'
+8   render         ·                   ·
+8   ·              render 0            oid
+8   ·              render 1            conname
+8   ·              render 2            contype
+8   ·              render 3            condeferrable
+8   ·              render 4            condeferred
+8   ·              render 5            conrelid
+8   ·              render 6            confrelid
+8   ·              render 7            confupdtype
+8   ·              render 8            confdeltype
+8   ·              render 9            conkey
+8   ·              render 10           confkey
+9   virtual table  ·                   ·
+9   ·              source              pg_constraint@primary
+6   project set    ·                   ·
+6   ·              render 0            generate_series(1, 32)
+7   emptyrow       ·                   ·
+4   filter         ·                   ·
+4   ·              filter              relkind = 'i'
+5   render         ·                   ·
+5   ·              render 0            oid
+5   ·              render 1            relname
+5   ·              render 2            relkind
+6   virtual table  ·                   ·
+6   ·              source              pg_class@primary
 
 # Ensure that left joins on non-null foreign keys turn into inner joins
 statement ok
@@ -417,10 +468,10 @@ merge-join  ·                   ·
  │          mergeJoinOrder      +"(cust=id)"
  ├── scan   ·                   ·
  │          table               cards@cards_auto_index_fk_cust_ref_customers
- │          spans               ALL
+ │          spans               FULL SCAN
  └── scan   ·                   ·
 ·           table               customers@primary
-·           spans               ALL
+·           spans               FULL SCAN
 
 # Tests for filter propagation through joins.
 
@@ -442,10 +493,10 @@ hash-join  ·                   ·
  │         right cols are key  ·
  ├── scan  ·                   ·
  │         table               pairs@primary
- │         spans               ALL
+ │         spans               FULL SCAN
  └── scan  ·                   ·
 ·          table               square@primary
-·          spans               ALL
+·          spans               FULL SCAN
 
 # The filter expression becomes an ON predicate.
 query TTTTT
@@ -467,10 +518,10 @@ render               ·            ·                 (a, b, n, sq)           ·
       │    │         render 2     b                 ·                       ·
       │    └── scan  ·            ·                 (a, b)                  ·
       │              table        pairs@primary     ·                       ·
-      │              spans        ALL               ·                       ·
+      │              spans        FULL SCAN         ·                       ·
       └── scan       ·            ·                 (n, sq)                 ·
 ·                    table        square@primary    ·                       ·
-·                    spans        ALL               ·                       ·
+·                    spans        FULL SCAN         ·                       ·
 
 # Query similar to the one above, but the filter refers to a rendered
 # expression and can't "break through".
@@ -496,10 +547,10 @@ render                     ·            ·               (a, b, n, sq)       ·
                 │          type         cross           ·                   ·
                 ├── scan   ·            ·               (a, b)              ·
                 │          table        pairs@primary   ·                   ·
-                │          spans        ALL             ·                   ·
+                │          spans        FULL SCAN       ·                   ·
                 └── scan   ·            ·               (n, sq)             ·
 ·                          table        square@primary  ·                   ·
-·                          spans        ALL             ·                   ·
+·                          spans        FULL SCAN       ·                   ·
 
 # The filter expression must stay on top of the outer join.
 query TTTTT
@@ -521,10 +572,10 @@ render               ·            ·                 (a, b, n, sq)           ·
       │    │         render 2     b                 ·                       ·
       │    └── scan  ·            ·                 (a, b)                  ·
       │              table        pairs@primary     ·                       ·
-      │              spans        ALL               ·                       ·
+      │              spans        FULL SCAN         ·                       ·
       └── scan       ·            ·                 (n, sq)                 ·
 ·                    table        square@primary    ·                       ·
-·                    spans        ALL               ·                       ·
+·                    spans        FULL SCAN         ·                       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM pairs FULL OUTER JOIN square ON pairs.a + pairs.b = square.sq WHERE pairs.b%2 <> square.sq%2
@@ -547,10 +598,10 @@ render                    ·            ·                    (a, b, n, sq)     
            │    │         render 2     b                    ·                       ·
            │    └── scan  ·            ·                    (a, b)                  ·
            │              table        pairs@primary        ·                       ·
-           │              spans        ALL                  ·                       ·
+           │              spans        FULL SCAN            ·                       ·
            └── scan       ·            ·                    (n, sq)                 ·
 ·                         table        square@primary       ·                       ·
-·                         spans        ALL                  ·                       ·
+·                         spans        FULL SCAN            ·                       ·
 
 # Filter propagation through outer joins.
 
@@ -572,7 +623,7 @@ filter          ·            ·
       │         pred         a > 1
       ├── scan  ·            ·
       │         table        pairs@primary
-      │         spans        ALL
+      │         spans        FULL SCAN
       │         filter       b > 1
       └── scan  ·            ·
 ·               table        square@primary
@@ -605,7 +656,7 @@ render               ·            ·
            │         spans        /2-
            └── scan  ·            ·
 ·                    table        pairs@primary
-·                    spans        ALL
+·                    spans        FULL SCAN
 ·                    filter       a > 1
 
 # The simpler plan for an inner join, to compare.
@@ -624,7 +675,7 @@ hash-join  ·            ·
  │         equality     (b) = (sq)
  ├── scan  ·            ·
  │         table        pairs@primary
- │         spans        ALL
+ │         spans        FULL SCAN
  │         filter       ((a > 1) AND ((a IS NULL) OR (a > 2))) AND ((a IS NULL) OR (a < b))
  └── scan  ·            ·
 ·          table        square@primary
@@ -650,10 +701,10 @@ render          ·            ·                (x)           ·
       │         equality     (x, y) = (x, y)  ·             ·
       ├── scan  ·            ·                (x, y)        ·
       │         table        t1@primary       ·             ·
-      │         spans        ALL              ·             ·
+      │         spans        FULL SCAN        ·             ·
       └── scan  ·            ·                (y, x)        ·
 ·               table        t2@primary       ·             ·
-·               spans        ALL              ·             ·
+·               spans        FULL SCAN        ·             ·
 
 # Tests for merge join ordering information.
 statement ok
@@ -680,10 +731,10 @@ hash-join  ·                   ·                      (a, b, c, d, a, b, c, d)
  │         right cols are key  ·                      ·                         ·
  ├── scan  ·                   ·                      (a, b, c, d)              ·
  │         table               pkba@primary           ·                         ·
- │         spans               ALL                    ·                         ·
+ │         spans               FULL SCAN              ·                         ·
  └── scan  ·                   ·                      (a, b, c, d)              ·
 ·          table               pkbc@primary           ·                         ·
-·          spans               ALL                    ·                         ·
+·          spans               FULL SCAN              ·                         ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM pkBA NATURAL JOIN pkBAD
@@ -702,10 +753,10 @@ render          ·                   ·                            (a, b, c, d) 
       │         right cols are key  ·                            ·                         ·
       ├── scan  ·                   ·                            (a, b, c, d)              ·
       │         table               pkba@primary                 ·                         ·
-      │         spans               ALL                          ·                         ·
+      │         spans               FULL SCAN                    ·                         ·
       └── scan  ·                   ·                            (a, b, c, d)              ·
 ·               table               pkbad@primary                ·                         ·
-·               spans               ALL                          ·                         ·
+·               spans               FULL SCAN                    ·                         ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM pkBAC AS l JOIN pkBAC AS r USING(a, b, c)
@@ -726,10 +777,10 @@ render           ·                   ·                           (a, b, c, d, 
       │          mergeJoinOrder      +"(b=b)",+"(a=a)",+"(c=c)"  ·                         ·
       ├── scan   ·                   ·                           (a, b, c, d)              +b,+a,+c
       │          table               pkbac@primary               ·                         ·
-      │          spans               ALL                         ·                         ·
+      │          spans               FULL SCAN                   ·                         ·
       └── scan   ·                   ·                           (a, b, c, d)              +b,+a,+c
 ·                table               pkbac@primary               ·                         ·
-·                spans               ALL                         ·                         ·
+·                spans               FULL SCAN                   ·                         ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM pkBAC AS l JOIN pkBAD AS r ON l.c = r.d AND l.a = r.a AND l.b = r.b
@@ -744,10 +795,10 @@ merge-join  ·                   ·                           (a, b, c, d, a, b,
  │          mergeJoinOrder      +"(b=b)",+"(a=a)",+"(c=d)"  ·                         ·
  ├── scan   ·                   ·                           (a, b, c, d)              +b,+a,+c
  │          table               pkbac@primary               ·                         ·
- │          spans               ALL                         ·                         ·
+ │          spans               FULL SCAN                   ·                         ·
  └── scan   ·                   ·                           (a, b, c, d)              +b,+a,+d
 ·           table               pkbad@primary               ·                         ·
-·           spans               ALL                         ·                         ·
+·           spans               FULL SCAN                   ·                         ·
 
 # Tests with joins with merged columns of collated string type.
 statement ok
@@ -760,7 +811,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT s, str1.s, str2.s FROM str1 INNER JOIN str2 USING(s)
 ----
 ·               distributed  false         ·          ·
-·               vectorized   false         ·          ·
+·               vectorized   true          ·          ·
 render          ·            ·             (s, s, s)  ·
  │              render 0     s             ·          ·
  │              render 1     s             ·          ·
@@ -770,16 +821,16 @@ render          ·            ·             (s, s, s)  ·
       │         equality     (s) = (s)     ·          ·
       ├── scan  ·            ·             (s)        ·
       │         table        str1@primary  ·          ·
-      │         spans        ALL           ·          ·
+      │         spans        FULL SCAN     ·          ·
       └── scan  ·            ·             (s)        ·
 ·               table        str2@primary  ·          ·
-·               spans        ALL           ·          ·
+·               spans        FULL SCAN     ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT s, str1.s, str2.s FROM str1 LEFT OUTER JOIN str2 USING(s)
 ----
 ·               distributed  false         ·          ·
-·               vectorized   false         ·          ·
+·               vectorized   true          ·          ·
 render          ·            ·             (s, s, s)  ·
  │              render 0     s             ·          ·
  │              render 1     s             ·          ·
@@ -789,16 +840,16 @@ render          ·            ·             (s, s, s)  ·
       │         equality     (s) = (s)     ·          ·
       ├── scan  ·            ·             (s)        ·
       │         table        str1@primary  ·          ·
-      │         spans        ALL           ·          ·
+      │         spans        FULL SCAN     ·          ·
       └── scan  ·            ·             (s)        ·
 ·               table        str2@primary  ·          ·
-·               spans        ALL           ·          ·
+·               spans        FULL SCAN     ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT s, str1.s, str2.s FROM str1 RIGHT OUTER JOIN str2 USING(s)
 ----
 ·               distributed  false           ·          ·
-·               vectorized   false           ·          ·
+·               vectorized   true            ·          ·
 render          ·            ·               (s, s, s)  ·
  │              render 0     COALESCE(s, s)  ·          ·
  │              render 1     s               ·          ·
@@ -808,16 +859,16 @@ render          ·            ·               (s, s, s)  ·
       │         equality     (s) = (s)       ·          ·
       ├── scan  ·            ·               (s)        ·
       │         table        str2@primary    ·          ·
-      │         spans        ALL             ·          ·
+      │         spans        FULL SCAN       ·          ·
       └── scan  ·            ·               (s)        ·
 ·               table        str1@primary    ·          ·
-·               spans        ALL             ·          ·
+·               spans        FULL SCAN       ·          ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT s, str1.s, str2.s FROM str1 FULL OUTER JOIN str2 USING(s)
 ----
 ·               distributed  false           ·          ·
-·               vectorized   false           ·          ·
+·               vectorized   true            ·          ·
 render          ·            ·               (s, s, s)  ·
  │              render 0     COALESCE(s, s)  ·          ·
  │              render 1     s               ·          ·
@@ -827,10 +878,10 @@ render          ·            ·               (s, s, s)  ·
       │         equality     (s) = (s)       ·          ·
       ├── scan  ·            ·               (s)        ·
       │         table        str1@primary    ·          ·
-      │         spans        ALL             ·          ·
+      │         spans        FULL SCAN       ·          ·
       └── scan  ·            ·               (s)        ·
 ·               table        str2@primary    ·          ·
-·               spans        ALL             ·          ·
+·               spans        FULL SCAN       ·          ·
 
 # Verify that we resolve the merged column a to str2.a but use IFNULL for
 # column s which is a collated string.
@@ -838,7 +889,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM str1 RIGHT OUTER JOIN str2 USING(a, s)
 ----
 ·               distributed         false            ·             ·
-·               vectorized          false            ·             ·
+·               vectorized          true             ·             ·
 render          ·                   ·                (a, s)        ·
  │              render 0            a                ·             ·
  │              render 1            COALESCE(s, s)   ·             ·
@@ -849,10 +900,10 @@ render          ·                   ·                (a, s)        ·
       │         right cols are key  ·                ·             ·
       ├── scan  ·                   ·                (a, s)        ·
       │         table               str2@primary     ·             ·
-      │         spans               ALL              ·             ·
+      │         spans               FULL SCAN        ·             ·
       └── scan  ·                   ·                (a, s)        ·
 ·               table               str1@primary     ·             ·
-·               spans               ALL              ·             ·
+·               spans               FULL SCAN        ·             ·
 
 
 statement ok
@@ -942,10 +993,10 @@ filter                ·               ·                  (x, y, u, v)        �
            │          mergeJoinOrder  +"(x=x)",+"(y=y)"  ·                   ·
            ├── scan   ·               ·                  (x, y, u)           +x,+y
            │          table           xyu@primary        ·                   ·
-           │          spans           ALL                ·                   ·
+           │          spans           FULL SCAN          ·                   ·
            └── scan   ·               ·                  (x, y, v)           +x,+y
 ·                     table           xyv@primary        ·                   ·
-·                     spans           ALL                ·                   ·
+·                     spans           FULL SCAN          ·                   ·
 
 # Verify that we transfer constraints between the two sides.
 query TTTTT
@@ -991,7 +1042,7 @@ merge-join  ·               ·                  (x, y, u, x, y, v)  ·
  │          mergeJoinOrder  +"(x=x)",+"(y=y)"  ·                   ·
  ├── scan   ·               ·                  (x, y, u)           +x,+y
  │          table           xyu@primary        ·                   ·
- │          spans           ALL                ·                   ·
+ │          spans           FULL SCAN          ·                   ·
  └── scan   ·               ·                  (x, y, v)           +y
 ·           table           xyv@primary        ·                   ·
 ·           spans           /1-/1/10           ·                   ·
@@ -1014,7 +1065,7 @@ render           ·               ·                  (x, y, u, x, y, v)  ·
       │          mergeJoinOrder  +"(x=x)",+"(y=y)"  ·                   ·
       ├── scan   ·               ·                  (x, y, v)           +x,+y
       │          table           xyv@primary        ·                   ·
-      │          spans           ALL                ·                   ·
+      │          spans           FULL SCAN          ·                   ·
       └── scan   ·               ·                  (x, y, u)           +y
 ·                table           xyu@primary        ·                   ·
 ·                spans           /1-/1/10           ·                   ·
@@ -1082,10 +1133,10 @@ filter                ·               ·                  (x, y, u, v)        �
            │          mergeJoinOrder  +"(x=x)",+"(y=y)"  ·                   ·
            ├── scan   ·               ·                  (x, y, u)           +x,+y
            │          table           xyu@primary        ·                   ·
-           │          spans           ALL                ·                   ·
+           │          spans           FULL SCAN          ·                   ·
            └── scan   ·               ·                  (x, y, v)           +x,+y
 ·                     table           xyv@primary        ·                   ·
-·                     spans           ALL                ·                   ·
+·                     spans           FULL SCAN          ·                   ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM (SELECT * FROM xyu ORDER BY x, y) AS xyu LEFT OUTER JOIN (SELECT * FROM xyv ORDER BY x, y) AS xyv ON xyu.x = xyv.x AND xyu.y = xyv.y AND xyu.x = 1 AND xyu.y < 10
@@ -1098,7 +1149,7 @@ merge-join  ·               ·                  (x, y, u, x, y, v)  ·
  │          mergeJoinOrder  +"(x=x)",+"(y=y)"  ·                   ·
  ├── scan   ·               ·                  (x, y, u)           +x,+y
  │          table           xyu@primary        ·                   ·
- │          spans           ALL                ·                   ·
+ │          spans           FULL SCAN          ·                   ·
  └── scan   ·               ·                  (x, y, v)           +y
 ·           table           xyv@primary        ·                   ·
 ·           spans           /1-/1/10           ·                   ·
@@ -1121,7 +1172,7 @@ render           ·               ·                  (x, y, u, x, y, v)  ·
       │          mergeJoinOrder  +"(x=x)",+"(y=y)"  ·                   ·
       ├── scan   ·               ·                  (x, y, v)           +x,+y
       │          table           xyv@primary        ·                   ·
-      │          spans           ALL                ·                   ·
+      │          spans           FULL SCAN          ·                   ·
       └── scan   ·               ·                  (x, y, u)           +y
 ·                table           xyu@primary        ·                   ·
 ·                spans           /1-/1/10           ·                   ·
@@ -1146,7 +1197,7 @@ render           ·               ·                  (x, y, u, v)        ·
       │          spans           /1/2/4-            ·                   ·
       └── scan   ·               ·                  (x, y, v)           +x,+y
 ·                table           xyv@primary        ·                   ·
-·                spans           ALL                ·                   ·
+·                spans           FULL SCAN          ·                   ·
 
 
 # Regression test for #20765/27431.
@@ -1272,10 +1323,9 @@ render           ·                   ·
       ├── scan   ·                   ·
       │          table               abcdef@primary
       │          spans               /1/2/6/9-
-      │          filter              (((a, b) > (1, 2)) OR (((a = 1) AND (b = 2)) AND (c < 6))) OR ((((a = 1) AND (b = 2)) AND (c = 6)) AND (d > 8))
       └── scan   ·                   ·
 ·                table               abg@primary
-·                spans               ALL
+·                spans               FULL SCAN
 
 # Regression tests for mixed-type equality columns (#22514).
 statement ok
@@ -1313,10 +1363,10 @@ render          ·            ·
       │         pred         (b = b) AND (d = d)
       ├── scan  ·            ·
       │         table        foo@primary
-      │         spans        ALL
+      │         spans        FULL SCAN
       └── scan  ·            ·
 ·               table        bar@primary
-·               spans        ALL
+·               spans        FULL SCAN
 
 # b can't be an equality column.
 query TTT
@@ -1339,10 +1389,10 @@ render           ·            ·
       │          pred         b = b
       ├── scan   ·            ·
       │          table        foo@primary
-      │          spans        ALL
+      │          spans        FULL SCAN
       └── scan   ·            ·
 ·                table        bar@primary
-·                spans        ALL
+·                spans        FULL SCAN
 
 # Only a can be an equality column.
 query TTT
@@ -1365,10 +1415,10 @@ render          ·            ·
       │         pred         b = b
       ├── scan  ·            ·
       │         table        foo@primary
-      │         spans        ALL
+      │         spans        FULL SCAN
       └── scan  ·            ·
 ·               table        bar@primary
-·               spans        ALL
+·               spans        FULL SCAN
 
 # Only a and c can be equality columns.
 query TTT
@@ -1390,10 +1440,10 @@ render          ·            ·
       │         pred         b = b
       ├── scan  ·            ·
       │         table        foo@primary
-      │         spans        ALL
+      │         spans        FULL SCAN
       └── scan  ·            ·
 ·               table        bar@primary
-·               spans        ALL
+·               spans        FULL SCAN
 
 # b can't be an equality column.
 query TTT
@@ -1408,10 +1458,10 @@ cross-join  ·            ·
  │          pred         b = b
  ├── scan   ·            ·
  │          table        foo@primary
- │          spans        ALL
+ │          spans        FULL SCAN
  └── scan   ·            ·
 ·           table        bar@primary
-·           spans        ALL
+·           spans        FULL SCAN
 
 # Only a can be an equality column.
 query TTT
@@ -1427,10 +1477,10 @@ hash-join  ·            ·
  │         pred         b = b
  ├── scan  ·            ·
  │         table        foo@primary
- │         spans        ALL
+ │         spans        FULL SCAN
  └── scan  ·            ·
 ·          table        bar@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 query TTT
 SELECT tree, field, description FROM [
@@ -1444,10 +1494,10 @@ cross-join  ·            ·
  │          pred         b = b
  ├── scan   ·            ·
  │          table        foo@primary
- │          spans        ALL
+ │          spans        FULL SCAN
  └── scan   ·            ·
 ·           table        bar@primary
-·           spans        ALL
+·           spans        FULL SCAN
 
 # Only a can be an equality column.
 query TTT
@@ -1463,10 +1513,10 @@ hash-join  ·            ·
  │         pred         b = b
  ├── scan  ·            ·
  │         table        foo@primary
- │         spans        ALL
+ │         spans        FULL SCAN
  └── scan  ·            ·
 ·          table        bar@primary
-·          spans        ALL
+·          spans        FULL SCAN
 
 # Only a and c can be equality columns.
 query TTT
@@ -1481,10 +1531,10 @@ render          ·            ·
       │         pred         (b = b) AND (d = d)
       ├── scan  ·            ·
       │         table        foo@primary
-      │         spans        ALL
+      │         spans        FULL SCAN
       └── scan  ·            ·
 ·               table        bar@primary
-·               spans        ALL
+·               spans        FULL SCAN
 
 # Zigzag join tests.
 statement ok
@@ -1624,12 +1674,12 @@ render               ·               ·
       │    │         order           +x
       │    └── scan  ·               ·
       │              table           onecolumn@primary
-      │              spans           ALL
+      │              spans           FULL SCAN
       └── sort       ·               ·
            │         order           +x
            └── scan  ·               ·
 ·                    table           twocolumn@primary
-·                    spans           ALL
+·                    spans           FULL SCAN
 
 # Test that we can force a merge join using the NATURAL syntax.
 query TTT
@@ -1646,12 +1696,12 @@ render               ·               ·
       │    │         order           +x
       │    └── scan  ·               ·
       │              table           onecolumn@primary
-      │              spans           ALL
+      │              spans           FULL SCAN
       └── sort       ·               ·
            │         order           +x
            └── scan  ·               ·
 ·                    table           twocolumn@primary
-·                    spans           ALL
+·                    spans           FULL SCAN
 
 # Test that we can force a merge join using the CROSS syntax.
 query TTT
@@ -1667,12 +1717,12 @@ merge-join      ·               ·
  │    │         order           +x
  │    └── scan  ·               ·
  │              table           onecolumn@primary
- │              spans           ALL
+ │              spans           FULL SCAN
  └── sort       ·               ·
       │         order           +x
       └── scan  ·               ·
 ·               table           twocolumn@primary
-·               spans           ALL
+·               spans           FULL SCAN
 
 statement error LOOKUP can only be used with INNER or LEFT joins
 EXPLAIN SELECT * FROM onecolumn RIGHT LOOKUP JOIN twocolumn USING(x)
@@ -1695,7 +1745,7 @@ hash-join  ·                   ·
  │         right cols are key  ·
  ├── scan  ·                   ·
  │         table               cards@primary
- │         spans               ALL
+ │         spans               FULL SCAN
  └── scan  ·                   ·
 ·          table               customers@primary
-·          spans               ALL
+·          spans               FULL SCAN

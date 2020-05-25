@@ -123,18 +123,18 @@ query TTTTT
 EXPLAIN (VERBOSE, TYPES) SELECT x FROM (SELECT (row(v,v,v) AS a,b,c) AS x FROM kv)
 ----
 ·          distributed  false                                                                               ·                                        ·
-·          vectorized   false                                                                               ·                                        ·
+·          vectorized   true                                                                                ·                                        ·
 render     ·            ·                                                                                   (x tuple{int AS a, int AS b, int AS c})  ·
  │         render 0     ((((v)[int], (v)[int], (v)[int]) AS a, b, c))[tuple{int AS a, int AS b, int AS c}]  ·                                        ·
  └── scan  ·            ·                                                                                   (v int)                                  ·
 ·          table        kv@primary                                                                          ·                                        ·
-·          spans        ALL                                                                                 ·                                        ·
+·          spans        FULL SCAN                                                                           ·                                        ·
 
 query TTTTT
 EXPLAIN (VERBOSE, TYPES) SELECT (x).a, (x).b, (x).c FROM (SELECT (row(v,v,v) AS a,b,c) AS x FROM kv)
 ----
 ·               distributed  false                                                                               ·                                        ·
-·               vectorized   false                                                                               ·                                        ·
+·               vectorized   true                                                                                ·                                        ·
 render          ·            ·                                                                                   (a int, b int, c int)                    ·
  │              render 0     (((x)[tuple{int AS a, int AS b, int AS c}]).a)[int]                                 ·                                        ·
  │              render 1     (((x)[tuple{int AS a, int AS b, int AS c}]).b)[int]                                 ·                                        ·
@@ -143,7 +143,7 @@ render          ·            ·                                                
       │         render 0     ((((v)[int], (v)[int], (v)[int]) AS a, b, c))[tuple{int AS a, int AS b, int AS c}]  ·                                        ·
       └── scan  ·            ·                                                                                   (v int)                                  ·
 ·               table        kv@primary                                                                          ·                                        ·
-·               spans        ALL                                                                                 ·                                        ·
+·               spans        FULL SCAN                                                                           ·                                        ·
 
 query TTTTT
 EXPLAIN (VERBOSE, TYPES) SELECT (x).e, (x).f, (x).g
@@ -151,12 +151,10 @@ FROM (
   SELECT ((1,'2',true) AS e,f,g) AS x
 )
 ----
-·            distributed    false                                                                                            ·                                            ·
-·            vectorized     false                                                                                            ·                                            ·
-render       ·              ·                                                                                                (e int, f string, g bool)                    ·
- │           render 0       (((x)[tuple{int AS e, string AS f, bool AS g}]).e)[int]                                          ·                                            ·
- │           render 1       (((x)[tuple{int AS e, string AS f, bool AS g}]).f)[string]                                       ·                                            ·
- │           render 2       (((x)[tuple{int AS e, string AS f, bool AS g}]).g)[bool]                                         ·                                            ·
- └── values  ·              ·                                                                                                (x tuple{int AS e, string AS f, bool AS g})  ·
-·            size           1 column, 1 row                                                                                  ·                                            ·
-·            row 0, expr 0  ((((1)[int], ('2')[string], (true)[bool]) AS e, f, g))[tuple{int AS e, string AS f, bool AS g}]  ·                                            ·
+·       distributed    false             ·                          ·
+·       vectorized     false             ·                          ·
+values  ·              ·                 (e int, f string, g bool)  ·
+·       size           3 columns, 1 row  ·                          ·
+·       row 0, expr 0  (1)[int]          ·                          ·
+·       row 0, expr 1  ('2')[string]     ·                          ·
+·       row 0, expr 2  (true)[bool]      ·                          ·

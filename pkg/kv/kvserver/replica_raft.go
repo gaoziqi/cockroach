@@ -20,9 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -34,16 +34,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 	"go.etcd.io/etcd/raft/tracker"
 )
 
-func makeIDKey() storagebase.CmdIDKey {
+func makeIDKey() kvserverbase.CmdIDKey {
 	idKeyBuf := make([]byte, 0, raftCommandIDLen)
 	idKeyBuf = encoding.EncodeUint64Ascending(idKeyBuf, uint64(rand.Int63()))
-	return storagebase.CmdIDKey(idKeyBuf)
+	return kvserverbase.CmdIDKey(idKeyBuf)
 }
 
 // evalAndPropose prepares the necessary pending command struct and initializes
@@ -51,27 +51,37 @@ func makeIDKey() storagebase.CmdIDKey {
 // parameter if the command requires a lease; nil otherwise. It then evaluates
 // the command and proposes it to Raft on success.
 //
+// The method accepts a concurrency guard, which it assumes responsibility for
+// if it succeeds in proposing a command into Raft. If the method does not
+// return an error, the guard is guaranteed to be eventually freed and the
+// caller should relinquish all ownership of it. If it does return an error, the
+// caller retains full ownership over the guard.
+//
 // Return values:
 // - a channel which receives a response or error upon application
 // - a closure used to attempt to abandon the command. When called, it unbinds
 //   the command's context from its Raft proposal. The client is then free to
 //   terminate execution, although it is given no guarantee that the proposal
 //   won't still go on to commit and apply at some later time.
-// - a callback to undo quota acquisition if the attempt to propose the batch
-//   request to raft fails. This also cleans up the command sizes stored for
-//   the corresponding proposal.
 // - the MaxLeaseIndex of the resulting proposal, if any.
 // - any error obtained during the creation or proposal of the command, in
 //   which case the other returned values are zero.
 func (r *Replica) evalAndPropose(
 	ctx context.Context, ba *roachpb.BatchRequest, g *concurrency.Guard, lease *roachpb.Lease,
-) (chan proposalResult, func(), int64, *concurrency.Guard, *roachpb.Error) {
+) (chan proposalResult, func(), int64, *roachpb.Error) {
 	idKey := makeIDKey()
 	proposal, pErr := r.requestToProposal(ctx, idKey, ba, g.LatchSpans())
 	log.Event(proposal.ctx, "evaluated request")
 
-	// Attach the endCmds to the proposal.
-	proposal.ec = endCmds{repl: r}
+	// If the request hit a server-side concurrency retry error, immediately
+	// proagate the error. Don't assume ownership of the concurrency guard.
+	if isConcurrencyRetryError(pErr) {
+		return nil, nil, 0, pErr
+	}
+
+	// Attach the endCmds to the proposal and assume responsibility for
+	// releasing the concurrency guard if the proposal makes it to Raft.
+	proposal.ec = endCmds{repl: r, g: g}
 
 	// Pull out proposal channel to return. proposal.doneCh may be set to
 	// nil if it is signaled in this function.
@@ -95,7 +105,7 @@ func (r *Replica) evalAndPropose(
 			EndTxns:            endTxns,
 		}
 		proposal.finishApplication(ctx, pr)
-		return proposalCh, func() {}, 0, g, nil
+		return proposalCh, func() {}, 0, nil
 	}
 
 	// If the request requested that Raft consensus be performed asynchronously,
@@ -106,7 +116,7 @@ func (r *Replica) evalAndPropose(
 			// Disallow async consensus for commands with EndTxnIntents because
 			// any !Always EndTxnIntent can't be cleaned up until after the
 			// command succeeds.
-			return nil, nil, 0, g, roachpb.NewErrorf("cannot perform consensus asynchronously for "+
+			return nil, nil, 0, roachpb.NewErrorf("cannot perform consensus asynchronously for "+
 				"proposal with EndTxnIntents=%v; %v", ets, ba)
 		}
 
@@ -126,10 +136,6 @@ func (r *Replica) evalAndPropose(
 		// Continue with proposal...
 	}
 
-	// Assume responsibility for releasing the concurrency guard
-	// if the proposal makes it to Raft.
-	proposal.ec.g = g
-
 	// Attach information about the proposer to the command.
 	proposal.command.ProposerLeaseSequence = lease.Sequence
 
@@ -147,14 +153,14 @@ func (r *Replica) evalAndPropose(
 	// behavior.
 	quotaSize := uint64(proposal.command.Size())
 	if maxSize := uint64(MaxCommandSize.Get(&r.store.cfg.Settings.SV)); quotaSize > maxSize {
-		return nil, nil, 0, g, roachpb.NewError(errors.Errorf(
+		return nil, nil, 0, roachpb.NewError(errors.Errorf(
 			"command is too large: %d bytes (max: %d)", quotaSize, maxSize,
 		))
 	}
 	var err error
 	proposal.quotaAlloc, err = r.maybeAcquireProposalQuota(ctx, quotaSize)
 	if err != nil {
-		return nil, nil, 0, g, roachpb.NewError(err)
+		return nil, nil, 0, roachpb.NewError(err)
 	}
 	// Make sure we clean up the proposal if we fail to insert it into the
 	// proposal buffer successfully. This ensures that we always release any
@@ -166,20 +172,20 @@ func (r *Replica) evalAndPropose(
 	}()
 
 	if filter := r.store.TestingKnobs().TestingProposalFilter; filter != nil {
-		filterArgs := storagebase.ProposalFilterArgs{
+		filterArgs := kvserverbase.ProposalFilterArgs{
 			Ctx:   ctx,
 			Cmd:   *proposal.command,
 			CmdID: idKey,
 			Req:   *ba,
 		}
 		if pErr := filter(filterArgs); pErr != nil {
-			return nil, nil, 0, g, pErr
+			return nil, nil, 0, pErr
 		}
 	}
 
 	maxLeaseIndex, pErr := r.propose(ctx, proposal)
 	if pErr != nil {
-		return nil, nil, 0, g, pErr
+		return nil, nil, 0, pErr
 	}
 	// Abandoning a proposal unbinds its context so that the proposal's client
 	// is free to terminate execution. However, it does nothing to try to
@@ -201,7 +207,7 @@ func (r *Replica) evalAndPropose(
 		// We'd need to make sure the span is finished eventually.
 		proposal.ctx = r.AnnotateCtx(context.TODO())
 	}
-	return proposalCh, abandon, maxLeaseIndex, nil, nil
+	return proposalCh, abandon, maxLeaseIndex, nil
 }
 
 // propose encodes a command, starts tracking it, and proposes it to raft. The
@@ -258,7 +264,7 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 		for _, rDesc := range crt.Removed() {
 			if rDesc.ReplicaID == replID {
 				msg := fmt.Sprintf("received invalid ChangeReplicasTrigger %s to remove self (leaseholder)", crt)
-				log.Error(p.ctx, msg)
+				log.Errorf(p.ctx, "%v", msg)
 				return 0, roachpb.NewErrorf("%s: %s", r, msg)
 			}
 		}
@@ -281,7 +287,7 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 		preLen = raftCommandPrefixLen
 	}
 	cmdLen := p.command.Size()
-	cap := preLen + cmdLen + storagepb.MaxRaftCommandFooterSize()
+	cap := preLen + cmdLen + kvserverpb.MaxRaftCommandFooterSize()
 	data := make([]byte, preLen, cap)
 	// Encode prefix with command ID, if necessary.
 	if prefix {
@@ -289,7 +295,7 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 	}
 	// Encode body of command.
 	data = data[:preLen+cmdLen]
-	if _, err := protoutil.MarshalToWithoutFuzzing(p.command, data[preLen:]); err != nil {
+	if _, err := protoutil.MarshalTo(p.command, data[preLen:]); err != nil {
 		return 0, roachpb.NewError(err)
 	}
 
@@ -333,8 +339,35 @@ func (r *Replica) numPendingProposalsRLocked() int {
 	return len(r.mu.proposals) + r.mu.proposalBuf.Len()
 }
 
+// hasPendingProposalsRLocked is part of the quiescer interface.
+// It returns true if this node has any outstanding proposals. A client might be
+// waiting for the outcome of these proposals, so we definitely don't want to
+// quiesce while such proposals are in-flight.
+//
+// Note that this method says nothing about other node's outstanding proposals:
+// if this node is the current leaseholders, previous leaseholders might have
+// proposals on which they're waiting. If this node is not the current
+// leaseholder, then obviously whoever is the current leaseholder might have
+// pending proposals. This method is called in two places: on the current
+// leaseholder when deciding whether the leaseholder should attempt to quiesce
+// the range, and then on every follower to confirm that the range can indeed be
+// quiesced.
 func (r *Replica) hasPendingProposalsRLocked() bool {
 	return r.numPendingProposalsRLocked() > 0
+}
+
+// hasPendingProposalQuotaRLocked is part of the quiescer interface. It returns
+// true if there are any commands that haven't completed replicating that are
+// tracked by this node's quota pool (i.e. commands that haven't been acked by
+// all live replicas).
+// We can't quiesce while there's outstanding quota because the respective quota
+// would not be released while quiesced, and it might prevent the range from
+// unquiescing (leading to deadlock). See #46699.
+func (r *Replica) hasPendingProposalQuotaRLocked() bool {
+	if r.mu.proposalQuota == nil {
+		return true
+	}
+	return !r.mu.proposalQuota.Full()
 }
 
 var errRemoved = errors.New("replica removed")
@@ -354,7 +387,7 @@ func (r *Replica) stepRaftGroup(req *RaftMessageRequest) error {
 		r.unquiesceWithOptionsLocked(false /* campaignOnWake */)
 		r.mu.lastUpdateTimes.update(req.FromReplica.ReplicaID, timeutil.Now())
 		err := raftGroup.Step(req.Message)
-		if err == raft.ErrProposalDropped {
+		if errors.Is(err, raft.ErrProposalDropped) {
 			// A proposal was forwarded to this replica but we couldn't propose it.
 			// Swallow the error since we don't have an effective way of signaling
 			// this to the sender.
@@ -434,7 +467,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		return unquiesceAndWakeLeader, nil
 	})
 	r.mu.Unlock()
-	if err == errRemoved {
+	if errors.Is(err, errRemoved) {
 		// If we've been removed then just return.
 		return stats, "", nil
 	} else if err != nil {
@@ -549,10 +582,10 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	appTask.SetMaxBatchSize(r.store.TestingKnobs().MaxApplicationBatchSize)
 	defer appTask.Close()
 	if err := appTask.Decode(ctx, rd.CommittedEntries); err != nil {
-		return stats, err.(*nonDeterministicFailure).safeExpl, err
+		return stats, getNonDeterministicFailureExplanation(err), err
 	}
 	if err := appTask.AckCommittedEntriesBeforeApplication(ctx, lastIndex); err != nil {
-		return stats, err.(*nonDeterministicFailure).safeExpl, err
+		return stats, getNonDeterministicFailureExplanation(err), err
 	}
 
 	// Separate the MsgApp messages from all other Raft message types so that we
@@ -731,15 +764,13 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	if len(rd.CommittedEntries) > 0 {
 		err := appTask.ApplyCommittedEntries(ctx)
 		stats.applyCommittedEntriesStats = sm.moveStats()
-		switch err {
-		case nil:
-		case apply.ErrRemoved:
+		if errors.Is(err, apply.ErrRemoved) {
 			// We know that our replica has been removed. All future calls to
 			// r.withRaftGroup() will return errRemoved so no future Ready objects
 			// will be processed by this Replica.
 			return stats, "", err
-		default:
-			return stats, err.(*nonDeterministicFailure).safeExpl, err
+		} else if err != nil {
+			return stats, getNonDeterministicFailureExplanation(err), err
 		}
 
 		// etcd raft occasionally adds a nil entry (our own commands are never
@@ -775,8 +806,17 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// the fact that we'll refuse to process messages intended for a higher
 	// replica ID ensures that our replica ID could not have changed.
 	const expl = "during advance"
-	err = r.withRaftGroup(true, func(raftGroup *raft.RawNode) (bool, error) {
+
+	r.mu.Lock()
+	err = r.withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
 		raftGroup.Advance(rd)
+		if stats.numConfChangeEntries > 0 {
+			// If the raft leader got removed, campaign the first remaining voter.
+			//
+			// NB: this must be called after Advance() above since campaigning is
+			// a no-op in the presence of unapplied conf changes.
+			maybeCampaignAfterConfChange(ctx, r.store.StoreID(), r.descRLocked(), raftGroup)
+		}
 
 		// If the Raft group still has more to process then we immediately
 		// re-enqueue it for another round of processing. This is possible if
@@ -787,6 +827,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		}
 		return true, nil
 	})
+	r.mu.Unlock()
 	if err != nil {
 		return stats, expl, errors.Wrap(err, expl)
 	}
@@ -822,10 +863,10 @@ func splitMsgApps(msgs []raftpb.Message) (msgApps, otherMsgs []raftpb.Message) {
 // maybeFatalOnRaftReadyErr will fatal if err is neither nil nor
 // apply.ErrRemoved.
 func maybeFatalOnRaftReadyErr(ctx context.Context, expl string, err error) (removed bool) {
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		return false
-	case apply.ErrRemoved:
+	case errors.Is(err, apply.ErrRemoved):
 		return true
 	default:
 		log.FatalfDepth(ctx, 1, "%s: %+v", log.Safe(expl), err)
@@ -1150,8 +1191,8 @@ func (r *Replica) sendRaftMessage(ctx context.Context, msg raftpb.Message) {
 			r.mu.droppedMessages++
 			raftGroup.ReportUnreachable(msg.To)
 			return true, nil
-		}); err != nil && err != errRemoved {
-			log.Fatal(ctx, err)
+		}); err != nil && !errors.Is(err, errRemoved) {
+			log.Fatalf(ctx, "%v", err)
 		}
 	}
 }
@@ -1193,8 +1234,8 @@ func (r *Replica) reportSnapshotStatus(ctx context.Context, to roachpb.ReplicaID
 	if err := r.withRaftGroup(true, func(raftGroup *raft.RawNode) (bool, error) {
 		raftGroup.ReportSnapshot(uint64(to), snapStatus)
 		return true, nil
-	}); err != nil && err != errRemoved {
-		log.Fatal(ctx, err)
+	}); err != nil && !errors.Is(err, errRemoved) {
+		log.Fatalf(ctx, "%v", err)
 	}
 }
 
@@ -1399,7 +1440,7 @@ func (r *Replica) withRaftGroup(
 }
 
 func shouldCampaignOnWake(
-	leaseStatus storagepb.LeaseStatus,
+	leaseStatus kvserverpb.LeaseStatus,
 	lease roachpb.Lease,
 	storeID roachpb.StoreID,
 	raftStatus raft.Status,
@@ -1410,7 +1451,7 @@ func shouldCampaignOnWake(
 	// time, with a lease pre-assigned to one of them). Note that
 	// thanks to PreVote, unnecessary campaigns are not disruptive so
 	// we should err on the side of campaigining here.
-	anotherOwnsLease := leaseStatus.State == storagepb.LeaseState_VALID && !lease.OwnedBy(storeID)
+	anotherOwnsLease := leaseStatus.State == kvserverpb.LeaseState_VALID && !lease.OwnedBy(storeID)
 
 	// If we're already campaigning or know who the leader is, don't
 	// start a new term.
@@ -1481,10 +1522,10 @@ func (m lastUpdateTimesMap) updateOnBecomeLeader(descs []roachpb.ReplicaDescript
 	}
 }
 
-// isFollowerActive returns whether the specified follower has made
-// communication with the leader in the last MaxQuotaReplicaLivenessDuration.
-func (m lastUpdateTimesMap) isFollowerActive(
-	ctx context.Context, replicaID roachpb.ReplicaID, now time.Time,
+// isFollowerActiveSince returns whether the specified follower has made
+// communication with the leader recently (since threshold).
+func (m lastUpdateTimesMap) isFollowerActiveSince(
+	ctx context.Context, replicaID roachpb.ReplicaID, now time.Time, threshold time.Duration,
 ) bool {
 	lastUpdateTime, ok := m[replicaID]
 	if !ok {
@@ -1493,7 +1534,7 @@ func (m lastUpdateTimesMap) isFollowerActive(
 		// replicas were updated).
 		return false
 	}
-	return now.Sub(lastUpdateTime) <= MaxQuotaReplicaLivenessDuration
+	return now.Sub(lastUpdateTime) <= threshold
 }
 
 // maybeAcquireSnapshotMergeLock checks whether the incoming snapshot subsumes
@@ -1552,7 +1593,7 @@ func (r *Replica) maybeAcquireSnapshotMergeLock(
 // After this method returns successfully the RHS of the split or merge
 // is guaranteed to exist in the Store using GetReplica().
 func (r *Replica) maybeAcquireSplitMergeLock(
-	ctx context.Context, raftCmd storagepb.RaftCommand,
+	ctx context.Context, raftCmd kvserverpb.RaftCommand,
 ) (func(), error) {
 	if split := raftCmd.ReplicatedEvalResult.Split; split != nil {
 		return r.acquireSplitLock(ctx, &split.SplitTrigger)
@@ -1571,7 +1612,7 @@ func (r *Replica) acquireSplitLock(
 		rightReplDesc.GetType() == roachpb.LEARNER)
 	// If getOrCreateReplica returns RaftGroupDeletedError we know that the RHS
 	// has already been removed. This case is handled properly in splitPostApply.
-	if _, isRaftGroupDeletedError := err.(*roachpb.RaftGroupDeletedError); isRaftGroupDeletedError {
+	if errors.HasType(err, (*roachpb.RaftGroupDeletedError)(nil)) {
 		return func() {}, nil
 	}
 	if err != nil {
@@ -1737,4 +1778,46 @@ func ComputeRaftLogSize(
 		}
 	}
 	return ms.SysBytes + totalSideloaded, nil
+}
+
+func maybeCampaignAfterConfChange(
+	ctx context.Context,
+	storeID roachpb.StoreID,
+	desc *roachpb.RangeDescriptor,
+	raftGroup *raft.RawNode,
+) {
+	// If a config change was carried out, it's possible that the Raft
+	// leader was removed. Verify that, and if so, campaign if we are
+	// the first remaining voter replica. Without this, the range will
+	// be leaderless (and thus unavailable) for a few seconds.
+	//
+	// We can't (or rather shouldn't) campaign on all remaining voters
+	// because that can lead to a stalemate. For example, three voters
+	// may all make it through PreVote and then reject each other.
+	st := raftGroup.BasicStatus()
+	if st.Lead == 0 {
+		// Leader unknown. This isn't what we expect in steady state, so we
+		// don't do anything.
+		return
+	}
+	if !desc.IsInitialized() {
+		// We don't have an initialized, so we can't figure out who is supposed
+		// to campaign. It's possible that it's us and we're waiting for the
+		// initial snapshot, but it's hard to tell. Don't do anything.
+		return
+	}
+	// If the leader is no longer in the descriptor but we are the first voter,
+	// campaign.
+	_, leaderStillThere := desc.GetReplicaDescriptorByID(roachpb.ReplicaID(st.Lead))
+	if !leaderStillThere && storeID == desc.Replicas().Voters()[0].StoreID {
+		log.VEventf(ctx, 3, "leader got removed by conf change; campaigning")
+		_ = raftGroup.Campaign()
+	}
+}
+
+func getNonDeterministicFailureExplanation(err error) string {
+	if nd := (*nonDeterministicFailure)(nil); errors.As(err, &nd) {
+		return nd.safeExpl
+	}
+	return "???"
 }

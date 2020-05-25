@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestParse verifies that we can parse the supplied SQL and regenerate the SQL
@@ -80,23 +81,29 @@ func TestParse(t *testing.T) {
 		{`CREATE SCHEMA foo`},
 
 		{`CREATE INDEX a ON b (c)`},
+		{`CREATE INDEX CONCURRENTLY a ON b (c)`},
 		{`EXPLAIN CREATE INDEX a ON b (c)`},
 		{`CREATE INDEX a ON b.c (d)`},
 		{`CREATE INDEX ON a (b)`},
 		{`CREATE INDEX ON a (b) STORING (c)`},
+		{`CREATE INDEX ON a (b) WHERE c > 3`},
 		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c (d)`},
 		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c.d (e)`},
 		{`CREATE INDEX ON a (b ASC, c DESC)`},
 		{`CREATE INDEX ON a (b NULLS FIRST, c ASC NULLS FIRST, d DESC NULLS LAST)`},
+		{`CREATE INDEX IF NOT EXISTS i ON a (b) WHERE c > 3`},
 		{`CREATE UNIQUE INDEX a ON b (c)`},
 		{`CREATE UNIQUE INDEX a ON b (c) STORING (d)`},
+		{`CREATE UNIQUE INDEX a ON b (c) WHERE d > 3`},
 		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d (e, f)`},
 		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d.e (f, g)`},
 		{`CREATE UNIQUE INDEX a ON b.c (d)`},
 		{`CREATE INVERTED INDEX a ON b (c)`},
 		{`CREATE INVERTED INDEX a ON b.c (d)`},
 		{`CREATE INVERTED INDEX a ON b (c) STORING (d)`},
+		{`CREATE INVERTED INDEX a ON b (c) WHERE d > 3`},
 		{`CREATE INVERTED INDEX a ON b (c) INTERLEAVE IN PARENT d (e)`},
+		{`CREATE INVERTED INDEX IF NOT EXISTS a ON b (c) WHERE d > 3`},
 
 		{`CREATE TABLE a ()`},
 		{`CREATE TEMPORARY TABLE a (b INT8)`},
@@ -116,6 +123,19 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b TIMETZ)`},
 		{`CREATE TABLE a (b TIME(3))`},
 		{`CREATE TABLE a (b TIMETZ(3))`},
+		{`CREATE TABLE a (b GEOGRAPHY)`},
+		{`CREATE TABLE a (b GEOGRAPHY(POINT))`},
+		{`CREATE TABLE a (b GEOGRAPHY(POINT,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(LINESTRING,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(POLYGON,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(MULTIPOINT,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(MULTILINESTRING,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(MULTIPOLYGON,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(GEOMETRY,4326))`},
+		{`CREATE TABLE a (b GEOGRAPHY(GEOMETRYCOLLECTION,4326))`},
+		{`CREATE TABLE a (b GEOMETRY)`},
+		{`CREATE TABLE a (b GEOMETRY(POINT))`},
+		{`CREATE TABLE a (b GEOMETRY(POINT,4326))`},
 		{`CREATE TABLE a (b UUID)`},
 		{`CREATE TABLE a (b INET)`},
 		{`CREATE TABLE a (b "char")`},
@@ -204,6 +224,8 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b INT8, c INT8 REFERENCES foo MATCH FULL ON DELETE RESTRICT ON UPDATE RESTRICT)`},
 		{`CREATE TABLE a (b INT8, c INT8 REFERENCES foo (bar) MATCH FULL)`},
 		{`CREATE TABLE a (b INT8, INDEX (b) STORING (c))`},
+		{`CREATE TABLE a (b INT8, INDEX (b) WHERE b > 3)`},
+		{`CREATE TABLE a (b INT8, INVERTED INDEX (b) WHERE b > 3)`},
 		{`CREATE TABLE a (b INT8, c STRING, INDEX (b ASC, c DESC) STORING (c))`},
 		{`CREATE TABLE a (b INT8, INDEX (b) INTERLEAVE IN PARENT c (d, e))`},
 		{`CREATE TABLE a (b INT8, FAMILY (b))`},
@@ -274,7 +296,13 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b STRING[] COLLATE de)`},
 		{`CREATE TABLE a (b STRING(3)[] COLLATE de)`},
 
+		{`CREATE TABLE a (LIKE b)`},
+		{`CREATE TABLE a (LIKE b, c INT8)`},
+		{`CREATE TABLE a (LIKE b EXCLUDING INDEXES INCLUDING INDEXES)`},
+		{`CREATE TABLE a (LIKE b INCLUDING ALL EXCLUDING INDEXES, c INT8)`},
+
 		{`CREATE VIEW a AS SELECT * FROM b`},
+		{`CREATE OR REPLACE VIEW a AS SELECT * FROM b`},
 		{`EXPLAIN CREATE VIEW a AS SELECT * FROM b`},
 		{`CREATE VIEW a AS SELECT b.* FROM b LIMIT 5`},
 		{`CREATE VIEW a AS (SELECT c, d FROM b WHERE c > 0 ORDER BY c)`},
@@ -315,6 +343,20 @@ func TestParse(t *testing.T) {
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.9`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.1 AS OF SYSTEM TIME '2016-01-01'`},
+
+		{`CREATE TYPE a AS ENUM ()`},
+		{`CREATE TYPE a AS ENUM ('a')`},
+		{`CREATE TYPE a AS ENUM ('a', 'b', 'c')`},
+		{`CREATE TYPE a.b AS ENUM ('a', 'b', 'c')`},
+		{`CREATE TYPE a.b.c AS ENUM ('a', 'b', 'c')`},
+
+		{`DROP TYPE a`},
+		{`DROP TYPE a, b, c`},
+		{`DROP TYPE db.sc.a, sc.a`},
+		{`DROP TYPE IF EXISTS db.sc.a, sc.a`},
+		{`DROP TYPE db.sc.a, sc.a CASCADE`},
+		{`DROP TYPE IF EXISTS db.sc.a, sc.a CASCADE`},
+		{`DROP TYPE IF EXISTS db.sc.a, sc.a RESTRICT`},
 
 		{`DELETE FROM a`},
 		{`EXPLAIN DELETE FROM a`},
@@ -395,9 +437,9 @@ func TestParse(t *testing.T) {
 
 		{`EXPLAIN SELECT 1`},
 		{`EXPLAIN EXPLAIN SELECT 1`},
-		{`EXPLAIN (A, B, C) SELECT 1`},
-		{`EXPLAIN ANALYZE (A, B, C) SELECT 1`},
-		{`EXPLAIN BUNDLE SELECT 1`},
+		{`EXPLAIN (OPT, VERBOSE) SELECT 1`},
+		{`EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
+		{`EXPLAIN ANALYZE (DEBUG) SELECT 1`},
 		{`SELECT * FROM [EXPLAIN SELECT 1]`},
 		{`SELECT * FROM [SHOW TRANSACTION STATUS]`},
 
@@ -685,6 +727,8 @@ func TestParse(t *testing.T) {
 		{`SELECT (a->'x')->'y'`},
 		{`SELECT (a->'x')->>'y'`},
 		{`SELECT b && c`},
+		{`SELECT |/a`},
+		{`SELECT ||/a`},
 
 		{`SELECT 1 FROM t`},
 		{`SELECT 1, 2 FROM t`},
@@ -746,12 +790,20 @@ func TestParse(t *testing.T) {
 		{`SELECT 'foo'::TIME(6)`},
 		{`SELECT '0'::INTERVAL`},
 
+		{`SELECT 'foo'::GEOGRAPHY`},
+		{`SELECT 'foo'::GEOGRAPHY(POINT,4326)`},
+		{`SELECT 'foo'::GEOGRAPHY(POINT)`},
+		{`SELECT 'foo'::GEOMETRY`},
+		{`SELECT 'foo'::GEOMETRY(POINT)`},
+		{`SELECT 'foo'::GEOMETRY(POINT,4326)`},
+
 		{`SELECT '192.168.0.1'::INET`},
 		{`SELECT '192.168.0.1':::INET`},
 		{`SELECT INET '192.168.0.1'`},
 
 		{`SELECT 1:::REGTYPE`},
 		{`SELECT 1:::REGPROC`},
+		{`SELECT 1:::REGPROCEDURE`},
 		{`SELECT 1:::REGCLASS`},
 		{`SELECT 1:::REGNAMESPACE`},
 
@@ -762,6 +814,23 @@ func TestParse(t *testing.T) {
 
 		{`SELECT 0xf0 FROM t`},
 		{`SELECT 0xF0 FROM t`},
+
+		// Test various cases of qualified and not statically known types.
+		{`SELECT 1::notatype`},
+		{`SELECT 1::schem.typ`},
+		{`SELECT 1::int4.typ`},
+		{`SELECT 1::db.schem.typ`},
+		{`SELECT 1::db.int4.typ[]`},
+		{`CREATE TABLE t (x special.type)`},
+		{`CREATE TABLE t (x int4.type)`},
+		{`CREATE TABLE t (x notatype)`},
+		{`SELECT 1 IS OF (my.type, int4.type)`},
+		{`SELECT my.type ''`},
+		{`SELECT int4.type ''`},
+		{`SELECT foo ''`},
+		{`SELECT CAST(1.2 + 2.3 AS notatype)`},
+		{`SELECT ANNOTATE_TYPE(1.2 + 2.3, notatype)`},
+		{`SELECT 'f'::blah`},
 
 		// Escaping may change since the scanning process loses information
 		// (you can write e'\'' or ''''), but these are the idempotent cases.
@@ -833,6 +902,8 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t WHERE a NOT BETWEEN SYMMETRIC b AND c`},
 		{`SELECT a FROM t WHERE a IS NULL`},
 		{`SELECT a FROM t WHERE a IS NOT NULL`},
+		{`SELECT a FROM t WHERE (a, b) IS NULL`},
+		{`SELECT a FROM t WHERE (a, b) IS NOT NULL`},
 		{`SELECT a FROM t WHERE a IS true`},
 		{`SELECT a FROM t WHERE a IS NOT true`},
 		{`SELECT a FROM t WHERE a IS false`},
@@ -841,6 +912,8 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t WHERE a IS NOT OF (FLOAT8, STRING)`},
 		{`SELECT a FROM t WHERE a IS DISTINCT FROM b`},
 		{`SELECT a FROM t WHERE a IS NOT DISTINCT FROM b`},
+		{`SELECT a FROM t WHERE (a, b) IS NOT DISTINCT FROM NULL`},
+		{`SELECT a FROM t WHERE (a, b) IS DISTINCT FROM NULL`},
 		{`SELECT a FROM t WHERE a < b`},
 		{`SELECT a FROM t WHERE a <= b`},
 		{`SELECT a FROM t WHERE a >= b`},
@@ -972,6 +1045,12 @@ func TestParse(t *testing.T) {
 		{`SELECT avg(1) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW) FROM t`},
 		{`SELECT avg(1) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE GROUP) FROM t`},
 		{`SELECT avg(1) OVER (ROWS UNBOUNDED PRECEDING EXCLUDE TIES) FROM t`},
+
+		{`SELECT percentile_disc(0.50) WITHIN GROUP (ORDER BY c) FROM t`},
+		{`SELECT percentile_disc(0.50) WITHIN GROUP (ORDER BY c DESC) FROM t`},
+		{`SELECT percentile_cont(0.50) WITHIN GROUP (ORDER BY c) FROM t`},
+		{`SELECT percentile_disc(ARRAY[0.95, 0.90]) WITHIN GROUP (ORDER BY c) FROM t`},
+		{`SELECT percentile_cont(ARRAY[0.95, 0.90]) WITHIN GROUP (ORDER BY c) FROM t`},
 
 		{`SELECT avg(1) FILTER (WHERE a > b)`},
 		{`SELECT avg(1) FILTER (WHERE a > b) OVER (ORDER BY c)`},
@@ -1301,6 +1380,14 @@ func TestParse(t *testing.T) {
 		{`EXPLAIN ALTER TABLE t EXPERIMENTAL_AUDIT SET READ WRITE`},
 		{`ALTER TABLE t EXPERIMENTAL_AUDIT SET OFF`},
 
+		{`ALTER TYPE db.s.t ADD VALUE 'hi'`},
+		{`ALTER TYPE s.t ADD VALUE 'hi' BEFORE 'hello'`},
+		{`ALTER TYPE t ADD VALUE 'hi' AFTER 'howdy'`},
+		{`ALTER TYPE s.t ADD VALUE IF NOT EXISTS 'hi' BEFORE 'hello'`},
+		{`ALTER TYPE t RENAME VALUE 'value1' TO 'value2'`},
+		{`ALTER TYPE t RENAME TO t2`},
+		{`ALTER TYPE t SET SCHEMA newschema`},
+
 		{`COMMENT ON COLUMN a.b IS 'a'`},
 		{`COMMENT ON COLUMN a.b IS NULL`},
 		{`COMMENT ON COLUMN a.b.c IS 'a'`},
@@ -1415,6 +1502,11 @@ func TestParse(t *testing.T) {
 		{`WITH cte AS (SELECT 1) SELECT * FROM cte`},
 		{`WITH cte (x) AS (INSERT INTO abc VALUES (1, 2)), cte2 (y) AS (SELECT x + 1 FROM cte) SELECT * FROM cte, cte2`},
 		{`WITH RECURSIVE cte (x) AS (SELECT 1), cte2 (y) AS (SELECT x + 1 FROM cte) SELECT 1`},
+		{`WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte`},
+		{`WITH RECURSIVE cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte`},
+		{`WITH cte AS NOT MATERIALIZED (SELECT 1) SELECT * FROM cte`},
+		{`WITH cte (x) AS MATERIALIZED (INSERT INTO abc VALUES (1, 2)), cte2 (y) AS NOT MATERIALIZED (SELECT x + 1 FROM cte) SELECT * FROM cte, cte2`},
+		{`WITH RECURSIVE cte (x) AS MATERIALIZED (INSERT INTO abc VALUES (1, 2)), cte2 (y) AS NOT MATERIALIZED (SELECT x + 1 FROM cte) SELECT * FROM cte, cte2`},
 	}
 	var p parser.Parser // Verify that the same parser can be reused.
 	for _, d := range testData {
@@ -1448,11 +1540,14 @@ func TestParse2(t *testing.T) {
 			`CREATE TABLE a (b INT8)`},
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b))`,
 			`CREATE TABLE a (b INT8, CONSTRAINT foo UNIQUE (b))`},
+		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b) WHERE c > 3)`,
+			`CREATE TABLE a (b INT8, CONSTRAINT foo UNIQUE (b) WHERE c > 3)`},
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b) INTERLEAVE IN PARENT c (d))`,
 			`CREATE TABLE a (b INT8, CONSTRAINT foo UNIQUE (b) INTERLEAVE IN PARENT c (d))`},
 		{`CREATE TABLE a (UNIQUE INDEX (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1)))`,
 			`CREATE TABLE a (UNIQUE (b) PARTITION BY LIST (c) (PARTITION d VALUES IN (1)))`},
 		{`CREATE INDEX ON a (b) COVERING (c)`, `CREATE INDEX ON a (b) STORING (c)`},
+		{`CREATE INDEX ON a (b) INCLUDE (c)`, `CREATE INDEX ON a (b) STORING (c)`},
 
 		{`CREATE INDEX a ON b USING GIN (c)`,
 			`CREATE INVERTED INDEX a ON b (c)`},
@@ -1516,8 +1611,8 @@ func TestParse2(t *testing.T) {
 
 		{`SELECT a FROM t WHERE a ISNULL`, `SELECT a FROM t WHERE a IS NULL`},
 		{`SELECT a FROM t WHERE a NOTNULL`, `SELECT a FROM t WHERE a IS NOT NULL`},
-		{`SELECT a FROM t WHERE a IS UNKNOWN`, `SELECT a FROM t WHERE a IS NULL`},
-		{`SELECT a FROM t WHERE a IS NOT UNKNOWN`, `SELECT a FROM t WHERE a IS NOT NULL`},
+		{`SELECT a FROM t WHERE a IS UNKNOWN`, `SELECT a FROM t WHERE a IS NOT DISTINCT FROM NULL`},
+		{`SELECT a FROM t WHERE a IS NOT UNKNOWN`, `SELECT a FROM t WHERE a IS DISTINCT FROM NULL`},
 
 		{`SELECT +1`, `SELECT 1`},
 		{`SELECT - - 5`, `SELECT 5`},
@@ -2244,8 +2339,9 @@ $function$`,
 
 		{`EXPLAIN ANALYZE SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
 		// Check the alternate spelling.
-		{`EXPLAIN ANALYSE (A, B, C) SELECT 1`, `EXPLAIN ANALYZE (A, B, C) SELECT 1`},
 		{`EXPLAIN ANALYSE SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
+		{`EXPLAIN ANALYSE (DISTSQL) SELECT 1`, `EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
+		{`EXPLAIN (VERBOSE, OPT) SELECT 1`, `EXPLAIN (OPT, VERBOSE) SELECT 1`},
 
 		{`SET a = INDEX`, `SET a = "index"`},
 		{`SET a = NOTHING`, `SET a = "nothing"`},
@@ -2277,6 +2373,11 @@ $function$`,
 		{`SELECT '{}'::JSONB ?& 'a' = false`, `SELECT ('{}'::JSONB ?& 'a') = false`},
 		{`SELECT '{}'::JSONB @> '{}'::JSONB = false`, `SELECT ('{}'::JSONB @> '{}'::JSONB) = false`},
 		{`SELECT '{}'::JSONB <@ '{}'::JSONB = false`, `SELECT ('{}'::JSONB <@ '{}'::JSONB) = false`},
+
+		{`SELECT 1::db.int4.typ array [1]`, `SELECT 1::db.int4.typ[]`},
+		{`SELECT 1::int4.typ array [1]`, `SELECT 1::int4.typ[]`},
+		{`SELECT 1::db.int4.typ array`, `SELECT 1::db.int4.typ[]`},
+		{`CREATE TABLE t (x int4.type array [1])`, `CREATE TABLE t (x int4.type[])`},
 	}
 	for _, d := range testData {
 		t.Run(d.sql, func(t *testing.T) {
@@ -2506,11 +2607,6 @@ DETAIL: source SQL:
 SELECT 1e-
        ^
 HINT: try \h SELECT`},
-		{"SELECT foo''",
-			`at or near "": syntax error: type does not exist
-DETAIL: source SQL:
-SELECT foo''
-          ^`},
 		{
 			`SELECT 0x FROM t`,
 			`lexical error: invalid hexadecimal numeric literal
@@ -2618,20 +2714,6 @@ ALTER TABLE t RENAME COLUMN x TO family
 HINT: try \h ALTER TABLE`,
 		},
 		{
-			`SELECT CAST(1.2+2.3 AS notatype)`,
-			`at or near "notatype": syntax error: type does not exist
-DETAIL: source SQL:
-SELECT CAST(1.2+2.3 AS notatype)
-                       ^`,
-		},
-		{
-			`SELECT ANNOTATE_TYPE(1.2+2.3, notatype)`,
-			`at or near "notatype": syntax error: type does not exist
-DETAIL: source SQL:
-SELECT ANNOTATE_TYPE(1.2+2.3, notatype)
-                              ^`,
-		},
-		{
 			`CREATE USER foo WITH PASSWORD`,
 			`at or near "EOF": syntax error
 DETAIL: source SQL:
@@ -2696,13 +2778,6 @@ SELECT EXISTS(SELECT 1)[1]
 DETAIL: source SQL:
 SELECT 1 + ANY ARRAY[1, 2, 3]
                              ^`,
-		},
-		{
-			`SELECT 'f'::"blah"`,
-			`at or near "blah": syntax error: type does not exist
-DETAIL: source SQL:
-SELECT 'f'::"blah"
-            ^`,
 		},
 		// Ensure that the support for ON ROLE <namelist> doesn't leak
 		// where it should not be recognized.
@@ -2870,6 +2945,13 @@ DETAIL: source SQL:
 ALTER PARTITION p OF TABLE tbl@* CONFIGURE ZONE USING num_replicas = 1
                                  ^
 HINT: try ALTER PARTITION <partition> OF INDEX <tablename>@*`,
+		},
+		{
+			`SELECT percentile_disc(0.50) WITHIN GROUP (ORDER BY f, s) FROM x;`,
+			`at or near ")": syntax error: multiple ORDER BY clauses are not supported in this function
+DETAIL: source SQL:
+SELECT percentile_disc(0.50) WITHIN GROUP (ORDER BY f, s) FROM x
+                                                        ^`,
 		},
 	}
 	for _, d := range testData {
@@ -3116,149 +3198,180 @@ func TestUnimplementedSyntax(t *testing.T) {
 		sql      string
 		issue    int
 		expected string
+		hint     string
 	}{
-		{`ALTER TABLE a ALTER CONSTRAINT foo`, 31632, `alter constraint`},
+		{`ALTER TABLE a ALTER CONSTRAINT foo`, 31632, `alter constraint`, ``},
+		{`ALTER TABLE a ADD CONSTRAINT foo EXCLUDE USING gist (bar WITH =)`, 46657, `add constraint exclude using`, ``},
 
-		{`CREATE AGGREGATE a`, 0, `create aggregate`},
-		{`CREATE CAST a`, 0, `create cast`},
-		{`CREATE CONSTRAINT TRIGGER a`, 28296, `create constraint`},
-		{`CREATE CONVERSION a`, 0, `create conversion`},
-		{`CREATE DEFAULT CONVERSION a`, 0, `create def conv`},
-		{`CREATE EXTENSION a`, 0, `create extension a`},
-		{`CREATE FOREIGN DATA WRAPPER a`, 0, `create fdw`},
-		{`CREATE FOREIGN TABLE a`, 0, `create foreign table`},
-		{`CREATE FUNCTION a`, 17511, `create`},
-		{`CREATE OR REPLACE FUNCTION a`, 17511, `create`},
-		{`CREATE LANGUAGE a`, 17511, `create language a`},
-		{`CREATE MATERIALIZED VIEW a`, 41649, ``},
-		{`CREATE OPERATOR a`, 0, `create operator`},
-		{`CREATE PUBLICATION a`, 0, `create publication`},
-		{`CREATE RULE a`, 0, `create rule`},
-		{`CREATE SERVER a`, 0, `create server`},
-		{`CREATE SUBSCRIPTION a`, 0, `create subscription`},
-		{`CREATE TEXT SEARCH a`, 7821, `create text`},
-		{`CREATE TRIGGER a`, 28296, `create`},
+		{`CREATE AGGREGATE a`, 0, `create aggregate`, ``},
+		{`CREATE CAST a`, 0, `create cast`, ``},
+		{`CREATE CONSTRAINT TRIGGER a`, 28296, `create constraint`, ``},
+		{`CREATE CONVERSION a`, 0, `create conversion`, ``},
+		{`CREATE DEFAULT CONVERSION a`, 0, `create def conv`, ``},
+		{`CREATE EXTENSION a`, 0, `create extension a`, ``},
+		{`CREATE FOREIGN DATA WRAPPER a`, 0, `create fdw`, ``},
+		{`CREATE FOREIGN TABLE a`, 0, `create foreign table`, ``},
+		{`CREATE FUNCTION a`, 17511, `create`, ``},
+		{`CREATE OR REPLACE FUNCTION a`, 17511, `create`, ``},
+		{`CREATE LANGUAGE a`, 17511, `create language a`, ``},
+		{`CREATE MATERIALIZED VIEW a`, 41649, ``, ``},
+		{`CREATE OPERATOR a`, 0, `create operator`, ``},
+		{`CREATE PUBLICATION a`, 0, `create publication`, ``},
+		{`CREATE RULE a`, 0, `create rule`, ``},
+		{`CREATE SERVER a`, 0, `create server`, ``},
+		{`CREATE SUBSCRIPTION a`, 0, `create subscription`, ``},
+		{`CREATE TEXT SEARCH a`, 7821, `create text`, ``},
+		{`CREATE TRIGGER a`, 28296, `create`, ``},
 
-		{`DROP AGGREGATE a`, 0, `drop aggregate`},
-		{`DROP CAST a`, 0, `drop cast`},
-		{`DROP COLLATION a`, 0, `drop collation`},
-		{`DROP CONVERSION a`, 0, `drop conversion`},
-		{`DROP DOMAIN a`, 27796, `drop`},
-		{`DROP EXTENSION a`, 0, `drop extension a`},
-		{`DROP FOREIGN TABLE a`, 0, `drop foreign table`},
-		{`DROP FOREIGN DATA WRAPPER a`, 0, `drop fdw`},
-		{`DROP FUNCTION a`, 17511, `drop `},
-		{`DROP LANGUAGE a`, 17511, `drop language a`},
-		{`DROP OPERATOR a`, 0, `drop operator`},
-		{`DROP PUBLICATION a`, 0, `drop publication`},
-		{`DROP RULE a`, 0, `drop rule`},
-		{`DROP SCHEMA a`, 26443, `drop`},
-		{`DROP SERVER a`, 0, `drop server`},
-		{`DROP SUBSCRIPTION a`, 0, `drop subscription`},
-		{`DROP TEXT SEARCH a`, 7821, `drop text`},
-		{`DROP TRIGGER a`, 28296, `drop`},
-		{`DROP TYPE a`, 27793, `drop type`},
+		{`DROP AGGREGATE a`, 0, `drop aggregate`, ``},
+		{`DROP CAST a`, 0, `drop cast`, ``},
+		{`DROP COLLATION a`, 0, `drop collation`, ``},
+		{`DROP CONVERSION a`, 0, `drop conversion`, ``},
+		{`DROP DOMAIN a`, 27796, `drop`, ``},
+		{`DROP EXTENSION a`, 0, `drop extension a`, ``},
+		{`DROP FOREIGN TABLE a`, 0, `drop foreign table`, ``},
+		{`DROP FOREIGN DATA WRAPPER a`, 0, `drop fdw`, ``},
+		{`DROP FUNCTION a`, 17511, `drop `, ``},
+		{`DROP LANGUAGE a`, 17511, `drop language a`, ``},
+		{`DROP OPERATOR a`, 0, `drop operator`, ``},
+		{`DROP PUBLICATION a`, 0, `drop publication`, ``},
+		{`DROP RULE a`, 0, `drop rule`, ``},
+		{`DROP SCHEMA a`, 26443, `drop`, ``},
+		{`DROP SERVER a`, 0, `drop server`, ``},
+		{`DROP SUBSCRIPTION a`, 0, `drop subscription`, ``},
+		{`DROP TEXT SEARCH a`, 7821, `drop text`, ``},
+		{`DROP TRIGGER a`, 28296, `drop`, ``},
 
-		{`DISCARD PLANS`, 0, `discard plans`},
-		{`DISCARD SEQUENCES`, 0, `discard sequences`},
-		{`DISCARD TEMP`, 0, `discard temp`},
-		{`DISCARD TEMPORARY`, 0, `discard temp`},
+		{`DISCARD PLANS`, 0, `discard plans`, ``},
+		{`DISCARD SEQUENCES`, 0, `discard sequences`, ``},
+		{`DISCARD TEMP`, 0, `discard temp`, ``},
+		{`DISCARD TEMPORARY`, 0, `discard temp`, ``},
 
-		{`SET CONSTRAINTS foo`, 0, `set constraints`},
-		{`SET LOCAL foo = bar`, 32562, ``},
-		{`SET foo FROM CURRENT`, 0, `set from current`},
+		{`SET CONSTRAINTS foo`, 0, `set constraints`, ``},
+		{`SET LOCAL foo = bar`, 32562, ``, ``},
+		{`SET foo FROM CURRENT`, 0, `set from current`, ``},
 
-		{`CREATE UNLOGGED TABLE a(b INT8)`, 0, `create unlogged`},
+		{`CREATE UNLOGGED TABLE a(b INT8)`, 0, `create unlogged`, ``},
 
-		{`CREATE TABLE a(x INT[][])`, 32552, ``},
-		{`CREATE TABLE a(x INT[1][2])`, 32552, ``},
-		{`CREATE TABLE a(x INT ARRAY[1][2])`, 32552, ``},
+		{`CREATE TABLE a(x INT[][])`, 32552, ``, ``},
+		{`CREATE TABLE a(x INT[1][2])`, 32552, ``, ``},
+		{`CREATE TABLE a(x INT ARRAY[1][2])`, 32552, ``, ``},
 
-		{`CREATE TABLE a(LIKE b)`, 30840, ``},
+		{`CREATE TABLE a(b INT8) WITH OIDS`, 0, `create table with oids`, ``},
 
-		{`CREATE TABLE a(b INT8) WITH OIDS`, 0, `create table with oids`},
+		{`CREATE TABLE a AS SELECT b WITH NO DATA`, 0, `create table as with no data`, ``},
 
-		{`CREATE TABLE a AS SELECT b WITH NO DATA`, 0, `create table as with no data`},
+		{`CREATE TABLE a(b INT8 AS (123) VIRTUAL)`, 0, `virtual computed columns`, ``},
+		{`CREATE TABLE a(b INT8 REFERENCES c(x) MATCH PARTIAL`, 20305, `match partial`, ``},
+		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) MATCH PARTIAL)`, 20305, `match partial`, ``},
 
-		{`CREATE TABLE a(b INT8 AS (123) VIRTUAL)`, 0, `virtual computed columns`},
-		{`CREATE TABLE a(b INT8 REFERENCES c(x) MATCH PARTIAL`, 20305, `match partial`},
-		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) MATCH PARTIAL)`, 20305, `match partial`},
+		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) DEFERRABLE)`, 31632, `deferrable`, ``},
+		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) INITIALLY DEFERRED)`, 31632, `initially deferred`, ``},
+		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) INITIALLY IMMEDIATE)`, 31632, `initially immediate`, ``},
+		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) DEFERRABLE INITIALLY DEFERRED)`, 31632, `initially deferred`, ``},
+		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) DEFERRABLE INITIALLY IMMEDIATE)`, 31632, `initially immediate`, ``},
+		{`CREATE TABLE a(b INT8, UNIQUE (b) DEFERRABLE)`, 31632, `deferrable`, ``},
+		{`CREATE TABLE a(b INT8, CHECK (b > 0) DEFERRABLE)`, 31632, `deferrable`, ``},
 
-		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) DEFERRABLE)`, 31632, `deferrable`},
-		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) INITIALLY DEFERRED)`, 31632, `initially deferred`},
-		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) INITIALLY IMMEDIATE)`, 31632, `initially immediate`},
-		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) DEFERRABLE INITIALLY DEFERRED)`, 31632, `initially deferred`},
-		{`CREATE TABLE a(b INT8, FOREIGN KEY (b) REFERENCES c(x) DEFERRABLE INITIALLY IMMEDIATE)`, 31632, `initially immediate`},
-		{`CREATE TABLE a(b INT8, UNIQUE (b) DEFERRABLE)`, 31632, `deferrable`},
-		{`CREATE TABLE a(b INT8, CHECK (b > 0) DEFERRABLE)`, 31632, `deferrable`},
+		{`CREATE TABLE a (LIKE b INCLUDING COMMENTS)`, 47071, `like table`, ``},
+		{`CREATE TABLE a (LIKE b INCLUDING IDENTITY)`, 47071, `like table`, ``},
+		{`CREATE TABLE a (LIKE b INCLUDING STATISTICS)`, 47071, `like table`, ``},
+		{`CREATE TABLE a (LIKE b INCLUDING STORAGE)`, 47071, `like table`, ``},
 
-		{`CREATE SEQUENCE a AS DOUBLE PRECISION`, 25110, `FLOAT8`},
+		{`CREATE TEMP TABLE a (a int) ON COMMIT DROP`, 46556, `drop`, ``},
+		{`CREATE TEMP TABLE a (a int) ON COMMIT DELETE ROWS`, 46556, `delete rows`, ``},
+		{`CREATE TEMP TABLE IF NOT EXISTS a (a int) ON COMMIT DROP`, 46556, `drop`, ``},
+		{`CREATE TEMP TABLE IF NOT EXISTS a (a int) ON COMMIT DELETE ROWS`, 46556, `delete rows`, ``},
+		{`CREATE TEMP TABLE b AS SELECT a FROM a ON COMMIT DROP`, 46556, `drop`, ``},
+		{`CREATE TEMP TABLE b AS SELECT a FROM a ON COMMIT DELETE ROWS`, 46556, `delete rows`, ``},
+		{`CREATE TEMP TABLE IF NOT EXISTS b AS SELECT a FROM a ON COMMIT DROP`, 46556, `drop`, ``},
+		{`CREATE TEMP TABLE IF NOT EXISTS b AS SELECT a FROM a ON COMMIT DELETE ROWS`, 46556, `delete rows`, ``},
 
-		{`CREATE OR REPLACE VIEW a AS SELECT b`, 24897, ``},
-		{`CREATE RECURSIVE VIEW a AS SELECT b`, 0, `create recursive view`},
+		{`CREATE SEQUENCE a AS DOUBLE PRECISION`, 25110, `FLOAT8`, ``},
 
-		{`CREATE TYPE a AS (b)`, 27792, ``},
-		{`CREATE TYPE a AS ENUM (b)`, 24873, ``},
-		{`CREATE TYPE a AS RANGE b`, 27791, ``},
-		{`CREATE TYPE a (b)`, 27793, `base`},
-		{`CREATE TYPE a`, 27793, `shell`},
-		{`CREATE DOMAIN a`, 27796, `create`},
+		{`CREATE RECURSIVE VIEW a AS SELECT b`, 0, `create recursive view`, ``},
 
-		{`CREATE INDEX a ON b(c) WHERE d > 0`, 9683, ``},
-		{`CREATE INDEX a ON b USING HASH (c)`, 0, `index using hash`},
-		{`CREATE INDEX a ON b USING GIST (c)`, 0, `index using gist`},
-		{`CREATE INDEX a ON b USING SPGIST (c)`, 0, `index using spgist`},
-		{`CREATE INDEX a ON b USING BRIN (c)`, 0, `index using brin`},
+		{`CREATE TYPE a AS (b)`, 27792, ``, ``},
+		{`CREATE TYPE a AS RANGE b`, 27791, ``, ``},
+		{`CREATE TYPE a (b)`, 27793, `base`, ``},
+		{`CREATE TYPE a`, 27793, `shell`, ``},
+		{`CREATE DOMAIN a`, 27796, `create`, ``},
 
-		{`CREATE INDEX a ON b(c + d)`, 9682, ``},
-		{`CREATE INDEX a ON b(c[d])`, 9682, ``},
-		{`CREATE INDEX a ON b(foo(c))`, 9682, ``},
-		{`CREATE INDEX a ON b(a NULLS LAST)`, 6224, ``},
-		{`CREATE INDEX a ON b(a ASC NULLS LAST)`, 6224, ``},
-		{`CREATE INDEX a ON b(a DESC NULLS FIRST)`, 6224, ``},
+		{`ALTER TYPE t OWNER TO hello`, 48700, `ALTER TYPE OWNER TO`, ``},
+		{`ALTER TYPE t OWNER TO CURRENT_USER`, 48700, `ALTER TYPE OWNER TO`, ``},
+		{`ALTER TYPE t OWNER TO SESSION_USER`, 48700, `ALTER TYPE OWNER TO`, ``},
+		{`ALTER TYPE db.t RENAME ATTRIBUTE foo TO bar`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar COLLATE hello`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar RESTRICT`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar CASCADE`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t DROP ATTRIBUTE foo`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t DROP ATTRIBUTE foo RESTRICT`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t DROP ATTRIBUTE foo CASCADE`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ALTER ATTRIBUTE foo TYPE typ`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ALTER ATTRIBUTE foo TYPE typ COLLATE en`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ALTER ATTRIBUTE foo TYPE typ COLLATE en CASCADE`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ALTER ATTRIBUTE foo SET DATA TYPE typ COLLATE en RESTRICT`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
+		{`ALTER TYPE db.s.t ADD ATTRIBUTE foo bar RESTRICT, DROP ATTRIBUTE foo`, 48701, `ALTER TYPE ATTRIBUTE`, ``},
 
-		{`INSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``},
-		{`INSERT INTO foo VALUES (1,2) ON CONFLICT ON CONSTRAINT a DO NOTHING`, 28161, ``},
+		{`CREATE INDEX a ON b USING HASH (c)`, 0, `index using hash`, ``},
+		{`CREATE INDEX a ON b USING GIST (c)`, 0, `index using gist`, ``},
+		{`CREATE INDEX a ON b USING SPGIST (c)`, 0, `index using spgist`, ``},
+		{`CREATE INDEX a ON b USING BRIN (c)`, 0, `index using brin`, ``},
 
-		{`SELECT * FROM ROWS FROM (a(b) AS (d))`, 0, `ROWS FROM with col_def_list`},
+		{`CREATE INDEX a ON b(c + d)`, 9682, ``, ``},
+		{`CREATE INDEX a ON b(c[d])`, 9682, ``, ``},
+		{`CREATE INDEX a ON b(foo(c))`, 9682, ``, ``},
+		{`CREATE INDEX a ON b(a NULLS LAST)`, 6224, ``, ``},
+		{`CREATE INDEX a ON b(a ASC NULLS LAST)`, 6224, ``, ``},
+		{`CREATE INDEX a ON b(a DESC NULLS FIRST)`, 6224, ``, ``},
 
-		{`SELECT a(b) 'c'`, 0, `a(...) SCONST`},
-		{`SELECT (a,b) OVERLAPS (c,d)`, 0, `overlaps`},
-		{`SELECT UNIQUE (SELECT b)`, 0, `UNIQUE predicate`},
-		{`SELECT GROUPING (a,b,c)`, 0, `d_expr grouping`},
-		{`SELECT a(VARIADIC b)`, 0, `variadic`},
-		{`SELECT a(b, c, VARIADIC b)`, 0, `variadic`},
-		{`SELECT TREAT (a AS INT8)`, 0, `treat`},
-		{`SELECT a(b) WITHIN GROUP (ORDER BY c)`, 0, `within group`},
+		{`INSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``, ``},
+		{`INSERT INTO foo VALUES (1,2) ON CONFLICT ON CONSTRAINT a DO NOTHING`, 28161, ``, ``},
 
-		{`SELECT a FROM t ORDER BY a NULLS LAST`, 6224, ``},
-		{`SELECT a FROM t ORDER BY a ASC NULLS LAST`, 6224, ``},
-		{`SELECT a FROM t ORDER BY a DESC NULLS FIRST`, 6224, ``},
+		{`SELECT * FROM ROWS FROM (a(b) AS (d))`, 0, `ROWS FROM with col_def_list`, ``},
 
-		{`CREATE TABLE a(b BOX)`, 21286, `box`},
-		{`CREATE TABLE a(b CIDR)`, 18846, `cidr`},
-		{`CREATE TABLE a(b CIRCLE)`, 21286, `circle`},
-		{`CREATE TABLE a(b LINE)`, 21286, `line`},
-		{`CREATE TABLE a(b LSEG)`, 21286, `lseg`},
-		{`CREATE TABLE a(b MACADDR)`, 0, `macaddr`},
-		{`CREATE TABLE a(b MACADDR8)`, 0, `macaddr8`},
-		{`CREATE TABLE a(b MONEY)`, 0, `money`},
-		{`CREATE TABLE a(b PATH)`, 21286, `path`},
-		{`CREATE TABLE a(b PG_LSN)`, 0, `pg_lsn`},
-		{`CREATE TABLE a(b POINT)`, 21286, `point`},
-		{`CREATE TABLE a(b POLYGON)`, 21286, `polygon`},
-		{`CREATE TABLE a(b TSQUERY)`, 7821, `tsquery`},
-		{`CREATE TABLE a(b TSVECTOR)`, 7821, `tsvector`},
-		{`CREATE TABLE a(b TXID_SNAPSHOT)`, 0, `txid_snapshot`},
-		{`CREATE TABLE a(b XML)`, 0, `xml`},
+		{`SELECT a(b) 'c'`, 0, `a(...) SCONST`, ``},
+		{`SELECT (a,b) OVERLAPS (c,d)`, 0, `overlaps`, ``},
+		{`SELECT UNIQUE (SELECT b)`, 0, `UNIQUE predicate`, ``},
+		{`SELECT GROUPING (a,b,c)`, 0, `d_expr grouping`, ``},
+		{`SELECT a(VARIADIC b)`, 0, `variadic`, ``},
+		{`SELECT a(b, c, VARIADIC b)`, 0, `variadic`, ``},
+		{`SELECT TREAT (a AS INT8)`, 0, `treat`, ``},
 
-		{`INSERT INTO a VALUES (1) ON CONFLICT (x) WHERE x > 3 DO NOTHING`, 32557, ``},
+		{`SELECT a FROM t ORDER BY a NULLS LAST`, 6224, ``, ``},
+		{`SELECT a FROM t ORDER BY a ASC NULLS LAST`, 6224, ``, ``},
+		{`SELECT a FROM t ORDER BY a DESC NULLS FIRST`, 6224, ``, ``},
 
-		{`UPDATE foo SET (a, a.b) = (1, 2)`, 27792, ``},
-		{`UPDATE foo SET a.b = 1`, 27792, ``},
-		{`UPDATE Foo SET x.y = z`, 27792, ``},
+		{`CREATE TABLE a(b BOX)`, 21286, `box`, ``},
+		{`CREATE TABLE a(b CIDR)`, 18846, `cidr`, ``},
+		{`CREATE TABLE a(b CIRCLE)`, 21286, `circle`, ``},
+		{`CREATE TABLE a(b LINE)`, 21286, `line`, ``},
+		{`CREATE TABLE a(b LSEG)`, 21286, `lseg`, ``},
+		{`CREATE TABLE a(b MACADDR)`, 0, `macaddr`, ``},
+		{`CREATE TABLE a(b MACADDR8)`, 0, `macaddr8`, ``},
+		{`CREATE TABLE a(b MONEY)`, 0, `money`, ``},
+		{`CREATE TABLE a(b PATH)`, 21286, `path`, ``},
+		{`CREATE TABLE a(b PG_LSN)`, 0, `pg_lsn`, ``},
+		{`CREATE TABLE a(b POINT)`, 21286, `point`, ``},
+		{`CREATE TABLE a(b POLYGON)`, 21286, `polygon`, ``},
+		{`CREATE TABLE a(b TSQUERY)`, 7821, `tsquery`, ``},
+		{`CREATE TABLE a(b TSVECTOR)`, 7821, `tsvector`, ``},
+		{`CREATE TABLE a(b TXID_SNAPSHOT)`, 0, `txid_snapshot`, ``},
+		{`CREATE TABLE a(b XML)`, 0, `xml`, ``},
 
-		{`UPSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``},
+		{`INSERT INTO a VALUES (1) ON CONFLICT (x) WHERE x > 3 DO NOTHING`, 32557, ``, ``},
+
+		{`UPDATE foo SET (a, a.b) = (1, 2)`, 27792, ``, ``},
+		{`UPDATE foo SET a.b = 1`, 27792, ``, ``},
+		{`UPDATE Foo SET x.y = z`, 27792, ``, ``},
+
+		{`REINDEX INDEX a`, 0, `reindex index`, `CockroachDB does not require reindexing.`},
+		{`REINDEX TABLE a`, 0, `reindex table`, `CockroachDB does not require reindexing.`},
+		{`REINDEX DATABASE a`, 0, `reindex database`, `CockroachDB does not require reindexing.`},
+		{`REINDEX SYSTEM a`, 0, `reindex system`, `CockroachDB does not require reindexing.`},
+
+		{`UPSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``, ``},
 	}
 	for _, d := range testData {
 		t.Run(d.sql, func(t *testing.T) {
@@ -3284,6 +3397,10 @@ func TestUnimplementedSyntax(t *testing.T) {
 				if !found {
 					t.Errorf("%s: expected %q in telemetry keys, got %+v", d.sql, d.expected, tkeys)
 				}
+			}
+			if d.hint != "" {
+				hints := errors.GetAllHints(err)
+				assert.Contains(t, hints, d.hint)
 			}
 			if d.issue != 0 {
 				exp := fmt.Sprintf("syntax.#%d", d.issue)

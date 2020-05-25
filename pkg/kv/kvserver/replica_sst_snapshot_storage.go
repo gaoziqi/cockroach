@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/time/rate"
 )
 
@@ -93,6 +93,7 @@ func (s *SSTSnapshotStorageScratch) NewFile(
 ) (*SSTSnapshotStorageFile, error) {
 	id := len(s.ssts)
 	filename := s.filename(id)
+	s.ssts = append(s.ssts, filename)
 	f := &SSTSnapshotStorageFile{
 		scratch:   s,
 		filename:  filename,
@@ -158,13 +159,12 @@ func (f *SSTSnapshotStorageFile) openFile() error {
 			return err
 		}
 	}
-	file, err := f.scratch.storage.engine.CreateFile(f.filename)
+	file, err := f.scratch.storage.engine.Create(f.filename)
 	if err != nil {
 		return err
 	}
 	f.file = file
 	f.created = true
-	f.scratch.ssts = append(f.scratch.ssts, f.filename)
 	return nil
 }
 

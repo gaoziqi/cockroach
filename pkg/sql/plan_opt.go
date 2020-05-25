@@ -73,13 +73,13 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		// descriptors and such).
 		return opc.flags, nil
 
-	case *tree.ExplainBundle:
+	case *tree.ExplainAnalyzeDebug:
 		// This statement returns result columns but does not support placeholders,
 		// and we don't want to do anything during prepare.
 		if len(p.semaCtx.Placeholders.Types) != 0 {
 			return 0, errors.Errorf("%s does not support placeholders", stmt.AST.StatementTag())
 		}
-		stmt.Prepared.Columns = sqlbase.ExplainBundleColumns
+		stmt.Prepared.Columns = sqlbase.ExplainAnalyzeDebugColumns
 		return opc.flags, nil
 	}
 
@@ -189,7 +189,7 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 		result.flags.Set(planFlagIsDDL)
 	}
 
-	cols := planColumns(result.plan)
+	cols := planColumns(result.main)
 	if stmt.ExpectedTypes != nil {
 		if !stmt.ExpectedTypes.TypesEqual(cols) {
 			return pgerror.New(pgcode.FeatureNotSupported, "cached plan must not change result type")
@@ -249,7 +249,7 @@ func (opc *optPlanningCtx) reset() {
 		// are multiple DDL operations; and transactions can be aborted leading to
 		// potential reuse of versions. To avoid these issues, we prevent saving a
 		// memo (for prepare) or reusing a saved memo (for execute).
-		opc.allowMemoReuse = !p.Tables().hasUncommittedTables()
+		opc.allowMemoReuse = !p.Tables().HasUncommittedTables()
 		opc.useCache = opc.allowMemoReuse && queryCacheEnabled.Get(&p.execCfg.Settings.SV)
 
 		if _, isCanned := p.stmt.AST.(*tree.CannedOptPlan); isCanned {
@@ -266,7 +266,7 @@ func (opc *optPlanningCtx) reset() {
 
 func (opc *optPlanningCtx) log(ctx context.Context, msg string) {
 	if log.VDepth(1, 1) {
-		log.InfofDepth(ctx, 1, "%s: %s", msg, opc.p.stmt)
+		log.InfofDepth(ctx, 1, "%s: %s", log.Safe(msg), opc.p.stmt)
 	} else {
 		log.Event(ctx, msg)
 	}

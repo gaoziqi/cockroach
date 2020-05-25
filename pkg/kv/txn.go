@@ -191,9 +191,15 @@ func (txn *Txn) status() roachpb.TransactionStatus {
 	return txn.mu.sender.TxnStatus()
 }
 
-// IsCommitted returns true if the transaction has the committed status.
+// IsCommitted returns true iff the transaction has the committed status.
 func (txn *Txn) IsCommitted() bool {
 	return txn.status() == roachpb.COMMITTED
+}
+
+// IsOpen returns true iff the transaction is in the open state where
+// it can accept further commands.
+func (txn *Txn) IsOpen() bool {
+	return txn.status() == roachpb.PENDING
 }
 
 // SetUserPriority sets the transaction's user priority. Transactions default to
@@ -227,7 +233,7 @@ func (txn *Txn) TestingSetPriority(priority enginepb.TxnPriority) {
 	// non-randomized, priority for the transaction.
 	txn.mu.userPriority = roachpb.UserPriority(-priority)
 	if err := txn.mu.sender.SetUserPriority(txn.mu.userPriority); err != nil {
-		log.Fatal(context.TODO(), err)
+		log.Fatalf(context.TODO(), "%+v", err)
 	}
 	txn.mu.Unlock()
 }
@@ -262,6 +268,13 @@ func (txn *Txn) DebugName() string {
 
 func (txn *Txn) debugNameLocked() string {
 	return fmt.Sprintf("%s (id: %s)", txn.mu.debugName, txn.mu.ID)
+}
+
+// String returns a string version of this transaction.
+func (txn *Txn) String() string {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.String()
 }
 
 // ReadTimestamp returns the transaction's current read timestamp.
@@ -392,10 +405,14 @@ func (txn *Txn) Put(ctx context.Context, key, value interface{}) error {
 // pass nil for expValue. Note that this must be an interface{}(nil), not a
 // typed nil value (e.g. []byte(nil)).
 //
-// Returns an error if the existing value is not equal to expValue.
+// Returns a ConditionFailedError if the existing value is not equal to expValue.
 //
 // key can be either a byte slice or a string. value can be any key type, a
 // protoutil.Message or any Go primitive type (bool, int, etc).
+//
+// Note that, as an exception to the general rule, it's ok to send more requests
+// after getting a ConditionFailedError. See comments on ConditionalPutRequest
+// for more info.
 func (txn *Txn) CPut(ctx context.Context, key, value interface{}, expValue *roachpb.Value) error {
 	b := txn.NewBatch()
 	b.CPut(key, value, expValue)
@@ -789,7 +806,7 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 				err = txn.Commit(ctx)
 				log.Eventf(ctx, "client.Txn did AutoCommit. err: %v\n", err)
 				if err != nil {
-					if _, retryable := err.(*roachpb.TransactionRetryWithProtoRefreshError); !retryable {
+					if !errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) {
 						// We can't retry, so let the caller know we tried to
 						// autocommit.
 						err = &AutoCommitError{cause: err}
@@ -798,11 +815,8 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 			}
 		}
 
-		cause := errors.UnwrapAll(err)
-
 		var retryable bool
-		switch t := cause.(type) {
-		case *roachpb.UnhandledRetryableError:
+		if errors.HasType(err, (*roachpb.UnhandledRetryableError)(nil)) {
 			if txn.typ == RootTxn {
 				// We sent transactional requests, so the TxnCoordSender was supposed to
 				// turn retryable errors into TransactionRetryWithProtoRefreshError. Note that this
@@ -810,7 +824,7 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 				log.Fatalf(ctx, "unexpected UnhandledRetryableError at the txn.exec() level: %s", err)
 			}
 
-		case *roachpb.TransactionRetryWithProtoRefreshError:
+		} else if t := (*roachpb.TransactionRetryWithProtoRefreshError)(nil); errors.As(err, &t) {
 			if !txn.IsRetryableErrMeantForTxn(*t) {
 				// Make sure the txn record that err carries is for this txn.
 				// If it's not, we terminate the "retryable" character of the error. We
@@ -915,8 +929,8 @@ func (txn *Txn) Send(
 }
 
 func (txn *Txn) handleErrIfRetryableLocked(ctx context.Context, err error) {
-	retryErr, ok := err.(*roachpb.TransactionRetryWithProtoRefreshError)
-	if !ok {
+	var retryErr *roachpb.TransactionRetryWithProtoRefreshError
+	if !errors.As(err, &retryErr) {
 		return
 	}
 	txn.resetDeadlineLocked()

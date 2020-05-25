@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/importccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -41,8 +43,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -862,7 +864,7 @@ func allPartitioningTests(rng *rand.Rand) []partitioningTest {
 	const schemaFmt = `CREATE TABLE %%s (a %s PRIMARY KEY) PARTITION BY LIST (a) (PARTITION p VALUES IN (%s))`
 	for _, typ := range append(types.Scalar, types.AnyCollatedString) {
 		switch typ.Family() {
-		case types.JsonFamily:
+		case types.JsonFamily, types.GeographyFamily, types.GeometryFamily:
 			// Not indexable.
 			continue
 		case types.CollatedStringFamily:
@@ -1252,7 +1254,7 @@ func TestSelectPartitionExprs(t *testing.T) {
 		{`p33p44,p335p445,p33dp44d`, `((a, b) = (3, 3)) OR ((a, b) = (4, 4))`},
 	}
 
-	evalCtx := &tree.EvalContext{}
+	evalCtx := &tree.EvalContext{Codec: keys.SystemSQLCodec}
 	for _, test := range tests {
 		t.Run(test.partitions, func(t *testing.T) {
 			var partNames tree.NameList
@@ -1332,7 +1334,7 @@ func TestRepartitioning(t *testing.T) {
 					repartition.WriteString(`PARTITION BY NOTHING`)
 				} else {
 					if err := sql.ShowCreatePartitioning(
-						&sqlbase.DatumAlloc{}, test.new.parsed.tableDesc, testIndex,
+						&sqlbase.DatumAlloc{}, keys.SystemSQLCodec, test.new.parsed.tableDesc, testIndex,
 						&testIndex.Partitioning, &repartition, 0 /* indent */, 0, /* colOffset */
 					); err != nil {
 						t.Fatalf("%+v", err)
@@ -1363,6 +1365,80 @@ func TestRepartitioning(t *testing.T) {
 				testutils.SucceedsSoon(t, test.new.verifyScansFn(ctx, t, db))
 			}
 		})
+	}
+}
+
+func TestPrimaryKeyChangeZoneConfigs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	// Write a table with some partitions into the database,
+	// and change its primary key.
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+USE t;
+CREATE TABLE t (
+  x INT PRIMARY KEY,
+  y INT NOT NULL,
+  z INT,
+  w INT,
+  INDEX i1 (z),
+  INDEX i2 (w),
+  FAMILY (x, y, z, w)
+);
+ALTER INDEX t@i1 PARTITION BY LIST (z) (
+  PARTITION p1 VALUES IN (1)
+);
+ALTER INDEX t@i2 PARTITION BY LIST (w) (
+  PARTITION p2 VALUES IN (3)
+);
+ALTER PARTITION p1 OF INDEX t@i1 CONFIGURE ZONE USING gc.ttlseconds = 15210;
+ALTER PARTITION p2 OF INDEX t@i2 CONFIGURE ZONE USING gc.ttlseconds = 15213;
+ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (y)
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get the zone config corresponding to the table.
+	table := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "t")
+	kv, err := kvDB.Get(ctx, config.MakeZoneKey(uint32(table.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var zone zonepb.ZoneConfig
+	if err := kv.ValueProto(&zone); err != nil {
+		t.Fatal(err)
+	}
+
+	// Our subzones should be spans prefixed with dropped copy of i1,
+	// dropped copy of i2, new copy of i1, and new copy of i2.
+	// These have ID's 2, 3, 6 and 7 respectively.
+	expectedSpans := []roachpb.Key{
+		table.IndexSpan(keys.SystemSQLCodec, 2 /* indexID */).Key,
+		table.IndexSpan(keys.SystemSQLCodec, 3 /* indexID */).Key,
+		table.IndexSpan(keys.SystemSQLCodec, 6 /* indexID */).Key,
+		table.IndexSpan(keys.SystemSQLCodec, 7 /* indexID */).Key,
+	}
+	if len(zone.SubzoneSpans) != len(expectedSpans) {
+		t.Fatalf("expected subzones to have length %d", len(expectedSpans))
+	}
+
+	// Subzone spans have the table prefix omitted.
+	prefix := keys.SystemSQLCodec.TablePrefix(uint32(table.ID))
+	for i := range expectedSpans {
+		// Subzone spans have the table prefix omitted.
+		expected := bytes.TrimPrefix(expectedSpans[i], prefix)
+		if !bytes.HasPrefix(zone.SubzoneSpans[i].Key, expected) {
+			t.Fatalf(
+				"expected span to have prefix %s but found %s",
+				expected,
+				zone.SubzoneSpans[i].Key,
+			)
+		}
 	}
 }
 

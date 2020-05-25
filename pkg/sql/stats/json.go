@@ -53,7 +53,7 @@ type JSONHistoBucket struct {
 
 // SetHistogram fills in the HistogramColumnType and HistogramBuckets fields.
 func (js *JSONStatistic) SetHistogram(h *HistogramData) error {
-	typ := &h.ColumnType
+	typ := h.ColumnType
 	js.HistogramColumnType = typ.SQLString()
 	js.HistogramBuckets = make([]JSONHistoBucket, len(h.Buckets))
 	var a sqlbase.DatumAlloc
@@ -72,7 +72,7 @@ func (js *JSONStatistic) SetHistogram(h *HistogramData) error {
 			NumEq:         b.NumEq,
 			NumRange:      b.NumRange,
 			DistinctRange: b.DistinctRange,
-			UpperBound:    tree.AsStringWithFlags(datum, tree.FmtBareStrings),
+			UpperBound:    tree.AsStringWithFlags(datum, tree.FmtExport),
 		}
 	}
 	return nil
@@ -95,16 +95,22 @@ func (js *JSONStatistic) DecodeAndSetHistogram(datum tree.Datum) error {
 }
 
 // GetHistogram converts the json histogram into HistogramData.
-func (js *JSONStatistic) GetHistogram(evalCtx *tree.EvalContext) (*HistogramData, error) {
+func (js *JSONStatistic) GetHistogram(
+	semaCtx *tree.SemaContext, evalCtx *tree.EvalContext,
+) (*HistogramData, error) {
 	if len(js.HistogramBuckets) == 0 {
 		return nil, nil
 	}
 	h := &HistogramData{}
-	colType, err := parser.ParseType(js.HistogramColumnType)
+	colTypeRef, err := parser.ParseType(js.HistogramColumnType)
 	if err != nil {
 		return nil, err
 	}
-	h.ColumnType = *colType
+	colType, err := tree.ResolveType(colTypeRef, semaCtx.GetTypeResolver())
+	if err != nil {
+		return nil, err
+	}
+	h.ColumnType = colType
 	h.Buckets = make([]HistogramData_Bucket, len(js.HistogramBuckets))
 	for i := range h.Buckets {
 		hb := &js.HistogramBuckets[i]

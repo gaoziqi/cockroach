@@ -12,13 +12,15 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 type renameTableNode struct {
@@ -35,11 +37,11 @@ type renameTableNode struct {
 func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNode, error) {
 	oldTn := n.Name.ToTableName()
 	newTn := n.NewName.ToTableName()
-	toRequire := ResolveRequireTableOrViewDesc
+	toRequire := resolver.ResolveRequireTableOrViewDesc
 	if n.IsView {
-		toRequire = ResolveRequireViewDesc
+		toRequire = resolver.ResolveRequireViewDesc
 	} else if n.IsSequence {
-		toRequire = ResolveRequireSequenceDesc
+		toRequire = resolver.ResolveRequireSequenceDesc
 	}
 
 	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &oldTn, !n.IfExists, toRequire)
@@ -83,17 +85,21 @@ func (n *renameTableNode) startExec(params runParams) error {
 	newTn := n.newTn
 	tableDesc := n.tableDesc
 
-	prevDbDesc, err := p.ResolveUncachedDatabase(ctx, oldTn)
+	oldUn := oldTn.ToUnresolvedObjectName()
+	prevDbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, oldUn)
 	if err != nil {
 		return err
 	}
+	oldTn.ObjectNamePrefix = prefix
 
 	// Check if target database exists.
 	// We also look at uncached descriptors here.
-	targetDbDesc, err := p.ResolveUncachedDatabase(ctx, newTn)
+	newUn := newTn.ToUnresolvedObjectName()
+	targetDbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, newUn)
 	if err != nil {
 		return err
 	}
+	newTn.ObjectNamePrefix = prefix
 
 	if err := p.CheckPrivilege(ctx, targetDbDesc, privilege.CREATE); err != nil {
 		return err
@@ -111,9 +117,9 @@ func (n *renameTableNode) startExec(params runParams) error {
 	tableDesc.ParentID = targetDbDesc.ID
 
 	newTbKey := sqlbase.MakePublicTableNameKey(ctx, params.ExecCfg().Settings,
-		targetDbDesc.ID, newTn.Table()).Key()
+		targetDbDesc.ID, newTn.Table()).Key(p.ExecCfg().Codec)
 
-	if err := tableDesc.Validate(ctx, p.txn); err != nil {
+	if err := tableDesc.Validate(ctx, p.txn, p.ExecCfg().Codec); err != nil {
 		return err
 	}
 
@@ -138,17 +144,22 @@ func (n *renameTableNode) startExec(params runParams) error {
 	if p.extendedEvalCtx.Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "CPut %s -> %d", newTbKey, descID)
 	}
-	err = writeDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(),
-		p.EvalContext().Settings, b, descID, tableDesc.TableDesc())
+	err = catalogkv.WriteDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+		p.EvalContext().Settings, b, p.ExecCfg().Codec, descID, tableDesc.TableDesc())
 	if err != nil {
 		return err
 	}
 
-	exists, _, err := sqlbase.LookupPublicTableID(
-		params.ctx, params.p.txn, targetDbDesc.ID, newTn.Table(),
+	exists, id, err := sqlbase.LookupPublicTableID(
+		params.ctx, params.p.txn, p.ExecCfg().Codec, targetDbDesc.ID, newTn.Table(),
 	)
 	if err == nil && exists {
-		return sqlbase.NewRelationAlreadyExistsError(newTn.Table())
+		// Try and see what kind of object we collided with.
+		desc, err := catalogkv.GetDescriptorByID(params.ctx, params.p.txn, p.ExecCfg().Codec, id)
+		if err != nil {
+			return err
+		}
+		return makeObjectAlreadyExistsError(desc, newTn.Table())
 	} else if err != nil {
 		return err
 	}
@@ -166,7 +177,7 @@ func (n *renameTableNode) Close(context.Context)        {}
 func (p *planner) dependentViewRenameError(
 	ctx context.Context, typeName, objName string, parentID, viewID sqlbase.ID,
 ) error {
-	viewDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, viewID)
+	viewDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, p.ExecCfg().Codec, viewID)
 	if err != nil {
 		return err
 	}
@@ -176,13 +187,13 @@ func (p *planner) dependentViewRenameError(
 		viewName, err = p.getQualifiedTableName(ctx, viewDesc)
 		if err != nil {
 			log.Warningf(ctx, "unable to retrieve name of view %d: %v", viewID, err)
-			msg := fmt.Sprintf("cannot rename %s %q because a view depends on it",
+			return sqlbase.NewDependentObjectErrorf(
+				"cannot rename %s %q because a view depends on it",
 				typeName, objName)
-			return sqlbase.NewDependentObjectError(msg)
 		}
 	}
-	msg := fmt.Sprintf("cannot rename %s %q because view %q depends on it",
-		typeName, objName, viewName)
-	hint := fmt.Sprintf("you can drop %s instead.", viewName)
-	return sqlbase.NewDependentObjectErrorWithHint(msg, hint)
+	return errors.WithHintf(
+		sqlbase.NewDependentObjectErrorf("cannot rename %s %q because view %q depends on it",
+			typeName, objName, viewName),
+		"you can drop %s instead.", viewName)
 }

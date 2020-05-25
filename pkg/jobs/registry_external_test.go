@@ -35,7 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func TestRoundtripJob(t *testing.T) {
@@ -84,14 +84,15 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 		const cancelInterval = time.Duration(math.MaxInt64)
 		const adoptInterval = time.Nanosecond
 
+		var c base.NodeIDContainer
+		c.Set(ctx, id)
+		idContainer := base.NewSQLIDContainer(0, &c, true /* exposed */)
 		ac := log.AmbientContext{Tracer: tracing.NewTracer()}
-		nodeID := &base.NodeIDContainer{}
-		nodeID.Reset(id)
 		r := jobs.MakeRegistry(
-			ac, s.Stopper(), clock, db, s.InternalExecutor().(sqlutil.InternalExecutor),
-			nodeID, s.ClusterSettings(), server.DefaultHistogramWindowInterval, jobs.FakePHS, "",
+			ac, s.Stopper(), clock, nodeLiveness, db, s.InternalExecutor().(sqlutil.InternalExecutor),
+			idContainer, s.ClusterSettings(), server.DefaultHistogramWindowInterval, jobs.FakePHS, "",
 		)
-		if err := r.Start(ctx, s.Stopper(), nodeLiveness, cancelInterval, adoptInterval); err != nil {
+		if err := r.Start(ctx, s.Stopper(), cancelInterval, adoptInterval); err != nil {
 			t.Fatal(err)
 		}
 		return r

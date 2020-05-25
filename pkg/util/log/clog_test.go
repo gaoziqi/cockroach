@@ -354,7 +354,7 @@ func TestVmoduleOff(t *testing.T) {
 	_ = SetVModule("notthisfile=2")
 	defer func() { _ = SetVModule("") }()
 	for i := 1; i <= 3; i++ {
-		if V(int32(i)) {
+		if V(Level(i)) {
 			t.Errorf("V enabled for %d", i)
 		}
 	}
@@ -536,7 +536,7 @@ func TestRollover(t *testing.T) {
 		t.Fatalf("info has initial error: %v", err)
 	}
 	fname0 := info.file.Name()
-	Info(context.Background(), strings.Repeat("x", int(LogFileMaxSize))) // force a rollover
+	Infof(context.Background(), "%s", strings.Repeat("x", int(LogFileMaxSize))) // force a rollover
 	if err != nil {
 		t.Fatalf("info has error after big write: %v", err)
 	}

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -29,16 +30,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -50,8 +54,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -748,7 +752,7 @@ COPY t (a, b, c) FROM stdin;
 			typ:  "PGDUMP",
 			data: testPgdumpFk,
 			query: map[string][][]string{
-				`SHOW TABLES`:              {{"cities"}, {"weather"}},
+				`SHOW TABLES`:              {{"public", "cities", "table"}, {"public", "weather", "table"}},
 				`SELECT city FROM cities`:  {{"Berkeley"}},
 				`SELECT city FROM weather`: {{"Berkeley"}},
 
@@ -772,7 +776,7 @@ COPY t (a, b, c) FROM stdin;
 			typ:  "PGDUMP",
 			data: testPgdumpFkCircular,
 			query: map[string][][]string{
-				`SHOW TABLES`:        {{"a"}, {"b"}},
+				`SHOW TABLES`:        {{"public", "a", "table"}, {"public", "b", "table"}},
 				`SELECT i, k FROM a`: {{"2", "2"}},
 				`SELECT j FROM b`:    {{"2"}},
 
@@ -822,7 +826,7 @@ COPY t (a, b, c) FROM stdin;
 			data: testPgdumpFk,
 			with: `WITH skip_foreign_keys`,
 			query: map[string][][]string{
-				`SHOW TABLES`: {{"cities"}, {"weather"}},
+				`SHOW TABLES`: {{"public", "cities", "table"}, {"public", "weather", "table"}},
 				// Verify the constraint is skipped.
 				`SELECT dependson_name FROM crdb_internal.backward_dependencies`: {},
 				`SHOW CONSTRAINTS FROM weather`:                                  {},
@@ -840,7 +844,7 @@ COPY t (a, b, c) FROM stdin;
 			data: testPgdumpFk,
 			with: `WITH skip_foreign_keys`,
 			query: map[string][][]string{
-				`SHOW TABLES`: {{"weather"}},
+				`SHOW TABLES`: {{"public", "weather", "table"}},
 			},
 		},
 		{
@@ -896,7 +900,7 @@ COPY t (a, b, c) FROM stdin;
 				CREATE TABLE t (i INT8);
 			`,
 			query: map[string][][]string{
-				`SHOW TABLES`: {{"t"}},
+				`SHOW TABLES`: {{"public", "t", "table"}},
 			},
 		},
 		{
@@ -1102,15 +1106,38 @@ func TestImportCSVStmt(t *testing.T) {
 	rowsPerFile := 1000
 	rowsPerRaceFile := 16
 
+	var forceFailure bool
+	blockGC := make(chan struct{})
+
 	ctx := context.Background()
 	baseDir := filepath.Join("testdata", "csv")
 	tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
 		SQLMemoryPoolSize: 256 << 20,
 		ExternalIODir:     baseDir,
+		Knobs: base.TestingKnobs{
+			GCJob: &sql.GCJobTestingKnobs{RunBeforeResume: func(_ int64) error { <-blockGC; return nil }},
+		},
 	}})
 	defer tc.Stopper().Stop(ctx)
 	conn := tc.Conns[0]
+
+	for i := range tc.Servers {
+		tc.Servers[i].JobRegistry().(*jobs.Registry).TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
+			jobspb.TypeImport: func(raw jobs.Resumer) jobs.Resumer {
+				r := raw.(*importResumer)
+				r.testingKnobs.afterImport = func(_ backupccl.RowCount) error {
+					if forceFailure {
+						return errors.New("testing injected failure")
+					}
+					return nil
+				}
+				return r
+			},
+		}
+	}
+
 	sqlDB := sqlutils.MakeSQLRunner(conn)
+	kvDB := tc.Server(0).DB()
 
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.batch_size = '10KB'`)
 
@@ -1140,6 +1167,7 @@ func TestImportCSVStmt(t *testing.T) {
 		t.Fatal(err)
 	}
 	empty := []string{"'nodelocal://0/empty.csv'"}
+	emptySchema := []interface{}{"nodelocal://0/empty.schema"}
 
 	// Support subtests by keeping track of the number of jobs that are executed.
 	testNum := -1
@@ -1332,6 +1360,22 @@ func TestImportCSVStmt(t *testing.T) {
 			` WITH decompress = 'gzip'`,
 			"gzip: invalid header",
 		},
+		{
+			"csv-with-invalid-delimited-option",
+			`IMPORT TABLE t CREATE USING $1 CSV DATA (%s) WITH fields_delimited_by = '|'`,
+			schema,
+			testFiles.files,
+			``,
+			"invalid option",
+		},
+		{
+			"empty-schema-in-file",
+			`IMPORT TABLE t CREATE USING $1 CSV DATA (%s)`,
+			emptySchema,
+			testFiles.files,
+			``,
+			"expected 1 create table statement",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if strings.Contains(tc.name, "bzip") && len(testFiles.bzipFiles) == 0 {
@@ -1453,6 +1497,67 @@ func TestImportCSVStmt(t *testing.T) {
 			t, `relation "t" already exists`,
 			fmt.Sprintf(`IMPORT TABLE t (a INT8 PRIMARY KEY, b STRING) CSV DATA (%s)`, testFiles.files[0]),
 		)
+	})
+
+	// Verify that a failed import will clean up after itself. This means:
+	//  - Delete the garbage data that it partially imported.
+	//  - Delete the table descriptor for the table that was created during the
+	//  import.
+	t.Run("failed-import-gc", func(t *testing.T) {
+		forceFailure = true
+		defer func() { forceFailure = false }()
+		defer gcjob.SetSmallMaxGCIntervalForTest()()
+		beforeImport, err := tree.MakeDTimestampTZ(tc.Server(0).Clock().Now().GoTime(), time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sqlDB.Exec(t, "CREATE DATABASE failedimport; USE failedimport;")
+		// Hit a failure during import.
+		sqlDB.ExpectErr(
+			t, `testing injected failure`,
+			fmt.Sprintf(`IMPORT TABLE t (a INT PRIMARY KEY, b STRING) CSV DATA (%s)`, testFiles.files[1]),
+		)
+		// Nudge the registry to quickly adopt the job.
+		tc.Server(0).JobRegistry().(*jobs.Registry).TestingNudgeAdoptionQueue()
+
+		// In the case of the test, the ID of the table that will be cleaned up due
+		// to the failed import will be one higher than the ID of the empty database
+		// it was created in.
+		dbID := sqlutils.QueryDatabaseID(t, sqlDB.DB, "failedimport")
+		tableID := sqlbase.ID(dbID + 1)
+		var td *sqlbase.TableDescriptor
+		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			var err error
+			td, err = sqlbase.GetTableDescFromID(ctx, txn, keys.SystemSQLCodec, tableID)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Ensure that we have garbage written to the descriptor that we want to
+		// clean up.
+		tests.CheckKeyCount(t, kvDB, td.TableSpan(keys.SystemSQLCodec), rowsPerFile)
+
+		// Allow GC to progress.
+		close(blockGC)
+		// Ensure that a GC job was created, and wait for it to finish.
+		doneGCQuery := fmt.Sprintf(
+			"SELECT count(*) FROM [SHOW JOBS] WHERE job_type = '%s' AND status = '%s' AND created > %s",
+			"SCHEMA CHANGE GC", jobs.StatusSucceeded, beforeImport.String(),
+		)
+		sqlDB.CheckQueryResultsRetry(t, doneGCQuery, [][]string{{"1"}})
+		// Expect there are no more KVs for this span.
+		tests.CheckKeyCount(t, kvDB, td.TableSpan(keys.SystemSQLCodec), 0)
+		// Expect that the table descriptor is deleted.
+		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			_, err := sqlbase.GetTableDescFromID(ctx, txn, keys.SystemSQLCodec, tableID)
+			if !testutils.IsError(err, "descriptor not found") {
+				return err
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
 	})
 
 	// Test basic role based access control. Users who have the admin role should
@@ -2491,7 +2596,7 @@ var _ importRowProducer = &csvBenchmarkStream{}
 // BenchmarkConvertRecord-16    	  500000	      2376 ns/op	  50.49 MB/s	    3606 B/op	     101 allocs/op
 // BenchmarkConvertRecord-16    	  500000	      2390 ns/op	  50.20 MB/s	    3606 B/op	     101 allocs/op
 func BenchmarkCSVConvertRecord(b *testing.B) {
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	tpchLineItemDataRows := [][]string{
 		{"1", "155190", "7706", "1", "17", "21168.23", "0.04", "0.02", "N", "O", "1996-03-13", "1996-02-12", "1996-03-22", "DELIVER IN PERSON", "TRUCK", "egular courts above the"},
@@ -2586,7 +2691,7 @@ func BenchmarkCSVConvertRecord(b *testing.B) {
 // BenchmarkDelimitedConvertRecord-16    	  500000	      3004 ns/op	  39.94 MB/s
 // BenchmarkDelimitedConvertRecord-16    	  500000	      2966 ns/op	  40.45 MB/s
 func BenchmarkDelimitedConvertRecord(b *testing.B) {
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	tpchLineItemDataRows := [][]string{
 		{"1", "155190", "7706", "1", "17", "21168.23", "0.04", "0.02", "N", "O", "1996-03-13", "1996-02-12", "1996-03-22", "DELIVER IN PERSON", "TRUCK", "egular courts above the"},
@@ -3875,4 +3980,84 @@ func TestImportClientDisconnect(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestDisallowsInvalidFormatOptions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	allOpts := make(map[string]struct{})
+	addOpts := func(opts map[string]struct{}) {
+		for opt := range opts {
+			allOpts[opt] = struct{}{}
+		}
+	}
+	addOpts(allowedCommonOptions)
+	addOpts(avroAllowedOptions)
+	addOpts(csvAllowedOptions)
+	addOpts(mysqlDumpAllowedOptions)
+	addOpts(mysqlOutAllowedOptions)
+	addOpts(pgDumpAllowedOptions)
+	addOpts(pgCopyAllowedOptions)
+
+	// Helper to pick num options from the set of allowed and the set
+	// of all other options.  Returns generated options plus a flag indicating
+	// if the generated options contain disallowed ones.
+	pickOpts := func(num int, allowed map[string]struct{}) (map[string]string, bool) {
+		opts := make(map[string]string, num)
+		haveDisallowed := false
+		var picks []string
+		if rand.Intn(10) > 5 {
+			for opt := range allOpts {
+				picks = append(picks, opt)
+			}
+		} else {
+			for opt := range allowed {
+				picks = append(picks, opt)
+			}
+		}
+		require.NotNil(t, picks)
+
+		for i := 0; i < num; i++ {
+			pick := picks[rand.Intn(len(picks))]
+			_, allowed := allowed[pick]
+			if !allowed {
+				_, allowed = allowedCommonOptions[pick]
+			}
+			if allowed {
+				opts[pick] = "ok"
+			} else {
+				opts[pick] = "bad"
+				haveDisallowed = true
+			}
+		}
+
+		return opts, haveDisallowed
+	}
+
+	tests := []struct {
+		format  string
+		allowed map[string]struct{}
+	}{
+		{"avro", avroAllowedOptions},
+		{"csv", csvAllowedOptions},
+		{"mysqouout", mysqlOutAllowedOptions},
+		{"mysqldump", mysqlDumpAllowedOptions},
+		{"pgdump", pgDumpAllowedOptions},
+		{"pgcopy", pgCopyAllowedOptions},
+	}
+
+	for _, tc := range tests {
+		for i := 0; i < 5; i++ {
+			opts, haveBadOptions := pickOpts(i, tc.allowed)
+			t.Run(fmt.Sprintf("validate-%s-%d/badOpts=%t", tc.format, i, haveBadOptions),
+				func(t *testing.T) {
+					err := validateFormatOptions(tc.format, opts, tc.allowed)
+					if haveBadOptions {
+						require.Error(t, err, opts)
+					} else {
+						require.NoError(t, err, opts)
+					}
+				})
+		}
+	}
 }

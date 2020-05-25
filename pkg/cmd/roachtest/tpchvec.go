@@ -14,659 +14,485 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"fmt"
+	"math/rand"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/workload/tpch"
+	"github.com/cockroachdb/errors"
 )
 
-func registerTPCHVec(r *testRegistry) {
-	const (
-		nodeCount      = 3
-		numTPCHQueries = 22
-		// vecOnSlowerFailFactor describes the threshold at which we fail the test
-		// if vec ON is slower that vec OFF, meaning that if
-		// vec_on_time > vecOnSlowerFailFactor * vec_off_time, the test is failed.
-		// This will help catch any regressions.
-		vecOnSlowerFailFactor = 1.5
-	)
+const (
+	tpchVecNodeCount = 3
+)
 
-	// queriesToSkipByVersionPrefix is a map from version prefix to another map
-	// that contains query numbers to be skipped (as well as the reasons for why
-	// they are skipped).
-	queriesToSkipByVersionPrefix := make(map[string]map[int]string)
-	queriesToSkipByVersionPrefix["v19.2"] = map[int]string{
-		5:  "can cause OOM",
-		7:  "can cause OOM",
-		8:  "can cause OOM",
-		9:  "can cause OOM",
-		19: "can cause OOM",
-	}
-	vectorizeOptionByVersionPrefix := map[string]string{
-		"v19.2": "experimental_on",
-		"v20.1": "on",
-	}
+type crdbVersion int
 
-	TPCHTables := []string{
-		"nation", "region", "part", "supplier",
-		"partsupp", "customer", "orders", "lineitem",
+const (
+	tpchVecVersion19_2 crdbVersion = iota
+	tpchVecVersion20_1
+	tpchVecVersion20_2
+)
+
+func toCRDBVersion(v string) (crdbVersion, error) {
+	if strings.HasPrefix(v, "v19.2") {
+		return tpchVecVersion19_2, nil
+	} else if strings.HasPrefix(v, "v20.1") {
+		return tpchVecVersion20_1, nil
+	} else if strings.HasPrefix(v, "v20.2") {
+		return tpchVecVersion20_2, nil
+	} else {
+		return 0, errors.Errorf("unrecognized version: %s", v)
 	}
-	TPCHTableStatsInjection := []string{
-		`ALTER TABLE region INJECT STATISTICS '[
-				{
-					"columns": ["r_regionkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 5,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["r_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 5,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["r_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 5,
-					"distinct_count": 5
-				}
-			]';`,
-		`ALTER TABLE nation INJECT STATISTICS '[
-				{
-					"columns": ["n_nationkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 25,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["n_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 25,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["n_regionkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 25,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["n_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 25,
-					"distinct_count": 25
-				}
-			]';`,
-		`ALTER TABLE supplier INJECT STATISTICS '[
-				{
-					"columns": ["s_suppkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_address"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_nationkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["s_phone"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_acctbal"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["s_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 10000,
-					"distinct_count": 10000
-				}
-			]';`,
-		`ALTER TABLE public.part INJECT STATISTICS '[
-				{
-					"columns": ["p_partkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 200000
-				},
-				{
-					"columns": ["p_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 200000
-				},
-				{
-					"columns": ["p_mfgr"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["p_brand"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["p_type"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 150
-				},
-				{
-					"columns": ["p_size"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 50
-				},
-				{
-					"columns": ["p_container"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 40
-				},
-				{
-					"columns": ["p_retailprice"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 20000
-				},
-				{
-					"columns": ["p_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 200000,
-					"distinct_count": 130000
-				}
-			]';`,
-		`ALTER TABLE partsupp INJECT STATISTICS '[
-				{
-					"columns": ["ps_partkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 200000
-				},
-				{
-					"columns": ["ps_suppkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["ps_availqty"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["ps_supplycost"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 100000
-				},
-				{
-					"columns": ["ps_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 800000,
-					"distinct_count": 800000
-				}
-			]';`,
-		`ALTER TABLE customer INJECT STATISTICS '[
-				{
-					"columns": ["c_custkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_name"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_address"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_nationkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 25
-				},
-				{
-					"columns": ["c_phone"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_acctbal"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				},
-				{
-					"columns": ["c_mktsegment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["c_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 150000,
-					"distinct_count": 150000
-				}
-			]';`,
-		`ALTER TABLE orders INJECT STATISTICS '[
-				{
-					"columns": ["o_orderkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1500000
-				},
-				{
-					"columns": ["o_custkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 100000
-				},
-				{
-					"columns": ["o_orderstatus"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 3
-				},
-				{
-					"columns": ["o_totalprice"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1500000
-				},
-				{
-					"columns": ["o_orderdate"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 2500
-				},
-				{
-					"columns": ["o_orderpriority"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 5
-				},
-				{
-					"columns": ["o_clerk"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1000
-				},
-				{
-					"columns": ["o_shippriority"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1
-				},
-				{
-					"columns": ["o_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 1500000,
-					"distinct_count": 1500000
-				}
-			]';`,
-		`ALTER TABLE lineitem INJECT STATISTICS '[
-				{
-					"columns": ["l_orderkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 1500000
-				},
-				{
-					"columns": ["l_partkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 200000
-				},
-				{
-					"columns": ["l_suppkey"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 10000
-				},
-				{
-					"columns": ["l_linenumber"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 7
-				},
-				{
-					"columns": ["l_quantity"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 50
-				},
-				{
-					"columns": ["l_extendedprice"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 1000000
-				},
-				{
-					"columns": ["l_discount"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 11
-				},
-				{
-					"columns": ["l_tax"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 9
-				},
-				{
-					"columns": ["l_returnflag"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 3
-				},
-				{
-					"columns": ["l_linestatus"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 2
-				},
-				{
-					"columns": ["l_shipdate"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 2500
-				},
-				{
-					"columns": ["l_commitdate"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 2500
-				},
-				{
-					"columns": ["l_receiptdate"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 2500
-				},
-				{
-					"columns": ["l_shipinstruct"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 4
-				},
-				{
-					"columns": ["l_shipmode"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 7
-				},
-				{
-					"columns": ["l_comment"],
-					"created_at": "2018-01-01 1:00:00.00000+00:00",
-					"row_count": 6001215,
-					"distinct_count": 4500000
-				}
-			]';`,
+}
+
+func vectorizeOptionToSetting(vectorize bool, version crdbVersion) string {
+	if !vectorize {
+		return "off"
+	}
+	switch version {
+	case tpchVecVersion19_2:
+		return "experimental_on"
+	default:
+		return "on"
+	}
+}
+
+var (
+	// queriesToSkipByVersion is a map keyed by version that contains query numbers
+	// to be skipped for the given version (as well as the reasons for why they are skipped).
+	queriesToSkipByVersion = map[crdbVersion]map[int]string{
+		tpchVecVersion19_2: {
+			5:  "can cause OOM",
+			7:  "can cause OOM",
+			8:  "can cause OOM",
+			9:  "can cause OOM",
+			19: "can cause OOM",
+		},
 	}
 
-	type runOption int
-	const (
-		// perf configuration is meant to be used to check the correctness of
-		// the vectorized engine and compare the queries' runtimes against
-		// row-by-row engine.
-		perf runOption = iota
-		// stressDiskSpilling configuration is meant to stress disk spilling of
-		// the vectorized engine. There is no comparison of the runtimes.
-		stressDiskSpilling
-	)
-	type runConfig struct {
-		vectorizeOptions   []bool
-		stressDiskSpilling bool
-		numRunsPerQuery    int
+	// slownessThreshold describes the threshold at which we fail the test
+	// if vec ON is slower that vec OFF, meaning that if
+	// vec_on_time > vecOnSlowerFailFactor * vec_off_time, the test is failed.
+	// This will help catch any regressions.
+	// Note that for 19.2 version the threshold is higher in order to reduce
+	// the noise.
+	slownessThresholdByVersion = map[crdbVersion]float64{
+		tpchVecVersion19_2: 1.5,
+		tpchVecVersion20_1: 1.2,
+		tpchVecVersion20_2: 1.2,
 	}
-	runConfigs := make(map[runOption]runConfig)
-	const (
-		// These correspond to "perf" run configuration below.
-		vecOnConfig  = 0
-		vecOffConfig = 1
-	)
-	runConfigs[perf] = runConfig{
-		vectorizeOptions:   []bool{true, false},
-		stressDiskSpilling: false,
-		numRunsPerQuery:    3,
-	}
-	runConfigs[stressDiskSpilling] = runConfig{
-		vectorizeOptions:   []bool{true},
-		stressDiskSpilling: true,
-		numRunsPerQuery:    1,
-	}
+)
 
-	runTPCHVec := func(ctx context.Context, t *test, c *cluster, option runOption) {
-		firstNode := c.Node(1)
-		c.Put(ctx, cockroach, "./cockroach", c.All())
-		c.Put(ctx, workload, "./workload", firstNode)
-		c.Start(ctx, t)
+var tpchTables = []string{
+	"nation", "region", "part", "supplier",
+	"partsupp", "customer", "orders", "lineitem",
+}
 
-		conn := c.Conn(ctx, 1)
-		t.Status("restoring TPCH dataset for Scale Factor 1")
-		setup := `
-CREATE DATABASE tpch;
-RESTORE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup' WITH into_db = 'tpch';
-`
-		if _, err := conn.Exec(setup); err != nil {
+type tpchVecTestCase interface {
+	// TODO(asubiotto): Getting the queries we want to run given a version should
+	//  also be part of this.
+	// vectorizeOptions are the vectorize options that each query will be run
+	// with.
+	vectorizeOptions() []bool
+	// numRunsPerQuery is the number of times each tpch query should be run.
+	numRunsPerQuery() int
+	// preTestRunHook is called before any tpch query is run. Can be used to
+	// perform setup.
+	preTestRunHook(ctx context.Context, t *test, c *cluster, conn *gosql.DB, version crdbVersion)
+	// postQueryRunHook is called after each tpch query is run with the output and
+	// the vectorize mode it was run in.
+	postQueryRunHook(t *test, output []byte, vectorized bool)
+	// postTestRunHook is called after all tpch queries are run. Can be used to
+	// perform teardown or general validation.
+	postTestRunHook(t *test, conn *gosql.DB, version crdbVersion)
+}
+
+// tpchVecTestCaseBase is a default tpchVecTestCase implementation that can be
+// embedded and extended.
+type tpchVecTestCaseBase struct{}
+
+func (b tpchVecTestCaseBase) vectorizeOptions() []bool {
+	return []bool{true}
+}
+
+func (b tpchVecTestCaseBase) numRunsPerQuery() int {
+	return 1
+}
+
+func (b tpchVecTestCaseBase) preTestRunHook(
+	_ context.Context, t *test, _ *cluster, conn *gosql.DB, version crdbVersion,
+) {
+	if version != tpchVecVersion19_2 {
+		t.Status("resetting sql.testing.vectorize.batch_size")
+		if _, err := conn.Exec("RESET CLUSTER SETTING sql.testing.vectorize.batch_size"); err != nil {
 			t.Fatal(err)
 		}
+	}
+	t.Status("resetting workmem to default")
+	if _, err := conn.Exec("RESET CLUSTER SETTING sql.distsql.temp_storage.workmem"); err != nil {
+		t.Fatal(err)
+	}
+}
 
-		t.Status("scattering the data")
-		if _, err := conn.Exec("USE tpch;"); err != nil {
+func (b tpchVecTestCaseBase) postQueryRunHook(_ *test, _ []byte, _ bool) {}
+
+func (b tpchVecTestCaseBase) postTestRunHook(_ *test, _ *gosql.DB, _ crdbVersion) {}
+
+const (
+	tpchPerfTestNumRunsPerQuery = 3
+	tpchPerfTestVecOnConfigIdx  = 0
+	tpchPerfTestVecOffConfigIdx = 1
+)
+
+type tpchVecPerfTest struct {
+	tpchVecTestCaseBase
+	timeByQueryNum []map[int][]float64
+}
+
+var _ tpchVecTestCase = &tpchVecPerfTest{}
+
+func newTpchVecPerfTest() *tpchVecPerfTest {
+	return &tpchVecPerfTest{
+		timeByQueryNum: []map[int][]float64{make(map[int][]float64), make(map[int][]float64)},
+	}
+}
+
+func (p tpchVecPerfTest) vectorizeOptions() []bool {
+	// Since this is a performance test, each query should be run with both
+	// vectorize modes.
+	return []bool{true, false}
+}
+
+func (p tpchVecPerfTest) numRunsPerQuery() int {
+	return tpchPerfTestNumRunsPerQuery
+}
+
+func (p tpchVecPerfTest) preTestRunHook(
+	ctx context.Context, t *test, c *cluster, conn *gosql.DB, version crdbVersion,
+) {
+	p.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version)
+	// TODO(yuzefovich): remove this once we figure out the issue with random
+	// performance hits on query 7.
+	for node := 1; node <= c.spec.NodeCount; node++ {
+		nodeConn := c.Conn(ctx, node)
+		if _, err := nodeConn.Exec(
+			"SELECT crdb_internal.set_vmodule('vectorized_flow=1,spilling_queue=1,row_container=2,hash_row_container=2');",
+		); err != nil {
 			t.Fatal(err)
 		}
-		for _, table := range TPCHTables {
-			scatter := fmt.Sprintf("ALTER TABLE %s SCATTER;", table)
-			if _, err := conn.Exec(scatter); err != nil {
-				t.Fatal(err)
+	}
+}
+
+func (p *tpchVecPerfTest) postQueryRunHook(t *test, output []byte, vectorized bool) {
+	configIdx := tpchPerfTestVecOffConfigIdx
+	if vectorized {
+		configIdx = tpchPerfTestVecOnConfigIdx
+	}
+	runtimeRegex := regexp.MustCompile(`.*\[q([\d]+)\] returned \d+ rows after ([\d]+\.[\d]+) seconds.*`)
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		match := runtimeRegex.FindSubmatch(line)
+		if match != nil {
+			queryNum, err := strconv.Atoi(string(match[1]))
+			if err != nil {
+				t.Fatalf("failed parsing %q as int with %s", match[1], err)
 			}
-		}
-		t.Status("waiting for full replication")
-		waitForFullReplication(t, conn)
-		t.Status("injecting stats")
-		for _, injectStats := range TPCHTableStatsInjection {
-			if _, err := conn.Exec(injectStats); err != nil {
-				t.Fatal(err)
+			queryTime, err := strconv.ParseFloat(string(match[2]), 64)
+			if err != nil {
+				t.Fatalf("failed parsing %q as float with %s", match[2], err)
 			}
+			p.timeByQueryNum[configIdx][queryNum] = append(p.timeByQueryNum[configIdx][queryNum], queryTime)
 		}
-		version, err := fetchCockroachVersion(ctx, c, c.Node(1)[0])
-		if err != nil {
-			t.Fatal(err)
+	}
+}
+
+func (p *tpchVecPerfTest) postTestRunHook(t *test, conn *gosql.DB, version crdbVersion) {
+	queriesToSkip := queriesToSkipByVersion[version]
+	t.Status("comparing the runtimes (only median values for each query are compared)")
+	for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
+		if _, skipped := queriesToSkip[queryNum]; skipped {
+			continue
 		}
-		var queriesToSkip map[int]string
-		for versionPrefix, toSkip := range queriesToSkipByVersionPrefix {
-			if strings.HasPrefix(version, versionPrefix) {
-				queriesToSkip = toSkip
-				break
-			}
+		findMedian := func(times []float64) float64 {
+			sort.Float64s(times)
+			return times[len(times)/2]
 		}
-		runConfig := runConfigs[option]
-		rng, _ := randutil.NewPseudoRand()
-		var vmoduleValue int
-		if runConfig.stressDiskSpilling {
-			// In order to stress the disk spilling of the vectorized
-			// engine, we will set workmem limit to a random value in range
-			// [100KiB, 1000KiB). We will also enable some logging.
-			vmoduleValue = 2
-			workmemInKiB := 100 + rng.Intn(900)
-			workmem := fmt.Sprintf("%dKiB", workmemInKiB)
-			t.Status(fmt.Sprintf("setting workmem='%s'", workmem))
-			if _, err := conn.Exec(fmt.Sprintf("SET CLUSTER SETTING sql.distsql.temp_storage.workmem='%s'", workmem)); err != nil {
-				t.Fatal(err)
-			}
+		vecOnTimes := p.timeByQueryNum[tpchPerfTestVecOnConfigIdx][queryNum]
+		vecOffTimes := p.timeByQueryNum[tpchPerfTestVecOffConfigIdx][queryNum]
+		if len(vecOnTimes) != tpchPerfTestNumRunsPerQuery {
+			t.Fatal(fmt.Sprintf("[q%d] unexpectedly wrong number of run times "+
+				"recorded with vec ON config: %v", queryNum, vecOnTimes))
+		}
+		if len(vecOffTimes) != tpchPerfTestNumRunsPerQuery {
+			t.Fatal(fmt.Sprintf("[q%d] unexpectedly wrong number of run times "+
+				"recorded with vec OFF config: %v", queryNum, vecOffTimes))
+		}
+		vecOnTime := findMedian(vecOnTimes)
+		vecOffTime := findMedian(vecOffTimes)
+		if vecOffTime < vecOnTime {
+			t.l.Printf(
+				fmt.Sprintf("[q%d] vec OFF was faster by %.2f%%: "+
+					"%.2fs ON vs %.2fs OFF --- WARNING\n"+
+					"vec ON times: %v\t vec OFF times: %v",
+					queryNum, 100*(vecOnTime-vecOffTime)/vecOffTime,
+					vecOnTime, vecOffTime, vecOnTimes, vecOffTimes))
 		} else {
-			// We are interested in the performance comparison between
-			// vectorized and row-by-row engines, so we will reset workmem
-			// limit to the default value. We will also disable logging.
-			vmoduleValue = 0
-			t.Status("resetting workmem to default")
-			if _, err := conn.Exec("RESET CLUSTER SETTING sql.distsql.temp_storage.workmem"); err != nil {
-				t.Fatal(err)
-			}
+			t.l.Printf(
+				fmt.Sprintf("[q%d] vec ON was faster by %.2f%%: "+
+					"%.2fs ON vs %.2fs OFF\n"+
+					"vec ON times: %v\t vec OFF times: %v",
+					queryNum, 100*(vecOffTime-vecOnTime)/vecOnTime,
+					vecOnTime, vecOffTime, vecOnTimes, vecOffTimes))
 		}
-		t.Status(fmt.Sprintf("setting vmodule=vectorized_flow=%d on all nodes", vmoduleValue))
-		for node := 1; node <= nodeCount; node++ {
-			conn := c.Conn(ctx, node)
-			if _, err := conn.Exec(
-				fmt.Sprintf("SELECT crdb_internal.set_vmodule('vectorized_flow=%d');", vmoduleValue),
-			); err != nil {
-				t.Fatal(err)
-			}
-		}
-		timeByQueryNum := []map[int][]float64{make(map[int][]float64), make(map[int][]float64)}
-		for queryNum := 1; queryNum <= numTPCHQueries; queryNum++ {
-			for configIdx, vectorize := range runConfig.vectorizeOptions {
-				if reason, skip := queriesToSkip[queryNum]; skip {
-					t.Status(fmt.Sprintf("skipping q%d because of %q", queryNum, reason))
-					continue
-				}
-				vectorizeSetting := "off"
-				if vectorize {
-					for versionPrefix, vectorizeOption := range vectorizeOptionByVersionPrefix {
-						if strings.HasPrefix(version, versionPrefix) {
-							vectorizeSetting = vectorizeOption
-							break
-						}
-					}
-					if vectorizeSetting == "off" {
-						t.Fatal("unexpectedly didn't find the corresponding vectorize option for ON case")
-					}
-				}
-				cmd := fmt.Sprintf("./workload run tpch --concurrency=1 --db=tpch "+
-					"--max-ops=%d --queries=%d --vectorize=%s {pgurl:1-%d}",
-					runConfig.numRunsPerQuery, queryNum, vectorizeSetting, nodeCount)
-				workloadOutput, err := c.RunWithBuffer(ctx, t.l, firstNode, cmd)
-				t.l.Printf("\n" + string(workloadOutput))
-				if err != nil {
-					// Note: if you see an error like "exit status 1", it is likely caused
-					// by the erroneous output of the query.
+		if vecOnTime >= slownessThresholdByVersion[version]*vecOffTime {
+			// For some reason, the vectorized engine executed the query a lot
+			// slower than the row-by-row engine which is unexpected. In order
+			// to understand where the slowness comes from, we will run EXPLAIN
+			// ANALYZE of the query with all `vectorize` options
+			// tpchPerfTestNumRunsPerQuery times (hoping at least one will
+			// "catch" the slowness).
+			for _, vectorize := range p.vectorizeOptions() {
+				vectorizeSetting := vectorizeOptionToSetting(vectorize, version)
+				if _, err := conn.Exec(fmt.Sprintf("SET vectorize=%s;", vectorizeSetting)); err != nil {
 					t.Fatal(err)
 				}
-				parseOutput := func(output []byte, timeByQueryNum map[int][]float64) {
-					runtimeRegex := regexp.MustCompile(`.*\[q([\d]+)\] returned \d+ rows after ([\d]+\.[\d]+) seconds.*`)
-					scanner := bufio.NewScanner(bytes.NewReader(output))
-					for scanner.Scan() {
-						line := scanner.Bytes()
-						match := runtimeRegex.FindSubmatch(line)
-						if match != nil {
-							queryNum, err := strconv.Atoi(string(match[1]))
-							if err != nil {
-								t.Fatalf("failed parsing %q as int with %s", match[1], err)
-							}
-							queryTime, err := strconv.ParseFloat(string(match[2]), 64)
-							if err != nil {
-								t.Fatalf("failed parsing %q as float with %s", match[2], err)
-							}
-							timeByQueryNum[queryNum] = append(timeByQueryNum[queryNum], queryTime)
-						}
+				for i := 0; i < tpchPerfTestNumRunsPerQuery; i++ {
+					rows, err := conn.Query(fmt.Sprintf(
+						"SELECT url FROM [EXPLAIN ANALYZE %s];", tpch.QueriesByNumber[queryNum],
+					))
+					if err != nil {
+						t.Fatal(err)
 					}
-				}
-				if option == perf {
-					// We only need to parse the output with 'perf' run option.
-					parseOutput(workloadOutput, timeByQueryNum[configIdx])
-				}
-			}
-		}
-		if option == perf {
-			// We are only interested in comparison with 'perf' run option.
-			t.Status("comparing the runtimes (only median values for each query are compared)")
-			for queryNum := 1; queryNum <= numTPCHQueries; queryNum++ {
-				if _, skipped := queriesToSkip[queryNum]; skipped {
-					continue
-				}
-				findMedian := func(times []float64) float64 {
-					sort.Float64s(times)
-					return times[len(times)/2]
-				}
-				vecOnTimes := timeByQueryNum[vecOnConfig][queryNum]
-				vecOffTimes := timeByQueryNum[vecOffConfig][queryNum]
-				if len(vecOnTimes) != runConfig.numRunsPerQuery {
-					t.Fatal(fmt.Sprintf("[q%d] unexpectedly wrong number of run times "+
-						"recorded with vec ON config: %v", queryNum, vecOnTimes))
-				}
-				if len(vecOffTimes) != runConfig.numRunsPerQuery {
-					t.Fatal(fmt.Sprintf("[q%d] unexpectedly wrong number of run times "+
-						"recorded with vec OFF config: %v", queryNum, vecOffTimes))
-				}
-				vecOnTime := findMedian(vecOnTimes)
-				vecOffTime := findMedian(vecOffTimes)
-				if vecOffTime < vecOnTime {
-					t.l.Printf(
-						fmt.Sprintf("[q%d] vec OFF was faster by %.2f%%: "+
-							"%.2fs ON vs %.2fs OFF --- WARNING\n"+
-							"vec ON times: %v\t vec OFF times: %v",
-							queryNum, 100*(vecOnTime-vecOffTime)/vecOffTime,
-							vecOnTime, vecOffTime, vecOnTimes, vecOffTimes))
-				} else {
-					t.l.Printf(
-						fmt.Sprintf("[q%d] vec ON was faster by %.2f%%: "+
-							"%.2fs ON vs %.2fs OFF\n"+
-							"vec ON times: %v\t vec OFF times: %v",
-							queryNum, 100*(vecOffTime-vecOnTime)/vecOnTime,
-							vecOnTime, vecOffTime, vecOnTimes, vecOffTimes))
-				}
-				if vecOnTime >= vecOnSlowerFailFactor*vecOffTime {
-					t.Fatal(fmt.Sprintf(
-						"[q%d] vec ON is slower by %.2f%% than vec OFF\n"+
-							"vec ON times: %v\nvec OFF times: %v",
-						queryNum, 100*(vecOnTime-vecOffTime)/vecOffTime, vecOnTimes, vecOffTimes))
+					defer rows.Close()
+					var url string
+					rows.Next()
+					if err = rows.Scan(&url); err != nil {
+						t.Fatal(err)
+					}
+					t.Status(fmt.Sprintf("EXPLAIN ANALYZE with vectorize=%s url:\n%s", vectorizeSetting, url))
 				}
 			}
+			t.Fatal(fmt.Sprintf(
+				"[q%d] vec ON is slower by %.2f%% than vec OFF\n"+
+					"vec ON times: %v\nvec OFF times: %v",
+				queryNum, 100*(vecOnTime-vecOffTime)/vecOffTime, vecOnTimes, vecOffTimes))
 		}
 	}
+}
 
+type tpchVecDiskTest struct {
+	tpchVecTestCaseBase
+}
+
+func (d tpchVecDiskTest) preTestRunHook(
+	ctx context.Context, t *test, c *cluster, conn *gosql.DB, version crdbVersion,
+) {
+	d.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version)
+	// In order to stress the disk spilling of the vectorized
+	// engine, we will set workmem limit to a random value in range
+	// [16KiB, 256KiB).
+	rng, _ := randutil.NewPseudoRand()
+	workmemInKiB := 16 + rng.Intn(240)
+	workmem := fmt.Sprintf("%dKiB", workmemInKiB)
+	t.Status(fmt.Sprintf("setting workmem='%s'", workmem))
+	if _, err := conn.Exec(fmt.Sprintf("SET CLUSTER SETTING sql.distsql.temp_storage.workmem='%s'", workmem)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setSmallBatchSize sets a cluster setting to override the batch size to be in
+// [1, 5) range.
+func setSmallBatchSize(t *test, conn *gosql.DB, rng *rand.Rand) {
+	batchSize := 1 + rng.Intn(4)
+	t.Status(fmt.Sprintf("setting sql.testing.vectorize.batch_size to %d", batchSize))
+	if _, err := conn.Exec(fmt.Sprintf("SET CLUSTER SETTING sql.testing.vectorize.batch_size=%d", batchSize)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type tpchVecSmallBatchSizeTest struct {
+	tpchVecTestCaseBase
+}
+
+func (b tpchVecSmallBatchSizeTest) preTestRunHook(
+	ctx context.Context, t *test, c *cluster, conn *gosql.DB, version crdbVersion,
+) {
+	b.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version)
+	rng, _ := randutil.NewPseudoRand()
+	setSmallBatchSize(t, conn, rng)
+}
+
+func baseTestRun(
+	ctx context.Context, t *test, c *cluster, version crdbVersion, tc tpchVecTestCase,
+) {
+	firstNode := c.Node(1)
+	queriesToSkip := queriesToSkipByVersion[version]
+	for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
+		for _, vectorize := range tc.vectorizeOptions() {
+			if reason, skip := queriesToSkip[queryNum]; skip {
+				t.Status(fmt.Sprintf("skipping q%d because of %q", queryNum, reason))
+				continue
+			}
+			vectorizeSetting := vectorizeOptionToSetting(vectorize, version)
+			cmd := fmt.Sprintf("./workload run tpch --concurrency=1 --db=tpch "+
+				"--max-ops=%d --queries=%d --vectorize=%s {pgurl:1-%d}",
+				tc.numRunsPerQuery(), queryNum, vectorizeSetting, tpchVecNodeCount)
+			workloadOutput, err := c.RunWithBuffer(ctx, t.l, firstNode, cmd)
+			t.l.Printf("\n" + string(workloadOutput))
+			if err != nil {
+				// Note: if you see an error like "exit status 1", it is likely caused
+				// by the erroneous output of the query.
+				t.Fatal(err)
+			}
+			tc.postQueryRunHook(t, workloadOutput, vectorize)
+		}
+	}
+}
+
+type tpchVecSmithcmpTest struct {
+	tpchVecTestCaseBase
+}
+
+const tpchVecSmithcmp = "smithcmp"
+
+func (s tpchVecSmithcmpTest) preTestRunHook(
+	ctx context.Context, t *test, c *cluster, conn *gosql.DB, version crdbVersion,
+) {
+	s.tpchVecTestCaseBase.preTestRunHook(ctx, t, c, conn, version)
+	const smithcmpSHA = "a3f41f5ba9273249c5ecfa6348ea8ee3ac4b77e3"
+	node := c.Node(1)
+	if local && runtime.GOOS != "linux" {
+		t.Fatalf("must run on linux os, found %s", runtime.GOOS)
+	}
+	// This binary has been manually compiled using
+	// './build/builder.sh go build ./pkg/cmd/smithcmp' and uploaded to S3
+	// bucket at cockroach/smithcmp. The binary shouldn't change much, so it is
+	// acceptable.
+	smithcmp, err := binfetcher.Download(ctx, binfetcher.Options{
+		Component: tpchVecSmithcmp,
+		Binary:    tpchVecSmithcmp,
+		Version:   smithcmpSHA,
+		GOOS:      "linux",
+		GOARCH:    "amd64",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Put(ctx, smithcmp, "./"+tpchVecSmithcmp, node)
+	// To increase test coverage, we will be randomizing the batch size in 50%
+	// of the runs.
+	rng, _ := randutil.NewPseudoRand()
+	if rng.Float64() < 0.5 {
+		setSmallBatchSize(t, conn, rng)
+	}
+}
+
+func smithcmpTestRun(ctx context.Context, t *test, c *cluster, _ crdbVersion, _ tpchVecTestCase) {
+	const (
+		configFile = `tpchvec_smithcmp.toml`
+		configURL  = `https://raw.githubusercontent.com/cockroachdb/cockroach/master/pkg/cmd/roachtest/` + configFile
+	)
+	firstNode := c.Node(1)
+	if err := c.RunE(ctx, firstNode, fmt.Sprintf("curl %s > %s", configURL, configFile)); err != nil {
+		t.Fatal(err)
+	}
+	cmd := fmt.Sprintf("./%s %s", tpchVecSmithcmp, configFile)
+	if err := c.RunE(ctx, firstNode, cmd); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runTPCHVec(
+	ctx context.Context,
+	t *test,
+	c *cluster,
+	testCase tpchVecTestCase,
+	testRun func(ctx context.Context, t *test, c *cluster, version crdbVersion, tc tpchVecTestCase),
+) {
+	firstNode := c.Node(1)
+	c.Put(ctx, cockroach, "./cockroach", c.All())
+	c.Put(ctx, workload, "./workload", firstNode)
+	c.Start(ctx, t)
+
+	conn := c.Conn(ctx, 1)
+	disableAutoStats(t, conn)
+	t.Status("restoring TPCH dataset for Scale Factor 1")
+	if err := loadTPCHDataset(ctx, t, c, 1 /* sf */, newMonitor(ctx, c), c.All()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := conn.Exec("USE tpch;"); err != nil {
+		t.Fatal(err)
+	}
+	scatterTables(t, conn, tpchTables)
+	t.Status("waiting for full replication")
+	waitForFullReplication(t, conn)
+	createStatsFromTables(t, conn, tpchTables)
+	versionString, err := fetchCockroachVersion(ctx, c, c.Node(1)[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := toCRDBVersion(versionString)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testCase.preTestRunHook(ctx, t, c, conn, version)
+	testRun(ctx, t, c, version, testCase)
+	testCase.postTestRunHook(t, conn, version)
+}
+
+func registerTPCHVec(r *testRegistry) {
 	r.Add(testSpec{
 		Name:       "tpchvec/perf",
 		Owner:      OwnerSQLExec,
-		Cluster:    makeClusterSpec(nodeCount),
+		Cluster:    makeClusterSpec(tpchVecNodeCount),
 		MinVersion: "v19.2.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			runTPCHVec(ctx, t, c, perf)
+			runTPCHVec(ctx, t, c, newTpchVecPerfTest(), baseTestRun)
 		},
 	})
+
 	r.Add(testSpec{
-		Name:       "tpchvec/disk",
-		Owner:      OwnerSQLExec,
-		Cluster:    makeClusterSpec(nodeCount),
-		MinVersion: "v19.2.0",
+		Name:    "tpchvec/disk",
+		Owner:   OwnerSQLExec,
+		Cluster: makeClusterSpec(tpchVecNodeCount),
+		// 19.2 version doesn't have disk spilling nor memory monitoring, so
+		// there is no point in running this config on that version.
+		MinVersion: "v20.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			runTPCHVec(ctx, t, c, stressDiskSpilling)
+			runTPCHVec(ctx, t, c, tpchVecDiskTest{}, baseTestRun)
+		},
+	})
+
+	r.Add(testSpec{
+		Name:    "tpchvec/smallbatchsize",
+		Owner:   OwnerSQLExec,
+		Cluster: makeClusterSpec(tpchVecNodeCount),
+		// 19.2 version doesn't have the testing cluster setting to change the batch
+		// size, so only run on versions >= 20.1.0.
+		MinVersion: "v20.1.0",
+		Run: func(ctx context.Context, t *test, c *cluster) {
+			runTPCHVec(ctx, t, c, tpchVecSmallBatchSizeTest{}, baseTestRun)
+		},
+	})
+
+	r.Add(testSpec{
+		Name:       "tpchvec/smithcmp",
+		Owner:      OwnerSQLExec,
+		Cluster:    makeClusterSpec(tpchVecNodeCount),
+		MinVersion: "v20.1.0",
+		Run: func(ctx context.Context, t *test, c *cluster) {
+			runTPCHVec(ctx, t, c, tpchVecSmithcmpTest{}, smithcmpTestRun)
 		},
 	})
 }

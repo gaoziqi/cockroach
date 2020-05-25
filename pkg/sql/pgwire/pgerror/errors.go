@@ -12,7 +12,6 @@ package pgerror
 
 import (
 	"bytes"
-	goErr "errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -52,11 +51,11 @@ func (pg *Error) SafeDetails() []string {
 // FullError can be used when the hint and/or detail are to be tested.
 func FullError(err error) string {
 	var errString string
-	if pqErr, ok := err.(*pq.Error); ok {
-		errString = formatMsgHintDetail("pq: ", pqErr.Message, pqErr.Hint, pqErr.Detail)
+	if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
+		errString = formatMsgHintDetail("pq", pqErr.Message, pqErr.Hint, pqErr.Detail)
 	} else {
 		pg := Flatten(err)
-		errString = formatMsgHintDetail("", err.Error(), pg.Hint, pg.Detail)
+		errString = formatMsgHintDetail(pg.Severity, err.Error(), pg.Hint, pg.Detail)
 	}
 	return errString
 }
@@ -64,6 +63,7 @@ func FullError(err error) string {
 func formatMsgHintDetail(prefix, msg, hint, detail string) string {
 	var b strings.Builder
 	b.WriteString(prefix)
+	b.WriteString(": ")
 	b.WriteString(msg)
 	if hint != "" {
 		b.WriteString("\nHINT: ")
@@ -98,13 +98,6 @@ func Newf(code string, format string, args ...interface{}) error {
 	return err
 }
 
-// Noticef generates a Notice with a format string.
-func Noticef(format string, args ...interface{}) error {
-	err := errors.NewWithDepthf(1, format, args...)
-	err = WithCandidateCode(err, pgcode.SuccessfulCompletion)
-	return err
-}
-
 // DangerousStatementf creates a new error for "rejected dangerous
 // statements".
 func DangerousStatementf(format string, args ...interface{}) error {
@@ -112,7 +105,7 @@ func DangerousStatementf(format string, args ...interface{}) error {
 	buf.WriteString("rejected: ")
 	fmt.Fprintf(&buf, format, args...)
 	buf.WriteString(" (sql_safe_updates = true)")
-	err := goErr.New(buf.String())
+	err := errors.Newf("%s", buf.String())
 	err = errors.WithSafeDetails(err, format, args...)
 	err = WithCandidateCode(err, pgcode.Warning)
 	return err

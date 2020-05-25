@@ -25,6 +25,7 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -66,6 +67,20 @@ var (
 
 	// DTimeMaxTimeRegex is a compiled regex for parsing the 24:00 time value.
 	DTimeMaxTimeRegex = regexp.MustCompile(`^([0-9-]*(\s|T))?\s*24:00(:00(.0+)?)?\s*$`)
+
+	// The maximum timestamp Golang can represents is represented as UNIX
+	// time timeutil.Unix(-9223372028715321601, 0).
+	// However, this causes errors as we cannot reliably sort as we use
+	// UNIX time in the key encoding, and 9223372036854775807 > -9223372028715321601
+	// but timeutil.Unix(9223372036854775807, 0) < timeutil.Unix(-9223372028715321601, 0).
+	//
+	// To be compatible with pgwire, we only support the published min/max for
+	// postgres 4714 BC (JULIAN = 0) - 4713 in their docs - and 294276 AD.
+
+	// MaxSupportedTime is the maximum time we support parsing.
+	MaxSupportedTime = timeutil.Unix(9224318016000-1, 999999000) // 294276-12-31 23:59:59.999999
+	// MinSupportedTime is the minimum time we support parsing.
+	MinSupportedTime = timeutil.Unix(-210866803200, 0) // 4714-11-24 00:00:00+00 BC
 )
 
 // Datum represents a SQL value.
@@ -182,7 +197,7 @@ func (d Datums) Compare(evalCtx *EvalContext, other Datums) int {
 
 // IsDistinctFrom checks to see if two datums are distinct from each other. Any
 // change in value is considered distinct, however, a NULL value is NOT
-// considered disctinct from another NULL value.
+// considered distinct from another NULL value.
 func (d Datums) IsDistinctFrom(evalCtx *EvalContext, other Datums) bool {
 	if len(d) != len(other) {
 		return true
@@ -825,6 +840,7 @@ func (d *DFloat) Next(_ *EvalContext) (Datum, bool) {
 	return NewDFloat(DFloat(math.Nextafter(f, math.Inf(+1)))), true
 }
 
+var dZeroFloat = NewDFloat(0.0)
 var dPosInfFloat = NewDFloat(DFloat(math.Inf(+1)))
 var dNegInfFloat = NewDFloat(DFloat(math.Inf(-1)))
 var dNaNFloat = NewDFloat(DFloat(math.NaN()))
@@ -990,6 +1006,7 @@ func (d *DDecimal) Next(_ *EvalContext) (Datum, bool) {
 	return nil, false
 }
 
+var dZeroDecimal = &DDecimal{Decimal: apd.Decimal{}}
 var dPosInfDecimal = &DDecimal{Decimal: apd.Decimal{Form: apd.Infinite, Negative: false}}
 var dNaNDecimal = &DDecimal{Decimal: apd.Decimal{Form: apd.NaN}}
 
@@ -1778,10 +1795,12 @@ func (d *DDate) Compare(ctx *EvalContext, other Datum) int {
 }
 
 var (
-	dMaxDate  = NewDDate(pgdate.PosInfDate)
-	dMinDate  = NewDDate(pgdate.NegInfDate)
-	dLowDate  = NewDDate(pgdate.LowDate)
-	dHighDate = NewDDate(pgdate.HighDate)
+	epochDate, _ = pgdate.MakeDateFromPGEpoch(0)
+	dEpochDate   = NewDDate(epochDate)
+	dMaxDate     = NewDDate(pgdate.PosInfDate)
+	dMinDate     = NewDDate(pgdate.NegInfDate)
+	dLowDate     = NewDDate(pgdate.LowDate)
+	dHighDate    = NewDDate(pgdate.HighDate)
 )
 
 // Prev implements the Datum interface.
@@ -1904,7 +1923,10 @@ func (d *DTime) Compare(ctx *EvalContext, other Datum) int {
 }
 
 // Prev implements the Datum interface.
-func (d *DTime) Prev(_ *EvalContext) (Datum, bool) {
+func (d *DTime) Prev(ctx *EvalContext) (Datum, bool) {
+	if d.IsMin(ctx) {
+		return nil, false
+	}
 	prev := *d - 1
 	return &prev, true
 }
@@ -1915,7 +1937,10 @@ func (d *DTime) Round(precision time.Duration) *DTime {
 }
 
 // Next implements the Datum interface.
-func (d *DTime) Next(_ *EvalContext) (Datum, bool) {
+func (d *DTime) Next(ctx *EvalContext) (Datum, bool) {
+	if d.IsMax(ctx) {
+		return nil, false
+	}
 	next := *d + 1
 	return &next, true
 }
@@ -1970,10 +1995,11 @@ type DTimeTZ struct {
 }
 
 var (
+	dZeroTimeTZ = NewDTimeTZFromOffset(timeofday.Min, 0)
 	// DMinTimeTZ is the min TimeTZ.
 	DMinTimeTZ = NewDTimeTZFromOffset(timeofday.Min, timetz.MinTimeTZOffsetSecs)
 	// DMaxTimeTZ is the max TimeTZ.
-	DMaxTimeTZ = NewDTimeTZFromOffset(timeofday.Time2400, timetz.MaxTimeTZOffsetSecs)
+	DMaxTimeTZ = NewDTimeTZFromOffset(timeofday.Max, timetz.MaxTimeTZOffsetSecs)
 )
 
 // NewDTimeTZ creates a DTimeTZ from a timetz.TimeTZ.
@@ -2089,9 +2115,25 @@ type DTimestamp struct {
 }
 
 // MakeDTimestamp creates a DTimestamp with specified precision.
-func MakeDTimestamp(t time.Time, precision time.Duration) *DTimestamp {
-	return &DTimestamp{Time: t.Round(precision)}
+func MakeDTimestamp(t time.Time, precision time.Duration) (*DTimestamp, error) {
+	ret := t.Round(precision)
+	if ret.After(MaxSupportedTime) || ret.Before(MinSupportedTime) {
+		return nil, errors.Newf("timestamp %q exceeds supported timestamp bounds", ret.Format(time.RFC3339))
+	}
+	return &DTimestamp{Time: ret}, nil
 }
+
+// MustMakeDTimestamp wraps MakeDTimestamp but panics if there is an error.
+// This is intended for testing applications only.
+func MustMakeDTimestamp(t time.Time, precision time.Duration) *DTimestamp {
+	ret, err := MakeDTimestamp(t, precision)
+	if err != nil {
+		panic(err)
+	}
+	return ret
+}
+
+var dZeroTimestamp = &DTimestamp{}
 
 // time.Time formats.
 const (
@@ -2110,7 +2152,7 @@ func ParseDTimestamp(ctx ParseTimeContext, s string, precision time.Duration) (*
 	// Truncate the timezone. DTimestamp doesn't carry its timezone around.
 	_, offset := t.Zone()
 	t = t.Add(time.Duration(offset) * time.Second).UTC()
-	return MakeDTimestamp(t, precision), nil
+	return MakeDTimestamp(t, precision)
 }
 
 // AsDTimestamp attempts to retrieve a DTimestamp from an Expr, returning a DTimestamp and
@@ -2138,7 +2180,7 @@ func MustBeDTimestamp(e Expr) DTimestamp {
 }
 
 // Round returns a new DTimestamp to the specified precision.
-func (d *DTimestamp) Round(precision time.Duration) *DTimestamp {
+func (d *DTimestamp) Round(precision time.Duration) (*DTimestamp, error) {
 	return MakeDTimestamp(d.Time, precision)
 }
 
@@ -2235,39 +2277,39 @@ func (d *DTimestamp) Compare(ctx *EvalContext, other Datum) int {
 }
 
 // Prev implements the Datum interface.
-func (d *DTimestamp) Prev(_ *EvalContext) (Datum, bool) {
+func (d *DTimestamp) Prev(ctx *EvalContext) (Datum, bool) {
+	if d.IsMin(ctx) {
+		return nil, false
+	}
 	return &DTimestamp{Time: d.Add(-time.Microsecond)}, true
 }
 
 // Next implements the Datum interface.
-func (d *DTimestamp) Next(_ *EvalContext) (Datum, bool) {
+func (d *DTimestamp) Next(ctx *EvalContext) (Datum, bool) {
+	if d.IsMax(ctx) {
+		return nil, false
+	}
 	return &DTimestamp{Time: d.Add(time.Microsecond)}, true
 }
 
 // IsMax implements the Datum interface.
 func (d *DTimestamp) IsMax(_ *EvalContext) bool {
-	// Adding 1 overflows to a smaller value
-	tNext := d.Time.Add(time.Microsecond)
-	return d.After(tNext)
+	return d.Equal(MaxSupportedTime)
 }
 
 // IsMin implements the Datum interface.
 func (d *DTimestamp) IsMin(_ *EvalContext) bool {
-	// Subtracting 1 underflows to a larger value.
-	tPrev := d.Time.Add(-time.Microsecond)
-	return d.Before(tPrev)
+	return d.Equal(MinSupportedTime)
 }
 
 // Min implements the Datum interface.
 func (d *DTimestamp) Min(_ *EvalContext) (Datum, bool) {
-	// TODO(knz): figure a good way to find a minimum.
-	return nil, false
+	return &DTimestamp{Time: MinSupportedTime}, true
 }
 
 // Max implements the Datum interface.
 func (d *DTimestamp) Max(_ *EvalContext) (Datum, bool) {
-	// TODO(knz): figure a good way to find a minimum.
-	return nil, false
+	return &DTimestamp{Time: MaxSupportedTime}, true
 }
 
 // AmbiguousFormat implements the Datum interface.
@@ -2297,8 +2339,22 @@ type DTimestampTZ struct {
 }
 
 // MakeDTimestampTZ creates a DTimestampTZ with specified precision.
-func MakeDTimestampTZ(t time.Time, precision time.Duration) *DTimestampTZ {
-	return &DTimestampTZ{Time: t.Round(precision)}
+func MakeDTimestampTZ(t time.Time, precision time.Duration) (*DTimestampTZ, error) {
+	ret := t.Round(precision)
+	if ret.After(MaxSupportedTime) || ret.Before(MinSupportedTime) {
+		return nil, errors.Newf("timestamp %q exceeds supported timestamp bounds", ret.Format(time.RFC3339))
+	}
+	return &DTimestampTZ{Time: ret}, nil
+}
+
+// MustMakeDTimestampTZ wraps MakeDTimestampTZ but panics if there is an error.
+// This is intended for testing applications only.
+func MustMakeDTimestampTZ(t time.Time, precision time.Duration) *DTimestampTZ {
+	ret, err := MakeDTimestampTZ(t, precision)
+	if err != nil {
+		panic(err)
+	}
+	return ret
 }
 
 // MakeDTimestampTZFromDate creates a DTimestampTZ from a DDate.
@@ -2311,7 +2367,7 @@ func MakeDTimestampTZFromDate(loc *time.Location, d *DDate) (*DTimestampTZ, erro
 	// Normalize to the correct zone.
 	t = t.In(loc)
 	_, offset := t.Zone()
-	return MakeDTimestampTZ(t.Add(time.Duration(-offset)*time.Second), time.Microsecond), nil
+	return MakeDTimestampTZ(t.Add(time.Duration(-offset)*time.Second), time.Microsecond)
 }
 
 // ParseDTimestampTZ parses and returns the *DTimestampTZ Datum value represented by
@@ -2325,8 +2381,10 @@ func ParseDTimestampTZ(
 		return nil, err
 	}
 	// Always normalize time to the current location.
-	return MakeDTimestampTZ(t, precision), nil
+	return MakeDTimestampTZ(t, precision)
 }
+
+var dZeroTimestampTZ = &DTimestampTZ{}
 
 // AsDTimestampTZ attempts to retrieve a DTimestampTZ from an Expr, returning a
 // DTimestampTZ and a flag signifying whether the assertion was successful. The
@@ -2353,7 +2411,7 @@ func MustBeDTimestampTZ(e Expr) DTimestampTZ {
 }
 
 // Round returns a new DTimestampTZ to the specified precision.
-func (d *DTimestampTZ) Round(precision time.Duration) *DTimestampTZ {
+func (d *DTimestampTZ) Round(precision time.Duration) (*DTimestampTZ, error) {
 	return MakeDTimestampTZ(d.Time, precision)
 }
 
@@ -2372,39 +2430,39 @@ func (d *DTimestampTZ) Compare(ctx *EvalContext, other Datum) int {
 }
 
 // Prev implements the Datum interface.
-func (d *DTimestampTZ) Prev(_ *EvalContext) (Datum, bool) {
+func (d *DTimestampTZ) Prev(ctx *EvalContext) (Datum, bool) {
+	if d.IsMin(ctx) {
+		return nil, false
+	}
 	return &DTimestampTZ{Time: d.Add(-time.Microsecond)}, true
 }
 
 // Next implements the Datum interface.
-func (d *DTimestampTZ) Next(_ *EvalContext) (Datum, bool) {
+func (d *DTimestampTZ) Next(ctx *EvalContext) (Datum, bool) {
+	if d.IsMax(ctx) {
+		return nil, false
+	}
 	return &DTimestampTZ{Time: d.Add(time.Microsecond)}, true
 }
 
 // IsMax implements the Datum interface.
 func (d *DTimestampTZ) IsMax(_ *EvalContext) bool {
-	// Adding 1 overflows to a smaller value
-	tNext := d.Time.Add(time.Microsecond)
-	return d.After(tNext)
+	return d.Equal(MaxSupportedTime)
 }
 
 // IsMin implements the Datum interface.
 func (d *DTimestampTZ) IsMin(_ *EvalContext) bool {
-	// Subtracting 1 underflows to a larger value.
-	tPrev := d.Time.Add(-time.Microsecond)
-	return d.Before(tPrev)
+	return d.Equal(MinSupportedTime)
 }
 
 // Min implements the Datum interface.
 func (d *DTimestampTZ) Min(_ *EvalContext) (Datum, bool) {
-	// TODO(knz): figure a good way to find a minimum.
-	return nil, false
+	return &DTimestampTZ{Time: MinSupportedTime}, true
 }
 
 // Max implements the Datum interface.
 func (d *DTimestampTZ) Max(_ *EvalContext) (Datum, bool) {
-	// TODO(knz): figure a good way to find a minimum.
-	return nil, false
+	return &DTimestampTZ{Time: MaxSupportedTime}, true
 }
 
 // AmbiguousFormat implements the Datum interface.
@@ -2431,13 +2489,13 @@ func (d *DTimestampTZ) Size() uintptr {
 // stripTimeZone removes the time zone from this TimestampTZ. For example, a
 // TimestampTZ '2012-01-01 12:00:00 +02:00' would become
 //             '2012-01-01 12:00:00'.
-func (d *DTimestampTZ) stripTimeZone(ctx *EvalContext) *DTimestamp {
+func (d *DTimestampTZ) stripTimeZone(ctx *EvalContext) (*DTimestamp, error) {
 	return d.EvalAtTimeZone(ctx, ctx.GetLocation())
 }
 
 // EvalAtTimeZone evaluates this TimestampTZ as if it were in the supplied
 // location, returning a timestamp without a timezone.
-func (d *DTimestampTZ) EvalAtTimeZone(ctx *EvalContext, loc *time.Location) *DTimestamp {
+func (d *DTimestampTZ) EvalAtTimeZone(ctx *EvalContext, loc *time.Location) (*DTimestamp, error) {
 	_, locOffset := d.Time.In(loc).Zone()
 	t := d.Time.UTC().Add(time.Duration(locOffset) * time.Second).UTC()
 	return MakeDTimestamp(t, time.Microsecond)
@@ -2446,6 +2504,16 @@ func (d *DTimestampTZ) EvalAtTimeZone(ctx *EvalContext, loc *time.Location) *DTi
 // DInterval is the interval Datum.
 type DInterval struct {
 	duration.Duration
+}
+
+// MustBeDInterval attempts to retrieve a DInterval from an Expr, panicking if the
+// assertion fails.
+func MustBeDInterval(e Expr) *DInterval {
+	switch t := e.(type) {
+	case *DInterval:
+		return t
+	}
+	panic(errors.AssertionFailedf("expected *DInterval, found %T", e))
 }
 
 // NewDInterval creates a new DInterval.
@@ -2578,8 +2646,9 @@ func (d *DInterval) IsMin(_ *EvalContext) bool {
 }
 
 var (
-	dMaxInterval = &DInterval{duration.MakeDuration(math.MaxInt64, math.MaxInt64, math.MaxInt64)}
-	dMinInterval = &DInterval{duration.MakeDuration(math.MinInt64, math.MinInt64, math.MinInt64)}
+	dZeroInterval = &DInterval{}
+	dMaxInterval  = &DInterval{duration.MakeDuration(math.MaxInt64, math.MaxInt64, math.MaxInt64)}
+	dMinInterval  = &DInterval{duration.MakeDuration(math.MinInt64, math.MinInt64, math.MinInt64)}
 )
 
 // Max implements the Datum interface.
@@ -2618,6 +2687,222 @@ func (d *DInterval) Size() uintptr {
 	return unsafe.Sizeof(*d)
 }
 
+// DGeography is the Geometry Datum.
+type DGeography struct {
+	*geo.Geography
+}
+
+// NewDGeography returns a new Geography Datum.
+func NewDGeography(g *geo.Geography) *DGeography {
+	return &DGeography{Geography: g}
+}
+
+// AsDGeography attempts to retrieve a *DGeography from an Expr, returning a
+// *DGeography and a flag signifying whether the assertion was successful. The
+// function should be used instead of direct type assertions wherever a
+// *DGeography wrapped by a *DOidWrapper is possible.
+func AsDGeography(e Expr) (*DGeography, bool) {
+	switch t := e.(type) {
+	case *DGeography:
+		return t, true
+	case *DOidWrapper:
+		return AsDGeography(t.Wrapped)
+	}
+	return nil, false
+}
+
+// MustBeDGeography attempts to retrieve a *DGeography from an Expr, panicking
+// if the assertion fails.
+func MustBeDGeography(e Expr) *DGeography {
+	i, ok := AsDGeography(e)
+	if !ok {
+		panic(errors.AssertionFailedf("expected *DGeography, found %T", e))
+	}
+	return i
+}
+
+// ParseDGeography attempts to pass `str` as a Geography type.
+func ParseDGeography(str string) (*DGeography, error) {
+	g, err := geo.ParseGeography(str)
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not parse geography")
+	}
+	return &DGeography{Geography: g}, nil
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (*DGeography) ResolvedType() *types.T {
+	return types.Geography
+}
+
+// Compare implements the Datum interface.
+func (d *DGeography) Compare(ctx *EvalContext, other Datum) int {
+	if other == DNull {
+		// NULL is less than any non-NULL value.
+		return 1
+	}
+	return bytes.Compare(d.EWKB(), other.(*DGeography).EWKB())
+}
+
+// Prev implements the Datum interface.
+func (d *DGeography) Prev(ctx *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// Next implements the Datum interface.
+func (d *DGeography) Next(ctx *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// IsMax implements the Datum interface.
+func (d *DGeography) IsMax(_ *EvalContext) bool {
+	return false
+}
+
+// IsMin implements the Datum interface.
+func (d *DGeography) IsMin(_ *EvalContext) bool {
+	return false
+}
+
+// Max implements the Datum interface.
+func (d *DGeography) Max(_ *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// Min implements the Datum interface.
+func (d *DGeography) Min(_ *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// AmbiguousFormat implements the Datum interface.
+func (*DGeography) AmbiguousFormat() bool { return true }
+
+// Format implements the NodeFormatter interface.
+func (d *DGeography) Format(ctx *FmtCtx) {
+	f := ctx.flags
+	bareStrings := f.HasFlags(FmtFlags(lex.EncBareStrings))
+	if !bareStrings {
+		ctx.WriteByte('\'')
+	}
+	ctx.WriteString(d.Geography.EWKBHex())
+	if !bareStrings {
+		ctx.WriteByte('\'')
+	}
+}
+
+// Size implements the Datum interface.
+func (d *DGeography) Size() uintptr {
+	return unsafe.Sizeof(*d)
+}
+
+// DGeometry is the Geometry Datum.
+type DGeometry struct {
+	*geo.Geometry
+}
+
+// NewDGeometry returns a new Geometry Datum.
+func NewDGeometry(g *geo.Geometry) *DGeometry {
+	return &DGeometry{Geometry: g}
+}
+
+// AsDGeometry attempts to retrieve a *DGeometry from an Expr, returning a
+// *DGeometry and a flag signifying whether the assertion was successful. The
+// function should be used instead of direct type assertions wherever a
+// *DGeometry wrapped by a *DOidWrapper is possible.
+func AsDGeometry(e Expr) (*DGeometry, bool) {
+	switch t := e.(type) {
+	case *DGeometry:
+		return t, true
+	case *DOidWrapper:
+		return AsDGeometry(t.Wrapped)
+	}
+	return nil, false
+}
+
+// MustBeDGeometry attempts to retrieve a *DGeometry from an Expr, panicking
+// if the assertion fails.
+func MustBeDGeometry(e Expr) *DGeometry {
+	i, ok := AsDGeometry(e)
+	if !ok {
+		panic(errors.AssertionFailedf("expected *DGeometry, found %T", e))
+	}
+	return i
+}
+
+// ParseDGeometry attempts to pass `str` as a Geometry type.
+func ParseDGeometry(str string) (*DGeometry, error) {
+	g, err := geo.ParseGeometry(str)
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not parse geometry")
+	}
+	return &DGeometry{Geometry: g}, nil
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (*DGeometry) ResolvedType() *types.T {
+	return types.Geometry
+}
+
+// Compare implements the Datum interface.
+func (d *DGeometry) Compare(ctx *EvalContext, other Datum) int {
+	if other == DNull {
+		// NULL is less than any non-NULL value.
+		return 1
+	}
+	return bytes.Compare(d.EWKB(), other.(*DGeometry).EWKB())
+}
+
+// Prev implements the Datum interface.
+func (d *DGeometry) Prev(ctx *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// Next implements the Datum interface.
+func (d *DGeometry) Next(ctx *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// IsMax implements the Datum interface.
+func (d *DGeometry) IsMax(_ *EvalContext) bool {
+	return false
+}
+
+// IsMin implements the Datum interface.
+func (d *DGeometry) IsMin(_ *EvalContext) bool {
+	return false
+}
+
+// Max implements the Datum interface.
+func (d *DGeometry) Max(_ *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// Min implements the Datum interface.
+func (d *DGeometry) Min(_ *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// AmbiguousFormat implements the Datum interface.
+func (*DGeometry) AmbiguousFormat() bool { return true }
+
+// Format implements the NodeFormatter interface.
+func (d *DGeometry) Format(ctx *FmtCtx) {
+	f := ctx.flags
+	bareStrings := f.HasFlags(FmtFlags(lex.EncBareStrings))
+	if !bareStrings {
+		ctx.WriteByte('\'')
+	}
+	ctx.WriteString(d.Geometry.EWKBHex())
+	if !bareStrings {
+		ctx.WriteByte('\'')
+	}
+}
+
+// Size implements the Datum interface.
+func (d *DGeometry) Size() uintptr {
+	return unsafe.Sizeof(*d)
+}
+
 // DJSON is the JSON Datum.
 type DJSON struct{ json.JSON }
 
@@ -2650,6 +2935,8 @@ func MakeDJSON(d interface{}) (Datum, error) {
 	}
 	return &DJSON{j}, nil
 }
+
+var dNullJSON = NewDJSON(json.NullJSONValue)
 
 // AsDJSON attempts to retrieve a *DJSON from an Expr, returning a *DJSON and
 // a flag signifying whether the assertion was successful. The function should
@@ -2732,7 +3019,8 @@ func AsJSON(d Datum, loc *time.Location) (json.JSON, error) {
 	case *DTimestamp:
 		// This is RFC3339Nano, but without the TZ fields.
 		return json.FromString(t.UTC().Format("2006-01-02T15:04:05.999999999")), nil
-	case *DDate, *DUuid, *DOid, *DInterval, *DBytes, *DIPAddr, *DTime, *DTimeTZ, *DBitArray:
+	case *DDate, *DUuid, *DOid, *DInterval, *DBytes, *DIPAddr, *DTime, *DTimeTZ, *DBitArray,
+		*DGeography, *DGeometry:
 		return json.FromString(AsStringWithFlags(t, FmtBareStrings)), nil
 	default:
 		if d == DNull {
@@ -2868,9 +3156,9 @@ func AsDTuple(e Expr) (*DTuple, bool) {
 // populated.
 func (d *DTuple) maybePopulateType() {
 	if d.typ == nil {
-		contents := make([]types.T, len(d.D))
+		contents := make([]*types.T, len(d.D))
 		for i, v := range d.D {
-			contents[i] = *v.ResolvedType()
+			contents[i] = v.ResolvedType()
 		}
 		d.typ = types.MakeTuple(contents)
 	}
@@ -3287,6 +3575,16 @@ func (d *DArray) ResolvedType() *types.T {
 	return types.MakeArray(d.ParamTyp)
 }
 
+// IsComposite implements the CompositeDatum interface.
+func (d *DArray) IsComposite() bool {
+	for _, elem := range d.Array {
+		if cdatum, ok := elem.(CompositeDatum); ok && cdatum.IsComposite() {
+			return true
+		}
+	}
+	return false
+}
+
 // FirstIndex returns the first index of the array. 1 for normal SQL arrays,
 // which are 1-indexed, and 0 for the special Postgers vector types which are
 // 0-indexed.
@@ -3460,6 +3758,145 @@ func (d *DArray) Append(v Datum) error {
 	}
 	d.Array = append(d.Array, v)
 	return d.Validate()
+}
+
+// DEnum represents an ENUM value.
+type DEnum struct {
+	// EnumType is the hydrated type of this enum.
+	EnumTyp *types.T
+	// PhysicalRep is a slice containing the encodable and ordered physical
+	// representation of this datum. It is used for comparisons and encoding.
+	PhysicalRep []byte
+	// LogicalRep is a string containing the user visible value of the enum.
+	LogicalRep string
+}
+
+// Size implements the Datum interface.
+func (d *DEnum) Size() uintptr {
+	// When creating DEnums, we store pointers back into the type enum
+	// metadata, so enums themselves don't pay for the memory of their
+	// physical and logical representations.
+	return unsafe.Sizeof(d.EnumTyp) +
+		unsafe.Sizeof(d.PhysicalRep) +
+		unsafe.Sizeof(d.LogicalRep)
+}
+
+// MakeDEnumFromPhysicalRepresentation creates a DEnum of the input type
+// and the input physical representation.
+func MakeDEnumFromPhysicalRepresentation(typ *types.T, rep []byte) *DEnum {
+	// Take a pointer into the enum metadata rather than holding on
+	// to a pointer to the input bytes.
+	idx := typ.EnumGetIdxOfPhysical(rep)
+	return &DEnum{
+		EnumTyp:     typ,
+		PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[idx],
+		LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[idx],
+	}
+}
+
+// MakeDEnumFromLogicalRepresentation creates a DEnum of the input type
+// and input logical representation. It returns an error if the input
+// logical representation is invalid.
+func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (*DEnum, error) {
+	// Return a nice error if the input requested type is types.AnyEnum.
+	if typ.Oid() == oid.T_anyenum {
+		return nil, errors.New("cannot create enum of unspecified type")
+	}
+	// Take a pointer into the enum metadata rather than holding on
+	// to a pointer to the input string.
+	idx, err := typ.EnumGetIdxOfLogical(rep)
+	if err != nil {
+		return nil, err
+	}
+	return &DEnum{
+		EnumTyp:     typ,
+		PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[idx],
+		LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[idx],
+	}, nil
+}
+
+// Format implements the NodeFormatter interface.
+func (d *DEnum) Format(ctx *FmtCtx) {
+	s := DString(d.LogicalRep)
+	s.Format(ctx)
+}
+
+func (d *DEnum) String() string {
+	return AsString(d)
+}
+
+// ResolvedType implements the Datum interface.
+func (d *DEnum) ResolvedType() *types.T {
+	return d.EnumTyp
+}
+
+// Compare implements the Datum interface.
+func (d *DEnum) Compare(ctx *EvalContext, other Datum) int {
+	if other == DNull {
+		return 1
+	}
+	v, ok := UnwrapDatum(ctx, other).(*DEnum)
+	if !ok {
+		panic(makeUnsupportedComparisonMessage(d, other))
+	}
+	return bytes.Compare(d.PhysicalRep, v.PhysicalRep)
+}
+
+// Prev implements the Datum interface.
+func (d *DEnum) Prev(ctx *EvalContext) (Datum, bool) {
+	idx := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if idx == 0 {
+		return nil, false
+	}
+	return MakeDEnumFromPhysicalRepresentation(
+		d.EnumTyp,
+		d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations[idx-1],
+	), true
+}
+
+// Next implements the Datum interface.
+func (d *DEnum) Next(ctx *EvalContext) (Datum, bool) {
+	idx := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
+	if idx == len(physReps)-1 {
+		return nil, false
+	}
+	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[idx+1]), true
+}
+
+// Max implements the Datum interface.
+func (d *DEnum) Max(ctx *EvalContext) (Datum, bool) {
+	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
+	if len(physReps) == 0 {
+		return nil, false
+	}
+	idx := len(physReps) - 1
+	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[idx]), true
+}
+
+// Min implements the Datum interface.
+func (d *DEnum) Min(ctx *EvalContext) (Datum, bool) {
+	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
+	if len(physReps) == 0 {
+		return nil, false
+	}
+	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[0]), true
+}
+
+// IsMax implements the Datum interface.
+func (d *DEnum) IsMax(_ *EvalContext) bool {
+	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
+	return d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep) == len(physReps)-1
+}
+
+// IsMin implements the Datum interface.
+func (d *DEnum) IsMin(_ *EvalContext) bool {
+	return d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep) == 0
+}
+
+// AmbiguousFormat implements the Datum interface.
+func (d *DEnum) AmbiguousFormat() bool {
+	return true
 }
 
 // DOid is the Postgres OID datum. It can represent either an OID type or any
@@ -3830,6 +4267,74 @@ func NewDOidVectorFromDArray(d *DArray) Datum {
 	return ret
 }
 
+// NewDefaultDatum returns a default non-NULL datum value for the given type.
+// This is used when updating non-NULL columns that are being added or dropped
+// from a table, and there is no user-defined DEFAULT value available.
+func NewDefaultDatum(evalCtx *EvalContext, t *types.T) (d Datum, err error) {
+	switch t.Family() {
+	case types.BoolFamily:
+		return DBoolFalse, nil
+	case types.IntFamily:
+		return DZero, nil
+	case types.FloatFamily:
+		return dZeroFloat, nil
+	case types.DecimalFamily:
+		return dZeroDecimal, nil
+	case types.DateFamily:
+		return dEpochDate, nil
+	case types.TimestampFamily:
+		return dZeroTimestamp, nil
+	case types.IntervalFamily:
+		return dZeroInterval, nil
+	case types.StringFamily:
+		return dEmptyString, nil
+	case types.BytesFamily:
+		return dEmptyBytes, nil
+	case types.TimestampTZFamily:
+		return dZeroTimestampTZ, nil
+	case types.CollatedStringFamily:
+		return NewDCollatedString("", t.Locale(), &evalCtx.CollationEnv)
+	case types.OidFamily:
+		return NewDOidWithName(DInt(t.Oid()), t, t.SQLStandardName()), nil
+	case types.UnknownFamily:
+		return DNull, nil
+	case types.UuidFamily:
+		return DMinUUID, nil
+	case types.ArrayFamily:
+		return NewDArray(t.ArrayContents()), nil
+	case types.INetFamily:
+		return DMinIPAddr, nil
+	case types.TimeFamily:
+		return dTimeMin, nil
+	case types.JsonFamily:
+		return dNullJSON, nil
+	case types.TimeTZFamily:
+		return dZeroTimeTZ, nil
+	case types.GeometryFamily, types.GeographyFamily:
+		// TODO(otan): force Geometry/Geography to not allow `NOT NULL` columns to
+		// make this impossible.
+		return nil, pgerror.Newf(
+			pgcode.FeatureNotSupported,
+			"%s must be set or be NULL",
+			t.Name(),
+		)
+	case types.TupleFamily:
+		contents := t.TupleContents()
+		datums := make([]Datum, len(contents))
+		for i, subT := range contents {
+			datums[i], err = NewDefaultDatum(evalCtx, subT)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return NewDTuple(t, datums...), nil
+	case types.BitFamily:
+		return bitArrayZero, nil
+	default:
+		return nil, errors.AssertionFailedf("unhandled type %v", t.SQLString())
+	}
+}
+
 // DatumTypeSize returns a lower bound on the total size of a Datum
 // of the given type in bytes, including memory that is
 // pointed at (even if shared between Datum instances) but excluding
@@ -3839,7 +4344,7 @@ func NewDOidVectorFromDArray(d *DArray) Datum {
 // sizes.
 //
 // It holds for every Datum d that d.Size() >= DatumSize(d.ResolvedType())
-func DatumTypeSize(t *types.T) (uintptr, bool) {
+func DatumTypeSize(t *types.T) (size uintptr, isVarlen bool) {
 	// The following are composite types or types that support multiple widths.
 	switch t.Family() {
 	case types.TupleFamily:
@@ -3849,13 +4354,20 @@ func DatumTypeSize(t *types.T) (uintptr, bool) {
 		sz := uintptr(0)
 		variable := false
 		for i := range t.TupleContents() {
-			typsz, typvariable := DatumTypeSize(&t.TupleContents()[i])
+			typsz, typvariable := DatumTypeSize(t.TupleContents()[i])
 			sz += typsz
 			variable = variable || typvariable
 		}
 		return sz, variable
 	case types.IntFamily, types.FloatFamily:
 		return uintptr(t.Width() / 8), false
+
+	case types.StringFamily:
+		// T_char is a special string type that has a fixed size of 1. We have to
+		// report its size accurately, and that it's not a variable-length datatype.
+		if t.Oid() == oid.T_char {
+			return 1, false
+		}
 	}
 
 	// All the primary types have fixed size information.
@@ -3885,6 +4397,8 @@ var baseDatumTypeSizes = map[types.Family]struct {
 	types.CollatedStringFamily: {unsafe.Sizeof(DCollatedString{"", "", nil}), variableSize},
 	types.BytesFamily:          {unsafe.Sizeof(DBytes("")), variableSize},
 	types.DateFamily:           {unsafe.Sizeof(DDate{}), fixedSize},
+	types.GeographyFamily:      {unsafe.Sizeof(DGeography{}), variableSize},
+	types.GeometryFamily:       {unsafe.Sizeof(DGeometry{}), variableSize},
 	types.TimeFamily:           {unsafe.Sizeof(DTime(0)), fixedSize},
 	types.TimeTZFamily:         {unsafe.Sizeof(DTimeTZ{}), fixedSize},
 	types.TimestampFamily:      {unsafe.Sizeof(DTimestamp{}), fixedSize},
@@ -3894,6 +4408,7 @@ var baseDatumTypeSizes = map[types.Family]struct {
 	types.UuidFamily:           {unsafe.Sizeof(DUuid{}), fixedSize},
 	types.INetFamily:           {unsafe.Sizeof(DIPAddr{}), fixedSize},
 	types.OidFamily:            {unsafe.Sizeof(DInt(0)), fixedSize},
+	types.EnumFamily:           {unsafe.Sizeof(DEnum{}), variableSize},
 
 	// TODO(jordan,justin): This seems suspicious.
 	types.ArrayFamily: {unsafe.Sizeof(DString("")), variableSize},

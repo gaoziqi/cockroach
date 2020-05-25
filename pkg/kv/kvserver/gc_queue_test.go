@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -36,8 +36,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/syncmap"
 )
@@ -142,7 +142,7 @@ func TestGCQueueMakeGCScoreLargeAbortSpan(t *testing.T) {
 	ms.SysBytes += probablyLargeAbortSpanSysBytesThreshold
 
 	gcThresh := hlc.Timestamp{WallTime: 1}
-	expiration := storagebase.TxnCleanupThreshold.Nanoseconds() + 1
+	expiration := kvserverbase.TxnCleanupThreshold.Nanoseconds() + 1
 
 	// GC triggered if abort span should all be gc'able and it's likely large.
 	{
@@ -636,7 +636,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	manual.Set(3 * 24 * time.Hour.Nanoseconds())
 
 	testTime := manual.UnixNano() + 2*time.Hour.Nanoseconds()
-	gcExpiration := testTime - storagebase.TxnCleanupThreshold.Nanoseconds()
+	gcExpiration := testTime - kvserverbase.TxnCleanupThreshold.Nanoseconds()
 
 	type spec struct {
 		status      roachpb.TransactionStatus
@@ -741,7 +741,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	// intent resolution.
 	tsc.TestingKnobs.IntentResolverKnobs.MaxIntentResolutionBatchSize = 1
 	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
+		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 			if resArgs, ok := filterArgs.Req.(*roachpb.ResolveIntentRequest); ok {
 				id := string(resArgs.IntentTxn.Key)
 				// Only count finalizing intent resolution attempts in `resolved`.
@@ -907,8 +907,12 @@ func TestGCQueueIntentResolution(t *testing.T) {
 	intentResolveTS := makeTS(now-gc.IntentAgeThreshold.Nanoseconds(), 0)
 	txns[0].ReadTimestamp = intentResolveTS
 	txns[0].WriteTimestamp = intentResolveTS
+	// The MinTimestamp is used by pushers that don't find a transaction record to
+	// infer when the coordinator was alive.
+	txns[0].MinTimestamp = intentResolveTS
 	txns[1].ReadTimestamp = intentResolveTS
 	txns[1].WriteTimestamp = intentResolveTS
+	txns[1].MinTimestamp = intentResolveTS
 
 	// Two transactions.
 	for i := 0; i < 2; i++ {
@@ -1020,7 +1024,7 @@ func TestGCQueueChunkRequests(t *testing.T) {
 	manual := hlc.NewManualClock(123)
 	tsc := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
 	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs storagebase.FilterArgs) *roachpb.Error {
+		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 			if _, ok := filterArgs.Req.(*roachpb.GCRequest); ok {
 				atomic.AddInt32(&gcRequests, 1)
 				return nil

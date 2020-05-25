@@ -40,7 +40,7 @@ type dataDistribution func() (storage.MVCCKeyValue, *roachpb.Transaction, bool)
 func (ds dataDistribution) setupTest(
 	t testing.TB, eng storage.Engine, desc roachpb.RangeDescriptor,
 ) enginepb.MVCCStats {
-	ctx := context.TODO()
+	ctx := context.Background()
 	var maxTs hlc.Timestamp
 	var ms enginepb.MVCCStats
 	for {
@@ -180,10 +180,10 @@ func (ds uniformDistSpec) dist(maxRows int, rng *rand.Rand) dataDistribution {
 }
 
 func (ds uniformDistSpec) desc() *roachpb.RangeDescriptor {
-	tablePrefix := keys.MakeTablePrefix(42)
+	tablePrefix := keys.SystemSQLCodec.TablePrefix(42)
 	return &roachpb.RangeDescriptor{
-		StartKey: tablePrefix,
-		EndKey:   roachpb.RKey(roachpb.Key(tablePrefix).PrefixEnd()),
+		StartKey: roachpb.RKey(tablePrefix),
+		EndKey:   roachpb.RKey(tablePrefix.PrefixEnd()),
 	}
 }
 

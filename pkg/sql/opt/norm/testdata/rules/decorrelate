@@ -14,6 +14,10 @@ exec-ddl
 CREATE TABLE cd (c INT PRIMARY KEY, d INT NOT NULL)
 ----
 
+exec-ddl
+CREATE TABLE ab (a INT, b INT)
+----
+
 # --------------------------------------------------
 # DecorrelateJoin
 # --------------------------------------------------
@@ -65,8 +69,8 @@ update xy
  ├── side-effects, mutations
  └── left-join (hash)
       ├── columns: x:3!null y:4 u:5 v:6
-      ├── key: (3,5)
-      ├── fd: (3)-->(4), (5)-->(6)
+      ├── key: (3)
+      ├── fd: (3)-->(4-6), (5)-->(6)
       ├── scan xy
       │    ├── columns: x:3!null y:4
       │    ├── key: (3)
@@ -875,8 +879,8 @@ project
  │    ├── fd: (1)-->(10)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null x:6 notnull:9
- │    │    ├── key: (1,6)
- │    │    ├── fd: (6)-->(9)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (6)-->(9), (1)-->(6,9)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null
  │    │    │    └── key: (1)
@@ -956,8 +960,8 @@ project
  │    ├── fd: (1)-->(10)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null x:6 notnull:9
- │    │    ├── key: (1,6)
- │    │    ├── fd: (6)-->(9)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (6)-->(9), (1)-->(6,9)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null
  │    │    │    └── key: (1)
@@ -998,8 +1002,8 @@ project
  │    ├── fd: (1)-->(2,10)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null i:2 x:6 y:7 notnull:9
- │    │    ├── key: (1,6)
- │    │    ├── fd: (1)-->(2), (6)-->(7), (7)~~>(9), (1,6)-->(9)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (1)-->(2,6,7,9), (6)-->(7), (7)~~>(9)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null i:2
  │    │    │    ├── key: (1)
@@ -1031,21 +1035,17 @@ SELECT i*i/5=ANY(SELECT y FROM xy WHERE x=k) AS r FROM a
 ----
 project
  ├── columns: r:8
- ├── side-effects
  ├── group-by
  │    ├── columns: k:1!null scalar:9 bool_or:11
  │    ├── grouping columns: k:1!null
- │    ├── side-effects
  │    ├── key: (1)
  │    ├── fd: (1)-->(9,11)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null x:6 y:7 scalar:9 notnull:10
- │    │    ├── side-effects
- │    │    ├── key: (1,6)
- │    │    ├── fd: (1)-->(9), (6)-->(7), (7)~~>(10), (1,6)-->(10)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (1)-->(6,7,9,10), (6)-->(7), (7)~~>(10)
  │    │    ├── project
  │    │    │    ├── columns: scalar:9 k:1!null
- │    │    │    ├── side-effects
  │    │    │    ├── key: (1)
  │    │    │    ├── fd: (1)-->(9)
  │    │    │    ├── scan a
@@ -1053,7 +1053,7 @@ project
  │    │    │    │    ├── key: (1)
  │    │    │    │    └── fd: (1)-->(2)
  │    │    │    └── projections
- │    │    │         └── (i:2 * i:2) / 5 [as=scalar:9, outer=(2), side-effects]
+ │    │    │         └── (i:2 * i:2) / 5 [as=scalar:9, outer=(2)]
  │    │    ├── project
  │    │    │    ├── columns: notnull:10!null x:6!null y:7
  │    │    │    ├── key: (6)
@@ -1088,15 +1088,12 @@ WHERE EXISTS
 distinct-on
  ├── columns: k:1!null
  ├── grouping columns: k:1!null
- ├── side-effects
  ├── key: (1)
  └── select
       ├── columns: k:1!null x:6!null div:10!null
-      ├── side-effects
       ├── fd: (6)==(10), (10)==(6)
       ├── project
       │    ├── columns: div:10!null k:1!null x:6!null
-      │    ├── side-effects
       │    ├── inner-join (cross)
       │    │    ├── columns: k:1!null i:2!null x:6!null u:8!null
       │    │    ├── key: (1,6,8)
@@ -1123,7 +1120,7 @@ distinct-on
       │    │    │    └── filters (true)
       │    │    └── filters (true)
       │    └── projections
-      │         └── u:8 / 1.1 [as=div:10, outer=(8), side-effects]
+      │         └── u:8 / 1.1 [as=div:10, outer=(8)]
       └── filters
            └── x:6 = div:10 [outer=(6,10), constraints=(/6: (/NULL - ]; /10: (/NULL - ]), fd=(6)==(10), (10)==(6)]
 
@@ -1137,11 +1134,9 @@ WHERE EXISTS
 ----
 project
  ├── columns: k:1!null
- ├── side-effects
  ├── key: (1)
  └── semi-join-apply
       ├── columns: k:1!null i:2
-      ├── side-effects
       ├── key: (1)
       ├── fd: (1)-->(2)
       ├── scan a
@@ -1151,11 +1146,9 @@ project
       ├── left-join (cross)
       │    ├── columns: x:6 div:10!null
       │    ├── outer: (2)
-      │    ├── side-effects
       │    ├── project
       │    │    ├── columns: div:10!null
       │    │    ├── outer: (2)
-      │    │    ├── side-effects
       │    │    ├── select
       │    │    │    ├── columns: u:8!null
       │    │    │    ├── outer: (2)
@@ -1166,7 +1159,7 @@ project
       │    │    │    └── filters
       │    │    │         └── i:2 = 5 [outer=(2), constraints=(/2: [/5 - /5]; tight), fd=()-->(2)]
       │    │    └── projections
-      │    │         └── u:8 / 1.1 [as=div:10, outer=(8), side-effects]
+      │    │         └── u:8 / 1.1 [as=div:10, outer=(8)]
       │    ├── scan xy
       │    │    ├── columns: x:6!null
       │    │    └── key: (6)
@@ -1277,8 +1270,8 @@ project
  │    ├── fd: (1)-->(11)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null x:6 column10:10
- │    │    ├── key: (1,6)
- │    │    ├── fd: (6)-->(10)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (6)-->(10), (1)-->(6,10)
  │    │    ├── scan a
  │    │    │    ├── columns: k:1!null
  │    │    │    └── key: (1)
@@ -1396,8 +1389,8 @@ project
       │    ├── fd: (1)-->(10)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null x:6 u:8
-      │    │    ├── key: (1,8)
-      │    │    ├── fd: (6)==(8), (8)==(6)
+      │    │    ├── key: (1)
+      │    │    ├── fd: (6)==(8), (8)==(6), (1)-->(6,8)
       │    │    ├── scan a
       │    │    │    ├── columns: k:1!null
       │    │    │    └── key: (1)
@@ -1438,7 +1431,8 @@ semi-join-apply
  ├── left-join (hash)
  │    ├── columns: x:6!null u:8
  │    ├── outer: (1)
- │    ├── key: (6,8)
+ │    ├── key: (6)
+ │    ├── fd: (6)-->(8)
  │    ├── scan xy
  │    │    ├── columns: x:6!null
  │    │    └── key: (6)
@@ -1552,15 +1546,16 @@ WHERE (SELECT i FROM a WHERE k=x) IS DISTINCT FROM u
 ----
 project
  ├── columns: x:1!null y:2 u:3!null v:4
+ ├── key: (1,3)
  ├── fd: (1)-->(2), (3)-->(4)
  └── select
       ├── columns: x:1!null y:2 u:3!null v:4 k:5 i:6
-      ├── key: (1,3,5)
-      ├── fd: (1)-->(2), (3)-->(4), (5)-->(6)
+      ├── key: (1,3)
+      ├── fd: (1)-->(2), (3)-->(4), (5)-->(6), (1,3)-->(5,6)
       ├── left-join (hash)
       │    ├── columns: x:1!null y:2 u:3!null v:4 k:5 i:6
-      │    ├── key: (1,3,5)
-      │    ├── fd: (1)-->(2), (3)-->(4), (5)-->(6)
+      │    ├── key: (1,3)
+      │    ├── fd: (1)-->(2), (3)-->(4), (5)-->(6), (1,3)-->(5,6)
       │    ├── inner-join (cross)
       │    │    ├── columns: x:1!null y:2 u:3!null v:4
       │    │    ├── key: (1,3)
@@ -1803,8 +1798,8 @@ project
       │    ├── fd: (1)-->(2), (3)-->(1,2,4,10), (1)==(4), (4)==(1)
       │    ├── left-join (hash)
       │    │    ├── columns: x:1!null y:2 u:3!null v:4!null k:5 i:6
-      │    │    ├── key: (3,5)
-      │    │    ├── fd: (1)-->(2), (3)-->(4), (1)==(4), (4)==(1), (5)-->(6)
+      │    │    ├── key: (3)
+      │    │    ├── fd: (1)-->(2), (3)-->(4-6), (1)==(4), (4)==(1), (5)-->(6)
       │    │    ├── inner-join (hash)
       │    │    │    ├── columns: x:1!null y:2 u:3!null v:4!null
       │    │    │    ├── key: (3)
@@ -1850,24 +1845,22 @@ project
  ├── columns: y:2!null cst:3!null
  ├── fd: ()-->(2,3)
  ├── select
- │    ├── columns: y:2!null max:9!null rownum:10!null
- │    ├── key: (10)
+ │    ├── columns: x:1!null y:2!null max:9!null
+ │    ├── key: (1)
  │    ├── fd: ()-->(2,9)
  │    ├── group-by
- │    │    ├── columns: y:2!null max:9 rownum:10!null
- │    │    ├── grouping columns: rownum:10!null
- │    │    ├── key: (10)
- │    │    ├── fd: ()-->(2), (10)-->(2,9)
+ │    │    ├── columns: x:1!null y:2!null max:9
+ │    │    ├── grouping columns: x:1!null
+ │    │    ├── key: (1)
+ │    │    ├── fd: ()-->(2), (1)-->(2,9)
  │    │    ├── inner-join (hash)
- │    │    │    ├── columns: y:2!null k:4!null s:7 rownum:10!null
- │    │    │    ├── key: (10)
+ │    │    │    ├── columns: x:1!null y:2!null k:4!null s:7
+ │    │    │    ├── key: (1)
  │    │    │    ├── fd: ()-->(2,4,7), (2)==(4), (4)==(2)
- │    │    │    ├── ordinality
- │    │    │    │    ├── columns: y:2 rownum:10!null
- │    │    │    │    ├── key: (10)
- │    │    │    │    ├── fd: (10)-->(2)
- │    │    │    │    └── scan xy
- │    │    │    │         └── columns: y:2
+ │    │    │    ├── scan xy
+ │    │    │    │    ├── columns: x:1!null y:2
+ │    │    │    │    ├── key: (1)
+ │    │    │    │    └── fd: (1)-->(2)
  │    │    │    ├── limit
  │    │    │    │    ├── columns: k:4!null s:7
  │    │    │    │    ├── cardinality: [0 - 1]
@@ -2031,86 +2024,71 @@ with &1 (w0)
       │    ├── columns: t0._string:6
       │    ├── scan t0
       │    │    └── columns: t0._string:6
-      │    ├── limit
-      │    │    ├── columns: tab_orig.rowid:14!null t1._decimal:19!null t1.rowid:21!null t2._bool:25!null t2._decimal:26 t2.rowid:28!null t3._int2:29!null t3._timestamptz:31!null t3.rowid:35!null t4._int8:44!null t4._timestamptz:45!null t5._decimal:54!null
-      │    │    ├── internal-ordering: +26 opt(25)
+      │    ├── inner-join (hash)
+      │    │    ├── columns: tab_orig.rowid:14!null t1._decimal:19!null t1.rowid:21!null t2._bool:25!null t2.rowid:28!null t3._int2:29!null t3._timestamptz:31!null t3.rowid:35!null t4._int8:44!null t4._timestamptz:45!null t5._decimal:54!null
       │    │    ├── outer: (6)
-      │    │    ├── cardinality: [0 - 66]
-      │    │    ├── fd: ()-->(25), (21)-->(19), (28)-->(26), (35)-->(29,31), (14,21,28,35)-->(19,26,29,31), (31)==(45), (45)==(31), (29)==(44), (44)==(29), (19)==(54), (54)==(19)
-      │    │    ├── sort
-      │    │    │    ├── columns: tab_orig.rowid:14!null t1._decimal:19!null t1.rowid:21!null t2._bool:25!null t2._decimal:26 t2.rowid:28!null t3._int2:29!null t3._timestamptz:31!null t3.rowid:35!null t4._int8:44!null t4._timestamptz:45!null t5._decimal:54!null
+      │    │    ├── fd: ()-->(25), (21)-->(19), (35)-->(29,31), (14,21,28,35)-->(19,29,31), (31)==(45), (45)==(31), (29)==(44), (44)==(29), (19)==(54), (54)==(19)
+      │    │    ├── inner-join (hash)
+      │    │    │    ├── columns: tab_orig.rowid:14!null t1._decimal:19 t1.rowid:21!null t2._bool:25 t2.rowid:28!null t3._int2:29!null t3._timestamptz:31!null t3.rowid:35!null t4._int8:44!null t4._timestamptz:45!null
       │    │    │    ├── outer: (6)
-      │    │    │    ├── fd: ()-->(25), (21)-->(19), (28)-->(26), (35)-->(29,31), (14,21,28,35)-->(19,26,29,31), (31)==(45), (45)==(31), (29)==(44), (44)==(29), (19)==(54), (54)==(19)
-      │    │    │    ├── ordering: +26 opt(25) [actual: +26]
-      │    │    │    ├── limit hint: 66.00
-      │    │    │    └── inner-join (hash)
-      │    │    │         ├── columns: tab_orig.rowid:14!null t1._decimal:19!null t1.rowid:21!null t2._bool:25!null t2._decimal:26 t2.rowid:28!null t3._int2:29!null t3._timestamptz:31!null t3.rowid:35!null t4._int8:44!null t4._timestamptz:45!null t5._decimal:54!null
-      │    │    │         ├── outer: (6)
-      │    │    │         ├── fd: ()-->(25), (21)-->(19), (28)-->(26), (35)-->(29,31), (14,21,28,35)-->(19,26,29,31), (31)==(45), (45)==(31), (29)==(44), (44)==(29), (19)==(54), (54)==(19)
-      │    │    │         ├── inner-join (hash)
-      │    │    │         │    ├── columns: tab_orig.rowid:14!null t1._decimal:19 t1.rowid:21!null t2._bool:25 t2._decimal:26 t2.rowid:28!null t3._int2:29!null t3._timestamptz:31!null t3.rowid:35!null t4._int8:44!null t4._timestamptz:45!null
-      │    │    │         │    ├── outer: (6)
-      │    │    │         │    ├── fd: (21)-->(19), (28)-->(25,26), (35)-->(29,31), (14,21,28,35)-->(19,25,26,29,31), (31)==(45), (45)==(31), (29)==(44), (44)==(29)
-      │    │    │         │    ├── group-by
-      │    │    │         │    │    ├── columns: tab_orig.rowid:14!null t1._decimal:19 t1.rowid:21!null t2._bool:25 t2._decimal:26 t2.rowid:28!null t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
-      │    │    │         │    │    ├── grouping columns: tab_orig.rowid:14!null t1.rowid:21!null t2.rowid:28!null t3.rowid:35!null
-      │    │    │         │    │    ├── outer: (6)
-      │    │    │         │    │    ├── key: (14,21,28,35)
-      │    │    │         │    │    ├── fd: (21)-->(19), (28)-->(25,26), (35)-->(29,31), (14,21,28,35)-->(19,25,26,29,31)
-      │    │    │         │    │    ├── inner-join (cross)
-      │    │    │         │    │    │    ├── columns: tab_orig.rowid:14!null t1._decimal:19 t1.rowid:21!null t2._bool:25 t2._decimal:26 t2.rowid:28!null t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
-      │    │    │         │    │    │    ├── outer: (6)
-      │    │    │         │    │    │    ├── key: (14,21,28,35)
-      │    │    │         │    │    │    ├── fd: (21)-->(19), (28)-->(25,26), (35)-->(29,31)
-      │    │    │         │    │    │    ├── scan tab_orig
-      │    │    │         │    │    │    │    ├── columns: tab_orig.rowid:14!null
-      │    │    │         │    │    │    │    └── key: (14)
-      │    │    │         │    │    │    ├── inner-join (cross)
-      │    │    │         │    │    │    │    ├── columns: t1._decimal:19 t1.rowid:21!null t2._bool:25 t2._decimal:26 t2.rowid:28!null t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
-      │    │    │         │    │    │    │    ├── key: (21,28,35)
-      │    │    │         │    │    │    │    ├── fd: (21)-->(19), (28)-->(25,26), (35)-->(29,31)
-      │    │    │         │    │    │    │    ├── scan t1
-      │    │    │         │    │    │    │    │    ├── columns: t1._decimal:19 t1.rowid:21!null
-      │    │    │         │    │    │    │    │    ├── key: (21)
-      │    │    │         │    │    │    │    │    └── fd: (21)-->(19)
-      │    │    │         │    │    │    │    ├── inner-join (cross)
-      │    │    │         │    │    │    │    │    ├── columns: t2._bool:25 t2._decimal:26 t2.rowid:28!null t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
-      │    │    │         │    │    │    │    │    ├── key: (28,35)
-      │    │    │         │    │    │    │    │    ├── fd: (28)-->(25,26), (35)-->(29,31)
-      │    │    │         │    │    │    │    │    ├── scan t2
-      │    │    │         │    │    │    │    │    │    ├── columns: t2._bool:25 t2._decimal:26 t2.rowid:28!null
-      │    │    │         │    │    │    │    │    │    ├── key: (28)
-      │    │    │         │    │    │    │    │    │    └── fd: (28)-->(25,26)
-      │    │    │         │    │    │    │    │    ├── scan t3
-      │    │    │         │    │    │    │    │    │    ├── columns: t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
-      │    │    │         │    │    │    │    │    │    ├── key: (35)
-      │    │    │         │    │    │    │    │    │    └── fd: (35)-->(29,31)
-      │    │    │         │    │    │    │    │    └── filters (true)
-      │    │    │         │    │    │    │    └── filters (true)
-      │    │    │         │    │    │    └── filters
-      │    │    │         │    │    │         └── t0._string:6 = 1 [outer=(6), constraints=(/6: [/1 - /1]; tight), fd=()-->(6)]
-      │    │    │         │    │    └── aggregations
-      │    │    │         │    │         ├── const-agg [as=t2._bool:25, outer=(25)]
-      │    │    │         │    │         │    └── t2._bool:25
-      │    │    │         │    │         ├── const-agg [as=t2._decimal:26, outer=(26)]
-      │    │    │         │    │         │    └── t2._decimal:26
-      │    │    │         │    │         ├── const-agg [as=t3._int2:29, outer=(29)]
-      │    │    │         │    │         │    └── t3._int2:29
-      │    │    │         │    │         ├── const-agg [as=t3._timestamptz:31, outer=(31)]
-      │    │    │         │    │         │    └── t3._timestamptz:31
-      │    │    │         │    │         └── const-agg [as=t1._decimal:19, outer=(19)]
-      │    │    │         │    │              └── t1._decimal:19
-      │    │    │         │    ├── scan t4
-      │    │    │         │    │    └── columns: t4._int8:44 t4._timestamptz:45
-      │    │    │         │    └── filters
-      │    │    │         │         ├── t3._timestamptz:31 = t4._timestamptz:45 [outer=(31,45), constraints=(/31: (/NULL - ]; /45: (/NULL - ]), fd=(31)==(45), (45)==(31)]
-      │    │    │         │         └── t3._int2:29 = t4._int8:44 [outer=(29,44), constraints=(/29: (/NULL - ]; /44: (/NULL - ]), fd=(29)==(44), (44)==(29)]
-      │    │    │         ├── scan t5
-      │    │    │         │    └── columns: t5._decimal:54
-      │    │    │         └── filters
-      │    │    │              ├── t2._bool:25 [outer=(25), constraints=(/25: [/true - /true]; tight), fd=()-->(25)]
-      │    │    │              └── t1._decimal:19 = t5._decimal:54 [outer=(19,54), constraints=(/19: (/NULL - ]; /54: (/NULL - ]), fd=(19)==(54), (54)==(19)]
-      │    │    └── 66
+      │    │    │    ├── fd: (21)-->(19), (28)-->(25), (35)-->(29,31), (14,21,28,35)-->(19,25,29,31), (31)==(45), (45)==(31), (29)==(44), (44)==(29)
+      │    │    │    ├── group-by
+      │    │    │    │    ├── columns: tab_orig.rowid:14!null t1._decimal:19 t1.rowid:21!null t2._bool:25 t2.rowid:28!null t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
+      │    │    │    │    ├── grouping columns: tab_orig.rowid:14!null t1.rowid:21!null t2.rowid:28!null t3.rowid:35!null
+      │    │    │    │    ├── outer: (6)
+      │    │    │    │    ├── key: (14,21,28,35)
+      │    │    │    │    ├── fd: (21)-->(19), (28)-->(25), (35)-->(29,31), (14,21,28,35)-->(19,25,29,31)
+      │    │    │    │    ├── inner-join (cross)
+      │    │    │    │    │    ├── columns: tab_orig.rowid:14!null t1._decimal:19 t1.rowid:21!null t2._bool:25 t2.rowid:28!null t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
+      │    │    │    │    │    ├── outer: (6)
+      │    │    │    │    │    ├── key: (14,21,28,35)
+      │    │    │    │    │    ├── fd: (21)-->(19), (28)-->(25), (35)-->(29,31)
+      │    │    │    │    │    ├── scan tab_orig
+      │    │    │    │    │    │    ├── columns: tab_orig.rowid:14!null
+      │    │    │    │    │    │    └── key: (14)
+      │    │    │    │    │    ├── inner-join (cross)
+      │    │    │    │    │    │    ├── columns: t1._decimal:19 t1.rowid:21!null t2._bool:25 t2.rowid:28!null t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
+      │    │    │    │    │    │    ├── key: (21,28,35)
+      │    │    │    │    │    │    ├── fd: (21)-->(19), (28)-->(25), (35)-->(29,31)
+      │    │    │    │    │    │    ├── scan t1
+      │    │    │    │    │    │    │    ├── columns: t1._decimal:19 t1.rowid:21!null
+      │    │    │    │    │    │    │    ├── key: (21)
+      │    │    │    │    │    │    │    └── fd: (21)-->(19)
+      │    │    │    │    │    │    ├── inner-join (cross)
+      │    │    │    │    │    │    │    ├── columns: t2._bool:25 t2.rowid:28!null t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
+      │    │    │    │    │    │    │    ├── key: (28,35)
+      │    │    │    │    │    │    │    ├── fd: (28)-->(25), (35)-->(29,31)
+      │    │    │    │    │    │    │    ├── scan t2
+      │    │    │    │    │    │    │    │    ├── columns: t2._bool:25 t2.rowid:28!null
+      │    │    │    │    │    │    │    │    ├── key: (28)
+      │    │    │    │    │    │    │    │    └── fd: (28)-->(25)
+      │    │    │    │    │    │    │    ├── scan t3
+      │    │    │    │    │    │    │    │    ├── columns: t3._int2:29 t3._timestamptz:31 t3.rowid:35!null
+      │    │    │    │    │    │    │    │    ├── key: (35)
+      │    │    │    │    │    │    │    │    └── fd: (35)-->(29,31)
+      │    │    │    │    │    │    │    └── filters (true)
+      │    │    │    │    │    │    └── filters (true)
+      │    │    │    │    │    └── filters
+      │    │    │    │    │         └── t0._string:6 = 1 [outer=(6), constraints=(/6: [/1 - /1]; tight), fd=()-->(6)]
+      │    │    │    │    └── aggregations
+      │    │    │    │         ├── const-agg [as=t2._bool:25, outer=(25)]
+      │    │    │    │         │    └── t2._bool:25
+      │    │    │    │         ├── const-agg [as=t3._int2:29, outer=(29)]
+      │    │    │    │         │    └── t3._int2:29
+      │    │    │    │         ├── const-agg [as=t3._timestamptz:31, outer=(31)]
+      │    │    │    │         │    └── t3._timestamptz:31
+      │    │    │    │         └── const-agg [as=t1._decimal:19, outer=(19)]
+      │    │    │    │              └── t1._decimal:19
+      │    │    │    ├── scan t4
+      │    │    │    │    └── columns: t4._int8:44 t4._timestamptz:45
+      │    │    │    └── filters
+      │    │    │         ├── t3._timestamptz:31 = t4._timestamptz:45 [outer=(31,45), constraints=(/31: (/NULL - ]; /45: (/NULL - ]), fd=(31)==(45), (45)==(31)]
+      │    │    │         └── t3._int2:29 = t4._int8:44 [outer=(29,44), constraints=(/29: (/NULL - ]; /44: (/NULL - ]), fd=(29)==(44), (44)==(29)]
+      │    │    ├── scan t5
+      │    │    │    └── columns: t5._decimal:54
+      │    │    └── filters
+      │    │         ├── t2._bool:25 [outer=(25), constraints=(/25: [/true - /true]; tight), fd=()-->(25)]
+      │    │         └── t1._decimal:19 = t5._decimal:54 [outer=(19,54), constraints=(/19: (/NULL - ]; /54: (/NULL - ]), fd=(19)==(54), (54)==(19)]
       │    └── filters (true)
       └── projections
            └── NULL [as="?column?":58]
@@ -2194,24 +2172,22 @@ project
  ├── columns: i:2!null cst:6!null
  ├── fd: ()-->(6)
  ├── select
- │    ├── columns: i:2!null max:9!null rownum:10!null
- │    ├── key: (10)
- │    ├── fd: ()-->(9), (10)-->(2)
+ │    ├── columns: k:1!null i:2!null max:9!null
+ │    ├── key: (1)
+ │    ├── fd: ()-->(9), (1)-->(2)
  │    ├── group-by
- │    │    ├── columns: i:2!null max:9!null rownum:10!null
- │    │    ├── grouping columns: rownum:10!null
- │    │    ├── key: (10)
- │    │    ├── fd: (10)-->(2,9)
+ │    │    ├── columns: k:1!null i:2!null max:9!null
+ │    │    ├── grouping columns: k:1!null
+ │    │    ├── key: (1)
+ │    │    ├── fd: (1)-->(2,9)
  │    │    ├── inner-join (hash)
- │    │    │    ├── columns: i:2!null x:7!null y:8!null rownum:10!null
- │    │    │    ├── key: (10)
- │    │    │    ├── fd: (10)-->(2), (7)-->(8), (2)==(7), (7)==(2)
- │    │    │    ├── ordinality
- │    │    │    │    ├── columns: i:2 rownum:10!null
- │    │    │    │    ├── key: (10)
- │    │    │    │    ├── fd: (10)-->(2)
- │    │    │    │    └── scan a
- │    │    │    │         └── columns: i:2
+ │    │    │    ├── columns: k:1!null i:2!null x:7!null y:8!null
+ │    │    │    ├── key: (1)
+ │    │    │    ├── fd: (1)-->(2), (7)-->(8), (2)==(7), (7)==(2)
+ │    │    │    ├── scan a
+ │    │    │    │    ├── columns: k:1!null i:2
+ │    │    │    │    ├── key: (1)
+ │    │    │    │    └── fd: (1)-->(2)
  │    │    │    ├── select
  │    │    │    │    ├── columns: x:7!null y:8!null
  │    │    │    │    ├── key: (7)
@@ -2337,40 +2313,45 @@ project
 
 # With an ordering.
 norm expect=TryDecorrelateScalarGroupBy
-SELECT i, ARRAY(SELECT y FROM xy WHERE xy.y = a.k OR xy.y = NULL ORDER BY y) FROM a
+SELECT i, ARRAY(SELECT y FROM xy WHERE xy.y = a.k OR xy.y IS NULL ORDER BY y) FROM a
 ----
 project
  ├── columns: i:2 array:9
  ├── group-by
- │    ├── columns: k:1!null i:2 y:7 array_agg:10
+ │    ├── columns: k:1!null i:2 canary:10 array_agg:11
  │    ├── grouping columns: k:1!null
  │    ├── internal-ordering: +7
  │    ├── key: (1)
- │    ├── fd: (1)-->(2,7,10)
+ │    ├── fd: (1)-->(2,10,11)
  │    ├── sort
- │    │    ├── columns: k:1!null i:2 y:7
+ │    │    ├── columns: k:1!null i:2 y:7 canary:10
  │    │    ├── fd: (1)-->(2)
  │    │    ├── ordering: +7
  │    │    └── left-join (cross)
- │    │         ├── columns: k:1!null i:2 y:7
+ │    │         ├── columns: k:1!null i:2 y:7 canary:10
  │    │         ├── fd: (1)-->(2)
  │    │         ├── scan a
  │    │         │    ├── columns: k:1!null i:2
  │    │         │    ├── key: (1)
  │    │         │    └── fd: (1)-->(2)
- │    │         ├── scan xy
- │    │         │    └── columns: y:7
+ │    │         ├── project
+ │    │         │    ├── columns: canary:10!null y:7
+ │    │         │    ├── fd: ()-->(10)
+ │    │         │    ├── scan xy
+ │    │         │    │    └── columns: y:7
+ │    │         │    └── projections
+ │    │         │         └── true [as=canary:10]
  │    │         └── filters
- │    │              └── (y:7 = k:1) OR NULL [outer=(1,7), constraints=(/1: (/NULL - ]; /7: (/NULL - ])]
+ │    │              └── (y:7 = k:1) OR (y:7 IS NULL) [outer=(1,7)]
  │    └── aggregations
- │         ├── array-agg [as=array_agg:10, outer=(7)]
+ │         ├── array-agg [as=array_agg:11, outer=(7)]
  │         │    └── y:7
  │         ├── const-agg [as=i:2, outer=(2)]
  │         │    └── i:2
- │         └── any-not-null-agg [as=y:7, outer=(7)]
- │              └── y:7
+ │         └── any-not-null-agg [as=canary:10, outer=(10)]
+ │              └── canary:10
  └── projections
-      └── COALESCE(CASE WHEN y:7 IS NOT NULL THEN array_agg:10 END, ARRAY[]) [as=array:9, outer=(7,10)]
+      └── COALESCE(CASE WHEN canary:10 IS NOT NULL THEN array_agg:11 END, ARRAY[]) [as=array:9, outer=(10,11)]
 
 # Nest scalar decorrelation within scalar decorrelation, using IS NULL to force
 # use of left joins.
@@ -2480,8 +2461,8 @@ project
       │    │    ├── fd: (1)-->(2,3,6)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: c:1!null d:2!null x:3 y:4
-      │    │    │    ├── key: (1,3)
-      │    │    │    ├── fd: (1)-->(2), (3)-->(4)
+      │    │    │    ├── key: (1)
+      │    │    │    ├── fd: (1)-->(2-4), (3)-->(4)
       │    │    │    ├── scan cd
       │    │    │    │    ├── columns: c:1!null d:2!null
       │    │    │    │    ├── key: (1)
@@ -2526,8 +2507,8 @@ project
       │    │    ├── fd: (1)-->(2-5,10,11)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6 column8:8 canary:10
-      │    │    │    ├── key: (1,6)
-      │    │    │    ├── fd: (1)-->(2-5), (6)-->(8), (1,6)-->(10)
+      │    │    │    ├── key: (1)
+      │    │    │    ├── fd: (1)-->(2-6,8,10), (6)-->(8)
       │    │    │    ├── scan a
       │    │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5
       │    │    │    │    ├── key: (1)
@@ -2578,8 +2559,8 @@ project
  │    ├── fd: (1)-->(12)
  │    ├── left-join (hash)
  │    │    ├── columns: a2.k:1!null a2.i:2 a.k:6 a.s:9 column11:11
- │    │    ├── key: (1,6)
- │    │    ├── fd: (1)-->(2), (6)-->(9), (1,6)-->(11)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (1)-->(2,6,9,11), (6)-->(9)
  │    │    ├── scan a2
  │    │    │    ├── columns: a2.k:1!null a2.i:2
  │    │    │    ├── key: (1)
@@ -2833,20 +2814,18 @@ SELECT (SELECT x FROM xy WHERE y=i LIMIT 1) FROM a
 project
  ├── columns: x:8
  ├── distinct-on
- │    ├── columns: xy.x:6 rownum:9!null
- │    ├── grouping columns: rownum:9!null
- │    ├── key: (9)
- │    ├── fd: (9)-->(6)
+ │    ├── columns: k:1!null xy.x:6
+ │    ├── grouping columns: k:1!null
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(6)
  │    ├── left-join (hash)
- │    │    ├── columns: i:2 xy.x:6 y:7 rownum:9!null
- │    │    ├── key: (6,9)
- │    │    ├── fd: (9)-->(2), (6)-->(7)
- │    │    ├── ordinality
- │    │    │    ├── columns: i:2 rownum:9!null
- │    │    │    ├── key: (9)
- │    │    │    ├── fd: (9)-->(2)
- │    │    │    └── scan a
- │    │    │         └── columns: i:2
+ │    │    ├── columns: k:1!null i:2 xy.x:6 y:7
+ │    │    ├── key: (1,6)
+ │    │    ├── fd: (1)-->(2), (6)-->(7)
+ │    │    ├── scan a
+ │    │    │    ├── columns: k:1!null i:2
+ │    │    │    ├── key: (1)
+ │    │    │    └── fd: (1)-->(2)
  │    │    ├── scan xy
  │    │    │    ├── columns: xy.x:6!null y:7
  │    │    │    ├── key: (6)
@@ -3110,6 +3089,303 @@ project
       │              └── k:3
       └── filters
            └── x:1 = k:3 [outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
+
+# --------------------------------------------------
+# TryDecorrelateMax1Row
+# --------------------------------------------------
+
+# Rule is activated on LeftJoinApply.
+norm format=show-miscprops expect=TryDecorrelateMax1Row
+SELECT (SELECT d FROM cd WHERE d=x) FROM xy
+----
+project
+ ├── columns: d:5
+ ├── ensure-distinct-on
+ │    ├── columns: x:1!null cd.d:4
+ │    ├── grouping columns: x:1!null
+ │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(4)
+ │    ├── left-join (hash)
+ │    │    ├── columns: x:1!null cd.d:4
+ │    │    ├── scan xy
+ │    │    │    ├── columns: x:1!null
+ │    │    │    └── key: (1)
+ │    │    ├── scan cd
+ │    │    │    └── columns: cd.d:4!null
+ │    │    └── filters
+ │    │         └── cd.d:4 = x:1 [outer=(1,4), constraints=(/1: (/NULL - ]; /4: (/NULL - ]), fd=(1)==(4), (4)==(1)]
+ │    └── aggregations
+ │         └── const-agg [as=cd.d:4, outer=(4)]
+ │              └── cd.d:4
+ └── projections
+      └── cd.d:4 [as=d:5, outer=(4)]
+
+# Rule is activated on LeftJoinApply.
+# Case without a primary key on left side of join.
+norm format=show-miscprops expect=TryDecorrelateMax1Row
+SELECT * FROM (SELECT y FROM xy) WHERE 5 = (SELECT d FROM cd WHERE d=y)
+----
+project
+ ├── columns: y:2
+ └── select
+      ├── columns: x:1!null y:2 d:4!null
+      ├── key: (1)
+      ├── fd: ()-->(4), (1)-->(2)
+      ├── ensure-distinct-on
+      │    ├── columns: x:1!null y:2 d:4
+      │    ├── grouping columns: x:1!null
+      │    ├── error: "more than one row returned by a subquery used as an expression"
+      │    ├── key: (1)
+      │    ├── fd: (1)-->(2,4)
+      │    ├── left-join (hash)
+      │    │    ├── columns: x:1!null y:2 d:4
+      │    │    ├── fd: (1)-->(2)
+      │    │    ├── scan xy
+      │    │    │    ├── columns: x:1!null y:2
+      │    │    │    ├── key: (1)
+      │    │    │    └── fd: (1)-->(2)
+      │    │    ├── scan cd
+      │    │    │    └── columns: d:4!null
+      │    │    └── filters
+      │    │         └── d:4 = y:2 [outer=(2,4), constraints=(/2: (/NULL - ]; /4: (/NULL - ]), fd=(2)==(4), (4)==(2)]
+      │    └── aggregations
+      │         ├── const-agg [as=y:2, outer=(2)]
+      │         │    └── y:2
+      │         └── const-agg [as=d:4, outer=(4)]
+      │              └── d:4
+      └── filters
+           └── d:4 = 5 [outer=(4), constraints=(/4: [/5 - /5]; tight), fd=()-->(4)]
+
+# Rule is activated on LeftJoinApply.
+# Case with multiple projected columns that will be translated to multiple
+# const-agg functions.
+norm format=show-miscprops expect=TryDecorrelateMax1Row
+SELECT (SELECT d FROM cd WHERE d=k), i, f, s, j FROM a
+----
+project
+ ├── columns: d:8 i:2 f:3 s:4 j:5
+ ├── ensure-distinct-on
+ │    ├── columns: k:1!null i:2 f:3 s:4 j:5 cd.d:7
+ │    ├── grouping columns: k:1!null
+ │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-5,7)
+ │    ├── left-join (hash)
+ │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 cd.d:7
+ │    │    ├── fd: (1)-->(2-5)
+ │    │    ├── scan a
+ │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5
+ │    │    │    ├── key: (1)
+ │    │    │    └── fd: (1)-->(2-5)
+ │    │    ├── scan cd
+ │    │    │    └── columns: cd.d:7!null
+ │    │    └── filters
+ │    │         └── cd.d:7 = k:1 [outer=(1,7), constraints=(/1: (/NULL - ]; /7: (/NULL - ]), fd=(1)==(7), (7)==(1)]
+ │    └── aggregations
+ │         ├── const-agg [as=i:2, outer=(2)]
+ │         │    └── i:2
+ │         ├── const-agg [as=f:3, outer=(3)]
+ │         │    └── f:3
+ │         ├── const-agg [as=s:4, outer=(4)]
+ │         │    └── s:4
+ │         ├── const-agg [as=j:5, outer=(5)]
+ │         │    └── j:5
+ │         └── const-agg [as=cd.d:7, outer=(7)]
+ │              └── cd.d:7
+ └── projections
+      └── cd.d:7 [as=d:8, outer=(7)]
+
+# Rule is activated on LeftJoin.
+# This test is a bit fragile because it depends on DecorrelateJoin activating
+# before TryDecorrelateMax1Row.
+# A LeftJoin is used because subquery cardinality might be zero.
+norm format=show-miscprops expect=TryDecorrelateMax1Row
+SELECT * FROM a LEFT JOIN LATERAL (SELECT * FROM uv WHERE (SELECT true FROM xy WHERE y=i)) ON true
+----
+project
+ ├── columns: k:1!null i:2 f:3 s:4 j:5 u:6 v:7
+ ├── key: (1,6)
+ ├── fd: (1)-->(2-5), (1,6)-->(7)
+ └── left-join-apply
+      ├── columns: k:1!null i:2 f:3 s:4 j:5 u:6 v:7 bool:10
+      ├── key: (1,6)
+      ├── fd: (1)-->(2-5), (1,6)-->(7,10)
+      ├── scan a
+      │    ├── columns: k:1!null i:2 f:3 s:4 j:5
+      │    ├── key: (1)
+      │    └── fd: (1)-->(2-5)
+      ├── ensure-distinct-on
+      │    ├── columns: u:6!null v:7 bool:10
+      │    ├── grouping columns: u:6!null
+      │    ├── error: "more than one row returned by a subquery used as an expression"
+      │    ├── outer: (2)
+      │    ├── key: (6)
+      │    ├── fd: (6)-->(7,10)
+      │    ├── left-join (cross)
+      │    │    ├── columns: u:6!null v:7 bool:10
+      │    │    ├── outer: (2)
+      │    │    ├── fd: (6)-->(7)
+      │    │    ├── scan uv
+      │    │    │    ├── columns: u:6!null v:7
+      │    │    │    ├── key: (6)
+      │    │    │    └── fd: (6)-->(7)
+      │    │    ├── project
+      │    │    │    ├── columns: bool:10!null
+      │    │    │    ├── outer: (2)
+      │    │    │    ├── fd: ()-->(10)
+      │    │    │    ├── select
+      │    │    │    │    ├── columns: y:9!null
+      │    │    │    │    ├── outer: (2)
+      │    │    │    │    ├── fd: ()-->(9)
+      │    │    │    │    ├── scan xy
+      │    │    │    │    │    └── columns: y:9
+      │    │    │    │    └── filters
+      │    │    │    │         └── y:9 = i:2 [outer=(2,9), constraints=(/2: (/NULL - ]; /9: (/NULL - ]), fd=(2)==(9), (9)==(2)]
+      │    │    │    └── projections
+      │    │    │         └── true [as=bool:10]
+      │    │    └── filters (true)
+      │    └── aggregations
+      │         ├── const-agg [as=v:7, outer=(7)]
+      │         │    └── v:7
+      │         └── const-agg [as=bool:10, outer=(10)]
+      │              └── bool:10
+      └── filters
+           └── bool:10 [outer=(10), constraints=(/10: [/true - /true]; tight), fd=()-->(10)]
+
+# Rule is activated on InnerJoinApply.
+# An InnerJoinApply is used because subquery cardinality is guaranteed to be
+# greater than zero.
+norm format=show-miscprops expect=TryDecorrelateMax1Row
+SELECT (SELECT t=x FROM (VALUES (1), (2)) f(t)) FROM xy
+----
+project
+ ├── columns: "?column?":5!null
+ ├── ensure-distinct-on
+ │    ├── columns: x:1!null "?column?":4!null
+ │    ├── grouping columns: x:1!null
+ │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(4)
+ │    ├── project
+ │    │    ├── columns: "?column?":4!null x:1!null
+ │    │    ├── inner-join (cross)
+ │    │    │    ├── columns: x:1!null column1:3!null
+ │    │    │    ├── scan xy
+ │    │    │    │    ├── columns: x:1!null
+ │    │    │    │    └── key: (1)
+ │    │    │    ├── values
+ │    │    │    │    ├── columns: column1:3!null
+ │    │    │    │    ├── cardinality: [2 - 2]
+ │    │    │    │    ├── (1,)
+ │    │    │    │    └── (2,)
+ │    │    │    └── filters (true)
+ │    │    └── projections
+ │    │         └── column1:3 = x:1 [as="?column?":4, outer=(1,3)]
+ │    └── aggregations
+ │         └── const-agg [as="?column?":4, outer=(4)]
+ │              └── "?column?":4
+ └── projections
+      └── "?column?":4 [as="?column?":5, outer=(4)]
+
+# Rule is activated on InnerJoin.
+# This test is a bit fragile because it depends on DecorrelateJoin activating
+# before TryDecorrelateMax1Row.
+norm format=show-miscprops expect=TryDecorrelateMax1Row
+SELECT * FROM a LEFT JOIN LATERAL (SELECT * FROM uv WHERE (SELECT y=i FROM (VALUES (1), (2)) v(y))) ON true
+----
+project
+ ├── columns: k:1!null i:2 f:3 s:4 j:5 u:6 v:7
+ ├── key: (1,6)
+ ├── fd: (1)-->(2-5), (1,6)-->(7)
+ └── left-join-apply
+      ├── columns: k:1!null i:2 f:3 s:4 j:5 u:6 v:7 "?column?":9
+      ├── key: (1,6)
+      ├── fd: (1)-->(2-5), (1,6)-->(7,9)
+      ├── scan a
+      │    ├── columns: k:1!null i:2 f:3 s:4 j:5
+      │    ├── key: (1)
+      │    └── fd: (1)-->(2-5)
+      ├── ensure-distinct-on
+      │    ├── columns: u:6!null v:7 "?column?":9
+      │    ├── grouping columns: u:6!null
+      │    ├── error: "more than one row returned by a subquery used as an expression"
+      │    ├── outer: (2)
+      │    ├── key: (6)
+      │    ├── fd: (6)-->(7,9)
+      │    ├── project
+      │    │    ├── columns: "?column?":9 u:6!null v:7
+      │    │    ├── outer: (2)
+      │    │    ├── fd: (6)-->(7)
+      │    │    ├── inner-join (cross)
+      │    │    │    ├── columns: u:6!null v:7 column1:8!null
+      │    │    │    ├── fd: (6)-->(7)
+      │    │    │    ├── scan uv
+      │    │    │    │    ├── columns: u:6!null v:7
+      │    │    │    │    ├── key: (6)
+      │    │    │    │    └── fd: (6)-->(7)
+      │    │    │    ├── values
+      │    │    │    │    ├── columns: column1:8!null
+      │    │    │    │    ├── cardinality: [2 - 2]
+      │    │    │    │    ├── (1,)
+      │    │    │    │    └── (2,)
+      │    │    │    └── filters (true)
+      │    │    └── projections
+      │    │         └── column1:8 = i:2 [as="?column?":9, outer=(2,8)]
+      │    └── aggregations
+      │         ├── const-agg [as=v:7, outer=(7)]
+      │         │    └── v:7
+      │         └── const-agg [as="?column?":9, outer=(9)]
+      │              └── "?column?":9
+      └── filters
+           └── "?column?":9 [outer=(9), constraints=(/9: [/true - /true]; tight), fd=()-->(9)]
+
+# Filter (y=3) must not be pushed through EnsureDistinctOn in order to ensure
+# expected error behavior.
+norm format=show-miscprops expect=TryDecorrelateMax1Row
+SELECT a FROM (VALUES (0), (0)) v(a) WHERE (SELECT y FROM xy WHERE x<>a)=3
+----
+project
+ ├── columns: a:1!null
+ └── select
+      ├── columns: column1:1!null y:3!null rownum:4!null
+      ├── key: (4)
+      ├── fd: ()-->(3), (4)-->(1)
+      ├── ensure-distinct-on
+      │    ├── columns: column1:1!null y:3 rownum:4!null
+      │    ├── grouping columns: rownum:4!null
+      │    ├── error: "more than one row returned by a subquery used as an expression"
+      │    ├── cardinality: [1 - ]
+      │    ├── key: (4)
+      │    ├── fd: (4)-->(1,3)
+      │    ├── left-join (cross)
+      │    │    ├── columns: column1:1!null x:2 y:3 rownum:4!null
+      │    │    ├── cardinality: [2 - ]
+      │    │    ├── key: (2,4)
+      │    │    ├── fd: (4)-->(1), (2)-->(3)
+      │    │    ├── ordinality
+      │    │    │    ├── columns: column1:1!null rownum:4!null
+      │    │    │    ├── cardinality: [2 - 2]
+      │    │    │    ├── key: (4)
+      │    │    │    ├── fd: (4)-->(1)
+      │    │    │    └── values
+      │    │    │         ├── columns: column1:1!null
+      │    │    │         ├── cardinality: [2 - 2]
+      │    │    │         ├── (0,)
+      │    │    │         └── (0,)
+      │    │    ├── scan xy
+      │    │    │    ├── columns: x:2!null y:3
+      │    │    │    ├── key: (2)
+      │    │    │    └── fd: (2)-->(3)
+      │    │    └── filters
+      │    │         └── x:2 != column1:1 [outer=(1,2), constraints=(/1: (/NULL - ]; /2: (/NULL - ])]
+      │    └── aggregations
+      │         ├── const-agg [as=column1:1, outer=(1)]
+      │         │    └── column1:1
+      │         └── const-agg [as=y:3, outer=(3)]
+      │              └── y:3
+      └── filters
+           └── y:3 = 3 [outer=(3), constraints=(/3: [/3 - /3]; tight), fd=()-->(3)]
 
 # --------------------------------------------------
 # HoistSelectExists
@@ -3576,8 +3852,8 @@ project
       │    ├── fd: (1)-->(2-5,8)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 u:6
-      │    │    ├── key: (1,6)
-      │    │    ├── fd: (1)-->(2-5)
+      │    │    ├── key: (1)
+      │    │    ├── fd: (1)-->(2-6)
       │    │    ├── scan a
       │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5
       │    │    │    ├── key: (1)
@@ -3671,8 +3947,8 @@ project
       │    │    ├── fd: (1)-->(2-5,9)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:6 y:7 notnull:8
-      │    │    │    ├── key: (1,6)
-      │    │    │    ├── fd: (1)-->(2-5), (6)-->(7), (7)~~>(8), (1,6)-->(8)
+      │    │    │    ├── key: (1)
+      │    │    │    ├── fd: (1)-->(2-8), (6)-->(7), (7)~~>(8)
       │    │    │    ├── scan a
       │    │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5
       │    │    │    │    ├── key: (1)
@@ -3732,21 +4008,17 @@ SELECT i*i/100 < ALL(SELECT y FROM xy WHERE x=k) AS r, s FROM a
 ----
 project
  ├── columns: r:8 s:4
- ├── side-effects
  ├── group-by
  │    ├── columns: k:1!null s:4 scalar:9 bool_or:11
  │    ├── grouping columns: k:1!null
- │    ├── side-effects
  │    ├── key: (1)
  │    ├── fd: (1)-->(4,9,11)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null s:4 x:6 y:7 scalar:9 notnull:10
- │    │    ├── side-effects
- │    │    ├── key: (1,6)
- │    │    ├── fd: (1)-->(4,9), (6)-->(7), (7)~~>(10), (1,6)-->(10)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (1)-->(4,6,7,9,10), (6)-->(7), (7)~~>(10)
  │    │    ├── project
  │    │    │    ├── columns: scalar:9 k:1!null s:4
- │    │    │    ├── side-effects
  │    │    │    ├── key: (1)
  │    │    │    ├── fd: (1)-->(4,9)
  │    │    │    ├── scan a
@@ -3754,7 +4026,7 @@ project
  │    │    │    │    ├── key: (1)
  │    │    │    │    └── fd: (1)-->(2,4)
  │    │    │    └── projections
- │    │    │         └── (i:2 * i:2) / 100 [as=scalar:9, outer=(2), side-effects]
+ │    │    │         └── (i:2 * i:2) / 100 [as=scalar:9, outer=(2)]
  │    │    ├── project
  │    │    │    ├── columns: notnull:10!null x:6!null y:7
  │    │    │    ├── key: (6)
@@ -3798,8 +4070,8 @@ project
       │    ├── fd: (1)-->(2-5,11)
       │    ├── left-join (hash)
       │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5 x:8 true:10
-      │    │    ├── key: (1,8)
-      │    │    ├── fd: (1)-->(2-5), (1,8)-->(10)
+      │    │    ├── key: (1)
+      │    │    ├── fd: (1)-->(2-5,8,10)
       │    │    ├── scan a
       │    │    │    ├── columns: k:1!null i:2 f:3 s:4 j:5
       │    │    │    ├── key: (1)
@@ -3852,7 +4124,8 @@ project
  ├── columns: x:8
  ├── left-join (hash)
  │    ├── columns: k:1!null xy.x:6
- │    ├── key: (1,6)
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(6)
  │    ├── scan a
  │    │    ├── columns: k:1!null
  │    │    └── key: (1)
@@ -3880,14 +4153,16 @@ project
  ├── fd: ()-->(17,19-21)
  ├── group-by
  │    ├── columns: k:1!null xy.x:6 count_rows:16!null
- │    ├── grouping columns: k:1!null xy.x:6
- │    ├── key: (1,6)
- │    ├── fd: (1,6)-->(16)
+ │    ├── grouping columns: k:1!null
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(6,16)
  │    ├── left-join (hash)
  │    │    ├── columns: k:1!null xy.x:6 xy.y:15
+ │    │    ├── fd: (1)-->(6)
  │    │    ├── left-join (hash)
  │    │    │    ├── columns: k:1!null xy.x:6
- │    │    │    ├── key: (1,6)
+ │    │    │    ├── key: (1)
+ │    │    │    ├── fd: (1)-->(6)
  │    │    │    ├── scan a
  │    │    │    │    ├── columns: k:1!null
  │    │    │    │    └── key: (1)
@@ -3901,8 +4176,10 @@ project
  │    │    └── filters
  │    │         └── xy.y:15 = k:1 [outer=(1,15), constraints=(/1: (/NULL - ]; /15: (/NULL - ]), fd=(1)==(15), (15)==(1)]
  │    └── aggregations
- │         └── count [as=count_rows:16, outer=(15)]
- │              └── xy.y:15
+ │         ├── count [as=count_rows:16, outer=(15)]
+ │         │    └── xy.y:15
+ │         └── const-agg [as=xy.x:6, outer=(6)]
+ │              └── xy.x:6
  └── projections
       ├── 5 [as=a:17]
       ├── xy.x:6 [as=x:18, outer=(6)]
@@ -3945,26 +4222,26 @@ scalar-group-by
  ├── fd: ()-->(9)
  ├── project
  │    ├── columns: column8:8
- │    ├── left-join-apply
- │    │    ├── columns: i:2 y:7
- │    │    ├── scan a
- │    │    │    └── columns: i:2
- │    │    ├── max1-row
- │    │    │    ├── columns: y:7!null
- │    │    │    ├── error: "more than one row returned by a subquery used as an expression"
- │    │    │    ├── outer: (2)
- │    │    │    ├── cardinality: [0 - 1]
- │    │    │    ├── key: ()
- │    │    │    ├── fd: ()-->(7)
- │    │    │    └── select
- │    │    │         ├── columns: y:7!null
- │    │    │         ├── outer: (2)
- │    │    │         ├── fd: ()-->(7)
- │    │    │         ├── scan xy
- │    │    │         │    └── columns: y:7
- │    │    │         └── filters
- │    │    │              └── y:7 = i:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
- │    │    └── filters (true)
+ │    ├── ensure-distinct-on
+ │    │    ├── columns: k:1!null y:7
+ │    │    ├── grouping columns: k:1!null
+ │    │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    │    ├── key: (1)
+ │    │    ├── fd: (1)-->(7)
+ │    │    ├── left-join (hash)
+ │    │    │    ├── columns: k:1!null i:2 y:7
+ │    │    │    ├── fd: (1)-->(2)
+ │    │    │    ├── scan a
+ │    │    │    │    ├── columns: k:1!null i:2
+ │    │    │    │    ├── key: (1)
+ │    │    │    │    └── fd: (1)-->(2)
+ │    │    │    ├── scan xy
+ │    │    │    │    └── columns: y:7
+ │    │    │    └── filters
+ │    │    │         └── y:7 = i:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
+ │    │    └── aggregations
+ │    │         └── const-agg [as=y:7, outer=(7)]
+ │    │              └── y:7
  │    └── projections
  │         └── y:7 [as=column8:8, outer=(7)]
  └── aggregations
@@ -3978,19 +4255,17 @@ SELECT EXISTS(SELECT * FROM xy WHERE y=i) FROM a
 project
  ├── columns: exists:8!null
  ├── group-by
- │    ├── columns: true_agg:10 rownum:12!null
- │    ├── grouping columns: rownum:12!null
- │    ├── key: (12)
- │    ├── fd: (12)-->(10)
+ │    ├── columns: k:1!null true_agg:10
+ │    ├── grouping columns: k:1!null
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(10)
  │    ├── left-join (hash)
- │    │    ├── columns: i:2 y:7 true:9 rownum:12!null
- │    │    ├── fd: (12)-->(2)
- │    │    ├── ordinality
- │    │    │    ├── columns: i:2 rownum:12!null
- │    │    │    ├── key: (12)
- │    │    │    ├── fd: (12)-->(2)
- │    │    │    └── scan a
- │    │    │         └── columns: i:2
+ │    │    ├── columns: k:1!null i:2 y:7 true:9
+ │    │    ├── fd: (1)-->(2)
+ │    │    ├── scan a
+ │    │    │    ├── columns: k:1!null i:2
+ │    │    │    ├── key: (1)
+ │    │    │    └── fd: (1)-->(2)
  │    │    ├── project
  │    │    │    ├── columns: true:9!null y:7
  │    │    │    ├── fd: ()-->(9)
@@ -4013,19 +4288,17 @@ SELECT 5 < ANY(SELECT y FROM xy WHERE y=i) AS r FROM a
 project
  ├── columns: r:8
  ├── group-by
- │    ├── columns: bool_or:10 rownum:12!null
- │    ├── grouping columns: rownum:12!null
- │    ├── key: (12)
- │    ├── fd: (12)-->(10)
+ │    ├── columns: k:1!null bool_or:10
+ │    ├── grouping columns: k:1!null
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(10)
  │    ├── left-join (hash)
- │    │    ├── columns: i:2 y:7 notnull:9 rownum:12!null
- │    │    ├── fd: (12)-->(2), (7)~~>(9)
- │    │    ├── ordinality
- │    │    │    ├── columns: i:2 rownum:12!null
- │    │    │    ├── key: (12)
- │    │    │    ├── fd: (12)-->(2)
- │    │    │    └── scan a
- │    │    │         └── columns: i:2
+ │    │    ├── columns: k:1!null i:2 y:7 notnull:9
+ │    │    ├── fd: (1)-->(2), (7)~~>(9)
+ │    │    ├── scan a
+ │    │    │    ├── columns: k:1!null i:2
+ │    │    │    ├── key: (1)
+ │    │    │    └── fd: (1)-->(2)
  │    │    ├── project
  │    │    │    ├── columns: notnull:9!null y:7
  │    │    │    ├── fd: (7)-->(9)
@@ -4050,35 +4323,32 @@ norm expect=HoistProjectSubquery
 SELECT EXISTS(SELECT EXISTS(SELECT * FROM xy WHERE y=i) FROM a)
 ----
 values
- ├── columns: exists:13
+ ├── columns: exists:12
  ├── cardinality: [1 - 1]
  ├── key: ()
- ├── fd: ()-->(13)
+ ├── fd: ()-->(12)
  └── tuple
       └── exists
            └── limit
-                ├── columns: i:2 y:7 true:9 rownum:12!null
+                ├── columns: k:1!null i:2 y:7 true:9
                 ├── cardinality: [0 - 1]
                 ├── key: ()
-                ├── fd: ()-->(2,7,9,12)
+                ├── fd: ()-->(1,2,7,9)
                 ├── left-join (hash)
-                │    ├── columns: i:2 y:7 true:9 rownum:12!null
-                │    ├── fd: ()-->(2,12)
+                │    ├── columns: k:1!null i:2 y:7 true:9
+                │    ├── fd: ()-->(1,2)
                 │    ├── limit hint: 1.00
-                │    ├── ordinality
-                │    │    ├── columns: i:2 rownum:12!null
+                │    ├── limit
+                │    │    ├── columns: k:1!null i:2
                 │    │    ├── cardinality: [0 - 1]
                 │    │    ├── key: ()
-                │    │    ├── fd: ()-->(2,12)
-                │    │    └── limit
-                │    │         ├── columns: i:2
-                │    │         ├── cardinality: [0 - 1]
-                │    │         ├── key: ()
-                │    │         ├── fd: ()-->(2)
-                │    │         ├── scan a
-                │    │         │    ├── columns: i:2
-                │    │         │    └── limit hint: 1.00
-                │    │         └── 1
+                │    │    ├── fd: ()-->(1,2)
+                │    │    ├── scan a
+                │    │    │    ├── columns: k:1!null i:2
+                │    │    │    ├── key: (1)
+                │    │    │    ├── fd: (1)-->(2)
+                │    │    │    └── limit hint: 1.00
+                │    │    └── 1
                 │    ├── project
                 │    │    ├── columns: true:9!null y:7
                 │    │    ├── fd: ()-->(9)
@@ -4165,8 +4435,8 @@ project
       │    │    ├── fd: (6)-->(11)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: x:6!null y:7 u:8 true:10
-      │    │    │    ├── key: (6,8)
-      │    │    │    ├── fd: (6)-->(7), (6,8)-->(10)
+      │    │    │    ├── key: (6)
+      │    │    │    ├── fd: (6)-->(7,8,10)
       │    │    │    ├── scan xy
       │    │    │    │    ├── columns: x:6!null y:7
       │    │    │    │    ├── key: (6)
@@ -4209,8 +4479,8 @@ project
       │    │    ├── fd: (1)-->(5), (6)-->(7), (1,6)-->(5,7,11)
       │    │    ├── left-join (hash)
       │    │    │    ├── columns: k:1!null i:2 j:5 x:6!null y:7 u:8 v:9 notnull:10
-      │    │    │    ├── key: (1,6,8)
-      │    │    │    ├── fd: (1)-->(2,5), (6)-->(7), (8)-->(9), (9)~~>(10), (1,6,8)-->(10)
+      │    │    │    ├── key: (1,6)
+      │    │    │    ├── fd: (1)-->(2,5), (6)-->(7), (8)-->(9), (9)~~>(10), (1,6)-->(8-10)
       │    │    │    ├── inner-join (cross)
       │    │    │    │    ├── columns: k:1!null i:2 j:5 x:6!null y:7
       │    │    │    │    ├── key: (1,6)
@@ -4259,60 +4529,57 @@ SELECT (VALUES ((SELECT i+1 AS r)), (10), ((SELECT k+1 AS s))) FROM a
 ----
 project
  ├── columns: column1:9
- ├── inner-join-apply
- │    ├── columns: k:1!null i:2 column1:8
+ ├── ensure-distinct-on
+ │    ├── columns: k:1!null column1:8
+ │    ├── grouping columns: k:1!null
+ │    ├── error: "more than one row returned by a subquery used as an expression"
  │    ├── key: (1)
- │    ├── fd: (1)-->(2,8)
- │    ├── scan a
- │    │    ├── columns: k:1!null i:2
- │    │    ├── key: (1)
- │    │    └── fd: (1)-->(2)
- │    ├── max1-row
- │    │    ├── columns: column1:8
- │    │    ├── error: "more than one row returned by a subquery used as an expression"
- │    │    ├── outer: (1,2)
- │    │    ├── cardinality: [1 - 1]
- │    │    ├── key: ()
- │    │    ├── fd: ()-->(8)
- │    │    └── project
- │    │         ├── columns: column1:8
- │    │         ├── outer: (1,2)
- │    │         ├── cardinality: [3 - 3]
- │    │         └── inner-join-apply
- │    │              ├── columns: r:6 s:7 column1:8
- │    │              ├── outer: (1,2)
- │    │              ├── cardinality: [3 - 3]
- │    │              ├── fd: ()-->(6,7)
- │    │              ├── inner-join (cross)
- │    │              │    ├── columns: r:6 s:7
- │    │              │    ├── outer: (1,2)
- │    │              │    ├── cardinality: [1 - 1]
- │    │              │    ├── key: ()
- │    │              │    ├── fd: ()-->(6,7)
- │    │              │    ├── values
- │    │              │    │    ├── columns: r:6
- │    │              │    │    ├── outer: (2)
- │    │              │    │    ├── cardinality: [1 - 1]
- │    │              │    │    ├── key: ()
- │    │              │    │    ├── fd: ()-->(6)
- │    │              │    │    └── (i:2 + 1,)
- │    │              │    ├── values
- │    │              │    │    ├── columns: s:7
- │    │              │    │    ├── outer: (1)
- │    │              │    │    ├── cardinality: [1 - 1]
- │    │              │    │    ├── key: ()
- │    │              │    │    ├── fd: ()-->(7)
- │    │              │    │    └── (k:1 + 1,)
- │    │              │    └── filters (true)
- │    │              ├── values
- │    │              │    ├── columns: column1:8
- │    │              │    ├── outer: (6,7)
- │    │              │    ├── cardinality: [3 - 3]
- │    │              │    ├── (r:6,)
- │    │              │    ├── (10,)
- │    │              │    └── (s:7,)
- │    │              └── filters (true)
- │    └── filters (true)
+ │    ├── fd: (1)-->(8)
+ │    ├── inner-join-apply
+ │    │    ├── columns: k:1!null i:2 r:6 s:7 column1:8
+ │    │    ├── fd: (1)-->(2)
+ │    │    ├── scan a
+ │    │    │    ├── columns: k:1!null i:2
+ │    │    │    ├── key: (1)
+ │    │    │    └── fd: (1)-->(2)
+ │    │    ├── inner-join-apply
+ │    │    │    ├── columns: r:6 s:7 column1:8
+ │    │    │    ├── outer: (1,2)
+ │    │    │    ├── cardinality: [3 - 3]
+ │    │    │    ├── fd: ()-->(6,7)
+ │    │    │    ├── inner-join (cross)
+ │    │    │    │    ├── columns: r:6 s:7
+ │    │    │    │    ├── outer: (1,2)
+ │    │    │    │    ├── cardinality: [1 - 1]
+ │    │    │    │    ├── key: ()
+ │    │    │    │    ├── fd: ()-->(6,7)
+ │    │    │    │    ├── values
+ │    │    │    │    │    ├── columns: r:6
+ │    │    │    │    │    ├── outer: (2)
+ │    │    │    │    │    ├── cardinality: [1 - 1]
+ │    │    │    │    │    ├── key: ()
+ │    │    │    │    │    ├── fd: ()-->(6)
+ │    │    │    │    │    └── (i:2 + 1,)
+ │    │    │    │    ├── values
+ │    │    │    │    │    ├── columns: s:7
+ │    │    │    │    │    ├── outer: (1)
+ │    │    │    │    │    ├── cardinality: [1 - 1]
+ │    │    │    │    │    ├── key: ()
+ │    │    │    │    │    ├── fd: ()-->(7)
+ │    │    │    │    │    └── (k:1 + 1,)
+ │    │    │    │    └── filters (true)
+ │    │    │    ├── values
+ │    │    │    │    ├── columns: column1:8
+ │    │    │    │    ├── outer: (6,7)
+ │    │    │    │    ├── cardinality: [3 - 3]
+ │    │    │    │    ├── (r:6,)
+ │    │    │    │    ├── (10,)
+ │    │    │    │    └── (s:7,)
+ │    │    │    └── filters (true)
+ │    │    └── filters (true)
+ │    └── aggregations
+ │         └── const-agg [as=column1:8, outer=(8)]
+ │              └── column1:8
  └── projections
       └── column1:8 [as=column1:9, outer=(8)]
 
@@ -4490,8 +4757,8 @@ project
       │    ├── columns: v:4
       │    └── left-join (hash)
       │         ├── columns: x:1!null u:3 v:4
-      │         ├── key: (1,3)
-      │         ├── fd: (3)-->(4)
+      │         ├── key: (1)
+      │         ├── fd: (3)-->(4), (1)-->(3,4)
       │         ├── scan xy
       │         │    ├── columns: x:1!null
       │         │    └── key: (1)
@@ -4517,14 +4784,15 @@ group-by
  ├── project-set
  │    ├── columns: x:1!null y:2 v:4 generate_series:5
  │    ├── side-effects
- │    ├── fd: (1)-->(2)
+ │    ├── fd: (1)-->(2,4)
  │    ├── project
  │    │    ├── columns: x:1!null y:2 v:4
- │    │    ├── fd: (1)-->(2)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (1)-->(2,4)
  │    │    └── left-join (hash)
  │    │         ├── columns: x:1!null y:2 u:3 v:4
- │    │         ├── key: (1,3)
- │    │         ├── fd: (1)-->(2), (3)-->(4)
+ │    │         ├── key: (1)
+ │    │         ├── fd: (1)-->(2-4), (3)-->(4)
  │    │         ├── scan xy
  │    │         │    ├── columns: x:1!null y:2
  │    │         │    ├── key: (1)
@@ -4555,12 +4823,12 @@ project
       │    ├── columns: y:7 v:9
       │    └── left-join (hash)
       │         ├── columns: k:1!null x:6 y:7 u:8 v:9
-      │         ├── key: (1,6,8)
-      │         ├── fd: (6)-->(7), (8)-->(9)
+      │         ├── key: (1)
+      │         ├── fd: (6)-->(7), (1)-->(6-9), (8)-->(9)
       │         ├── left-join (hash)
       │         │    ├── columns: k:1!null x:6 y:7
-      │         │    ├── key: (1,6)
-      │         │    ├── fd: (6)-->(7)
+      │         │    ├── key: (1)
+      │         │    ├── fd: (6)-->(7), (1)-->(6,7)
       │         │    ├── scan a
       │         │    │    ├── columns: k:1!null
       │         │    │    └── key: (1)
@@ -4596,12 +4864,12 @@ project
  │    │    ├── columns: v:7 xy.x:9
  │    │    └── left-join (hash)
  │    │         ├── columns: k:1!null u:6 v:7 xy.x:9
- │    │         ├── key: (1,6,9)
- │    │         ├── fd: (6)-->(7)
+ │    │         ├── key: (1)
+ │    │         ├── fd: (6)-->(7), (1)-->(6,7,9)
  │    │         ├── left-join (hash)
  │    │         │    ├── columns: k:1!null u:6 v:7
- │    │         │    ├── key: (1,6)
- │    │         │    ├── fd: (6)-->(7)
+ │    │         │    ├── key: (1)
+ │    │         │    ├── fd: (6)-->(7), (1)-->(6,7)
  │    │         │    ├── scan a
  │    │         │    │    ├── columns: k:1!null
  │    │         │    │    └── key: (1)
@@ -5188,3 +5456,108 @@ semi-join (hash)
  │    └── columns: xy.y:7
  └── filters
       └── i:2 = xy.y:7 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
+
+# --------------------------------------------------
+# EnsureKey
+# --------------------------------------------------
+
+# Check that when the EnsureKey function is called on a Scan that has pruned its
+# key away, it creates a new Scan with the primary key added back rather than
+# introducing an ordinality operator.
+#
+# In this test case, the key column of a is pruned away from the Scan, but when
+# TryDecorrelateLimitOne calls EnsureKey on the Scan, the key is added back.
+norm
+SELECT (SELECT x FROM xy WHERE y=i LIMIT 1) FROM a
+----
+project
+ ├── columns: x:8
+ ├── distinct-on
+ │    ├── columns: k:1!null xy.x:6
+ │    ├── grouping columns: k:1!null
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(6)
+ │    ├── left-join (hash)
+ │    │    ├── columns: k:1!null i:2 xy.x:6 y:7
+ │    │    ├── key: (1,6)
+ │    │    ├── fd: (1)-->(2), (6)-->(7)
+ │    │    ├── scan a
+ │    │    │    ├── columns: k:1!null i:2
+ │    │    │    ├── key: (1)
+ │    │    │    └── fd: (1)-->(2)
+ │    │    ├── scan xy
+ │    │    │    ├── columns: xy.x:6!null y:7
+ │    │    │    ├── key: (6)
+ │    │    │    └── fd: (6)-->(7)
+ │    │    └── filters
+ │    │         └── y:7 = i:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
+ │    └── aggregations
+ │         └── first-agg [as=xy.x:6, outer=(6)]
+ │              └── xy.x:6
+ └── projections
+      └── xy.x:6 [as=x:8, outer=(6)]
+
+# Case where EnsureKey retrieves an implicit key to add to the Scan.
+norm
+SELECT (SELECT x FROM xy WHERE y=b LIMIT 1) FROM ab
+----
+project
+ ├── columns: x:6
+ ├── distinct-on
+ │    ├── columns: rowid:3!null xy.x:4
+ │    ├── grouping columns: rowid:3!null
+ │    ├── key: (3)
+ │    ├── fd: (3)-->(4)
+ │    ├── left-join (hash)
+ │    │    ├── columns: b:2 rowid:3!null xy.x:4 y:5
+ │    │    ├── key: (3,4)
+ │    │    ├── fd: (3)-->(2), (4)-->(5)
+ │    │    ├── scan ab
+ │    │    │    ├── columns: b:2 rowid:3!null
+ │    │    │    ├── key: (3)
+ │    │    │    └── fd: (3)-->(2)
+ │    │    ├── scan xy
+ │    │    │    ├── columns: xy.x:4!null y:5
+ │    │    │    ├── key: (4)
+ │    │    │    └── fd: (4)-->(5)
+ │    │    └── filters
+ │    │         └── y:5 = b:2 [outer=(2,5), constraints=(/2: (/NULL - ]; /5: (/NULL - ]), fd=(2)==(5), (5)==(2)]
+ │    └── aggregations
+ │         └── first-agg [as=xy.x:4, outer=(4)]
+ │              └── xy.x:4
+ └── projections
+      └── xy.x:4 [as=x:6, outer=(4)]
+
+# EnsureKey should construct an Ordinality operator when it is called on a Scan
+# over a virtual table.
+norm
+SELECT (SELECT x FROM xy WHERE y=version LIMIT 1) FROM information_schema.tables
+----
+project
+ ├── columns: x:10
+ ├── distinct-on
+ │    ├── columns: xy.x:8 rownum:11!null
+ │    ├── grouping columns: rownum:11!null
+ │    ├── key: (11)
+ │    ├── fd: (11)-->(8)
+ │    ├── left-join (hash)
+ │    │    ├── columns: version:7 xy.x:8 y:9 rownum:11!null
+ │    │    ├── key: (8,11)
+ │    │    ├── fd: (11)-->(7), (8)-->(9)
+ │    │    ├── ordinality
+ │    │    │    ├── columns: version:7 rownum:11!null
+ │    │    │    ├── key: (11)
+ │    │    │    ├── fd: (11)-->(7)
+ │    │    │    └── scan information_schema.tables
+ │    │    │         └── columns: version:7
+ │    │    ├── scan xy
+ │    │    │    ├── columns: xy.x:8!null y:9
+ │    │    │    ├── key: (8)
+ │    │    │    └── fd: (8)-->(9)
+ │    │    └── filters
+ │    │         └── y:9 = version:7 [outer=(7,9), constraints=(/7: (/NULL - ]; /9: (/NULL - ]), fd=(7)==(9), (9)==(7)]
+ │    └── aggregations
+ │         └── first-agg [as=xy.x:8, outer=(8)]
+ │              └── xy.x:8
+ └── projections
+      └── xy.x:8 [as=x:10, outer=(8)]

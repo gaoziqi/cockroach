@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -22,6 +23,7 @@ import (
 type simpleProjectOp struct {
 	OneInputNode
 	NonExplainable
+	closerHelper
 
 	projection []uint32
 	batches    map[coldata.Batch]*projectingBatch
@@ -46,9 +48,12 @@ type projectingBatch struct {
 }
 
 func newProjectionBatch(projection []uint32) *projectingBatch {
-	return &projectingBatch{
-		projection: projection,
+	p := &projectingBatch{
+		projection: make([]uint32, len(projection)),
 	}
+	// We make a copy of projection to be safe.
+	copy(p.projection, projection)
+	return p
 }
 
 func (b *projectingBatch) ColVec(i int) coldata.Vec {
@@ -59,7 +64,7 @@ func (b *projectingBatch) ColVecs() []coldata.Vec {
 	if b.Batch == coldata.ZeroBatch {
 		return nil
 	}
-	if b.colVecs == nil {
+	if b.colVecs == nil || len(b.colVecs) != len(b.projection) {
 		b.colVecs = make([]coldata.Vec, len(b.projection))
 	}
 	for i := range b.colVecs {
@@ -77,12 +82,18 @@ func (b *projectingBatch) AppendCol(col coldata.Vec) {
 	b.projection = append(b.projection, uint32(b.Batch.Width())-1)
 }
 
+func (b *projectingBatch) ReplaceCol(col coldata.Vec, idx int) {
+	b.Batch.ReplaceCol(col, int(b.projection[idx]))
+}
+
 // NewSimpleProjectOp returns a new simpleProjectOp that applies a simple
 // projection on the columns in its input batch, returning a new batch with
 // only the columns in the projection slice, in order. In a degenerate case
 // when input already outputs batches that satisfy the projection, a
 // simpleProjectOp is not planned and input is returned.
-func NewSimpleProjectOp(input Operator, numInputCols int, projection []uint32) Operator {
+func NewSimpleProjectOp(
+	input colexecbase.Operator, numInputCols int, projection []uint32,
+) colexecbase.Operator {
 	if numInputCols == len(projection) {
 		projectionIsRedundant := true
 		for i := range projection {
@@ -94,12 +105,15 @@ func NewSimpleProjectOp(input Operator, numInputCols int, projection []uint32) O
 			return input
 		}
 	}
-	return &simpleProjectOp{
+	s := &simpleProjectOp{
 		OneInputNode:               NewOneInputNode(input),
-		projection:                 projection,
+		projection:                 make([]uint32, len(projection)),
 		batches:                    make(map[coldata.Batch]*projectingBatch),
 		numBatchesLoggingThreshold: 128,
 	}
+	// We make a copy of projection to be safe.
+	copy(s.projection, projection)
+	return s
 }
 
 func (d *simpleProjectOp) Init() {
@@ -110,8 +124,7 @@ func (d *simpleProjectOp) Next(ctx context.Context) coldata.Batch {
 	batch := d.input.Next(ctx)
 	projBatch, found := d.batches[batch]
 	if !found {
-		// We pass in a copy of d.projection just to be safe.
-		projBatch = newProjectionBatch(append([]uint32{}, d.projection...))
+		projBatch = newProjectionBatch(d.projection)
 		d.batches[batch] = projBatch
 		if len(d.batches) == d.numBatchesLoggingThreshold {
 			if log.V(1) {
@@ -124,9 +137,17 @@ func (d *simpleProjectOp) Next(ctx context.Context) coldata.Batch {
 	return projBatch
 }
 
-func (d *simpleProjectOp) Close(ctx context.Context) error {
-	if c, ok := d.input.(closer); ok {
-		return c.Close(ctx)
+// Close closes the simpleProjectOp's input.
+// TODO(asubiotto): Remove this method. It only exists so that we can call Close
+//  from some runTests subtests when not draining the input fully. The test
+//  should pass in the testing.T object used so that the caller can decide to
+//  explicitly close the input after checking the test.
+func (d *simpleProjectOp) IdempotentClose(ctx context.Context) error {
+	if !d.close() {
+		return nil
+	}
+	if c, ok := d.input.(IdempotentCloser); ok {
+		return c.IdempotentClose(ctx)
 	}
 	return nil
 }

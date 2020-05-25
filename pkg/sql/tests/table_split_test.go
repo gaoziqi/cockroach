@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func TestSplitAtTableBoundary(t *testing.T) {
@@ -31,7 +31,7 @@ func TestSplitAtTableBoundary(t *testing.T) {
 		ReplicationMode: base.ReplicationAuto,
 	}
 	tc := testcluster.StartTestCluster(t, 3, testClusterArgs)
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	runner := sqlutils.MakeSQLRunner(tc.Conns[0])
 	runner.Exec(t, `CREATE DATABASE test`)
@@ -44,7 +44,7 @@ SELECT tables.id FROM system.namespace tables
 `
 	var tableID uint32
 	runner.QueryRow(t, tableIDQuery, "test", "t").Scan(&tableID)
-	tableStartKey := keys.MakeTablePrefix(tableID)
+	tableStartKey := keys.SystemSQLCodec.TablePrefix(tableID)
 
 	// Wait for new table to split.
 	testutils.SucceedsSoon(t, func() error {
@@ -53,7 +53,7 @@ SELECT tables.id FROM system.namespace tables
 			t.Fatal(err)
 		}
 		if !desc.StartKey.Equal(tableStartKey) {
-			log.Infof(context.TODO(), "waiting on split results")
+			log.Infof(context.Background(), "waiting on split results")
 			return errors.Errorf("expected range start key %s; got %s", tableStartKey, desc.StartKey)
 		}
 		return nil

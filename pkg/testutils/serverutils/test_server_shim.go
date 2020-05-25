@@ -44,6 +44,9 @@ type TestServerInterface interface {
 
 	Start(params base.TestServerArgs) error
 
+	// Node returns the server.Node as an interface{}.
+	Node() interface{}
+
 	// NodeID returns the ID of this node within its cluster.
 	NodeID() roachpb.NodeID
 
@@ -100,6 +103,9 @@ type TestServerInterface interface {
 
 	// JobRegistry returns the *jobs.Registry as an interface{}.
 	JobRegistry() interface{}
+
+	// MigrationManager returns the *jobs.Registry as an interface{}.
+	MigrationManager() interface{}
 
 	// SetDistSQLSpanResolver changes the SpanResolver used for DistSQL inside the
 	// server's executor. The argument must be a physicalplan.SpanResolver
@@ -170,6 +176,27 @@ type TestServerInterface interface {
 	// An error will be returned if the same table name exists in multiple schemas
 	// inside the specified database.
 	ForceTableGC(ctx context.Context, database, table string, timestamp hlc.Timestamp) error
+
+	// CheckForUpdates phones home to check for updates and report usage.
+	//
+	// When using this for testing, consider setting DiagnosticsReportingEnabled
+	// to false so the periodic check doesn't interfere with the test.
+	//
+	// This can be slow because of cloud detection; use cloudinfo.Disable() in
+	// tests to avoid that.
+	CheckForUpdates(ctx context.Context)
+
+	// ReportDiagnostics phones home to report diagnostics.
+	//
+	// If using this for testing, consider setting DiagnosticsReportingEnabled to
+	// false so the periodic reporting doesn't interfere with the test.
+	//
+	// This can be slow because of cloud detection; use cloudinfo.Disable() in
+	// tests to avoid that.
+	ReportDiagnostics(ctx context.Context)
+
+	// StartTenant spawns off tenant process connecting to this TestServer.
+	StartTenant() (pgAddr string, _ error)
 }
 
 // TestServerFactory encompasses the actual implementation of the shim
@@ -195,7 +222,7 @@ func StartServer(
 ) (TestServerInterface, *gosql.DB, *kv.DB) {
 	server, err := StartServerRaw(params)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%+v", err)
 	}
 
 	pgURL, cleanupGoDB := sqlutils.PGUrl(
@@ -229,6 +256,28 @@ func StartServerRaw(args base.TestServerArgs) (TestServerInterface, error) {
 		return nil, err
 	}
 	return server, nil
+}
+
+// StartTenant starts a tenant SQL server connecting to the supplied test
+// server. It uses the server's stopper to shut down automatically. However,
+// the returned DB is for the caller to close.
+func StartTenant(t testing.TB, ts TestServerInterface) *gosql.DB {
+	pgAddr, err := ts.StartTenant()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pgURL, cleanupGoDB := sqlutils.PGUrl(
+		t, pgAddr, t.Name() /* prefix */, url.User(security.RootUser))
+
+	db, err := gosql.Open("postgres", pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts.Stopper().AddCloser(stop.CloserFn(func() {
+		cleanupGoDB()
+	}))
+	return db
 }
 
 // GetJSONProto uses the supplied client to GET the URL specified by the parameters

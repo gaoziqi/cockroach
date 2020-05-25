@@ -11,8 +11,6 @@
 package optbuilder
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
@@ -40,11 +38,11 @@ func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outSco
 		// resolved correctly.
 		// TODO(solon): Once it is possible to drop schemas, it will no longer be
 		// safe to set the schema name to `public`, as it may have been dropped.
-		ct.Table.TableNamePrefix.SchemaName = tree.PublicSchemaName
+		ct.Table.ObjectNamePrefix.SchemaName = tree.PublicSchemaName
 		ct.Temporary = true
 	}
 	sch, resName := b.resolveSchemaForCreate(&ct.Table)
-	ct.Table.TableNamePrefix = resName
+	ct.Table.ObjectNamePrefix = resName
 	schID := b.factory.Metadata().AddSchema(sch)
 
 	// HoistConstraints normalizes any column constraints in the CreateTable AST
@@ -65,7 +63,7 @@ func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outSco
 
 		b.pushWithFrame()
 		// Build the input query.
-		outScope := b.buildStmt(ct.AsSource, nil /* desiredTypes */, inScope)
+		outScope = b.buildStmt(ct.AsSource, nil /* desiredTypes */, inScope)
 		b.popWithFrame(outScope)
 
 		numColNames := 0
@@ -76,10 +74,10 @@ func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outSco
 		}
 		numColumns := len(outScope.cols)
 		if numColNames != 0 && numColNames != numColumns {
-			panic(sqlbase.NewSyntaxError(fmt.Sprintf(
+			panic(sqlbase.NewSyntaxErrorf(
 				"CREATE TABLE specifies %d column name%s, but data source has %d column%s",
 				numColNames, util.Pluralize(int64(numColNames)),
-				numColumns, util.Pluralize(int64(numColumns)))))
+				numColumns, util.Pluralize(int64(numColumns))))
 		}
 
 		input = outScope.expr
@@ -102,7 +100,8 @@ func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outSco
 		input = b.factory.ConstructZeroValues()
 	}
 
-	expr := b.factory.ConstructCreateTable(
+	outScope = b.allocScope()
+	outScope.expr = b.factory.ConstructCreateTable(
 		input,
 		&memo.CreateTablePrivate{
 			Schema:    schID,
@@ -110,5 +109,5 @@ func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outSco
 			Syntax:    ct,
 		},
 	)
-	return &scope{builder: b, expr: expr}
+	return outScope
 }

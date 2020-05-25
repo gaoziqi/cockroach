@@ -18,7 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -46,6 +47,7 @@ func TestExternalSort(t *testing.T) {
 		},
 	}
 
+	const numForcedRepartitions = 3
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
 
@@ -68,40 +70,39 @@ func TestExternalSort(t *testing.T) {
 		for _, tcs := range [][]sortTestCase{sortAllTestCases, topKSortTestCases, sortChunksTestCases} {
 			for _, tc := range tcs {
 				t.Run(fmt.Sprintf("spillForced=%t/%s", spillForced, tc.description), func(t *testing.T) {
-					// Unfortunately, there is currently no better way to check that a
-					// sorter does not have leftover file descriptors other than appending
-					// each semaphore used to this slice on construction. This is because
-					// some tests don't fully drain the input, making intercepting the
-					// sorter.Close() method not a useful option, since it is impossible
-					// to check between an expected case where more than 0 FDs are open
-					// (e.g. in verifySelAndNullResets, where the sorter is not fully
-					// drained so Close must be called explicitly) and an unexpected one.
-					// These cases happen during normal execution when a limit is
-					// satisfied, but flows will call Close explicitly on Cleanup.
-					// TODO(asubiotto): Not implemented yet, currently we rely on the
-					//  flow tracking open FDs and releasing any leftovers.
 					var semsToCheck []semaphore.Semaphore
-					runTests(
+					runTestsWithTyps(
 						t,
 						[]tuples{tc.tuples},
+						[][]*types.T{tc.typs},
 						tc.expected,
 						orderedVerifier,
-						func(input []Operator) (Operator, error) {
+						func(input []colexecbase.Operator) (colexecbase.Operator, error) {
 							// A sorter should never exceed externalSorterMinPartitions, even
 							// during repartitioning. A panic will happen if a sorter requests
 							// more than this number of file descriptors.
-							sem := NewTestingSemaphore(externalSorterMinPartitions)
+							sem := colexecbase.NewTestingSemaphore(externalSorterMinPartitions)
 							// If a limit is satisfied before the sorter is drained of all its
 							// tuples, the sorter will not close its partitioner. During a
-							// flow this will happen in Cleanup, since there is no way to tell
-							// an operator that Next won't be called again.
-							if tc.k == 0 || int(tc.k) >= len(tc.tuples) {
+							// flow this will happen in a downstream materializer/outbox,
+							// since there is no way to tell an operator that Next won't be
+							// called again.
+							if tc.k == 0 || tc.k >= len(tc.tuples) {
 								semsToCheck = append(semsToCheck, sem)
 							}
-							sorter, newAccounts, newMonitors, err := createDiskBackedSorter(
-								ctx, flowCtx, input, tc.logTypes, tc.ordCols, tc.matchLen, tc.k, func() {},
-								externalSorterMinPartitions, false /* delegateFDAcquisition */, queueCfg, sem,
+							// TODO(asubiotto): Pass in the testing.T of the caller to this
+							//  function and do substring matching on the test name to
+							//  conditionally explicitly call Close() on the sorter (through
+							//  result.ToClose) in cases where it is know the sorter will not
+							//  be drained.
+							sorter, newAccounts, newMonitors, closers, err := createDiskBackedSorter(
+								ctx, flowCtx, input, tc.typs, tc.ordCols, tc.matchLen, tc.k, func() {},
+								numForcedRepartitions, false /* delegateFDAcquisition */, queueCfg, sem,
 							)
+							// Check that the sort was added as a Closer.
+							// TODO(asubiotto): Explicitly Close when testing.T is passed into
+							//  this constructor and we do a substring match.
+							require.Equal(t, 1, len(closers))
 							accounts = append(accounts, newAccounts...)
 							monitors = append(monitors, newMonitors...)
 							return sorter, err
@@ -138,11 +139,12 @@ func TestExternalSortRandomized(t *testing.T) {
 	nTups := coldata.BatchSize()*4 + 1
 	maxCols := 2
 	// TODO(yuzefovich): randomize types as well.
-	logTypes := make([]types.T, maxCols)
-	for i := range logTypes {
-		logTypes[i] = *types.Int
+	typs := make([]*types.T, maxCols)
+	for i := range typs {
+		typs[i] = types.Int
 	}
 
+	const numForcedRepartitions = 3
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
 
@@ -155,11 +157,9 @@ func TestExternalSortRandomized(t *testing.T) {
 	// 2) The memory limit is dynamically set to repartition twice, this will also
 	//    allow the in-memory sorter to spool several batches before hitting the
 	//    memory limit.
-	colTyps, err := typeconv.FromColumnTypes(logTypes)
-	require.NoError(t, err)
 	// memoryToSort is the total amount of memory that will be sorted in this
 	// test.
-	memoryToSort := (nTups / coldata.BatchSize()) * estimateBatchSizeBytes(colTyps, coldata.BatchSize())
+	memoryToSort := (nTups / coldata.BatchSize()) * colmem.EstimateBatchSizeBytes(typs, coldata.BatchSize())
 	// partitionSize will be the memory limit passed in to tests with a memory
 	// limit. With a maximum number of partitions of 2 this will result in
 	// repartitioning twice. To make this a total amount of memory, we also need
@@ -195,13 +195,16 @@ func TestExternalSortRandomized(t *testing.T) {
 						[]tuples{tups},
 						expected,
 						orderedVerifier,
-						func(input []Operator) (Operator, error) {
-							sem := NewTestingSemaphore(externalSorterMinPartitions)
+						func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+							sem := colexecbase.NewTestingSemaphore(externalSorterMinPartitions)
 							semsToCheck = append(semsToCheck, sem)
-							sorter, newAccounts, newMonitors, err := createDiskBackedSorter(
-								ctx, flowCtx, input, logTypes[:nCols], ordCols,
+							sorter, newAccounts, newMonitors, closers, err := createDiskBackedSorter(
+								ctx, flowCtx, input, typs[:nCols], ordCols,
 								0 /* matchLen */, 0 /* k */, func() {},
-								externalSorterMinPartitions, delegateFDAcquisition, queueCfg, sem)
+								numForcedRepartitions, delegateFDAcquisition, queueCfg, sem)
+							// TODO(asubiotto): Explicitly Close when testing.T is passed into
+							//  this constructor and we do a substring match.
+							require.Equal(t, 1, len(closers))
 							accounts = append(accounts, newAccounts...)
 							monitors = append(monitors, newMonitors...)
 							return sorter, err
@@ -252,13 +255,11 @@ func BenchmarkExternalSort(b *testing.B) {
 					// 8 (bytes / int64) * nBatches (number of batches) * coldata.BatchSize() (rows /
 					// batch) * nCols (number of columns / row).
 					b.SetBytes(int64(8 * nBatches * coldata.BatchSize() * nCols))
-					logTypes := make([]types.T, nCols)
-					for i := range logTypes {
-						logTypes[i] = *types.Int
+					typs := make([]*types.T, nCols)
+					for i := range typs {
+						typs[i] = types.Int
 					}
-					physTypes, err := typeconv.FromColumnTypes(logTypes)
-					require.NoError(b, err)
-					batch := testAllocator.NewMemBatch(physTypes)
+					batch := testAllocator.NewMemBatch(typs)
 					batch.SetLength(coldata.BatchSize())
 					ordCols := make([]execinfrapb.Ordering_Column, nCols)
 					for i := range ordCols {
@@ -271,15 +272,12 @@ func BenchmarkExternalSort(b *testing.B) {
 					}
 					b.ResetTimer()
 					for n := 0; n < b.N; n++ {
-						source := newFiniteBatchSource(batch, nBatches)
+						source := newFiniteBatchSource(batch, typs, nBatches)
 						var spilled bool
-						// TODO(yuzefovich): do not specify maxNumberPartitions (let the
-						// external sorter figure out that number itself) once we pass in
-						// filled-in disk queue config.
-						sorter, accounts, monitors, err := createDiskBackedSorter(
-							ctx, flowCtx, []Operator{source}, logTypes, ordCols,
+						sorter, accounts, monitors, _, err := createDiskBackedSorter(
+							ctx, flowCtx, []colexecbase.Operator{source}, typs, ordCols,
 							0 /* matchLen */, 0 /* k */, func() { spilled = true },
-							64 /* maxNumberPartitions */, false /* delegateFDAcquisitions */, queueCfg, &TestingSemaphore{},
+							0 /* numForcedRepartitions */, false /* delegateFDAcquisitions */, queueCfg, &colexecbase.TestingSemaphore{},
 						)
 						memAccounts = append(memAccounts, accounts...)
 						memMonitors = append(memMonitors, monitors...)
@@ -313,23 +311,23 @@ func BenchmarkExternalSort(b *testing.B) {
 func createDiskBackedSorter(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
-	input []Operator,
-	logTypes []types.T,
+	input []colexecbase.Operator,
+	typs []*types.T,
 	ordCols []execinfrapb.Ordering_Column,
 	matchLen int,
-	k uint16,
+	k int,
 	spillingCallbackFn func(),
-	maxNumberPartitions int,
+	numForcedRepartitions int,
 	delegateFDAcquisitions bool,
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	testingSemaphore semaphore.Semaphore,
-) (Operator, []*mon.BoundAccount, []*mon.BytesMonitor, error) {
+) (colexecbase.Operator, []*mon.BoundAccount, []*mon.BytesMonitor, []IdempotentCloser, error) {
 	sorterSpec := &execinfrapb.SorterSpec{
 		OutputOrdering:   execinfrapb.Ordering{Columns: ordCols},
 		OrderingMatchLen: uint32(matchLen),
 	}
 	spec := &execinfrapb.ProcessorSpec{
-		Input: []execinfrapb.InputSyncSpec{{ColumnTypes: logTypes}},
+		Input: []execinfrapb.InputSyncSpec{{ColumnTypes: typs}},
 		Core: execinfrapb.ProcessorCoreUnion{
 			Sorter: sorterSpec,
 		},
@@ -348,8 +346,8 @@ func createDiskBackedSorter(
 	// understand when to start a new partition, so we will not use
 	// the streaming memory account.
 	args.TestingKnobs.SpillingCallbackFn = spillingCallbackFn
-	args.TestingKnobs.NumForcedRepartitions = maxNumberPartitions
+	args.TestingKnobs.NumForcedRepartitions = numForcedRepartitions
 	args.TestingKnobs.DelegateFDAcquisitions = delegateFDAcquisitions
 	result, err := NewColOperator(ctx, flowCtx, args)
-	return result.Op, result.OpAccounts, result.OpMonitors, err
+	return result.Op, result.OpAccounts, result.OpMonitors, result.ToClose, err
 }

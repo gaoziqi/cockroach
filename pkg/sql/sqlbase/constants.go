@@ -53,6 +53,7 @@ const (
 	CrdbInternalBuildInfoTableID
 	CrdbInternalBuiltinFunctionsTableID
 	CrdbInternalClusterQueriesTableID
+	CrdbInternalClusterTransactionsTableID
 	CrdbInternalClusterSessionsTableID
 	CrdbInternalClusterSettingsTableID
 	CrdbInternalCreateStmtsTableID
@@ -68,6 +69,7 @@ const (
 	CrdbInternalKVStoreStatusTableID
 	CrdbInternalLeasesTableID
 	CrdbInternalLocalQueriesTableID
+	CrdbInternalLocalTransactionsTableID
 	CrdbInternalLocalSessionsTableID
 	CrdbInternalLocalMetricsTableID
 	CrdbInternalPartitionsTableID
@@ -107,6 +109,7 @@ const (
 	InformationSchemaViewsTableID
 	InformationSchemaUserPrivilegesID
 	PgCatalogID
+	PgCatalogAggregateTableID
 	PgCatalogAmTableID
 	PgCatalogAttrDefTableID
 	PgCatalogAttributeTableID
@@ -124,6 +127,7 @@ const (
 	PgCatalogDescriptionTableID
 	PgCatalogSharedDescriptionTableID
 	PgCatalogEnumTableID
+	PgCatalogEventTriggerTableID
 	PgCatalogExtensionTableID
 	PgCatalogForeignDataWrapperTableID
 	PgCatalogForeignServerTableID
@@ -156,5 +160,9 @@ const (
 	PgCatalogStatActivityTableID
 	PgCatalogSecurityLabelTableID
 	PgCatalogSharedSecurityLabelTableID
-	MinVirtualID = PgCatalogSharedSecurityLabelTableID
+	PgExtensionSchemaID
+	PgExtensionGeographyColumnsTableID
+	PgExtensionGeometryColumnsTableID
+	PgExtensionSpatialRefSysTableID
+	MinVirtualID = PgExtensionSpatialRefSysTableID
 )

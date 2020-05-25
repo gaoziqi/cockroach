@@ -22,8 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 )
 
 const indexJoinerBatchSize = 10000
@@ -99,6 +99,7 @@ func newIndexJoiner(
 	}
 	var fetcher row.Fetcher
 	if _, _, err := initRowFetcher(
+		flowCtx,
 		&fetcher,
 		&ij.desc,
 		0, /* primary index */
@@ -122,7 +123,7 @@ func newIndexJoiner(
 		ij.fetcher = &fetcher
 	}
 
-	ij.spanBuilder = span.MakeBuilder(&spec.Table, &spec.Table.PrimaryIndex)
+	ij.spanBuilder = span.MakeBuilder(flowCtx.Codec(), &spec.Table, &spec.Table.PrimaryIndex)
 	ij.spanBuilder.SetNeededColumns(ij.Out.NeededColumns())
 
 	return ij, nil
@@ -251,7 +252,10 @@ func (ij *indexJoiner) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 
 // ChildCount is part of the execinfra.OpNode interface.
 func (ij *indexJoiner) ChildCount(verbose bool) int {
-	return 1
+	if _, ok := ij.input.(execinfra.OpNode); ok {
+		return 1
+	}
+	return 0
 }
 
 // Child is part of the execinfra.OpNode interface.

@@ -91,8 +91,8 @@ type tableInfo struct {
 
 	// -- Fields updated during a scan --
 
-	keyValTypes []types.T
-	extraTypes  []types.T
+	keyValTypes []*types.T
+	extraTypes  []*types.T
 	keyVals     []sqlbase.EncDatum
 	extraVals   []sqlbase.EncDatum
 	row         sqlbase.EncDatumRow
@@ -161,6 +161,9 @@ type FetcherTableArgs struct {
 //      // Process res.row
 //   }
 type Fetcher struct {
+	// codec is used to encode and decode sql keys.
+	codec keys.SQLCodec
+
 	// tables is a slice of all the tables and their descriptors for which
 	// rows are returned.
 	tables []tableInfo
@@ -245,6 +248,7 @@ func (rf *Fetcher) Reset() {
 // non-primary index, tables.ValNeededForCol can only refer to columns in the
 // index.
 func (rf *Fetcher) Init(
+	codec keys.SQLCodec,
 	reverse bool,
 	lockStr sqlbase.ScanLockingStrength,
 	returnRangeInfo bool,
@@ -256,6 +260,7 @@ func (rf *Fetcher) Init(
 		return errors.AssertionFailedf("no tables to fetch from")
 	}
 
+	rf.codec = codec
 	rf.reverse = reverse
 	rf.lockStr = lockStr
 	rf.returnRangeInfo = returnRangeInfo
@@ -336,7 +341,9 @@ func (rf *Fetcher) Init(
 			}
 		}
 
-		table.knownPrefixLength = len(sqlbase.MakeIndexKeyPrefix(table.desc.TableDesc(), table.index.ID))
+		table.knownPrefixLength = len(
+			sqlbase.MakeIndexKeyPrefix(codec, table.desc.TableDesc(), table.index.ID),
+		)
 
 		var indexColumnIDs []sqlbase.ColumnID
 		indexColumnIDs, table.indexColumnDirs = table.index.FullColumnIDs()
@@ -690,16 +697,10 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 		// is that the extra columns are not always there, and are used to unique-ify
 		// the index key, rather than provide the primary key column values.
 		if foundNull && rf.currentTable.isSecondaryIndex && rf.currentTable.index.Unique && len(rf.currentTable.desc.Families) != 1 {
-			for _, colID := range rf.currentTable.index.ExtraColumnIDs {
-				colIdx := rf.currentTable.colIdxMap[colID]
+			for range rf.currentTable.index.ExtraColumnIDs {
 				var err error
 				// Slice off an extra encoded column from rf.keyRemainingBytes.
-				rf.keyRemainingBytes, err = sqlbase.SkipTableKey(
-					&rf.currentTable.cols[colIdx].Type,
-					rf.keyRemainingBytes,
-					// Extra columns are always stored in ascending order.
-					sqlbase.IndexDescriptor_ASC,
-				)
+				rf.keyRemainingBytes, err = sqlbase.SkipTableKey(rf.keyRemainingBytes)
 				if err != nil {
 					return false, err
 				}
@@ -733,10 +734,10 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 	}
 }
 
-func (rf *Fetcher) prettyEncDatums(types []types.T, vals []sqlbase.EncDatum) string {
+func (rf *Fetcher) prettyEncDatums(types []*types.T, vals []sqlbase.EncDatum) string {
 	var buf strings.Builder
 	for i, v := range vals {
-		if err := v.EnsureDecoded(&types[i], rf.alloc); err != nil {
+		if err := v.EnsureDecoded(types[i], rf.alloc); err != nil {
 			buf.WriteString("error decoding: ")
 			buf.WriteString(err.Error())
 		}
@@ -1021,12 +1022,12 @@ func (rf *Fetcher) processValueSingle(
 	if rf.traceKV || table.neededCols.Contains(int(colID)) {
 		if idx, ok := table.colIdxMap[colID]; ok {
 			if rf.traceKV {
-				prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.Columns[idx].Name)
+				prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].Name)
 			}
 			if len(kv.Value.RawBytes) == 0 {
 				return prettyKey, "", nil
 			}
-			typ := &table.cols[idx].Type
+			typ := table.cols[idx].Type
 			// TODO(arjun): The value is a directly marshaled single value, so we
 			// unmarshal it eagerly here. This can potentially be optimized out,
 			// although that would require changing UnmarshalColumnValue to operate
@@ -1096,7 +1097,7 @@ func (rf *Fetcher) processValueBytes(
 		idx := table.colIdxMap[colID]
 
 		if rf.traceKV {
-			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.Columns[idx].Name)
+			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].Name)
 		}
 
 		var encValue sqlbase.EncDatum
@@ -1106,7 +1107,7 @@ func (rf *Fetcher) processValueBytes(
 			return "", "", err
 		}
 		if rf.traceKV {
-			err := encValue.EnsureDecoded(&table.cols[idx].Type, rf.alloc)
+			err := encValue.EnsureDecoded(table.cols[idx].Type, rf.alloc)
 			if err != nil {
 				return "", "", err
 			}
@@ -1212,7 +1213,7 @@ func (rf *Fetcher) NextRowDecoded(
 			rf.rowReadyTable.decodedRow[i] = tree.DNull
 			continue
 		}
-		if err := encDatum.EnsureDecoded(&rf.rowReadyTable.cols[i].Type, rf.alloc); err != nil {
+		if err := encDatum.EnsureDecoded(rf.rowReadyTable.cols[i].Type, rf.alloc); err != nil {
 			return nil, nil, nil, err
 		}
 		rf.rowReadyTable.decodedRow[i] = encDatum.Datum
@@ -1266,7 +1267,7 @@ func (rf *Fetcher) NextRowWithErrors(ctx context.Context) (sqlbase.EncDatumRow, 
 			rf.rowReadyTable.decodedRow[i] = tree.DNull
 			continue
 		}
-		if err := row[i].EnsureDecoded(&rf.rowReadyTable.cols[i].Type, rf.alloc); err != nil {
+		if err := row[i].EnsureDecoded(rf.rowReadyTable.cols[i].Type, rf.alloc); err != nil {
 			return nil, err
 		}
 		rf.rowReadyTable.decodedRow[i] = row[i].Datum
@@ -1360,7 +1361,7 @@ func (rf *Fetcher) checkSecondaryIndexDatumEncodings(ctx context.Context) error 
 
 	// The below code makes incorrect checks (#45256).
 	indexEntries, err := sqlbase.EncodeSecondaryIndex(
-		table.desc.TableDesc(), table.index, table.colIdxMap, values, false /* includeEmpty */)
+		rf.codec, table.desc.TableDesc(), table.index, table.colIdxMap, values, false /* includeEmpty */)
 	if err != nil {
 		return err
 	}
@@ -1438,7 +1439,7 @@ func (rf *Fetcher) finalizeRow() error {
 				var indexColValues []string
 				for _, idx := range table.indexColIdx {
 					if idx != -1 {
-						indexColValues = append(indexColValues, table.row[idx].String(&table.cols[idx].Type))
+						indexColValues = append(indexColValues, table.row[idx].String(table.cols[idx].Type))
 					} else {
 						indexColValues = append(indexColValues, "?")
 					}

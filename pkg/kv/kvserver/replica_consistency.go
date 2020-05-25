@@ -39,7 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // fatalOnStatsMismatch, if true, turns stats mismatches into fatal errors. A
@@ -167,7 +167,7 @@ func (r *Replica) CheckConsistency(
 		}
 
 		if isQueue {
-			log.Error(ctx, buf.String())
+			log.Errorf(ctx, "%v", buf.String())
 		}
 		res.Detail += buf.String()
 	} else {
@@ -547,7 +547,7 @@ func (r *Replica) sha512(
 		} else {
 			timestampBuf = timestampBuf[:size]
 		}
-		if _, err := protoutil.MarshalToWithoutFuzzing(&legacyTimestamp, timestampBuf); err != nil {
+		if _, err := protoutil.MarshalTo(&legacyTimestamp, timestampBuf); err != nil {
 			return err
 		}
 		if _, err := hasher.Write(timestampBuf); err != nil {

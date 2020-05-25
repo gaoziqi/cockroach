@@ -30,7 +30,7 @@ import "./events.styl";
 type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.IEvent;
 
 // Number of events to show in the sidebar.
-const EVENT_BOX_NUM_EVENTS = 10;
+const EVENT_BOX_NUM_EVENTS = 5;
 
 const eventsSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "events/sort_setting", (s) => s.localSettings,
@@ -65,12 +65,17 @@ export class EventRow extends React.Component<EventRowProps, {}> {
     const e = getEventInfo(event);
     return <tr>
       <td>
-        <ToolTipWrapper placement="left" text={ e.content }>
-          <div className="events__message">{e.content}</div>
+        <ToolTipWrapper
+          placement="left"
+          text={ e.content }
+        >
+          <div className="events__message">
+            {e.content}
+          </div>
         </ToolTipWrapper>
-      </td>
-      <td>
-        <div className="events__timestamp">{e.fromNowString}</div>
+        <div className="events__timestamp">
+          {e.fromNowString}
+        </div>
       </td>
     </tr>;
   }
@@ -86,14 +91,14 @@ export interface EventBoxProps {
 
 export class EventBoxUnconnected extends React.Component<EventBoxProps, {}> {
 
-  componentWillMount() {
+  componentDidMount() {
     // Refresh events when mounting.
     this.props.refreshEvents();
   }
 
-  componentWillReceiveProps(props: EventPageProps) {
+  componentDidUpdate() {
     // Refresh events when props change.
-    props.refreshEvents();
+    this.props.refreshEvents();
   }
 
   render() {
@@ -124,14 +129,14 @@ export interface EventPageProps {
 }
 
 export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
-  componentWillMount() {
+  componentDidMount() {
     // Refresh events when mounting.
     this.props.refreshEvents();
   }
 
-  componentWillReceiveProps(props: EventPageProps) {
+  componentDidUpdate() {
     // Refresh events when props change.
-    props.refreshEvents();
+    this.props.refreshEvents();
   }
 
   render() {

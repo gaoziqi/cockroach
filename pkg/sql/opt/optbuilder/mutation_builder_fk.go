@@ -11,20 +11,36 @@
 package optbuilder
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
 )
 
-// buildFKChecks* methods populate mb.checks with queries that check the
-// integrity of foreign key relations that involve modified rows.
+// This file contains methods that populate mutationBuilder.checks and cascades.
+//
+// -- Checks --
 //
 // The foreign key checks are queries that run after the statement (including
-// the relevant mutation) completes; any row that is returned by these
-// FK check queries indicates a foreign key violation.
+// the relevant mutation) completes. They check the integrity of the foreign key
+// relations that involve modified rows; any row that is returned by these FK
+// check queries indicates a foreign key violation.
+//
+// -- Cacades --
+//
+// The foreign key cascades are "potential" future queries that perform
+// cascading mutations of child tables. These queries are constructed later as
+// necessary; mb.cascades stores metadata that include CascadeBuilder instances
+// which are used to construct these queries.
+
+// buildFKChecksForInsert builds FK check queries for an insert.
+//
+// See the comment at the top of the file for general information on checks and
+// cascades.
 //
 // In the case of insert, each FK check query is an anti-join with the left side
 // being a WithScan of the mutation input and the right side being the
@@ -47,14 +63,13 @@ import (
 //                        └── column2:5 = parent.p:6
 //
 // See testdata/fk-checks-insert for more examples.
-//
 func (mb *mutationBuilder) buildFKChecksForInsert() {
 	if mb.tab.OutboundForeignKeyCount() == 0 {
 		// No relevant FKs.
 		return
 	}
-	if !mb.b.evalCtx.SessionData.OptimizerFKs {
-		mb.fkFallback = true
+	if !mb.b.evalCtx.SessionData.OptimizerFKChecks {
+		mb.setFKFallback()
 		return
 	}
 
@@ -66,17 +81,19 @@ func (mb *mutationBuilder) buildFKChecksForInsert() {
 
 	h := &mb.fkCheckHelper
 	for i, n := 0, mb.tab.OutboundForeignKeyCount(); i < n; i++ {
-		h.initWithOutboundFK(mb, i)
-		mb.checks = append(mb.checks, h.buildInsertionCheck())
+		if h.initWithOutboundFK(mb, i) {
+			mb.checks = append(mb.checks, h.buildInsertionCheck())
+		}
 	}
+	telemetry.Inc(sqltelemetry.ForeignKeyChecksUseCounter)
 }
 
-// buildFKChecks* methods populate mb.checks with queries that check the
-// integrity of foreign key relations that involve modified rows.
+// buildFKChecksAndCascadesForDelete builds FK check and cascades for a delete.
 //
-// The foreign key checks are queries that run after the statement (including
-// the relevant mutation) completes; any row that is returned by these
-// FK check queries indicates a foreign key violation.
+// See the comment at the top of the file for general information on checks and
+// cascades.
+//
+// -- Checks --
 //
 // In the case of delete, each FK check query is a semi-join with the left side
 // being a WithScan of the mutation input and the right side being the
@@ -99,13 +116,17 @@ func (mb *mutationBuilder) buildFKChecksForInsert() {
 //
 // See testdata/fk-checks-delete for more examples.
 //
-func (mb *mutationBuilder) buildFKChecksForDelete() {
+// -- Cascades --
+//
+// See onDeleteCascadeBuilder, onDeleteSetBuilder for details.
+//
+func (mb *mutationBuilder) buildFKChecksAndCascadesForDelete() {
 	if mb.tab.InboundForeignKeyCount() == 0 {
 		// No relevant FKs.
 		return
 	}
-	if !mb.b.evalCtx.SessionData.OptimizerFKs {
-		mb.fkFallback = true
+	if !mb.b.evalCtx.SessionData.OptimizerFKChecks {
+		mb.setFKFallback()
 		return
 	}
 
@@ -116,25 +137,53 @@ func (mb *mutationBuilder) buildFKChecksForDelete() {
 		if !h.initWithInboundFK(mb, i) {
 			continue
 		}
-
+		// The action dictates how a foreign key reference is handled:
+		//  - with Cascade/SetNull/SetDefault, we create a cascading mutation to
+		//    modify or delete "orphaned" rows in the child table.
+		//  - with Restrict/NoAction, we create a check that causes an error if
+		//    there are any "orhpaned" rows in the child table.
 		if a := h.fk.DeleteReferenceAction(); a != tree.Restrict && a != tree.NoAction {
-			// Bail, so that exec FK checks pick up on FK checks and perform them.
-			mb.checks = nil
-			mb.fkFallback = true
-			return
+			if !mb.b.evalCtx.SessionData.OptimizerFKCascades {
+				// Bail, so that exec FK checks pick up on FK checks and perform them.
+				mb.setFKFallback()
+				telemetry.Inc(sqltelemetry.ForeignKeyCascadesUseCounter)
+				return
+			}
+
+			var builder memo.CascadeBuilder
+			switch a {
+			case tree.Cascade:
+				builder = newOnDeleteCascadeBuilder(mb.tab, i, h.otherTab)
+			case tree.SetNull, tree.SetDefault:
+				builder = newOnDeleteSetBuilder(mb.tab, i, h.otherTab, a)
+			default:
+				panic(errors.AssertionFailedf("unhandled action type %s", a))
+			}
+
+			cols := make(opt.ColList, len(h.tabOrdinals))
+			for i := range cols {
+				cols[i] = mb.scopeOrdToColID(mb.fetchOrds[h.tabOrdinals[i]])
+			}
+			mb.cascades = append(mb.cascades, memo.FKCascade{
+				FKName:    h.fk.Name(),
+				Builder:   builder,
+				WithID:    mb.withID,
+				OldValues: cols,
+				NewValues: nil,
+			})
+			continue
 		}
 
 		fkInput, withScanCols, _ := h.makeFKInputScan(fkInputScanFetchedVals)
 		mb.checks = append(mb.checks, h.buildDeletionCheck(fkInput, withScanCols))
 	}
+	telemetry.Inc(sqltelemetry.ForeignKeyChecksUseCounter)
 }
 
-// buildFKChecks* methods populate mb.checks with queries that check the
-// integrity of foreign key relations that involve modified rows.
+// buildFKChecksForUpdate builds FK check queries for an update.
 //
-// The foreign key checks are queries that run after the statement (including
-// the relevant mutation) completes; any row that is returned by these
-// FK check queries indicates a foreign key violation.
+// See the comment at the top of the file for general information on checks and
+// cascades.
 //
 // In the case of update, there are two types of FK check queries:
 //
@@ -192,8 +241,8 @@ func (mb *mutationBuilder) buildFKChecksForUpdate() {
 	if mb.tab.OutboundForeignKeyCount() == 0 && mb.tab.InboundForeignKeyCount() == 0 {
 		return
 	}
-	if !mb.b.evalCtx.SessionData.OptimizerFKs {
-		mb.fkFallback = true
+	if !mb.b.evalCtx.SessionData.OptimizerFKChecks {
+		mb.setFKFallback()
 		return
 	}
 
@@ -226,8 +275,9 @@ func (mb *mutationBuilder) buildFKChecksForUpdate() {
 	for i, n := 0, mb.tab.OutboundForeignKeyCount(); i < n; i++ {
 		// Verify that at least one FK column is actually updated.
 		if mb.outboundFKColsUpdated(i) {
-			h.initWithOutboundFK(mb, i)
-			mb.checks = append(mb.checks, h.buildInsertionCheck())
+			if h.initWithOutboundFK(mb, i) {
+				mb.checks = append(mb.checks, h.buildInsertionCheck())
+			}
 		}
 	}
 
@@ -245,8 +295,8 @@ func (mb *mutationBuilder) buildFKChecksForUpdate() {
 
 		if a := h.fk.UpdateReferenceAction(); a != tree.Restrict && a != tree.NoAction {
 			// Bail, so that exec FK checks pick up on FK checks and perform them.
-			mb.checks = nil
-			mb.fkFallback = true
+			mb.setFKFallback()
+			telemetry.Inc(sqltelemetry.ForeignKeyCascadesUseCounter)
 			return
 		}
 
@@ -292,14 +342,13 @@ func (mb *mutationBuilder) buildFKChecksForUpdate() {
 
 		mb.checks = append(mb.checks, h.buildDeletionCheck(deletedRows, colsForOldRow))
 	}
+	telemetry.Inc(sqltelemetry.ForeignKeyChecksUseCounter)
 }
 
-// buildFKChecks* methods populate mb.checks with queries that check the
-// integrity of foreign key relations that involve modified rows.
+// buildFKChecksForUpsert builds FK check queries for an upsert.
 //
-// The foreign key checks are queries that run after the statement (including
-// the relevant mutation) completes; any row that is returned by these
-// FK check queries indicates a foreign key violation.
+// See the comment at the top of the file for general information on checks and
+// cascades.
 //
 // The case of upsert is very similar to update; see buildFKChecksForUpdate.
 // The main difference is that for update, the "new" values were readily
@@ -321,8 +370,8 @@ func (mb *mutationBuilder) buildFKChecksForUpsert() {
 		return
 	}
 
-	if !mb.b.evalCtx.SessionData.OptimizerFKs {
-		mb.fkFallback = true
+	if !mb.b.evalCtx.SessionData.OptimizerFKChecks {
+		mb.setFKFallback()
 		return
 	}
 
@@ -330,8 +379,9 @@ func (mb *mutationBuilder) buildFKChecksForUpsert() {
 
 	h := &mb.fkCheckHelper
 	for i := 0; i < numOutbound; i++ {
-		h.initWithOutboundFK(mb, i)
-		mb.checks = append(mb.checks, h.buildInsertionCheck())
+		if h.initWithOutboundFK(mb, i) {
+			mb.checks = append(mb.checks, h.buildInsertionCheck())
+		}
 	}
 
 	for i := 0; i < numInbound; i++ {
@@ -348,8 +398,8 @@ func (mb *mutationBuilder) buildFKChecksForUpsert() {
 
 		if a := h.fk.UpdateReferenceAction(); a != tree.Restrict && a != tree.NoAction {
 			// Bail, so that exec FK checks pick up on FK checks and perform them.
-			mb.checks = nil
-			mb.fkFallback = true
+			mb.setFKFallback()
+			telemetry.Inc(sqltelemetry.ForeignKeyCascadesUseCounter)
 			return
 		}
 
@@ -378,6 +428,7 @@ func (mb *mutationBuilder) buildFKChecksForUpsert() {
 		)
 		mb.checks = append(mb.checks, h.buildDeletionCheck(deletedRows, colsForOldRow))
 	}
+	telemetry.Inc(sqltelemetry.ForeignKeyChecksUseCounter)
 }
 
 // outboundFKColsUpdated returns true if any of the FK columns for an outbound
@@ -426,6 +477,9 @@ type fkCheckHelper struct {
 }
 
 // initWithOutboundFK initializes the helper with an outbound FK constraint.
+//
+// Returns false if the FK relation should be ignored (e.g. because the new
+// values for the FK columns are known to be always NULL).
 func (h *fkCheckHelper) initWithOutboundFK(mb *mutationBuilder, fkOrdinal int) bool {
 	*h = fkCheckHelper{
 		mb:         mb,
@@ -453,6 +507,26 @@ func (h *fkCheckHelper) initWithOutboundFK(mb *mutationBuilder, fkOrdinal int) b
 		h.tabOrdinals[i] = h.fk.OriginColumnOrdinal(mb.tab, i)
 		h.otherTabOrdinals[i] = h.fk.ReferencedColumnOrdinal(h.otherTab, i)
 	}
+
+	// Check if we are setting NULL values for the FK columns, like when this
+	// mutation is the result of a SET NULL cascade action.
+	numNullCols := 0
+	for _, tabOrd := range h.tabOrdinals {
+		col := mb.scopeOrdToColID(mb.mapToReturnScopeOrd(tabOrd))
+		if memo.OutputColumnIsAlwaysNull(mb.outScope.expr, col) {
+			numNullCols++
+		}
+	}
+	if numNullCols == numCols {
+		// All FK columns are getting NULL values; FK check not needed.
+		return false
+	}
+	if numNullCols > 0 && h.fk.MatchMethod() == tree.MatchSimple {
+		// At least one FK column is getting a NULL value and we are using MATCH
+		// SIMPLE; FK check not needed.
+		return false
+	}
+
 	return true
 }
 
@@ -559,7 +633,7 @@ func (h *fkCheckHelper) buildOtherTableScan() (outScope *scope, tabMeta *opt.Tab
 		h.otherTabOrdinals,
 		&tree.IndexFlags{IgnoreForeignKeys: true},
 		noRowLocking,
-		includeMutations,
+		excludeMutations,
 		h.mb.b.allocScope(),
 	), otherTabMeta
 }
@@ -713,4 +787,14 @@ func (h *fkCheckHelper) buildDeletionCheck(
 		KeyCols:         deleteCols,
 		OpName:          h.mb.opName,
 	})
+}
+
+// setFKFallback enables fallback to the legacy foreign key checks and
+// cascade path.
+func (mb *mutationBuilder) setFKFallback() {
+	// Clear out any checks or cascades that may have been built already.
+	mb.checks = nil
+	mb.cascades = nil
+	mb.fkFallback = true
+	telemetry.Inc(sqltelemetry.ForeignKeyLegacyUseCounter)
 }

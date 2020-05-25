@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -70,7 +69,7 @@ func TestPGWireDrainClient(t *testing.T) {
 	params := base.TestServerArgs{Insecure: true}
 	s, _, _ := serverutils.StartServer(t, params)
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
 	host, port, err := net.SplitHostPort(s.ServingSQLAddr())
@@ -96,19 +95,13 @@ func TestPGWireDrainClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	on := []serverpb.DrainMode{serverpb.DrainMode_CLIENT}
 	// Draining runs in a separate goroutine since it won't return until the
 	// connection with an ongoing transaction finishes.
 	errChan := make(chan error)
 	go func() {
 		defer close(errChan)
 		errChan <- func() error {
-			if now, err := s.(*server.TestServer).Drain(ctx, on); err != nil {
-				return err
-			} else if !reflect.DeepEqual(on, now) {
-				return errors.Errorf("expected drain modes %v, got %v", on, now)
-			}
-			return nil
+			return s.(*server.TestServer).DrainClients(ctx)
 		}()
 	}()
 
@@ -133,8 +126,8 @@ func TestPGWireDrainClient(t *testing.T) {
 		}
 	}
 
-	if now := s.(*server.TestServer).Undrain(ctx, on); len(now) != 0 {
-		t.Fatalf("unexpected active drain modes: %v", now)
+	if !s.(*server.TestServer).PGServer().IsDraining() {
+		t.Fatal("server should be draining, but is not")
 	}
 }
 
@@ -144,7 +137,7 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params := base.TestServerArgs{Insecure: true}
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	host, port, err := net.SplitHostPort(s.ServingSQLAddr())
 	if err != nil {
@@ -200,13 +193,13 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 		// because we must wait (since we told the pgServer not to) until the
 		// connection registers the cancellation and closes itself.
 		testutils.SucceedsSoon(t, func() error {
-			if _, err := txn.Exec("SELECT 1"); err != driver.ErrBadConn {
+			if _, err := txn.Exec("SELECT 1"); !errors.Is(err, driver.ErrBadConn) {
 				return errors.Errorf("unexpected error: %v", err)
 			}
 			return nil
 		})
 
-		if err := txn.Commit(); err != driver.ErrBadConn {
+		if err := txn.Commit(); !errors.Is(err, driver.ErrBadConn) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
@@ -231,7 +224,8 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 		}
 
 		if err := txn.Commit(); err == nil ||
-			(err != driver.ErrBadConn && !strings.Contains(err.Error(), "connection reset by peer")) {
+			(!errors.Is(err, driver.ErrBadConn) &&
+				!strings.Contains(err.Error(), "connection reset by peer")) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
@@ -245,7 +239,7 @@ func TestPGUnwrapError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
@@ -262,7 +256,7 @@ func TestPGUnwrapError(t *testing.T) {
 	if _, err := db.Exec(stmt); err == nil {
 		t.Fatalf("expected %s to error", stmt)
 	} else {
-		if _, ok := err.(*pq.Error); !ok {
+		if !errors.HasType(err, (*pq.Error)(nil)) {
 			t.Fatalf("pgwire should be surfacing a pq.Error")
 		}
 	}
@@ -272,7 +266,7 @@ func TestPGPrepareFail(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
@@ -323,7 +317,7 @@ func TestPGPrepareWithCreateDropInTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
@@ -556,10 +550,10 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("users", "primary", false, 1, "username", "ASC", false, false),
 		}},
 		{"SHOW TABLES FROM system", []preparedQueryTest{
-			baseTest.Results("comments").Others(25),
+			baseTest.Results("public", "comments", "table").Others(26),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
-			baseTest.Results("crdb_internal").Others(3),
+			baseTest.Results("crdb_internal").Others(4),
 		}},
 		{"SHOW CONSTRAINTS FROM system.users", []preparedQueryTest{
 			baseTest.Results("users", "primary", "PRIMARY KEY", "PRIMARY KEY (username ASC)", true),
@@ -760,6 +754,12 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"SELECT $1::TIMETZ", []preparedQueryTest{
 			baseTest.SetArgs("12:00:00+0330").Results("0000-01-01T12:00:00+03:30"),
 		}},
+		{"SELECT $1::GEOGRAPHY", []preparedQueryTest{
+			baseTest.SetArgs("POINT(1.0 1.0)").Results("0101000020E6100000000000000000F03F000000000000F03F"),
+		}},
+		{"SELECT $1::GEOMETRY", []preparedQueryTest{
+			baseTest.SetArgs("POINT(1.0 1.0)").Results("0101000000000000000000F03F000000000000F03F"),
+		}},
 		{"SELECT $1:::FLOAT[]", []preparedQueryTest{
 			baseTest.SetArgs("{}").Results("{}"),
 			baseTest.SetArgs("{1.0,2.0,3.0}").Results("{1.0,2.0,3.0}"),
@@ -814,7 +814,7 @@ func TestPGPreparedQuery(t *testing.T) {
 	}
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
@@ -987,7 +987,7 @@ func (p preparedExecTest) RowsAffectedErr(err string) preparedExecTest {
 func TestPGPrepareDate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec("CREATE TABLE test (t TIMESTAMPTZ)"); err != nil {
 		t.Fatal(err)
@@ -1230,7 +1230,7 @@ func TestPGPreparedExec(t *testing.T) {
 	}
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	runTests := func(
 		t *testing.T, query string, tests []preparedExecTest, execFunc func(...interface{},
@@ -1291,7 +1291,7 @@ func TestPGPreparedExec(t *testing.T) {
 func TestPGPrepareNameQual(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
@@ -1342,7 +1342,7 @@ func TestPGPrepareNameQual(t *testing.T) {
 func TestPGPrepareInvalidate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
@@ -1407,7 +1407,7 @@ func TestPGPrepareInvalidate(t *testing.T) {
 func TestCmdCompleteVsEmptyStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(
 		t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
@@ -1451,7 +1451,7 @@ func TestCmdCompleteVsEmptyStatements(t *testing.T) {
 func TestPGCommandTags(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
@@ -1572,7 +1572,7 @@ func TestSQLNetworkMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Setup pgwire client.
 	pgURL, cleanupFn := sqlutils.PGUrl(
@@ -1666,7 +1666,7 @@ func TestPGWireOverUnixSocket(t *testing.T) {
 		SocketFile: socketFile,
 	}
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// We can't pass socket paths as url.Host to libpq, use ?host=/... instead.
 	options := url.Values{
@@ -1686,7 +1686,7 @@ func TestPGWireOverUnixSocket(t *testing.T) {
 func TestPGWireResultChange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()
@@ -1752,7 +1752,7 @@ func TestSessionParameters(t *testing.T) {
 	params := base.TestServerArgs{Insecure: true}
 	s, _, _ := serverutils.StartServer(t, params)
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
 	host, ports, _ := net.SplitHostPort(s.ServingSQLAddr())
@@ -1858,7 +1858,7 @@ func TestSessionParameters(t *testing.T) {
 type pgxTestLogger struct{}
 
 func (l pgxTestLogger) Log(level pgx.LogLevel, msg string, data map[string]interface{}) {
-	log.Infof(context.TODO(), "pgx log [%s] %s - %s", level, msg, data)
+	log.Infof(context.Background(), "pgx log [%s] %s - %s", level, msg, data)
 }
 
 // pgxTestLogger implements pgx.Logger.
@@ -1867,40 +1867,48 @@ var _ pgx.Logger = pgxTestLogger{}
 func TestCancelRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	params := base.TestServerArgs{Insecure: true}
-	s, _, _ := serverutils.StartServer(t, params)
+	testutils.RunTrueAndFalse(t, "insecure", func(t *testing.T, insecure bool) {
+		params := base.TestServerArgs{Insecure: insecure}
+		s, _, _ := serverutils.StartServer(t, params)
 
-	ctx := context.TODO()
-	defer s.Stopper().Stop(ctx)
+		ctx := context.Background()
+		defer s.Stopper().Stop(ctx)
 
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", s.ServingSQLAddr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
+		var d net.Dialer
+		conn, err := d.DialContext(ctx, "tcp", s.ServingSQLAddr())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
 
-	fe, err := pgproto3.NewFrontend(conn, conn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const versionCancel = 80877102
-	if err := fe.Send(&pgproto3.StartupMessage{ProtocolVersion: versionCancel}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fe.Receive(); err != io.EOF {
-		t.Fatalf("unexpected: %v", err)
-	}
-	if count := telemetry.GetRawFeatureCounts()["pgwire.unimplemented.cancel_request"]; count != 1 {
-		t.Fatalf("expected 1 cancel request, got %d", count)
-	}
+		// Reset telemetry so we get a deterministic count below.
+		_ = telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
+
+		fe, err := pgproto3.NewFrontend(conn, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// versionCancel is the special code sent as header for cancel requests.
+		// See: https://www.postgresql.org/docs/current/protocol-message-formats.html
+		// and the explanation in server.go.
+		const versionCancel = 80877102
+		if err := fe.Send(&pgproto3.StartupMessage{ProtocolVersion: versionCancel}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fe.Receive(); err != io.EOF {
+			t.Fatalf("unexpected: %v", err)
+		}
+		if count := telemetry.GetRawFeatureCounts()["pgwire.unimplemented.cancel_request"]; count != 1 {
+			t.Fatalf("expected 1 cancel request, got %d", count)
+		}
+	})
 }
 
 func TestFailPrepareFailsTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanupFn()

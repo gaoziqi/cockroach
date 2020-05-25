@@ -39,8 +39,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	"github.com/pkg/errors"
 )
 
 // TODO(tamird): why does rocksdb not link jemalloc,snappy statically?
@@ -115,13 +115,13 @@ func rocksDBLog(usePrimaryLog C.bool, sevLvl C.int, s *C.char, n C.int) {
 	ctx := logtags.AddTag(context.Background(), "rocksdb", nil)
 	switch sev {
 	case log.Severity_WARNING:
-		log.Warning(ctx, C.GoStringN(s, n))
+		log.Warningf(ctx, "%v", C.GoStringN(s, n))
 	case log.Severity_ERROR:
-		log.Error(ctx, C.GoStringN(s, n))
+		log.Errorf(ctx, "%v", C.GoStringN(s, n))
 	case log.Severity_FATAL:
-		log.Fatal(ctx, C.GoStringN(s, n))
+		log.Fatalf(ctx, "%v", C.GoStringN(s, n))
 	default:
-		log.Info(ctx, C.GoStringN(s, n))
+		log.Infof(ctx, "%v", C.GoStringN(s, n))
 	}
 }
 
@@ -740,7 +740,7 @@ func (r *RocksDB) Close() {
 		}
 		// Remove the temporary directory when the engine is in-memory.
 		if err := os.RemoveAll(r.auxDir); err != nil {
-			log.Warning(context.TODO(), err)
+			log.Warningf(context.TODO(), "%v", err)
 		}
 	} else {
 		log.Infof(context.TODO(), "closing rocksdb instance at %q", r.cfg.Dir)
@@ -1220,7 +1220,11 @@ func (r *RocksDB) GetStats() (*Stats, error) {
 		BloomFilterPrefixUseful:        int64(s.bloom_filter_prefix_useful),
 		MemtableTotalSize:              int64(s.memtable_total_size),
 		Flushes:                        int64(s.flushes),
+		FlushedBytes:                   int64(s.flush_bytes),
 		Compactions:                    int64(s.compactions),
+		IngestedBytes:                  0, // Not exposed by RocksDB.
+		CompactedBytesRead:             int64(s.compact_read_bytes),
+		CompactedBytesWritten:          int64(s.compact_write_bytes),
 		TableReadersMemEstimate:        int64(s.table_readers_mem_estimate),
 		PendingCompactionBytesEstimate: int64(s.pending_compaction_bytes_estimate),
 		L0FileCount:                    int64(s.l0_file_count),
@@ -3261,28 +3265,29 @@ func (r *RocksDB) WriteFile(filename string, data []byte) error {
 	return statusToError(C.DBEnvWriteFile(r.rdb, goToCSlice([]byte(filename)), goToCSlice(data)))
 }
 
-// DeleteFile deletes the file with the given filename from this RocksDB's env.
+// Remove deletes the file with the given filename from this RocksDB's env.
 // If the file with given filename doesn't exist, return os.ErrNotExist.
-func (r *RocksDB) DeleteFile(filename string) error {
+func (r *RocksDB) Remove(filename string) error {
 	if err := statusToError(C.DBEnvDeleteFile(r.rdb, goToCSlice([]byte(filename)))); err != nil {
 		return notFoundErrOrDefault(err)
 	}
 	return nil
 }
 
-// DeleteDirAndFiles deletes the directory and any files it contains but
+// RemoveDirAndFiles deletes the directory and any files it contains but
 // not subdirectories from this RocksDB's env. If dir does not exist,
 // return os.ErrNotExist.
-func (r *RocksDB) DeleteDirAndFiles(dir string) error {
+func (r *RocksDB) RemoveDirAndFiles(dir string) error {
 	if err := statusToError(C.DBEnvDeleteDirAndFiles(r.rdb, goToCSlice([]byte(dir)))); err != nil {
 		return notFoundErrOrDefault(err)
 	}
 	return nil
 }
 
-// LinkFile creates 'newname' as a hard link to 'oldname'. This use the Env responsible for the file
-// which may handle extra logic (eg: copy encryption settings for EncryptedEnv).
-func (r *RocksDB) LinkFile(oldname, newname string) error {
+// Link creates 'newname' as a hard link to 'oldname'. This use the Env
+// responsible for the file which may handle extra logic (eg: copy encryption
+// settings for EncryptedEnv).
+func (r *RocksDB) Link(oldname, newname string) error {
 	if err := statusToError(C.DBEnvLinkFile(r.rdb, goToCSlice([]byte(oldname)), goToCSlice([]byte(newname)))); err != nil {
 		return &os.LinkError{
 			Op:  "link",
@@ -3465,13 +3470,13 @@ func (f *rocksdbDirectory) ReadAt(p []byte, off int64) (n int, err error) {
 
 var _ fs.FS = &RocksDB{}
 
-// CreateFile implements the FS interface.
-func (r *RocksDB) CreateFile(name string) (fs.File, error) {
-	return r.CreateFileWithSync(name, 0)
+// Create implements the FS interface.
+func (r *RocksDB) Create(name string) (fs.File, error) {
+	return r.CreateWithSync(name, 0)
 }
 
-// CreateFileWithSync implements the FS interface.
-func (r *RocksDB) CreateFileWithSync(name string, bytesPerSync int) (fs.File, error) {
+// CreateWithSync implements the FS interface.
+func (r *RocksDB) CreateWithSync(name string, bytesPerSync int) (fs.File, error) {
 	var file C.DBWritableFile
 	if err := statusToError(C.DBEnvOpenFile(
 		r.rdb, goToCSlice([]byte(name)), C.uint64_t(bytesPerSync), &file)); err != nil {
@@ -3480,8 +3485,8 @@ func (r *RocksDB) CreateFileWithSync(name string, bytesPerSync int) (fs.File, er
 	return &rocksdbWritableFile{file: file, rdb: r.rdb}, nil
 }
 
-// OpenFile implements the FS interface.
-func (r *RocksDB) OpenFile(name string) (fs.File, error) {
+// Open implements the FS interface.
+func (r *RocksDB) Open(name string) (fs.File, error) {
 	var file C.DBReadableFile
 	if err := statusToError(C.DBEnvOpenReadableFile(r.rdb, goToCSlice([]byte(name)), &file)); err != nil {
 		return nil, notFoundErrOrDefault(err)
@@ -3498,23 +3503,23 @@ func (r *RocksDB) OpenDir(name string) (fs.File, error) {
 	return &rocksdbDirectory{file: file, rdb: r.rdb}, nil
 }
 
-// RenameFile implements the FS interface.
-func (r *RocksDB) RenameFile(oldname, newname string) error {
+// Rename implements the FS interface.
+func (r *RocksDB) Rename(oldname, newname string) error {
 	return statusToError(C.DBEnvRenameFile(r.rdb, goToCSlice([]byte(oldname)), goToCSlice([]byte(newname))))
 }
 
-// CreateDir implements the FS interface.
-func (r *RocksDB) CreateDir(name string) error {
+// MkdirAll implements the FS interface.
+func (r *RocksDB) MkdirAll(name string) error {
 	return statusToError(C.DBEnvCreateDir(r.rdb, goToCSlice([]byte(name))))
 }
 
-// DeleteDir implements the FS interface.
-func (r *RocksDB) DeleteDir(name string) error {
+// RemoveDir implements the FS interface.
+func (r *RocksDB) RemoveDir(name string) error {
 	return statusToError(C.DBEnvDeleteDir(r.rdb, goToCSlice([]byte(name))))
 }
 
-// ListDir implements the FS interface.
-func (r *RocksDB) ListDir(name string) ([]string, error) {
+// List implements the FS interface.
+func (r *RocksDB) List(name string) ([]string, error) {
 	list := C.DBEnvListDir(r.rdb, goToCSlice([]byte(name)))
 	n := list.n
 	names := list.names

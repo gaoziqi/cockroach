@@ -10,7 +10,6 @@ package importccl
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -29,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 func descForTable(
@@ -69,7 +69,7 @@ func descForTable(
 	} else {
 		stmt = parsed[0].AST.(*tree.CreateTable)
 	}
-	table, err := MakeSimpleTableDescriptor(context.TODO(), settings, stmt, parent, id, fks, nanos)
+	table, err := MakeSimpleTableDescriptor(context.Background(), settings, stmt, parent, id, fks, nanos)
 	if err != nil {
 		t.Fatalf("could not interpret %q: %v", create, err)
 	}
@@ -85,6 +85,7 @@ var testEvalCtx = &tree.EvalContext{
 	},
 	StmtTimestamp: timeutil.Unix(100000000, 0),
 	Settings:      cluster.MakeTestingClusterSettings(),
+	Codec:         keys.SystemSQLCodec,
 }
 
 // Value generator represents a value of some data at specified row/col.

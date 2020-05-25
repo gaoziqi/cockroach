@@ -11,25 +11,24 @@
 package sqlsmith
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
 func typeFromName(name string) *types.T {
-	typ, err := parser.ParseType(name)
+	typRef, err := parser.ParseType(name)
 	if err != nil {
 		panic(errors.AssertionFailedf("failed to parse type: %v", name))
 	}
-	return typ
+	return tree.MustBeStaticallyKnownType(typRef)
 }
 
 // pickAnyType returns a concrete type if typ is types.Any or types.AnyArray,
 // otherwise typ.
-func (s *Smither) pickAnyType(typ *types.T) (_ *types.T, ok bool) {
+func (s *Smither) pickAnyType(typ *types.T) *types.T {
 	switch typ.Family() {
 	case types.AnyFamily:
 		typ = s.randType()
@@ -38,39 +37,15 @@ func (s *Smither) pickAnyType(typ *types.T) (_ *types.T, ok bool) {
 			typ = sqlbase.RandArrayContentsType(s.rnd)
 		}
 	}
-	return typ, s.allowedType(typ)
+	return typ
 }
 
 func (s *Smither) randScalarType() *types.T {
-	for {
-		t := sqlbase.RandScalarType(s.rnd)
-		if !s.allowedType(t) {
-			continue
-		}
-		return t
-	}
+	return sqlbase.RandScalarType(s.rnd)
 }
 
 func (s *Smither) randType() *types.T {
-	for {
-		t := sqlbase.RandType(s.rnd)
-		if !s.allowedType(t) {
-			continue
-		}
-		return t
-	}
-}
-
-// allowedType returns whether t is ok to be used. This is useful to filter
-// out undesirable types to enable certain execution paths to be taken (like
-// vectorization).
-func (s *Smither) allowedType(types ...*types.T) bool {
-	for _, t := range types {
-		if s.vectorizable && typeconv.FromColumnType(t) == coltypes.Unhandled {
-			return false
-		}
-	}
-	return true
+	return sqlbase.RandType(s.rnd)
 }
 
 func (s *Smither) makeDesiredTypes() []*types.T {

@@ -159,7 +159,6 @@ var typingFuncMap map[opt.Operator]typingFunc
 
 func init() {
 	typingFuncMap = make(map[opt.Operator]typingFunc)
-	typingFuncMap[opt.ConstOp] = typeAsTypedExpr
 	typingFuncMap[opt.PlaceholderOp] = typeAsTypedExpr
 	typingFuncMap[opt.UnsupportedExprOp] = typeAsTypedExpr
 	typingFuncMap[opt.CoalesceOp] = typeCoalesce
@@ -361,7 +360,7 @@ func typeSubquery(e opt.ScalarExpr) *types.T {
 func typeColumnAccess(e opt.ScalarExpr) *types.T {
 	colAccess := e.(*ColumnAccessExpr)
 	typ := colAccess.Input.DataType()
-	return &typ.TupleContents()[colAccess.Idx]
+	return typ.TupleContents()[colAccess.Idx]
 }
 
 // FindBinaryOverload finds the correct type signature overload for the

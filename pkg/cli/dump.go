@@ -20,12 +20,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
@@ -39,13 +43,45 @@ var dumpCmd = &cobra.Command{
 Dump SQL tables of a cockroach database. If the table name
 is omitted, dump all tables in the database.
 `,
-	Args: cobra.MinimumNArgs(1),
 	RunE: MaybeDecorateGRPCError(runDump),
 }
 
 // We accept versions that are strictly newer than v2.1.0-alpha.20180416
 // (hence the "-0" at the end).
 var verDump = version.MustParse("v2.1.0-alpha.20180416-0")
+
+// databasesNamesExtractor extracts list of available databases to dump
+func databasesNamesExtractor(conn *sqlConn) ([]string, error) {
+	var dbNames []string
+
+	maxReservedDescID, err := driver.Int32.ConvertValue(keys.MaxReservedDescID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := conn.Query(`SELECT name FROM system.namespace WHERE id > $1 AND "parentID" = 0`, []driver.Value{maxReservedDescID})
+	if err != nil {
+		return nil, err
+	}
+
+	vals := make([]driver.Value, 1)
+	for {
+		if err := rows.Next(vals); err == io.EOF {
+			break
+		}
+
+		if name, ok := vals[0].(string); ok {
+			dbNames = append(dbNames, name)
+		} else {
+			return nil, fmt.Errorf("unexpected value: %T", name)
+		}
+	}
+
+	// sort to get deterministic output of ordered database names
+	sort.Strings(dbNames)
+
+	return dbNames, nil
+}
 
 // runDumps performs a dump of a table or database.
 //
@@ -62,81 +98,112 @@ func runDump(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	dbName := args[0]
+	var dbNames []string
+	if dumpCtx.dumpAll && len(args) != 0 {
+		return fmt.Errorf("cannot specify --%s and a specific database at the same time", cliflags.DumpAll.Name)
+	}
+
+	if len(args) != 0 {
+		dbNames = append(dbNames, args[0])
+	} else if dumpCtx.dumpAll {
+		dbNames, err = databasesNamesExtractor(conn)
+		if err != nil {
+			return err
+		}
+	}
+
 	var tableNames []string
 	if len(args) > 1 {
 		tableNames = args[1:]
 	}
 
-	mds, ts, err := getDumpMetadata(conn, dbName, tableNames, dumpCtx.asOf)
-	if err != nil {
-		return err
-	}
-
-	byID := make(map[int64]basicMetadata)
-	for _, md := range mds {
-		byID[md.ID] = md
-	}
-
-	// First sort by name to guarantee stable output.
-	sort.Slice(mds, func(i, j int) bool {
-		return mds[i].name.String() < mds[j].name.String()
-	})
-
-	// Collect transitive dependencies in topological order into collected.
-	var collected []int64
-	seen := make(map[int64]bool)
-	for _, md := range mds {
-		collect(md.ID, byID, seen, &collected)
-	}
-	// collectOrder maps a table ID to its collection index. This is needed
-	// instead of just using range over collected because collected may contain
-	// table IDs not present in the dump spec. It is simpler to sort mds correctly
-	// to skip over these referenced-but-not-dumped tables.
-	collectOrder := make(map[int64]int)
-	for i, id := range collected {
-		collectOrder[id] = i
-	}
-
-	// Second sort dumped tables by dependency order.
-	sort.SliceStable(mds, func(i, j int) bool {
-		return collectOrder[mds[i].ID] < collectOrder[mds[j].ID]
-	})
-
+	var fullMds []basicMetadata
 	w := os.Stdout
 
-	if dumpCtx.dumpMode != dumpDataOnly {
-		for i, md := range mds {
-			if i > 0 {
-				fmt.Fprintln(w)
-			}
-			if err := dumpCreateTable(w, md); err != nil {
+	for _, dbName := range dbNames {
+		mds, err := getDumpMetadata(conn, dbName, tableNames, dumpCtx.asOf)
+		if err != nil {
+			return err
+		}
+
+		if len(mds) == 0 {
+			continue
+		}
+
+		byID := make(map[int64]basicMetadata)
+		for _, md := range mds {
+			byID[md.ID] = md
+		}
+
+		// First sort by name to guarantee stable output.
+		sort.Slice(mds, func(i, j int) bool {
+			return mds[i].name.String() < mds[j].name.String()
+		})
+
+		// Collect transitive dependencies in topological order into collected.
+		// The topological order is essential here since it captures dependencies
+		// for views and sequences creation, hence simple alphabetical sort won't
+		// be enough.
+		var collected []int64
+		seen := make(map[int64]bool)
+		for _, md := range mds {
+			collect(md.ID, byID, seen, &collected)
+		}
+		// collectOrder maps a table ID to its collection index. This is needed
+		// instead of just using range over collected because collected may contain
+		// table IDs not present in the dump spec. It is simpler to sort mds correctly
+		// to skip over these referenced-but-not-dumped tables.
+		collectOrder := make(map[int64]int)
+		for i, id := range collected {
+			collectOrder[id] = i
+		}
+
+		// Second sort dumped tables by dependency order.
+		sort.SliceStable(mds, func(i, j int) bool {
+			return collectOrder[mds[i].ID] < collectOrder[mds[j].ID]
+		})
+
+		if dumpCtx.dumpAll && dumpCtx.dumpMode != dumpDataOnly {
+			if _, err := fmt.Fprintf(w, "\nCREATE DATABASE IF NOT EXISTS %s;\nUSE %s;\n\n", dbName, dbName); err != nil {
 				return err
 			}
 		}
-	}
-	if dumpCtx.dumpMode != dumpSchemaOnly {
-		for _, md := range mds {
-			switch md.kind {
-			case "table":
-				if err := dumpTableData(w, conn, ts, md); err != nil {
+
+		if dumpCtx.dumpMode != dumpDataOnly {
+			for i, md := range mds {
+				if i > 0 {
+					fmt.Fprintln(w)
+				}
+				if err := dumpCreateTable(w, md); err != nil {
 					return err
 				}
-			case "sequence":
-				if err := dumpSequenceData(w, conn, ts, md); err != nil {
-					return err
-				}
-			case "view":
-				continue
-			default:
-				panic("unknown descriptor type: " + md.kind)
 			}
 		}
+		if dumpCtx.dumpMode != dumpSchemaOnly {
+			for _, md := range mds {
+				switch md.kind {
+				case "table":
+					if err := dumpTableData(w, conn, md); err != nil {
+						return err
+					}
+				case "sequence":
+					if err := dumpSequenceData(w, conn, md); err != nil {
+						return err
+					}
+				case "view":
+					continue
+				default:
+					panic("unknown descriptor type: " + md.kind)
+				}
+			}
+		}
+		fullMds = append(fullMds, mds...)
 	}
+
 	// Put FK ALTERs at the end.
 	if dumpCtx.dumpMode != dumpDataOnly {
 		hasRefs := false
-		for _, md := range mds {
+		for _, md := range fullMds {
 			for _, alter := range md.alter {
 				if !hasRefs {
 					hasRefs = true
@@ -152,7 +219,7 @@ func runDump(cmd *cobra.Command, args []string) error {
 			if _, err := w.Write([]byte("\n" + alterValidateMessage + "\n")); err != nil {
 				return err
 			}
-			for _, md := range mds {
+			for _, md := range fullMds {
 				for _, validate := range md.validate {
 					fmt.Fprintf(w, "%s;\n", validate)
 				}
@@ -185,6 +252,7 @@ type basicMetadata struct {
 	kind       string // "string", "table", or "view"
 	alter      []string
 	validate   []string
+	ts         string
 }
 
 // tableMetadata describes one table to dump.
@@ -200,17 +268,18 @@ type tableMetadata struct {
 // retrieved.
 func getDumpMetadata(
 	conn *sqlConn, dbName string, tableNames []string, asOf string,
-) (mds []basicMetadata, clusterTS string, err error) {
+) (mds []basicMetadata, err error) {
+	var clusterTS string
 	if asOf == "" {
 		vals, err := conn.QueryRow("SELECT cluster_logical_timestamp()", nil)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		clusterTS = string(vals[0].([]byte))
 	} else {
 		// Validate the timestamp. This prevents SQL injection.
 		if _, err := tree.ParseDTimestamp(nil, asOf, time.Nanosecond); err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		clusterTS = asOf
 	}
@@ -218,7 +287,7 @@ func getDumpMetadata(
 	if tableNames == nil {
 		tableNames, err = getTableNames(conn, dbName, clusterTS)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 	}
 
@@ -226,12 +295,12 @@ func getDumpMetadata(
 	for i, tableName := range tableNames {
 		basicMD, err := getBasicMetadata(conn, dbName, tableName, clusterTS)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		mds[i] = basicMD
 	}
 
-	return mds, clusterTS, nil
+	return mds, nil
 }
 
 // getTableNames retrieves all tables names in the given database.
@@ -352,6 +421,7 @@ func getBasicMetadata(conn *sqlConn, dbName, tableName string, ts string) (basic
 		kind:       kind,
 		alter:      alterStatements,
 		validate:   validateStatements,
+		ts:         ts,
 	}
 
 	return md, nil
@@ -373,16 +443,11 @@ func extractArray(val interface{}) ([]string, error) {
 	return res, nil
 }
 
-func getMetadataForTable(conn *sqlConn, md basicMetadata, ts string) (tableMetadata, error) {
-	// Fetch column types.
-	//
-	// TODO(knz): this approach is flawed, see #28948.
-
-	makeQuery := func(colname string) string {
-		// This query is parameterized by the column name because of
-		// 2.0/2.1beta/2.1 trans-version compatibility requirements.  See
-		// below for details.
-		return fmt.Sprintf(`
+func makeMetadataQuery(md basicMetadata, columnName string) string {
+	// This query is parameterized by the column name because of
+	// 2.0/2.1beta/2.1 trans-version compatibility requirements.  See
+	// below for details.
+	return fmt.Sprintf(`
 		SELECT COLUMN_NAME, %s
 		FROM %s.information_schema.columns
 		AS OF SYSTEM TIME %s
@@ -390,9 +455,15 @@ func getMetadataForTable(conn *sqlConn, md basicMetadata, ts string) (tableMetad
 			AND TABLE_SCHEMA = $2
 			AND TABLE_NAME = $3
 			AND GENERATION_EXPRESSION = ''
-		`, colname, &md.name.CatalogName, lex.EscapeSQLString(ts))
+		`, columnName, &md.name.CatalogName, lex.EscapeSQLString(md.ts))
+}
+
+func fetchColumnsNamesAndTypes(conn *sqlConn, md basicMetadata, noHidden bool) (*sqlRows, error) {
+	query := makeMetadataQuery(md, "CRDB_SQL_TYPE")
+	if noHidden {
+		query = query + ` AND IS_HIDDEN = 'NO'`
 	}
-	rows, err := conn.Query(makeQuery("CRDB_SQL_TYPE")+` AND IS_HIDDEN = 'NO'`,
+	rows, err := conn.Query(query,
 		[]driver.Value{md.name.Catalog(), md.name.Schema(), md.name.Table()})
 	if err != nil {
 		// IS_HIDDEN was introduced in the first 2.1 beta. CRDB_SQL_TYPE
@@ -406,20 +477,28 @@ func getMetadataForTable(conn *sqlConn, md basicMetadata, ts string) (tableMetad
 			// information_schema.columns. When it does not exist,
 			// information_schema.columns.data_type contains a usable SQL
 			// type name instead. Use that.
-			rows, err = conn.Query(makeQuery("DATA_TYPE")+` AND IS_HIDDEN = 'NO'`,
+			query := makeMetadataQuery(md, "DATA_TYPE")
+			if noHidden {
+				query = query + ` AND IS_HIDDEN = 'NO'`
+			}
+			rows, err = conn.Query(query,
 				[]driver.Value{md.name.Catalog(), md.name.Schema(), md.name.Table()})
 		}
 		if strings.Contains(err.Error(), "column \"is_hidden\" does not exist") {
 			// Pre-2.1 IS_HIDDEN did not exist in information_schema.columns.
 			// When it does not exist, information_schema.columns only returns
 			// non-hidden columns so we can still use that.
-			rows, err = conn.Query(makeQuery("DATA_TYPE"),
+			rows, err = conn.Query(makeMetadataQuery(md, "DATA_TYPE"),
 				[]driver.Value{md.name.Catalog(), md.name.Schema(), md.name.Table()})
 		}
 		if err != nil {
-			return tableMetadata{}, err
+			return nil, err
 		}
 	}
+	return rows, err
+}
+
+func constructTableMetadata(rows *sqlRows, md basicMetadata) (tableMetadata, error) {
 	vals := make([]driver.Value, 2)
 	coltypes := make(map[string]*types.T)
 	colnames := tree.NewFmtCtx(tree.FmtSimple)
@@ -441,13 +520,17 @@ func getMetadataForTable(conn *sqlConn, md basicMetadata, ts string) (tableMetad
 		}
 
 		// Transform the type name to an internal coltype.
-		sql := fmt.Sprintf("ALTER TABLE woo ALTER COLUMN woo SET DATA TYPE %s", typ)
+		sql := fmt.Sprintf("CREATE TABLE woo (x %s)", typ)
 		stmt, err := parser.ParseOne(sql)
 		if err != nil {
 			return tableMetadata{}, fmt.Errorf("type %s is not a valid CockroachDB type", typ)
 		}
-		coltyp := stmt.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAlterColumnType).ToType
+		ref := stmt.AST.(*tree.CreateTable).Defs[0].(*tree.ColumnTableDef).Type
 
+		coltyp, ok := tree.GetStaticallyKnownType(ref)
+		if !ok {
+			return tableMetadata{}, unimplemented.NewWithIssue(47765, "user defined types are unsupported")
+		}
 		coltypes[name] = coltyp
 		if colnames.Len() > 0 {
 			colnames.WriteString(", ")
@@ -466,6 +549,32 @@ func getMetadataForTable(conn *sqlConn, md basicMetadata, ts string) (tableMetad
 	}, nil
 }
 
+func getMetadataForTable(conn *sqlConn, md basicMetadata) (tableMetadata, error) {
+	// Fetch column types.
+	//
+	// TODO(knz): this approach is flawed, see #28948.
+
+	rows, err := fetchColumnsNamesAndTypes(conn, md, true)
+	if err != nil {
+		return tableMetadata{}, err
+	}
+
+	metadata, err := constructTableMetadata(rows, md)
+	if err != nil {
+		return tableMetadata{}, err
+	}
+
+	if len(metadata.columnNames) == 0 {
+		rows, err := fetchColumnsNamesAndTypes(conn, md, false)
+		if err != nil {
+			return tableMetadata{}, err
+		}
+
+		return constructTableMetadata(rows, md)
+	}
+	return metadata, err
+}
+
 // dumpCreateTable dumps the CREATE statement of the specified table to w.
 func dumpCreateTable(w io.Writer, md basicMetadata) error {
 	if _, err := w.Write([]byte(md.createStmt)); err != nil {
@@ -482,11 +591,11 @@ const (
 	insertRows = 100
 )
 
-func dumpSequenceData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetadata) error {
+func dumpSequenceData(w io.Writer, conn *sqlConn, bmd basicMetadata) error {
 	// Get sequence value.
 	vals, err := conn.QueryRow(fmt.Sprintf(
 		"SELECT last_value FROM %s AS OF SYSTEM TIME %s",
-		bmd.name, lex.EscapeSQLString(clusterTS),
+		bmd.name, lex.EscapeSQLString(bmd.ts),
 	), nil)
 	if err != nil {
 		return err
@@ -507,7 +616,7 @@ func dumpSequenceData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMet
 		&bmd.name.CatalogName,
 		lex.EscapeSQLString(bmd.name.Schema()),
 		lex.EscapeSQLString(bmd.name.Table()),
-		lex.EscapeSQLString(clusterTS),
+		lex.EscapeSQLString(bmd.ts),
 	), nil)
 	if err != nil {
 		return err
@@ -530,30 +639,16 @@ func dumpSequenceData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMet
 }
 
 // dumpTableData dumps the data of the specified table to w.
-func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetadata) error {
-	md, err := getMetadataForTable(conn, bmd, clusterTS)
+func dumpTableData(w io.Writer, conn *sqlConn, bmd basicMetadata) error {
+	md, err := getMetadataForTable(conn, bmd)
 	if err != nil {
 		return err
 	}
-
-	if strings.TrimSpace(md.columnNames) == "" {
-		// A table with no columns may still have one or more rows. In
-		// fact, it can have arbitrary many rows, each with a different
-		// (hidden) PK value. Unfortunately, the dump command today simply
-		// omits the hidden PKs from the dump, so it is not possible to
-		// restore the invisible values.
-		// Instead of failing with an incomprehensible error below, inform
-		// the user more clearly.
-		err := errors.Newf("table %q has no visible columns", tree.ErrString(bmd.name))
-		err = errors.WithHint(err, "To proceed with the dump, either omit this table from the list of tables to dump, drop the table, or add some visible columns.")
-		err = errors.WithIssueLink(err, errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/37768"})
-		return err
-	}
-
+	var collationEnv tree.CollationEnvironment
 	bs := fmt.Sprintf("SELECT %s FROM %s AS OF SYSTEM TIME %s ORDER BY PRIMARY KEY %[2]s",
 		md.columnNames,
 		md.name,
-		lex.EscapeSQLString(clusterTS),
+		lex.EscapeSQLString(md.ts),
 	)
 	inserts := make([]string, 0, insertRows)
 	rows, err := conn.Query(bs, nil)
@@ -620,7 +715,17 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 				case float64:
 					d = tree.NewDFloat(tree.DFloat(t))
 				case string:
-					d = tree.NewDString(t)
+					switch ct := md.columnTypes[cols[si]]; ct.Family() {
+					case types.StringFamily:
+						d = tree.NewDString(t)
+					case types.CollatedStringFamily:
+						d, err = tree.NewDCollatedString(t, ct.Locale(), &collationEnv)
+						if err != nil {
+							return err
+						}
+					default:
+						return errors.AssertionFailedf("unknown string type %s", ct)
+					}
 				case []byte:
 					// TODO(knz): this approach is brittle+flawed, see #28948.
 					switch ct := md.columnTypes[cols[si]]; ct.Family() {
@@ -638,6 +743,16 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 						}
 					case types.INetFamily:
 						d, err = tree.ParseDIPAddrFromINetString(string(t))
+						if err != nil {
+							return err
+						}
+					case types.GeographyFamily:
+						d, err = tree.ParseDGeography(string(t))
+						if err != nil {
+							return err
+						}
+					case types.GeometryFamily:
+						d, err = tree.ParseDGeometry(string(t))
 						if err != nil {
 							return err
 						}
@@ -683,13 +798,19 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 						}
 					case types.TimeFamily:
 						// pq awkwardly represents TIME as a time.Time with date 0000-01-01.
-						d = tree.MakeDTime(timeofday.FromTime(t))
+						d = tree.MakeDTime(timeofday.FromTimeAllow2400(t))
 					case types.TimeTZFamily:
-						d = tree.NewDTimeTZFromTime(t)
+						d = tree.NewDTimeTZ(timetz.MakeTimeTZFromTimeAllow2400(t))
 					case types.TimestampFamily:
-						d = tree.MakeDTimestamp(t, time.Nanosecond)
+						d, err = tree.MakeDTimestamp(t, time.Nanosecond)
+						if err != nil {
+							return err
+						}
 					case types.TimestampTZFamily:
-						d = tree.MakeDTimestampTZ(t, time.Nanosecond)
+						d, err = tree.MakeDTimestampTZ(t, time.Nanosecond)
+						if err != nil {
+							return err
+						}
 					default:
 						return errors.Errorf("unknown timestamp type: %s, %v: %s", t, cols[si], md.columnTypes[cols[si]])
 					}
@@ -725,7 +846,7 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 }
 
 func writeInserts(w io.Writer, tmd tableMetadata, inserts []string) {
-	fmt.Fprintf(w, "\nINSERT INTO %s (%s) VALUES", &tmd.name.TableName, tmd.columnNames)
+	fmt.Fprintf(w, "\nINSERT INTO %s (%s) VALUES", &tmd.name.ObjectName, tmd.columnNames)
 	for idx, values := range inserts {
 		if idx > 0 {
 			fmt.Fprint(w, ",")

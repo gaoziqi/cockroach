@@ -13,12 +13,12 @@ package kvserver
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
@@ -92,7 +92,7 @@ func maybeSideloadEntriesImpl(
 			cmdID, data := DecodeRaftCommand(ent.Data) // cheap
 
 			// Unmarshal the command into an object that we can mutate.
-			var strippedCmd storagepb.RaftCommand
+			var strippedCmd kvserverpb.RaftCommand
 			if err := protoutil.Unmarshal(data, &strippedCmd); err != nil {
 				return nil, 0, err
 			}
@@ -113,7 +113,7 @@ func maybeSideloadEntriesImpl(
 			{
 				data := make([]byte, raftCommandPrefixLen+strippedCmd.Size())
 				encodeRaftCommandPrefix(data[:raftCommandPrefixLen], raftVersionSideloaded, cmdID)
-				_, err := protoutil.MarshalToWithoutFuzzing(&strippedCmd, data[raftCommandPrefixLen:])
+				_, err := protoutil.MarshalTo(&strippedCmd, data[raftCommandPrefixLen:])
 				if err != nil {
 					return nil, 0, errors.Wrap(err, "while marshaling stripped sideloaded command")
 				}
@@ -172,7 +172,7 @@ func maybeInlineSideloadedRaftCommand(
 	// Out of luck, for whatever reason the inlined proposal isn't in the cache.
 	cmdID, data := DecodeRaftCommand(ent.Data)
 
-	var command storagepb.RaftCommand
+	var command kvserverpb.RaftCommand
 	if err := protoutil.Unmarshal(data, &command); err != nil {
 		return nil, err
 	}
@@ -193,7 +193,7 @@ func maybeInlineSideloadedRaftCommand(
 	{
 		data := make([]byte, raftCommandPrefixLen+command.Size())
 		encodeRaftCommandPrefix(data[:raftCommandPrefixLen], raftVersionSideloaded, cmdID)
-		_, err := protoutil.MarshalToWithoutFuzzing(&command, data[raftCommandPrefixLen:])
+		_, err := protoutil.MarshalTo(&command, data[raftCommandPrefixLen:])
 		if err != nil {
 			return nil, err
 		}
@@ -211,10 +211,10 @@ func assertSideloadedRaftCommandInlined(ctx context.Context, ent *raftpb.Entry) 
 		return
 	}
 
-	var command storagepb.RaftCommand
+	var command kvserverpb.RaftCommand
 	_, data := DecodeRaftCommand(ent.Data)
 	if err := protoutil.Unmarshal(data, &command); err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 
 	if len(command.ReplicatedEvalResult.AddSSTable.Data) == 0 {
@@ -232,7 +232,7 @@ func maybePurgeSideloaded(
 	var totalSize int64
 	for i := firstIndex; i <= lastIndex; i++ {
 		size, err := ss.Purge(ctx, i, term)
-		if err != nil && errors.Cause(err) != errSideloadedFileNotFound {
+		if err != nil && !errors.Is(err, errSideloadedFileNotFound) {
 			return totalSize, err
 		}
 		totalSize += size

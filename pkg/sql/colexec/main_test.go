@@ -17,8 +17,12 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -28,14 +32,15 @@ import (
 
 var (
 	// testAllocator is an Allocator with an unlimited budget for use in tests.
-	testAllocator *Allocator
+	testAllocator     *colmem.Allocator
+	testColumnFactory coldata.ColumnFactory
 
 	// testMemMonitor and testMemAcc are a test monitor with an unlimited budget
 	// and a memory account bound to it for use in tests.
 	testMemMonitor *mon.BytesMonitor
 	testMemAcc     *mon.BoundAccount
 
-	// testDiskMonitor and testDiskmAcc are a test monitor with an unlimited budget
+	// testDiskMonitor and testDiskAcc are a test monitor with an unlimited budget
 	// and a disk account bound to it for use in tests.
 	testDiskMonitor *mon.BytesMonitor
 	testDiskAcc     *mon.BoundAccount
@@ -45,35 +50,42 @@ func TestMain(m *testing.M) {
 	randutil.SeedForTests()
 	os.Exit(func() int {
 		ctx := context.Background()
-		testMemMonitor = execinfra.NewTestMemMonitor(ctx, cluster.MakeTestingClusterSettings())
+		st := cluster.MakeTestingClusterSettings()
+		testMemMonitor = execinfra.NewTestMemMonitor(ctx, st)
 		defer testMemMonitor.Stop(ctx)
 		memAcc := testMemMonitor.MakeBoundAccount()
 		testMemAcc = &memAcc
-		testAllocator = NewAllocator(ctx, testMemAcc)
+		evalCtx := tree.MakeTestingEvalContext(st)
+		testColumnFactory = coldataext.NewExtendedColumnFactory(&evalCtx)
+		testAllocator = colmem.NewAllocator(ctx, testMemAcc, testColumnFactory)
 		defer testMemAcc.Close(ctx)
 
-		testDiskMonitor = execinfra.NewTestDiskMonitor(ctx, cluster.MakeTestingClusterSettings())
+		testDiskMonitor = execinfra.NewTestDiskMonitor(ctx, st)
 		defer testDiskMonitor.Stop(ctx)
 		diskAcc := testDiskMonitor.MakeBoundAccount()
 		testDiskAcc = &diskAcc
 		defer testDiskAcc.Close(ctx)
 
-		// Pick a random batch size in [coldata.MinBatchSize, coldata.MaxBatchSize]
+		// Pick a random batch size in [minBatchSize, coldata.MaxBatchSize]
 		// range. The randomization can be disabled using COCKROACH_RANDOMIZE_BATCH_SIZE=false.
 		randomBatchSize := generateBatchSize()
 		fmt.Printf("coldata.BatchSize() is set to %d\n", randomBatchSize)
-		coldata.SetBatchSizeForTests(randomBatchSize)
+		if err := coldata.SetBatchSizeForTests(randomBatchSize); err != nil {
+			colexecerror.InternalError(err)
+		}
 		return m.Run()
 	}())
 }
+
+// minBatchSize is the minimum acceptable size of batches for tests in this
+// package.
+const minBatchSize = 3
 
 func generateBatchSize() int {
 	randomizeBatchSize := envutil.EnvOrDefaultBool("COCKROACH_RANDOMIZE_BATCH_SIZE", true)
 	if randomizeBatchSize {
 		rng, _ := randutil.NewPseudoRand()
-		batchSize := coldata.MinBatchSize +
-			rng.Intn(coldata.MaxBatchSize-coldata.MinBatchSize)
-		return batchSize
+		return minBatchSize + rng.Intn(coldata.MaxBatchSize-minBatchSize)
 	}
 	return coldata.BatchSize()
 }

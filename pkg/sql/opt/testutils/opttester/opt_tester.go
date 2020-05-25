@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"math"
 	"path/filepath"
 	"runtime"
@@ -44,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/pmezard/go-difflib/difflib"
@@ -178,7 +180,7 @@ type Flags struct {
 	Database string
 
 	// Table specifies the current table to use for the command. This field
-	// is only used by the stats command.
+	// is only used by the stats and inject-stats commands.
 	Table string
 
 	// SaveTablesPrefix specifies the prefix of the table to create or print
@@ -188,6 +190,9 @@ type Flags struct {
 	// File specifies the name of the file to import. This field is only used by
 	// the import command.
 	File string
+
+	// CascadeLevels limits the depth of recursive cascades for build-cascades.
+	CascadeLevels int
 }
 
 // New constructs a new instance of the OptTester for the given SQL statement.
@@ -204,7 +209,10 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	// Set any OptTester-wide session flags here.
 
 	ot.evalCtx.SessionData.ZigzagJoinEnabled = true
-	ot.evalCtx.SessionData.OptimizerFKs = true
+	ot.evalCtx.SessionData.OptimizerFKChecks = true
+	ot.evalCtx.SessionData.OptimizerFKCascades = true
+	ot.evalCtx.SessionData.OptimizerUseHistograms = true
+	ot.evalCtx.SessionData.OptimizerUseMultiColStats = true
 	ot.evalCtx.SessionData.ReorderJoinsLimit = opt.DefaultJoinOrderLimit
 	ot.evalCtx.SessionData.InsertFastPath = true
 
@@ -235,6 +243,11 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    Builds an expression tree from a SQL query, fully optimizes it using the
 //    memo, and then outputs the lowest cost tree.
 //
+//  - build-cascades [flags]
+//
+//    Builds a query and then recursively builds cascading queries. Outputs all
+//    unoptimized plans.
+//
 //  - optsteps [flags]
 //
 //    Outputs the lowest cost tree for each step in optimization using the
@@ -259,6 +272,12 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    Builds an expression directly from an opt-gen-like string; see
 //    exprgen.Build.
 //
+//  - exprnorm
+//
+//    Builds an expression directly from an opt-gen-like string (see
+//    exprgen.Build), applies normalization optimizations, and outputs the tree
+//    without any exploration optimizations applied to it.
+//
 //  - save-tables [flags]
 //
 //    Fully optimizes the given query and saves the subexpressions as tables
@@ -266,7 +285,7 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    If rewriteActualFlag=true, also executes the given query against a
 //    running database and saves the intermediate results as tables.
 //
-//  - stats [flags]
+//  - stats table=... [flags]
 //
 //    Compares estimated statistics for a relational expression with the actual
 //    statistics calculated by calling CREATE STATISTICS on the output of the
@@ -274,7 +293,7 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    target expression as a table. The name of this table must be provided
 //    with the table flag.
 //
-//  - import [flags]
+//  - import file=...
 //
 //    Imports a file containing exec-ddl commands in order to add tables and/or
 //    stats to the catalog. This allows commonly-used schemas such as TPC-C or
@@ -282,6 +301,10 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    stats multiple times. The file name must be provided with the file flag.
 //    The path of the file should be relative to
 //    testutils/opttester/testfixtures.
+//
+//  - inject-stats file=... table=...
+//
+//    Injects table statistics from a json file.
 //
 // Supported flags:
 //
@@ -334,8 +357,12 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    Otherwise, outputs the name of the table that would be created for each
 //    subexpression.
 //
-//  - file: used to set the name of the file to be imported. This is used by
-//    the import command.
+//  - file: specifies a file, used for the following commands:
+//     - import: the file path is relative to opttester/testfixtures;
+//     - inject-stats: the file path is relative to the test file.
+//
+//  - cascade-levels: used to limit the depth of recursive cascades for
+//    build-cascades.
 //
 func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 	// Allow testcases to override the flags.
@@ -365,7 +392,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		}
 		s, err := testCatalog.ExecuteDDL(d.Input)
 		if err != nil {
-			d.Fatalf(tb, "%+v", err)
+			d.Fatalf(tb, "%v", err)
 		}
 		return s
 
@@ -410,6 +437,55 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		}
 		ot.postProcess(tb, d, e)
 		return ot.FormatExpr(e)
+
+	case "build-cascades":
+		o := ot.makeOptimizer()
+		o.DisableOptimizations()
+		if err := ot.buildExpr(o.Factory()); err != nil {
+			d.Fatalf(tb, "%+v", err)
+		}
+		e := o.Memo().RootExpr()
+
+		var buildCascades func(e opt.Expr, tp treeprinter.Node, level int)
+		buildCascades = func(e opt.Expr, tp treeprinter.Node, level int) {
+			if ot.Flags.CascadeLevels != 0 && level > ot.Flags.CascadeLevels {
+				return
+			}
+			if opt.IsMutationOp(e) {
+				p := e.Private().(*memo.MutationPrivate)
+
+				for _, c := range p.FKCascades {
+					// We use the same memo to build the cascade. This makes the entire
+					// tree easier to read (e.g. the column IDs won't overlap).
+					cascade, err := c.Builder.Build(
+						context.Background(),
+						&ot.semaCtx,
+						&ot.evalCtx,
+						ot.catalog,
+						o.Factory(),
+						c.WithID,
+						e.Child(0).(memo.RelExpr).Relational(),
+						c.OldValues,
+						c.NewValues,
+					)
+					if err != nil {
+						d.Fatalf(tb, "error building cascade: %+v", err)
+					}
+					n := tp.Child("cascade")
+					n.Child(strings.TrimRight(ot.FormatExpr(cascade), "\n"))
+					buildCascades(cascade, n, level+1)
+				}
+			}
+			for i := 0; i < e.ChildCount(); i++ {
+				buildCascades(e.Child(i), tp, level)
+			}
+		}
+		tp := treeprinter.New()
+		root := tp.Child("root")
+		root.Child(strings.TrimRight(ot.FormatExpr(e), "\n"))
+		buildCascades(e, root, 1)
+
+		return tp.String()
 
 	case "optsteps":
 		result, err := ot.OptSteps()
@@ -464,7 +540,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		return ot.FormatExpr(e)
 
 	case "stats":
-		result, err := ot.Stats(d)
+		result, err := ot.Stats(tb, d)
 		if err != nil {
 			d.Fatalf(tb, "%+v", err)
 		}
@@ -472,6 +548,10 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 
 	case "import":
 		ot.Import(tb)
+		return ""
+
+	case "inject-stats":
+		ot.InjectStats(tb, d)
 		return ""
 
 	default:
@@ -621,16 +701,18 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 		f.ExploreTraceSkipNoop = true
 
 	case "expect":
-		var err error
-		if f.ExpectedRules, err = ruleNamesToRuleSet(arg.Vals); err != nil {
+		ruleset, err := ruleNamesToRuleSet(arg.Vals)
+		if err != nil {
 			return err
 		}
+		f.ExpectedRules.UnionWith(ruleset)
 
 	case "expect-not":
-		var err error
-		if f.UnexpectedRules, err = ruleNamesToRuleSet(arg.Vals); err != nil {
+		ruleset, err := ruleNamesToRuleSet(arg.Vals)
+		if err != nil {
 			return err
 		}
+		f.UnexpectedRules.UnionWith(ruleset)
 
 	case "colstat":
 		if len(arg.Vals) == 0 {
@@ -687,6 +769,16 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 			return fmt.Errorf("file requires one argument")
 		}
 		f.File = arg.Vals[0]
+
+	case "cascade-levels":
+		if len(arg.Vals) != 1 {
+			return fmt.Errorf("cascade-levels requires a single argument")
+		}
+		levels, err := strconv.ParseInt(arg.Vals[0], 10, 64)
+		if err != nil {
+			return errors.Wrap(err, "cascade-levels")
+		}
+		f.CascadeLevels = int(levels)
 
 	default:
 		return fmt.Errorf("unknown argument: %s", arg.Key)
@@ -1066,7 +1158,10 @@ func (ot *OptTester) ExploreTrace() (string, error) {
 // actual statistics collected from running CREATE STATISTICS on the output
 // of the relational expression. If the -rewrite-actual-stats flag is
 // used, the actual stats are recalculated.
-func (ot *OptTester) Stats(d *datadriven.TestData) (string, error) {
+func (ot *OptTester) Stats(tb testing.TB, d *datadriven.TestData) (string, error) {
+	if ot.Flags.Table == "" {
+		tb.Fatal("table not specified")
+	}
 	catalog, ok := ot.catalog.(*testcat.Catalog)
 	if !ok {
 		return "", fmt.Errorf("stats can only be used with TestCatalog")
@@ -1081,6 +1176,9 @@ func (ot *OptTester) Stats(d *datadriven.TestData) (string, error) {
 // TPC-C or TPC-H to be used by multiple test files without copying the schemas
 // and stats multiple times.
 func (ot *OptTester) Import(tb testing.TB) {
+	if ot.Flags.File == "" {
+		tb.Fatal("file not specified")
+	}
 	// Find the file to be imported in opttester/testfixtures.
 	_, optTesterFile, _, ok := runtime.Caller(1)
 	if !ok {
@@ -1091,6 +1189,38 @@ func (ot *OptTester) Import(tb testing.TB) {
 		tester := New(ot.catalog, d.Input)
 		return tester.RunCommand(t, d)
 	})
+}
+
+// InjectStats constructs and executes an ALTER TABLE INJECT STATISTICS
+// statement using the statistics in a separate json file.
+func (ot *OptTester) InjectStats(tb testing.TB, d *datadriven.TestData) {
+	if ot.Flags.File == "" {
+		tb.Fatal("file not specified")
+	}
+	if ot.Flags.Table == "" {
+		tb.Fatal("table not specified")
+	}
+	// We get the file path from the Pos string which always of the form
+	// "file:linenum".
+	testfilePath := strings.SplitN(d.Pos, ":", 1)[0]
+	path := filepath.Join(filepath.Dir(testfilePath), ot.Flags.File)
+	stats, err := ioutil.ReadFile(path)
+	if err != nil {
+		tb.Fatalf("error reading %s: %v", path, err)
+	}
+	stmt := fmt.Sprintf(
+		"ALTER TABLE %s INJECT STATISTICS '%s'",
+		ot.Flags.Table,
+		strings.Replace(string(stats), "'", "''", -1),
+	)
+	testCatalog, ok := ot.catalog.(*testcat.Catalog)
+	if !ok {
+		d.Fatalf(tb, "inject-stats can only be used with TestCatalog")
+	}
+	_, err = testCatalog.ExecuteDDL(stmt)
+	if err != nil {
+		d.Fatalf(tb, "%v", err)
+	}
 }
 
 // SaveTables optimizes the given query and saves the subexpressions as tables
@@ -1208,7 +1338,6 @@ func (ot *OptTester) createTableAs(name tree.TableName, rel memo.RelExpr) (*test
 			Ordinal:  i,
 			Name:     colName,
 			Type:     colMeta.Type,
-			ColType:  *colMeta.Type,
 			Nullable: !relProps.NotNullCols.Contains(col),
 		}
 

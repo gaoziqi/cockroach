@@ -112,30 +112,30 @@ count                ·                 ·
       └── render     ·                 ·
            └── scan  ·                 ·
 ·                    table             xyz@primary
-·                    spans             ALL
+·                    spans             FULL SCAN
 ·                    locking strength  for update
 
 query TTTTT
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (1, 2)
 ----
-·                    distributed       false        ·                            ·
-·                    vectorized        false        ·                            ·
-count                ·                 ·            ()                           ·
- └── update          ·                 ·            ()                           ·
-      │              table             xyz          ·                            ·
-      │              set               x, y         ·                            ·
-      │              strategy          updater      ·                            ·
-      │              auto commit       ·            ·                            ·
-      └── render     ·                 ·            (x, y, z, column7, column8)  ·
-           │         render 0          x            ·                            ·
-           │         render 1          y            ·                            ·
-           │         render 2          z            ·                            ·
-           │         render 3          1            ·                            ·
-           │         render 4          2            ·                            ·
-           └── scan  ·                 ·            (x, y, z)                    ·
-·                    table             xyz@primary  ·                            ·
-·                    spans             ALL          ·                            ·
-·                    locking strength  for update   ·                            ·
+·                    distributed       false        ·                        ·
+·                    vectorized        false        ·                        ·
+count                ·                 ·            ()                       ·
+ └── update          ·                 ·            ()                       ·
+      │              table             xyz          ·                        ·
+      │              set               x, y         ·                        ·
+      │              strategy          updater      ·                        ·
+      │              auto commit       ·            ·                        ·
+      └── render     ·                 ·            (x, y, z, x_new, y_new)  ·
+           │         render 0          x            ·                        ·
+           │         render 1          y            ·                        ·
+           │         render 2          z            ·                        ·
+           │         render 3          1            ·                        ·
+           │         render 4          2            ·                        ·
+           └── scan  ·                 ·            (x, y, z)                ·
+·                    table             xyz@primary  ·                        ·
+·                    spans             FULL SCAN    ·                        ·
+·                    locking strength  for update   ·                        ·
 
 query TTTTT
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (y, x)
@@ -156,35 +156,35 @@ count                ·                 ·            ()               ·
            │         render 4          x            ·                ·
            └── scan  ·                 ·            (x, y, z)        ·
 ·                    table             xyz@primary  ·                ·
-·                    spans             ALL          ·                ·
+·                    spans             FULL SCAN    ·                ·
 ·                    locking strength  for update   ·                ·
 
 query TTTTT
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (2, 2)
 ----
-·                         distributed       false        ·                            ·
-·                         vectorized        false        ·                            ·
-count                     ·                 ·            ()                           ·
- └── update               ·                 ·            ()                           ·
-      │                   table             xyz          ·                            ·
-      │                   set               x, y         ·                            ·
-      │                   strategy          updater      ·                            ·
-      │                   auto commit       ·            ·                            ·
-      └── render          ·                 ·            (x, y, z, column7, column7)  ·
-           │              render 0          x            ·                            ·
-           │              render 1          y            ·                            ·
-           │              render 2          z            ·                            ·
-           │              render 3          column7      ·                            ·
-           │              render 4          column7      ·                            ·
-           └── render     ·                 ·            (column7, x, y, z)           ·
-                │         render 0          2            ·                            ·
-                │         render 1          x            ·                            ·
-                │         render 2          y            ·                            ·
-                │         render 3          z            ·                            ·
-                └── scan  ·                 ·            (x, y, z)                    ·
-·                         table             xyz@primary  ·                            ·
-·                         spans             ALL          ·                            ·
-·                         locking strength  for update   ·                            ·
+·                         distributed       false        ·                        ·
+·                         vectorized        false        ·                        ·
+count                     ·                 ·            ()                       ·
+ └── update               ·                 ·            ()                       ·
+      │                   table             xyz          ·                        ·
+      │                   set               x, y         ·                        ·
+      │                   strategy          updater      ·                        ·
+      │                   auto commit       ·            ·                        ·
+      └── render          ·                 ·            (x, y, z, x_new, x_new)  ·
+           │              render 0          x            ·                        ·
+           │              render 1          y            ·                        ·
+           │              render 2          z            ·                        ·
+           │              render 3          x_new        ·                        ·
+           │              render 4          x_new        ·                        ·
+           └── render     ·                 ·            (x_new, x, y, z)         ·
+                │         render 0          2            ·                        ·
+                │         render 1          x            ·                        ·
+                │         render 2          y            ·                        ·
+                │         render 3          z            ·                        ·
+                └── scan  ·                 ·            (x, y, z)                ·
+·                         table             xyz@primary  ·                        ·
+·                         spans             FULL SCAN    ·                        ·
+·                         locking strength  for update   ·                        ·
 
 statement ok
 CREATE TABLE pks (
@@ -247,7 +247,7 @@ count                          ·            ·
                      │         order        -v
                      └── scan  ·            ·
 ·                              table        kv@primary
-·                              spans        ALL
+·                              spans        FULL SCAN
 
 # Use case for UPDATE ... ORDER BY: renumbering a PK without unique violation.
 query TTT
@@ -296,7 +296,7 @@ count                ·                 ·
            │         render 3          c + 1
            └── scan  ·                 ·
 ·                    table             tu@primary
-·                    spans             ALL
+·                    spans             FULL SCAN
 ·                    locking strength  for update
 
 statement ok
@@ -346,7 +346,7 @@ root                                          ·                 ·             
  │    │                                       order             +a                                ·                         ·
  │    └── scan buffer node                    ·                 ·                                 (a)                       ·
  │                                            label             buffer 1                          ·                         ·
- └── subquery                                 ·                 ·                                 (a)                       +a
+ └── subquery                                 ·                 ·                                 ·                         ·
       │                                       id                @S1                               ·                         ·
       │                                       original sql      UPDATE abc SET a = c RETURNING a  ·                         ·
       │                                       exec mode         all rows                          ·                         ·
@@ -368,7 +368,7 @@ root                                          ·                 ·             
                                     │         render 4          c                                 ·                         ·
                                     └── scan  ·                 ·                                 (a, b, c, rowid[hidden])  ·
 ·                                             table             abc@primary                       ·                         ·
-·                                             spans             ALL                               ·                         ·
+·                                             spans             FULL SCAN                         ·                         ·
 ·                                             locking strength  for update                        ·                         ·
 
 # ------------------------------------------------------------------------------
@@ -402,27 +402,27 @@ CREATE TABLE t38799 (a INT PRIMARY KEY, b INT, c INT, INDEX foo(b), FAMILY "prim
 query TTTTT
 EXPLAIN (VERBOSE) UPDATE t38799@foo SET c=2 WHERE a=1
 ----
-·                               distributed  false           ·                   ·
-·                               vectorized   false           ·                   ·
-count                           ·            ·               ()                  ·
- └── update                     ·            ·               ()                  ·
-      │                         table        t38799          ·                   ·
-      │                         set          c               ·                   ·
-      │                         strategy     updater         ·                   ·
-      │                         auto commit  ·               ·                   ·
-      └── render                ·            ·               (a, b, c, column7)  ·
-           │                    render 0     a               ·                   ·
-           │                    render 1     b               ·                   ·
-           │                    render 2     c               ·                   ·
-           │                    render 3     2               ·                   ·
-           └── filter           ·            ·               (a, b, c)           ·
-                │               filter       a = 1           ·                   ·
-                └── index-join  ·            ·               (a, b, c)           ·
-                     │          table        t38799@primary  ·                   ·
-                     │          key columns  a               ·                   ·
-                     └── scan   ·            ·               (a, b)              ·
-·                               table        t38799@foo      ·                   ·
-·                               spans        ALL             ·                   ·
+·                               distributed  false           ·                 ·
+·                               vectorized   false           ·                 ·
+count                           ·            ·               ()                ·
+ └── update                     ·            ·               ()                ·
+      │                         table        t38799          ·                 ·
+      │                         set          c               ·                 ·
+      │                         strategy     updater         ·                 ·
+      │                         auto commit  ·               ·                 ·
+      └── render                ·            ·               (a, b, c, c_new)  ·
+           │                    render 0     a               ·                 ·
+           │                    render 1     b               ·                 ·
+           │                    render 2     c               ·                 ·
+           │                    render 3     2               ·                 ·
+           └── filter           ·            ·               (a, b, c)         ·
+                │               filter       a = 1           ·                 ·
+                └── index-join  ·            ·               (a, b, c)         ·
+                     │          table        t38799@primary  ·                 ·
+                     │          key columns  a               ·                 ·
+                     └── scan   ·            ·               (a, b)            ·
+·                               table        t38799@foo      ·                 ·
+·                               spans        FULL SCAN       ·                 ·
 
 # ------------------------------------------------------------------------------
 # Test without implicit SELECT FOR UPDATE.
@@ -478,7 +478,7 @@ count                ·                 ·
       └── render     ·                 ·
            └── scan  ·                 ·
 ·                    table             kv@primary
-·                    spans             ALL
+·                    spans             FULL SCAN
 ·                    locking strength  for update
 
 statement ok
@@ -580,28 +580,28 @@ count                ·            ·
       └── render     ·            ·
            └── scan  ·            ·
 ·                    table        kv@primary
-·                    spans        ALL
+·                    spans        FULL SCAN
 
 query TTTTT
 EXPLAIN (VERBOSE) UPDATE xyz SET (x, y) = (1, 2)
 ----
-·                    distributed  false        ·                            ·
-·                    vectorized   false        ·                            ·
-count                ·            ·            ()                           ·
- └── update          ·            ·            ()                           ·
-      │              table        xyz          ·                            ·
-      │              set          x, y         ·                            ·
-      │              strategy     updater      ·                            ·
-      │              auto commit  ·            ·                            ·
-      └── render     ·            ·            (x, y, z, column7, column8)  ·
-           │         render 0     x            ·                            ·
-           │         render 1     y            ·                            ·
-           │         render 2     z            ·                            ·
-           │         render 3     1            ·                            ·
-           │         render 4     2            ·                            ·
-           └── scan  ·            ·            (x, y, z)                    ·
-·                    table        xyz@primary  ·                            ·
-·                    spans        ALL          ·                            ·
+·                    distributed  false        ·                        ·
+·                    vectorized   false        ·                        ·
+count                ·            ·            ()                       ·
+ └── update          ·            ·            ()                       ·
+      │              table        xyz          ·                        ·
+      │              set          x, y         ·                        ·
+      │              strategy     updater      ·                        ·
+      │              auto commit  ·            ·                        ·
+      └── render     ·            ·            (x, y, z, x_new, y_new)  ·
+           │         render 0     x            ·                        ·
+           │         render 1     y            ·                        ·
+           │         render 2     z            ·                        ·
+           │         render 3     1            ·                        ·
+           │         render 4     2            ·                        ·
+           └── scan  ·            ·            (x, y, z)                ·
+·                    table        xyz@primary  ·                        ·
+·                    spans        FULL SCAN    ·                        ·
 
 query TTT
 EXPLAIN UPDATE kv SET v = v - 1 WHERE k < 3 LIMIT 1
@@ -675,7 +675,7 @@ count                ·            ·
       └── render     ·            ·
            └── scan  ·            ·
 ·                    table        tu@primary
-·                    spans        ALL
+·                    spans        FULL SCAN
 
 # Reset for rest of test.
 statement ok

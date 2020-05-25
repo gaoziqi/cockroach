@@ -149,7 +149,7 @@ func classifierHardestOf(classifiers ...classifier) classifier {
 
 // classifierTimePrecision returns trivial only if the new type has a precision
 // greater than the existing precision.  If they are the same, it returns
-// no-op.  Otherwise, it returns validate.
+// no-op.  Otherwise, it returns ColumnConversionOverwrite.
 func classifierTimePrecision(oldType *types.T, newType *types.T) ColumnConversionKind {
 	oldPrecision := oldType.Precision()
 	newPrecision := newType.Precision()
@@ -158,7 +158,7 @@ func classifierTimePrecision(oldType *types.T, newType *types.T) ColumnConversio
 	case newPrecision >= oldPrecision:
 		return ColumnConversionTrivial
 	default:
-		return ColumnConversionValidate
+		return ColumnConversionGeneral
 	}
 }
 
@@ -228,10 +228,9 @@ func ClassifyConversion(oldType *types.T, newType *types.T) (ColumnConversionKin
 	}
 
 	// Cook up a cast expression using the placeholder.
-	if cast, err := tree.NewTypedCastExpr(fromPlaceholder, newType); err == nil {
-		if _, err := cast.TypeCheck(&ctx, nil); err == nil {
-			return ColumnConversionGeneral, nil
-		}
+	cast := tree.NewTypedCastExpr(fromPlaceholder, newType)
+	if _, err := cast.TypeCheck(&ctx, nil); err == nil {
+		return ColumnConversionGeneral, nil
 	}
 
 	return ColumnConversionImpossible,

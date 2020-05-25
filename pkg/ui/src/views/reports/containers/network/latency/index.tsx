@@ -11,14 +11,15 @@
 import { Divider, Tooltip } from "antd";
 import classNames from "classnames";
 import _ from "lodash";
-import { NanoToMilli } from "oss/src/util/convert";
-import { FixLong } from "oss/src/util/fixLong";
-import { Chip } from "oss/src/views/app/components/chip";
-import Empty from "oss/src/views/app/components/empty";
+import { NanoToMilli } from "src/util/convert";
+import { FixLong } from "src/util/fixLong";
+import { Chip } from "src/views/app/components/chip";
 import React from "react";
 import { Link } from "react-router-dom";
 import { getValueFromString, Identity } from "..";
 import "./latency.styl";
+import { Empty } from "src/components/empty";
+
 interface StdDev {
   stddev: number;
   stddevMinus2: number;
@@ -232,7 +233,7 @@ const getLatencyCell = ({ latency, identityB, identityA }: { latency: number; id
                 <p className="Chip--tooltip__nodes--item-description">{identityA.locality}</p>
               </div>
             </div>
-            <p className={`color--${type}`}>{`${latency.toFixed(2)}ms`}</p>
+            <p className={`color--${type}`}>{`${latency.toFixed(2)}ms roundtrip`}</p>
           </div>
         )}>
           <div>

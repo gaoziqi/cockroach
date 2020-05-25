@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -39,7 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
@@ -388,6 +389,19 @@ func (v *Value) SetFloat(f float64) {
 	v.setTag(ValueType_FLOAT)
 }
 
+// SetGeo encodes the specified geo value into the bytes field of the
+// receiver, sets the tag and clears the checksum.
+func (v *Value) SetGeo(so geopb.SpatialObject) error {
+	bytes, err := protoutil.Marshal(&so)
+	if err != nil {
+		return err
+	}
+	v.ensureRawBytes(headerSize + len(bytes))
+	copy(v.dataBytes(), bytes)
+	v.setTag(ValueType_GEO)
+	return nil
+}
+
 // SetBool encodes the specified bool value into the bytes field of the
 // receiver, sets the tag and clears the checksum.
 func (v *Value) SetBool(b bool) {
@@ -414,12 +428,11 @@ func (v *Value) SetInt(i int64) {
 // receiver and clears the checksum. If the proto message is an
 // InternalTimeSeriesData, the tag will be set to TIMESERIES rather than BYTES.
 func (v *Value) SetProto(msg protoutil.Message) error {
-	msg = protoutil.MaybeFuzz(msg)
 	// All of the Cockroach protos implement MarshalTo and Size. So we marshal
 	// directly into the Value.RawBytes field instead of allocating a separate
 	// []byte and copying.
 	v.ensureRawBytes(headerSize + msg.Size())
-	if _, err := protoutil.MarshalToWithoutFuzzing(msg, v.RawBytes[headerSize:]); err != nil {
+	if _, err := protoutil.MarshalTo(msg, v.RawBytes[headerSize:]); err != nil {
 		return err
 	}
 	// Special handling for timeseries data.
@@ -513,6 +526,17 @@ func (v Value) GetFloat() (float64, error) {
 		return 0, err
 	}
 	return math.Float64frombits(u), nil
+}
+
+// GetGeo decodes a geo value from the bytes field of the receiver. If the
+// tag is not GEO an error will be returned.
+func (v Value) GetGeo() (geopb.SpatialObject, error) {
+	if tag := v.GetTag(); tag != ValueType_GEO {
+		return geopb.SpatialObject{}, fmt.Errorf("value type is not %s: %s", ValueType_GEO, tag)
+	}
+	var ret geopb.SpatialObject
+	err := protoutil.Unmarshal(v.dataBytes(), &ret)
+	return ret, err
 }
 
 // GetBool decodes a bool value from the bytes field of the receiver. If the
@@ -772,7 +796,7 @@ func (ts TransactionStatus) IsCommittedOrStaging() bool {
 	return ts == COMMITTED || ts == STAGING
 }
 
-var _ log.SafeMessager = Transaction{}
+var _ errors.SafeMessager = Transaction{}
 
 // MakeTransaction creates a new transaction. The transaction key is
 // composed using the specified baseKey (for locality with data
@@ -1857,27 +1881,25 @@ func AsIntents(txn *enginepb.TxnMeta, keys []Key) []Intent {
 	return ret
 }
 
-// MakeLockUpdate makes a lock update from the given span and txn.
-// The function assumes that the lock has a replicated durability.
+// MakeLockAcquisition makes a lock acquisition message from the given
+// txn, key, and durability level.
+func MakeLockAcquisition(txn *Transaction, key Key, dur lock.Durability) LockAcquisition {
+	return LockAcquisition{Span: Span{Key: key}, Txn: txn.TxnMeta, Durability: dur}
+}
+
+// MakeLockUpdate makes a lock update from the given txn and span.
 func MakeLockUpdate(txn *Transaction, span Span) LockUpdate {
-	return MakeLockUpdateWithDur(txn, span, lock.Replicated)
+	u := LockUpdate{Span: span}
+	u.SetTxn(txn)
+	return u
 }
 
-// MakeLockUpdateWithDur makes a lock update from the given span,
-// txn, and lock durability.
-func MakeLockUpdateWithDur(txn *Transaction, span Span, dur lock.Durability) LockUpdate {
-	update := LockUpdate{Span: span}
-	update.SetTxn(txn)
-	update.Durability = dur
-	return update
-}
-
-// AsLockUpdates takes a slice of spans and returns it as a slice
-// of lock updates for the given transaction and lock durability.
-func AsLockUpdates(txn *Transaction, spans []Span, dur lock.Durability) []LockUpdate {
+// AsLockUpdates takes a slice of spans and returns it as a slice of
+// lock updates.
+func AsLockUpdates(txn *Transaction, spans []Span) []LockUpdate {
 	ret := make([]LockUpdate, len(spans))
 	for i := range spans {
-		ret[i] = MakeLockUpdateWithDur(txn, spans[i], dur)
+		ret[i] = MakeLockUpdate(txn, spans[i])
 	}
 	return ret
 }

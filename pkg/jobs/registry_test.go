@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -47,20 +48,20 @@ func TestRegistryCancelation(t *testing.T) {
 	// of a dep cycle.
 	const histogramWindowInterval = 60 * time.Second
 
+	const nodeCount = 1
+	nodeLiveness := NewFakeNodeLiveness(nodeCount)
+
 	var db *kv.DB
 	// Insulate this test from wall time.
 	mClock := hlc.NewManualClock(hlc.UnixNano())
 	clock := hlc.NewClock(mClock.UnixNano, time.Nanosecond)
 	registry := MakeRegistry(
-		log.AmbientContext{}, stopper, clock, db, nil /* ex */, FakeNodeID, cluster.NoSettings,
+		log.AmbientContext{}, stopper, clock, nodeLiveness, db, nil /* ex */, base.TestingIDContainer, cluster.NoSettings,
 		histogramWindowInterval, FakePHS, "")
-
-	const nodeCount = 1
-	nodeLiveness := NewFakeNodeLiveness(nodeCount)
 
 	const cancelInterval = time.Nanosecond
 	const adoptInterval = time.Duration(math.MaxInt64)
-	if err := registry.Start(ctx, stopper, nodeLiveness, cancelInterval, adoptInterval); err != nil {
+	if err := registry.Start(ctx, stopper, cancelInterval, adoptInterval); err != nil {
 		t.Fatal(err)
 	}
 
@@ -207,11 +208,11 @@ func TestRegistryGC(t *testing.T) {
 	muchEarlier := ts.Add(-2 * time.Hour)
 
 	setMutations := func(mutations []sqlbase.DescriptorMutation) sqlbase.ID {
-		desc := sqlbase.GetTableDescriptor(kvDB, "t", "to_be_mutated")
+		desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
 		desc.Mutations = mutations
 		if err := kvDB.Put(
-			context.TODO(),
-			sqlbase.MakeDescMetadataKey(desc.GetID()),
+			context.Background(),
+			sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID()),
 			sqlbase.WrapDescriptor(desc),
 		); err != nil {
 			t.Fatal(err)
@@ -220,11 +221,11 @@ func TestRegistryGC(t *testing.T) {
 	}
 
 	setGCMutations := func(gcMutations []sqlbase.TableDescriptor_GCDescriptorMutation) sqlbase.ID {
-		desc := sqlbase.GetTableDescriptor(kvDB, "t", "to_be_mutated")
+		desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
 		desc.GCMutations = gcMutations
 		if err := kvDB.Put(
-			context.TODO(),
-			sqlbase.MakeDescMetadataKey(desc.GetID()),
+			context.Background(),
+			sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID()),
 			sqlbase.WrapDescriptor(desc),
 		); err != nil {
 			t.Fatal(err)
@@ -233,7 +234,7 @@ func TestRegistryGC(t *testing.T) {
 	}
 
 	setDropJob := func(shouldDrop bool) sqlbase.ID {
-		desc := sqlbase.GetTableDescriptor(kvDB, "t", "to_be_mutated")
+		desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
 		if shouldDrop {
 			desc.DropJobID = 123
 		} else {
@@ -241,8 +242,8 @@ func TestRegistryGC(t *testing.T) {
 			desc.DropJobID = 0
 		}
 		if err := kvDB.Put(
-			context.TODO(),
-			sqlbase.MakeDescMetadataKey(desc.GetID()),
+			context.Background(),
+			sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID()),
 			sqlbase.WrapDescriptor(desc),
 		); err != nil {
 			t.Fatal(err)

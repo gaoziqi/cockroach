@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -26,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func setTestEqColForSide(colName string, side *scanNode, equalityIndices *[]int) error {
@@ -103,13 +104,13 @@ var tableNames = map[string]bool{
 // Format for any key:
 //   <table-name>/<index-id>/<index-col1>/.../#/<table-name>/<index-id>/....
 func encodeTestKey(kvDB *kv.DB, keyStr string) (roachpb.Key, error) {
-	var key []byte
+	key := keys.SystemSQLCodec.TenantPrefix()
 	tokens := strings.Split(keyStr, "/")
 
 	for _, tok := range tokens {
 		// Encode the table ID if the token is a table name.
 		if tableNames[tok] {
-			desc := sqlbase.GetTableDescriptor(kvDB, sqlutils.TestDB, tok)
+			desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, sqlutils.TestDB, tok)
 			key = encoding.EncodeUvarintAscending(key, uint64(desc.ID))
 			continue
 		}
@@ -151,8 +152,8 @@ func decodeTestKey(kvDB *kv.DB, key roachpb.Key) (string, error) {
 				return "", err
 			}
 
-			if err := kvDB.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
-				desc, err := sqlbase.GetTableDescFromID(context.TODO(), txn, sqlbase.ID(descID))
+			if err := kvDB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+				desc, err := sqlbase.GetTableDescFromID(context.Background(), txn, keys.SystemSQLCodec, sqlbase.ID(descID))
 				if err != nil {
 					return err
 				}
@@ -226,7 +227,7 @@ func TestUseInterleavedJoin(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlutils.CreateTestInterleavedHierarchy(t, sqlDB)
 
@@ -361,7 +362,7 @@ func TestMaximalJoinPrefix(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlutils.CreateTestInterleavedHierarchy(t, sqlDB)
 
@@ -471,7 +472,7 @@ func TestAlignInterleavedSpans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlutils.CreateTestInterleavedHierarchy(t, sqlDB)
 
@@ -805,7 +806,7 @@ func TestInterleavedNodes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlutils.CreateTestInterleavedHierarchy(t, sqlDB)
 

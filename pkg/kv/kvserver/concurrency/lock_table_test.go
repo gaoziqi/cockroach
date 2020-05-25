@@ -86,7 +86,7 @@ add-discovered r=<name> k=<key> txn=<name>
 ----
 <error string>
 
- Adds a discovered lock that is disovered by the named request.
+ Adds a discovered lock that is discovered by the named request.
 
 dequeue r=<name>
 ----
@@ -333,7 +333,7 @@ func TestLockTableBasic(t *testing.T) {
 					d.Fatalf(t, "unknown txn %s", txnName)
 				}
 				intent := roachpb.MakeIntent(txnMeta, roachpb.Key(key))
-				if err := lt.AddDiscoveredLock(&intent, g); err != nil {
+				if _, err := lt.AddDiscoveredLock(&intent, g); err != nil {
 					return err.Error()
 				}
 				return lt.(*lockTableImpl).String()
@@ -375,7 +375,7 @@ func TestLockTableBasic(t *testing.T) {
 				}
 				state := g.CurState()
 				var typeStr string
-				switch state.stateKind {
+				switch state.kind {
 				case waitForDistinguished:
 					typeStr = "waitForDistinguished"
 				case waitFor:
@@ -398,12 +398,8 @@ func TestLockTableBasic(t *testing.T) {
 				if txnS == "" {
 					txnS = fmt.Sprintf("unknown txn with ID: %v", state.txn.ID)
 				}
-				tsS := fmt.Sprintf("%d", state.ts.WallTime)
-				if state.ts.Logical != 0 {
-					tsS += fmt.Sprintf(",%d", state.ts.Logical)
-				}
-				return fmt.Sprintf("%sstate=%s txn=%s ts=%s key=%s held=%t guard-access=%s",
-					str, typeStr, txnS, tsS, state.key, state.held, state.guardAccess)
+				return fmt.Sprintf("%sstate=%s txn=%s key=%s held=%t guard-access=%s",
+					str, typeStr, txnS, state.key, state.held, state.guardAccess)
 
 			case "enable":
 				lt.Enable()
@@ -520,7 +516,7 @@ func doWork(ctx context.Context, item *workItem, e *workloadExecutor) error {
 			// cancellation, the code makes sure to release latches when returning
 			// early due to error. Otherwise other requests will get stuck and
 			// group.Wait() will not return until the test times out.
-			lg, err = e.lm.Acquire(context.TODO(), item.request.LatchSpans)
+			lg, err = e.lm.Acquire(context.Background(), item.request.LatchSpans)
 			if err != nil {
 				return err
 			}
@@ -538,7 +534,7 @@ func doWork(ctx context.Context, item *workItem, e *workloadExecutor) error {
 					return ctx.Err()
 				}
 				state := g.CurState()
-				switch state.stateKind {
+				switch state.kind {
 				case doneWaiting:
 					if !lastID.Equal(uuid.UUID{}) && item.request.Txn != nil {
 						_, err = e.waitingFor(item.request.Txn.ID, lastID, uuid.UUID{})
@@ -566,7 +562,7 @@ func doWork(ctx context.Context, item *workItem, e *workloadExecutor) error {
 						}
 					}
 				default:
-					return errors.Errorf("unexpected state: %v", state.stateKind)
+					return errors.Errorf("unexpected state: %v", state.kind)
 				}
 			}
 		}
@@ -773,7 +769,7 @@ func (e *workloadExecutor) tryFinishTxn(
 func (e *workloadExecutor) execute(strict bool, maxNonStrictConcurrency int) error {
 	numOutstanding := 0
 	i := 0
-	group, ctx := errgroup.WithContext(context.TODO())
+	group, ctx := errgroup.WithContext(context.Background())
 	timer := time.NewTimer(time.Second)
 	timer.Stop()
 	var err error
@@ -1062,7 +1058,7 @@ func doBenchWork(item *benchWorkItem, env benchEnv, doneCh chan<- error) {
 	var err error
 	firstIter := true
 	for {
-		if lg, err = env.lm.Acquire(context.TODO(), item.LatchSpans); err != nil {
+		if lg, err = env.lm.Acquire(context.Background(), item.LatchSpans); err != nil {
 			doneCh <- err
 			return
 		}
@@ -1079,7 +1075,7 @@ func doBenchWork(item *benchWorkItem, env benchEnv, doneCh chan<- error) {
 		for {
 			<-g.NewStateChan()
 			state := g.CurState()
-			if state.stateKind == doneWaiting {
+			if state.kind == doneWaiting {
 				break
 			}
 		}
@@ -1097,7 +1093,7 @@ func doBenchWork(item *benchWorkItem, env benchEnv, doneCh chan<- error) {
 		return
 	}
 	// Release locks.
-	if lg, err = env.lm.Acquire(context.TODO(), item.LatchSpans); err != nil {
+	if lg, err = env.lm.Acquire(context.Background(), item.LatchSpans); err != nil {
 		doneCh <- err
 		return
 	}
@@ -1244,7 +1240,7 @@ func BenchmarkLockTable(b *testing.B) {
 							runRequests(b, iters, requestsPerGroup[0], env)
 						}
 						if log.V(1) {
-							log.Infof(context.TODO(), "num requests that waited: %d, num scan calls: %d\n",
+							log.Infof(context.Background(), "num requests that waited: %d, num scan calls: %d\n",
 								atomic.LoadUint64(&numRequestsWaited), atomic.LoadUint64(&numScanCalls))
 						}
 					})

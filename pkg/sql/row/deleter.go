@@ -40,6 +40,7 @@ type Deleter struct {
 func MakeDeleter(
 	ctx context.Context,
 	txn *kv.Txn,
+	codec keys.SQLCodec,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	fkTables FkTableMetadata,
 	requestedCols []sqlbase.ColumnDescriptor,
@@ -48,7 +49,7 @@ func MakeDeleter(
 	alloc *sqlbase.DatumAlloc,
 ) (Deleter, error) {
 	rowDeleter, err := makeRowDeleterWithoutCascader(
-		ctx, txn, tableDesc, fkTables, requestedCols, checkFKs, alloc,
+		ctx, txn, codec, tableDesc, fkTables, requestedCols, checkFKs, alloc,
 	)
 	if err != nil {
 		return Deleter{}, err
@@ -59,6 +60,28 @@ func MakeDeleter(
 		if err != nil {
 			return Deleter{}, err
 		}
+		// If we are performing a cascade operation for a particular foreign
+		// key constraint, we don't also need to perform a foreign key
+		// existence check after the delete for the same foreign key
+		// constraint. This pass removes unnecessary existence helpers.
+		// In particular, we omit checks for CASCADE and SET NULL because
+		// after the cascader has finished deleting or setting rows to
+		// NULL, we don't need to verify the result of those operations.
+		// TODO (rohany): This code will be removed once the optimizer
+		//  handles cascade operations.
+		for k, helpers := range rowDeleter.Fks.fks {
+			index := 0
+			for i := range helpers {
+				helper := &helpers[i]
+				if helper.ref.OnDelete == sqlbase.ForeignKeyReference_CASCADE ||
+					helper.ref.OnDelete == sqlbase.ForeignKeyReference_SET_NULL {
+					continue
+				}
+				helpers[index] = *helper
+				index++
+			}
+			rowDeleter.Fks.fks[k] = helpers[:index]
+		}
 	}
 	return rowDeleter, nil
 }
@@ -68,6 +91,7 @@ func MakeDeleter(
 func makeRowDeleterWithoutCascader(
 	ctx context.Context,
 	txn *kv.Txn,
+	codec keys.SQLCodec,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	fkTables FkTableMetadata,
 	requestedCols []sqlbase.ColumnDescriptor,
@@ -110,13 +134,13 @@ func makeRowDeleterWithoutCascader(
 	}
 
 	rd := Deleter{
-		Helper:               newRowHelper(tableDesc, indexes),
+		Helper:               newRowHelper(codec, tableDesc, indexes),
 		FetchCols:            fetchCols,
 		FetchColIDtoRowIndex: fetchColIDtoRowIndex,
 	}
 	if checkFKs == CheckFKs {
 		var err error
-		if rd.Fks, err = makeFkExistenceCheckHelperForDelete(ctx, txn, tableDesc, fkTables,
+		if rd.Fks, err = makeFkExistenceCheckHelperForDelete(ctx, txn, codec, tableDesc, fkTables,
 			fetchColIDtoRowIndex, alloc); err != nil {
 			return Deleter{}, err
 		}
@@ -137,7 +161,13 @@ func (rd *Deleter) DeleteRow(
 	for i := range rd.Helper.Indexes {
 		// We want to include empty k/v pairs because we want to delete all k/v's for this row.
 		entries, err := sqlbase.EncodeSecondaryIndex(
-			rd.Helper.TableDesc.TableDesc(), &rd.Helper.Indexes[i], rd.FetchColIDtoRowIndex, values, true /* includeEmpty */)
+			rd.Helper.Codec,
+			rd.Helper.TableDesc.TableDesc(),
+			&rd.Helper.Indexes[i],
+			rd.FetchColIDtoRowIndex,
+			values,
+			true, /* includeEmpty */
+		)
 		if err != nil {
 			return err
 		}
@@ -210,7 +240,13 @@ func (rd *Deleter) DeleteIndexRow(
 	// to true, we will get a k/v pair for each family in the row,
 	// which will guarantee that we delete all the k/v's in this row.
 	secondaryIndexEntry, err := sqlbase.EncodeSecondaryIndex(
-		rd.Helper.TableDesc.TableDesc(), idx, rd.FetchColIDtoRowIndex, values, true /* includeEmpty */)
+		rd.Helper.Codec,
+		rd.Helper.TableDesc.TableDesc(),
+		idx,
+		rd.FetchColIDtoRowIndex,
+		values,
+		true, /* includeEmpty */
+	)
 	if err != nil {
 		return err
 	}

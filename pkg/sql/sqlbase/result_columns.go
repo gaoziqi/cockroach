@@ -24,6 +24,12 @@ type ResultColumn struct {
 
 	// If set, this is an implicit column; used internally.
 	Hidden bool
+
+	// TableID/PGAttributeNum identify the source of the column, if it is a simple
+	// reference to a column of a base table (or view). If it is not a simple
+	// reference, these fields are zeroes.
+	TableID        ID       // OID of column's source table (pg_attribute.attrelid).
+	PGAttributeNum ColumnID // Column's number in source table (pg_attribute.attnum).
 }
 
 // ResultColumns is the type used throughout the sql module to
@@ -31,20 +37,35 @@ type ResultColumn struct {
 type ResultColumns []ResultColumn
 
 // ResultColumnsFromColDescs converts ColumnDescriptors to ResultColumns.
-func ResultColumnsFromColDescs(colDescs []ColumnDescriptor) ResultColumns {
+func ResultColumnsFromColDescs(tableID ID, colDescs []ColumnDescriptor) ResultColumns {
 	cols := make(ResultColumns, 0, len(colDescs))
 	for i := range colDescs {
 		// Convert the ColumnDescriptor to ResultColumn.
 		colDesc := &colDescs[i]
-		typ := &colDesc.Type
+		typ := colDesc.Type
 		if typ == nil {
 			panic(fmt.Sprintf("unsupported column type: %s", colDesc.Type.Family()))
 		}
 
 		hidden := colDesc.Hidden
-		cols = append(cols, ResultColumn{Name: colDesc.Name, Typ: typ, Hidden: hidden})
+		cols = append(
+			cols,
+			ResultColumn{
+				Name:           colDesc.Name,
+				Typ:            typ,
+				Hidden:         hidden,
+				TableID:        tableID,
+				PGAttributeNum: colDesc.GetLogicalColumnID(),
+			},
+		)
 	}
 	return cols
+}
+
+// GetTypeModifier returns the type modifier for this column. If it is not set,
+// it defaults to returning -1.
+func (r ResultColumn) GetTypeModifier() int32 {
+	return r.Typ.TypeModifier()
 }
 
 // TypesEqual returns whether the length and types of r matches other. If
@@ -126,8 +147,9 @@ var ExplainVecColumns = ResultColumns{
 	{Name: "text", Typ: types.String},
 }
 
-// ExplainBundleColumns are the result columns of an EXPLAIN BUNDLE statement.
-var ExplainBundleColumns = ResultColumns{
+// ExplainAnalyzeDebugColumns are the result columns of an
+// EXPLAIN ANALYZE (DEBUG) statement.
+var ExplainAnalyzeDebugColumns = ResultColumns{
 	{Name: "text", Typ: types.String},
 }
 

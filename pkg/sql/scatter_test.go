@@ -37,7 +37,7 @@ func TestScatterRandomizeLeases(t *testing.T) {
 	const numHosts = 3
 
 	tc := serverutils.StartTestCluster(t, numHosts, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	sqlutils.CreateTable(
 		t, tc.ServerConn(0), "t",
@@ -120,7 +120,7 @@ func TestScatterResponse(t *testing.T) {
 		1000,
 		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(10)),
 	)
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	r := sqlutils.MakeSQLRunner(sqlDB)
 	r.Exec(t, "ALTER TABLE test.t SPLIT AT (SELECT i*10 FROM generate_series(1, 99) AS g(i))")
@@ -135,7 +135,7 @@ func TestScatterResponse(t *testing.T) {
 		}
 		var expectedKey roachpb.Key
 		if i == 0 {
-			expectedKey = keys.MakeTablePrefix(uint32(tableDesc.ID))
+			expectedKey = keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.ID))
 		} else {
 			var err error
 			expectedKey, err = sqlbase.TestingMakePrimaryIndexKey(tableDesc, i*10)

@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -130,6 +129,18 @@ var (
 	errJobCanceled = errors.New("job canceled by user")
 )
 
+// isOldSchemaChangeJob returns whether the provided payload is for a job that
+// is a 19.2-style schema change, and therefore cannot be run or updated in 20.1
+// (without first having undergone a migration).
+// TODO (lucy): Remove this in 20.2. (I think it's possible in theory for a 19.2
+// schema change job to persist on a 20.1 cluster indefinitely, since the
+// migration is asynchronous, so this will take some care beyond just removing
+// the format version gate.)
+func isOldSchemaChangeJob(payload *jobspb.Payload) bool {
+	schemaChangeDetails, ok := payload.UnwrapDetails().(jobspb.SchemaChangeDetails)
+	return ok && schemaChangeDetails.FormatVersion < jobspb.JobResumerFormatVersion
+}
+
 // Terminal returns whether this status represents a "terminal" state: a state
 // after which the job should never be updated again.
 func (s Status) Terminal() bool {
@@ -155,11 +166,10 @@ func (e *InvalidStatusError) Error() string {
 // SimplifyInvalidStatusError unwraps an *InvalidStatusError into an error
 // message suitable for users. Other errors are returned as passed.
 func SimplifyInvalidStatusError(err error) error {
-	ierr, ok := err.(*InvalidStatusError)
-	if !ok {
-		return err
+	if ierr := (*InvalidStatusError)(nil); errors.As(err, &ierr) {
+		return errors.Errorf("job %s", ierr.status)
 	}
-	return errors.Errorf("job %s", ierr.status)
+	return err
 }
 
 // ID returns the ID of the job that this Job is currently tracking. This will
@@ -171,7 +181,7 @@ func (j *Job) ID() *int64 {
 // Created records the creation of a new job in the system.jobs table and
 // remembers the assigned ID of the job in the Job. The job information is read
 // from the Record field at the time Created is called.
-func (j *Job) Created(ctx context.Context) error {
+func (j *Job) created(ctx context.Context) error {
 	if j.ID() != nil {
 		return errors.Errorf("job already created with ID %v", *j.ID())
 	}
@@ -179,7 +189,7 @@ func (j *Job) Created(ctx context.Context) error {
 }
 
 // Started marks the tracked job as started.
-func (j *Job) Started(ctx context.Context) error {
+func (j *Job) started(ctx context.Context) error {
 	return j.Update(ctx, func(_ *kv.Txn, md JobMetadata, ju *JobUpdater) error {
 		if md.Status != StatusPending && md.Status != StatusRunning {
 			return errors.Errorf("job with status %s cannot be marked started", md.Status)
@@ -329,10 +339,10 @@ func (j *Job) HighWaterProgressed(ctx context.Context, progressedFn HighWaterPro
 	})
 }
 
-// Paused sets the status of the tracked job to paused. It does not directly
-// pause the job; instead, it expects the job to call job.Progressed soon,
-// observe a "job is paused" error, and abort further work.
-func (j *Job) Paused(ctx context.Context, fn func(context.Context, *kv.Txn) error) error {
+// paused sets the status of the tracked job to paused. It is called by the
+// registry adoption loop by the node currently running a job to move it from
+// pauseRequested to paused.
+func (j *Job) paused(ctx context.Context, fn func(context.Context, *kv.Txn) error) error {
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
 		if md.Status == StatusPaused {
 			// Already paused - do nothing.
@@ -351,7 +361,7 @@ func (j *Job) Paused(ctx context.Context, fn func(context.Context, *kv.Txn) erro
 	})
 }
 
-// Resumed sets the status of the tracked job to running or reverting iff the
+// resumed sets the status of the tracked job to running or reverting iff the
 // job is currently paused. It does not directly resume the job; rather, it
 // expires the job's lease so that a Registry adoption loop detects it and
 // resumes it.
@@ -387,6 +397,19 @@ func (j *Job) resumed(ctx context.Context) error {
 // StatusReverting.
 func (j *Job) cancelRequested(ctx context.Context, fn func(context.Context, *kv.Txn) error) error {
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
+		// Don't allow 19.2-style schema change jobs to undergo changes in job state
+		// before they undergo a migration to make them properly runnable in 20.1 and
+		// later versions. While we could support cancellation in principle, the
+		// point is to cut down on the number of possible states that the migration
+		// could encounter.
+		//
+		// TODO (lucy): Remove this in 20.2.
+		if isOldSchemaChangeJob(md.Payload) {
+			return errors.Newf(
+				"schema change job was created in earlier version, and cannot be " +
+					"canceled in this version until the upgrade is finalized and an internal migration is complete")
+		}
+
 		if md.Payload.Noncancelable {
 			return errors.Newf("job %d: not cancelable", *j.ID())
 		}
@@ -410,12 +433,34 @@ func (j *Job) cancelRequested(ctx context.Context, fn func(context.Context, *kv.
 	})
 }
 
+// onPauseRequestFunc is a function used to perform action on behalf of a job
+// implementation when a pause is requested.
+type onPauseRequestFunc func(
+	ctx context.Context, planHookState interface{}, txn *kv.Txn, progress *jobspb.Progress,
+) error
+
 // pauseRequested sets the status of the tracked job to pause-requested. It does
 // not directly pause the job; it expects the node that runs the job will
 // actively cancel it when it notices that it is in state StatusPauseRequested
 // and will move it to state StatusPaused.
-func (j *Job) pauseRequested(ctx context.Context, fn func(context.Context, *kv.Txn) error) error {
+func (j *Job) pauseRequested(ctx context.Context, fn onPauseRequestFunc) error {
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
+		// Don't allow 19.2-style schema change jobs to undergo changes in job state
+		// before they undergo a migration to make them properly runnable in 20.1 and
+		// later versions.
+		//
+		// In particular, schema change jobs could not be paused in 19.2, so allowing
+		// pausing here could break backward compatibility during an upgrade by
+		// forcing 19.2 nodes to deal with a schema change job in a state that wasn't
+		// possible in 19.2.
+		//
+		// TODO (lucy): Remove this in 20.2.
+		if isOldSchemaChangeJob(md.Payload) {
+			return errors.Newf(
+				"schema change job was created in earlier version, and cannot be " +
+					"paused in this version until the upgrade is finalized and an internal migration is complete")
+		}
+
 		if md.Status == StatusPauseRequested || md.Status == StatusPaused {
 			return nil
 		}
@@ -423,17 +468,20 @@ func (j *Job) pauseRequested(ctx context.Context, fn func(context.Context, *kv.T
 			return fmt.Errorf("job with status %s cannot be requested to be paused", md.Status)
 		}
 		if fn != nil {
-			if err := fn(ctx, txn); err != nil {
+			phs, cleanup := j.registry.planFn("pause request", j.Payload().Username)
+			defer cleanup()
+			if err := fn(ctx, phs, txn, md.Progress); err != nil {
 				return err
 			}
+			ju.UpdateProgress(md.Progress)
 		}
 		ju.UpdateStatus(StatusPauseRequested)
 		return nil
 	})
 }
 
-// Reverted sets the status of the tracked job to reverted.
-func (j *Job) Reverted(
+// reverted sets the status of the tracked job to reverted.
+func (j *Job) reverted(
 	ctx context.Context, err error, fn func(context.Context, *kv.Txn) error,
 ) error {
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
@@ -486,7 +534,7 @@ func (j *Job) canceled(ctx context.Context, fn func(context.Context, *kv.Txn) er
 }
 
 // Failed marks the tracked job as having failed with the given error.
-func (j *Job) Failed(
+func (j *Job) failed(
 	ctx context.Context, err error, fn func(context.Context, *kv.Txn) error,
 ) error {
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
@@ -508,9 +556,9 @@ func (j *Job) Failed(
 	})
 }
 
-// Succeeded marks the tracked job as having succeeded and sets its fraction
+// succeeded marks the tracked job as having succeeded and sets its fraction
 // completed to 1.0.
-func (j *Job) Succeeded(ctx context.Context, fn func(context.Context, *kv.Txn) error) error {
+func (j *Job) succeeded(ctx context.Context, fn func(context.Context, *kv.Txn) error) error {
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
 		if md.Status == StatusSucceeded {
 			return nil
@@ -619,11 +667,7 @@ func (e *JobNotFoundError) Error() string {
 
 // HasJobNotFoundError returns true if the error contains a JobNotFoundError.
 func HasJobNotFoundError(err error) bool {
-	_, hasJobNotFoundError := errors.If(err, func(err error) (interface{}, bool) {
-		_, isJobNotFoundError := err.(*JobNotFoundError)
-		return err, isJobNotFoundError
-	})
-	return hasJobNotFoundError
+	return errors.HasType(err, (*JobNotFoundError)(nil))
 }
 
 func (j *Job) load(ctx context.Context) error {
@@ -690,7 +734,6 @@ func (j *Job) insert(ctx context.Context, id int64, lease *jobspb.Lease) error {
 }
 
 func (j *Job) adopt(ctx context.Context, oldLease *jobspb.Lease) error {
-	log.Infof(ctx, "job %d: adopting", *j.ID())
 	return j.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
 		if !md.Payload.Lease.Equal(oldLease) {
 			return errors.Errorf("current lease %v did not match expected lease %v",
@@ -776,7 +819,7 @@ func (sj *StartableJob) Start(ctx context.Context) (errCh <-chan error, err erro
 	if !sj.txn.IsCommitted() {
 		return nil, fmt.Errorf("cannot resume %T job which is not committed", sj.resumer)
 	}
-	if err := sj.Started(ctx); err != nil {
+	if err := sj.started(ctx); err != nil {
 		return nil, err
 	}
 	errCh, err = sj.registry.resume(sj.resumerCtx, sj.resumer, sj.resultsCh, sj.Job)
@@ -798,6 +841,8 @@ func (sj *StartableJob) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	jobCompletedOk := false
+
 	var r tree.Datums // stores a row if we've received one.
 	for {
 		// Alternate between receiving rows and sending them. Nil channels block.
@@ -820,6 +865,9 @@ func (sj *StartableJob) Run(ctx context.Context) error {
 			}
 		case toClient <- r:
 			r = nil
+			if jobCompletedOk {
+				return nil
+			}
 		case <-ctx.Done():
 			// Launch a goroutine to continue consuming results from the job.
 			if resultsFromJob != nil {
@@ -839,6 +887,11 @@ func (sj *StartableJob) Run(ctx context.Context) error {
 			return ctx.Err()
 		case err := <-errCh:
 			// The job has completed, return its final error.
+			if err == nil && r != nil {
+				// We still have data to send to the client.
+				jobCompletedOk = true
+				continue
+			}
 			return err
 		}
 	}

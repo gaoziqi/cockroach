@@ -21,6 +21,7 @@ package tree
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
@@ -112,9 +113,11 @@ type CreateIndex struct {
 	Sharded     *ShardedIndexDef
 	// Extra columns to be stored together with the indexed ones as an optimization
 	// for improved reading performance.
-	Storing     NameList
-	Interleave  *InterleaveDef
-	PartitionBy *PartitionBy
+	Storing      NameList
+	Interleave   *InterleaveDef
+	PartitionBy  *PartitionBy
+	Predicate    Expr
+	Concurrently bool
 }
 
 // Format implements the NodeFormatter interface.
@@ -127,6 +130,9 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 		ctx.WriteString("INVERTED ")
 	}
 	ctx.WriteString("INDEX ")
+	if node.Concurrently {
+		ctx.WriteString("CONCURRENTLY ")
+	}
 	if node.IfNotExists {
 		ctx.WriteString("IF NOT EXISTS ")
 	}
@@ -161,6 +167,62 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 	if node.PartitionBy != nil {
 		ctx.FormatNode(node.PartitionBy)
 	}
+	if node.Predicate != nil {
+		ctx.WriteString(" WHERE ")
+		ctx.FormatNode(node.Predicate)
+	}
+}
+
+// CreateTypeVariety represents a particular variety of user defined types.
+type CreateTypeVariety int
+
+//go:generate stringer -type=CreateTypeVariety
+const (
+	_ CreateTypeVariety = iota
+	// Enum represents an ENUM user defined type.
+	Enum
+	// Composite represents a composite user defined type.
+	Composite
+	// Range represents a RANGE user defined type.
+	Range
+	// Base represents a base user defined type.
+	Base
+	// Shell represents a shell user defined type.
+	Shell
+	// Domain represents a DOMAIN user defined type.
+	Domain
+)
+
+// CreateType represents a CREATE TYPE statement.
+type CreateType struct {
+	TypeName *UnresolvedObjectName
+	Variety  CreateTypeVariety
+	// EnumLabels is set when this represents a CREATE TYPE ... AS ENUM statement.
+	EnumLabels []string
+}
+
+var _ Statement = &CreateType{}
+
+// Format implements the NodeFormatter interface.
+func (node *CreateType) Format(ctx *FmtCtx) {
+	ctx.WriteString("CREATE TYPE ")
+	ctx.WriteString(node.TypeName.String())
+	ctx.WriteString(" ")
+	switch node.Variety {
+	case Enum:
+		ctx.WriteString("AS ENUM (")
+		for i := range node.EnumLabels {
+			if i > 0 {
+				ctx.WriteString(", ")
+			}
+			lex.EncodeSQLString(&ctx.Buffer, node.EnumLabels[i])
+		}
+		ctx.WriteString(")")
+	}
+}
+
+func (node *CreateType) String() string {
+	return AsString(node)
 }
 
 // TableDef represents a column, index or constraint definition within a CREATE
@@ -170,9 +232,6 @@ type TableDef interface {
 	// Placeholder function to ensure that only desired types (*TableDef) conform
 	// to the TableDef interface.
 	tableDef()
-
-	// SetName replaces the name of the definition in-place. Used in the parser.
-	SetName(name Name)
 }
 
 func (*ColumnTableDef) tableDef()               {}
@@ -180,6 +239,7 @@ func (*IndexTableDef) tableDef()                {}
 func (*FamilyTableDef) tableDef()               {}
 func (*ForeignKeyConstraintTableDef) tableDef() {}
 func (*CheckConstraintTableDef) tableDef()      {}
+func (*LikeTableDef) tableDef()                 {}
 
 // TableDefs represents a list of table definitions.
 type TableDefs []TableDef
@@ -209,7 +269,7 @@ const (
 // statement.
 type ColumnTableDef struct {
 	Name     Name
-	Type     *types.T
+	Type     ResolvableTypeReference
 	IsSerial bool
 	Nullable struct {
 		Nullability    Nullability
@@ -252,7 +312,16 @@ type ColumnTableDefCheckExpr struct {
 	ConstraintName Name
 }
 
-func processCollationOnType(name Name, typ *types.T, c ColumnCollation) (*types.T, error) {
+func processCollationOnType(
+	name Name, ref ResolvableTypeReference, c ColumnCollation,
+) (*types.T, error) {
+	// At the moment, only string types can be collated. User defined types
+	//  like enums don't support collations, so check this at parse time.
+	typ, ok := GetStaticallyKnownType(ref)
+	if !ok {
+		return nil, pgerror.Newf(pgcode.DatatypeMismatch,
+			"COLLATE declaration for non-string-typed column %q", name)
+	}
 	switch typ.Family() {
 	case types.StringFamily:
 		return types.MakeCollatedString(typ, string(c)), nil
@@ -273,11 +342,14 @@ func processCollationOnType(name Name, typ *types.T, c ColumnCollation) (*types.
 
 // NewColumnTableDef constructs a column definition for a CreateTable statement.
 func NewColumnTableDef(
-	name Name, typ *types.T, isSerial bool, qualifications []NamedColumnQualification,
+	name Name,
+	typRef ResolvableTypeReference,
+	isSerial bool,
+	qualifications []NamedColumnQualification,
 ) (*ColumnTableDef, error) {
 	d := &ColumnTableDef{
 		Name:     name,
-		Type:     typ,
+		Type:     typRef,
 		IsSerial: isSerial,
 	}
 	d.Nullable.Nullability = SilentNull
@@ -289,10 +361,11 @@ func NewColumnTableDef(
 			if err != nil {
 				return nil, pgerror.Wrapf(err, pgcode.Syntax, "invalid locale %s", locale)
 			}
-			d.Type, err = processCollationOnType(name, d.Type, t)
+			collatedTyp, err := processCollationOnType(name, d.Type, t)
 			if err != nil {
 				return nil, err
 			}
+			d.Type = collatedTyp
 		case *ColumnDefault:
 			if d.HasDefaultExpr() {
 				return nil, pgerror.Newf(pgcode.Syntax,
@@ -357,11 +430,6 @@ func NewColumnTableDef(
 		}
 	}
 	return d, nil
-}
-
-// SetName implements the TableDef interface.
-func (node *ColumnTableDef) SetName(name Name) {
-	node.Name = name
 }
 
 // HasDefaultExpr returns if the ColumnTableDef has a default expression.
@@ -478,7 +546,10 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 func (node *ColumnTableDef) columnTypeString() string {
 	if node.IsSerial {
 		// Map INT types to SERIAL keyword.
-		switch node.Type.Width() {
+		// TODO (rohany): This should be pushed until type resolution occurs.
+		//  However, the argument is that we deal with serial at parse time only,
+		//  so we handle those cases here.
+		switch MustBeStaticallyKnownType(node.Type).Width() {
 		case 16:
 			return "SERIAL2"
 		case 32:
@@ -577,11 +648,7 @@ type IndexTableDef struct {
 	Interleave  *InterleaveDef
 	Inverted    bool
 	PartitionBy *PartitionBy
-}
-
-// SetName implements the TableDef interface.
-func (node *IndexTableDef) SetName(name Name) {
-	node.Name = name
+	Predicate   Expr
 }
 
 // Format implements the NodeFormatter interface.
@@ -611,6 +678,10 @@ func (node *IndexTableDef) Format(ctx *FmtCtx) {
 	if node.PartitionBy != nil {
 		ctx.FormatNode(node.PartitionBy)
 	}
+	if node.Predicate != nil {
+		ctx.WriteString(" WHERE ")
+		ctx.FormatNode(node.Predicate)
+	}
 }
 
 // ConstraintTableDef represents a constraint definition within a CREATE TABLE
@@ -620,6 +691,9 @@ type ConstraintTableDef interface {
 	// Placeholder function to ensure that only desired types
 	// (*ConstraintTableDef) conform to the ConstraintTableDef interface.
 	constraintTableDef()
+
+	// SetName replaces the name of the definition in-place. Used in the parser.
+	SetName(name Name)
 }
 
 func (*UniqueConstraintTableDef) constraintTableDef()     {}
@@ -631,6 +705,11 @@ func (*CheckConstraintTableDef) constraintTableDef()      {}
 type UniqueConstraintTableDef struct {
 	IndexTableDef
 	PrimaryKey bool
+}
+
+// SetName implements the TableDef interface.
+func (node *UniqueConstraintTableDef) SetName(name Name) {
+	node.Name = name
 }
 
 // Format implements the NodeFormatter interface.
@@ -661,6 +740,10 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 	}
 	if node.PartitionBy != nil {
 		ctx.FormatNode(node.PartitionBy)
+	}
+	if node.Predicate != nil {
+		ctx.WriteString(" WHERE ")
+		ctx.FormatNode(node.Predicate)
 	}
 }
 
@@ -768,7 +851,7 @@ func (node *ForeignKeyConstraintTableDef) Format(ctx *FmtCtx) {
 	ctx.FormatNode(&node.Actions)
 }
 
-// SetName implements the TableDef interface.
+// SetName implements the ConstraintTableDef interface.
 func (node *ForeignKeyConstraintTableDef) SetName(name Name) {
 	node.Name = name
 }
@@ -781,7 +864,7 @@ type CheckConstraintTableDef struct {
 	Hidden bool
 }
 
-// SetName implements the TableDef interface.
+// SetName implements the ConstraintTableDef interface.
 func (node *CheckConstraintTableDef) SetName(name Name) {
 	node.Name = name
 }
@@ -805,11 +888,6 @@ type FamilyTableDef struct {
 	Columns NameList
 }
 
-// SetName implements the TableDef interface.
-func (node *FamilyTableDef) SetName(name Name) {
-	node.Name = name
-}
-
 // Format implements the NodeFormatter interface.
 func (node *FamilyTableDef) Format(ctx *FmtCtx) {
 	ctx.WriteString("FAMILY ")
@@ -826,24 +904,6 @@ func (node *FamilyTableDef) Format(ctx *FmtCtx) {
 // TABLE or CREATE INDEX statement.
 type ShardedIndexDef struct {
 	ShardBuckets Expr
-}
-
-// EvalShardBucketCount evaluates and checks the integer argument to a `USING HASH WITH
-// BUCKET_COUNT` index creation query.
-func EvalShardBucketCount(shardBuckets Expr) (int32, error) {
-	const invalidBucketCountMsg = `BUCKET_COUNT must be a strictly positive integer value`
-	cst, ok := shardBuckets.(*NumVal)
-	if !ok {
-		return 0, pgerror.New(pgcode.InvalidParameterValue, invalidBucketCountMsg)
-	}
-	buckets, err := cst.AsInt32()
-	if err != nil || buckets <= 0 {
-		if err != nil {
-			return 0, pgerror.Wrap(err, pgcode.InvalidParameterValue, invalidBucketCountMsg)
-		}
-		return 0, pgerror.New(pgcode.InvalidParameterValue, invalidBucketCountMsg)
-	}
-	return buckets, nil
 }
 
 // Format implements the NodeFormatter interface.
@@ -990,6 +1050,17 @@ func (o *StorageParams) Format(ctx *FmtCtx) {
 	}
 }
 
+// CreateTableOnCommitSetting represents the CREATE TABLE ... ON COMMIT <action>
+// parameters.
+type CreateTableOnCommitSetting uint32
+
+const (
+	// CreateTableOnCommitUnset indicates that ON COMMIT was unset.
+	CreateTableOnCommitUnset CreateTableOnCommitSetting = iota
+	// CreateTableOnCommitPreserveRows indicates that ON COMMIT PRESERVE ROWS was set.
+	CreateTableOnCommitPreserveRows
+)
+
 // CreateTable represents a CREATE TABLE statement.
 type CreateTable struct {
 	IfNotExists   bool
@@ -998,6 +1069,7 @@ type CreateTable struct {
 	PartitionBy   *PartitionBy
 	Temporary     bool
 	StorageParams StorageParams
+	OnCommit      CreateTableOnCommitSetting
 	// In CREATE...AS queries, Defs represents a list of ColumnTableDefs, one for
 	// each column, and a ConstraintTableDef for each constraint on a subset of
 	// these columns.
@@ -1250,6 +1322,80 @@ const (
 	_ = SeqOptAs
 )
 
+// LikeTableDef represents a LIKE table declaration on a CREATE TABLE statement.
+type LikeTableDef struct {
+	Name    TableName
+	Options []LikeTableOption
+}
+
+// LikeTableOption represents an individual INCLUDING / EXCLUDING statement
+// on a LIKE table declaration.
+type LikeTableOption struct {
+	Excluded bool
+	Opt      LikeTableOpt
+}
+
+// Format implements the NodeFormatter interface.
+func (def *LikeTableDef) Format(ctx *FmtCtx) {
+	ctx.WriteString("LIKE ")
+	ctx.FormatNode(&def.Name)
+	for _, o := range def.Options {
+		ctx.WriteString(" ")
+		ctx.FormatNode(o)
+	}
+}
+
+// Format implements the NodeFormatter interface.
+func (l LikeTableOption) Format(ctx *FmtCtx) {
+	if l.Excluded {
+		ctx.WriteString("EXCLUDING ")
+	} else {
+		ctx.WriteString("INCLUDING ")
+	}
+	ctx.WriteString(l.Opt.String())
+}
+
+// LikeTableOpt represents one of the types of things that can be included or
+// excluded in a LIKE table declaration. It's a bitmap, where each of the Opt
+// values is a single enabled bit in the map.
+type LikeTableOpt int
+
+// The values for LikeTableOpt.
+const (
+	LikeTableOptConstraints LikeTableOpt = 1 << iota
+	LikeTableOptDefaults
+	LikeTableOptGenerated
+	LikeTableOptIndexes
+
+	// Make sure this field stays last!
+	likeTableOptInvalid
+)
+
+// LikeTableOptAll is the full LikeTableOpt bitmap.
+const LikeTableOptAll = ^likeTableOptInvalid
+
+// Has returns true if the receiver has the other options bits set.
+func (o LikeTableOpt) Has(other LikeTableOpt) bool {
+	return int(o)&int(other) != 0
+}
+
+func (o LikeTableOpt) String() string {
+	switch o {
+	case LikeTableOptConstraints:
+		return "CONSTRAINTS"
+	case LikeTableOptDefaults:
+		return "DEFAULTS"
+	case LikeTableOptGenerated:
+		return "GENERATED"
+	case LikeTableOptIndexes:
+		return "INDEXES"
+	case LikeTableOptAll:
+		return "ALL"
+	default:
+		panic("unknown like table opt" + strconv.Itoa(int(o)))
+	}
+}
+
 // ToRoleOptions converts KVOptions to a roleoption.List using
 // typeAsString to convert exprs to strings.
 func (o KVOptions) ToRoleOptions(
@@ -1381,11 +1527,16 @@ type CreateView struct {
 	AsSource    *Select
 	IfNotExists bool
 	Temporary   bool
+	Replace     bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *CreateView) Format(ctx *FmtCtx) {
 	ctx.WriteString("CREATE ")
+
+	if node.Replace {
+		ctx.WriteString("OR REPLACE ")
+	}
 
 	if node.Temporary {
 		ctx.WriteString("TEMPORARY ")

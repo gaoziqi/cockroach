@@ -74,11 +74,12 @@ func (b *Builder) buildScalar(
 			// of a larger grouping expression would have been detected by the
 			// groupStrs checking code above.
 			// Normally this would be a "column must appear in the GROUP BY clause"
-			// error. The only case where we allow this (for compatibility with
-			// Postgres) is when this column is part of a table and we are already
+			// error. The only cases where we allow this (for compatibility with
+			// Postgres) is when this column is an outer column (and therefore
+			// effectively constant) or it is part of a table and we are already
 			// grouping on the entire PK of that table.
 			g := inScope.groupby
-			if !b.allowImplicitGroupingColumn(t.id, g) {
+			if !inScope.isOuterColumn(t.id) && !b.allowImplicitGroupingColumn(t.id, g) {
 				panic(newGroupingError(&t.name))
 			}
 
@@ -250,7 +251,7 @@ func (b *Builder) buildScalar(
 	case *tree.CastExpr:
 		texpr := t.Expr.(tree.TypedExpr)
 		arg := b.buildScalar(texpr, inScope, nil, nil, colRefs)
-		out = b.factory.ConstructCast(arg, t.Type)
+		out = b.factory.ConstructCast(arg, t.ResolvedType())
 
 	case *tree.CoalesceExpr:
 		args := make(memo.ScalarListExpr, len(t.Exprs))
@@ -307,6 +308,22 @@ func (b *Builder) buildScalar(
 		input := b.buildScalar(t.TypedInnerExpr(), inScope, nil, nil, colRefs)
 		out = b.factory.ConstructNot(input)
 
+	case *tree.IsNullExpr:
+		input := b.buildScalar(t.TypedInnerExpr(), inScope, nil, nil, colRefs)
+		if t.TypedInnerExpr().ResolvedType().Family() == types.TupleFamily {
+			out = b.factory.ConstructIsTupleNull(input)
+		} else {
+			out = b.factory.ConstructIs(input, memo.NullSingleton)
+		}
+
+	case *tree.IsNotNullExpr:
+		input := b.buildScalar(t.TypedInnerExpr(), inScope, nil, nil, colRefs)
+		if t.TypedInnerExpr().ResolvedType().Family() == types.TupleFamily {
+			out = b.factory.ConstructIsTupleNotNull(input)
+		} else {
+			out = b.factory.ConstructIsNot(input, memo.NullSingleton)
+		}
+
 	case *tree.NullIfExpr:
 		// Ensure that the type of the first expression matches the resolved type
 		// of the NULLIF expression so that type inference will be correct in the
@@ -347,6 +364,9 @@ func (b *Builder) buildScalar(
 		to := b.buildScalar(t.TypedTo(), inScope, nil, nil, colRefs)
 		out = b.buildRangeCond(t.Not, t.Symmetric, inputFrom, from, inputTo, to)
 
+	case *sqlFnInfo:
+		out = b.buildSQLFn(t, inScope, outScope, outCol, colRefs)
+
 	case *srf:
 		if len(t.cols) == 1 {
 			if inGroupingContext {
@@ -386,7 +406,7 @@ func (b *Builder) buildScalar(
 		actualType := t.Expr.(tree.TypedExpr).ResolvedType()
 
 		found := false
-		for _, typ := range t.Types {
+		for _, typ := range t.ResolvedTypes() {
 			if actualType.Equivalent(typ) {
 				found = true
 				break
@@ -572,7 +592,7 @@ func (b *Builder) checkSubqueryOuterCols(
 		aggCols := inScope.groupby.aggregateResultCols()
 		for i := range aggCols {
 			if subqueryOuterCols.Contains(aggCols[i].id) {
-				panic(tree.NewInvalidFunctionUsageError(tree.AggregateClass, inScope.context))
+				panic(tree.NewInvalidFunctionUsageError(tree.AggregateClass, inScope.context.String()))
 			}
 		}
 	}
@@ -704,6 +724,10 @@ func (b *Builder) constructUnary(
 		return b.factory.ConstructUnaryMinus(input)
 	case tree.UnaryComplement:
 		return b.factory.ConstructUnaryComplement(input)
+	case tree.UnarySqrt:
+		return b.factory.ConstructUnarySqrt(input)
+	case tree.UnaryCbrt:
+		return b.factory.ConstructUnaryCbrt(input)
 	}
 	panic(errors.AssertionFailedf("unhandled unary operator: %s", log.Safe(un)))
 }

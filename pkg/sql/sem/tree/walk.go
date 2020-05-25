@@ -433,6 +433,28 @@ func (expr *NotExpr) Walk(v Visitor) Expr {
 }
 
 // Walk implements the Expr interface.
+func (expr *IsNullExpr) Walk(v Visitor) Expr {
+	e, changed := WalkExpr(v, expr.Expr)
+	if changed {
+		exprCopy := *expr
+		exprCopy.Expr = e
+		return &exprCopy
+	}
+	return expr
+}
+
+// Walk implements the Expr interface.
+func (expr *IsNotNullExpr) Walk(v Visitor) Expr {
+	e, changed := WalkExpr(v, expr.Expr)
+	if changed {
+		exprCopy := *expr
+		exprCopy.Expr = e
+		return &exprCopy
+	}
+	return expr
+}
+
+// Walk implements the Expr interface.
 func (expr *NullIfExpr) Walk(v Visitor) Expr {
 	e1, changed1 := WalkExpr(v, expr.Expr1)
 	e2, changed2 := WalkExpr(v, expr.Expr2)
@@ -626,6 +648,9 @@ func (expr *DTimeTZ) Walk(_ Visitor) Expr { return expr }
 func (expr *DFloat) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
+func (expr *DEnum) Walk(_ Visitor) Expr { return expr }
+
+// Walk implements the Expr interface.
 func (expr *DDecimal) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
@@ -633,6 +658,12 @@ func (expr *DInt) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
 func (expr *DInterval) Walk(_ Visitor) Expr { return expr }
+
+// Walk implements the Expr interface.
+func (expr *DGeography) Walk(_ Visitor) Expr { return expr }
+
+// Walk implements the Expr interface.
+func (expr *DGeometry) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
 func (expr *DJSON) Walk(_ Visitor) Expr { return expr }
@@ -808,7 +839,6 @@ func (stmt *Delete) walkStmt(v Visitor) Statement {
 // copyNode makes a copy of this Statement without recursing in any child Statements.
 func (stmt *Explain) copyNode() *Explain {
 	stmtCopy := *stmt
-	stmtCopy.Options = append([]string(nil), stmt.Options...)
 	return &stmtCopy
 }
 
@@ -823,13 +853,13 @@ func (stmt *Explain) walkStmt(v Visitor) Statement {
 }
 
 // copyNode makes a copy of this Statement without recursing in any child Statements.
-func (stmt *ExplainBundle) copyNode() *ExplainBundle {
+func (stmt *ExplainAnalyzeDebug) copyNode() *ExplainAnalyzeDebug {
 	stmtCopy := *stmt
 	return &stmtCopy
 }
 
 // walkStmt is part of the walkableStmt interface.
-func (stmt *ExplainBundle) walkStmt(v Visitor) Statement {
+func (stmt *ExplainAnalyzeDebug) walkStmt(v Visitor) Statement {
 	s, changed := walkStmt(v, stmt.Statement)
 	if changed {
 		stmt = stmt.copyNode()
@@ -1117,7 +1147,7 @@ func (stmt *SelectClause) copyNode() *SelectClause {
 		hCopy := *stmt.Having
 		stmtCopy.Having = &hCopy
 	}
-	stmt.Window = append(Window(nil), stmt.Window...)
+	stmtCopy.Window = append(Window(nil), stmt.Window...)
 	return &stmtCopy
 }
 

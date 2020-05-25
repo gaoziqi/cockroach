@@ -12,11 +12,13 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -35,7 +37,7 @@ func (p *planner) IncrementSequence(ctx context.Context, seqName *tree.TableName
 		return 0, readOnlyError("nextval()")
 	}
 
-	descriptor, err := ResolveExistingObject(ctx, p, seqName, tree.ObjectLookupFlagsWithRequired(), ResolveRequireSequenceDesc)
+	descriptor, err := resolver.ResolveExistingTableObject(ctx, p, seqName, tree.ObjectLookupFlagsWithRequired(), resolver.ResolveRequireSequenceDesc)
 	if err != nil {
 		return 0, err
 	}
@@ -46,19 +48,17 @@ func (p *planner) IncrementSequence(ctx context.Context, seqName *tree.TableName
 	seqOpts := descriptor.SequenceOpts
 	var val int64
 	if seqOpts.Virtual {
-		rowid := builtins.GenerateUniqueInt(p.EvalContext().NodeID)
+		rowid := builtins.GenerateUniqueInt(p.EvalContext().NodeID.SQLInstanceID())
 		val = int64(rowid)
 	} else {
-		seqValueKey := keys.MakeSequenceKey(uint32(descriptor.ID))
+		seqValueKey := p.ExecCfg().Codec.SequenceKey(uint32(descriptor.ID))
 		val, err = kv.IncrementValRetryable(
 			ctx, p.txn.DB(), seqValueKey, seqOpts.Increment)
 		if err != nil {
-			switch err.(type) {
-			case *roachpb.IntegerOverflowError:
+			if errors.HasType(err, (*roachpb.IntegerOverflowError)(nil)) {
 				return 0, boundsExceededError(descriptor)
-			default:
-				return 0, err
 			}
+			return 0, err
 		}
 		if val > seqOpts.MaxValue || val < seqOpts.MinValue {
 			return 0, boundsExceededError(descriptor)
@@ -93,7 +93,7 @@ func boundsExceededError(descriptor *sqlbase.ImmutableTableDescriptor) error {
 func (p *planner) GetLatestValueInSessionForSequence(
 	ctx context.Context, seqName *tree.TableName,
 ) (int64, error) {
-	descriptor, err := ResolveExistingObject(ctx, p, seqName, tree.ObjectLookupFlagsWithRequired(), ResolveRequireSequenceDesc)
+	descriptor, err := resolver.ResolveExistingTableObject(ctx, p, seqName, tree.ObjectLookupFlagsWithRequired(), resolver.ResolveRequireSequenceDesc)
 	if err != nil {
 		return 0, err
 	}
@@ -116,7 +116,7 @@ func (p *planner) SetSequenceValue(
 		return readOnlyError("setval()")
 	}
 
-	descriptor, err := ResolveExistingObject(ctx, p, seqName, tree.ObjectLookupFlagsWithRequired(), ResolveRequireSequenceDesc)
+	descriptor, err := resolver.ResolveExistingTableObject(ctx, p, seqName, tree.ObjectLookupFlagsWithRequired(), resolver.ResolveRequireSequenceDesc)
 	if err != nil {
 		return err
 	}
@@ -134,7 +134,7 @@ func (p *planner) SetSequenceValue(
 			`cannot set the value of virtual sequence %q`, tree.ErrString(seqName))
 	}
 
-	seqValueKey, newVal, err := MakeSequenceKeyVal(descriptor.TableDesc(), newVal, isCalled)
+	seqValueKey, newVal, err := MakeSequenceKeyVal(p.ExecCfg().Codec, descriptor.TableDesc(), newVal, isCalled)
 	if err != nil {
 		return err
 	}
@@ -148,7 +148,7 @@ func (p *planner) SetSequenceValue(
 // MakeSequenceKeyVal returns the key and value of a sequence being set
 // with newVal.
 func MakeSequenceKeyVal(
-	sequence *TableDescriptor, newVal int64, isCalled bool,
+	codec keys.SQLCodec, sequence *TableDescriptor, newVal int64, isCalled bool,
 ) ([]byte, int64, error) {
 	opts := sequence.SequenceOpts
 	if newVal > opts.MaxValue || newVal < opts.MinValue {
@@ -162,18 +162,18 @@ func MakeSequenceKeyVal(
 		newVal = newVal - sequence.SequenceOpts.Increment
 	}
 
-	seqValueKey := keys.MakeSequenceKey(uint32(sequence.ID))
+	seqValueKey := codec.SequenceKey(uint32(sequence.ID))
 	return seqValueKey, newVal, nil
 }
 
 // GetSequenceValue returns the current value of the sequence.
 func (p *planner) GetSequenceValue(
-	ctx context.Context, desc *sqlbase.ImmutableTableDescriptor,
+	ctx context.Context, codec keys.SQLCodec, desc *sqlbase.ImmutableTableDescriptor,
 ) (int64, error) {
 	if desc.SequenceOpts == nil {
 		return 0, errors.New("descriptor is not a sequence")
 	}
-	keyValue, err := p.txn.Get(ctx, keys.MakeSequenceKey(uint32(desc.ID)))
+	keyValue, err := p.txn.Get(ctx, codec.SequenceKey(uint32(desc.ID)))
 	if err != nil {
 		return 0, err
 	}
@@ -331,7 +331,7 @@ func removeSequenceOwnerIfExists(
 	if opts.SequenceOwner.Equal(sqlbase.TableDescriptor_SequenceOpts_SequenceOwner{}) {
 		return nil
 	}
-	tableDesc, err := p.Tables().getMutableTableVersionByID(ctx, opts.SequenceOwner.OwnerTableID, p.txn)
+	tableDesc, err := p.Tables().GetMutableTableVersionByID(ctx, opts.SequenceOwner.OwnerTableID, p.txn)
 	if err != nil {
 		return err
 	}
@@ -369,7 +369,7 @@ func resolveColumnItemToDescriptors(
 		tableName = columnItem.TableName.ToTableName()
 	}
 
-	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &tableName, true /* required */, ResolveRequireTableDesc)
+	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &tableName, true /* required */, resolver.ResolveRequireTableDesc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -404,7 +404,7 @@ func addSequenceOwner(
 // The passed-in column descriptor is mutated, and the modified sequence descriptors are returned.
 func maybeAddSequenceDependencies(
 	ctx context.Context,
-	sc SchemaResolver,
+	sc resolver.SchemaResolver,
 	tableDesc *sqlbase.MutableTableDescriptor,
 	col *sqlbase.ColumnDescriptor,
 	expr tree.TypedExpr,
@@ -425,13 +425,13 @@ func maybeAddSequenceDependencies(
 		var seqDesc *MutableTableDescriptor
 		p, ok := sc.(*planner)
 		if ok {
-			seqDesc, err = p.ResolveMutableTableDescriptor(ctx, &tn, true /*required*/, ResolveRequireSequenceDesc)
+			seqDesc, err = p.ResolveMutableTableDescriptor(ctx, &tn, true /*required*/, resolver.ResolveRequireSequenceDesc)
 			if err != nil {
 				return nil, err
 			}
 		} else {
 			// This is only executed via IMPORT which uses its own resolver.
-			seqDesc, err = ResolveMutableExistingObject(ctx, sc, &tn, true /*required*/, ResolveRequireSequenceDesc)
+			seqDesc, err = resolver.ResolveMutableExistingTableObject(ctx, sc, &tn, true /*required*/, resolver.ResolveRequireSequenceDesc)
 			if err != nil {
 				return nil, err
 			}
@@ -469,13 +469,14 @@ func (p *planner) dropSequencesOwnedByCol(
 	ctx context.Context, col *sqlbase.ColumnDescriptor,
 ) error {
 	for _, sequenceID := range col.OwnsSequenceIds {
-		seqDesc, err := p.Tables().getMutableTableVersionByID(ctx, sequenceID, p.txn)
+		seqDesc, err := p.Tables().GetMutableTableVersionByID(ctx, sequenceID, p.txn)
 		if err != nil {
 			return err
 		}
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
+		jobDesc := fmt.Sprintf("removing sequence %q dependent on column %q which is being dropped",
+			seqDesc.Name, col.ColName())
 		if err := p.dropSequenceImpl(
-			ctx, seqDesc, true /* queueJob */, "dropping dependent sequence", tree.DropRestrict,
+			ctx, seqDesc, true /* queueJob */, jobDesc, tree.DropRestrict,
 		); err != nil {
 			return err
 		}
@@ -493,7 +494,7 @@ func (p *planner) removeSequenceDependencies(
 ) error {
 	for _, sequenceID := range col.UsesSequenceIds {
 		// Get the sequence descriptor so we can remove the reference from it.
-		seqDesc, err := p.Tables().getMutableTableVersionByID(ctx, sequenceID, p.txn)
+		seqDesc, err := p.Tables().GetMutableTableVersionByID(ctx, sequenceID, p.txn)
 		if err != nil {
 			return err
 		}
@@ -535,9 +536,10 @@ func (p *planner) removeSequenceDependencies(
 				seqDesc.DependedOnBy[refTableIdx+1:]...)
 		}
 
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
+		jobDesc := fmt.Sprintf("removing sequence %q dependent on column %q which is being dropped",
+			seqDesc.Name, col.ColName())
 		if err := p.writeSchemaChange(
-			ctx, seqDesc, sqlbase.InvalidMutationID, "removing sequence dependency",
+			ctx, seqDesc, sqlbase.InvalidMutationID, jobDesc,
 		); err != nil {
 			return err
 		}

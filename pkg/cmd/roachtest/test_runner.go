@@ -35,9 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/petermattis/goid"
-	"github.com/pkg/errors"
 )
 
 // testRunner runs tests.
@@ -281,7 +281,7 @@ func (r *testRunner) Run(
 				l,
 			); err != nil {
 				// A worker returned an error. Let's shut down.
-				msg := fmt.Sprintf("Worker %d returned with error. Quiescing. Error: %s", i, err)
+				msg := fmt.Sprintf("Worker %d returned with error. Quiescing. Error: %+v", i, err)
 				shout(ctx, l, lopt.stdout, msg)
 				errs.AddErr(err)
 				// Quiesce the stopper. This will cause all workers to not pick up more
@@ -479,7 +479,7 @@ func (r *testRunner) runWorker(
 		if err != nil || t.Failed() {
 			failureMsg := fmt.Sprintf("%s (%d) - ", testToRun.spec.Name, testToRun.runNum)
 			if err != nil {
-				failureMsg += err.Error()
+				failureMsg += fmt.Sprintf("%+v", err)
 			} else {
 				failureMsg += t.FailureMsg()
 			}
@@ -812,7 +812,7 @@ func (r *testRunner) runTest(
 			r.collectClusterLogs(ctx, c, t.l)
 			// We return an error here because the test goroutine is still running, so
 			// we want to alert the caller of this unusual situation.
-			return false, fmt.Errorf(msg)
+			return false, errors.New(msg)
 		}
 	}
 
@@ -1136,8 +1136,14 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 
 	buildVersionMajorMinor := fmt.Sprintf("%d.%d", buildVersion.Major(), buildVersion.Minor())
 
+	// NB: you can update the values in this map to point at newer patch
+	// releases. You will need to run acceptance/version-upgrade with the
+	// checkpoint option enabled to create the missing store directory fixture
+	// (see runVersionUpgrade). The same is true for adding a new key to this
+	// map.
 	verMap := map[string]string{
-		"20.1": "19.2.1",
+		"20.2": "20.1.0",
+		"20.1": "19.2.7",
 		"19.2": "19.1.5",
 		"19.1": "2.1.9",
 		"2.2":  "2.1.9",

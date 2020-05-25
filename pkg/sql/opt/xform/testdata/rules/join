@@ -675,7 +675,7 @@ memo (optimized, ~8KB, required=[presentation: a:1,b:2,c:3,k:5])
  ├── G1: (inner-join G2 G3 G4) (inner-join G3 G2 G4)
  │    └── [presentation: a:1,b:2,c:3,k:5]
  │         ├── best: (inner-join G2 G3 G4)
- │         └── cost: 12120.05
+ │         └── cost: 12120.06
  ├── G2: (scan abc,cols=(1-3)) (scan abc@ab,cols=(1-3)) (scan abc@bc,cols=(1-3))
  │    └── []
  │         ├── best: (scan abc,cols=(1-3))
@@ -1463,6 +1463,52 @@ inner-join (lookup bool_col)
  │    └── filters (true)
  └── filters (true)
 
+opt
+SELECT * FROM small INNER JOIN bool_col ON a=m AND b=10 AND c
+----
+inner-join (lookup bool_col)
+ ├── columns: m:1!null n:2 a:4!null b:5!null c:6!null d:7 e:8
+ ├── key columns: [9] = [9]
+ ├── lookup columns are key
+ ├── fd: ()-->(5,6), (1)==(4), (4)==(1)
+ ├── inner-join (lookup bool_col@secondary)
+ │    ├── columns: m:1!null n:2 a:4!null b:5!null c:6!null bool_col.rowid:9!null
+ │    ├── key columns: [1 10 11] = [4 5 6]
+ │    ├── fd: ()-->(5,6), (9)-->(4), (1)==(4), (4)==(1)
+ │    ├── project
+ │    │    ├── columns: "project_const_col_@5":10!null "project_const_col_@6":11!null m:1 n:2
+ │    │    ├── fd: ()-->(10,11)
+ │    │    ├── scan small
+ │    │    │    └── columns: m:1 n:2
+ │    │    └── projections
+ │    │         ├── 10 [as="project_const_col_@5":10]
+ │    │         └── true [as="project_const_col_@6":11]
+ │    └── filters (true)
+ └── filters (true)
+
+opt
+SELECT * FROM small INNER JOIN bool_col ON a=m AND b=10 AND NOT c
+----
+inner-join (lookup bool_col)
+ ├── columns: m:1!null n:2 a:4!null b:5!null c:6!null d:7 e:8
+ ├── key columns: [9] = [9]
+ ├── lookup columns are key
+ ├── fd: ()-->(5,6), (1)==(4), (4)==(1)
+ ├── inner-join (lookup bool_col@secondary)
+ │    ├── columns: m:1!null n:2 a:4!null b:5!null c:6!null bool_col.rowid:9!null
+ │    ├── key columns: [1 10 11] = [4 5 6]
+ │    ├── fd: ()-->(5,6), (9)-->(4), (1)==(4), (4)==(1)
+ │    ├── project
+ │    │    ├── columns: "project_const_col_@5":10!null "project_const_col_@6":11!null m:1 n:2
+ │    │    ├── fd: ()-->(10,11)
+ │    │    ├── scan small
+ │    │    │    └── columns: m:1 n:2
+ │    │    └── projections
+ │    │         ├── 10 [as="project_const_col_@5":10]
+ │    │         └── false [as="project_const_col_@6":11]
+ │    └── filters (true)
+ └── filters (true)
+
 exec-ddl
 CREATE TABLE t(pk INT PRIMARY KEY, col0 INT, col1 INT, col2 INT, col4 INT, UNIQUE INDEX (col2))
 ----
@@ -1518,6 +1564,188 @@ project
       └── filters (true)
 
 # --------------------------------------------------
+# GenerateGeospatialLookupJoins
+# --------------------------------------------------
+
+exec-ddl
+CREATE TABLE nyc_census_blocks (
+  gid serial PRIMARY KEY,
+  blkid varchar(15),
+  popn_total float8,
+  popn_white float8,
+  popn_black float8,
+  popn_nativ float8,
+  popn_asian float8,
+  popn_other float8,
+  boroname varchar(32),
+  geom GEOMETRY(MULTIPOLYGON,4326),
+  INVERTED INDEX nyc_census_blocks_geo_idx (geom)
+)
+----
+
+exec-ddl
+CREATE TABLE nyc_neighborhoods (
+  gid serial PRIMARY KEY,
+  boroname varchar(43),
+  name varchar(64),
+  geom GEOMETRY(MULTIPOLYGON,4326),
+  INVERTED INDEX nyc_neighborhoods_geo_idx (geom)
+)
+----
+
+exec-ddl
+ALTER TABLE nyc_census_blocks INJECT STATISTICS '[
+  {
+    "columns": ["gid"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 38794,
+    "distinct_count": 38794
+  },
+  {
+    "columns": ["boroname"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 38794,
+    "distinct_count": 5
+  }
+]'
+----
+
+exec-ddl
+ALTER TABLE nyc_neighborhoods INJECT STATISTICS '[
+  {
+    "columns": ["gid"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 129,
+    "distinct_count": 129
+  },
+  {
+    "columns": ["boroname"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 129,
+    "distinct_count": 5
+  },
+  {
+    "columns": ["name"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 129,
+    "distinct_count": 129
+  }
+]'
+----
+
+# This query calculates the population density of two different neighborhoods
+# in New York City.
+opt expect=GenerateGeoLookupJoins
+SELECT
+  n.name,
+  Sum(c.popn_total) / (ST_Area(n.geom) / 1000000.0) AS popn_per_sqkm
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods AS n
+ON ST_Intersects(c.geom, n.geom) AND c.boroname = n.boroname
+WHERE n.name = 'Upper West Side'
+OR n.name = 'Upper East Side'
+GROUP BY n.name, n.geom
+----
+project
+ ├── columns: name:13!null popn_per_sqkm:16
+ ├── side-effects
+ ├── group-by
+ │    ├── columns: name:13!null n.geom:14 sum:15
+ │    ├── grouping columns: name:13!null n.geom:14
+ │    ├── key: (13,14)
+ │    ├── fd: (13,14)-->(15)
+ │    ├── inner-join (lookup nyc_census_blocks)
+ │    │    ├── columns: popn_total:3 c.boroname:9!null c.geom:10 n.boroname:12!null name:13!null n.geom:14
+ │    │    ├── key columns: [1] = [1]
+ │    │    ├── lookup columns are key
+ │    │    ├── fd: (9)==(12), (12)==(9)
+ │    │    ├── inner-join (geo-lookup nyc_census_blocks@nyc_census_blocks_geo_idx)
+ │    │    │    ├── columns: c.gid:1!null n.boroname:12 name:13!null n.geom:14
+ │    │    │    ├── geo-relationship: intersects
+ │    │    │    ├── select
+ │    │    │    │    ├── columns: n.boroname:12 name:13!null n.geom:14
+ │    │    │    │    ├── scan n
+ │    │    │    │    │    └── columns: n.boroname:12 name:13 n.geom:14
+ │    │    │    │    └── filters
+ │    │    │    │         └── (name:13 = 'Upper West Side') OR (name:13 = 'Upper East Side') [outer=(13), constraints=(/13: [/'Upper East Side' - /'Upper East Side'] [/'Upper West Side' - /'Upper West Side']; tight)]
+ │    │    │    └── filters (true)
+ │    │    └── filters
+ │    │         ├── st_intersects(c.geom:10, n.geom:14) [outer=(10,14)]
+ │    │         └── c.boroname:9 = n.boroname:12 [outer=(9,12), constraints=(/9: (/NULL - ]; /12: (/NULL - ]), fd=(9)==(12), (12)==(9)]
+ │    └── aggregations
+ │         └── sum [as=sum:15, outer=(3)]
+ │              └── popn_total:3
+ └── projections
+      └── sum:15 / (st_area(n.geom:14) / 1e+06) [as=popn_per_sqkm:16, outer=(14,15), side-effects]
+
+memo expect=GenerateGeoLookupJoins
+SELECT
+  n.name,
+  Sum(c.popn_total) / (ST_Area(n.geom) / 1000000.0) AS popn_per_sqkm
+FROM nyc_census_blocks AS c
+JOIN nyc_neighborhoods AS n
+ON ST_Intersects(c.geom, n.geom) AND c.boroname = n.boroname
+WHERE n.name = 'Upper West Side'
+OR n.name = 'Upper East Side'
+GROUP BY n.name, n.geom
+----
+memo (optimized, ~23KB, required=[presentation: name:13,popn_per_sqkm:16])
+ ├── G1: (project G2 G3 name)
+ │    └── [presentation: name:13,popn_per_sqkm:16]
+ │         ├── best: (project G2 G3 name)
+ │         └── cost: 6717.66
+ ├── G2: (group-by G4 G5 cols=(13,14))
+ │    └── []
+ │         ├── best: (group-by G4 G5 cols=(13,14))
+ │         └── cost: 6717.61
+ ├── G3: (projections G6)
+ ├── G4: (inner-join G7 G8 G9) (inner-join G8 G7 G9) (lookup-join G10 G9 nyc_census_blocks,keyCols=[1],outCols=(3,9,10,12-14))
+ │    └── []
+ │         ├── best: (lookup-join G10 G9 nyc_census_blocks,keyCols=[1],outCols=(3,9,10,12-14))
+ │         └── cost: 6510.67
+ ├── G5: (aggregations G11)
+ ├── G6: (div G12 G13)
+ ├── G7: (scan c,cols=(3,9,10))
+ │    └── []
+ │         ├── best: (scan c,cols=(3,9,10))
+ │         └── cost: 43837.24
+ ├── G8: (select G14 G15)
+ │    └── []
+ │         ├── best: (select G14 G15)
+ │         └── cost: 139.35
+ ├── G9: (filters G16 G17)
+ ├── G10: (geo-lookup-join G8 G18 nyc_census_blocks@nyc_census_blocks_geo_idx)
+ │    └── []
+ │         ├── best: (geo-lookup-join G8 G18 nyc_census_blocks@nyc_census_blocks_geo_idx)
+ │         └── cost: 1754.40
+ ├── G11: (sum G19)
+ ├── G12: (variable sum)
+ ├── G13: (div G20 G21)
+ ├── G14: (scan n,cols=(12-14))
+ │    └── []
+ │         ├── best: (scan n,cols=(12-14))
+ │         └── cost: 138.05
+ ├── G15: (filters G22)
+ ├── G16: (function G23 st_intersects)
+ ├── G17: (eq G24 G25)
+ ├── G18: (filters)
+ ├── G19: (variable popn_total)
+ ├── G20: (function G26 st_area)
+ ├── G21: (const 1e+06)
+ ├── G22: (or G27 G28)
+ ├── G23: (scalar-list G29 G30)
+ ├── G24: (variable c.boroname)
+ ├── G25: (variable n.boroname)
+ ├── G26: (scalar-list G30)
+ ├── G27: (eq G31 G32)
+ ├── G28: (eq G31 G33)
+ ├── G29: (variable c.geom)
+ ├── G30: (variable n.geom)
+ ├── G31: (variable name)
+ ├── G32: (const 'Upper West Side')
+ └── G33: (const 'Upper East Side')
+
+# --------------------------------------------------
 # GenerateZigZagJoins
 # --------------------------------------------------
 
@@ -1556,7 +1784,7 @@ memo (optimized, ~13KB, required=[presentation: q:2,r:3])
  ├── G1: (select G2 G3) (zigzag-join G3 pqr@q pqr@r) (select G4 G5) (select G6 G7) (select G8 G7)
  │    └── [presentation: q:2,r:3]
  │         ├── best: (zigzag-join G3 pqr@q pqr@r)
- │         └── cost: 0.22
+ │         └── cost: 0.24
  ├── G2: (scan pqr,cols=(2,3))
  │    └── []
  │         ├── best: (scan pqr,cols=(2,3))
@@ -1595,6 +1823,20 @@ memo (optimized, ~13KB, required=[presentation: q:2,r:3])
  ├── G16: (variable r)
  └── G17: (const 2)
 
+# Case where the fixed columns are extracted from a complicated expression.
+opt
+SELECT q,r FROM pqr WHERE q = 1 AND ((r < 1 AND r > 1) OR (r >= 2 AND r <= 2))
+----
+inner-join (zigzag pqr@q pqr@r)
+ ├── columns: q:2!null r:3!null
+ ├── eq columns: [1] = [1]
+ ├── left fixed columns: [2] = [1]
+ ├── right fixed columns: [3] = [2]
+ ├── fd: ()-->(2,3)
+ └── filters
+      ├── q:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+      └── ((r:3 < 1) AND (r:3 > 1)) OR ((r:3 >= 2) AND (r:3 <= 2)) [outer=(3), constraints=(/3: [/2 - /2]), fd=()-->(3)]
+
 # Nested zigzag case - zigzag join needs to be wrapped in a lookup join to
 # satisfy required columns.
 opt
@@ -1623,7 +1865,7 @@ memo (optimized, ~15KB, required=[presentation: q:2,r:3,s:4])
  ├── G1: (select G2 G3) (lookup-join G4 G5 pqr,keyCols=[1],outCols=(2-4)) (select G6 G7) (select G8 G9) (select G10 G9)
  │    └── [presentation: q:2,r:3,s:4]
  │         ├── best: (lookup-join G4 G5 pqr,keyCols=[1],outCols=(2-4))
- │         └── cost: 0.84
+ │         └── cost: 0.86
  ├── G2: (scan pqr,cols=(2-4))
  │    └── []
  │         ├── best: (scan pqr,cols=(2-4))
@@ -1632,7 +1874,7 @@ memo (optimized, ~15KB, required=[presentation: q:2,r:3,s:4])
  ├── G4: (zigzag-join G3 pqr@q pqr@r)
  │    └── []
  │         ├── best: (zigzag-join G3 pqr@q pqr@r)
- │         └── cost: 0.22
+ │         └── cost: 0.24
  ├── G5: (filters)
  ├── G6: (index-join G13 pqr,cols=(2-4))
  │    └── []
@@ -1688,7 +1930,7 @@ memo (optimized, ~11KB, required=[presentation: q:2,s:4])
  ├── G1: (select G2 G3) (zigzag-join G3 pqr@q pqr@s) (select G4 G5) (select G6 G7)
  │    └── [presentation: q:2,s:4]
  │         ├── best: (zigzag-join G3 pqr@q pqr@s)
- │         └── cost: 0.22
+ │         └── cost: 0.24
  ├── G2: (scan pqr,cols=(2,4))
  │    └── []
  │         ├── best: (scan pqr,cols=(2,4))
@@ -1742,7 +1984,7 @@ memo (optimized, ~13KB, required=[presentation: r:3,t:5])
  ├── G1: (select G2 G3) (zigzag-join G3 pqr@rs pqr@ts) (select G4 G5) (select G6 G5) (select G7 G8)
  │    └── [presentation: r:3,t:5]
  │         ├── best: (zigzag-join G3 pqr@rs pqr@ts)
- │         └── cost: 0.22
+ │         └── cost: 0.24
  ├── G2: (scan pqr,cols=(3,5))
  │    └── []
  │         ├── best: (scan pqr,cols=(3,5))
@@ -1833,7 +2075,7 @@ memo (optimized, ~31KB, required=[presentation: p:1,q:2,r:3,s:4])
  ├── G1: (select G2 G3) (lookup-join G4 G5 pqr,keyCols=[1],outCols=(1-4)) (zigzag-join G3 pqr@q pqr@s) (zigzag-join G3 pqr@q pqr@rs) (lookup-join G6 G7 pqr,keyCols=[1],outCols=(1-4)) (select G8 G9) (select G10 G11) (select G12 G7) (select G13 G7)
  │    └── [presentation: p:1,q:2,r:3,s:4]
  │         ├── best: (zigzag-join G3 pqr@q pqr@s)
- │         └── cost: 0.01
+ │         └── cost: 0.04
  ├── G2: (scan pqr,cols=(1-4))
  │    └── []
  │         ├── best: (scan pqr,cols=(1-4))
@@ -1842,12 +2084,12 @@ memo (optimized, ~31KB, required=[presentation: p:1,q:2,r:3,s:4])
  ├── G4: (zigzag-join G17 pqr@q pqr@r)
  │    └── []
  │         ├── best: (zigzag-join G17 pqr@q pqr@r)
- │         └── cost: 0.22
+ │         └── cost: 0.24
  ├── G5: (filters G16)
  ├── G6: (zigzag-join G9 pqr@r pqr@s)
  │    └── []
  │         ├── best: (zigzag-join G9 pqr@r pqr@s)
- │         └── cost: 0.22
+ │         └── cost: 0.24
  ├── G7: (filters G14)
  ├── G8: (index-join G18 pqr,cols=(1-4))
  │    └── []
@@ -1985,14 +2227,17 @@ SELECT q,r FROM pqr WHERE q = 1 AND r = 2 FOR UPDATE
 ----
 select
  ├── columns: q:2!null r:3!null
+ ├── side-effects
  ├── fd: ()-->(2,3)
  ├── index-join pqr
  │    ├── columns: q:2 r:3
+ │    ├── side-effects
  │    ├── fd: ()-->(2)
  │    └── scan pqr@q
  │         ├── columns: p:1!null q:2!null
  │         ├── constraint: /2/1: [/1 - /1]
  │         ├── locking: for-update
+ │         ├── side-effects
  │         ├── key: (1)
  │         └── fd: ()-->(2)
  └── filters
@@ -2599,16 +2844,19 @@ SELECT b,a FROM t5 WHERE b @> '{"a":1, "c":2}' FOR UPDATE
 ----
 select
  ├── columns: b:2 a:1!null
+ ├── side-effects
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── index-join t5
  │    ├── columns: a:1!null b:2
+ │    ├── side-effects
  │    ├── key: (1)
  │    ├── fd: (1)-->(2)
  │    └── scan t5@b_idx
  │         ├── columns: a:1!null
  │         ├── constraint: /2/1: [/'{"a": 1}' - /'{"a": 1}']
  │         ├── locking: for-update
+ │         ├── side-effects
  │         └── key: (1)
  └── filters
       └── b:2 @> '{"a": 1, "c": 2}' [outer=(2)]

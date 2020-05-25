@@ -23,7 +23,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // TODO(yuzefovich): add benchmarks.
@@ -32,8 +34,9 @@ import (
 // ROW_NUMBER. outputColIdx specifies in which coldata.Vec the operator should
 // put its output (if there is no such column, a new column is appended).
 func NewRowNumberOperator(
-	allocator *Allocator, input Operator, outputColIdx int, partitionColIdx int,
-) Operator {
+	allocator *colmem.Allocator, input colexecbase.Operator, outputColIdx int, partitionColIdx int,
+) colexecbase.Operator {
+	input = newVectorTypeEnforcer(allocator, input, types.Int, outputColIdx)
 	base := rowNumberBase{
 		OneInputNode:    NewOneInputNode(input),
 		allocator:       allocator,
@@ -51,7 +54,7 @@ func NewRowNumberOperator(
 // and should not be used directly.
 type rowNumberBase struct {
 	OneInputNode
-	allocator       *Allocator
+	allocator       *colmem.Allocator
 	outputColIdx    int
 	partitionColIdx int
 
@@ -62,51 +65,60 @@ func (r *rowNumberBase) Init() {
 	r.Input().Init()
 }
 
-// {{ range . }}
+// {{/*
+// _COMPUTE_ROW_NUMBER is a code snippet that computes the row number value
+// for a single tuple at index i as an increment from the previous tuple's row
+// number. If a new partition begins, then the running 'rowNumber' variable is
+// reset.
+func _COMPUTE_ROW_NUMBER() { // */}}
+	// {{define "computeRowNumber" -}}
+	// {{if $.HasPartition}}
+	if partitionCol[i] {
+		r.rowNumber = 0
+	}
+	// {{end}}
+	r.rowNumber++
+	rowNumberCol[i] = r.rowNumber
+	// {{end}}
+	// {{/*
+} // */}}
+
+// {{range .}}
 
 type _ROW_NUMBER_STRINGOp struct {
 	rowNumberBase
 }
 
-var _ Operator = &_ROW_NUMBER_STRINGOp{}
+var _ colexecbase.Operator = &_ROW_NUMBER_STRINGOp{}
 
 func (r *_ROW_NUMBER_STRINGOp) Next(ctx context.Context) coldata.Batch {
 	batch := r.Input().Next(ctx)
-	if batch.Length() == 0 {
+	n := batch.Length()
+	if n == 0 {
 		return coldata.ZeroBatch
 	}
-	// {{ if .HasPartition }}
-	r.allocator.MaybeAddColumn(batch, coltypes.Bool, r.partitionColIdx)
-	// {{ end }}
-	r.allocator.MaybeAddColumn(batch, coltypes.Int64, r.outputColIdx)
 
-	// {{ if .HasPartition }}
+	// {{if .HasPartition}}
 	partitionCol := batch.ColVec(r.partitionColIdx).Bool()
-	// {{ end }}
-	rowNumberCol := batch.ColVec(r.outputColIdx).Int64()
+	// {{end}}
+	rowNumberVec := batch.ColVec(r.outputColIdx)
+	if rowNumberVec.MaybeHasNulls() {
+		// We need to make sure that there are no left over null values in the
+		// output vector.
+		rowNumberVec.Nulls().UnsetNulls()
+	}
+	rowNumberCol := rowNumberVec.Int64()
 	sel := batch.Selection()
 	if sel != nil {
-		for i := 0; i < batch.Length(); i++ {
-			// {{ if .HasPartition }}
-			if partitionCol[sel[i]] {
-				r.rowNumber = 1
-			}
-			// {{ end }}
-			r.rowNumber++
-			rowNumberCol[sel[i]] = r.rowNumber
+		for _, i := range sel[:n] {
+			_COMPUTE_ROW_NUMBER()
 		}
 	} else {
-		for i := 0; i < batch.Length(); i++ {
-			// {{ if .HasPartition }}
-			if partitionCol[i] {
-				r.rowNumber = 0
-			}
-			// {{ end }}
-			r.rowNumber++
-			rowNumberCol[i] = r.rowNumber
+		for i := range rowNumberCol[:n] {
+			_COMPUTE_ROW_NUMBER()
 		}
 	}
 	return batch
 }
 
-// {{ end }}
+// {{end}}

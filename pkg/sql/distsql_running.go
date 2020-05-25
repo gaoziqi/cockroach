@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -35,12 +36,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	opentracing "github.com/opentracing/opentracing-go"
 )
@@ -147,7 +150,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 	}
 
 	if evalCtx.SessionData.VectorizeMode != sessiondata.VectorizeOff {
-		if !vectorizeThresholdMet && (evalCtx.SessionData.VectorizeMode == sessiondata.Vectorize192Auto || evalCtx.SessionData.VectorizeMode == sessiondata.VectorizeAuto) {
+		if !vectorizeThresholdMet && (evalCtx.SessionData.VectorizeMode == sessiondata.Vectorize201Auto || evalCtx.SessionData.VectorizeMode == sessiondata.VectorizeOn) {
 			// Vectorization is not justified for this flow because the expected
 			// amount of data is too small and the overhead of pre-allocating data
 			// structures needed for the vectorized engine is expected to dominate
@@ -173,7 +176,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 							ClusterID:      &dsp.rpcCtx.ClusterID,
 							VecFDSemaphore: dsp.distSQLSrv.VecFDSemaphore,
 						},
-						NodeID: -1,
+						NodeID: evalCtx.NodeID,
 					}, spec.Processors, fuseOpt, recv,
 				); err != nil {
 					// Vectorization attempt failed with an error.
@@ -324,8 +327,34 @@ func (dsp *DistSQLPlanner) Run(
 		return func() {}
 	}
 
-	if logPlanDiagram {
+	if planCtx.saveDiagram != nil {
+		// Local flows might not have the UUID field set. We need it to be set to
+		// distinguish statistics for processors in subqueries vs the main query vs
+		// postqueries.
+		if len(flows) == 1 {
+			for _, f := range flows {
+				if f.FlowID == (execinfrapb.FlowID{}) {
+					f.FlowID.UUID = uuid.MakeV4()
+				}
+			}
+		}
 		log.VEvent(ctx, 1, "creating plan diagram")
+		var stmtStr string
+		if planCtx.planner != nil && planCtx.planner.stmt != nil {
+			stmtStr = planCtx.planner.stmt.String()
+		}
+		diagram, err := execinfrapb.GeneratePlanDiagram(
+			stmtStr, flows, planCtx.saveDiagramShowInputTypes,
+		)
+		if err != nil {
+			recv.SetError(err)
+			return func() {}
+		}
+		planCtx.saveDiagram(diagram)
+	}
+
+	if logPlanDiagram {
+		log.VEvent(ctx, 1, "creating plan diagram for logging")
 		var stmtStr string
 		if planCtx.planner != nil && planCtx.planner.stmt != nil {
 			stmtStr = planCtx.planner.stmt.String()
@@ -418,7 +447,7 @@ type DistSQLReceiver struct {
 	stmtType tree.StatementType
 
 	// outputTypes are the types of the result columns produced by the plan.
-	outputTypes []types.T
+	outputTypes []*types.T
 
 	// resultToStreamColMap maps result columns to columns in the rowexec results
 	// stream.
@@ -615,11 +644,7 @@ func (r *DistSQLReceiver) Push(
 			// previous error (if any).
 			if roachpb.ErrPriority(meta.Err) > roachpb.ErrPriority(r.resultWriter.Err()) {
 				if r.txn != nil {
-					if err, ok := errors.If(meta.Err, func(err error) (v interface{}, ok bool) {
-						v, ok = err.(*roachpb.UnhandledRetryableError)
-						return v, ok
-					}); ok {
-						retryErr := err.(*roachpb.UnhandledRetryableError)
+					if retryErr := (*roachpb.UnhandledRetryableError)(nil); errors.As(meta.Err, &retryErr) {
 						// Update the txn in response to remote errors. In the non-DistSQL
 						// world, the TxnCoordSender handles "unhandled" retryable errors,
 						// but this one is coming from a distributed SQL node, which has
@@ -700,7 +725,7 @@ func (r *DistSQLReceiver) Push(
 			r.row = make(tree.Datums, len(r.resultToStreamColMap))
 		}
 		for i, resIdx := range r.resultToStreamColMap {
-			err := row[resIdx].EnsureDecoded(&r.outputTypes[resIdx], &r.alloc)
+			err := row[resIdx].EnsureDecoded(r.outputTypes[resIdx], &r.alloc)
 			if err != nil {
 				r.resultWriter.SetError(err)
 				r.status = execinfra.ConsumerClosed
@@ -761,7 +786,7 @@ func (r *DistSQLReceiver) ProducerDone() {
 }
 
 // Types is part of the RowReceiver interface.
-func (r *DistSQLReceiver) Types() []types.T {
+func (r *DistSQLReceiver) Types() []*types.T {
 	return r.outputTypes
 }
 
@@ -846,8 +871,9 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	var subqueryPlanCtx *PlanningCtx
 	var distributeSubquery bool
 	if maybeDistribute {
-		distributeSubquery = shouldDistributePlan(
-			ctx, planner.SessionData().DistSQLMode, dsp, subqueryPlan.plan)
+		distributeSubquery = willDistributePlan(
+			ctx, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, subqueryPlan.plan,
+		)
 	}
 	if distributeSubquery {
 		subqueryPlanCtx = dsp.NewPlanningCtx(ctx, evalCtx, planner.txn)
@@ -858,10 +884,14 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	subqueryPlanCtx.isLocal = !distributeSubquery
 	subqueryPlanCtx.planner = planner
 	subqueryPlanCtx.stmtType = tree.Rows
+	if planner.collectBundle {
+		subqueryPlanCtx.saveDiagram = func(diagram execinfrapb.FlowDiagram) {
+			planner.curPlan.distSQLDiagrams = append(planner.curPlan.distSQLDiagrams, diagram)
+		}
+	}
 	// Don't close the top-level plan from subqueries - someone else will handle
 	// that.
 	subqueryPlanCtx.ignoreClose = true
-
 	subqueryPhysPlan, err := dsp.createPlanForNode(subqueryPlanCtx, subqueryPlan.plan)
 	if err != nil {
 		return err
@@ -876,7 +906,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	var rows *rowcontainer.RowContainer
 	if subqueryPlan.execMode == rowexec.SubqueryExecModeExists {
 		subqueryRecv.noColsRequired = true
-		typ = sqlbase.ColTypeInfoFromColTypes([]types.T{})
+		typ = sqlbase.ColTypeInfoFromColTypes([]*types.T{})
 	} else {
 		// Apply the PlanToStreamColMap projection to the ResultTypes to get the
 		// final set of output types for the subquery. The reason this is necessary
@@ -884,7 +914,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 		// to merge the streams, but that aren't required by the final output of the
 		// query. These get projected out, so we need to similarly adjust the
 		// expected result types of the subquery here.
-		colTypes := make([]types.T, len(subqueryPhysPlan.PlanToStreamColMap))
+		colTypes := make([]*types.T, len(subqueryPhysPlan.PlanToStreamColMap))
 		for i, resIdx := range subqueryPhysPlan.PlanToStreamColMap {
 			colTypes[i] = subqueryPhysPlan.ResultTypes[resIdx]
 		}
@@ -988,29 +1018,130 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 	return dsp.Run(planCtx, txn, &physPlan, recv, evalCtx, nil /* finishedSetupFn */)
 }
 
-// PlanAndRunPostqueries returns false if an error was encountered and sets
-// that error in the provided receiver.
-func (dsp *DistSQLPlanner) PlanAndRunPostqueries(
+// PlanAndRunCascadesAndChecks runs any cascade and check queries.
+//
+// Because cascades can themselves generate more cascades or check queries, this
+// method can append to plan.cascades and plan.checkPlans (and all these plans
+// must be closed later).
+//
+// Returns false if an error was encountered and sets that error in the provided
+// receiver.
+func (dsp *DistSQLPlanner) PlanAndRunCascadesAndChecks(
 	ctx context.Context,
 	planner *planner,
 	evalCtxFactory func() *extendedEvalContext,
-	postqueryPlans []postquery,
+	plan *planComponents,
 	recv *DistSQLReceiver,
 	maybeDistribute bool,
 ) bool {
+	if len(plan.cascades) == 0 && len(plan.checkPlans) == 0 {
+		return false
+	}
+
 	prevSteppingMode := planner.Txn().ConfigureStepping(ctx, kv.SteppingEnabled)
 	defer func() { _ = planner.Txn().ConfigureStepping(ctx, prevSteppingMode) }()
-	for _, postqueryPlan := range postqueryPlans {
-		// We place a sequence point before every postquery, so
-		// that each subsequent postquery can observe the writes
+
+	// We treat plan.cascades as a queue.
+	for i := 0; i < len(plan.cascades); i++ {
+		// The original bufferNode is stored in c.Buffer; we can refer to it
+		// directly.
+		// TODO(radu): this requires keeping all previous plans "alive" until the
+		// very end. We may want to make copies of the buffer nodes and clean up
+		// everything else.
+		buf := plan.cascades[i].Buffer.(*bufferNode)
+		if buf.bufferedRows.Len() == 0 {
+			// No rows were actually modified.
+			continue
+		}
+
+		log.VEventf(ctx, 1, "executing cascade for constraint %s", plan.cascades[i].FKName)
+
+		// We place a sequence point before every cascade, so
+		// that each subsequent cascade can observe the writes
 		// by the previous step.
+		// TODO(radu): the cascades themselves can have more cascades; if any of
+		// those fall back to legacy cascades code, it will disable stepping. So we
+		// have to reenable stepping each time.
+		_ = planner.Txn().ConfigureStepping(ctx, kv.SteppingEnabled)
 		if err := planner.Txn().Step(ctx); err != nil {
 			recv.SetError(err)
 			return false
 		}
+
+		evalCtx := evalCtxFactory()
+		execFactory := makeExecFactory(planner)
+		// The cascading query is allowed to autocommit only if it is the last
+		// cascade and there are no check queries to run.
+		if len(plan.checkPlans) > 0 || i < len(plan.cascades)-1 {
+			execFactory.disableAutoCommit()
+		}
+		cascadePlan, err := plan.cascades[i].PlanFn(
+			ctx, &planner.semaCtx, &evalCtx.EvalContext, &execFactory, buf, buf.bufferedRows.Len(),
+		)
+		if err != nil {
+			recv.SetError(err)
+			return false
+		}
+		cp := cascadePlan.(*planTop)
+		plan.cascades[i].plan = cp.main
+		if len(cp.subqueryPlans) > 0 {
+			recv.SetError(errors.AssertionFailedf("cascades should not have subqueries"))
+			return false
+		}
+
+		// Queue any new cascades.
+		if len(cp.cascades) > 0 {
+			plan.cascades = append(plan.cascades, cp.cascades...)
+		}
+
+		// Collect any new checks.
+		if len(cp.checkPlans) > 0 {
+			plan.checkPlans = append(plan.checkPlans, cp.checkPlans...)
+		}
+
+		// In cyclical reference situations, the number of cascading operations can
+		// be arbitrarily large. To avoid OOM, we enforce a limit. This is also a
+		// safeguard in case we have a bug that results in an infinite cascade loop.
+		if limit := evalCtx.SessionData.OptimizerFKCascadesLimit; len(plan.cascades) > limit {
+			telemetry.Inc(sqltelemetry.CascadesLimitReached)
+			err := pgerror.Newf(pgcode.TriggeredActionException, "cascades limit (%d) reached", limit)
+			recv.SetError(err)
+			return false
+		}
+
 		if err := dsp.planAndRunPostquery(
 			ctx,
-			postqueryPlan,
+			cp.main,
+			planner,
+			evalCtx,
+			recv,
+			maybeDistribute,
+		); err != nil {
+			recv.SetError(err)
+			return false
+		}
+	}
+
+	if len(plan.checkPlans) == 0 {
+		return true
+	}
+
+	// We place a sequence point before the checks, so that they observe the
+	// writes of the main query and/or any cascades.
+	// TODO(radu): the cascades themselves can have more cascades; if any of
+	// those fall back to legacy cascades code, it will disable stepping. So we
+	// have to reenable stepping each time.
+	_ = planner.Txn().ConfigureStepping(ctx, kv.SteppingEnabled)
+	if err := planner.Txn().Step(ctx); err != nil {
+		recv.SetError(err)
+		return false
+	}
+
+	for i := range plan.checkPlans {
+		log.VEventf(ctx, 1, "executing check query %d out of %d", i+1, len(plan.checkPlans))
+		if err := dsp.planAndRunPostquery(
+			ctx,
+			plan.checkPlans[i].plan,
 			planner,
 			evalCtxFactory(),
 			recv,
@@ -1024,9 +1155,10 @@ func (dsp *DistSQLPlanner) PlanAndRunPostqueries(
 	return true
 }
 
+// planAndRunPostquery runs a cascade or check query.
 func (dsp *DistSQLPlanner) planAndRunPostquery(
 	ctx context.Context,
-	postqueryPlan postquery,
+	postqueryPlan planNode,
 	planner *planner,
 	evalCtx *extendedEvalContext,
 	recv *DistSQLReceiver,
@@ -1050,8 +1182,9 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	var postqueryPlanCtx *PlanningCtx
 	var distributePostquery bool
 	if maybeDistribute {
-		distributePostquery = shouldDistributePlan(
-			ctx, planner.SessionData().DistSQLMode, dsp, postqueryPlan.plan)
+		distributePostquery = willDistributePlan(
+			ctx, planner.execCfg.NodeID, planner.SessionData().DistSQLMode, postqueryPlan,
+		)
 	}
 	if distributePostquery {
 		postqueryPlanCtx = dsp.NewPlanningCtx(ctx, evalCtx, planner.txn)
@@ -1063,8 +1196,13 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	postqueryPlanCtx.planner = planner
 	postqueryPlanCtx.stmtType = tree.Rows
 	postqueryPlanCtx.ignoreClose = true
+	if planner.collectBundle {
+		postqueryPlanCtx.saveDiagram = func(diagram execinfrapb.FlowDiagram) {
+			planner.curPlan.distSQLDiagrams = append(planner.curPlan.distSQLDiagrams, diagram)
+		}
+	}
 
-	postqueryPhysPlan, err := dsp.createPlanForNode(postqueryPlanCtx, postqueryPlan.plan)
+	postqueryPhysPlan, err := dsp.createPlanForNode(postqueryPlanCtx, postqueryPlan)
 	if err != nil {
 		return err
 	}

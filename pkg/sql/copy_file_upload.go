@@ -15,17 +15,15 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/blobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -47,10 +45,11 @@ type fileUploadMachine struct {
 }
 
 func newFileUploadMachine(
+	ctx context.Context,
 	conn pgwirebase.Conn,
 	n *tree.CopyFrom,
+	txnOpt copyTxnOpt,
 	execCfg *ExecutorConfig,
-	resetPlanner func(p *planner, txn *kv.Txn, txnTS time.Time, stmtTS time.Time),
 ) (f *fileUploadMachine, retErr error) {
 	if len(n.Columns) != 0 {
 		return nil, errors.New("expected 0 columns specified for file uploads")
@@ -58,12 +57,23 @@ func newFileUploadMachine(
 	c := &copyMachine{
 		conn: conn,
 		// The planner will be prepared before use.
-		p:            planner{execCfg: execCfg},
-		resetPlanner: resetPlanner,
+		p: planner{execCfg: execCfg, alloc: &sqlbase.DatumAlloc{}},
 	}
 	f = &fileUploadMachine{
 		c:  c,
 		wg: &sync.WaitGroup{},
+	}
+
+	// We need a planner to do the initial planning, even if a planner
+	// is not required after that.
+	cleanup := c.p.preparePlannerForCopy(ctx, txnOpt)
+	defer func() {
+		retErr = cleanup(ctx, retErr)
+	}()
+	c.parsingEvalCtx = c.p.EvalContext()
+
+	if err := c.p.RequireAdminRole(ctx, "upload to nodelocal"); err != nil {
+		return nil, err
 	}
 
 	optsFn, err := f.c.p.TypeAsStringOpts(n.Options, copyFileOptionExpectValues)
@@ -100,7 +110,6 @@ func newFileUploadMachine(
 		_ = localStorage.Delete(opts[copyOptionDest])
 	}
 
-	c.resetPlanner(&c.p, nil /* txn */, time.Time{} /* txnTS */, time.Time{} /* stmtTS */)
 	c.resultColumns = make(sqlbase.ResultColumns, 1)
 	c.resultColumns[0] = sqlbase.ResultColumn{Typ: types.Bytes}
 	c.parsingEvalCtx = c.p.EvalContext()

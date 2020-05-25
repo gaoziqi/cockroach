@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -72,7 +72,7 @@ type Config struct {
 	// TODO(ajwerner): Should this live underneath the FilterFunc?
 	// Should there be another function to decide whether to update the
 	// lease manager?
-	LeaseManager *sql.LeaseManager
+	LeaseManager *lease.Manager
 }
 
 // SchemaFeed tracks changes to a set of tables and exports them as a queue of
@@ -91,7 +91,7 @@ type SchemaFeed struct {
 	clock    *hlc.Clock
 	settings *cluster.Settings
 	targets  jobspb.ChangefeedTargets
-	leaseMgr *sql.LeaseManager
+	leaseMgr *lease.Manager
 	mu       struct {
 		syncutil.Mutex
 
@@ -190,7 +190,7 @@ func (tf *SchemaFeed) primeInitialTableDescs(ctx context.Context) error {
 		txn.SetFixedTimestamp(ctx, initialTableDescTs)
 		// Note that all targets are currently guaranteed to be tables.
 		for tableID := range tf.targets {
-			tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+			tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, keys.SystemSQLCodec, tableID)
 			if err != nil {
 				return err
 			}
@@ -452,7 +452,7 @@ func fetchTableDescriptorVersions(
 		log.Infof(ctx, `fetching table descs (%s,%s]`, startTS, endTS)
 	}
 	start := timeutil.Now()
-	span := roachpb.Span{Key: keys.MakeTablePrefix(keys.DescriptorTableID)}
+	span := roachpb.Span{Key: keys.TODOSQLCodec.TablePrefix(keys.DescriptorTableID)}
 	span.EndKey = span.Key.PrefixEnd()
 	header := roachpb.Header{Timestamp: endTS}
 	req := &roachpb.ExportRequest{
@@ -486,7 +486,7 @@ func fetchTableDescriptorVersions(
 					return nil
 				}
 				k := it.UnsafeKey()
-				remaining, _, _, err := sqlbase.DecodeTableIDIndexID(k.Key)
+				remaining, _, _, err := keys.TODOSQLCodec.DecodeIndexPrefix(k.Key)
 				if err != nil {
 					return err
 				}

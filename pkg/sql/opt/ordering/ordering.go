@@ -157,7 +157,17 @@ func init() {
 		buildChildReqOrdering: distinctOnBuildChildReqOrdering,
 		buildProvidedOrdering: distinctOnBuildProvided,
 	}
+	funcMap[opt.EnsureDistinctOnOp] = funcs{
+		canProvideOrdering:    distinctOnCanProvideOrdering,
+		buildChildReqOrdering: distinctOnBuildChildReqOrdering,
+		buildProvidedOrdering: distinctOnBuildProvided,
+	}
 	funcMap[opt.UpsertDistinctOnOp] = funcs{
+		canProvideOrdering:    distinctOnCanProvideOrdering,
+		buildChildReqOrdering: distinctOnBuildChildReqOrdering,
+		buildProvidedOrdering: distinctOnBuildProvided,
+	}
+	funcMap[opt.EnsureUpsertDistinctOnOp] = funcs{
 		canProvideOrdering:    distinctOnCanProvideOrdering,
 		buildChildReqOrdering: distinctOnBuildChildReqOrdering,
 		buildProvidedOrdering: distinctOnBuildProvided,

@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -37,9 +38,10 @@ func TestGossipInvalidation(t *testing.T) {
 
 	sc := stats.NewTableStatisticsCache(
 		10, /* cacheSize */
-		tc.Server(0).GossipI().(*gossip.Gossip),
+		gossip.MakeExposedGossip(tc.Server(0).GossipI().(*gossip.Gossip)),
 		tc.Server(0).DB(),
 		tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
+		keys.SystemSQLCodec,
 	)
 
 	sr0 := sqlutils.MakeSQLRunner(tc.ServerConn(0))
@@ -47,7 +49,7 @@ func TestGossipInvalidation(t *testing.T) {
 	sr0.Exec(t, "CREATE TABLE test.t (k INT PRIMARY KEY, v INT)")
 	sr0.Exec(t, "INSERT INTO test.t VALUES (1, 1), (2, 2), (3, 3)")
 
-	tableDesc := sqlbase.GetTableDescriptor(tc.Server(0).DB(), "test", "t")
+	tableDesc := sqlbase.GetTableDescriptor(tc.Server(0).DB(), keys.SystemSQLCodec, "test", "t")
 	tableID := tableDesc.ID
 
 	expectNStats := func(n int) error {

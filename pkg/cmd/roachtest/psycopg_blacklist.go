@@ -15,6 +15,7 @@ var psycopgBlacklists = blacklistsForVersion{
 	{"v19.1", "psycopgBlackList19_1", psycopgBlackList19_1, "psycopgIgnoreList19_1", psycopgIgnoreList19_1},
 	{"v19.2", "psycopgBlackList19_2", psycopgBlackList19_2, "psycopgIgnoreList19_2", psycopgIgnoreList19_2},
 	{"v20.1", "psycopgBlackList20_1", psycopgBlackList20_1, "psycopgIgnoreList20_1", psycopgIgnoreList20_1},
+	{"v20.2", "psycopgBlackList20_2", psycopgBlackList20_2, "psycopgIgnoreList20_2", psycopgIgnoreList20_2},
 }
 
 // These are lists of known psycopg test errors and failures.
@@ -28,6 +29,8 @@ var psycopgBlacklists = blacklistsForVersion{
 // Please keep these lists alphabetized for easy diffing.
 // After a failed run, an updated version of this blacklist should be available
 // in the test log.
+var psycopgBlackList20_2 = psycopgBlackList20_1
+
 var psycopgBlackList20_1 = blacklist{
 	"tests.test_async.AsyncTests.test_async_callproc":                                                        "44701",
 	"tests.test_async.AsyncTests.test_error":                                                                 "44706",
@@ -39,7 +42,6 @@ var psycopgBlackList20_1 = blacklist{
 	"tests.test_async_keyword.CancelTests.test_async_cancel":                                                 "41335",
 	"tests.test_cancel.CancelTests.test_async_cancel":                                                        "41335",
 	"tests.test_cancel.CancelTests.test_cancel":                                                              "41335",
-	"tests.test_connection.AutocommitTests.test_set_session_autocommit":                                      "35879",
 	"tests.test_connection.ConnectionTests.test_cleanup_on_badconn_close":                                    "35897",
 	"tests.test_connection.ConnectionTests.test_encoding_name":                                               "35882",
 	"tests.test_connection.ConnectionTests.test_notices":                                                     "44711",
@@ -280,7 +282,6 @@ var psycopgBlackList19_2 = blacklist{
 	"tests.test_cancel.CancelTests.test_async_connection_cancel":                                             "5807",
 	"tests.test_cancel.CancelTests.test_cancel":                                                              "5807",
 	"tests.test_cancel.CancelTests.test_empty_cancel":                                                        "5807",
-	"tests.test_connection.AutocommitTests.test_set_session_autocommit":                                      "35879",
 	"tests.test_connection.ConnectionTests.test_cleanup_on_badconn_close":                                    "35897",
 	"tests.test_connection.ConnectionTests.test_encoding_name":                                               "35882",
 	"tests.test_connection.ConnectionTests.test_notices":                                                     "5807",
@@ -319,8 +320,6 @@ var psycopgBlackList19_2 = blacklist{
 	"tests.test_connection.IsolationLevelsTestCase.test_setattr_isolation_level_int":                         "12123",
 	"tests.test_connection.IsolationLevelsTestCase.test_setattr_isolation_level_invalid":                     "12123",
 	"tests.test_connection.IsolationLevelsTestCase.test_setattr_isolation_level_str":                         "12123",
-	"tests.test_connection.TransactionControlTests.test_idempotence_check":                                   "35879",
-	"tests.test_connection.TransactionControlTests.test_mixing_session_attribs":                              "35879",
 	"tests.test_connection.TransactionControlTests.test_set_deferrable":                                      "31632",
 	"tests.test_connection.TransactionControlTests.test_set_isolation_level":                                 "12123",
 	"tests.test_connection.TransactionControlTests.test_set_isolation_level_str":                             "12123",
@@ -819,6 +818,8 @@ var psycopgBlackList19_1 = blacklist{
 	"tests.test_with.WithCursorTestCase.test_exception_swallow":                                              "30352",
 	"tests.test_with.WithCursorTestCase.test_named_with_noop":                                                "30352",
 }
+
+var psycopgIgnoreList20_2 = psycopgIgnoreList20_1
 
 var psycopgIgnoreList20_1 = psycopgIgnoreList19_2
 

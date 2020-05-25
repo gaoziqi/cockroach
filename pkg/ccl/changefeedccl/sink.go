@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -40,8 +41,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	"github.com/pkg/errors"
 )
 
 // Sink is an abstraction for anything that a changefeed may emit into.
@@ -271,13 +272,13 @@ type kafkaLogAdapter struct {
 var _ sarama.StdLogger = (*kafkaLogAdapter)(nil)
 
 func (l *kafkaLogAdapter) Print(v ...interface{}) {
-	log.InfoDepth(l.ctx, 1, v...)
+	log.InfofDepth(l.ctx, 1, "", v...)
 }
 func (l *kafkaLogAdapter) Printf(format string, v ...interface{}) {
 	log.InfofDepth(l.ctx, 1, format, v...)
 }
 func (l *kafkaLogAdapter) Println(v ...interface{}) {
-	log.InfoDepth(l.ctx, 1, v...)
+	log.InfofDepth(l.ctx, 1, "", v...)
 }
 
 func init() {
@@ -734,7 +735,7 @@ func (s *sqlSink) emit(
 	// Generate the message id on the client to match the guaranttees of kafka
 	// (two messages are only guaranteed to keep their order if emitted from the
 	// same producer to the same partition).
-	messageID := builtins.GenerateUniqueInt(roachpb.NodeID(partition))
+	messageID := builtins.GenerateUniqueInt(base.SQLInstanceID(partition))
 	s.rowBuf = append(s.rowBuf, topic, partition, messageID, key, value, resolved)
 	if len(s.rowBuf)/sqlSinkEmitCols >= sqlSinkRowBatchSize {
 		return s.Flush(ctx)

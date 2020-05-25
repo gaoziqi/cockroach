@@ -18,7 +18,6 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -29,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/workload"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type workloadReader struct {
@@ -57,29 +56,32 @@ func makeDatumFromColOffset(
 	if col.Nulls().NullAt(rowIdx) {
 		return tree.DNull, nil
 	}
-	switch col.Type() {
-	case coltypes.Bool:
+	switch t := col.Type(); col.CanonicalTypeFamily() {
+	case types.BoolFamily:
 		return tree.MakeDBool(tree.DBool(col.Bool()[rowIdx])), nil
-	case coltypes.Int64:
-		switch hint.Family() {
-		case types.IntFamily:
-			return alloc.NewDInt(tree.DInt(col.Int64()[rowIdx])), nil
-		case types.DecimalFamily:
-			d := *apd.New(col.Int64()[rowIdx], 0)
-			return alloc.NewDDecimal(tree.DDecimal{Decimal: d}), nil
-		case types.DateFamily:
-			date, err := pgdate.MakeDateFromUnixEpoch(col.Int64()[rowIdx])
-			if err != nil {
-				return nil, err
+	case types.IntFamily:
+		switch t.Width() {
+		case 0, 64:
+			switch hint.Family() {
+			case types.IntFamily:
+				return alloc.NewDInt(tree.DInt(col.Int64()[rowIdx])), nil
+			case types.DecimalFamily:
+				d := *apd.New(col.Int64()[rowIdx], 0)
+				return alloc.NewDDecimal(tree.DDecimal{Decimal: d}), nil
+			case types.DateFamily:
+				date, err := pgdate.MakeDateFromUnixEpoch(col.Int64()[rowIdx])
+				if err != nil {
+					return nil, err
+				}
+				return alloc.NewDDate(tree.DDate{Date: date}), nil
 			}
-			return alloc.NewDDate(tree.DDate{Date: date}), nil
+		case 16:
+			switch hint.Family() {
+			case types.IntFamily:
+				return alloc.NewDInt(tree.DInt(col.Int16()[rowIdx])), nil
+			}
 		}
-	case coltypes.Int16:
-		switch hint.Family() {
-		case types.IntFamily:
-			return alloc.NewDInt(tree.DInt(col.Int16()[rowIdx])), nil
-		}
-	case coltypes.Float64:
+	case types.FloatFamily:
 		switch hint.Family() {
 		case types.FloatFamily:
 			return alloc.NewDFloat(tree.DFloat(col.Float64()[rowIdx])), nil
@@ -90,7 +92,7 @@ func makeDatumFromColOffset(
 			}
 			return alloc.NewDDecimal(tree.DDecimal{Decimal: d}), nil
 		}
-	case coltypes.Bytes:
+	case types.BytesFamily:
 		switch hint.Family() {
 		case types.BytesFamily:
 			return alloc.NewDBytes(tree.DBytes(col.Bytes().Get(rowIdx))), nil
@@ -105,7 +107,7 @@ func makeDatumFromColOffset(
 		}
 	}
 	return nil, errors.Errorf(
-		`don't know how to interpret %s column as %s`, col.Type().GoTypeName(), hint)
+		`don't know how to interpret %s column as %s`, col.Type(), hint)
 }
 
 func (w *workloadReader) readFiles(
@@ -138,7 +140,8 @@ func (w *workloadReader) readFiles(
 		}
 		gen := meta.New()
 		if f, ok := gen.(workload.Flagser); ok {
-			if err := f.Flags().Parse(conf.Flags); err != nil {
+			flags := f.Flags()
+			if err := flags.Parse(conf.Flags); err != nil {
 				return errors.Wrapf(err, `parsing parameters %s`, strings.Join(conf.Flags, ` `))
 			}
 		}
@@ -224,7 +227,7 @@ func (w *WorkloadKVConverter) Worker(ctx context.Context, evalCtx *tree.EvalCont
 	}
 	var alloc sqlbase.DatumAlloc
 	var a bufalloc.ByteAllocator
-	cb := coldata.NewMemBatchWithSize(nil, 0)
+	cb := coldata.NewMemBatchWithSize(nil /* types */, 0 /* size */, coldata.StandardColumnFactory)
 
 	for {
 		batchIdx := int(atomic.AddInt64(&w.batchIdxAtomic, 1))

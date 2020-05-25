@@ -14,7 +14,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"math"
 	"net"
 	"sync"
 	"testing"
@@ -24,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -37,7 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // TestCluster represents a set of TestServers. The hope is that it can be used
@@ -684,7 +683,7 @@ func (tc *TestCluster) FindRangeLeaseHolder(
 // kv scratch space (it doesn't overlap system spans or SQL tables). The range
 // is lazily split off on the first call to ScratchRange.
 func (tc *TestCluster) ScratchRange(t testing.TB) roachpb.Key {
-	scratchKey := keys.MakeTablePrefix(math.MaxUint32)
+	scratchKey := keys.TableDataMax
 	if tc.scratchRangeID > 0 {
 		return scratchKey
 	}
@@ -789,7 +788,7 @@ func (tc *TestCluster) WaitForFullReplication() error {
 				if err := s.ComputeMetrics(context.TODO(), 0); err != nil {
 					// This can sometimes fail since ComputeMetrics calls
 					// updateReplicationGauges which needs the system config gossiped.
-					log.Info(context.TODO(), err)
+					log.Infof(context.TODO(), "%v", err)
 					notReplicated = true
 					return nil
 				}
@@ -857,11 +856,11 @@ func (tc *TestCluster) WaitForNodeLiveness(t testing.TB) {
 		db := tc.Servers[0].DB()
 		for _, s := range tc.Servers {
 			key := keys.NodeLivenessKey(s.NodeID())
-			var liveness storagepb.Liveness
+			var liveness kvserverpb.Liveness
 			if err := db.GetProto(context.Background(), key, &liveness); err != nil {
 				return err
 			}
-			if (liveness == storagepb.Liveness{}) {
+			if (liveness == kvserverpb.Liveness{}) {
 				return fmt.Errorf("no liveness record")
 			}
 			fmt.Printf("n%d: found liveness\n", s.NodeID())

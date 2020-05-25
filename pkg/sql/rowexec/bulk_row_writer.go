@@ -14,7 +14,7 @@ import (
 	"context"
 	"sync/atomic"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -24,12 +24,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // CTASPlanResultTypes is the result types for EXPORT plans.
-var CTASPlanResultTypes = []types.T{
-	*types.Bytes, // rows
+var CTASPlanResultTypes = []*types.T{
+	types.Bytes, // rows
 }
 
 type bulkRowWriter struct {
@@ -118,7 +118,7 @@ func (sp *bulkRowWriter) work(ctx context.Context) error {
 	return g.Wait()
 }
 
-func (sp *bulkRowWriter) OutputTypes() []types.T {
+func (sp *bulkRowWriter) OutputTypes() []*types.T {
 	return CTASPlanResultTypes
 }
 
@@ -126,7 +126,7 @@ func (sp *bulkRowWriter) ingestLoop(ctx context.Context, kvCh chan row.KVBatch) 
 	writeTS := sp.spec.Table.CreateAsOfTime
 	const bufferSize = 64 << 20
 	adder, err := sp.flowCtx.Cfg.BulkAdder(
-		ctx, sp.flowCtx.Cfg.DB, writeTS, storagebase.BulkAdderOptions{MinBufferSize: bufferSize},
+		ctx, sp.flowCtx.Cfg.DB, writeTS, kvserverbase.BulkAdderOptions{MinBufferSize: bufferSize},
 	)
 	if err != nil {
 		return err
@@ -139,7 +139,7 @@ func (sp *bulkRowWriter) ingestLoop(ctx context.Context, kvCh chan row.KVBatch) 
 		for kvBatch := range kvCh {
 			for _, kv := range kvBatch.KVs {
 				if err := adder.Add(ctx, kv.Key, kv.Value.RawBytes); err != nil {
-					if _, ok := err.(storagebase.DuplicateKeyError); ok {
+					if errors.HasType(err, (*kvserverbase.DuplicateKeyError)(nil)) {
 						return errors.WithStack(err)
 					}
 					return err
@@ -148,7 +148,7 @@ func (sp *bulkRowWriter) ingestLoop(ctx context.Context, kvCh chan row.KVBatch) 
 		}
 
 		if err := adder.Flush(ctx); err != nil {
-			if err, ok := err.(storagebase.DuplicateKeyError); ok {
+			if errors.HasType(err, (*kvserverbase.DuplicateKeyError)(nil)) {
 				return errors.WithStack(err)
 			}
 			return err
@@ -196,7 +196,7 @@ func (sp *bulkRowWriter) convertLoop(
 					conv.Datums[i] = tree.DNull
 					continue
 				}
-				if err := ed.EnsureDecoded(&typs[i], alloc); err != nil {
+				if err := ed.EnsureDecoded(typs[i], alloc); err != nil {
 					return err
 				}
 				conv.Datums[i] = ed.Datum

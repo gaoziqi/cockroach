@@ -22,6 +22,7 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -250,6 +251,18 @@ func DecodeOidDatum(
 				return nil, err
 			}
 			return tree.NewDFloat(tree.DFloat(f)), nil
+		case oidext.T_geography:
+			d, err := tree.ParseDGeography(string(b))
+			if err != nil {
+				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as geography", b)
+			}
+			return d, nil
+		case oidext.T_geometry:
+			d, err := tree.ParseDGeometry(string(b))
+			if err != nil {
+				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as geometry", b)
+			}
+			return d, nil
 		case oid.T_numeric:
 			d, err := tree.ParseDDecimal(string(b))
 			if err != nil {
@@ -549,13 +562,13 @@ func DecodeOidDatum(
 				return nil, pgerror.Newf(pgcode.Syntax, "timestamp requires 8 bytes for binary format")
 			}
 			i := int64(binary.BigEndian.Uint64(b))
-			return tree.MakeDTimestamp(pgBinaryToTime(i), time.Microsecond), nil
+			return tree.MakeDTimestamp(pgBinaryToTime(i), time.Microsecond)
 		case oid.T_timestamptz:
 			if len(b) < 8 {
 				return nil, pgerror.Newf(pgcode.Syntax, "timestamptz requires 8 bytes for binary format")
 			}
 			i := int64(binary.BigEndian.Uint64(b))
-			return tree.MakeDTimestampTZ(pgBinaryToTime(i), time.Microsecond), nil
+			return tree.MakeDTimestampTZ(pgBinaryToTime(i), time.Microsecond)
 		case oid.T_date:
 			if len(b) < 4 {
 				return nil, pgerror.Newf(pgcode.Syntax, "date requires 4 bytes for binary format")

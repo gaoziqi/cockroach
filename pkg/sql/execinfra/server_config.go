@@ -16,10 +16,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -61,31 +62,11 @@ import (
 //
 // ATTENTION: When updating these fields, add to version_history.txt explaining
 // what changed.
-const Version execinfrapb.DistSQLVersion = 28
+const Version execinfrapb.DistSQLVersion = 29
 
 // MinAcceptedVersion is the oldest version that the server is
 // compatible with; see above.
-const MinAcceptedVersion execinfrapb.DistSQLVersion = 27
-
-// SettingUseTempStorageJoins is a cluster setting that configures whether
-// joins are allowed to spill to disk.
-// TODO(yuzefovich): remove this setting.
-var SettingUseTempStorageJoins = settings.RegisterPublicBoolSetting(
-	"sql.distsql.temp_storage.joins",
-	"set to true to enable use of disk for distributed sql joins. "+
-		"Note that disabling this can have negative impact on memory usage and performance.",
-	true,
-)
-
-// SettingUseTempStorageSorts is a cluster setting that configures whether
-// sorts are allowed to spill to disk.
-// TODO(yuzefovich): remove this setting.
-var SettingUseTempStorageSorts = settings.RegisterPublicBoolSetting(
-	"sql.distsql.temp_storage.sorts",
-	"set to true to enable use of disk for distributed sql sorts. "+
-		"Note that disabling this can have negative impact on memory usage and performance.",
-	true,
-)
+const MinAcceptedVersion execinfrapb.DistSQLVersion = 29
 
 // SettingWorkMemBytes is a cluster setting that determines the maximum amount
 // of RAM that a processor can use.
@@ -103,6 +84,15 @@ type ServerConfig struct {
 	Settings     *cluster.Settings
 	RuntimeStats RuntimeStats
 
+	ClusterID   *base.ClusterIDContainer
+	ClusterName string
+
+	// NodeID is the id of the node on which this Server is running.
+	NodeID *base.SQLIDContainer
+
+	// Codec is capable of encoding and decoding sql table keys.
+	Codec keys.SQLCodec
+
 	// DB is a handle to the cluster.
 	DB *kv.DB
 	// Executor can be used to run "internal queries". Note that Flows also have
@@ -110,11 +100,6 @@ type ServerConfig struct {
 	// whereas this one isn't.
 	Executor sqlutil.InternalExecutor
 
-	// FlowDB is the DB that flows should use for interacting with the database.
-	// This DB has to be set such that it bypasses the local TxnCoordSender. We
-	// want only the TxnCoordSender on the gateway to be involved with requests
-	// performed by DistSQL.
-	FlowDB       *kv.DB
 	RPCContext   *rpc.Context
 	Stopper      *stop.Stopper
 	TestingKnobs TestingKnobs
@@ -140,7 +125,7 @@ type ServerConfig struct {
 	VecFDSemaphore semaphore.Semaphore
 
 	// BulkAdder is used by some processors to bulk-ingest data as SSTs.
-	BulkAdder storagebase.BulkAdderFactory
+	BulkAdder kvserverbase.BulkAdderFactory
 
 	// DiskMonitor is used to monitor temporary storage disk usage. Actual disk
 	// space used will be a small multiple (~1.1) of this because of RocksDB
@@ -148,11 +133,6 @@ type ServerConfig struct {
 	DiskMonitor *mon.BytesMonitor
 
 	Metrics *DistSQLMetrics
-
-	// NodeID is the id of the node on which this Server is running.
-	NodeID      *base.NodeIDContainer
-	ClusterID   *base.ClusterIDContainer
-	ClusterName string
 
 	// JobRegistry manages jobs being used by this Server.
 	JobRegistry *jobs.Registry
@@ -163,7 +143,7 @@ type ServerConfig struct {
 
 	// A handle to gossip used to broadcast the node's DistSQL version and
 	// draining state.
-	Gossip *gossip.Gossip
+	Gossip gossip.DeprecatedGossip
 
 	NodeDialer *nodedialer.Dialer
 

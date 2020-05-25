@@ -14,6 +14,7 @@ package cockroach.sql.sem.types;
 option go_package = "types";
 
 import "gogoproto/gogo.proto";
+import "geo/geopb/geopb.proto";
 
 // See the comment header for the T.Family method for more details.
 enum Family {
@@ -297,7 +298,7 @@ enum Family {
     // construct tuples using the ROW function or tuple construction syntax.
     //
     //   Oid          : T_record
-    //   TupleContents: []types.T of each tuple field
+    //   TupleContents: []*types.T of each tuple field
     //   TupleLabels  : []string of each tuple label
     //
     // Examples:
@@ -323,6 +324,36 @@ enum Family {
     //   BIT(10)
     //
     BitFamily = 21;
+
+    // GeometryFamily is a family that supports the Geometry geospatial type,
+    // which is compatible with PostGIS's Geometry implementation.
+    //
+    //   Canonical: types.Geometry
+    //   Oid      : oidext.T_geometry
+    //
+    // Examples:
+    //   GEOMETRY
+    //   GEOMETRY(LINESTRING)
+    //   GEOMETRY(LINESTRING, SRID)
+    GeometryFamily = 22;
+
+    // GeographyFamily is a family that supports the Geography geospatial type,
+    // which is compatible with PostGIS's Geography implementation.
+    //
+    //   Canonical: types.Geography
+    //   Oid      : oidext.T_geography
+    //
+    // Examples:
+    //   GEOGRAPHY
+    //   GEOGRAPHY(LINESTRING)
+    //   GEOGRAPHY(LINESTRING, SRID)
+    GeographyFamily = 23;
+
+    // EnumFamily is a family that represents all ENUM types. ENUM types
+    // have data about the ENUM defined in a TypeDescriptor. The ID of
+    // the TypeDescriptor that backs this ENUM is stored in the StableTypeID
+    // field. It does not have a canonical form.
+    EnumFamily = 24;
 
     // AnyFamily is a special type family used during static analysis as a
     // wildcard type that matches any other type, including scalar, array, and
@@ -380,6 +411,27 @@ message IntervalDurationField {
   optional IntervalDurationType from_duration_type = 2 [(gogoproto.nullable) = false];
 }
 
+// GeoMetadata contains metadata associated with Geospatial data types.
+message GeoMetadata {
+  optional int32 srid = 1 [(gogoproto.nullable)=false,(gogoproto.customname)="SRID",(gogoproto.casttype)="github.com/cockroachdb/cockroach/pkg/geo/geopb.SRID"];
+  optional geopb.Shape shape = 2 [(gogoproto.nullable)=false];
+}
+
+// T is a wrapper around InternalType.
+message T {
+    option (gogoproto.typedecl) = false;
+    option (gogoproto.marshaler) = false;
+    option (gogoproto.unmarshaler) = false;
+    option (gogoproto.sizer) = false;
+    option (gogoproto.goproto_getters) = false;
+    option (gogoproto.goproto_stringer) = false;
+    // InternalType should never be directly referenced outside this package. The
+    // only reason it is exported is because gogoproto panics when printing the
+    // string representation of an unexported field. This is a problem when this
+    // struct is embedded in a larger struct (like a ColumnDescriptor).
+    optional InternalType internal_type = 1 [(gogoproto.nullable) = false];
+}
+
 // InternalType is the protobuf encoding for SQL types. It is always wrapped by
 // a T struct, and should never be used directly by outside packages. See the
 // comment header for the T struct for more details.
@@ -422,19 +474,21 @@ message InternalType {
 
     // TupleContents returns a slice containing the type of each tuple field. This
     // is nil for non-TUPLE types.
-    repeated bytes tuple_contents = 8 [(gogoproto.nullable) = false, (gogoproto.customtype) = "T"];
+    repeated T tuple_contents = 8;
 
     // TupleLabels returns a slice containing the labels of each tuple field. This
     // is nil for non-TUPLE types, or if the TUPLE type does not specify labels.
     repeated string tuple_labels = 9;
 
     // Oid returns the type's Postgres Object ID. See the header for the T.Oid
-    // method for more details.
+    // method for more details. For user-defined types, the OID value is an
+    // offset (oidext.CockroachPredefinedOIDMax) away from the stable_type_id
+    // field. This makes it easy to retrieve a type descriptor by OID.
     optional uint32 oid = 10 [(gogoproto.nullable) = false, (gogoproto.customname) = "Oid", (gogoproto.customtype) = "github.com/lib/pq/oid.Oid"];
 
     // ArrayContents returns the type of array elements. This is nil for non-ARRAY
     // types.
-    optional bytes array_contents = 11 [(gogoproto.customtype) = "T"];
+    optional T array_contents = 11;
 
     // TimePrecisionIsSet indicates whether the precision was explicitly set.
     // It is currently in use for the TIME-related families and INTERVALs
@@ -451,4 +505,12 @@ message InternalType {
     // IntervalDurationField is populated for intervals, representing extra
     // typmod or precision data that may be required.
     optional IntervalDurationField interval_duration_field = 13;
+
+    // GeoMetadata is populated for geospatial types.
+    optional GeoMetadata geo_metadata = 14;
+
+    // StableTypeID is the ID of the backing TypeDescriptor for this type.
+    // StableTypeID is set only for User Defined Types.
+    optional uint32 stable_type_id = 15
+      [(gogoproto.nullable) = false, (gogoproto.customname) = "StableTypeID"];
 }

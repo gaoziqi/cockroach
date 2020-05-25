@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -102,7 +103,8 @@ func ValidateColumnDefType(t *types.T) error {
 
 	case types.BitFamily, types.IntFamily, types.FloatFamily, types.BoolFamily, types.BytesFamily, types.DateFamily,
 		types.INetFamily, types.IntervalFamily, types.JsonFamily, types.OidFamily, types.TimeFamily,
-		types.TimestampFamily, types.TimestampTZFamily, types.UuidFamily, types.TimeTZFamily:
+		types.TimestampFamily, types.TimestampTZFamily, types.UuidFamily, types.TimeTZFamily,
+		types.GeographyFamily, types.GeometryFamily, types.EnumFamily:
 		// These types are OK.
 
 	default:
@@ -123,12 +125,12 @@ func ValidateColumnDefType(t *types.T) error {
 // expression.
 //
 // semaCtx can be nil if no default expression is used for the
-// column.
+// column or during cluster bootstrapping.
 //
 // The DEFAULT expression is returned in TypedExpr form for analysis (e.g. recording
 // sequence dependencies).
 func MakeColumnDefDescs(
-	d *tree.ColumnTableDef, semaCtx *tree.SemaContext,
+	d *tree.ColumnTableDef, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext,
 ) (*ColumnDescriptor, *IndexDescriptor, tree.TypedExpr, error) {
 	if d.IsSerial {
 		// To the reader of this code: if control arrives here, this means
@@ -155,11 +157,14 @@ func MakeColumnDefDescs(
 	}
 
 	// Validate and assign column type.
-	err := ValidateColumnDefType(d.Type)
+	resType, err := tree.ResolveType(d.Type, semaCtx.GetTypeResolver())
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	col.Type = *d.Type
+	if err := ValidateColumnDefType(resType); err != nil {
+		return nil, nil, nil, err
+	}
+	col.Type = resType
 
 	var typedExpr tree.TypedExpr
 	if d.HasDefaultExpr() {
@@ -167,7 +172,7 @@ func MakeColumnDefDescs(
 		// and does not contain invalid functions.
 		var err error
 		if typedExpr, err = SanitizeVarFreeExpr(
-			d.DefaultExpr.Expr, d.Type, "DEFAULT", semaCtx, true, /* allowImpure */
+			d.DefaultExpr.Expr, resType, "DEFAULT", semaCtx, true, /* allowImpure */
 		); err != nil {
 			return nil, nil, nil, err
 		}
@@ -196,7 +201,7 @@ func MakeColumnDefDescs(
 				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
 			}
 		} else {
-			buckets, err := tree.EvalShardBucketCount(d.PrimaryKey.ShardBuckets)
+			buckets, err := EvalShardBucketCount(semaCtx, evalCtx, d.PrimaryKey.ShardBuckets)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -219,6 +224,29 @@ func MakeColumnDefDescs(
 	}
 
 	return col, idx, typedExpr, nil
+}
+
+// EvalShardBucketCount evaluates and checks the integer argument to a `USING HASH WITH
+// BUCKET_COUNT` index creation query.
+func EvalShardBucketCount(
+	semaCtx *tree.SemaContext, evalCtx *tree.EvalContext, shardBuckets tree.Expr,
+) (int32, error) {
+	const invalidBucketCountMsg = `BUCKET_COUNT must be an integer greater than 1`
+	typedExpr, err := SanitizeVarFreeExpr(
+		shardBuckets, types.Int, "BUCKET_COUNT", semaCtx, true, /* allowImpure */
+	)
+	if err != nil {
+		return 0, err
+	}
+	d, err := typedExpr.Eval(evalCtx)
+	if err != nil {
+		return 0, pgerror.Wrap(err, pgcode.InvalidParameterValue, invalidBucketCountMsg)
+	}
+	buckets := tree.MustBeDInt(d)
+	if buckets < 2 {
+		return 0, pgerror.New(pgcode.InvalidParameterValue, invalidBucketCountMsg)
+	}
+	return int32(buckets), nil
 }
 
 // GetShardColumnName generates a name for the hidden shard column to be used to create a
@@ -262,8 +290,8 @@ func EncodeColumns(
 }
 
 // GetColumnTypes returns the types of the columns with the given IDs.
-func GetColumnTypes(desc *TableDescriptor, columnIDs []ColumnID) ([]types.T, error) {
-	types := make([]types.T, len(columnIDs))
+func GetColumnTypes(desc *TableDescriptor, columnIDs []ColumnID) ([]*types.T, error) {
+	types := make([]*types.T, len(columnIDs))
 	for i, id := range columnIDs {
 		col, err := desc.FindActiveColumnByID(id)
 		if err != nil {
@@ -310,12 +338,12 @@ type tableLookupFn func(ID) (*TableDescriptor, error)
 
 // GetConstraintInfo returns a summary of all constraints on the table.
 func (desc *TableDescriptor) GetConstraintInfo(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
 ) (map[string]ConstraintDetail, error) {
 	var tableLookup tableLookupFn
 	if txn != nil {
 		tableLookup = func(id ID) (*TableDescriptor, error) {
-			return GetTableDescFromID(ctx, txn, id)
+			return GetTableDescFromID(ctx, txn, codec, id)
 		}
 	}
 	return desc.collectConstraintInfo(tableLookup)
@@ -508,15 +536,52 @@ func FindFKOriginIndex(
 	)
 }
 
+// FindFKOriginIndexInTxn finds the first index in the supplied originTable
+// that can satisfy an outgoing foreign key of the supplied column ids.
+// It returns either an index that is active, or an index that was created
+// in the same transaction that is currently running.
+func FindFKOriginIndexInTxn(
+	originTable *MutableTableDescriptor, originColIDs ColumnIDs,
+) (*IndexDescriptor, error) {
+	// Search for an index on the origin table that matches our foreign
+	// key columns.
+	if originTable.PrimaryIndex.IsValidOriginIndex(originColIDs) {
+		return &originTable.PrimaryIndex, nil
+	}
+	// If the PK doesn't match, find the index corresponding to the origin column.
+	for i := range originTable.Indexes {
+		idx := &originTable.Indexes[i]
+		if idx.IsValidOriginIndex(originColIDs) {
+			return idx, nil
+		}
+	}
+	currentMutationID := originTable.ClusterVersion.NextMutationID
+	for i := range originTable.Mutations {
+		mut := &originTable.Mutations[i]
+		if idx := mut.GetIndex(); idx != nil &&
+			mut.MutationID == currentMutationID &&
+			mut.Direction == DescriptorMutation_ADD {
+			if idx.IsValidOriginIndex(originColIDs) {
+				return idx, nil
+			}
+		}
+	}
+	return nil, pgerror.Newf(
+		pgcode.ForeignKeyViolation,
+		"there is no index matching given keys for referenced table %s",
+		originTable.Name,
+	)
+}
+
 // ConditionalGetTableDescFromTxn validates that the supplied TableDescriptor
 // matches the one currently stored in kv. This simulates a CPut and returns a
 // ConditionFailedError on mismatch. We don't directly use CPut with protos
 // because the marshaling is not guaranteed to be stable and also because it's
 // sensitive to things like missing vs default values of fields.
 func ConditionalGetTableDescFromTxn(
-	ctx context.Context, txn *kv.Txn, expectation *TableDescriptor,
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, expectation *TableDescriptor,
 ) (*roachpb.Value, error) {
-	key := MakeDescMetadataKey(expectation.ID)
+	key := MakeDescMetadataKey(codec, expectation.ID)
 	existingKV, err := txn.Get(ctx, key)
 	if err != nil {
 		return nil, err
@@ -535,4 +600,46 @@ func ConditionalGetTableDescFromTxn(
 		return nil, &roachpb.ConditionFailedError{ActualValue: existingKV.Value}
 	}
 	return existingKV.Value, nil
+}
+
+// FilterTableState inspects the state of a given table and returns an error if
+// the state is anything but PUBLIC. The error describes the state of the table.
+func FilterTableState(tableDesc *TableDescriptor) error {
+	switch tableDesc.State {
+	case TableDescriptor_DROP:
+		return &inactiveTableError{errors.New("table is being dropped")}
+	case TableDescriptor_OFFLINE:
+		err := errors.Errorf("table %q is offline", tableDesc.Name)
+		if tableDesc.OfflineReason != "" {
+			err = errors.Errorf("table %q is offline: %s", tableDesc.Name, tableDesc.OfflineReason)
+		}
+		return &inactiveTableError{err}
+	case TableDescriptor_ADD:
+		return errTableAdding
+	case TableDescriptor_PUBLIC:
+		return nil
+	default:
+		return errors.Errorf("table in unknown state: %s", tableDesc.State.String())
+	}
+}
+
+var errTableAdding = errors.New("table is being added")
+
+type inactiveTableError struct {
+	cause error
+}
+
+func (i *inactiveTableError) Error() string { return i.cause.Error() }
+
+func (i *inactiveTableError) Unwrap() error { return i.cause }
+
+// HasAddingTableError returns true if the error contains an addingTableError.
+func HasAddingTableError(err error) bool {
+	return errors.Is(err, errTableAdding)
+}
+
+// HasInactiveTableError returns true if the error contains an
+// inactiveTableError.
+func HasInactiveTableError(err error) bool {
+	return errors.HasType(err, (*inactiveTableError)(nil))
 }

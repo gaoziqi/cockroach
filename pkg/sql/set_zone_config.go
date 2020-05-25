@@ -202,7 +202,7 @@ func checkPrivilegeForSetZoneConfig(ctx context.Context, p *planner, zs tree.Zon
 	}
 	tableDesc, err := p.resolveTableForZone(ctx, &zs)
 	if err != nil {
-		if zs.TargetsIndex() && zs.TableOrIndex.Table.TableName == "" {
+		if zs.TargetsIndex() && zs.TableOrIndex.Table.ObjectName == "" {
 			err = errors.WithHint(err, "try specifying the index as <tablename>@<indexname>")
 		}
 		return err
@@ -415,7 +415,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		_, completeZone, completeSubzone, err := GetZoneConfigInTxn(params.ctx, params.p.txn,
 			uint32(targetID), index, partition, n.setDefault)
 
-		if err == errNoZoneConfigApplies {
+		if errors.Is(err, errNoZoneConfigApplies) {
 			// No zone config yet.
 			//
 			// GetZoneConfigInTxn will fail with errNoZoneConfigApplies when
@@ -565,10 +565,15 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 				return err
 			}
 
+			ss, err := params.extendedEvalCtx.StatusServer.OptionalErr()
+			if err != nil {
+				return err
+			}
+
 			// Validate that the result makes sense.
 			if err := validateZoneAttrsAndLocalities(
 				params.ctx,
-				params.extendedEvalCtx.StatusServer.Nodes,
+				ss.Nodes,
 				&newZone,
 			); err != nil {
 				return err
@@ -677,7 +682,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			params.p.txn,
 			eventLogType,
 			int32(targetID),
-			int32(params.extendedEvalCtx.NodeID),
+			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 			info,
 		)
 	}
@@ -835,7 +840,7 @@ func writeZoneConfig(
 	if len(zone.Subzones) > 0 {
 		st := execCfg.Settings
 		zone.SubzoneSpans, err = GenerateSubzoneSpans(
-			st, execCfg.ClusterID(), table, zone.Subzones, hasNewSubzones)
+			st, execCfg.ClusterID(), execCfg.Codec, table, zone.Subzones, hasNewSubzones)
 		if err != nil {
 			return 0, err
 		}
@@ -889,7 +894,7 @@ func RemoveIndexZoneConfigs(
 	tableID sqlbase.ID,
 	indexDescs []sqlbase.IndexDescriptor,
 ) error {
-	tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+	tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, execCfg.Codec, tableID)
 	if err != nil {
 		return err
 	}

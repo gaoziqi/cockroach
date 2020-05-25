@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/sync/errgroup"
 )
@@ -67,7 +67,7 @@ func makeQueryCacheTestHelper(tb testing.TB, numConns int) *queryCacheTestHelper
 }
 
 func (h *queryCacheTestHelper) Stop() {
-	h.srv.Stopper().Stop(context.TODO())
+	h.srv.Stopper().Stop(context.Background())
 }
 
 func (h *queryCacheTestHelper) GetStats() (numHits, numMisses int) {
@@ -486,17 +486,17 @@ SELECT cte.x, cte.y FROM cte LEFT JOIN cte as cte2 on cte.y = cte2.x`, j)
 			r0.Exec(t, "PREPARE c3 (decimal) AS SELECT pg_typeof(1 + $1)") // Should miss the cache.
 			h.AssertStats(t, 3 /* hits */, 6 /* misses */)
 
-			r0.CheckQueryResults(t, "EXECUTE a1 (1)", [][]string{{"int"}})
-			r0.CheckQueryResults(t, "EXECUTE a2 (1)", [][]string{{"int"}})
-			r0.CheckQueryResults(t, "EXECUTE a3 (1)", [][]string{{"int"}})
+			r0.CheckQueryResults(t, "EXECUTE a1 (1)", [][]string{{"bigint"}})
+			r0.CheckQueryResults(t, "EXECUTE a2 (1)", [][]string{{"bigint"}})
+			r0.CheckQueryResults(t, "EXECUTE a3 (1)", [][]string{{"bigint"}})
 
-			r0.CheckQueryResults(t, "EXECUTE b1 (1)", [][]string{{"float"}})
-			r0.CheckQueryResults(t, "EXECUTE b2 (1)", [][]string{{"float"}})
-			r0.CheckQueryResults(t, "EXECUTE b3 (1)", [][]string{{"float"}})
+			r0.CheckQueryResults(t, "EXECUTE b1 (1)", [][]string{{"double precision"}})
+			r0.CheckQueryResults(t, "EXECUTE b2 (1)", [][]string{{"double precision"}})
+			r0.CheckQueryResults(t, "EXECUTE b3 (1)", [][]string{{"double precision"}})
 
-			r0.CheckQueryResults(t, "EXECUTE c1 (1)", [][]string{{"decimal"}})
-			r0.CheckQueryResults(t, "EXECUTE c2 (1)", [][]string{{"decimal"}})
-			r0.CheckQueryResults(t, "EXECUTE c3 (1)", [][]string{{"decimal"}})
+			r0.CheckQueryResults(t, "EXECUTE c1 (1)", [][]string{{"numeric"}})
+			r0.CheckQueryResults(t, "EXECUTE c2 (1)", [][]string{{"numeric"}})
+			r0.CheckQueryResults(t, "EXECUTE c3 (1)", [][]string{{"numeric"}})
 		})
 	})
 }

@@ -62,6 +62,13 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	md := scan.Memo().Metadata()
 	hardLimit := scan.HardLimit.RowCount()
 
+	// Side Effects
+	// ------------
+	// A Locking option is a side-effect (we don't want to elide this scan).
+	if scan.Locking != nil {
+		rel.CanHaveSideEffects = true
+	}
+
 	// Output Columns
 	// --------------
 	// Scan output columns are stored in the definition.
@@ -94,6 +101,9 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 		if scan.Constraint != nil {
 			rel.FuncDeps.AddConstants(scan.Constraint.ExtractConstCols(b.evalCtx))
 		}
+		if tabMeta := md.TableMeta(scan.Table); tabMeta.Constraints != nil {
+			b.addFiltersToFuncDep(*tabMeta.Constraints.(*FiltersExpr), &rel.FuncDeps)
+		}
 		rel.FuncDeps.MakeNotNull(rel.NotNullCols)
 		rel.FuncDeps.ProjectCols(rel.OutputCols)
 	}
@@ -120,34 +130,6 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	if !b.disableStats {
 		b.sb.buildScan(scan, rel)
 	}
-}
-
-func (b *logicalPropsBuilder) buildVirtualScanProps(scan *VirtualScanExpr, rel *props.Relational) {
-	// Output Columns
-	// --------------
-	// VirtualScan output columns are stored in the definition.
-	rel.OutputCols = scan.Cols
-
-	// Not Null Columns
-	// ----------------
-	// All columns are assumed to be nullable.
-
-	// Outer Columns
-	// -------------
-	// VirtualScan operator never has outer columns.
-
-	// Functional Dependencies
-	// -----------------------
-	// VirtualScan operator has an empty FD set.
-
-	// Cardinality
-	// -----------
-	// Don't make any assumptions about cardinality of output.
-	rel.Cardinality = props.AnyCardinality
-
-	// Statistics
-	// ----------
-	b.sb.buildVirtualScan(scan, rel)
 }
 
 func (b *logicalPropsBuilder) buildSequenceSelectProps(
@@ -417,6 +399,12 @@ func (b *logicalPropsBuilder) buildLookupJoinProps(join *LookupJoinExpr, rel *pr
 	b.buildJoinProps(join, rel)
 }
 
+func (b *logicalPropsBuilder) buildGeoLookupJoinProps(
+	join *GeoLookupJoinExpr, rel *props.Relational,
+) {
+	b.buildJoinProps(join, rel)
+}
+
 func (b *logicalPropsBuilder) buildZigzagJoinProps(join *ZigzagJoinExpr, rel *props.Relational) {
 	b.buildJoinProps(join, rel)
 }
@@ -441,8 +429,20 @@ func (b *logicalPropsBuilder) buildDistinctOnProps(
 	b.buildGroupingExprProps(distinctOn, rel)
 }
 
+func (b *logicalPropsBuilder) buildEnsureDistinctOnProps(
+	distinctOn *EnsureDistinctOnExpr, rel *props.Relational,
+) {
+	b.buildGroupingExprProps(distinctOn, rel)
+}
+
 func (b *logicalPropsBuilder) buildUpsertDistinctOnProps(
 	distinctOn *UpsertDistinctOnExpr, rel *props.Relational,
+) {
+	b.buildGroupingExprProps(distinctOn, rel)
+}
+
+func (b *logicalPropsBuilder) buildEnsureUpsertDistinctOnProps(
+	distinctOn *EnsureUpsertDistinctOnExpr, rel *props.Relational,
 ) {
 	b.buildGroupingExprProps(distinctOn, rel)
 }
@@ -486,11 +486,13 @@ func (b *logicalPropsBuilder) buildGroupingExprProps(groupExpr RelExpr, rel *pro
 			continue
 		}
 
-		// All PG aggregate functions return a non-NULL result if they have at
-		// least one input row, and if all argument values are non-NULL.
-		inputCols := ExtractAggInputColumns(agg)
-		if inputCols.SubsetOf(inputProps.NotNullCols) {
-			rel.NotNullCols.Add(item.Col)
+		// Most aggregate functions return a non-NULL result if they have at least
+		// one input row with non-NULL argument value, and if all argument values are non-NULL.
+		if opt.AggregateIsNeverNullOnNonNullInput(agg.Op()) {
+			inputCols := ExtractAggInputColumns(agg)
+			if inputCols.SubsetOf(inputProps.NotNullCols) {
+				rel.NotNullCols.Add(item.Col)
+			}
 		}
 	}
 
@@ -513,9 +515,10 @@ func (b *logicalPropsBuilder) buildGroupingExprProps(groupExpr RelExpr, rel *pro
 
 		// The output of most of the grouping operators forms a strict key because
 		// they eliminate all duplicates in the grouping columns. However, the
-		// UpsertDistinctOn operator does not group NULL values together, so it
-		// only forms a lax key when NULL values are possible.
-		if groupExpr.Op() == opt.UpsertDistinctOnOp && !groupingCols.SubsetOf(rel.NotNullCols) {
+		// UpsertDistinctOn and EnsureUpsertDistinctOn operators do not group
+		// NULL values together, so they only form a lax key when NULL values
+		// are possible.
+		if groupPrivate.NullsAreDistinct && !groupingCols.SubsetOf(rel.NotNullCols) {
 			rel.FuncDeps.AddLaxKey(groupingCols, rel.OutputCols)
 		} else {
 			rel.FuncDeps.AddStrictKey(groupingCols, rel.OutputCols)
@@ -1365,8 +1368,22 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared) {
 		return
 
 	case *DivExpr:
-		// Division by zero error is possible.
-		shared.CanHaveSideEffects = true
+		// Division by zero error is possible, unless the right-hand side is a
+		// non-zero constant.
+		var nonZero bool
+		if c, ok := t.Right.(*ConstExpr); ok {
+			switch v := c.Value.(type) {
+			case *tree.DInt:
+				nonZero = (*v != 0)
+			case *tree.DFloat:
+				nonZero = (*v != 0.0)
+			case *tree.DDecimal:
+				nonZero = !v.IsZero()
+			}
+		}
+		if !nonZero {
+			shared.CanHaveSideEffects = true
+		}
 
 	case *SubqueryExpr, *ExistsExpr, *AnyExpr, *ArrayFlattenExpr:
 		shared.HasSubquery = true
@@ -1641,6 +1658,30 @@ func ensureLookupJoinInputProps(join *LookupJoinExpr, sb *statisticsBuilder) *pr
 	return relational
 }
 
+// ensureGeoLookupJoinInputProps lazily populates the relational properties
+// that apply to the lookup side of the join, as if it were a Scan operator.
+func ensureGeoLookupJoinInputProps(
+	join *GeoLookupJoinExpr, sb *statisticsBuilder,
+) *props.Relational {
+	relational := &join.lookupProps
+	if relational.OutputCols.Empty() {
+		md := join.Memo().Metadata()
+		relational.OutputCols = join.Cols.Difference(join.Input.Relational().OutputCols)
+		relational.NotNullCols = tableNotNullCols(md, join.Table)
+		relational.NotNullCols.IntersectionWith(relational.OutputCols)
+		relational.Cardinality = props.AnyCardinality
+
+		// TODO(rytaft): See if we need to use different functional dependencies
+		// for the inverted index.
+		relational.FuncDeps.CopyFrom(MakeTableFuncDep(md, join.Table))
+		relational.FuncDeps.ProjectCols(relational.OutputCols)
+
+		// TODO(rytaft): Change this to use inverted index stats once available.
+		relational.Stats = *sb.makeTableStatistics(join.Table)
+	}
+	return relational
+}
+
 // ensureZigzagJoinInputProps lazily populates the relational properties that
 // apply to the two sides of the join, as if it were a Scan operator.
 func ensureZigzagJoinInputProps(join *ZigzagJoinExpr, sb *statisticsBuilder) {
@@ -1756,6 +1797,19 @@ func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 		}
 
 		// Lookup join has implicit equality conditions on KeyCols.
+		h.filterIsTrue = false
+		h.filterIsFalse = h.filters.IsFalse()
+
+	case *GeoLookupJoinExpr:
+		h.leftProps = joinExpr.Child(0).(RelExpr).Relational()
+		ensureGeoLookupJoinInputProps(join, &b.sb)
+		h.joinType = join.JoinType
+		h.rightProps = &join.lookupProps
+		h.filters = join.On
+		b.addFiltersToFuncDep(h.filters, &h.filtersFD)
+		h.filterNotNullCols = b.rejectNullCols(h.filters)
+
+		// Geospatial lookup join always has a filter condition on the index keys.
 		h.filterIsTrue = false
 		h.filterIsFalse = h.filters.IsFalse()
 
@@ -1911,10 +1965,16 @@ func (h *joinPropsHelper) setFuncDeps(rel *props.Relational) {
 			addOuterColsToFuncDep(rel.OuterCols, &rel.FuncDeps)
 
 		case opt.LeftJoinOp, opt.LeftJoinApplyOp:
-			rel.FuncDeps.MakeLeftOuter(h.rightProps.OutputCols, notNullInputCols)
+			rel.FuncDeps.MakeLeftOuter(
+				&h.leftProps.FuncDeps, &h.filtersFD,
+				h.leftProps.OutputCols, h.rightProps.OutputCols, notNullInputCols,
+			)
 
 		case opt.RightJoinOp:
-			rel.FuncDeps.MakeLeftOuter(h.leftProps.OutputCols, notNullInputCols)
+			rel.FuncDeps.MakeLeftOuter(
+				&h.rightProps.FuncDeps, &h.filtersFD,
+				h.rightProps.OutputCols, h.leftProps.OutputCols, notNullInputCols,
+			)
 
 		case opt.FullJoinOp:
 			rel.FuncDeps.MakeFullOuter(h.leftProps.OutputCols, h.rightProps.OutputCols, notNullInputCols)

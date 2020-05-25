@@ -15,7 +15,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -63,7 +62,7 @@ type descriptorResolver struct {
 	objsByName map[sqlbase.ID]map[string]sqlbase.ID
 }
 
-// LookupSchema implements the tree.TableNameTargetResolver interface.
+// LookupSchema implements the tree.ObjectNameTargetResolver interface.
 func (r *descriptorResolver) LookupSchema(
 	_ context.Context, dbName, scName string,
 ) (bool, tree.SchemaMeta, error) {
@@ -76,7 +75,7 @@ func (r *descriptorResolver) LookupSchema(
 	return false, nil, nil
 }
 
-// LookupObject implements the tree.TableNameExistingResolver interface.
+// LookupObject implements the tree.ObjectNameExistingResolver interface.
 func (r *descriptorResolver) LookupObject(
 	_ context.Context, flags tree.ObjectLookupFlags, dbName, scName, obName string,
 ) (bool, tree.NameResolutionResult, error) {
@@ -211,10 +210,14 @@ func descriptorsMatchingTargets(
 
 		switch p := pattern.(type) {
 		case *tree.TableName:
-			found, descI, err := p.ResolveExisting(ctx, resolver, tree.ObjectLookupFlags{}, currentDatabase, searchPath)
+			// TODO: As part of work for #34240, this should not be a TableName.
+			//  Instead, it should be an UnresolvedObjectName.
+			un := p.ToUnresolvedObjectName()
+			found, prefix, descI, err := tree.ResolveExisting(ctx, un, resolver, tree.ObjectLookupFlags{}, currentDatabase, searchPath)
 			if err != nil {
 				return ret, err
 			}
+			p.ObjectNamePrefix = prefix
 			doesNotExistErr := errors.Errorf(`table %q does not exist`, tree.ErrString(p))
 			if !found {
 				return ret, doesNotExistErr
@@ -223,7 +226,7 @@ func descriptorsMatchingTargets(
 			tableDesc := desc.Table(hlc.Timestamp{})
 
 			// Verify that the table is in the correct state.
-			if err := sql.FilterTableState(tableDesc); err != nil {
+			if err := sqlbase.FilterTableState(tableDesc); err != nil {
 				// Return a does not exist error if explicitly asking for this table.
 				return ret, doesNotExistErr
 			}
@@ -242,7 +245,7 @@ func descriptorsMatchingTargets(
 			}
 
 		case *tree.AllTablesSelector:
-			found, descI, err := p.TableNamePrefix.Resolve(ctx, resolver, currentDatabase, searchPath)
+			found, descI, err := p.ObjectNamePrefix.Resolve(ctx, resolver, currentDatabase, searchPath)
 			if err != nil {
 				return ret, err
 			}
@@ -274,7 +277,7 @@ func descriptorsMatchingTargets(
 		for _, tblID := range resolver.objsByName[dbID] {
 			desc := resolver.descByID[tblID]
 			table := desc.Table(hlc.Timestamp{})
-			if err := sql.FilterTableState(table); err != nil {
+			if err := sqlbase.FilterTableState(table); err != nil {
 				// Don't include this table in the expansion since it's not in a valid
 				// state. Silently fail since this table was not directly requested,
 				// but was just part of an expansion.
@@ -406,7 +409,7 @@ func getAllDescChanges(
 	startTime, endTime hlc.Timestamp,
 	priorIDs map[sqlbase.ID]sqlbase.ID,
 ) ([]BackupManifest_DescriptorRevision, error) {
-	startKey := roachpb.Key(keys.MakeTablePrefix(keys.DescriptorTableID))
+	startKey := keys.TODOSQLCodec.TablePrefix(keys.DescriptorTableID)
 	endKey := startKey.PrefixEnd()
 
 	allRevs, err := storageccl.GetAllRevisions(ctx, db, startKey, endKey, startTime, endTime)
@@ -417,7 +420,7 @@ func getAllDescChanges(
 	var res []BackupManifest_DescriptorRevision
 
 	for _, revs := range allRevs {
-		id, err := keys.DecodeDescMetadataID(revs.Key)
+		id, err := keys.TODOSQLCodec.DecodeDescMetadataID(revs.Key)
 		if err != nil {
 			return nil, err
 		}
@@ -441,7 +444,7 @@ func getAllDescChanges(
 }
 
 func allSQLDescriptors(ctx context.Context, txn *kv.Txn) ([]sqlbase.Descriptor, error) {
-	startKey := roachpb.Key(keys.MakeTablePrefix(keys.DescriptorTableID))
+	startKey := keys.TODOSQLCodec.TablePrefix(keys.DescriptorTableID)
 	endKey := startKey.PrefixEnd()
 	rows, err := txn.Scan(ctx, startKey, endKey, 0)
 	if err != nil {
@@ -572,7 +575,10 @@ func fullClusterTargets(
 	for _, desc := range allDescs {
 		if dbDesc := desc.GetDatabase(); dbDesc != nil {
 			fullClusterDescs = append(fullClusterDescs, desc)
-			fullClusterDBs = append(fullClusterDBs, dbDesc)
+			if dbDesc.ID != sqlbase.SystemDB.ID {
+				// The only database that isn't being fully backed up is the system DB.
+				fullClusterDBs = append(fullClusterDBs, dbDesc)
+			}
 		}
 		if tableDesc := desc.Table(hlc.Timestamp{}); tableDesc != nil {
 			if tableDesc.ParentID == sqlbase.SystemDB.ID {
@@ -592,8 +598,10 @@ func fullClusterTargets(
 	return fullClusterDescs, fullClusterDBs, nil
 }
 
-func lookupDatabaseID(ctx context.Context, txn *kv.Txn, name string) (sqlbase.ID, error) {
-	found, id, err := sqlbase.LookupDatabaseID(ctx, txn, name)
+func lookupDatabaseID(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, name string,
+) (sqlbase.ID, error) {
+	found, id, err := sqlbase.LookupDatabaseID(ctx, txn, codec, name)
 	if err != nil {
 		return sqlbase.InvalidID, err
 	}
@@ -605,8 +613,10 @@ func lookupDatabaseID(ctx context.Context, txn *kv.Txn, name string) (sqlbase.ID
 
 // CheckTableExists returns an error if a table already exists with given
 // parent and name.
-func CheckTableExists(ctx context.Context, txn *kv.Txn, parentID sqlbase.ID, name string) error {
-	found, _, err := sqlbase.LookupPublicTableID(ctx, txn, parentID, name)
+func CheckTableExists(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, parentID sqlbase.ID, name string,
+) error {
+	found, _, err := sqlbase.LookupPublicTableID(ctx, txn, codec, parentID, name)
 	if err != nil {
 		return err
 	}
@@ -625,13 +635,13 @@ func fullClusterTargetsRestore(
 	}
 	filteredDescs := make([]sqlbase.Descriptor, 0, len(fullClusterDescs))
 	for _, desc := range fullClusterDescs {
-		if _, isDefaultDB := sql.DefaultUserDBs[desc.GetName()]; !isDefaultDB && desc.GetID() != sqlbase.SystemDB.ID {
+		if _, isDefaultDB := sqlbase.DefaultUserDBs[desc.GetName()]; !isDefaultDB && desc.GetID() != sqlbase.SystemDB.ID {
 			filteredDescs = append(filteredDescs, desc)
 		}
 	}
 	filteredDBs := make([]*sqlbase.DatabaseDescriptor, 0, len(fullClusterDBs))
 	for _, db := range fullClusterDBs {
-		if _, isDefaultDB := sql.DefaultUserDBs[db.GetName()]; !isDefaultDB && db.GetID() != sqlbase.SystemDB.ID {
+		if _, isDefaultDB := sqlbase.DefaultUserDBs[db.GetName()]; !isDefaultDB && db.GetID() != sqlbase.SystemDB.ID {
 			filteredDBs = append(filteredDBs, db)
 		}
 	}

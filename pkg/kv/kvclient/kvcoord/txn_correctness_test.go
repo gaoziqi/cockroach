@@ -25,14 +25,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type retryError struct {
@@ -610,8 +610,8 @@ func (hv *historyVerifier) runHistoryWithRetry(
 		if log.V(1) {
 			log.Infof(context.Background(), "got an error running history %s: %s", historyString(cmds), err)
 		}
-		retry, ok := err.(*retryError)
-		if !ok {
+		var retry *retryError
+		if !errors.As(err, &retry) {
 			return err
 		}
 
@@ -675,7 +675,7 @@ func (hv *historyVerifier) runHistory(
 	for i, txnCmds := range txnMap {
 		go func(i int, txnCmds []*cmd) {
 			if err := hv.runTxn(i, priorities[i], txnCmds, db, t); err != nil {
-				if re, ok := err.(*retryError); !ok {
+				if re := (*retryError)(nil); !errors.As(err, &re) {
 					reportErr := errors.Wrapf(err, "(%s): unexpected failure", cmds)
 					select {
 					case errs <- reportErr:
@@ -731,7 +731,7 @@ func (hv *historyVerifier) runCmds(
 ) (string, map[string]int64, error) {
 	var strs []string
 	env := map[string]int64{}
-	err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		txn.SetDebugName(txnName)
 		for _, c := range cmds {
 			c.historyIdx = hv.idx
@@ -763,7 +763,7 @@ func (hv *historyVerifier) runTxn(
 		prev.ch <- err
 	}
 
-	err := db.Txn(context.TODO(), func(ctx context.Context, txn *kv.Txn) error {
+	err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		// If this is 2nd attempt, and a retry wasn't expected, return a
 		// retry error which results in further histories being enumerated.
 		if retry++; retry > 1 {
@@ -826,7 +826,7 @@ func checkConcurrency(name string, txns []string, verify *verifier, t *testing.T
 			// after the pushee's commit has already returned successfully. This
 			// is a result of the asynchronous nature of making transaction commits
 			// explicit after a parallel commit.
-			EvalKnobs: storagebase.BatchEvalTestingKnobs{
+			EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 				RecoverIndeterminateCommitsOnFailedPushes: true,
 			},
 		},

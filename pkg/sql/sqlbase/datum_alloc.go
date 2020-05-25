@@ -10,11 +10,17 @@
 
 package sqlbase
 
-import "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+import (
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
+)
 
 // DatumAlloc provides batch allocation of datum pointers, amortizing the cost
 // of the allocations.
+// NOTE: it *must* be passed in by a pointer.
 type DatumAlloc struct {
+	_ util.NoCopy
+
 	datumAlloc        []tree.Datum
 	dintAlloc         []tree.DInt
 	dfloatAlloc       []tree.DFloat
@@ -23,6 +29,8 @@ type DatumAlloc struct {
 	dbitArrayAlloc    []tree.DBitArray
 	ddecimalAlloc     []tree.DDecimal
 	ddateAlloc        []tree.DDate
+	dgeometryAlloc    []tree.DGeometry
+	dgeographyAlloc   []tree.DGeography
 	dtimeAlloc        []tree.DTime
 	dtimetzAlloc      []tree.DTimeTZ
 	dtimestampAlloc   []tree.DTimestamp
@@ -137,6 +145,30 @@ func (a *DatumAlloc) NewDDate(v tree.DDate) *tree.DDate {
 	buf := &a.ddateAlloc
 	if len(*buf) == 0 {
 		*buf = make([]tree.DDate, datumAllocSize)
+	}
+	r := &(*buf)[0]
+	*r = v
+	*buf = (*buf)[1:]
+	return r
+}
+
+// NewDGeography allocates a DGeography.
+func (a *DatumAlloc) NewDGeography(v tree.DGeography) *tree.DGeography {
+	buf := &a.dgeographyAlloc
+	if len(*buf) == 0 {
+		*buf = make([]tree.DGeography, datumAllocSize)
+	}
+	r := &(*buf)[0]
+	*r = v
+	*buf = (*buf)[1:]
+	return r
+}
+
+// NewDGeometry allocates a DGeometry.
+func (a *DatumAlloc) NewDGeometry(v tree.DGeometry) *tree.DGeometry {
+	buf := &a.dgeometryAlloc
+	if len(*buf) == 0 {
+		*buf = make([]tree.DGeometry, datumAllocSize)
 	}
 	r := &(*buf)[0]
 	*r = v

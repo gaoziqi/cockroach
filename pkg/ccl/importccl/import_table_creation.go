@@ -18,8 +18,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -54,11 +55,14 @@ func readCreateTableFromStore(
 	if err != nil {
 		return nil, err
 	}
-	stmt, err := parser.ParseOne(string(tableDefStr))
+	stmts, err := parser.Parse(string(tableDefStr))
 	if err != nil {
 		return nil, err
 	}
-	create, ok := stmt.AST.(*tree.CreateTable)
+	if len(stmts) != 1 {
+		return nil, errors.Errorf("expected 1 create table statement, found %d", len(stmts))
+	}
+	create, ok := stmts[0].AST.(*tree.CreateTable)
 	if !ok {
 		return nil, errors.New("expected CREATE TABLE statement in table file")
 	}
@@ -128,7 +132,7 @@ func MakeSimpleTableDescriptor(
 				continue
 			}
 			// Strip the schema/db prefix.
-			def.Table = tree.MakeUnqualifiedTableName(def.Table.TableName)
+			def.Table = tree.MakeUnqualifiedTableName(def.Table.ObjectName)
 
 		default:
 			return nil, unimplemented.Newf(fmt.Sprintf("import.%T", def), "unsupported table definition: %s", tree.AsString(def))
@@ -240,7 +244,7 @@ func (so *importSequenceOperators) SetSequenceValue(
 
 type fkResolver map[string]*sqlbase.MutableTableDescriptor
 
-var _ sql.SchemaResolver = fkResolver{}
+var _ resolver.SchemaResolver = fkResolver{}
 
 // Implements the sql.SchemaResolver interface.
 func (r fkResolver) Txn() *kv.Txn {
@@ -248,7 +252,7 @@ func (r fkResolver) Txn() *kv.Txn {
 }
 
 // Implements the sql.SchemaResolver interface.
-func (r fkResolver) LogicalSchemaAccessor() sql.SchemaAccessor {
+func (r fkResolver) LogicalSchemaAccessor() catalog.Accessor {
 	return nil
 }
 
@@ -275,7 +279,7 @@ func (r fkResolver) ObjectLookupFlags(required bool, requireMutable bool) tree.O
 	}
 }
 
-// Implements the tree.TableNameExistingResolver interface.
+// Implements the tree.ObjectNameExistingResolver interface.
 func (r fkResolver) LookupObject(
 	ctx context.Context, lookupFlags tree.ObjectLookupFlags, dbName, scName, obName string,
 ) (found bool, objMeta tree.NameResolutionResult, err error) {
@@ -294,7 +298,7 @@ func (r fkResolver) LookupObject(
 	return false, nil, errors.Errorf("referenced table %q not found in tables being imported (%s)", obName, suggestions)
 }
 
-// Implements the tree.TableNameTargetResolver interface.
+// Implements the tree.ObjectNameTargetResolver interface.
 func (r fkResolver) LookupSchema(
 	ctx context.Context, dbName, scName string,
 ) (found bool, scMeta tree.SchemaMeta, err error) {
@@ -302,6 +306,8 @@ func (r fkResolver) LookupSchema(
 }
 
 // Implements the sql.SchemaResolver interface.
-func (r fkResolver) LookupTableByID(ctx context.Context, id sqlbase.ID) (row.TableEntry, error) {
-	return row.TableEntry{}, errSchemaResolver
+func (r fkResolver) LookupTableByID(
+	ctx context.Context, id sqlbase.ID,
+) (catalog.TableEntry, error) {
+	return catalog.TableEntry{}, errSchemaResolver
 }

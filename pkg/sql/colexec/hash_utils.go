@@ -14,7 +14,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 // initHash, rehash, and finalizeHash work together to compute the hash value
@@ -109,6 +110,7 @@ type tupleHashDistributor struct {
 	// check for query cancellation.
 	cancelChecker  CancelChecker
 	decimalScratch decimalOverloadScratch
+	datumAlloc     sqlbase.DatumAlloc
 }
 
 func newTupleHashDistributor(initHashValue uint64, numOutputs int) *tupleHashDistributor {
@@ -124,13 +126,13 @@ func newTupleHashDistributor(initHashValue uint64, numOutputs int) *tupleHashDis
 }
 
 func (d *tupleHashDistributor) distribute(
-	ctx context.Context, b coldata.Batch, types []coltypes.T, hashCols []uint32,
+	ctx context.Context, b coldata.Batch, types []*types.T, hashCols []uint32,
 ) [][]int {
 	n := b.Length()
 	initHash(d.buckets, n, d.initHashValue)
 
 	for _, i := range hashCols {
-		rehash(ctx, d.buckets, types[i], b.ColVec(int(i)), n, b.Selection(), d.cancelChecker, d.decimalScratch)
+		rehash(ctx, d.buckets, b.ColVec(int(i)), n, b.Selection(), d.cancelChecker, d.decimalScratch, &d.datumAlloc)
 	}
 
 	finalizeHash(d.buckets, n, uint64(len(d.selections)))

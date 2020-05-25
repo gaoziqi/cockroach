@@ -23,14 +23,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util/causer"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -39,10 +38,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	crdberrors "github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 	"go.etcd.io/etcd/raft/tracker"
@@ -65,7 +62,7 @@ func (r *Replica) AdminSplit(
 }
 
 func maybeDescriptorChangedError(desc *roachpb.RangeDescriptor, err error) (string, bool) {
-	if detail, ok := err.(*roachpb.ConditionFailedError); ok {
+	if detail := (*roachpb.ConditionFailedError)(nil); errors.As(err, &detail) {
 		// Provide a better message in the common case that the range being changed
 		// was already changed by a concurrent transaction.
 		var actualDesc roachpb.RangeDescriptor
@@ -134,14 +131,12 @@ func prepareSplitDescs(
 	}
 
 	leftDesc.IncrementGeneration()
-	leftDesc.GenerationComparable = proto.Bool(true)
 	leftDesc.EndKey = splitKey
 
 	// Set the generation of the right hand side descriptor to match that of the
 	// (updated) left hand side. See the comment on the field for an explanation
 	// of why generations are useful.
 	rightDesc.Generation = leftDesc.Generation
-	rightDesc.GenerationComparable = proto.Bool(true)
 
 	setStickyBit(rightDesc, expiration)
 	return leftDesc, rightDesc
@@ -331,13 +326,13 @@ func (r *Replica) adminSplitWithDescriptor(
 			// If the key that routed this request to this range is now out of this
 			// range's bounds, return an error for the client to try again on the
 			// correct range.
-			if !storagebase.ContainsKey(desc, args.Key) {
+			if !kvserverbase.ContainsKey(desc, args.Key) {
 				return reply, roachpb.NewRangeKeyMismatchError(args.Key, args.Key, desc)
 			}
 			foundSplitKey = args.SplitKey
 		}
 
-		if !storagebase.ContainsKey(desc, foundSplitKey) {
+		if !kvserverbase.ContainsKey(desc, foundSplitKey) {
 			return reply, errors.Errorf("requested split key %s out of bounds of %s", args.SplitKey, r)
 		}
 
@@ -525,23 +520,15 @@ func (r *Replica) executeAdminCommandWithDescriptor(
 		// Without the lease, a replica's local descriptor can be arbitrarily
 		// stale, which will result in a ConditionFailedError. To avoid this, we
 		// make sure that we still have the lease before each attempt.
-		if _, _, pErr := r.redirectOnOrAcquireLease(ctx); pErr != nil {
+		if _, pErr := r.redirectOnOrAcquireLease(ctx); pErr != nil {
 			return pErr
 		}
 
 		lastErr = updateDesc(r.Desc())
 		// On seeing a ConditionFailedError or an AmbiguousResultError, retry the
 		// command with the updated descriptor.
-		if retry := causer.Visit(lastErr, func(err error) bool {
-			switch err.(type) {
-			case *roachpb.ConditionFailedError:
-				return true
-			case *roachpb.AmbiguousResultError:
-				return true
-			default:
-				return false
-			}
-		}); !retry {
+		if !errors.HasType(lastErr, (*roachpb.ConditionFailedError)(nil)) &&
+			!errors.HasType(lastErr, (*roachpb.AmbiguousResultError)(nil)) {
 			break
 		}
 	}
@@ -654,11 +641,10 @@ func (r *Replica) AdminMerge(
 		updatedLeftDesc := *origLeftDesc
 		// lhs.Generation = max(rhs.Generation, lhs.Generation)+1.
 		// See the comment on the Generation field for why generation are useful.
-		if updatedLeftDesc.GetGeneration() < rightDesc.GetGeneration() {
+		if updatedLeftDesc.Generation < rightDesc.Generation {
 			updatedLeftDesc.Generation = rightDesc.Generation
 		}
 		updatedLeftDesc.IncrementGeneration()
-		updatedLeftDesc.GenerationComparable = proto.Bool(true)
 		updatedLeftDesc.EndKey = rightDesc.EndKey
 		log.Infof(ctx, "initiating a merge of %s into this range (%s)", &rightDesc, reason)
 
@@ -772,7 +758,7 @@ func (r *Replica) AdminMerge(
 		if err != nil {
 			txn.CleanupOnError(ctx, err)
 		}
-		if _, canRetry := errors.Cause(err).(*roachpb.TransactionRetryWithProtoRefreshError); !canRetry {
+		if !errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) {
 			if err != nil {
 				return reply, roachpb.NewErrorf("merge failed: %s", err)
 			}
@@ -850,10 +836,7 @@ func (s *snapshotError) Error() string {
 
 // IsSnapshotError returns true iff the error indicates a snapshot failed.
 func IsSnapshotError(err error) bool {
-	return causer.Visit(err, func(err error) bool {
-		_, ok := errors.Cause(err).(*snapshotError)
-		return ok
-	})
+	return errors.HasType(err, (*snapshotError)(nil))
 }
 
 // ChangeReplicas atomically changes the replicas that are members of a range.
@@ -943,7 +926,7 @@ func (r *Replica) ChangeReplicas(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	priority SnapshotRequest_Priority,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs roachpb.ReplicationChanges,
 ) (updatedDesc *roachpb.RangeDescriptor, _ error) {
@@ -977,7 +960,7 @@ func (r *Replica) changeReplicasImpl(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	priority SnapshotRequest_Priority,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs roachpb.ReplicationChanges,
 ) (updatedDesc *roachpb.RangeDescriptor, _ error) {
@@ -1067,7 +1050,7 @@ func maybeLeaveAtomicChangeReplicas(
 	//
 	// TODO(tbg): reconsider this.
 	return execChangeReplicasTxn(
-		ctx, store, desc, storagepb.ReasonUnknown /* unused */, "", nil, /* iChgs */
+		ctx, store, desc, kvserverpb.ReasonUnknown /* unused */, "", nil, /* iChgs */
 	)
 }
 
@@ -1102,7 +1085,7 @@ func maybeLeaveAtomicChangeReplicasAndRemoveLearners(
 	for _, target := range targets {
 		var err error
 		desc, err = execChangeReplicasTxn(
-			ctx, store, desc, storagepb.ReasonAbandonedLearner, "",
+			ctx, store, desc, kvserverpb.ReasonAbandonedLearner, "",
 			[]internalReplicationChange{{target: target, typ: internalChangeTypeRemove}},
 		)
 		if err != nil {
@@ -1170,7 +1153,7 @@ func addLearnerReplicas(
 	ctx context.Context,
 	store *Store,
 	desc *roachpb.RangeDescriptor,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	targets []roachpb.ReplicationTarget,
 ) (*roachpb.RangeDescriptor, error) {
@@ -1247,7 +1230,7 @@ func (r *Replica) atomicReplicationChange(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	priority SnapshotRequest_Priority,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs roachpb.ReplicationChanges,
 ) (*roachpb.RangeDescriptor, error) {
@@ -1332,7 +1315,7 @@ func (r *Replica) tryRollBackLearnerReplica(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	target roachpb.ReplicationTarget,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 ) {
 	repDesc, ok := desc.GetReplicaDescriptor(target.StoreID)
@@ -1418,7 +1401,6 @@ func prepareChangeReplicasTrigger(
 	updatedDesc := *desc
 	updatedDesc.SetReplicas(desc.Replicas().DeepCopy())
 	updatedDesc.IncrementGeneration()
-	updatedDesc.GenerationComparable = proto.Bool(true)
 
 	var added, removed []roachpb.ReplicaDescriptor
 	if !chgs.leaveJoint() {
@@ -1553,7 +1535,7 @@ func execChangeReplicasTxn(
 	ctx context.Context,
 	store *Store,
 	referenceDesc *roachpb.RangeDescriptor,
-	reason storagepb.RangeLogEventReason,
+	reason kvserverpb.RangeLogEventReason,
 	details string,
 	chgs internalReplicationChanges,
 ) (*roachpb.RangeDescriptor, error) {
@@ -1649,14 +1631,14 @@ func execChangeReplicasTxn(
 			},
 		})
 		if err := txn.Run(ctx, b); err != nil {
-			log.Event(ctx, err.Error())
+			log.Eventf(ctx, "%v", err)
 			return err
 		}
 
 		returnDesc = crt.Desc
 		return nil
 	}); err != nil {
-		log.Event(ctx, err.Error())
+		log.Eventf(ctx, "%v", err)
 		// NB: desc may not be the descriptor we actually compared against, but
 		// either way this gives a good idea of what happened which is all it's
 		// supposed to do.
@@ -1740,11 +1722,8 @@ func execChangeReplicasTxn(
 // three SSTs from them for direct ingestion: one for the replicated range-ID
 // local keys, one for the range local keys, and one for the user keys. The
 // reason it creates three separate SSTs is to prevent overlaps with the
-// memtable and existing SSTs in RocksDB. These SST files are created lazily,
-// so in the case where the keyspace is empty, no file will be created. Each
-// of the SSTs has a range deletion tombstone written to it to delete the
-// existing data in the range, however if the keyspace is empty, then the
-// tombstone will be omitted.
+// memtable and existing SSTs in RocksDB. Each of the SSTs also has a range
+// deletion tombstone to delete the existing data in the range.
 //
 // Applying the snapshot: After the recipient has received the message
 // indicating it has all the data, it hands it all to
@@ -1881,7 +1860,7 @@ func (r *Replica) sendSnapshot(
 		r.store.Engine().NewBatch,
 		sent,
 	); err != nil {
-		if errors.Cause(err) == errMalformedSnapshot {
+		if errors.Is(err, errMalformedSnapshot) {
 			tag := fmt.Sprintf("r%d_%s", r.RangeID, snap.SnapUUID.Short())
 			if dir, err := r.store.checkpoint(ctx, tag); err != nil {
 				log.Warningf(ctx, "unable to create checkpoint %s: %+v", dir, err)
@@ -2026,7 +2005,7 @@ func (s *Store) AdminRelocateRange(
 	// about them.
 	newDesc, err := maybeLeaveAtomicChangeReplicasAndRemoveLearners(ctx, s, &rangeDesc)
 	if err != nil {
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "%v", err)
 		return err
 	}
 	rangeDesc = *newDesc
@@ -2120,7 +2099,7 @@ func (s *Store) AdminRelocateRange(
 						return returnErr
 					}
 					if every.ShouldLog() {
-						log.Info(ctx, returnErr)
+						log.Infof(ctx, "%v", returnErr)
 					}
 					success = false
 					break
@@ -2142,7 +2121,7 @@ func (s *Store) relocateOne(
 	if len(rangeReplicas) != len(desc.Replicas().Voters()) {
 		// The caller removed all the learners, so there shouldn't be anything but
 		// voters.
-		return nil, nil, crdberrors.AssertionFailedf(
+		return nil, nil, errors.AssertionFailedf(
 			`range %s had non-voter replicas: %v`, desc, desc.Replicas())
 	}
 

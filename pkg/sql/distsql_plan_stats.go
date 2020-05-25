@@ -26,8 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	"github.com/pkg/errors"
 )
 
 type requestedStat struct {
@@ -82,11 +82,12 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	if err != nil {
 		return PhysicalPlan{}, err
 	}
-	sb := span.MakeBuilder(desc.TableDesc(), scan.index)
-	scan.spans, err = sb.UnconstrainedSpans(scan.isDeleteSource)
+	sb := span.MakeBuilder(planCtx.planner.ExecCfg().Codec, desc.TableDesc(), scan.index)
+	scan.spans, err = sb.UnconstrainedSpans()
 	if err != nil {
 		return PhysicalPlan{}, err
 	}
+	scan.isFull = true
 
 	p, err := dsp.createTableReaders(planCtx, &scan, nil /* overrideResultColumns */)
 	if err != nil {
@@ -135,19 +136,19 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	}
 
 	// The sampler outputs the original columns plus a rank column and four sketch columns.
-	outTypes := make([]types.T, 0, len(p.ResultTypes)+5)
+	outTypes := make([]*types.T, 0, len(p.ResultTypes)+5)
 	outTypes = append(outTypes, p.ResultTypes...)
 	// An INT column for the rank of each row.
-	outTypes = append(outTypes, *types.Int)
+	outTypes = append(outTypes, types.Int)
 	// An INT column indicating the sketch index.
-	outTypes = append(outTypes, *types.Int)
+	outTypes = append(outTypes, types.Int)
 	// An INT column indicating the number of rows processed.
-	outTypes = append(outTypes, *types.Int)
+	outTypes = append(outTypes, types.Int)
 	// An INT column indicating the number of rows that have a NULL in any sketch
 	// column.
-	outTypes = append(outTypes, *types.Int)
+	outTypes = append(outTypes, types.Int)
 	// A BYTES column with the sketch data.
-	outTypes = append(outTypes, *types.Bytes)
+	outTypes = append(outTypes, types.Bytes)
 
 	p.AddNoGroupingStage(
 		execinfrapb.ProcessorCoreUnion{Sampler: sampler},
@@ -196,7 +197,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		node,
 		execinfrapb.ProcessorCoreUnion{SampleAggregator: agg},
 		execinfrapb.PostProcessSpec{},
-		[]types.T{},
+		[]*types.T{},
 	)
 
 	return p, nil
@@ -247,7 +248,7 @@ func (dsp *DistSQLPlanner) planAndRunCreateStats(
 		evalCtx.ExecCfg.LeaseHolderCache,
 		txn,
 		func(ts hlc.Timestamp) {
-			_ = evalCtx.ExecCfg.Clock.Update(ts)
+			evalCtx.ExecCfg.Clock.Update(ts)
 		},
 		evalCtx.Tracing,
 	)

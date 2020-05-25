@@ -204,6 +204,52 @@ func TestConformanceReport(t *testing.T) {
 				},
 			},
 		},
+		{
+			// Test that, when we have conjunctions of constraints, we report at the
+			// level of the whole conjunction, not for individuals constraints within
+			// the conjunction. I.e. if we have a constraint {"+region=us,+dc=dc1":1}
+			// (one replica needs to be in a node with locality us,dc1), and instead
+			// the replica is in us,dc2, then the report has an entry for the pair
+			// "us,dc1" with a violation instead of one entry for "us" with no
+			// violation, and another entry for "dc1" with one violation.
+			name: "constraint conjunctions",
+			baseReportTestCase: baseReportTestCase{
+				defaultZone: zone{replicas: 3},
+				schema: []database{
+					{
+						name:   "db1",
+						tables: []table{{name: "t1"}, {name: "t2"}},
+						// The database has a zone requesting everything to be on SSDs.
+						zone: &zone{
+							replicas: 2,
+							// The first conjunction will be satisfied; the second won't.
+							constraints: `{"+region=us,+dc=dc1":1,"+region=us,+dc=dc2":1}`,
+						},
+					},
+				},
+				splits: []split{
+					{key: "/Table/t1", stores: []int{1, 2}},
+				},
+				nodes: []node{
+					{id: 1, locality: "region=us,dc=dc1", stores: []store{{id: 1}}},
+					{id: 2, locality: "region=us,dc=dc3", stores: []store{{id: 2}}},
+				},
+			},
+			exp: []constraintEntry{
+				{
+					object:         "db1",
+					constraint:     "+region=us,+dc=dc1:1",
+					constraintType: Constraint,
+					numRanges:      0,
+				},
+				{
+					object:         "db1",
+					constraint:     "+region=us,+dc=dc2:1",
+					constraintType: Constraint,
+					numRanges:      1,
+				},
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -226,9 +272,9 @@ func runConformanceReportTest(t *testing.T, tc conformanceConstraintTestCase) {
 	}
 
 	// Sort the report's keys.
-	gotRows := make(rows, len(rep.constraints))
+	gotRows := make(rows, len(rep))
 	i := 0
-	for k, v := range rep.constraints {
+	for k, v := range rep {
 		gotRows[i] = row{ConstraintStatusKey: k, ConstraintStatus: v}
 		i++
 	}
@@ -516,20 +562,22 @@ func TestConstraintReport(t *testing.T) {
 	require.ElementsMatch(t, TableData(ctx, "system.reports_meta", con), [][]string{})
 
 	// Add several replication constraint statuses.
-	r := makeReplicationConstraintStatusReportSaver()
-	r.EnsureEntry(MakeZoneKey(1, 3), "constraint", "+country=CH")
-	r.AddViolation(MakeZoneKey(2, 3), "constraint", "+country=CH")
-	r.EnsureEntry(MakeZoneKey(2, 3), "constraint", "+country=CH")
-	r.AddViolation(MakeZoneKey(5, 6), "constraint", "+ssd")
-	r.AddViolation(MakeZoneKey(5, 6), "constraint", "+ssd")
-	r.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
-	r.EnsureEntry(MakeZoneKey(7, 8), "constraint", "+dc=east")
-	r.EnsureEntry(MakeZoneKey(7, 8), "constraint", "+dc=east")
-	r.AddViolation(MakeZoneKey(8, 9), "constraint", "+dc=west")
-	r.EnsureEntry(MakeZoneKey(8, 9), "constraint", "+dc=east")
+	report := make(ConstraintReport)
+	report.ensureEntry(MakeZoneKey(1, 3), "constraint", "+country=CH")
+	report.AddViolation(MakeZoneKey(2, 3), "constraint", "+country=CH")
+	report.ensureEntry(MakeZoneKey(2, 3), "constraint", "+country=CH")
+	report.AddViolation(MakeZoneKey(5, 6), "constraint", "+ssd")
+	report.AddViolation(MakeZoneKey(5, 6), "constraint", "+ssd")
+	report.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
+	report.ensureEntry(MakeZoneKey(7, 8), "constraint", "+dc=east")
+	report.ensureEntry(MakeZoneKey(7, 8), "constraint", "+dc=east")
+	report.AddViolation(MakeZoneKey(8, 9), "constraint", "+dc=west")
+	report.ensureEntry(MakeZoneKey(8, 9), "constraint", "+dc=east")
 
 	time1 := time.Date(2001, 1, 1, 10, 0, 0, 0, time.UTC)
-	require.NoError(t, r.Save(ctx, time1, db, con))
+	r := makeReplicationConstraintStatusReportSaver()
+	require.NoError(t, r.Save(ctx, report, time1, db, con))
+	report = make(ConstraintReport)
 
 	require.ElementsMatch(t, TableData(ctx, "system.replication_constraint_stats", con), [][]string{
 		{"1", "3", "'constraint'", "'+country=CH'", "1", "NULL", "0"},
@@ -546,17 +594,18 @@ func TestConstraintReport(t *testing.T) {
 	require.Equal(t, 7, r.LastUpdatedRowCount())
 
 	// Add new set of replication constraint statuses to the existing report and verify the old ones are deleted.
-	r.AddViolation(MakeZoneKey(1, 3), "constraint", "+country=CH")
-	r.EnsureEntry(MakeZoneKey(5, 6), "constraint", "+ssd")
-	r.AddViolation(MakeZoneKey(6, 8), "constraint", "+dc=east")
-	r.EnsureEntry(MakeZoneKey(6, 8), "constraint", "+dc=west")
-	r.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
-	r.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
-	r.AddViolation(MakeZoneKey(8, 9), "constraint", "+dc=west")
-	r.EnsureEntry(MakeZoneKey(8, 9), "constraint", "+dc=east")
+	report.AddViolation(MakeZoneKey(1, 3), "constraint", "+country=CH")
+	report.ensureEntry(MakeZoneKey(5, 6), "constraint", "+ssd")
+	report.AddViolation(MakeZoneKey(6, 8), "constraint", "+dc=east")
+	report.ensureEntry(MakeZoneKey(6, 8), "constraint", "+dc=west")
+	report.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
+	report.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
+	report.AddViolation(MakeZoneKey(8, 9), "constraint", "+dc=west")
+	report.ensureEntry(MakeZoneKey(8, 9), "constraint", "+dc=east")
 
 	time2 := time.Date(2001, 1, 1, 11, 0, 0, 0, time.UTC)
-	require.NoError(t, r.Save(ctx, time2, db, con))
+	require.NoError(t, r.Save(ctx, report, time2, db, con))
+	report = make(ConstraintReport)
 
 	require.ElementsMatch(t, TableData(ctx, "system.replication_constraint_stats", con), [][]string{
 		// Wasn't violated before - is violated now.
@@ -598,17 +647,18 @@ func TestConstraintReport(t *testing.T) {
 	require.Equal(t, 1, rows)
 
 	// Add new set of replication constraint statuses to the existing report and verify the everything is good.
-	r.AddViolation(MakeZoneKey(1, 3), "constraint", "+country=CH")
-	r.EnsureEntry(MakeZoneKey(5, 6), "constraint", "+ssd")
-	r.AddViolation(MakeZoneKey(6, 8), "constraint", "+dc=east")
-	r.EnsureEntry(MakeZoneKey(6, 8), "constraint", "+dc=west")
-	r.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
-	r.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
-	r.AddViolation(MakeZoneKey(8, 9), "constraint", "+dc=west")
-	r.EnsureEntry(MakeZoneKey(8, 9), "constraint", "+dc=east")
+	report.AddViolation(MakeZoneKey(1, 3), "constraint", "+country=CH")
+	report.ensureEntry(MakeZoneKey(5, 6), "constraint", "+ssd")
+	report.AddViolation(MakeZoneKey(6, 8), "constraint", "+dc=east")
+	report.ensureEntry(MakeZoneKey(6, 8), "constraint", "+dc=west")
+	report.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
+	report.AddViolation(MakeZoneKey(7, 8), "constraint", "+dc=west")
+	report.AddViolation(MakeZoneKey(8, 9), "constraint", "+dc=west")
+	report.ensureEntry(MakeZoneKey(8, 9), "constraint", "+dc=east")
 
 	time4 := time.Date(2001, 1, 1, 12, 0, 0, 0, time.UTC)
-	require.NoError(t, r.Save(ctx, time4, db, con))
+	require.NoError(t, r.Save(ctx, report, time4, db, con))
+	report = make(ConstraintReport)
 
 	require.ElementsMatch(t, TableData(ctx, "system.replication_constraint_stats", con), [][]string{
 		{"1", "3", "'constraint'", "'+country=CH'", "1", "'2001-01-01 12:00:00+00:00'", "1"},
@@ -627,10 +677,10 @@ func TestConstraintReport(t *testing.T) {
 	// A brand new report (after restart for example) - still works.
 	// Add several replication constraint statuses.
 	r = makeReplicationConstraintStatusReportSaver()
-	r.AddViolation(MakeZoneKey(1, 3), "constraint", "+country=CH")
+	report.AddViolation(MakeZoneKey(1, 3), "constraint", "+country=CH")
 
 	time5 := time.Date(2001, 1, 1, 12, 30, 0, 0, time.UTC)
-	require.NoError(t, r.Save(ctx, time5, db, con))
+	require.NoError(t, r.Save(ctx, report, time5, db, con))
 
 	require.ElementsMatch(t, TableData(ctx, "system.replication_constraint_stats", con), [][]string{
 		{"1", "3", "'constraint'", "'+country=CH'", "1", "'2001-01-01 12:00:00+00:00'", "1"},
@@ -807,8 +857,8 @@ func generateTableZone(t table, tableDesc sqlbase.TableDescriptor) (*zonepb.Zone
 	if tableZone != nil {
 		var err error
 		tableZone.SubzoneSpans, err = sql.GenerateSubzoneSpans(
-			nil, uuid.UUID{} /* clusterID */, &tableDesc, tableZone.Subzones,
-			false /* hasNewSubzones */)
+			nil, uuid.UUID{} /* clusterID */, keys.SystemSQLCodec,
+			&tableDesc, tableZone.Subzones, false /* hasNewSubzones */)
 		if err != nil {
 			return nil, errors.Wrap(err, "error generating subzone spans")
 		}
@@ -882,7 +932,7 @@ func makeTableDesc(t table, tableID int, dbID int) (sqlbase.TableDescriptor, err
 		desc.Columns = append(desc.Columns, sqlbase.ColumnDescriptor{
 			Name: fmt.Sprintf("col%d", i),
 			ID:   sqlbase.ColumnID(i),
-			Type: *types.Int,
+			Type: types.Int,
 		})
 	}
 
@@ -1023,7 +1073,7 @@ func (b *systemConfigBuilder) addTableDesc(id int, tableDesc sqlbase.TableDescri
 		panic(fmt.Sprintf("parent not set for table %q", tableDesc.Name))
 	}
 	// Write the table to the SystemConfig, in the descriptors table.
-	k := sqlbase.MakeDescMetadataKey(sqlbase.ID(id))
+	k := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(id))
 	desc := &sqlbase.Descriptor{
 		Union: &sqlbase.Descriptor_Table{
 			Table: &tableDesc,
@@ -1042,7 +1092,7 @@ func (b *systemConfigBuilder) addTableDesc(id int, tableDesc sqlbase.TableDescri
 // addTableDesc adds a database descriptor to the SystemConfig.
 func (b *systemConfigBuilder) addDBDesc(id int, dbDesc sqlbase.DatabaseDescriptor) {
 	// Write the table to the SystemConfig, in the descriptors table.
-	k := sqlbase.MakeDescMetadataKey(sqlbase.ID(id))
+	k := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, sqlbase.ID(id))
 	desc := &sqlbase.Descriptor{
 		Union: &sqlbase.Descriptor_Database{
 			Database: &dbDesc,

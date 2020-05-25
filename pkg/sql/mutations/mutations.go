@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math/rand"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -202,11 +203,12 @@ func statisticsMutator(
 			}
 			n := rng.Intn(10)
 			seen := map[string]bool{}
+			colType := tree.MustBeStaticallyKnownType(col.Type)
 			h := stats.HistogramData{
-				ColumnType: *col.Type,
+				ColumnType: colType,
 			}
 			for i := 0; i < n; i++ {
-				upper := sqlbase.RandDatumWithNullChance(rng, col.Type, 0)
+				upper := sqlbase.RandDatumWithNullChance(rng, colType, 0)
 				if upper == tree.DNull {
 					continue
 				}
@@ -416,7 +418,9 @@ func foreignKeyMutator(
 				fkCol := fkCols[len(usingCols)]
 				found := false
 				for refI, refCol := range availCols {
-					if fkCol.Type.Equivalent(refCol.Type) {
+					fkColType := tree.MustBeStaticallyKnownType(fkCol.Type)
+					refColType := tree.MustBeStaticallyKnownType(refCol.Type)
+					if fkColType.Equivalent(refColType) {
 						usingCols = append(usingCols, refCol)
 						availCols = append(availCols[:refI], availCols[refI+1:]...)
 						found = true
@@ -507,6 +511,8 @@ Loop:
 	}
 }
 
+var postgresMutatorAtIndex = regexp.MustCompile(`@[\[\]\w]+`)
+
 func postgresMutator(rng *rand.Rand, q string) string {
 	q, _ = ApplyString(rng, q, postgresStatementMutator)
 
@@ -521,6 +527,7 @@ func postgresMutator(rng *rand.Rand, q string) string {
 	} {
 		q = strings.Replace(q, from, to, -1)
 	}
+	q = postgresMutatorAtIndex.ReplaceAllString(q, "")
 	return q
 }
 

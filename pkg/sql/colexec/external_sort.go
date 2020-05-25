@@ -15,11 +15,14 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
 )
@@ -109,11 +112,17 @@ const externalSorterMinPartitions = 3
 type externalSorter struct {
 	OneInputNode
 	NonExplainable
+	closerHelper
 
-	closed             bool
-	unlimitedAllocator *Allocator
+	// mu is used to protect against concurrent IdempotentClose and Next calls,
+	// which are currently allowed.
+	// TODO(asubiotto): Explore calling IdempotentClose from the same goroutine as
+	//  Next, which will simplify this model.
+	mu syncutil.Mutex
+
+	unlimitedAllocator *colmem.Allocator
 	state              externalSorterState
-	inputTypes         []coltypes.T
+	inputTypes         []*types.T
 	ordering           execinfrapb.Ordering
 	inMemSorter        resettableOperator
 	inMemSorterInput   *inputPartitioningOperator
@@ -131,7 +140,7 @@ type externalSorter struct {
 		acquiredFDs int
 	}
 
-	emitter Operator
+	emitter colexecbase.Operator
 
 	testingKnobs struct {
 		// delegateFDAcquisitions if true, means that a test wants to force the
@@ -164,10 +173,10 @@ var _ closableOperator = &externalSorter{}
 // them up front in Next. This should only be true in tests.
 func newExternalSorter(
 	ctx context.Context,
-	unlimitedAllocator *Allocator,
+	unlimitedAllocator *colmem.Allocator,
 	standaloneMemAccount *mon.BoundAccount,
-	input Operator,
-	inputTypes []coltypes.T,
+	input colexecbase.Operator,
+	inputTypes []*types.T,
 	ordering execinfrapb.Ordering,
 	memoryLimit int64,
 	maxNumberPartitions int,
@@ -175,9 +184,9 @@ func newExternalSorter(
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
 	diskAcc *mon.BoundAccount,
-) Operator {
+) colexecbase.Operator {
 	if diskQueueCfg.CacheMode != colcontainer.DiskQueueCacheModeReuseCache {
-		execerror.VectorizedInternalPanic(errors.Errorf("external sorter instantiated with suboptimal disk queue cache mode: %d", diskQueueCfg.CacheMode))
+		colexecerror.InternalError(errors.Errorf("external sorter instantiated with suboptimal disk queue cache mode: %d", diskQueueCfg.CacheMode))
 	}
 	if diskQueueCfg.BufferSizeBytes > 0 && maxNumberPartitions == 0 {
 		// With the default limit of 256 file descriptors, this results in 16
@@ -193,7 +202,7 @@ func newExternalSorter(
 	// memoryLimit of the partitions to sort in memory by those cache sizes. To be
 	// safe, we also estimate the size of the output batch and subtract that as
 	// well.
-	batchMemSize := estimateBatchSizeBytes(inputTypes, coldata.BatchSize())
+	batchMemSize := colmem.EstimateBatchSizeBytes(inputTypes, coldata.BatchSize())
 	// Reserve a certain amount of memory for the partition caches.
 	memoryLimit -= int64((maxNumberPartitions * diskQueueCfg.BufferSizeBytes) + batchMemSize)
 	if memoryLimit < 1 {
@@ -201,13 +210,13 @@ func newExternalSorter(
 		// zero-length batch, so make it at least 1.
 		memoryLimit = 1
 	}
-	inputPartitioner := newInputPartitioningOperator(ctx, input, standaloneMemAccount, memoryLimit)
+	inputPartitioner := newInputPartitioningOperator(input, standaloneMemAccount, memoryLimit)
 	inMemSorter, err := newSorter(
 		unlimitedAllocator, newAllSpooler(unlimitedAllocator, inputPartitioner, inputTypes),
 		inputTypes, ordering.Columns,
 	)
 	if err != nil {
-		execerror.VectorizedInternalPanic(err)
+		colexecerror.InternalError(err)
 	}
 	partitionedDiskQueueSemaphore := fdSemaphore
 	if !delegateFDAcquisitions {
@@ -239,6 +248,8 @@ func (s *externalSorter) Init() {
 }
 
 func (s *externalSorter) Next(ctx context.Context) coldata.Batch {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for {
 		switch s.state {
 		case externalSorterNewPartition:
@@ -256,7 +267,7 @@ func (s *externalSorter) Next(ctx context.Context) coldata.Batch {
 				s.partitioner = s.partitionerCreator()
 			}
 			if err := s.partitioner.Enqueue(ctx, newPartitionIdx, b); err != nil {
-				execerror.VectorizedInternalPanic(err)
+				colexecerror.InternalError(err)
 			}
 			s.state = externalSorterSpillPartition
 			continue
@@ -284,31 +295,42 @@ func (s *externalSorter) Next(ctx context.Context) coldata.Batch {
 			if !s.testingKnobs.delegateFDAcquisitions && s.fdState.fdSemaphore != nil && s.fdState.acquiredFDs == 0 {
 				toAcquire := s.maxNumberPartitions
 				if err := s.fdState.fdSemaphore.Acquire(ctx, toAcquire); err != nil {
-					execerror.VectorizedInternalPanic(err)
+					colexecerror.InternalError(err)
 				}
 				s.fdState.acquiredFDs = toAcquire
 			}
 			if err := s.partitioner.Enqueue(ctx, curPartitionIdx, b); err != nil {
-				execerror.VectorizedInternalPanic(err)
+				colexecerror.InternalError(err)
 			}
 			continue
 		case externalSorterRepeatedMerging:
 			// We will merge all partitions in range [s.firstPartitionIdx,
-			// s.firstPartitionIdx+s.numPartitions) and will spill all the resulting
-			// batches into a new partition with the next available index.
-			merger := s.createMergerForPartitions(s.firstPartitionIdx, s.numPartitions)
+			// s.firstPartitionIdx+s.numPartitions) and will spill all the
+			// resulting batches into a new partition with the next available
+			// index.
+			//
+			// The merger will be using some amount of RAM, will register it
+			// with the unlimited allocator and will *not* release that memory
+			// from the allocator, so we have to do it ourselves.
+			before := s.unlimitedAllocator.Used()
+			merger, err := s.createMergerForPartitions(s.firstPartitionIdx, s.numPartitions)
+			if err != nil {
+				colexecerror.InternalError(err)
+			}
 			merger.Init()
 			newPartitionIdx := s.firstPartitionIdx + s.numPartitions
 			for b := merger.Next(ctx); b.Length() > 0; b = merger.Next(ctx) {
 				if err := s.partitioner.Enqueue(ctx, newPartitionIdx, b); err != nil {
-					execerror.VectorizedInternalPanic(err)
+					colexecerror.InternalError(err)
 				}
 			}
+			after := s.unlimitedAllocator.Used()
+			s.unlimitedAllocator.ReleaseMemory(after - before)
 			// Reclaim disk space by closing the inactive read partitions. Since the
 			// merger must have exhausted all inputs, this is all the partitions just
 			// read from.
 			if err := s.partitioner.CloseInactiveReadPartitions(ctx); err != nil {
-				execerror.VectorizedInternalPanic(err)
+				colexecerror.InternalError(err)
 			}
 			s.firstPartitionIdx += s.numPartitions
 			s.numPartitions = 1
@@ -323,7 +345,11 @@ func (s *externalSorter) Next(ctx context.Context) coldata.Batch {
 					s.unlimitedAllocator, s.inputTypes, s.partitioner, s.firstPartitionIdx,
 				)
 			} else {
-				s.emitter = s.createMergerForPartitions(s.firstPartitionIdx, s.numPartitions)
+				var err error
+				s.emitter, err = s.createMergerForPartitions(s.firstPartitionIdx, s.numPartitions)
+				if err != nil {
+					colexecerror.InternalError(err)
+				}
 			}
 			s.emitter.Init()
 			s.state = externalSorterEmitting
@@ -336,12 +362,12 @@ func (s *externalSorter) Next(ctx context.Context) coldata.Batch {
 			}
 			return b
 		case externalSorterFinished:
-			if err := s.Close(ctx); err != nil {
-				execerror.VectorizedInternalPanic(err)
+			if err := s.internalCloseLocked(ctx); err != nil {
+				colexecerror.InternalError(err)
 			}
 			return coldata.ZeroBatch
 		default:
-			execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected externalSorterState %d", s.state))
+			colexecerror.InternalError(fmt.Sprintf("unexpected externalSorterState %d", s.state))
 		}
 	}
 }
@@ -351,35 +377,46 @@ func (s *externalSorter) reset(ctx context.Context) {
 		r.reset(ctx)
 	}
 	s.state = externalSorterNewPartition
-	if err := s.Close(ctx); err != nil {
-		execerror.VectorizedInternalPanic(err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.internalCloseLocked(ctx); err != nil {
+		colexecerror.InternalError(err)
 	}
-	s.closed = false
 	s.firstPartitionIdx = 0
 	s.numPartitions = 0
 }
 
-func (s *externalSorter) Close(ctx context.Context) error {
-	if s.closed {
-		return nil
-	}
-	var err error
+func (s *externalSorter) internalCloseLocked(ctx context.Context) error {
+	var lastErr error
 	if s.partitioner != nil {
-		err = s.partitioner.Close(ctx)
+		lastErr = s.partitioner.Close(ctx)
 		s.partitioner = nil
+	}
+	if err := s.inMemSorterInput.Close(ctx); err != nil {
+		lastErr = err
 	}
 	if !s.testingKnobs.delegateFDAcquisitions && s.fdState.fdSemaphore != nil && s.fdState.acquiredFDs > 0 {
 		s.fdState.fdSemaphore.Release(s.fdState.acquiredFDs)
 		s.fdState.acquiredFDs = 0
 	}
-	s.closed = true
-	return err
+	return lastErr
+}
+
+func (s *externalSorter) IdempotentClose(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.close() {
+		return nil
+	}
+	return s.internalCloseLocked(ctx)
 }
 
 // createMergerForPartitions creates an ordered synchronizer that will merge
 // partitions in [firstIdx, firstIdx+numPartitions) range.
-func (s *externalSorter) createMergerForPartitions(firstIdx, numPartitions int) Operator {
-	syncInputs := make([]Operator, numPartitions)
+func (s *externalSorter) createMergerForPartitions(
+	firstIdx, numPartitions int,
+) (colexecbase.Operator, error) {
+	syncInputs := make([]colexecbase.Operator, numPartitions)
 	for i := range syncInputs {
 		syncInputs[i] = newPartitionerToOperator(
 			s.unlimitedAllocator, s.inputTypes, s.partitioner, firstIdx+i,
@@ -394,11 +431,10 @@ func (s *externalSorter) createMergerForPartitions(firstIdx, numPartitions int) 
 }
 
 func newInputPartitioningOperator(
-	ctx context.Context, input Operator, standaloneMemAccount *mon.BoundAccount, memoryLimit int64,
+	input colexecbase.Operator, standaloneMemAccount *mon.BoundAccount, memoryLimit int64,
 ) resettableOperator {
 	return &inputPartitioningOperator{
 		OneInputNode:         NewOneInputNode(input),
-		ctx:                  ctx,
 		standaloneMemAccount: standaloneMemAccount,
 		memoryLimit:          memoryLimit,
 	}
@@ -411,7 +447,6 @@ type inputPartitioningOperator struct {
 	OneInputNode
 	NonExplainable
 
-	ctx                  context.Context
 	standaloneMemAccount *mon.BoundAccount
 	memoryLimit          int64
 	// interceptReset determines whether the reset method will be called on
@@ -456,24 +491,9 @@ func (o *inputPartitioningOperator) Next(ctx context.Context) coldata.Batch {
 	// it's ok if we have some deviation. This numbers matter only to understand
 	// when to start a new partition, and the memory will be actually accounted
 	// for correctly.)
-	length := int64(b.Length())
-	usesSel := b.Selection() != nil
-	b.SetSelection(true)
-	selCapacity := cap(b.Selection())
-	b.SetSelection(usesSel)
-	batchMemSize := int64(0)
-	if selCapacity > 0 {
-		batchMemSize = selVectorSize(selCapacity) * length / int64(selCapacity)
-	}
-	for _, vec := range b.ColVecs() {
-		if vec.Type() == coltypes.Bytes {
-			batchMemSize += int64(vec.Bytes().ProportionalSize(length))
-		} else {
-			batchMemSize += getVecMemoryFootprint(vec) * length / int64(vec.Capacity())
-		}
-	}
-	if err := o.standaloneMemAccount.Grow(o.ctx, batchMemSize); err != nil {
-		execerror.VectorizedInternalPanic(err)
+	batchMemSize := colmem.GetProportionalBatchMemSize(b, int64(b.Length()))
+	if err := o.standaloneMemAccount.Grow(ctx, batchMemSize); err != nil {
+		colexecerror.InternalError(err)
 	}
 	return b
 }
@@ -485,5 +505,10 @@ func (o *inputPartitioningOperator) reset(ctx context.Context) {
 		}
 	}
 	o.interceptReset = false
-	o.standaloneMemAccount.Shrink(o.ctx, o.standaloneMemAccount.Used())
+	o.standaloneMemAccount.Shrink(ctx, o.standaloneMemAccount.Used())
+}
+
+func (o *inputPartitioningOperator) Close(ctx context.Context) error {
+	o.standaloneMemAccount.Clear(ctx)
+	return nil
 }

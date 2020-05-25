@@ -49,7 +49,6 @@ const (
 # To exit, type: \q.
 #
 `
-	// TODO(#42242): document the \demo_node command.
 	helpMessageFmt = `You are using 'cockroach sql', CockroachDB's lightweight SQL client.
 Type:
   \? or "help"      print this help.
@@ -65,9 +64,19 @@ Type:
   \dt               show the tables of the current schema in the current database.
   \du               list the users for all databases.
   \d [TABLE]        show details about columns in the specified table, or alias for '\dt' if no table is specified.
+%s
 More documentation about our SQL dialect and the CLI shell is available online:
 %s
 %s`
+
+	demoCommandsHelp = `
+Commands specific to the demo shell (EXPERIMENTAL):
+  \demo ls                     list the demo nodes and their connection URLs.
+  \demo shutdown <nodeid>      stop a demo node.
+  \demo restart <nodeid>       restart a stopped demo node.
+  \demo decommission <nodeid>  decommission a node.
+  \demo recommission <nodeid>  recommission a node.
+`
 
 	defaultPromptPattern = "%n@%M/%/%x>"
 
@@ -101,9 +110,6 @@ type cliState struct {
 	errExit bool
 	// Determines whether to perform client-side syntax checking.
 	checkSyntax bool
-	// smartPrompt indicates whether to detect the txn status and offer
-	// multi-line statements at the start of fresh transactions.
-	smartPrompt bool
 
 	// The prompt at the beginning of a multi-line entry.
 	fullPrompt string
@@ -207,8 +213,13 @@ const (
 )
 
 // printCliHelp prints a short inline help about the CLI.
-func printCliHelp() {
+func (c *cliState) printCliHelp() {
+	demoHelpStr := ""
+	if demoCtx.transientCluster != nil {
+		demoHelpStr = demoCommandsHelp
+	}
 	fmt.Printf(helpMessageFmt,
+		demoHelpStr,
 		base.DocsURL("sql-statements.html"),
 		base.DocsURL("use-the-built-in-sql-client.html"),
 	)
@@ -269,7 +280,8 @@ var options = map[string]struct {
 	set                       func(c *cliState, val string) error
 	reset                     func(c *cliState) error
 	// display is used to retrieve the current value.
-	display func(c *cliState) string
+	display    func(c *cliState) string
+	deprecated bool
 }{
 	`auto_trace`: {
 		description:               "automatically run statement tracing on each executed statement",
@@ -349,12 +361,13 @@ var options = map[string]struct {
 		display:                   func(_ *cliState) string { return strconv.FormatBool(sqlCtx.showTimes) },
 	},
 	`smart_prompt`: {
-		description:               "detect open transactions and propose entering multi-line statements",
+		description:               "deprecated",
 		isBoolean:                 true,
 		validDuringMultilineEntry: false,
-		set:                       func(c *cliState, _ string) error { c.smartPrompt = true; return nil },
-		reset:                     func(c *cliState) error { c.smartPrompt = false; return nil },
-		display:                   func(c *cliState) string { return strconv.FormatBool(c.smartPrompt) },
+		set:                       func(c *cliState, _ string) error { return nil },
+		reset:                     func(c *cliState) error { return nil },
+		display:                   func(c *cliState) string { return "false" },
+		deprecated:                true,
 	},
 	`prompt1`: {
 		description:               "prompt string to use before each command (the following are expanded: %M full host, %m host, %> port number, %n user, %/ database, %x txn status)",
@@ -388,6 +401,9 @@ func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cl
 	if len(args) == 0 {
 		optData := make([][]string, 0, len(options))
 		for _, n := range optionNames {
+			if options[n].deprecated {
+				continue
+			}
 			optData = append(optData, []string{n, options[n].display(c), options[n].description})
 		}
 		err := printQueryOutput(os.Stdout,
@@ -470,19 +486,23 @@ func isEndOfStatement(lastTok int) bool {
 	return lastTok == ';' || lastTok == parser.HELPTOKEN
 }
 
-// handleDemoNode handles operations on \demo_node.
+// handleDemo handles operations on \demo.
 // This can only be done from `cockroach demo`.
-func (c *cliState) handleDemoNode(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
-	usageStr := `Usage: \demo_node <shutdown|restart|recommission|decommission> <node_id>` + "\n"
+func (c *cliState) handleDemo(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
 	// A transient cluster signifies the presence of `cockroach demo`.
 	if demoCtx.transientCluster == nil {
-		return c.invalidSyntax(errState, `\demo_node can only be run with cockroach demo`)
+		return c.invalidSyntax(errState, `\demo can only be run with cockroach demo`)
 	}
+
+	if len(cmd) == 1 && cmd[0] == "ls" {
+		demoCtx.transientCluster.listDemoNodes(os.Stdout, false /* justOne */)
+		return nextState
+	}
+
 	if len(cmd) != 2 {
-		fmt.Fprint(stderr, usageStr)
-		c.exitErr = errInvalidSyntax
-		return errState
+		return c.invalidSyntax(errState, `\demo expects 2 parameters`)
 	}
+
 	nodeID, err := strconv.ParseInt(cmd[1], 10, 32)
 	if err != nil {
 		return c.invalidSyntax(
@@ -491,6 +511,7 @@ func (c *cliState) handleDemoNode(cmd []string, nextState, errState cliStateEnum
 			errors.Wrapf(err, "cannot convert %s to string", cmd[2]).Error(),
 		)
 	}
+
 	switch cmd[0] {
 	case "shutdown":
 		if err := demoCtx.transientCluster.DrainNode(roachpb.NodeID(nodeID)); err != nil {
@@ -517,9 +538,7 @@ func (c *cliState) handleDemoNode(cmd []string, nextState, errState cliStateEnum
 		fmt.Printf("node %d has been decommissioned\n", nodeID)
 		return nextState
 	}
-	fmt.Fprint(stderr, usageStr)
-	c.exitErr = errInvalidSyntax
-	return errState
+	return c.invalidSyntax(errState, `command not recognized: %s`, cmd[0])
 }
 
 // handleHelp prints SQL help.
@@ -551,7 +570,7 @@ func (c *cliState) handleFunctionHelp(cmd []string, nextState, errState cliState
 		}
 		fmt.Println()
 	} else {
-		_, helpText, _ := c.serverSideParse(fmt.Sprintf("select %s(??", funcName))
+		helpText, _ := c.serverSideParse(fmt.Sprintf("select %s(??", funcName))
 		if helpText != "" {
 			fmt.Println(helpText)
 		} else {
@@ -665,12 +684,8 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 	c.lastKnownTxnStatus = unknownTxnStatus
 
 	wantDbStateInPrompt := rePromptDbState.MatchString(c.customPromptPattern)
-	if wantDbStateInPrompt || c.smartPrompt {
-		// Even if the prompt does not need it, the transaction status is needed
-		// for the multi-line smart prompt.
-		c.refreshTransactionStatus()
-	}
 	if wantDbStateInPrompt {
+		c.refreshTransactionStatus()
 		// refreshDatabaseName() must be called *after* refreshTransactionStatus(),
 		// even when %/ appears before %x in the prompt format.
 		// This is because the database name should not be queried during
@@ -783,22 +798,6 @@ func (c *cliState) refreshDatabaseName() string {
 	return dbName
 }
 
-// endsWithIncompleteTxn returns true if and only if its
-// argument ends with an incomplete transaction prefix (BEGIN without
-// ROLLBACK/COMMIT).
-func endsWithIncompleteTxn(stmts []string) bool {
-	txnStarted := false
-	for _, stmt := range stmts {
-		if strings.HasPrefix(stmt, "BEGIN TRANSACTION") {
-			txnStarted = true
-		} else if strings.HasPrefix(stmt, "COMMIT TRANSACTION") ||
-			strings.HasPrefix(stmt, "ROLLBACK TRANSACTION") {
-			txnStarted = false
-		}
-	}
-	return txnStarted
-}
-
 var cmdHistFile = envutil.EnvOrDefaultString("COCKROACH_SQL_CLI_HISTORY", ".cockroachsql_history")
 
 // GetCompletions implements the readline.CompletionGenerator interface.
@@ -809,7 +808,7 @@ func (c *cliState) GetCompletions(_ string) []string {
 		fmt.Fprintf(c.ins.Stdout(),
 			"\ntab completion not supported; append '??' and press tab for contextual help\n\n")
 	} else {
-		_, helpText, err := c.serverSideParse(sql)
+		helpText, err := c.serverSideParse(sql)
 		if helpText != "" {
 			// We have a completion suggestion. Use that.
 			fmt.Fprintf(c.ins.Stdout(), "\nSuggestion:\n%s\n", helpText)
@@ -897,8 +896,8 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 		}
 	}
 
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		// Do we have multiple lines of input?
 		lines := strings.Split(l, "\n")
 		if len(lines) > 1 {
@@ -909,7 +908,7 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 		}
 		// In any case, process one line.
 
-	case readline.ErrInterrupted:
+	case errors.Is(err, readline.ErrInterrupted):
 		if !cliCtx.isInteractive {
 			// Ctrl+C terminates non-interactive shells in all cases.
 			c.exitErr = err
@@ -932,7 +931,7 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 		c.exitErr = err
 		return cliStop
 
-	case io.EOF:
+	case errors.Is(err, io.EOF):
 		c.atEOF = true
 
 		if cliCtx.isInteractive {
@@ -969,7 +968,7 @@ func (c *cliState) doProcessFirstLine(startState, nextState cliStateEnum) cliSta
 		return startState
 
 	case "help":
-		printCliHelp()
+		c.printCliHelp()
 		return startState
 
 	case "exit", "quit":
@@ -1005,7 +1004,7 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		return cliStop
 
 	case `\`, `\?`, `\help`:
-		printCliHelp()
+		c.printCliHelp()
 
 	case `\set`:
 		return c.handleSet(cmd[1:], loopState, errState)
@@ -1056,8 +1055,8 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		}
 		return c.invalidSyntax(errState, `%s. Try \? for help.`, c.lastInputLine)
 
-	case `\demo_node`:
-		return c.handleDemoNode(cmd[1:], loopState, errState)
+	case `\demo`:
+		return c.handleDemo(cmd[1:], loopState, errState)
 
 	default:
 		if strings.HasPrefix(cmd[0], `\d`) {
@@ -1128,7 +1127,7 @@ func (c *cliState) doPrepareStatementLine(
 
 func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnum) cliStateEnum {
 	// From here on, client-side syntax checking is enabled.
-	parsedStmts, helpText, err := c.serverSideParse(c.concatLines)
+	helpText, err := c.serverSideParse(c.concatLines)
 	if err != nil {
 		if helpText != "" {
 			// There was a help text included. Use it.
@@ -1157,20 +1156,6 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 	}
 
 	nextState := execState
-
-	// When the smart prompt is enabled, we make some additional effort
-	// to help the user: if the entry so far is starting an incomplete
-	// transaction, push the user to enter input over multiple lines.
-	if c.smartPrompt &&
-		c.lastKnownTxnStatus == "" && endsWithIncompleteTxn(parsedStmts) && c.lastInputLine != "" {
-		if c.partialStmtsLen == 0 {
-			fmt.Fprintln(stderr, "Now adding input for a multi-line SQL transaction client-side (smart_prompt enabled).\n"+
-				"Press Enter two times to send the SQL text collected so far to the server, or Ctrl+C to cancel.\n"+
-				"You can also use \\show to display the statements entered so far.")
-		}
-
-		nextState = contState
-	}
 
 	c.partialStmtsLen = len(c.partialLines)
 
@@ -1336,11 +1321,6 @@ func (c *cliState) configurePreShellDefaults() (cleanupFn func(), err error) {
 		// times by default.
 		sqlCtx.showTimes = true
 	}
-	if cliCtx.isInteractive && !sqlCtx.debugMode {
-		// If the terminal is interactive and this was not explicitly
-		// disabled by setting the debug mode, enable the smart prompt.
-		c.smartPrompt = true
-	}
 
 	if cliCtx.isInteractive {
 		// If a human user is providing the input, we want to help them with
@@ -1369,7 +1349,7 @@ func (c *cliState) configurePreShellDefaults() (cleanupFn func(), err error) {
 		c.ins, c.exitErr = readline.InitFiles("cockroach",
 			true, /* wideChars */
 			stdin, os.Stdout, stderr)
-		if c.exitErr == readline.ErrWidecharNotSupported {
+		if errors.Is(c.exitErr, readline.ErrWidecharNotSupported) {
 			log.Warning(context.TODO(), "wide character support disabled")
 			c.ins, c.exitErr = readline.InitFiles("cockroach",
 				false, stdin, os.Stdout, stderr)
@@ -1554,17 +1534,17 @@ func (c *cliState) tryEnableCheckSyntax() {
 // If the syntax is correct, the function returns the statement
 // decomposition in the first return value. If it is not, the function
 // extracts a help string if available.
-func (c *cliState) serverSideParse(sql string) (stmts []string, helpText string, err error) {
+func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 	cols, rows, err := runQuery(c.conn, makeQuery("SHOW SYNTAX "+lex.EscapeSQLString(sql)), true)
 	if err != nil {
 		// The query failed with some error. This is not a syntax error
 		// detected by SHOW SYNTAX (those show up as valid rows) but
 		// instead something else.
-		return nil, "", errors.Wrap(err, "unexpected error")
+		return "", errors.Wrap(err, "unexpected error")
 	}
 
 	if len(cols) < 2 {
-		return nil, "", errors.Newf(
+		return "", errors.Newf(
 			"invalid results for SHOW SYNTAX: %q %q", cols, rows)
 	}
 
@@ -1598,17 +1578,7 @@ func (c *cliState) serverSideParse(sql string) (stmts []string, helpText string,
 		if detail != "" {
 			err = errors.WithDetail(err, detail)
 		}
-		return nil, helpText, err
+		return helpText, err
 	}
-
-	// Otherwise, hopefully we got some SQL statements.
-	stmts = make([]string, len(rows))
-	for i := range rows {
-		if rows[i][0] != "sql" {
-			return nil, "", errors.Newf(
-				"invalid results for SHOW SYNTAX: %q %q", cols, rows)
-		}
-		stmts[i] = rows[i][1]
-	}
-	return stmts, "", nil
+	return "", nil
 }

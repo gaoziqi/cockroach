@@ -25,13 +25,17 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
+
+// Remove unused warning.
+var _ = execgen.UNSAFEGET
 
 // {{/*
 
@@ -46,45 +50,53 @@ var _ time.Time
 // Dummy import to pull in "duration" package.
 var _ duration.Duration
 
-// _TYPES_T is the template type variable for coltypes.T. It will be replaced by
-// coltypes.Foo for each type Foo in the coltypes.T type.
-const _TYPES_T = coltypes.Unhandled
-
-// _GOTYPE is the template Go type variable for this operator. It will be
-// replaced by the Go type equivalent for each type in coltypes.T, for example
-// int64 for coltypes.Int64.
+// _GOTYPE is the template variable.
 type _GOTYPE interface{}
+
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
 
 // */}}
 
 // NewConstOp creates a new operator that produces a constant value constVal of
 // type t at index outputIdx.
 func NewConstOp(
-	allocator *Allocator, input Operator, t coltypes.T, constVal interface{}, outputIdx int,
-) (Operator, error) {
-	switch t {
+	allocator *colmem.Allocator,
+	input colexecbase.Operator,
+	t *types.T,
+	constVal interface{},
+	outputIdx int,
+) (colexecbase.Operator, error) {
+	input = newVectorTypeEnforcer(allocator, input, t, outputIdx)
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
-	case _TYPES_T:
-		return &const_TYPEOp{
-			OneInputNode: NewOneInputNode(input),
-			allocator:    allocator,
-			outputIdx:    outputIdx,
-			typ:          t,
-			constVal:     constVal.(_GOTYPE),
-		}, nil
-	// {{end}}
-	default:
-		return nil, errors.Errorf("unsupported const type %s", t)
+	case _CANONICAL_TYPE_FAMILY:
+		switch t.Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			return &const_TYPEOp{
+				OneInputNode: NewOneInputNode(input),
+				allocator:    allocator,
+				outputIdx:    outputIdx,
+				constVal:     constVal.(_GOTYPE),
+			}, nil
+			// {{end}}
+		}
+		// {{end}}
 	}
+	return nil, errors.Errorf("unsupported const type %s", t.Name())
 }
 
 // {{range .}}
+// {{range .WidthOverloads}}
 
 type const_TYPEOp struct {
 	OneInputNode
 
-	allocator *Allocator
-	typ       coltypes.T
+	allocator *colmem.Allocator
 	outputIdx int
 	constVal  _GOTYPE
 }
@@ -99,9 +111,13 @@ func (c const_TYPEOp) Next(ctx context.Context) coldata.Batch {
 	if n == 0 {
 		return coldata.ZeroBatch
 	}
-	c.allocator.MaybeAddColumn(batch, c.typ, c.outputIdx)
 	vec := batch.ColVec(c.outputIdx)
-	col := vec._TemplateType()
+	col := vec.TemplateType()
+	if vec.MaybeHasNulls() {
+		// We need to make sure that there are no left over null values in the
+		// output vector.
+		vec.Nulls().UnsetNulls()
+	}
 	c.allocator.PerformOperation(
 		[]coldata.Vec{vec},
 		func() {
@@ -121,26 +137,26 @@ func (c const_TYPEOp) Next(ctx context.Context) coldata.Batch {
 }
 
 // {{end}}
+// {{end}}
 
 // NewConstNullOp creates a new operator that produces a constant (untyped) NULL
 // value at index outputIdx.
-func NewConstNullOp(allocator *Allocator, input Operator, outputIdx int, typ coltypes.T) Operator {
+func NewConstNullOp(
+	allocator *colmem.Allocator, input colexecbase.Operator, outputIdx int,
+) colexecbase.Operator {
+	input = newVectorTypeEnforcer(allocator, input, types.Unknown, outputIdx)
 	return &constNullOp{
 		OneInputNode: NewOneInputNode(input),
-		allocator:    allocator,
 		outputIdx:    outputIdx,
-		typ:          typ,
 	}
 }
 
 type constNullOp struct {
 	OneInputNode
-	allocator *Allocator
 	outputIdx int
-	typ       coltypes.T
 }
 
-var _ Operator = &constNullOp{}
+var _ colexecbase.Operator = &constNullOp{}
 
 func (c constNullOp) Init() {
 	c.input.Init()
@@ -152,16 +168,7 @@ func (c constNullOp) Next(ctx context.Context) coldata.Batch {
 	if n == 0 {
 		return coldata.ZeroBatch
 	}
-	c.allocator.MaybeAddColumn(batch, c.typ, c.outputIdx)
 
-	col := batch.ColVec(c.outputIdx)
-	nulls := col.Nulls()
-	if sel := batch.Selection(); sel != nil {
-		for _, i := range sel[:n] {
-			nulls.SetNull(i)
-		}
-	} else {
-		nulls.SetNulls()
-	}
+	batch.ColVec(c.outputIdx).Nulls().SetNulls()
 	return batch
 }

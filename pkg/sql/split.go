@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type splitNode struct {
@@ -49,12 +49,12 @@ func (n *splitNode) Next(params runParams) (bool, error) {
 		return ok, err
 	}
 
-	rowKey, err := getRowKey(n.tableDesc, n.index, n.rows.Values())
+	rowKey, err := getRowKey(params.ExecCfg().Codec, n.tableDesc, n.index, n.rows.Values())
 	if err != nil {
 		return false, err
 	}
 
-	if err := params.extendedEvalCtx.ExecCfg.DB.AdminSplit(params.ctx, rowKey, rowKey, n.expirationTime); err != nil {
+	if err := params.ExecCfg().DB.AdminSplit(params.ctx, rowKey, rowKey, n.expirationTime); err != nil {
 		return false, err
 	}
 
@@ -83,13 +83,16 @@ func (n *splitNode) Close(ctx context.Context) {
 // getRowKey generates a key that corresponds to a row (or prefix of a row) in a table or index.
 // Both tableDesc and index are required (index can be the primary index).
 func getRowKey(
-	tableDesc *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor, values []tree.Datum,
+	codec keys.SQLCodec,
+	tableDesc *sqlbase.TableDescriptor,
+	index *sqlbase.IndexDescriptor,
+	values []tree.Datum,
 ) ([]byte, error) {
 	colMap := make(map[sqlbase.ColumnID]int)
 	for i := range values {
 		colMap[index.ColumnIDs[i]] = i
 	}
-	prefix := sqlbase.MakeIndexKeyPrefix(tableDesc, index.ID)
+	prefix := sqlbase.MakeIndexKeyPrefix(codec, tableDesc, index.ID)
 	key, _, err := sqlbase.EncodePartialIndexKey(
 		tableDesc, index, len(values), colMap, values, prefix,
 	)

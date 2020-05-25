@@ -12,7 +12,6 @@ package ptverifier_test
 
 import (
 	"context"
-	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -68,7 +68,7 @@ func TestVerifier(t *testing.T) {
 	db := kv.NewDB(s.DB().AmbientContext, tsf, s.Clock())
 	ptv := ptverifier.New(db, pts)
 	makeTableSpan := func(tableID uint32) roachpb.Span {
-		k := roachpb.Key(keys.MakeTablePrefix(tableID))
+		k := keys.SystemSQLCodec.TablePrefix(tableID)
 		return roachpb.Span{Key: k, EndKey: k.PrefixEnd()}
 	}
 

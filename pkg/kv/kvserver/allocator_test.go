@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -41,9 +41,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 	"github.com/olekukonko/tablewriter"
-	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/tracker"
@@ -53,7 +54,7 @@ const firstRangeID = roachpb.RangeID(1)
 
 var simpleZoneConfig = zonepb.ZoneConfig{
 	NumReplicas: proto.Int32(1),
-	Constraints: []zonepb.Constraints{
+	Constraints: []zonepb.ConstraintsConjunction{
 		{
 			Constraints: []zonepb.Constraint{
 				{Value: "a", Type: zonepb.Constraint_REQUIRED},
@@ -65,7 +66,7 @@ var simpleZoneConfig = zonepb.ZoneConfig{
 
 var multiDCConfig = zonepb.ZoneConfig{
 	NumReplicas: proto.Int32(2),
-	Constraints: []zonepb.Constraints{
+	Constraints: []zonepb.ConstraintsConjunction{
 		{Constraints: []zonepb.Constraint{{Value: "ssd", Type: zonepb.Constraint_REQUIRED}}},
 	},
 }
@@ -308,7 +309,7 @@ func createTestAllocator(
 	stopper, g, manual, storePool, _ := createTestStorePool(
 		TestTimeUntilStoreDeadOff, deterministic,
 		func() int { return numNodes },
-		storagepb.NodeLivenessStatus_LIVE)
+		kvserverpb.NodeLivenessStatus_LIVE)
 	a := MakeAllocator(storePool, func(string) (time.Duration, bool) {
 		return 0, true
 	})
@@ -328,10 +329,10 @@ func mockStorePool(
 	storePool.detailsMu.Lock()
 	defer storePool.detailsMu.Unlock()
 
-	liveNodeSet := map[roachpb.NodeID]storagepb.NodeLivenessStatus{}
+	liveNodeSet := map[roachpb.NodeID]kvserverpb.NodeLivenessStatus{}
 	storePool.detailsMu.storeDetails = map[roachpb.StoreID]*storeDetail{}
 	for _, storeID := range aliveStoreIDs {
-		liveNodeSet[roachpb.NodeID(storeID)] = storagepb.NodeLivenessStatus_LIVE
+		liveNodeSet[roachpb.NodeID(storeID)] = kvserverpb.NodeLivenessStatus_LIVE
 		detail := storePool.getStoreDetailLocked(storeID)
 		detail.desc = &roachpb.StoreDescriptor{
 			StoreID: storeID,
@@ -339,7 +340,7 @@ func mockStorePool(
 		}
 	}
 	for _, storeID := range unavailableStoreIDs {
-		liveNodeSet[roachpb.NodeID(storeID)] = storagepb.NodeLivenessStatus_UNAVAILABLE
+		liveNodeSet[roachpb.NodeID(storeID)] = kvserverpb.NodeLivenessStatus_UNAVAILABLE
 		detail := storePool.getStoreDetailLocked(storeID)
 		detail.desc = &roachpb.StoreDescriptor{
 			StoreID: storeID,
@@ -347,7 +348,7 @@ func mockStorePool(
 		}
 	}
 	for _, storeID := range deadStoreIDs {
-		liveNodeSet[roachpb.NodeID(storeID)] = storagepb.NodeLivenessStatus_DEAD
+		liveNodeSet[roachpb.NodeID(storeID)] = kvserverpb.NodeLivenessStatus_DEAD
 		detail := storePool.getStoreDetailLocked(storeID)
 		detail.desc = &roachpb.StoreDescriptor{
 			StoreID: storeID,
@@ -355,7 +356,7 @@ func mockStorePool(
 		}
 	}
 	for _, storeID := range decommissioningStoreIDs {
-		liveNodeSet[roachpb.NodeID(storeID)] = storagepb.NodeLivenessStatus_DECOMMISSIONING
+		liveNodeSet[roachpb.NodeID(storeID)] = kvserverpb.NodeLivenessStatus_DECOMMISSIONING
 		detail := storePool.getStoreDetailLocked(storeID)
 		detail.desc = &roachpb.StoreDescriptor{
 			StoreID: storeID,
@@ -363,7 +364,7 @@ func mockStorePool(
 		}
 	}
 	for _, storeID := range decommissionedStoreIDs {
-		liveNodeSet[roachpb.NodeID(storeID)] = storagepb.NodeLivenessStatus_DECOMMISSIONED
+		liveNodeSet[roachpb.NodeID(storeID)] = kvserverpb.NodeLivenessStatus_DECOMMISSIONED
 		detail := storePool.getStoreDetailLocked(storeID)
 		detail.desc = &roachpb.StoreDescriptor{
 			StoreID: storeID,
@@ -373,11 +374,11 @@ func mockStorePool(
 
 	// Set the node liveness function using the set we constructed.
 	storePool.nodeLivenessFn =
-		func(nodeID roachpb.NodeID, now time.Time, threshold time.Duration) storagepb.NodeLivenessStatus {
+		func(nodeID roachpb.NodeID, now time.Time, threshold time.Duration) kvserverpb.NodeLivenessStatus {
 			if status, ok := liveNodeSet[nodeID]; ok {
 				return status
 			}
-			return storagepb.NodeLivenessStatus_UNAVAILABLE
+			return kvserverpb.NodeLivenessStatus_UNAVAILABLE
 		}
 }
 
@@ -484,7 +485,7 @@ func TestAllocatorExistingReplica(t *testing.T) {
 		context.Background(),
 		&zonepb.ZoneConfig{
 			NumReplicas: proto.Int32(0),
-			Constraints: []zonepb.Constraints{
+			Constraints: []zonepb.ConstraintsConjunction{
 				{
 					Constraints: []zonepb.Constraint{
 						{Value: "a", Type: zonepb.Constraint_REQUIRED},
@@ -1244,7 +1245,7 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 	stopper, g, _, storePool, nl := createTestStorePool(
 		TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
-		storagepb.NodeLivenessStatus_LIVE)
+		kvserverpb.NodeLivenessStatus_LIVE)
 	a := MakeAllocator(storePool, func(string) (time.Duration, bool) {
 		return 0, true
 	})
@@ -1264,7 +1265,7 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 	sg.GossipStores(stores, t)
 
 	// UNAVAILABLE is the node liveness status used for a node that's draining.
-	nl.setNodeStatus(1, storagepb.NodeLivenessStatus_UNAVAILABLE)
+	nl.setNodeStatus(1, kvserverpb.NodeLivenessStatus_UNAVAILABLE)
 
 	existing := []roachpb.ReplicaDescriptor{
 		{StoreID: 1},
@@ -1644,7 +1645,7 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 	stopper, g, _, storePool, nl := createTestStorePool(
 		TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
-		storagepb.NodeLivenessStatus_LIVE)
+		kvserverpb.NodeLivenessStatus_LIVE)
 	a := MakeAllocator(storePool, func(string) (time.Duration, bool) {
 		return 0, true
 	})
@@ -1664,7 +1665,7 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 	sg.GossipStores(stores, t)
 
 	// UNAVAILABLE is the node liveness status used for a node that's draining.
-	nl.setNodeStatus(1, storagepb.NodeLivenessStatus_UNAVAILABLE)
+	nl.setNodeStatus(1, kvserverpb.NodeLivenessStatus_UNAVAILABLE)
 
 	testCases := []struct {
 		leaseholder roachpb.StoreID
@@ -2236,7 +2237,7 @@ func TestAllocatorRebalanceTargetLocality(t *testing.T) {
 }
 
 var (
-	threeSpecificLocalities = []zonepb.Constraints{
+	threeSpecificLocalities = []zonepb.ConstraintsConjunction{
 		{
 			Constraints: []zonepb.Constraint{
 				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
@@ -2257,7 +2258,7 @@ var (
 		},
 	}
 
-	twoAndOneLocalities = []zonepb.Constraints{
+	twoAndOneLocalities = []zonepb.ConstraintsConjunction{
 		{
 			Constraints: []zonepb.Constraint{
 				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
@@ -2272,7 +2273,7 @@ var (
 		},
 	}
 
-	threeInOneLocality = []zonepb.Constraints{
+	threeInOneLocality = []zonepb.ConstraintsConjunction{
 		{
 			Constraints: []zonepb.Constraint{
 				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
@@ -2281,7 +2282,7 @@ var (
 		},
 	}
 
-	twoAndOneNodeAttrs = []zonepb.Constraints{
+	twoAndOneNodeAttrs = []zonepb.ConstraintsConjunction{
 		{
 			Constraints: []zonepb.Constraint{
 				{Value: "ssd", Type: zonepb.Constraint_REQUIRED},
@@ -2296,7 +2297,7 @@ var (
 		},
 	}
 
-	twoAndOneStoreAttrs = []zonepb.Constraints{
+	twoAndOneStoreAttrs = []zonepb.ConstraintsConjunction{
 		{
 			Constraints: []zonepb.Constraint{
 				{Value: "odd", Type: zonepb.Constraint_REQUIRED},
@@ -2311,7 +2312,7 @@ var (
 		},
 	}
 
-	mixLocalityAndAttrs = []zonepb.Constraints{
+	mixLocalityAndAttrs = []zonepb.ConstraintsConjunction{
 		{
 			Constraints: []zonepb.Constraint{
 				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
@@ -2334,7 +2335,7 @@ var (
 		},
 	}
 
-	twoSpecificLocalities = []zonepb.Constraints{
+	twoSpecificLocalities = []zonepb.ConstraintsConjunction{
 		{
 			Constraints: []zonepb.Constraint{
 				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
@@ -2363,7 +2364,7 @@ func TestAllocateCandidatesNumReplicasConstraints(t *testing.T) {
 	// stores from multiDiversityDCStores would be the best addition to the range
 	// purely on the basis of constraint satisfaction and locality diversity.
 	testCases := []struct {
-		constraints []zonepb.Constraints
+		constraints []zonepb.ConstraintsConjunction
 		existing    []roachpb.StoreID
 		expected    []roachpb.StoreID
 	}{
@@ -2601,7 +2602,7 @@ func TestRemoveCandidatesNumReplicasConstraints(t *testing.T) {
 	// stores would be best to remove if we had to remove one purely on the basis
 	// of constraint-matching and locality diversity.
 	testCases := []struct {
-		constraints []zonepb.Constraints
+		constraints []zonepb.ConstraintsConjunction
 		existing    []roachpb.StoreID
 		expected    []roachpb.StoreID
 	}{
@@ -2828,7 +2829,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 		candidates []roachpb.StoreID
 	}
 	testCases := []struct {
-		constraints     []zonepb.Constraints
+		constraints     []zonepb.ConstraintsConjunction
 		zoneNumReplicas int32
 		existing        []roachpb.StoreID
 		expected        []rebalanceStoreIDs
@@ -3635,7 +3636,7 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	stopper, g, _, storePool, _ := createTestStorePool(
 		TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
-		storagepb.NodeLivenessStatus_LIVE)
+		kvserverpb.NodeLivenessStatus_LIVE)
 	defer stopper.Stop(context.Background())
 
 	// 3 stores where the lease count for each store is equal to 10x the store ID.
@@ -4008,7 +4009,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4037,7 +4038,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(5),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4076,7 +4077,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4100,7 +4101,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(5),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4134,7 +4135,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(5),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4168,7 +4169,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4202,7 +4203,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(5),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4246,7 +4247,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4285,7 +4286,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4319,7 +4320,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4360,7 +4361,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4389,7 +4390,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4418,7 +4419,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 		{
 			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.ConstraintsConjunction{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4999,7 +5000,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 	stopper, _, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDeadOff, false, /* deterministic */
 		func() int { return numNodes },
-		storagepb.NodeLivenessStatus_LIVE)
+		kvserverpb.NodeLivenessStatus_LIVE)
 	a := MakeAllocator(sp, func(string) (time.Duration, bool) {
 		return 0, true
 	})
@@ -5122,10 +5123,10 @@ func TestAllocatorComputeActionNoStorePool(t *testing.T) {
 func TestAllocatorError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	constraint := []zonepb.Constraints{
+	constraint := []zonepb.ConstraintsConjunction{
 		{Constraints: []zonepb.Constraint{{Value: "one", Type: zonepb.Constraint_REQUIRED}}},
 	}
-	constraints := []zonepb.Constraints{
+	constraints := []zonepb.ConstraintsConjunction{
 		{
 			Constraints: []zonepb.Constraint{
 				{Value: "one", Type: zonepb.Constraint_REQUIRED},
@@ -5144,25 +5145,23 @@ func TestAllocatorError(t *testing.T) {
 			"0 of 2 live stores are able to take a new replica for the range (1 throttled, 1 already has a replica)"},
 		{allocatorError{constraints: constraint, existingReplicas: 1, aliveStores: 1},
 			`0 of 1 live stores are able to take a new replica for the range (1 already has a replica); ` +
-				`must match constraints [{num_replicas:0 constraints:<type:REQUIRED key:"" value:"one" > }]`},
+				`must match constraints [{+one}]`},
 		{allocatorError{constraints: constraint, existingReplicas: 1, aliveStores: 2},
 			`0 of 2 live stores are able to take a new replica for the range (1 already has a replica); ` +
-				`must match constraints [{num_replicas:0 constraints:<type:REQUIRED key:"" value:"one" > }]`},
+				`must match constraints [{+one}]`},
 		{allocatorError{constraints: constraints, existingReplicas: 1, aliveStores: 1},
 			`0 of 1 live stores are able to take a new replica for the range (1 already has a replica); ` +
-				`must match constraints [{num_replicas:0 constraints:<type:REQUIRED key:"" value:"one" > constraints:<type:REQUIRED key:"" value:"two" > }]`},
+				`must match constraints [{+one,+two}]`},
 		{allocatorError{constraints: constraints, existingReplicas: 1, aliveStores: 2},
 			`0 of 2 live stores are able to take a new replica for the range (1 already has a replica); ` +
-				`must match constraints [{num_replicas:0 constraints:<type:REQUIRED key:"" value:"one" > constraints:<type:REQUIRED key:"" value:"two" > }]`},
+				`must match constraints [{+one,+two}]`},
 		{allocatorError{constraints: constraint, existingReplicas: 1, aliveStores: 2, throttledStores: 1},
 			`0 of 2 live stores are able to take a new replica for the range (1 throttled, 1 already has a replica); ` +
-				`must match constraints [{num_replicas:0 constraints:<type:REQUIRED key:"" value:"one" > }]`},
+				`must match constraints [{+one}]`},
 	}
 
 	for i, testCase := range testCases {
-		if actual := testCase.ae.Error(); testCase.expected != actual {
-			t.Errorf("%d: actual error message \"%s\" does not match expected \"%s\"", i, actual, testCase.expected)
-		}
+		assert.EqualErrorf(t, &testCase.ae, testCase.expected, "test case: %d", i)
 	}
 }
 
@@ -5182,7 +5181,7 @@ func TestAllocatorThrottled(t *testing.T) {
 		firstRangeID,
 		[]roachpb.ReplicaDescriptor{},
 	)
-	if _, ok := err.(purgatoryError); !ok {
+	if !errors.HasInterface(err, (*purgatoryError)(nil)) {
 		t.Fatalf("expected a purgatory error, got: %+v", err)
 	}
 
@@ -5216,7 +5215,7 @@ func TestAllocatorThrottled(t *testing.T) {
 		firstRangeID,
 		[]roachpb.ReplicaDescriptor{},
 	)
-	if _, ok := err.(purgatoryError); ok {
+	if errors.HasInterface(err, (*purgatoryError)(nil)) {
 		t.Fatalf("expected a non purgatory error, got: %+v", err)
 	}
 }
@@ -5517,13 +5516,13 @@ func TestAllocatorRebalanceAway(t *testing.T) {
 	}
 
 	stopper, g, _, a, _ := createTestAllocator(10, false /* deterministic */)
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
 	ctx := context.Background()
 
 	for _, tc := range testCases {
 		t.Run(tc.constraint.String(), func(t *testing.T) {
-			constraints := zonepb.Constraints{
+			constraints := zonepb.ConstraintsConjunction{
 				Constraints: []zonepb.Constraint{
 					tc.constraint,
 				},
@@ -5532,7 +5531,7 @@ func TestAllocatorRebalanceAway(t *testing.T) {
 			var rangeUsageInfo RangeUsageInfo
 			actual, _, _, ok := a.RebalanceTarget(
 				ctx,
-				&zonepb.ZoneConfig{NumReplicas: proto.Int32(0), Constraints: []zonepb.Constraints{constraints}},
+				&zonepb.ZoneConfig{NumReplicas: proto.Int32(0), Constraints: []zonepb.ConstraintsConjunction{constraints}},
 				nil,
 				firstRangeID,
 				existingReplicas,
@@ -5620,7 +5619,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 	const capacity = (1 << 30) + 1
 	const rangeSize = 16 << 20
 
-	mockNodeLiveness := newMockNodeLiveness(storagepb.NodeLivenessStatus_LIVE)
+	mockNodeLiveness := newMockNodeLiveness(kvserverpb.NodeLivenessStatus_LIVE)
 	sp := NewStorePool(
 		log.AmbientContext{Tracer: st.Tracer},
 		st,
@@ -5662,7 +5661,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 	for i := 0; i < generations; i++ {
 		// First loop through test stores and randomly add data.
 		for j := 0; j < len(testStores); j++ {
-			if mockNodeLiveness.nodeLivenessFunc(roachpb.NodeID(j), time.Time{}, 0) == storagepb.NodeLivenessStatus_DEAD {
+			if mockNodeLiveness.nodeLivenessFunc(roachpb.NodeID(j), time.Time{}, 0) == kvserverpb.NodeLivenessStatus_DEAD {
 				continue
 			}
 			ts := &testStores[j]
@@ -5677,7 +5676,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 			if ts.Capacity.Available <= 0 {
 				t.Errorf("testStore %d ran out of space during generation %d (rangesAdded=%d/%d): %+v",
 					j, i, rangesAdded, rangesToAdd, ts.Capacity)
-				mockNodeLiveness.setNodeStatus(roachpb.NodeID(j), storagepb.NodeLivenessStatus_DEAD)
+				mockNodeLiveness.setNodeStatus(roachpb.NodeID(j), kvserverpb.NodeLivenessStatus_DEAD)
 			}
 			wg.Add(1)
 			if err := g.AddInfoProto(gossip.MakeStoreKey(roachpb.StoreID(j)), &ts.StoreDescriptor, 0); err != nil {
@@ -5689,7 +5688,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 		// Loop through each store a number of times and maybe rebalance.
 		for j := 0; j < 10; j++ {
 			for k := 0; k < len(testStores); k++ {
-				if mockNodeLiveness.nodeLivenessFunc(roachpb.NodeID(k), time.Time{}, 0) == storagepb.NodeLivenessStatus_DEAD {
+				if mockNodeLiveness.nodeLivenessFunc(roachpb.NodeID(k), time.Time{}, 0) == kvserverpb.NodeLivenessStatus_DEAD {
 					continue
 				}
 				ts := &testStores[k]
@@ -5724,11 +5723,11 @@ func TestAllocatorFullDisks(t *testing.T) {
 
 		// Simulate rocksdb compactions freeing up disk space.
 		for j := 0; j < len(testStores); j++ {
-			if mockNodeLiveness.nodeLivenessFunc(roachpb.NodeID(j), time.Time{}, 0) != storagepb.NodeLivenessStatus_DEAD {
+			if mockNodeLiveness.nodeLivenessFunc(roachpb.NodeID(j), time.Time{}, 0) != kvserverpb.NodeLivenessStatus_DEAD {
 				ts := &testStores[j]
 				if ts.Capacity.Available <= 0 {
 					t.Errorf("testStore %d ran out of space during generation %d: %+v", j, i, ts.Capacity)
-					mockNodeLiveness.setNodeStatus(roachpb.NodeID(j), storagepb.NodeLivenessStatus_DEAD)
+					mockNodeLiveness.setNodeStatus(roachpb.NodeID(j), kvserverpb.NodeLivenessStatus_DEAD)
 				} else {
 					ts.compact()
 				}
@@ -5739,7 +5738,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 
 func Example_rebalancing() {
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 
 	st := cluster.MakeTestingClusterSettings()
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
@@ -5772,7 +5771,7 @@ func Example_rebalancing() {
 		func() int {
 			return nodes
 		},
-		newMockNodeLiveness(storagepb.NodeLivenessStatus_LIVE).nodeLivenessFunc,
+		newMockNodeLiveness(kvserverpb.NodeLivenessStatus_LIVE).nodeLivenessFunc,
 		/* deterministic */ true,
 	)
 	alloc := MakeAllocator(sp, func(string) (time.Duration, bool) {
@@ -5835,7 +5834,7 @@ func Example_rebalancing() {
 				storeFilterThrottled,
 			)
 			if ok {
-				log.Infof(context.TODO(), "rebalancing to %v; details: %s", target, details)
+				log.Infof(context.Background(), "rebalancing to %v; details: %s", target, details)
 				testStores[j].rebalance(&testStores[int(target.StoreID)], alloc.randGen.Int63n(1<<20))
 			}
 		}

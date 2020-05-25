@@ -27,11 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -52,9 +52,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/google/btree"
 	"github.com/kr/pretty"
-	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft"
 )
 
@@ -251,7 +251,7 @@ type Replica struct {
 		// the closing of the channel.
 		mergeComplete chan struct{}
 		// The state of the Raft state machine.
-		state storagepb.ReplicaState
+		state kvserverpb.ReplicaState
 		// Last index/term persisted to the raft log (not necessarily
 		// committed). Note that lastTerm may be 0 (and thus invalid) even when
 		// lastIndex is known, in which case the term will have to be retrieved
@@ -340,7 +340,7 @@ type Replica struct {
 		//
 		// TODO(ajwerner): move the proposal map and ProposalData entirely under
 		// the raftMu.
-		proposals         map[storagebase.CmdIDKey]*ProposalData
+		proposals         map[kvserverbase.CmdIDKey]*ProposalData
 		internalRaftGroup *raft.RawNode
 		// The ID of the replica within the Raft group. This value may never be 0.
 		replicaID roachpb.ReplicaID
@@ -439,10 +439,13 @@ type Replica struct {
 		// released as the base index moves up by one, etc.
 		proposalQuotaBaseIndex uint64
 
-		// Once the leader observes a proposal come 'out of Raft', we add the
-		// size of the associated command to a queue of quotas we have yet to
-		// release back to the quota pool. We only do so when all replicas have
-		// persisted the corresponding entry into their logs.
+		// Once the leader observes a proposal come 'out of Raft', we add the size
+		// of the associated command to a queue of quotas we have yet to release
+		// back to the quota pool. At that point ownership of the quota is
+		// transferred from r.mu.proposals to this queue.
+		// We'll release the respective quota once all replicas have persisted the
+		// corresponding entry into their logs (or once we give up waiting on some
+		// replica because it looks like it's dead).
 		quotaReleaseQueue []*quotapool.IntAlloc
 
 		// Counts calls to Replica.tick()
@@ -469,6 +472,34 @@ type Replica struct {
 		// will see the effect of a protected timestamp record, they need to verify
 		// the request. See the comment on the struct for more details.
 		cachedProtectedTS cachedProtectedTimestampState
+
+		// largestPreviousMaxRangeSizeBytes tracks a previous zone.RangeMaxBytes
+		// which exceeded the current zone.RangeMaxBytes to help defeat the range
+		// backpressure mechanism in cases where a user reduces the configured range
+		// size. It is set when the zone config changes to a smaller value and the
+		// current range size exceeds the new value. It is cleared after the range's
+		// size drops below its current zone.MaxRangeBytes or if the
+		// zone.MaxRangeBytes increases to surpass the current value.
+		largestPreviousMaxRangeSizeBytes int64
+
+		// failureToGossipSystemConfig is set to true when the leaseholder of the
+		// range containing the system config span fails to gossip due to an
+		// outstanding intent (see MaybeGossipSystemConfig). It is reset when the
+		// system config is successfully gossiped or when the Replica loses the
+		// lease. It is read when handling a MaybeGossipSystemConfigIfHaveFailure
+		// local result trigger. That trigger is set when an EndTransaction with an
+		// ABORTED status is evaluated on a range containing the system config span.
+		//
+		// While the gossipping of the system config span is best-effort, the sql
+		// schema leasing mechanism degrades dramatically if changes are not
+		// gossiped. This degradation is due to the fact that schema changes, after
+		// writing intents, often need to ensure that there aren't outstanding
+		// leases on old versions and if there are, roll back and wait until there
+		// are not. The problem is that this waiting may take a long time if the
+		// current leaseholders are not notified. We deal with this by detecting the
+		// abort of a transaction which might have blocked the system config from
+		// being gossiped and attempting to gossip again.
+		failureToGossipSystemConfig bool
 	}
 
 	rangefeedMu struct {
@@ -589,6 +620,33 @@ func (r *Replica) GetMaxBytes() int64 {
 func (r *Replica) SetZoneConfig(zone *zonepb.ZoneConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.isInitializedRLocked() &&
+		r.mu.zone != nil &&
+		zone != nil {
+		total := r.mu.state.Stats.Total()
+
+		// Set largestPreviousMaxRangeSizeBytes if the current range size is above
+		// the new limit and we don't already have a larger value. Reset it if
+		// the new limit is larger than the current largest we're aware of.
+		if total > *zone.RangeMaxBytes &&
+			*zone.RangeMaxBytes < *r.mu.zone.RangeMaxBytes &&
+			r.mu.largestPreviousMaxRangeSizeBytes < *r.mu.zone.RangeMaxBytes &&
+			// Check to make sure that we're replacing a real zone config. Otherwise
+			// the default value would prevent backpressure until the range was
+			// larger than the default value. When the store starts up it sets the
+			// zone for the replica to this default value; later on it overwrites it
+			// with a new instance even if the value is the same as the default.
+			r.mu.zone != r.store.cfg.DefaultZoneConfig &&
+			r.mu.zone != r.store.cfg.DefaultSystemZoneConfig {
+
+			r.mu.largestPreviousMaxRangeSizeBytes = *r.mu.zone.RangeMaxBytes
+		} else if r.mu.largestPreviousMaxRangeSizeBytes > 0 &&
+			r.mu.largestPreviousMaxRangeSizeBytes < *zone.RangeMaxBytes {
+
+			r.mu.largestPreviousMaxRangeSizeBytes = 0
+		}
+	}
 	r.mu.zone = zone
 }
 
@@ -651,7 +709,7 @@ func (r *Replica) StoreID() roachpb.StoreID {
 }
 
 // EvalKnobs returns the EvalContext's Knobs.
-func (r *Replica) EvalKnobs() storagebase.BatchEvalTestingKnobs {
+func (r *Replica) EvalKnobs() kvserverbase.BatchEvalTestingKnobs {
 	return r.store.cfg.TestingKnobs.EvalKnobs
 }
 
@@ -714,13 +772,13 @@ func (r *Replica) GetGCThreshold() hlc.Timestamp {
 // is enabled and the TTL has passed. If this is an admin command or this range
 // contains data outside of the user keyspace, we return the true GC threshold.
 func (r *Replica) getImpliedGCThresholdRLocked(
-	now hlc.Timestamp, st *storagepb.LeaseStatus, isAdmin bool,
+	st *kvserverpb.LeaseStatus, isAdmin bool,
 ) hlc.Timestamp {
 	threshold := *r.mu.state.GCThreshold
 
 	// The GC threshold is the oldest value we can return here.
 	if isAdmin || !StrictGCEnforcement.Get(&r.store.ClusterSettings().SV) ||
-		r.mu.state.Desc.StartKey.Less(roachpb.RKey(keys.UserTableDataMin)) {
+		r.isSystemRangeRLocked() {
 		return threshold
 	}
 
@@ -733,11 +791,11 @@ func (r *Replica) getImpliedGCThresholdRLocked(
 	// user experience win; it's always safe to allow reads to continue so long
 	// as they are after the GC threshold.
 	c := r.mu.cachedProtectedTS
-	if st == nil || c.readAt.Less(st.Lease.Start) {
+	if st.State != kvserverpb.LeaseState_VALID || c.readAt.Less(st.Lease.Start) {
 		return threshold
 	}
 
-	impliedThreshold := gc.CalculateThreshold(now, *r.mu.zone.GC)
+	impliedThreshold := gc.CalculateThreshold(st.Timestamp, *r.mu.zone.GC)
 	threshold.Forward(impliedThreshold)
 
 	// If we have a protected timestamp record which precedes the implied
@@ -746,6 +804,17 @@ func (r *Replica) getImpliedGCThresholdRLocked(
 		threshold = c.earliestRecord.Timestamp.Prev()
 	}
 	return threshold
+}
+
+// isSystemRange returns true if r's key range precedes keys.UserTableDataMin.
+func (r *Replica) isSystemRange() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isSystemRangeRLocked()
+}
+
+func (r *Replica) isSystemRangeRLocked() bool {
+	return r.mu.state.Desc.StartKey.Less(roachpb.RKey(keys.UserTableDataMin))
 }
 
 // maxReplicaIDOfAny returns the maximum ReplicaID of any replica, including
@@ -833,13 +902,13 @@ func (r *Replica) GetSplitQPS() float64 {
 //
 // TODO(bdarnell): This is not the same as RangeDescriptor.ContainsKey.
 func (r *Replica) ContainsKey(key roachpb.Key) bool {
-	return storagebase.ContainsKey(r.Desc(), key)
+	return kvserverbase.ContainsKey(r.Desc(), key)
 }
 
 // ContainsKeyRange returns whether this range contains the specified
 // key range from start to end.
 func (r *Replica) ContainsKeyRange(start, end roachpb.Key) bool {
-	return storagebase.ContainsKeyRange(r.Desc(), start, end)
+	return kvserverbase.ContainsKeyRange(r.Desc(), start, end)
 }
 
 // GetLastReplicaGCTimestamp reads the timestamp at which the replica was
@@ -911,13 +980,13 @@ func (r *Replica) raftBasicStatusRLocked() raft.BasicStatus {
 
 // State returns a copy of the internal state of the Replica, along with some
 // auxiliary information.
-func (r *Replica) State() storagepb.RangeInfo {
-	var ri storagepb.RangeInfo
+func (r *Replica) State() kvserverpb.RangeInfo {
+	var ri kvserverpb.RangeInfo
 
 	// NB: this acquires an RLock(). Reentrant RLocks are deadlock prone, so do
 	// this first before RLocking below. Performance of this extra lock
 	// acquisition is not a concern.
-	ri.ActiveClosedTimestamp = r.maxClosed(context.Background())
+	ri.ActiveClosedTimestamp, _ = r.maxClosed(context.Background())
 
 	// NB: numRangefeedRegistrations doesn't require Replica.mu to be locked.
 	// However, it does require coordination between multiple goroutines, so
@@ -926,7 +995,7 @@ func (r *Replica) State() storagepb.RangeInfo {
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	ri.ReplicaState = *(protoutil.Clone(&r.mu.state)).(*storagepb.ReplicaState)
+	ri.ReplicaState = *(protoutil.Clone(&r.mu.state)).(*kvserverpb.ReplicaState)
 	ri.LastIndex = r.mu.lastIndex
 	ri.NumPending = uint64(r.numPendingProposalsRLocked())
 	ri.RaftLogSize = r.mu.raftLogSize
@@ -956,8 +1025,9 @@ func (r *Replica) State() storagepb.RangeInfo {
 				}
 				if ri.NewestClosedTimestamp.ClosedTimestamp.Less(e.ClosedTimestamp) {
 					ri.NewestClosedTimestamp.NodeID = replDesc.NodeID
-					ri.NewestClosedTimestamp.MLAI = int64(mlai)
 					ri.NewestClosedTimestamp.ClosedTimestamp = e.ClosedTimestamp
+					ri.NewestClosedTimestamp.MLAI = int64(mlai)
+					ri.NewestClosedTimestamp.Epoch = int64(e.Epoch)
 				}
 				return true // done
 			})
@@ -974,18 +1044,17 @@ func (r *Replica) State() storagepb.RangeInfo {
 func (r *Replica) assertStateLocked(ctx context.Context, reader storage.Reader) {
 	diskState, err := r.mu.stateLoader.Load(ctx, reader, r.mu.state.Desc)
 	if err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 	if !diskState.Equal(r.mu.state) {
 		// The roundabout way of printing here is to expose this information in sentry.io.
 		//
 		// TODO(dt): expose properly once #15892 is addressed.
-		log.Errorf(ctx, "on-disk and in-memory state diverged:\n%s", pretty.Diff(diskState, r.mu.state))
+		log.Errorf(ctx, "on-disk and in-memory state diverged:\n%s",
+			pretty.Diff(diskState, r.mu.state))
 		r.mu.state.Desc, diskState.Desc = nil, nil
-		log.Fatal(ctx, log.Safe(
-			fmt.Sprintf("on-disk and in-memory state diverged: %s",
-				pretty.Diff(diskState, r.mu.state)),
-		))
+		log.Fatalf(ctx, "on-disk and in-memory state diverged: %s",
+			log.Safe(pretty.Diff(diskState, r.mu.state)))
 	}
 }
 
@@ -1002,7 +1071,7 @@ func (r *Replica) assertStateLocked(ctx context.Context, reader storage.Reader) 
 // they know that they will end up checking for a pending merge at some later
 // time.
 func (r *Replica) checkExecutionCanProceed(
-	ba *roachpb.BatchRequest, g *concurrency.Guard, now hlc.Timestamp, st *storagepb.LeaseStatus,
+	ba *roachpb.BatchRequest, g *concurrency.Guard, st *kvserverpb.LeaseStatus,
 ) error {
 	rSpan, err := keys.Range(ba.Requests)
 	if err != nil {
@@ -1014,7 +1083,7 @@ func (r *Replica) checkExecutionCanProceed(
 		return err
 	} else if err := r.checkSpanInRangeRLocked(rSpan); err != nil {
 		return err
-	} else if err := r.checkTSAboveGCThresholdRLocked(ba.Timestamp, now, st, ba.IsAdmin()); err != nil {
+	} else if err := r.checkTSAboveGCThresholdRLocked(ba.Timestamp, st, ba.IsAdmin()); err != nil {
 		return err
 	} else if g.HoldingLatches() && st != nil {
 		// Only check for a pending merge if latches are held and the Range
@@ -1030,13 +1099,15 @@ func (r *Replica) checkExecutionCanProceed(
 func (r *Replica) checkExecutionCanProceedForRangeFeed(
 	rSpan roachpb.RSpan, ts hlc.Timestamp,
 ) error {
+	now := r.Clock().Now()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	status := r.leaseStatus(*r.mu.state.Lease, now, r.mu.minLeaseProposedTS)
 	if _, err := r.isDestroyedRLocked(); err != nil {
 		return err
 	} else if err := r.checkSpanInRangeRLocked(rSpan); err != nil {
 		return err
-	} else if err := r.checkTSAboveGCThresholdRLocked(ts, r.Clock().Now(), nil, false /* isAdmin */); err != nil {
+	} else if err := r.checkTSAboveGCThresholdRLocked(ts, &status, false /* isAdmin */); err != nil {
 		return err
 	} else if r.requiresExpiringLeaseRLocked() {
 		// Ensure that the range does not require an expiration-based lease. If it
@@ -1062,9 +1133,9 @@ func (r *Replica) checkSpanInRangeRLocked(rspan roachpb.RSpan) error {
 // checkTSAboveGCThresholdRLocked returns an error if a request (identified
 // by its MVCC timestamp) can be run on the replica.
 func (r *Replica) checkTSAboveGCThresholdRLocked(
-	ts, now hlc.Timestamp, st *storagepb.LeaseStatus, isAdmin bool,
+	ts hlc.Timestamp, st *kvserverpb.LeaseStatus, isAdmin bool,
 ) error {
-	threshold := r.getImpliedGCThresholdRLocked(now, st, isAdmin)
+	threshold := r.getImpliedGCThresholdRLocked(st, isAdmin)
 	if threshold.Less(ts) {
 		return nil
 	}
@@ -1385,7 +1456,7 @@ func (r *Replica) maybeWatchForMerge(ctx context.Context) error {
 		r.mu.Unlock()
 		r.raftMu.Unlock()
 	})
-	if err == stop.ErrUnavailable {
+	if errors.Is(err, stop.ErrUnavailable) {
 		// We weren't able to launch a goroutine to watch for the merge's completion
 		// because the server is shutting down. Normally failing to launch the
 		// watcher goroutine would wedge pending requests on the replica's
@@ -1518,6 +1589,18 @@ func (r *Replica) GetExternalStorageFromURI(
 	ctx context.Context, uri string,
 ) (cloud.ExternalStorage, error) {
 	return r.store.cfg.ExternalStorageFromURI(ctx, uri)
+}
+
+func (r *Replica) markSystemConfigGossipSuccess() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mu.failureToGossipSystemConfig = false
+}
+
+func (r *Replica) markSystemConfigGossipFailed() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mu.failureToGossipSystemConfig = true
 }
 
 func init() {

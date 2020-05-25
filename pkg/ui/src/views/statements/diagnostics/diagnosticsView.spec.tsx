@@ -16,7 +16,7 @@ import Long from "long";
 
 import "src/enzymeInit";
 import { DiagnosticsView, EmptyDiagnosticsView } from "./diagnosticsView";
-import { Table } from "oss/src/components";
+import { Table } from "src/components";
 import { connectedMount } from "src/test-utils";
 import { cockroach } from "src/js/protos";
 import IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
@@ -84,7 +84,7 @@ describe("DiagnosticsView", () => {
       activateFn.calledOnceWith(statementFingerprint);
     });
 
-    it("Activate button is disabled if diagnostics is requested and waiting query", () => {
+    it("Activate button is hidden if diagnostics is requested and waiting query", () => {
       const diagnosticsRequests: IStatementDiagnosticsReport[] = [
         generateDiagnosticsRequest({ completed: false }),
         generateDiagnosticsRequest(),
@@ -99,11 +99,8 @@ describe("DiagnosticsView", () => {
         />),
       );
 
-      const activateButtonComponent = wrapper.find(".crl-button").first();
-      assert.isTrue(wrapper.find(".crl-button.crl-button--disabled").exists());
-
-      activateButtonComponent.simulate("click");
-      assert.isTrue(activateFn.notCalled, "Activate button is called when diagnostic is already requested");
+      const activateButtonComponent = wrapper.find(".crl-statements-diagnostics-view__activate-button").first();
+      assert.isFalse(activateButtonComponent.exists());
     });
   });
 });

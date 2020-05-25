@@ -5,6 +5,11 @@
 # The cluster size or distsql mode aren't important for these tests.
 #
 
+# "local" logic test configuration overrides the DistSQL mode to 'off', but
+# we're interested in behavior with 'auto' in this test file.
+statement ok
+SET distsql=auto
+
 statement ok
 CREATE TABLE kv (k INT PRIMARY KEY, v INT)
 
@@ -64,10 +69,11 @@ SELECT automatic FROM [EXPLAIN (DISTSQL) SELECT * FROM kv LIMIT 1]
 true
 
 # Soft limit in scan - don't distribute.
+# TODO(yuzefovich): soft limits are currently ignored in scans.
 query B
 SELECT automatic FROM [EXPLAIN (DISTSQL) SELECT * FROM kv UNION SELECT * FROM kv LIMIT 1]
 ----
-false
+true
 
 # Limit after sort - distribute.
 query B

@@ -14,6 +14,7 @@ import (
 	"crypto/sha512"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -25,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // ExportRequestTargetFileSize controls the target file size for SSTs created
@@ -204,7 +205,10 @@ func evalExport(
 		}
 
 		if exportStore != nil {
-			exported.Path = fmt.Sprintf("%d.sst", builtins.GenerateUniqueInt(cArgs.EvalCtx.NodeID()))
+			// TODO(dt): don't reach out into a SQL builtin here; this code lives in KV.
+			// Create a unique int differently.
+			nodeID := cArgs.EvalCtx.NodeID()
+			exported.Path = fmt.Sprintf("%d.sst", builtins.GenerateUniqueInt(base.SQLInstanceID(nodeID)))
 			if err := exportStore.WriteFile(ctx, exported.Path, bytes.NewReader(data)); err != nil {
 				return result.Result{}, err
 			}

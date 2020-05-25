@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -44,9 +45,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx"
 	"github.com/jackc/pgx/pgproto3"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -72,7 +73,7 @@ func TestConn(t *testing.T) {
 	// execute some metadata queries that pgx sends whenever it opens a
 	// connection.
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true, UseDatabase: "system"})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Start a pgwire "server".
 	addr := util.TestAddr
@@ -81,10 +82,10 @@ func TestConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	serverAddr := ln.Addr()
-	log.Infof(context.TODO(), "started listener on %s", serverAddr)
+	log.Infof(context.Background(), "started listener on %s", serverAddr)
 
 	var g errgroup.Group
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	var clientWG sync.WaitGroup
 	clientWG.Add(1)
@@ -287,7 +288,7 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 	batch := conn.BeginBatch()
 	batch.Queue("select 7", nil, nil, nil)
 	batch.Queue("select 8", nil, nil, nil)
-	if err := batch.Send(context.TODO(), &pgx.TxOptions{}); err != nil {
+	if err := batch.Send(context.Background(), &pgx.TxOptions{}); err != nil {
 		return err
 	}
 	if err := batch.Close(); err != nil {
@@ -331,7 +332,7 @@ func waitForClientConn(ln net.Listener) (*conn, error) {
 	}
 
 	// Consume the connection options.
-	if _, err := parseClientProvidedSessionParameters(context.TODO(), nil, &buf); err != nil {
+	if _, err := parseClientProvidedSessionParameters(context.Background(), nil, &buf); err != nil {
 		return nil, err
 	}
 
@@ -343,7 +344,7 @@ func waitForClientConn(ln net.Listener) (*conn, error) {
 func makeTestingConvCfg() sessiondata.DataConversionConfig {
 	return sessiondata.DataConversionConfig{
 		Location:          time.UTC,
-		BytesEncodeFormat: sessiondata.BytesEncodeHex,
+		BytesEncodeFormat: lex.BytesEncodeHex,
 	}
 }
 
@@ -385,6 +386,7 @@ const (
 func expectExecStmt(
 	ctx context.Context, t *testing.T, expSQL string, rd *sql.StmtBufReader, c *conn, typ executeType,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -393,18 +395,18 @@ func expectExecStmt(
 
 	es, ok := cmd.(sql.ExecStmt)
 	if !ok {
-		t.Fatalf("%s: expected command ExecStmt, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command ExecStmt, got: %T (%+v)", cmd, cmd)
 	}
 
 	if es.AST.String() != expSQL {
-		t.Fatalf("%s: expected %s, got %s", testutils.Caller(1), expSQL, es.AST.String())
+		t.Fatalf("expected %s, got %s", expSQL, es.AST.String())
 	}
 
 	if es.ParseStart == (time.Time{}) {
-		t.Fatalf("%s: ParseStart not filled in", testutils.Caller(1))
+		t.Fatalf("ParseStart not filled in")
 	}
 	if es.ParseEnd == (time.Time{}) {
-		t.Fatalf("%s: ParseEnd not filled in", testutils.Caller(1))
+		t.Fatalf("ParseEnd not filled in")
 	}
 	if typ == queryStringComplete {
 		if err := finishQuery(execute, c); err != nil {
@@ -420,6 +422,7 @@ func expectExecStmt(
 func expectPrepareStmt(
 	ctx context.Context, t *testing.T, expName string, expSQL string, rd *sql.StmtBufReader, c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -428,15 +431,15 @@ func expectPrepareStmt(
 
 	pr, ok := cmd.(sql.PrepareStmt)
 	if !ok {
-		t.Fatalf("%s: expected command PrepareStmt, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command PrepareStmt, got: %T (%+v)", cmd, cmd)
 	}
 
 	if pr.Name != expName {
-		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, pr.Name)
+		t.Fatalf("expected name %s, got %s", expName, pr.Name)
 	}
 
 	if pr.AST.String() != expSQL {
-		t.Fatalf("%s: expected %s, got %s", testutils.Caller(1), expSQL, pr.AST.String())
+		t.Fatalf("expected %s, got %s", expSQL, pr.AST.String())
 	}
 
 	if err := finishQuery(prepare, c); err != nil {
@@ -452,6 +455,7 @@ func expectDescribeStmt(
 	rd *sql.StmtBufReader,
 	c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -460,15 +464,15 @@ func expectDescribeStmt(
 
 	desc, ok := cmd.(sql.DescribeStmt)
 	if !ok {
-		t.Fatalf("%s: expected command DescribeStmt, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command DescribeStmt, got: %T (%+v)", cmd, cmd)
 	}
 
 	if desc.Name != expName {
-		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, desc.Name)
+		t.Fatalf("expected name %s, got %s", expName, desc.Name)
 	}
 
 	if desc.Type != expType {
-		t.Fatalf("%s: expected type %s, got %s", testutils.Caller(1), expType, desc.Type)
+		t.Fatalf("expected type %s, got %s", expType, desc.Type)
 	}
 
 	if err := finishQuery(describe, c); err != nil {
@@ -479,6 +483,7 @@ func expectDescribeStmt(
 func expectBindStmt(
 	ctx context.Context, t *testing.T, expName string, rd *sql.StmtBufReader, c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -487,11 +492,11 @@ func expectBindStmt(
 
 	bd, ok := cmd.(sql.BindStmt)
 	if !ok {
-		t.Fatalf("%s: expected command BindStmt, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command BindStmt, got: %T (%+v)", cmd, cmd)
 	}
 
 	if bd.PreparedStatementName != expName {
-		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, bd.PreparedStatementName)
+		t.Fatalf("expected name %s, got %s", expName, bd.PreparedStatementName)
 	}
 
 	if err := finishQuery(bind, c); err != nil {
@@ -500,6 +505,7 @@ func expectBindStmt(
 }
 
 func expectSync(ctx context.Context, t *testing.T, rd *sql.StmtBufReader) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -508,13 +514,14 @@ func expectSync(ctx context.Context, t *testing.T, rd *sql.StmtBufReader) {
 
 	_, ok := cmd.(sql.Sync)
 	if !ok {
-		t.Fatalf("%s: expected command Sync, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command Sync, got: %T (%+v)", cmd, cmd)
 	}
 }
 
 func expectExecPortal(
 	ctx context.Context, t *testing.T, expName string, rd *sql.StmtBufReader, c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -523,11 +530,11 @@ func expectExecPortal(
 
 	ep, ok := cmd.(sql.ExecPortal)
 	if !ok {
-		t.Fatalf("%s: expected command ExecPortal, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command ExecPortal, got: %T (%+v)", cmd, cmd)
 	}
 
 	if ep.Name != expName {
-		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, ep.Name)
+		t.Fatalf("expected name %s, got %s", expName, ep.Name)
 	}
 
 	if err := finishQuery(execPortal, c); err != nil {
@@ -538,6 +545,7 @@ func expectExecPortal(
 func expectSendError(
 	ctx context.Context, t *testing.T, pgErrCode string, rd *sql.StmtBufReader, c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -546,7 +554,7 @@ func expectSendError(
 
 	se, ok := cmd.(sql.SendError)
 	if !ok {
-		t.Fatalf("%s: expected command SendError, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command SendError, got: %T (%+v)", cmd, cmd)
 	}
 
 	if code := pgerror.GetPGCode(se.Err); code != pgErrCode {
@@ -594,7 +602,7 @@ func finishQuery(t finishType, c *conn) error {
 	case describe:
 		skipFinish = true
 		if err := c.writeRowDescription(
-			context.TODO(), nil /* columns */, nil /* formatCodes */, c.conn,
+			context.Background(), nil /* columns */, nil /* formatCodes */, c.conn,
 		); err != nil {
 			return err
 		}
@@ -633,7 +641,7 @@ func finishQuery(t finishType, c *conn) error {
 type pgxTestLogger struct{}
 
 func (l pgxTestLogger) Log(level pgx.LogLevel, msg string, data map[string]interface{}) {
-	log.Infof(context.TODO(), "pgx log [%s] %s - %s", level, msg, data)
+	log.Infof(context.Background(), "pgx log [%s] %s - %s", level, msg, data)
 }
 
 // pgxTestLogger implements pgx.Logger.
@@ -647,7 +655,7 @@ func TestConnCloseReleasesLocks(t *testing.T) {
 	// state.
 	testutils.RunTrueAndFalse(t, "open state", func(t *testing.T, open bool) {
 		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-		ctx := context.TODO()
+		ctx := context.Background()
 		defer s.Stopper().Stop(ctx)
 
 		pgURL, cleanupFunc := sqlutils.PGUrl(
@@ -715,7 +723,7 @@ func TestConnCloseReleasesLocks(t *testing.T) {
 func TestConnCloseWhileProducingRows(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	ctx := context.TODO()
+	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
 	// Disable results buffering.
@@ -776,7 +784,7 @@ func TestConnCloseWhileProducingRows(t *testing.T) {
 func TestMaliciousInputs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	for _, tc := range [][]byte{
 		// This byte string sends a pgwirebase.ClientMsgClose message type. When
@@ -862,7 +870,7 @@ func TestReadTimeoutConnExits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	log.Infof(context.TODO(), "started listener on %s", ln.Addr())
+	log.Infof(context.Background(), "started listener on %s", ln.Addr())
 	defer func() {
 		if err := ln.Close(); err != nil {
 			t.Fatal(err)
@@ -916,7 +924,7 @@ func TestReadTimeoutConnExits(t *testing.T) {
 	default:
 	}
 	cancel()
-	if err := <-errChan; err != context.Canceled {
+	if err := <-errChan; !errors.Is(err, context.Canceled) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

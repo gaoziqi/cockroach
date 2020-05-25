@@ -16,6 +16,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -23,11 +24,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -38,7 +41,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgx"
 	"github.com/lib/pq"
+	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,37 +57,97 @@ INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see');
 select * from crdb_internal.node_runtime_info;
 `
 
-	rUnsafe := "i'm not safe"
-	rSafe := log.Safe("something safe")
+	t.Run("unsafe", func(t *testing.T) {
+		rUnsafe := "i'm not safe"
+		safeErr := sql.AnonymizeStatementsForReporting("testing", stmt, rUnsafe)
 
-	safeErr := sql.AnonymizeStatementsForReporting("testing", stmt, rUnsafe)
+		const expMessage = "panic: i'm not safe"
+		actMessage := safeErr.Error()
+		if actMessage != expMessage {
+			t.Errorf("wanted: %s\ngot: %s", expMessage, actMessage)
+		}
 
-	const (
-		expMessage = "panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
-			"(_, _, __more2__); SELECT * FROM _._; caused by i'm not safe"
-		expSafeRedactedMessage = "?:0: panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
-			"(_, _, __more2__); SELECT * FROM _._: caused by <redacted>"
-		expSafeSafeMessage = "?:0: panic while testing 2 statements: INSERT INTO _(_, _) VALUES " +
-			"(_, _, __more2__); SELECT * FROM _._: caused by something safe"
-	)
+		const expSafeRedactedMessage = `...conn_executor_test.go:NN: <*errors.errorString>
+wrapper: <*safedetails.withSafeDetails>
+(more details:)
+panic: %v
+-- arg 1: <string>
+wrapper: <*withstack.withStack>
+(more details:)
+github.com/cockroachdb/cockroach/pkg/sql_test.TestAnonymizeStatementsForReporting.func1
+	...conn_executor_test.go:NN
+testing.tRunner
+	...testing.go:NN
+runtime.goexit
+	...asm_amd64.s:NN
+wrapper: <*safedetails.withSafeDetails>
+(more details:)
+panic while %s %d statements: %s
+-- arg 1: testing
+-- arg 2: 2
+-- arg 3: INSERT INTO _(_, _) VALUES (_, _, __more2__); SELECT * FROM _._`
+		actSafeRedactedMessage := fileref.ReplaceAllString(errors.Redact(safeErr), "...$2:NN")
+		if actSafeRedactedMessage != expSafeRedactedMessage {
+			diff, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+				A:        difflib.SplitLines(expSafeRedactedMessage),
+				B:        difflib.SplitLines(actSafeRedactedMessage),
+				FromFile: "Expected",
+				FromDate: "",
+				ToFile:   "Actual",
+				ToDate:   "",
+				Context:  1,
+			})
+			t.Errorf("Diff:\n%s", diff)
+		}
 
-	actMessage := safeErr.Error()
-	if actMessage != expMessage {
-		t.Fatalf("wanted: %s\ngot: %s", expMessage, actMessage)
-	}
+	})
 
-	actSafeRedactedMessage := log.ReportablesToSafeError(0, "", []interface{}{safeErr}).Error()
-	if actSafeRedactedMessage != expSafeRedactedMessage {
-		t.Fatalf("wanted: %s\ngot: %s", expSafeRedactedMessage, actSafeRedactedMessage)
-	}
+	t.Run("safe", func(t *testing.T) {
+		rSafe := log.Safe("something safe")
+		safeErr := sql.AnonymizeStatementsForReporting("testing", stmt, rSafe)
 
-	safeErr = sql.AnonymizeStatementsForReporting("testing", stmt, rSafe)
+		const expMessage = "panic: something safe"
+		actMessage := safeErr.Error()
+		if actMessage != expMessage {
+			t.Errorf("wanted: %s\ngot: %s", expMessage, actMessage)
+		}
 
-	actSafeSafeMessage := log.ReportablesToSafeError(0, "", []interface{}{safeErr}).Error()
-	if actSafeSafeMessage != expSafeSafeMessage {
-		t.Fatalf("wanted: %s\ngot: %s", expSafeSafeMessage, actSafeSafeMessage)
-	}
+		const expSafeSafeMessage = `...conn_executor_test.go:NN: <*errors.errorString>
+wrapper: <*safedetails.withSafeDetails>
+(more details:)
+panic: %v
+-- arg 1: something safe
+wrapper: <*withstack.withStack>
+(more details:)
+github.com/cockroachdb/cockroach/pkg/sql_test.TestAnonymizeStatementsForReporting.func2
+	...conn_executor_test.go:NN
+testing.tRunner
+	...testing.go:NN
+runtime.goexit
+	...asm_amd64.s:NN
+wrapper: <*safedetails.withSafeDetails>
+(more details:)
+panic while %s %d statements: %s
+-- arg 1: testing
+-- arg 2: 2
+-- arg 3: INSERT INTO _(_, _) VALUES (_, _, __more2__); SELECT * FROM _._`
+		actSafeSafeMessage := fileref.ReplaceAllString(errors.Redact(safeErr), "...$2:NN")
+		if actSafeSafeMessage != expSafeSafeMessage {
+			diff, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+				A:        difflib.SplitLines(expSafeSafeMessage),
+				B:        difflib.SplitLines(actSafeSafeMessage),
+				FromFile: "Expected",
+				FromDate: "",
+				ToFile:   "Actual",
+				ToDate:   "",
+				Context:  1,
+			})
+			t.Errorf("Diff:\n%s", diff)
+		}
+	})
 }
+
+var fileref = regexp.MustCompile(`((?:[a-zA-Z0-9\._@-]*/)*)([a-zA-Z0-9._@-]*\.(?:go|s)):\d+`)
 
 // Test that a connection closed abruptly while a SQL txn is in progress results
 // in that txn being rolled back.
@@ -140,7 +206,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 				}
 			}()
 
-			ctx := context.TODO()
+			ctx := context.Background()
 			conn := c.(driver.ConnBeginTx)
 			txn, err := conn.BeginTx(ctx, driver.TxOptions{})
 			if err != nil {
@@ -261,7 +327,7 @@ func TestNonRetriableErrorOnAutoCommit(t *testing.T) {
 		},
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	sqlDB.SetMaxOpenConns(1)
 
@@ -290,7 +356,7 @@ func TestErrorOnRollback(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingProposalFilter: func(fArgs storagebase.ProposalFilterArgs) *roachpb.Error {
+				TestingProposalFilter: func(fArgs kvserverbase.ProposalFilterArgs) *roachpb.Error {
 					if !fArgs.Req.IsSingleRequest() {
 						return nil
 					}
@@ -315,7 +381,7 @@ func TestErrorOnRollback(t *testing.T) {
 		},
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	ctx := context.TODO()
+	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
 	if _, err := sqlDB.Exec(`
@@ -379,7 +445,7 @@ func TestHalloweenProblemAvoidance(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Insecure = true
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 CREATE DATABASE t;
@@ -428,7 +494,7 @@ func TestAppNameStatisticsInitialization(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Insecure = true
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Prepare a session with a custom application name.
 	pgURL := url.URL{
@@ -478,7 +544,7 @@ func TestQueryProgress(t *testing.T) {
 	var queryRunningAtomic, scannedBatchesAtomic int64
 	stalled, unblock := make(chan struct{}), make(chan struct{})
 
-	tableKey := roachpb.Key(keys.MakeTablePrefix(keys.MinNonPredefinedUserDescID + 1))
+	tableKey := keys.SystemSQLCodec.TablePrefix(keys.MinNonPredefinedUserDescID + 1)
 	tableSpan := roachpb.Span{Key: tableKey, EndKey: tableKey.PrefixEnd()}
 
 	// Install a store filter which, if queryRunningAtomic is 1, will count scan
@@ -509,7 +575,7 @@ func TestQueryProgress(t *testing.T) {
 		},
 	}
 	s, rawDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	db := sqlutils.MakeSQLRunner(rawDB)
 
@@ -557,4 +623,223 @@ func TestQueryProgress(t *testing.T) {
 	// non-deterministic so we could see 47% done or 53% done, etc. To avoid being
 	// flaky, we just make sure we see one of 4x% or 5x%
 	require.Regexp(t, `executing \([45]\d\.`, progress)
+}
+
+// This test ensures that when in an explicit transaction, statement preparation
+// uses the user's transaction and thus properly interacts with deadlock
+// detection.
+func TestPrepareInExplicitTransactionDoesNotDeadlock(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+
+	testDB := sqlutils.MakeSQLRunner(sqlDB)
+	testDB.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
+	testDB.Exec(t, "CREATE TABLE bar (i INT PRIMARY KEY)")
+
+	tx1, err := sqlDB.Begin()
+	require.NoError(t, err)
+
+	tx2, err := sqlDB.Begin()
+	require.NoError(t, err)
+
+	// So now I really want to try to have a deadlock.
+
+	_, err = tx1.Exec("ALTER TABLE foo ADD COLUMN j INT NOT NULL")
+	require.NoError(t, err)
+
+	_, err = tx2.Exec("ALTER TABLE bar ADD COLUMN j INT NOT NULL")
+	require.NoError(t, err)
+
+	// Now we want tx2 to get blocked on tx1 and stay blocked, then we want to
+	// push tx1 above tx2 and have it get blocked in planning.
+	errCh := make(chan error)
+	go func() {
+		_, err := tx2.Exec("ALTER TABLE foo ADD COLUMN k INT NOT NULL")
+		errCh <- err
+	}()
+	select {
+	case <-time.After(time.Millisecond):
+	case err := <-errCh:
+		t.Fatalf("expected the transaction to block, got %v", err)
+	default:
+	}
+
+	// Read from foo so that we can push tx1 above tx2.
+	testDB.Exec(t, "SELECT count(*) FROM foo")
+
+	// Write into foo to push tx1
+	_, err = tx1.Exec("INSERT INTO foo VALUES (1)")
+	require.NoError(t, err)
+
+	// Plan a query which will resolve bar during planning time, this would block
+	// and deadlock if it were run on a new transaction.
+	_, err = tx1.Prepare("SELECT NULL FROM [SHOW COLUMNS FROM bar] LIMIT 1")
+	require.NoError(t, err)
+
+	// Try to commit tx1. Either it should get a RETRY_SERIALIZABLE error or
+	// tx2 should. Ensure that either one or both of them does.
+	if tx1Err := tx1.Commit(); tx1Err == nil {
+		// tx1 committed successfully, ensure tx2 failed.
+		tx2ExecErr := <-errCh
+		require.Regexp(t, "RETRY_SERIALIZABLE", tx2ExecErr)
+		_ = tx2.Rollback()
+	} else {
+		require.Regexp(t, "RETRY_SERIALIZABLE", tx1Err)
+		tx2ExecErr := <-errCh
+		require.NoError(t, tx2ExecErr)
+		if tx2CommitErr := tx2.Commit(); tx2CommitErr != nil {
+			require.Regexp(t, "RETRY_SERIALIZABLE", tx2CommitErr)
+		}
+	}
+}
+
+// TestRetriableErrorDuringPrepare ensures that when preparing and using a new
+// transaction, retriable errors are handled properly and do not propagate to
+// the user's transaction.
+func TestRetriableErrorDuringPrepare(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const uniqueString = "'a very unique string'"
+	var failed int64
+	const numToFail = 2 // only fail on the first two attempts
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				BeforePrepare: func(ctx context.Context, stmt string, txn *kv.Txn) error {
+					if strings.Contains(stmt, uniqueString) && atomic.AddInt64(&failed, 1) <= numToFail {
+						return roachpb.NewTransactionRetryWithProtoRefreshError("boom",
+							txn.ID(), *txn.TestingCloneTxn())
+					}
+					return nil
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(context.Background())
+
+	testDB := sqlutils.MakeSQLRunner(sqlDB)
+	testDB.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
+
+	stmt, err := sqlDB.Prepare("SELECT " + uniqueString)
+	require.NoError(t, err)
+	defer func() { _ = stmt.Close() }()
+}
+
+// This test ensures that when in an explicit transaction and statement
+// preparation uses the user's transaction, errors during those planning queries
+// are handled correctly.
+func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	filter := newDynamicRequestFilter()
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				TestingRequestFilter: filter.filter,
+			},
+		},
+	})
+	defer s.Stopper().Stop(context.Background())
+
+	testDB := sqlutils.MakeSQLRunner(sqlDB)
+	testDB.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
+	testDB.Exec(t, "CREATE TABLE bar (i INT PRIMARY KEY)")
+
+	// This test will create an explicit transaction that encounters an error on
+	// a latter statement during planning of SHOW COLUMNS. The planning for this
+	// SHOW COLUMNS will be run in the user's transaction. The test will inject
+	// errors into the execution of that planning query and ensure that the user's
+	// transaction state evolves appropriately.
+
+	// Use pgx so that we can introspect error codes returned from cockroach.
+	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "", url.User("root"))
+	defer cleanup()
+	conf, err := pgx.ParseConnectionString(pgURL.String())
+	require.NoError(t, err)
+	conn, err := pgx.Connect(conf)
+	require.NoError(t, err)
+
+	tx, err := conn.Begin()
+	require.NoError(t, err)
+
+	_, err = tx.Exec("SAVEPOINT cockroach_restart")
+	require.NoError(t, err)
+
+	// Do something with the user's transaction so that we'll use the user
+	// transaction in the planning of the below `SHOW COLUMNS`.
+	_, err = tx.Exec("INSERT INTO foo VALUES (1)")
+	require.NoError(t, err)
+
+	// Inject an error that will happen during planning.
+	filter.setFilter(func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+		if ba.Txn == nil {
+			return nil
+		}
+		if req, ok := ba.GetArg(roachpb.Get); ok {
+			get := req.(*roachpb.GetRequest)
+			_, tableID, err := keys.SystemSQLCodec.DecodeTablePrefix(get.Key)
+			if err != nil || tableID != keys.NamespaceTableID {
+				err = nil
+				return nil
+			}
+			return roachpb.NewErrorWithTxn(
+				roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "boom"), ba.Txn)
+		}
+		return nil
+	})
+
+	// Plan a query will get a restart error during planning.
+	_, err = tx.Prepare("show_columns", "SELECT NULL FROM [SHOW COLUMNS FROM bar] LIMIT 1")
+	require.Regexp(t,
+		`restart transaction: TransactionRetryWithProtoRefreshError: TransactionRetryError: retry txn \(RETRY_REASON_UNKNOWN - boom\)`,
+		err)
+	var pgErr pgx.PgError
+	require.True(t, errors.As(err, &pgErr))
+	require.Equal(t, pgcode.SerializationFailure, pgErr.Code)
+
+	// Clear the error producing filter, restart the transaction, and run it to
+	// completion.
+	filter.setFilter(nil)
+
+	_, err = tx.Exec("ROLLBACK TO SAVEPOINT cockroach_restart")
+	require.NoError(t, err)
+
+	_, err = tx.Exec("INSERT INTO foo VALUES (1)")
+	require.NoError(t, err)
+	_, err = tx.Prepare("show_columns", "SELECT NULL FROM [SHOW COLUMNS FROM bar] LIMIT 1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+}
+
+// dynamicRequestFilter exposes a filter method which is a
+// kvserverbase.ReplicaRequestFilter but can be set dynamically.
+type dynamicRequestFilter struct {
+	v atomic.Value
+}
+
+func newDynamicRequestFilter() *dynamicRequestFilter {
+	f := &dynamicRequestFilter{}
+	f.v.Store(kvserverbase.ReplicaRequestFilter(noopRequestFilter))
+	return f
+}
+
+func (f *dynamicRequestFilter) setFilter(filter kvserverbase.ReplicaRequestFilter) {
+	if filter == nil {
+		f.v.Store(kvserverbase.ReplicaRequestFilter(noopRequestFilter))
+	} else {
+		f.v.Store(filter)
+	}
+}
+
+// noopRequestFilter is a kvserverbase.ReplicaRequestFilter.
+func (f *dynamicRequestFilter) filter(
+	ctx context.Context, request roachpb.BatchRequest,
+) *roachpb.Error {
+	return f.v.Load().(kvserverbase.ReplicaRequestFilter)(ctx, request)
+}
+
+// noopRequestFilter is a kvserverbase.ReplicaRequestFilter that does nothing.
+func noopRequestFilter(ctx context.Context, request roachpb.BatchRequest) *roachpb.Error {
+	return nil
 }

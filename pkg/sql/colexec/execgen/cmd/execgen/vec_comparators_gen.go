@@ -27,19 +27,23 @@ func genVecComparators(wr io.Writer) error {
 		return err
 	}
 	s := string(d)
-	s = strings.Replace(s, "_TYPE", "{{.LTyp}}", -1)
-	s = strings.Replace(s, "_GOTYPESLICE", "{{.LTyp.GoTypeSliceName}}", -1)
-	compareRe := makeFunctionRegex("_COMPARE", 3)
-	s = compareRe.ReplaceAllString(s, makeTemplateFunctionCall("Compare", 3))
 
-	s = replaceManipulationFuncs(".LTyp", s)
+	s = strings.ReplaceAll(s, "_CANONICAL_TYPE_FAMILY", "{{.CanonicalTypeFamilyStr}}")
+	s = strings.ReplaceAll(s, "_TYPE_WIDTH", "{{.Width}}{{if eq .Width -1}}: default{{end}}")
+	s = strings.ReplaceAll(s, "_GOTYPESLICE", "{{.GoTypeSliceName}}")
+	s = strings.ReplaceAll(s, "_TYPE", "{{.VecMethod}}")
+
+	compareRe := makeFunctionRegex("_COMPARE", 5)
+	s = compareRe.ReplaceAllString(s, makeTemplateFunctionCall("Compare", 5))
+
+	s = replaceManipulationFuncs(s)
 
 	tmpl, err := template.New("vec_comparators").Parse(s)
 	if err != nil {
 		return err
 	}
 
-	return tmpl.Execute(wr, sameTypeComparisonOpToOverloads[tree.LT])
+	return tmpl.Execute(wr, sameTypeComparisonOpToOverloads[tree.EQ])
 }
 
 func init() {

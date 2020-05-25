@@ -16,11 +16,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const configGossipTTL = 0 // does not expire
@@ -93,8 +93,9 @@ func (r *Replica) MaybeGossipSystemConfig(ctx context.Context) error {
 	// TODO(marc): check for bad split in the middle of the SystemConfig span.
 	loadedCfg, err := r.loadSystemConfig(ctx)
 	if err != nil {
-		if err == errSystemConfigIntent {
+		if errors.Is(err, errSystemConfigIntent) {
 			log.VEventf(ctx, 2, "not gossiping system config because intents were found on SystemConfigSpan")
+			r.markSystemConfigGossipFailed()
 			return nil
 		}
 		return errors.Wrap(err, "could not load SystemConfig span")
@@ -103,6 +104,9 @@ func (r *Replica) MaybeGossipSystemConfig(ctx context.Context) error {
 	if gossipedCfg := r.store.Gossip().GetSystemConfig(); gossipedCfg != nil && gossipedCfg.Equal(loadedCfg) &&
 		r.store.Gossip().InfoOriginatedHere(gossip.KeySystemConfig) {
 		log.VEventf(ctx, 2, "not gossiping unchanged system config")
+		// Clear the failure bit if all intents have been resolved but there's
+		// nothing new to gossip.
+		r.markSystemConfigGossipSuccess()
 		return nil
 	}
 
@@ -110,7 +114,21 @@ func (r *Replica) MaybeGossipSystemConfig(ctx context.Context) error {
 	if err := r.store.Gossip().AddInfoProto(gossip.KeySystemConfig, loadedCfg, 0); err != nil {
 		return errors.Wrap(err, "failed to gossip system config")
 	}
+	r.markSystemConfigGossipSuccess()
 	return nil
+}
+
+// MaybeGossipSystemConfigIfHaveFailure is a trigger to gossip the system config
+// due to an abort of a transaction keyed in the system config span. It will
+// call MaybeGossipSystemConfig if failureToGossipSystemConfig is true.
+func (r *Replica) MaybeGossipSystemConfigIfHaveFailure(ctx context.Context) error {
+	r.mu.RLock()
+	failed := r.mu.failureToGossipSystemConfig
+	r.mu.RUnlock()
+	if !failed {
+		return nil
+	}
+	return r.MaybeGossipSystemConfig(ctx)
 }
 
 // MaybeGossipNodeLiveness gossips information for all node liveness
@@ -137,7 +155,7 @@ func (r *Replica) MaybeGossipNodeLiveness(ctx context.Context, span roachpb.Span
 	defer rw.Close()
 
 	br, result, pErr :=
-		evaluateBatch(ctx, storagebase.CmdIDKey(""), rw, rec, nil, &ba, true /* readOnly */)
+		evaluateBatch(ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, &ba, true /* readOnly */)
 	if pErr != nil {
 		return errors.Wrapf(pErr.GoError(), "couldn't scan node liveness records in span %s", span)
 	}
@@ -147,7 +165,7 @@ func (r *Replica) MaybeGossipNodeLiveness(ctx context.Context, span roachpb.Span
 	kvs := br.Responses[0].GetInner().(*roachpb.ScanResponse).Rows
 	log.VEventf(ctx, 2, "gossiping %d node liveness record(s) from span %s", len(kvs), span)
 	for _, kv := range kvs {
-		var kvLiveness, gossipLiveness storagepb.Liveness
+		var kvLiveness, gossipLiveness kvserverpb.Liveness
 		if err := kv.Value.GetProto(&kvLiveness); err != nil {
 			return errors.Wrapf(err, "failed to unmarshal liveness value %s", kv.Key)
 		}
@@ -180,7 +198,7 @@ func (r *Replica) loadSystemConfig(ctx context.Context) (*config.SystemConfigEnt
 	defer rw.Close()
 
 	br, result, pErr := evaluateBatch(
-		ctx, storagebase.CmdIDKey(""), rw, rec, nil, &ba, true, /* readOnly */
+		ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, &ba, true, /* readOnly */
 	)
 	if pErr != nil {
 		return nil, pErr.GoError()
@@ -193,7 +211,7 @@ func (r *Replica) loadSystemConfig(ctx context.Context) (*config.SystemConfigEnt
 		// locked), so disallow synchronous processing (which blocks that mutex
 		// for too long and is a potential deadlock).
 		if err := r.store.intentResolver.CleanupIntentsAsync(ctx, intents, false /* allowSync */); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 		return nil, errSystemConfigIntent
 	}
@@ -216,7 +234,7 @@ func (r *Replica) getLeaseForGossip(ctx context.Context) (bool, *roachpb.Error) 
 		ctx, "storage.Replica: acquiring lease to gossip",
 		func(ctx context.Context) {
 			// Check for or obtain the lease, if none active.
-			_, _, pErr = r.redirectOnOrAcquireLease(ctx)
+			_, pErr = r.redirectOnOrAcquireLease(ctx)
 			hasLease = pErr == nil
 			if pErr != nil {
 				switch e := pErr.GetDetail().(type) {

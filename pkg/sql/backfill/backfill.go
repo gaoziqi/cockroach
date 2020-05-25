@@ -121,6 +121,7 @@ func (cb *ColumnBackfiller) Init(
 		ValNeededForCol: valNeededForCol,
 	}
 	return cb.fetcher.Init(
+		evalCtx.Codec,
 		false, /* reverse */
 		sqlbase.ScanLockingStrength_FOR_NONE,
 		false, /* returnRangeInfo */
@@ -175,6 +176,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	ru, err := row.MakeUpdater(
 		ctx,
 		txn,
+		cb.evalCtx.Codec,
 		tableDesc,
 		fkTables,
 		cb.updateCols,
@@ -297,8 +299,9 @@ type IndexBackfiller struct {
 	// colIdxMap maps ColumnIDs to indices into desc.Columns and desc.Mutations.
 	colIdxMap map[sqlbase.ColumnID]int
 
-	types   []types.T
+	types   []*types.T
 	rowVals tree.Datums
+	evalCtx *tree.EvalContext
 }
 
 // ContainsInvertedIndex returns true if backfilling an inverted index.
@@ -312,7 +315,10 @@ func (ib *IndexBackfiller) ContainsInvertedIndex() bool {
 }
 
 // Init initializes an IndexBackfiller.
-func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
+func (ib *IndexBackfiller) Init(
+	evalCtx *tree.EvalContext, desc *sqlbase.ImmutableTableDescriptor,
+) error {
+	ib.evalCtx = evalCtx
 	numCols := len(desc.Columns)
 	cols := desc.Columns
 	if len(desc.Mutations) > 0 {
@@ -346,7 +352,7 @@ func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
 		}
 	}
 
-	ib.types = make([]types.T, len(cols))
+	ib.types = make([]*types.T, len(cols))
 	for i := range cols {
 		ib.types[i] = cols[i].Type
 	}
@@ -364,6 +370,7 @@ func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
 		ValNeededForCol: valNeededForCol,
 	}
 	return ib.fetcher.Init(
+		evalCtx.Codec,
 		false, /* reverse */
 		sqlbase.ScanLockingStrength_FOR_NONE,
 		false, /* returnRangeInfo */
@@ -426,8 +433,14 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 		// not want to include empty k/v pairs while backfilling.
 		buffer = buffer[:0]
 		if buffer, err = sqlbase.EncodeSecondaryIndexes(
-			tableDesc.TableDesc(), ib.added, ib.colIdxMap,
-			ib.rowVals, buffer, false /* includeEmpty */); err != nil {
+			ib.evalCtx.Codec,
+			tableDesc.TableDesc(),
+			ib.added,
+			ib.colIdxMap,
+			ib.rowVals,
+			buffer,
+			false, /* includeEmpty */
+		); err != nil {
 			return nil, nil, err
 		}
 		entries = append(entries, buffer...)

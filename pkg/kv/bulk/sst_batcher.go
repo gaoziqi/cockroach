@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -28,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -139,7 +139,7 @@ func (b *SSTBatcher) AddMVCCKey(ctx context.Context, key storage.MVCCKey, value 
 			return nil
 		}
 
-		var err storagebase.DuplicateKeyError
+		err := &kvserverbase.DuplicateKeyError{}
 		err.Key = append(err.Key, key.Key...)
 		err.Value = append(err.Value, value...)
 		return err
@@ -271,13 +271,13 @@ func (b *SSTBatcher) doFlush(ctx context.Context, reason int, nextKey roachpb.Ke
 		// minimizes impact on other adders (e.g. causing extra SST splitting).
 		if b.flushCounts.total == 1 {
 			if splitAt, err := keys.EnsureSafeSplitKey(start); err != nil {
-				log.Warning(ctx, err)
+				log.Warningf(ctx, "%v", err)
 			} else {
 				// NB: Passing 'hour' here is technically illegal until 19.2 is
 				// active, but the value will be ignored before that, and we don't
 				// have access to the cluster version here.
 				if err := b.db.SplitAndScatter(ctx, splitAt, hour); err != nil {
-					log.Warning(ctx, err)
+					log.Warningf(ctx, "%v", err)
 				}
 			}
 		}
@@ -319,7 +319,7 @@ func (b *SSTBatcher) doFlush(ctx context.Context, reason int, nextKey roachpb.Ke
 		if b.splitAfter != nil {
 			if splitAfter := b.splitAfter(); b.flushedToCurrentRange > splitAfter && nextKey != nil {
 				if splitAt, err := keys.EnsureSafeSplitKey(nextKey); err != nil {
-					log.Warning(ctx, err)
+					log.Warningf(ctx, "%v", err)
 				} else {
 					beforeSplit := timeutil.Now()
 
@@ -429,7 +429,7 @@ func AddSSTable(
 					return nil
 				}
 				// This range has split -- we need to split the SST to try again.
-				if m, ok := errors.Cause(err).(*roachpb.RangeKeyMismatchError); ok {
+				if m := (*roachpb.RangeKeyMismatchError)(nil); errors.As(err, &m) {
 					split := m.MismatchedRange.EndKey.AsRawKey()
 					log.Infof(ctx, "SSTable cannot be added spanning range bounds %v, retrying...", split)
 					left, right, err := createSplitSSTable(ctx, db, item.start, split, item.disallowShadowing, iter, settings)
@@ -451,7 +451,7 @@ func AddSSTable(
 					return nil
 				}
 				// Retry on AmbiguousResult.
-				if _, ok := err.(*roachpb.AmbiguousResultError); ok {
+				if errors.HasType(err, (*roachpb.AmbiguousResultError)(nil)) {
 					log.Warningf(ctx, "addsstable [%s,%s) attempt %d failed: %+v", start, end, i, err)
 					continue
 				}

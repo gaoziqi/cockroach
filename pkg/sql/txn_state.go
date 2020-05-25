@@ -50,6 +50,9 @@ type txnState struct {
 		syncutil.RWMutex
 
 		txn *kv.Txn
+
+		// txnStart records the time that txn started.
+		txnStart time.Time
 	}
 
 	// connCtx is the connection's context. This is the parent of Ctx.
@@ -196,11 +199,12 @@ func (ts *txnState) resetForNewSQLTxn(
 	ts.mon.Start(ts.Ctx, tranCtx.connMon, mon.BoundAccount{} /* reserved */)
 	ts.mu.Lock()
 	if txn == nil {
-		ts.mu.txn = kv.NewTxnWithSteppingEnabled(ts.Ctx, tranCtx.db, tranCtx.nodeID)
+		ts.mu.txn = kv.NewTxnWithSteppingEnabled(ts.Ctx, tranCtx.db, tranCtx.nodeIDOrZero)
 		ts.mu.txn.SetDebugName(opName)
 	} else {
 		ts.mu.txn = txn
 	}
+	ts.mu.txnStart = timeutil.Now()
 	ts.mu.Unlock()
 	if historicalTimestamp != nil {
 		ts.setHistoricalTimestamp(ts.Ctx, *historicalTimestamp)
@@ -245,6 +249,7 @@ func (ts *txnState) finishSQLTxn() {
 	ts.Ctx = nil
 	ts.mu.Lock()
 	ts.mu.txn = nil
+	ts.mu.txnStart = time.Time{}
 	ts.mu.Unlock()
 	ts.recordingThreshold = 0
 }
@@ -394,9 +399,9 @@ type advanceInfo struct {
 
 // transitionCtx is a bag of fields needed by some state machine events.
 type transitionCtx struct {
-	db     *kv.DB
-	nodeID roachpb.NodeID
-	clock  *hlc.Clock
+	db           *kv.DB
+	nodeIDOrZero roachpb.NodeID // zero on SQL tenant servers, see #48008
+	clock        *hlc.Clock
 	// connMon is the connExecutor's monitor. New transactions will create a child
 	// monitor tracking txn-scoped objects.
 	connMon *mon.BytesMonitor

@@ -29,9 +29,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/cockroach/pkg/workload/tpcc"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/ttycolor"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 type tpccOptions struct {
@@ -238,6 +238,8 @@ func registerTPCC(r *testRegistry) {
 		},
 	})
 	mixedHeadroomSpec := makeClusterSpec(5, cpu(16))
+
+	// TODO(tbg): rewrite and extend this using the harness in versionupgrade.go.
 	r.Add(testSpec{
 		// mixed-headroom is similar to w=headroom, but with an additional node
 		// and on a mixed version cluster. It simulates a real production
@@ -285,14 +287,14 @@ func registerTPCC(r *testRegistry) {
 		},
 	})
 	r.Add(testSpec{
-		Name:       "weekly/tpcc-max",
+		Name:       "weekly/tpcc/headroom",
 		Owner:      OwnerKV,
 		MinVersion: maybeMinVersionForFixturesImport(cloud),
 		Tags:       []string{`weekly`},
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Timeout:    time.Duration(6*24)*time.Hour + time.Duration(10)*time.Minute,
 		Run: func(ctx context.Context, t *test, c *cluster) {
-			warehouses := 1350
+			warehouses := 1000
 			runTPCC(ctx, t, c, tpccOptions{
 				Warehouses: warehouses,
 				Duration:   6 * 24 * time.Hour,
@@ -338,8 +340,8 @@ func registerTPCC(r *testRegistry) {
 		Nodes: 3,
 		CPUs:  16,
 
-		LoadWarehouses: gceOrAws(cloud, 2000, 2500),
-		EstimatedMax:   gceOrAws(cloud, 1600, 2350),
+		LoadWarehouses: gceOrAws(cloud, 2000, 3000),
+		EstimatedMax:   gceOrAws(cloud, 1600, 2500),
 	})
 	registerTPCCBenchSpec(r, tpccBenchSpec{
 		Nodes: 12,
@@ -365,7 +367,7 @@ func registerTPCC(r *testRegistry) {
 		LoadConfig:   multiLoadgen,
 
 		LoadWarehouses: 5000,
-		EstimatedMax:   2200,
+		EstimatedMax:   3000,
 
 		MinVersion: "v19.1.0",
 	})
@@ -601,8 +603,8 @@ func loadTPCCBench(
 		// before restoring.
 		c.Wipe(ctx, roachNodes)
 		c.Start(ctx, t, append(b.startOpts(), roachNodes)...)
-	} else if pqErr, ok := err.(*pq.Error); !ok ||
-		string(pqErr.Code) != pgcode.InvalidCatalogName {
+	} else if pqErr := (*pq.Error)(nil); !(errors.As(err, &pqErr) &&
+		string(pqErr.Code) == pgcode.InvalidCatalogName) {
 		return err
 	}
 

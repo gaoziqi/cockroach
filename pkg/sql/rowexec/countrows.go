@@ -36,7 +36,7 @@ var _ execinfra.RowSource = &countAggregator{}
 
 const countRowsProcName = "count rows"
 
-var outputTypes = []types.T{*types.Int}
+var outputTypes = []*types.T{types.Int}
 
 func newCountAggregator(
 	flowCtx *execinfra.FlowCtx,
@@ -90,8 +90,13 @@ func (ag *countAggregator) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMet
 			ret := make(sqlbase.EncDatumRow, 1)
 			ret[0] = sqlbase.EncDatum{Datum: tree.NewDInt(tree.DInt(ag.count))}
 			rendered, _, err := ag.Out.ProcessRow(ag.Ctx, ret)
-			// We're done as soon as we process our one output row.
-			ag.MoveToDraining(err)
+			// We're done as soon as we process our one output row, so we
+			// transition into draining state. We will, however, return non-nil
+			// error (if such occurs during rendering) separately below.
+			ag.MoveToDraining(nil /* err */)
+			if err != nil {
+				return nil, &execinfrapb.ProducerMetadata{Err: err}
+			}
 			return rendered, nil
 		}
 		ag.count++

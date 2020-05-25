@@ -11,11 +11,12 @@
 package exec
 
 import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -25,6 +26,13 @@ import (
 // Node represents a node in the execution tree
 // (currently maps to sql.planNode).
 type Node interface{}
+
+// BufferNode is a node returned by ConstructBuffer.
+type BufferNode interface {
+	Node
+
+	BufferNodeMarker()
+}
 
 // Plan represents the plan for a query (currently maps to sql.planTop).
 // For simple queries, the plan is associated with a single Node tree.
@@ -50,12 +58,10 @@ type Factory interface {
 	//   - Only the given set of needed columns are part of the result.
 	//   - If indexConstraint is not nil, the scan is restricted to the spans in
 	//     in the constraint.
-	//   - If hardLimit > 0, then only up to hardLimit rows can be returned from
-	//     the scan. If hardLimit > 0, softLimit must be 0.
+	//   - If hardLimit > 0, then the scan returns only up to hardLimit rows.
 	//   - If softLimit > 0, then the scan may be required to return up to all
-	//     of its rows, but can be optimized under the assumption that only
-	//     softLimit rows will be needed. If softLimit > 0, then hardLimit must
-	//     be 0.
+	//     of its rows (or up to the hardLimit if it is set), but can be optimized
+	//     under the assumption that only softLimit rows will be needed.
 	//   - If maxResults > 0, the scan is guaranteed to return at most maxResults
 	//     rows.
 	//   - If locking is provided, the scan should use the specified row-level
@@ -63,7 +69,7 @@ type Factory interface {
 	ConstructScan(
 		table cat.Table,
 		index cat.Index,
-		needed ColumnOrdinalSet,
+		needed TableColumnOrdinalSet,
 		indexConstraint *constraint.Constraint,
 		hardLimit int64,
 		softLimit int64,
@@ -73,11 +79,6 @@ type Factory interface {
 		rowCount float64,
 		locking *tree.LockingItem,
 	) (Node, error)
-
-	// ConstructVirtualScan returns a node that represents the scan of a virtual
-	// table. Virtual tables are system tables that are populated "on the fly"
-	// with rows synthesized from system metadata and other state.
-	ConstructVirtualScan(table cat.Table) (Node, error)
 
 	// ConstructFilter returns a node that applies a filter on the results of
 	// the given input node.
@@ -90,13 +91,14 @@ type Factory interface {
 	// The colNames argument is optional; if it is nil, the names of the
 	// corresponding input columns are kept.
 	ConstructSimpleProject(
-		n Node, cols []ColumnOrdinal, colNames []string, reqOrdering OutputOrdering,
+		n Node, cols []NodeColumnOrdinal, colNames []string, reqOrdering OutputOrdering,
 	) (Node, error)
 
 	// ConstructRender returns a node that applies a projection on the results of
-	// the given input node. The projection can contain new expressions.
+	// the given input node. The projection can contain new expressions. The input
+	// expression slice will be modified.
 	ConstructRender(
-		n Node, exprs tree.TypedExprs, colNames []string, reqOrdering OutputOrdering,
+		n Node, columns sqlbase.ResultColumns, exprs tree.TypedExprs, reqOrdering OutputOrdering,
 	) (Node, error)
 
 	// ConstructApplyJoin returns a node that runs an apply join between an input
@@ -106,32 +108,17 @@ type Factory interface {
 	// the data in leftBoundColMap. The apply join can be any kind of join except
 	// for right outer and full outer.
 	//
-	// leftBoundColMap is a map from opt.ColumnID to opt.ColumnOrdinal that maps
-	// a column bound by the left side of the apply join to the column ordinal
-	// in the left side that contains the binding.
-	//
-	// memo, rightProps, and right are the memo, required physical properties, and
-	// RelExpr of the right side of the join that will be repeatedly modified,
-	// re-planned and executed for every row from the left side. The rightProps
-	// always includes a presentation.
-	//
-	// fakeRight is a pre-planned node that is the right side of the join with
-	// all outer columns replaced by NULL. The physical properties of this node
-	// (its output columns, their order and types) are used to pre-determine the
-	// runtime indexes and types for the right side of the apply join, since all
-	// re-plannings of the right hand side will be pinned to output the exact
-	// same output columns in the same order.
+	// To plan the right-hand side, planRightSideFn must be called for each left
+	// row. This function generates a plan (using the same factory) that produces
+	// the rightColumns (in order).
 	//
 	// onCond is the join condition.
 	ConstructApplyJoin(
 		joinType sqlbase.JoinType,
 		left Node,
-		leftBoundColMap opt.ColMap,
-		memo *memo.Memo,
-		rightProps *physical.Required,
-		fakeRight Node,
-		right memo.RelExpr,
+		rightColumns sqlbase.ResultColumns,
 		onCond tree.TypedExpr,
+		planRightSideFn ApplyJoinPlanRightSideFn,
 	) (Node, error)
 
 	// ConstructHashJoin returns a node that runs a hash-join between the results
@@ -145,7 +132,7 @@ type Factory interface {
 	ConstructHashJoin(
 		joinType sqlbase.JoinType,
 		left, right Node,
-		leftEqCols, rightEqCols []ColumnOrdinal,
+		leftEqCols, rightEqCols []NodeColumnOrdinal,
 		leftEqColsAreKey, rightEqColsAreKey bool,
 		extraOnCond tree.TypedExpr,
 	) (Node, error)
@@ -172,7 +159,7 @@ type Factory interface {
 	// for each distinct set of values on the set of columns in the ordering).
 	ConstructGroupBy(
 		input Node,
-		groupCols []ColumnOrdinal,
+		groupCols []NodeColumnOrdinal,
 		groupColOrdering sqlbase.ColumnOrdering,
 		aggregations []AggInfo,
 		reqOrdering OutputOrdering,
@@ -190,7 +177,7 @@ type Factory interface {
 	// columns are a contiguous part of the input).
 	ConstructDistinct(
 		input Node,
-		distinctCols, orderedCols ColumnOrdinalSet,
+		distinctCols, orderedCols NodeColumnOrdinalSet,
 		reqOrdering OutputOrdering,
 		nullsAreDistinct bool,
 		errorOnDup string,
@@ -220,12 +207,12 @@ type Factory interface {
 	ConstructIndexJoin(
 		input Node,
 		table cat.Table,
-		keyCols []ColumnOrdinal,
-		tableCols ColumnOrdinalSet,
+		keyCols []NodeColumnOrdinal,
+		tableCols TableColumnOrdinalSet,
 		reqOrdering OutputOrdering,
 	) (Node, error)
 
-	// ConstructLookupJoin returns a node that preforms a lookup join.
+	// ConstructLookupJoin returns a node that performs a lookup join.
 	// The eqCols are columns from the input used as keys for the columns of the
 	// index (or a prefix of them); lookupCols are ordinals for the table columns
 	// we are retrieving.
@@ -238,9 +225,30 @@ type Factory interface {
 		input Node,
 		table cat.Table,
 		index cat.Index,
-		eqCols []ColumnOrdinal,
+		eqCols []NodeColumnOrdinal,
 		eqColsAreKey bool,
-		lookupCols ColumnOrdinalSet,
+		lookupCols TableColumnOrdinalSet,
+		onCond tree.TypedExpr,
+		reqOrdering OutputOrdering,
+	) (Node, error)
+
+	// ConstructGeoLookupJoin returns a node that performs a geospatial lookup
+	// join. geoRelationshipType describes the type of geospatial relationship
+	// represented by the join. geoCol is the geospatial column from the input
+	// that will be used to look up into the index; lookupCols are ordinals for
+	// the table columns we are retrieving.
+	//
+	// The node produces the columns in the input and (unless join type is
+	// LeftSemiJoin or LeftAntiJoin) the lookupCols, ordered by ordinal. The ON
+	// condition can refer to these using IndexedVars.
+	ConstructGeoLookupJoin(
+		joinType sqlbase.JoinType,
+		geoRelationshipType geoindex.RelationshipType,
+		input Node,
+		table cat.Table,
+		index cat.Index,
+		geoCol NodeColumnOrdinal,
+		lookupCols TableColumnOrdinalSet,
 		onCond tree.TypedExpr,
 		reqOrdering OutputOrdering,
 	) (Node, error)
@@ -256,10 +264,10 @@ type Factory interface {
 		leftIndex cat.Index,
 		rightTable cat.Table,
 		rightIndex cat.Index,
-		leftEqCols []ColumnOrdinal,
-		rightEqCols []ColumnOrdinal,
-		leftCols ColumnOrdinalSet,
-		rightCols ColumnOrdinalSet,
+		leftEqCols []NodeColumnOrdinal,
+		rightEqCols []NodeColumnOrdinal,
+		leftCols NodeColumnOrdinalSet,
+		rightCols NodeColumnOrdinalSet,
 		onCond tree.TypedExpr,
 		fixedVals []Node,
 		reqOrdering OutputOrdering,
@@ -290,14 +298,19 @@ type Factory interface {
 	RenameColumns(input Node, colNames []string) (Node, error)
 
 	// ConstructPlan creates a plan enclosing the given plan and (optionally)
-	// subqueries and postqueries.
+	// subqueries, cascades, and checks.
 	//
 	// Subqueries are executed before the root tree, which can refer to subquery
 	// results using tree.Subquery nodes.
 	//
-	// Postqueries are executed after the root tree. They don't return results but
-	// can generate errors (e.g. foreign key check failures).
-	ConstructPlan(root Node, subqueries []Subquery, postqueries []Node) (Plan, error)
+	// Cascades are executed after the root tree. They can return more cascades
+	// and checks which should also be executed.
+	//
+	// Checks are executed after all cascades have been executed. They don't
+	// return results but can generate errors (e.g. foreign key check failures).
+	ConstructPlan(
+		root Node, subqueries []Subquery, cascades []Cascade, checks []Node,
+	) (Plan, error)
 
 	// ConstructExplain returns a node that implements EXPLAIN (OPT), showing
 	// information about the given plan.
@@ -327,12 +340,12 @@ type Factory interface {
 	//
 	// If skipFKChecks is set, foreign keys are not checked as part of the
 	// execution of the insertion. This is used when the FK checks are planned by
-	// the optimizer and are run separately as plan postqueries.
+	// the optimizer and are run separately as plan checks.
 	ConstructInsert(
 		input Node,
 		table cat.Table,
-		insertCols ColumnOrdinalSet,
-		returnCols ColumnOrdinalSet,
+		insertCols TableColumnOrdinalSet,
+		returnCols TableColumnOrdinalSet,
 		checkCols CheckOrdinalSet,
 		allowAutoCommit bool,
 		skipFKChecks bool,
@@ -354,8 +367,8 @@ type Factory interface {
 	ConstructInsertFastPath(
 		rows [][]tree.TypedExpr,
 		table cat.Table,
-		insertCols ColumnOrdinalSet,
-		returnCols ColumnOrdinalSet,
+		insertCols TableColumnOrdinalSet,
+		returnCols TableColumnOrdinalSet,
 		checkCols CheckOrdinalSet,
 		fkChecks []InsertFastPathFKCheck,
 	) (Node, error)
@@ -384,13 +397,13 @@ type Factory interface {
 	//
 	// If skipFKChecks is set, foreign keys are not checked as part of the
 	// execution of the insertion. This is used when the FK checks are planned by
-	// the optimizer and are run separately as plan postqueries.
+	// the optimizer and are run separately as plan checks.
 	ConstructUpdate(
 		input Node,
 		table cat.Table,
-		fetchCols ColumnOrdinalSet,
-		updateCols ColumnOrdinalSet,
-		returnCols ColumnOrdinalSet,
+		fetchCols TableColumnOrdinalSet,
+		updateCols TableColumnOrdinalSet,
+		returnCols TableColumnOrdinalSet,
 		checks CheckOrdinalSet,
 		passthrough sqlbase.ResultColumns,
 		allowAutoCommit bool,
@@ -429,15 +442,15 @@ type Factory interface {
 	// If skipFKChecks is set, foreign keys are not checked as part of the
 	// execution of the upsert for the insert half. This is used when the FK
 	// checks are planned by the optimizer and are run separately as plan
-	// postqueries.
+	// checks.
 	ConstructUpsert(
 		input Node,
 		table cat.Table,
-		canaryCol ColumnOrdinal,
-		insertCols ColumnOrdinalSet,
-		fetchCols ColumnOrdinalSet,
-		updateCols ColumnOrdinalSet,
-		returnCols ColumnOrdinalSet,
+		canaryCol NodeColumnOrdinal,
+		insertCols TableColumnOrdinalSet,
+		fetchCols TableColumnOrdinalSet,
+		updateCols TableColumnOrdinalSet,
+		returnCols TableColumnOrdinalSet,
 		checks CheckOrdinalSet,
 		allowAutoCommit bool,
 		skipFKChecks bool,
@@ -458,23 +471,41 @@ type Factory interface {
 	//
 	// If skipFKChecks is set, foreign keys are not checked as part of the
 	// execution of the delete. This is used when the FK checks are planned
-	// by the optimizer and are run separately as plan postqueries.
+	// by the optimizer and are run separately as plan checks.
 	ConstructDelete(
 		input Node,
 		table cat.Table,
-		fetchCols ColumnOrdinalSet,
-		returnCols ColumnOrdinalSet,
+		fetchCols TableColumnOrdinalSet,
+		returnCols TableColumnOrdinalSet,
 		allowAutoCommit bool,
 		skipFKChecks bool,
 	) (Node, error)
 
 	// ConstructDeleteRange creates a node that efficiently deletes contiguous
 	// rows stored in the given table's primary index. This fast path is only
-	// possible when certain conditions hold true (see canUseDeleteRange for more
-	// details). See the comment for ConstructScan for descriptions of the
-	// parameters, since DeleteRange combines Delete + Scan into a single operator.
-	ConstructDeleteRange(table cat.Table, needed ColumnOrdinalSet, indexConstraint *constraint.Constraint,
-		maxReturnedKeys int, allowAutoCommit bool) (Node, error)
+	// possible when certain conditions hold true:
+	//  - there are no secondary indexes;
+	//  - the input to the delete is a scan (without limits);
+	//  - the table is not involved in interleaving, or it is at the root of an
+	//    interleaving hierarchy with cascading FKs such that a delete of a row
+	//    cascades and deletes all interleaved rows corresponding to that row;
+	//  - there are no inbound FKs to the table (other than within the
+	//    interleaving as described above).
+	//
+	// See the comment for ConstructScan for descriptions of the needed and
+	// indexConstraint parameters, since DeleteRange combines Delete + Scan into a
+	// single operator.
+	//
+	// If any interleavedTables are passed, they are all the descendant tables in
+	// an interleaving hierarchy we are deleting from.
+	ConstructDeleteRange(
+		table cat.Table,
+		needed TableColumnOrdinalSet,
+		indexConstraint *constraint.Constraint,
+		interleavedTables []cat.Table,
+		maxReturnedKeys int,
+		allowAutoCommit bool,
+	) (Node, error)
 
 	// ConstructCreateTable returns a node that implements a CREATE TABLE
 	// statement.
@@ -486,6 +517,7 @@ type Factory interface {
 		schema cat.Schema,
 		viewName string,
 		ifNotExists bool,
+		replace bool,
 		temporary bool,
 		viewQuery string,
 		columns sqlbase.ResultColumns,
@@ -526,11 +558,11 @@ type Factory interface {
 
 	// ConstructBuffer constructs a node whose input can be referenced from
 	// elsewhere in the query.
-	ConstructBuffer(input Node, label string) (Node, error)
+	ConstructBuffer(input Node, label string) (BufferNode, error)
 
 	// ConstructScanBuffer constructs a node which refers to a node constructed by
 	// ConstructBuffer or passed to RecursiveCTEIterationFn.
-	ConstructScanBuffer(ref Node, label string) (Node, error)
+	ConstructScanBuffer(ref BufferNode, label string) (Node, error)
 
 	// ConstructRecursiveCTE constructs a node that executes a recursive CTE:
 	//   * the initial plan is run first; the results are emitted and also saved
@@ -607,13 +639,20 @@ const (
 	SubqueryAllRows
 )
 
-// ColumnOrdinal is the 0-based ordinal index of a cat.Table column or a column
-// produced by a Node.
-// TODO(radu): separate these two usages for clarity of the interface.
-type ColumnOrdinal int32
+// TableColumnOrdinal is the 0-based ordinal index of a cat.Table column.
+// It is used when operations involve a table directly (e.g. scans, index/lookup
+// joins, mutations).
+type TableColumnOrdinal int32
 
-// ColumnOrdinalSet contains a set of ColumnOrdinal values as ints.
-type ColumnOrdinalSet = util.FastIntSet
+// TableColumnOrdinalSet contains a set of TableColumnOrdinal values.
+type TableColumnOrdinalSet = util.FastIntSet
+
+// NodeColumnOrdinal is the 0-based ordinal index of a column produced by a
+// Node. It is used when referring to a column in an input to an operator.
+type NodeColumnOrdinal int32
+
+// NodeColumnOrdinalSet contains a set of NodeColumnOrdinal values.
+type NodeColumnOrdinalSet = util.FastIntSet
 
 // CheckOrdinalSet contains the ordinal positions of a set of check constraints
 // taken from the opt.Table.Check collection.
@@ -625,7 +664,7 @@ type AggInfo struct {
 	Builtin    *tree.Overload
 	Distinct   bool
 	ResultType *types.T
-	ArgCols    []ColumnOrdinal
+	ArgCols    []NodeColumnOrdinal
 
 	// ConstArgs is the list of any constant arguments to the aggregate,
 	// for instance, the separator in string_agg.
@@ -633,7 +672,7 @@ type AggInfo struct {
 
 	// Filter is the index of the column, if any, which should be used as the
 	// FILTER condition for the aggregate. If there is no filter, Filter is -1.
-	Filter ColumnOrdinal
+	Filter NodeColumnOrdinal
 }
 
 // WindowInfo represents the information about a window function that must be
@@ -653,13 +692,13 @@ type WindowInfo struct {
 
 	// ArgIdxs is the list of column ordinals each function takes as arguments,
 	// in the same order as Exprs.
-	ArgIdxs [][]ColumnOrdinal
+	ArgIdxs [][]NodeColumnOrdinal
 
 	// FilterIdxs is the list of column indices to use as filters.
 	FilterIdxs []int
 
 	// Partition is the set of input columns to partition on.
-	Partition []ColumnOrdinal
+	Partition []NodeColumnOrdinal
 
 	// Ordering is the set of input columns to order on.
 	Ordering sqlbase.ColumnOrdering
@@ -669,7 +708,7 @@ type WindowInfo struct {
 	// boundary. We store it separately because the ordering might be simplified
 	// (when that single column is in Partition), but the execution still needs
 	// to know the original ordering.
-	RangeOffsetColumn ColumnOrdinal
+	RangeOffsetColumn NodeColumnOrdinal
 }
 
 // ExplainEnvData represents the data that's going to be displayed in EXPLAIN (env).
@@ -688,14 +727,51 @@ type KVOption struct {
 	Value tree.TypedExpr
 }
 
+// RecursiveCTEIterationFn creates a plan for an iteration of WITH RECURSIVE,
+// given the result of the last iteration (as a BufferNode).
+type RecursiveCTEIterationFn func(bufferRef BufferNode) (Plan, error)
+
+// ApplyJoinPlanRightSideFn creates a plan for an iteration of ApplyJoin, given
+// a row produced from the left side. The plan is guaranteed to produce the
+// rightColumns passed to ConstructApplyJoin (in order).
+type ApplyJoinPlanRightSideFn func(leftRow tree.Datums) (Plan, error)
+
+// Cascade describes a cascading query. The query uses a BufferNode as an input;
+// it should only be triggered if this buffer is not empty.
+type Cascade struct {
+	// FKName is the name of the foreign key constraint.
+	FKName string
+
+	// Buffer is the Node returned by ConstructBuffer which stores the input to
+	// the mutation.
+	Buffer BufferNode
+
+	// PlanFn builds the cascade query and creates the plan for it.
+	// Note that the generated Plan can in turn contain more cascades (as well as
+	// checks, which should run after all cascades are executed).
+	//
+	// The bufferRef is a reference that can be used with ConstructWithBuffer to
+	// read the mutation input. It is conceptually the same as the Buffer field;
+	// however, we allow the execution engine to provide a different copy or
+	// implementation of the node (e.g. to facilitate early cleanup of the
+	// original plan).
+	//
+	// This method does not mutate any captured state; it is ok to call PlanFn
+	// methods concurrently (provided that they don't use a single non-thread-safe
+	// execFactory).
+	PlanFn func(
+		ctx context.Context,
+		semaCtx *tree.SemaContext,
+		evalCtx *tree.EvalContext,
+		execFactory Factory,
+		bufferRef BufferNode,
+		numBufferedRows int,
+	) (Plan, error)
+}
+
 // InsertFastPathMaxRows is the maximum number of rows for which we can use the
 // insert fast path.
 const InsertFastPathMaxRows = 10000
-
-// RecursiveCTEIterationFn creates a plan for an iteration of WITH RECURSIVE,
-// given the result of the last iteration (as a Buffer that can be used with
-// ConstructScanBuffer).
-type RecursiveCTEIterationFn func(bufferRef Node) (Plan, error)
 
 // InsertFastPathFKCheck contains information about a foreign key check to be
 // performed by the insert fast-path (see ConstructInsertFastPath). It
@@ -707,7 +783,7 @@ type InsertFastPathFKCheck struct {
 	// InsertCols contains the FK columns from the origin table, in the order of
 	// the ReferencedIndex columns. For each, the value in the array indicates the
 	// index of the column in the input table.
-	InsertCols []ColumnOrdinal
+	InsertCols []TableColumnOrdinal
 
 	MatchMethod tree.CompositeKeyMatchMethod
 

@@ -14,11 +14,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
-	"github.com/pkg/errors"
 )
 
 // LocalResult is data belonging to an evaluated command that is
@@ -34,7 +34,7 @@ type LocalResult struct {
 	// resolve them is made.
 	EncounteredIntents []roachpb.Intent
 	// AcquiredLocks stores any newly acquired or re-acquired locks.
-	AcquiredLocks []roachpb.LockUpdate
+	AcquiredLocks []roachpb.LockAcquisition
 	// ResolvedLocks stores any resolved lock spans, either with finalized or
 	// pending statuses. Unlike AcquiredLocks and EncounteredIntents, values in
 	// this slice will represent spans of locks that were resolved.
@@ -57,6 +57,8 @@ type LocalResult struct {
 	GossipFirstRange bool
 	// Call MaybeGossipSystemConfig.
 	MaybeGossipSystemConfig bool
+	// Call MaybeGossipSystemConfigIfHaveFailure
+	MaybeGossipSystemConfigIfHaveFailure bool
 	// Call MaybeAddToSplitQueue.
 	MaybeAddToSplitQueue bool
 	// Call MaybeGossipNodeLiveness with the specified Span, if set.
@@ -80,6 +82,7 @@ func (lResult *LocalResult) IsZero() bool {
 		lResult.EndTxns == nil &&
 		!lResult.GossipFirstRange &&
 		!lResult.MaybeGossipSystemConfig &&
+		!lResult.MaybeGossipSystemConfigIfHaveFailure &&
 		lResult.MaybeGossipNodeLiveness == nil &&
 		!lResult.MaybeWatchForMerge &&
 		lResult.Metrics == nil
@@ -92,12 +95,14 @@ func (lResult *LocalResult) String() string {
 	return fmt.Sprintf("LocalResult (reply: %v, "+
 		"#encountered intents: %d, #acquired locks: %d, #resolved locks: %d"+
 		"#updated txns: %d #end txns: %d, "+
-		"GossipFirstRange:%t MaybeGossipSystemConfig:%t MaybeAddToSplitQueue:%t "+
+		"GossipFirstRange:%t MaybeGossipSystemConfig:%t "+
+		"MaybeGossipSystemConfigIfHaveFailure:%t MaybeAddToSplitQueue:%t "+
 		"MaybeGossipNodeLiveness:%s MaybeWatchForMerge:%t",
 		lResult.Reply,
 		len(lResult.EncounteredIntents), len(lResult.AcquiredLocks), len(lResult.ResolvedLocks),
 		len(lResult.UpdatedTxns), len(lResult.EndTxns),
-		lResult.GossipFirstRange, lResult.MaybeGossipSystemConfig, lResult.MaybeAddToSplitQueue,
+		lResult.GossipFirstRange, lResult.MaybeGossipSystemConfig,
+		lResult.MaybeGossipSystemConfigIfHaveFailure, lResult.MaybeAddToSplitQueue,
 		lResult.MaybeGossipNodeLiveness, lResult.MaybeWatchForMerge)
 }
 
@@ -146,9 +151,9 @@ func (lResult *LocalResult) DetachEndTxns(alwaysOnly bool) []EndTxnIntents {
 //    it must run when the command has applied (such as resolving intents).
 type Result struct {
 	Local        LocalResult
-	Replicated   storagepb.ReplicatedEvalResult
-	WriteBatch   *storagepb.WriteBatch
-	LogicalOpLog *storagepb.LogicalOpLog
+	Replicated   kvserverpb.ReplicatedEvalResult
+	WriteBatch   *kvserverpb.WriteBatch
+	LogicalOpLog *kvserverpb.LogicalOpLog
 }
 
 // IsZero reports whether p is the zero value.
@@ -156,7 +161,7 @@ func (p *Result) IsZero() bool {
 	if !p.Local.IsZero() {
 		return false
 	}
-	if !p.Replicated.Equal(storagepb.ReplicatedEvalResult{}) {
+	if !p.Replicated.Equal(kvserverpb.ReplicatedEvalResult{}) {
 		return false
 	}
 	if p.WriteBatch != nil {
@@ -188,7 +193,7 @@ func (p *Result) MergeAndDestroy(q Result) error {
 			return errors.New("must not specify RaftApplyIndex")
 		}
 		if p.Replicated.State == nil {
-			p.Replicated.State = &storagepb.ReplicaState{}
+			p.Replicated.State = &kvserverpb.ReplicaState{}
 		}
 		if p.Replicated.State.Desc == nil {
 			p.Replicated.State.Desc = q.Replicated.State.Desc
@@ -223,9 +228,9 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		if q.Replicated.State.Stats != nil {
 			return errors.New("must not specify Stats")
 		}
-		if (*q.Replicated.State != storagepb.ReplicaState{}) {
+		if (*q.Replicated.State != kvserverpb.ReplicaState{}) {
 			log.Fatalf(context.TODO(), "unhandled EvalResult: %s",
-				pretty.Diff(*q.Replicated.State, storagepb.ReplicaState{}))
+				pretty.Diff(*q.Replicated.State, kvserverpb.ReplicaState{}))
 		}
 		q.Replicated.State = nil
 	}
@@ -332,6 +337,7 @@ func (p *Result) MergeAndDestroy(q Result) error {
 
 	coalesceBool(&p.Local.GossipFirstRange, &q.Local.GossipFirstRange)
 	coalesceBool(&p.Local.MaybeGossipSystemConfig, &q.Local.MaybeGossipSystemConfig)
+	coalesceBool(&p.Local.MaybeGossipSystemConfigIfHaveFailure, &q.Local.MaybeGossipSystemConfigIfHaveFailure)
 	coalesceBool(&p.Local.MaybeAddToSplitQueue, &q.Local.MaybeAddToSplitQueue)
 	coalesceBool(&p.Local.MaybeWatchForMerge, &q.Local.MaybeWatchForMerge)
 

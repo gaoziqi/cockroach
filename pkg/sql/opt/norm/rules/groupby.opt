@@ -5,11 +5,7 @@
 # ConvertGroupByToDistinct converts a GroupBy operator that has no aggregations
 # to an equivalent DistinctOn operator.
 [ConvertGroupByToDistinct, Normalize]
-(GroupBy
-    $input:*
-    $aggregations:[]
-    $groupingPrivate:*
-)
+(GroupBy $input:* $aggregations:[] $groupingPrivate:*)
 =>
 (DistinctOn $input $aggregations $groupingPrivate)
 
@@ -22,33 +18,31 @@
 # replace it with a Project so that the correct columns are projected. The
 # project itself may be eliminated later by other rules.
 [EliminateDistinct, Normalize]
-(DistinctOn
+(DistinctOn | EnsureDistinctOn
     $input:*
     $aggs:*
-    $groupingPrivate:* & (ColsAreStrictKey (GroupingCols $groupingPrivate) $input)
+    $groupingPrivate:* &
+        (ColsAreStrictKey (GroupingCols $groupingPrivate) $input)
 )
 =>
-(Project
-  $input
-  []
-  (GroupingOutputCols $groupingPrivate $aggs)
-)
+(Project $input [] (GroupingOutputCols $groupingPrivate $aggs))
 
 # EliminateGroupByProject discards a nested Project operator that is only
 # removing columns from its input (and not synthesizing new ones). That's
 # something the GroupBy operators can do on their own.
 [EliminateGroupByProject, Normalize]
-(GroupBy | ScalarGroupBy | DistinctOn | UpsertDistinctOn
-    $input:(Project $innerInput:*) & (ColsAreSubset (OutputCols $input) (OutputCols $innerInput))
+(GroupBy | ScalarGroupBy | DistinctOn | EnsureDistinctOn
+        | UpsertDistinctOn | EnsureUpsertDistinctOn
+    $input:(Project $innerInput:*) &
+        (ColsAreSubset
+            (OutputCols $input)
+            (OutputCols $innerInput)
+        )
     $aggregations:*
     $groupingPrivate:*
 )
 =>
-((OpName)
-    $innerInput
-    $aggregations
-    $groupingPrivate
-)
+((OpName) $innerInput $aggregations $groupingPrivate)
 
 # ReduceGroupingCols eliminates redundant grouping columns from the GroupBy
 # operator and replaces them by ConstAgg aggregate functions. A grouping
@@ -57,12 +51,21 @@
 # Therefore, it has no effect on the grouping and can instead be represented as
 # an ConstAgg aggregate, since all rows in the group have the same value for
 # that column.
+#
+# Note: Doesn't match EnsureDistinctOn because test cases were too difficult to
+# find. If a test case for EnsureDistinctOn is found, it should be added to the
+# match pattern.
 [ReduceGroupingCols, Normalize]
 (GroupBy | DistinctOn
     $input:*
     $aggregations:*
     $groupingPrivate:* &
-        ^(ColsAreEmpty $redundantCols:(RedundantCols $input (GroupingCols $groupingPrivate)))
+        ^(ColsAreEmpty
+            $redundantCols:(RedundantCols
+                $input
+                (GroupingCols $groupingPrivate)
+            )
+        )
 )
 =>
 ((OpName)
@@ -82,13 +85,16 @@
 #   SELECT c FROM t WHERE c IS NULL
 #
 [ReduceNotNullGroupingCols, Normalize]
-(UpsertDistinctOn
+(UpsertDistinctOn | EnsureUpsertDistinctOn
     $input:*
     $aggregations:*
     $groupingPrivate:* &
         ^(ColsAreEmpty
             $redundantCols:(IntersectionCols
-                (RedundantCols $input (GroupingCols $groupingPrivate))
+                (RedundantCols
+                    $input
+                    (GroupingCols $groupingPrivate)
+                )
                 (NotNullCols $input)
             )
         )
@@ -105,13 +111,17 @@
 [EliminateAggDistinctForKeys, Normalize]
 (GroupBy | ScalarGroupBy
     $input:* & (HasStrictKey $input)
-    $aggregations:
-    [
+    $aggregations:[
         ...
         $item:(AggregationsItem (AggDistinct $agg:*))
         ...
     ]
-    $groupingPrivate:* & (CanRemoveAggDistinctForKeys $input $groupingPrivate $agg)
+    $groupingPrivate:* &
+        (CanRemoveAggDistinctForKeys
+            $input
+            $groupingPrivate
+            $agg
+        )
 )
 =>
 ((OpName)
@@ -125,56 +135,72 @@
 [EliminateAggFilteredDistinctForKeys, Normalize]
 (GroupBy | ScalarGroupBy
     $input:* & (HasStrictKey $input)
-    $aggregations:
-    [
+    $aggregations:[
         ...
-        $item:(AggregationsItem (AggFilter (AggDistinct $agg:*) $filter:*))
+        $item:(AggregationsItem
+            (AggFilter (AggDistinct $agg:*) $filter:*)
+        )
         ...
     ]
-    $groupingPrivate:* & (CanRemoveAggDistinctForKeys $input $groupingPrivate $agg)
+    $groupingPrivate:* &
+        (CanRemoveAggDistinctForKeys
+            $input
+            $groupingPrivate
+            $agg
+        )
 )
 =>
 ((OpName)
     $input
-    (ReplaceAggregationsItem $aggregations $item (AggFilter $agg $filter))
+    (ReplaceAggregationsItem
+        $aggregations
+        $item
+        (AggFilter $agg $filter)
+    )
     $groupingPrivate
 )
 
-# EliminateDistinctOnNoColumns eliminates a DistinctOn with no grouping columns,
-# replacing it with a projection and a LIMIT 1. For example:
+# EliminateDistinctNoColumns eliminates a distinct operator with no grouping
+# columns, replacing it with a projection and a LIMIT 1. For example:
 #   SELECT DISTINCT ON (a) a, b FROM ab WHERE a=1
 # is equivalent to:
 #   SELECT a, b FROM ab WHERE a=1 LIMIT 1
 #
-# Note that this rule does not apply to UpsertDistinctOn, since that will raise
-# an error if there are duplicate rows.
-[EliminateDistinctOnNoColumns, Normalize]
-(DistinctOn
+# Note that this rule does not apply to EnsureDistinctOn or
+# EnsureUpsertDistinctOn, since they will raise an error if there are duplicate
+# rows.
+[EliminateDistinctNoColumns, Normalize]
+(DistinctOn | UpsertDistinctOn
     $input:*
     $aggregations:*
     $groupingPrivate:* & (HasNoGroupingCols $groupingPrivate)
 )
 =>
 (ConstructProjectionFromDistinctOn
-    (Limit $input (Const 1) (GroupingInputOrdering $groupingPrivate))
+    (Limit
+        $input
+        (IntConst 1)
+        (GroupingInputOrdering $groupingPrivate)
+    )
     (MakeEmptyColSet)
     $aggregations
 )
 
-# EliminateUpsertDistinctOnNoColumns is similar to EliminateDistinctOnNoColumns,
-# except that it will raise an error if there are no grouping columns and the
-# input has more than one row. No grouping columns means there is at most one
-# group. And the Max1Row operator is needed to raise an error if that group has
-# more than one row, which is a requirement of the Upsert operator.
-[EliminateUpsertDistinctOnNoColumns, Normalize]
-(UpsertDistinctOn
+# EliminateEnsureDistinctNoColumns is similar to EliminateDistinctNoColumns,
+# except that Max1Row will raise an error if there are no grouping columns and
+# the input has more than one row. No grouping columns means there is at most
+# one group. And the Max1Row operator is needed to raise an error if that group
+# has more than one row, which is a requirement of the EnsureDistinct and
+# EnsureUpsertDistinct operators.
+[EliminateEnsureDistinctNoColumns, Normalize]
+(EnsureDistinctOn | EnsureUpsertDistinctOn
     $input:*
     $aggregations:*
     $groupingPrivate:* & (HasNoGroupingCols $groupingPrivate)
 )
 =>
 (ConstructProjectionFromDistinctOn
-    (Max1Row $input (DuplicateUpsertErrText))
+    (Max1Row $input (ErrorOnDup $groupingPrivate))
     (MakeEmptyColSet)
     $aggregations
 )
@@ -186,16 +212,95 @@
 # patterns that are generated by the optbuilder's upsert construction code,
 # which must ensure the same row cannot be updated twice. See the comment for
 # UpsertDistinctOn for more detail on NullsAreDistinct behavior.
+#
+# Note: Doesn't match EnsureDistinctOn because test cases were too difficult to
+# find. If a test case for EnsureDistinctOn is found, it should be added to the
+# match pattern.
 [EliminateDistinctOnValues, Normalize]
-(DistinctOn | UpsertDistinctOn
+(DistinctOn | UpsertDistinctOn | EnsureUpsertDistinctOn
     $input:*
     $aggregations:*
     $groupingPrivate:* &
-        (AreValuesDistinct $input (GroupingCols $groupingPrivate) (NullsAreDistinct (OpName)))
+        (AreValuesDistinct
+            $input
+            (GroupingCols $groupingPrivate)
+            (NullsAreDistinct $groupingPrivate)
+        )
 )
 =>
 (ConstructProjectionFromDistinctOn
     $input
     (GroupingCols $groupingPrivate)
     $aggregations
+)
+
+# PushAggDistinctIntoScalarGroupBy pushes an aggregate function DISTINCT
+# modifier into the input of the ScalarGroupBy operator. This allows the
+# optimizer to take advantage of an index on the column(s) subject to the
+# DISTINCT operation. PushAggDistinctIntoScalarGroupBy can match any single
+# aggregate function, including those that have multiple input arguments.
+[PushAggDistinctIntoScalarGroupBy, Normalize]
+(ScalarGroupBy
+    $input:*
+    $aggregations:[
+        $item:(AggregationsItem (AggDistinct $agg:*) $aggColID:*)
+    ]
+    $groupingPrivate:*
+)
+=>
+(ScalarGroupBy
+    (DistinctOn
+        $input
+        []
+        (MakeGrouping
+            (ExtractAggInputColumns $agg)
+            (EmptyOrdering)
+        )
+    )
+    [ (AggregationsItem $agg $aggColID) ]
+    $groupingPrivate
+)
+
+# PushAggFilterIntoScalarGroupBy pushes an aggregate function FILTER
+# modifier into the input of the ScalarGroupBy operator. This allows the
+# optimizer to take advantage of an index on the column(s) subject to the
+# FILTER operation. PushAggFilterIntoScalarGroupBy can match any single
+# aggregate function, including those that have multiple input arguments.
+[PushAggFilterIntoScalarGroupBy, Normalize]
+(ScalarGroupBy
+    $input:*
+    $aggregations:[
+        $item:(AggregationsItem
+            (AggFilter $agg:* $condition:*)
+            $aggColID:*
+        )
+    ]
+    $groupingPrivate:*
+)
+=>
+(ScalarGroupBy
+    (Select $input [ (FiltersItem $condition) ])
+    [ (AggregationsItem $agg $aggColID) ]
+    $groupingPrivate
+)
+
+# ConvertCountToCountRows replaces a Count operator performed on a non-null
+# expression with a CountRows operator. CountRows is significantly faster to
+# execute than Count.
+[ConvertCountToCountRows, Normalize]
+(GroupBy | ScalarGroupBy
+    $input:*
+    $aggregations:[
+        ...
+        $item:(AggregationsItem (Count $arg:*)) &
+            (ExprIsNeverNull $arg (NotNullCols $input))
+        ...
+    ]
+    $groupingPrivate:*
+)
+=>
+((OpName)
+    $input
+    (ReplaceAggregationsItem $aggregations $item (CountRows))
+    $groupingPrivate
 )

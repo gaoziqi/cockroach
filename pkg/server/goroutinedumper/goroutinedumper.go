@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -112,10 +112,6 @@ func (gd *GoroutineDumper) MaybeDump(ctx context.Context, st *cluster.Settings, 
 func NewGoroutineDumper(dir string) (*GoroutineDumper, error) {
 	if dir == "" {
 		return nil, errors.New("directory to store dumps could not be determined")
-	}
-	dir = filepath.Join(dir, "goroutine_dump")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
 	}
 	gd := &GoroutineDumper{
 		heuristics: []heuristic{

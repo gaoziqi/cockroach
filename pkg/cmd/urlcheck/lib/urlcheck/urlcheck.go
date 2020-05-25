@@ -13,7 +13,6 @@ package urlcheck
 import (
 	"bytes"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -23,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/ghemawat/stream"
 )
 
@@ -138,13 +138,13 @@ func checkURL(client *http.Client, url string) error {
 		return nil
 	}
 
-	return errors.New(resp.Status)
+	return errors.Newf("%s", errors.Safe(resp.Status))
 }
 
 func checkURLWithRetries(client *http.Client, url string) error {
 	for i := 0; i < timeoutRetries; i++ {
 		err := checkURL(client, url)
-		if err, ok := err.(net.Error); ok && err.Timeout() {
+		if netErr := (net.Error)(nil); errors.As(err, &netErr) && netErr.Timeout() {
 			// Back off exponentially if we hit a timeout.
 			time.Sleep((1 << uint(i)) * time.Second)
 			continue
@@ -239,7 +239,7 @@ func checkURLs(uniqueURLs map[string][]string) error {
 				for _, loc := range locs {
 					fmt.Fprintln(&buf, "    ", loc)
 				}
-				errChan <- errors.New(buf.String())
+				errChan <- errors.Newf("%s", buf.String())
 			} else {
 				errChan <- nil
 			}
@@ -258,7 +258,7 @@ func checkURLs(uniqueURLs map[string][]string) error {
 			fmt.Fprint(&buf, err)
 		}
 		fmt.Fprintf(&buf, "%d errors\n", len(errs))
-		return errors.New(buf.String())
+		return errors.Newf("%s", buf.String())
 	}
 	return nil
 }

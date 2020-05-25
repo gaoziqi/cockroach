@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 )
@@ -109,7 +110,7 @@ func TestDetachMemoRace(t *testing.T) {
 						memo.FiltersExpr{f.ConstructFiltersItem(
 							f.ConstructEq(
 								f.ConstructVariable(col),
-								f.ConstructConst(tree.NewDInt(10)),
+								f.ConstructConst(tree.NewDInt(10), types.Int),
 							),
 						)},
 					)
@@ -162,15 +163,12 @@ func TestPhysicalProps(t *testing.T) {
 //   ...
 func TestRuleProps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	datadriven.Walk(t, "testdata/ruleprops", func(t *testing.T, path string) {
-		catalog := testcat.New()
-		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
-			tester := opttester.New(catalog, d.Input)
-			tester.Flags.ExprFormat = memo.ExprFmtHideStats | memo.ExprFmtHideCost |
-				memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes
-			return tester.RunCommand(t, d)
-		})
-	})
+	runDataDrivenTest(
+		t,
+		"testdata/ruleprops/",
+		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideQualifications|
+			memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
+	)
 }
 
 // TestRules files can be run separately like this:

@@ -6,35 +6,36 @@ postgres
 system
 test
 
-query T
+query TTT
 SHOW TABLES FROM system
 ----
-comments
-descriptor
-eventlog
-jobs
-lease
-locations
-namespace
-namespace_deprecated
-protected_ts_meta
-protected_ts_records
-rangelog
-replication_constraint_stats
-replication_critical_localities
-replication_stats
-reports_meta
-role_members
-role_options
-settings
-statement_bundle_chunks
-statement_diagnostics
-statement_diagnostics_requests
-table_statistics
-ui
-users
-web_sessions
-zones
+public  comments                         table
+public  descriptor                       table
+public  eventlog                         table
+public  jobs                             table
+public  lease                            table
+public  locations                        table
+public  namespace                        table
+public  namespace2                       table
+public  protected_ts_meta                table
+public  protected_ts_records             table
+public  rangelog                         table
+public  replication_constraint_stats     table
+public  replication_critical_localities  table
+public  replication_stats                table
+public  reports_meta                     table
+public  role_members                     table
+public  role_options                     table
+public  settings                         table
+public  statement_bundle_chunks          table
+public  statement_diagnostics            table
+public  statement_diagnostics_requests   table
+public  table_statistics                 table
+public  tenants                          table
+public  ui                               table
+public  users                            table
+public  web_sessions                     table
+public  zones                            table
 
 query I rowsort
 SELECT id FROM system.descriptor
@@ -45,6 +46,7 @@ SELECT id FROM system.descriptor
 4
 5
 6
+8
 11
 12
 13
@@ -173,6 +175,10 @@ system  pg_catalog          admin  GRANT
 system  pg_catalog          admin  SELECT
 system  pg_catalog          root   GRANT
 system  pg_catalog          root   SELECT
+system  pg_extension        admin  GRANT
+system  pg_extension        admin  SELECT
+system  pg_extension        root   GRANT
+system  pg_extension        root   SELECT
 system  public              admin  GRANT
 system  public              admin  SELECT
 system  public              root   GRANT
@@ -240,10 +246,10 @@ system  public  namespace                        admin   GRANT
 system  public  namespace                        admin   SELECT
 system  public  namespace                        root    GRANT
 system  public  namespace                        root    SELECT
-system  public  namespace_deprecated             admin   GRANT
-system  public  namespace_deprecated             admin   SELECT
-system  public  namespace_deprecated             root    GRANT
-system  public  namespace_deprecated             root    SELECT
+system  public  namespace2                       admin   GRANT
+system  public  namespace2                       admin   SELECT
+system  public  namespace2                       root    GRANT
+system  public  namespace2                       root    SELECT
 system  public  protected_ts_meta                admin   GRANT
 system  public  protected_ts_meta                admin   SELECT
 system  public  protected_ts_meta                root    GRANT
@@ -372,6 +378,10 @@ system  public  table_statistics                 root    GRANT
 system  public  table_statistics                 root    INSERT
 system  public  table_statistics                 root    SELECT
 system  public  table_statistics                 root    UPDATE
+system  public  tenants                          admin   GRANT
+system  public  tenants                          admin   SELECT
+system  public  tenants                          root    GRANT
+system  public  tenants                          root    SELECT
 system  public  ui                               admin   DELETE
 system  public  ui                               admin   GRANT
 system  public  ui                               admin   INSERT
@@ -533,6 +543,7 @@ FROM system.settings
 WHERE name != 'sql.defaults.distsql'
 AND name != 'sql.stats.automatic_collection.enabled'
 AND name NOT LIKE '%sql.defaults.vectorize%'
+AND name NOT LIKE '%sql.testing.vectorize.batch_size%'
 ORDER BY name
 ----
 cluster.secret
@@ -549,7 +560,8 @@ SELECT name, value
 FROM system.settings
 WHERE name NOT IN ('version', 'sql.defaults.distsql', 'cluster.secret',
   'sql.stats.automatic_collection.enabled', 'sql.defaults.vectorize',
-  'sql.defaults.vectorize_row_count_threshold')
+  'sql.defaults.vectorize_row_count_threshold',
+  'sql.testing.vectorize.batch_size')
 ORDER BY name
 ----
 diagnostics.reporting.enabled                  true

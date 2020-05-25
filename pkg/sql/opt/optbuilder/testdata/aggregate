@@ -214,6 +214,8 @@ array_agg(decimal) -> decimal[]
 array_agg(date) -> date[]
 array_agg(timestamp) -> timestamp[]
 array_agg(interval) -> interval[]
+array_agg(geography) -> geography[]
+array_agg(geometry) -> geometry[]
 array_agg(string) -> string[]
 array_agg(bytes) -> bytes[]
 array_agg(timestamptz) -> timestamptz[]
@@ -549,7 +551,7 @@ error (42803): column "v" must appear in the GROUP BY clause or be used in an ag
 build
 SELECT k FROM kv WHERE avg(k) > 1
 ----
-error (42803): avg(): aggregate functions are not allowed in WHERE
+error (42803): aggregate functions are not allowed in WHERE
 
 build
 SELECT max(avg(k)) FROM kv
@@ -2706,17 +2708,14 @@ scalar-group-by
 build
 SELECT corr(k, NULL) FROM kv
 ----
-project
- ├── columns: corr:5
- ├── scan kv
- │    └── columns: k:1!null v:2 w:3 s:4
- └── projections
-      └── NULL [as=corr:5]
+error (42725): ambiguous call: corr(int, unknown), candidates are:
+corr(int, int) -> float
+corr(int, float) -> float
 
 build
 SELECT corr('foo', v) FROM kv
 ----
-error (42883): unknown signature: corr(string, int)
+error (22P02): corr(): could not parse "foo" as type int: strconv.ParseInt: parsing "foo": invalid syntax
 
 # Tests for string_agg.
 
@@ -2926,14 +2925,14 @@ firstCol, secondCol, thirdCol;
 group-by
  ├── columns: firstcol:1(int!null) secondcol:2(int) thirdcol:2(int)
  ├── grouping columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int)
- ├── stats: [rows=991, distinct(1,2)=991, null(1,2)=10]
- ├── cost: 1109.96
+ ├── stats: [rows=1000, distinct(1,2)=1000, null(1,2)=0]
+ ├── cost: 1110.05
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── interesting orderings: (+1,+2)
  └── project
       ├── columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int)
-      ├── stats: [rows=1000, distinct(1,2)=991, null(1,2)=10]
+      ├── stats: [rows=1000, distinct(1,2)=1000, null(1,2)=0]
       ├── cost: 1070.03
       ├── key: (1)
       ├── fd: (1)-->(2)
@@ -2941,7 +2940,7 @@ group-by
       ├── interesting orderings: (+1,+2)
       └── scan t.public.xyz
            ├── columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int) t.public.xyz.z:3(float)
-           ├── stats: [rows=1000, distinct(1,2)=991, null(1,2)=10]
+           ├── stats: [rows=1000, distinct(1,2)=1000, null(1,2)=0]
            ├── cost: 1060.02
            ├── key: (1)
            ├── fd: (1)-->(2,3)
@@ -3651,3 +3650,294 @@ project
            │    └── column5:5
            └── sum [as=sum:8]
                 └── column7:7
+
+# Regression test for #44724.
+build
+SELECT *
+  FROM (SELECT 1 AS one, v FROM kv) AS kv
+  JOIN LATERAL (
+        SELECT b, sum(one) FROM abxy
+       ) AS abxy ON kv.v = abxy.b
+----
+error (42803): aggregate functions are not allowed in FROM clause of their own query level
+
+# Regression test for #45838. The aggregate should be allowed in the WHERE
+# clause since it's scoped at the outer level.
+build
+  SELECT sum(x)
+    FROM abxy AS t
+GROUP BY y
+  HAVING EXISTS(SELECT 1 FROM abxy AS t2 WHERE sum(t.x) = 1)
+----
+project
+ ├── columns: sum:5
+ └── select
+      ├── columns: t.y:4 sum:5
+      ├── group-by
+      │    ├── columns: t.y:4 sum:5
+      │    ├── grouping columns: t.y:4
+      │    ├── project
+      │    │    ├── columns: t.x:3 t.y:4
+      │    │    └── scan t
+      │    │         └── columns: t.a:1!null t.b:2!null t.x:3 t.y:4
+      │    └── aggregations
+      │         └── sum [as=sum:5]
+      │              └── t.x:3
+      └── filters
+           └── exists
+                └── project
+                     ├── columns: "?column?":11!null
+                     ├── select
+                     │    ├── columns: t2.a:6!null t2.b:7!null t2.x:8 t2.y:9
+                     │    ├── scan t2
+                     │    │    └── columns: t2.a:6!null t2.b:7!null t2.x:8 t2.y:9
+                     │    └── filters
+                     │         └── sum:5 = 1
+                     └── projections
+                          └── 1 [as="?column?":11]
+
+exec-ddl
+CREATE TABLE onek (
+        unique1         int,
+        unique2         int,
+        two                     int,
+        four            int,
+        ten                     int,
+        twenty          int,
+        hundred         int,
+        thousand        int,
+        twothousand     int,
+        fivethous       int,
+        tenthous        int,
+        odd                     int,
+        even            int,
+        stringu1        string,
+        stringu2        string,
+        string4         string
+)
+----
+
+# Regression tests for #30652.
+build
+  SELECT ten, sum(DISTINCT four)
+    FROM onek AS a
+GROUP BY ten
+  HAVING EXISTS(
+            SELECT 1 FROM onek AS b WHERE sum(DISTINCT a.four) = b.four
+         )
+----
+select
+ ├── columns: ten:5 sum:18
+ ├── group-by
+ │    ├── columns: a.ten:5 sum:18
+ │    ├── grouping columns: a.ten:5
+ │    ├── project
+ │    │    ├── columns: a.four:4 a.ten:5
+ │    │    └── scan a
+ │    │         └── columns: a.unique1:1 a.unique2:2 a.two:3 a.four:4 a.ten:5 a.twenty:6 a.hundred:7 a.thousand:8 a.twothousand:9 a.fivethous:10 a.tenthous:11 a.odd:12 a.even:13 a.stringu1:14 a.stringu2:15 a.string4:16 a.rowid:17!null
+ │    └── aggregations
+ │         └── agg-distinct [as=sum:18]
+ │              └── sum
+ │                   └── a.four:4
+ └── filters
+      └── exists
+           └── project
+                ├── columns: "?column?":37!null
+                ├── select
+                │    ├── columns: b.unique1:19 b.unique2:20 b.two:21 b.four:22!null b.ten:23 b.twenty:24 b.hundred:25 b.thousand:26 b.twothousand:27 b.fivethous:28 b.tenthous:29 b.odd:30 b.even:31 b.stringu1:32 b.stringu2:33 b.string4:34 b.rowid:35!null
+                │    ├── scan b
+                │    │    └── columns: b.unique1:19 b.unique2:20 b.two:21 b.four:22 b.ten:23 b.twenty:24 b.hundred:25 b.thousand:26 b.twothousand:27 b.fivethous:28 b.tenthous:29 b.odd:30 b.even:31 b.stringu1:32 b.stringu2:33 b.string4:34 b.rowid:35!null
+                │    └── filters
+                │         └── sum:18 = b.four:22
+                └── projections
+                     └── 1 [as="?column?":37]
+
+build
+  SELECT ten, sum(DISTINCT four)
+    FROM onek AS a
+GROUP BY ten
+  HAVING EXISTS(
+            SELECT 1
+              FROM onek AS b
+             WHERE sum(DISTINCT a.four + b.four) = b.four
+         )
+----
+error (42803): aggregate functions are not allowed in WHERE
+
+build
+SELECT (
+        SELECT t2.a
+          FROM abxy AS t2 JOIN abxy AS t3 ON sum(t1.x) = t3.x
+       )
+  FROM abxy AS t1
+----
+project
+ ├── columns: a:15
+ ├── scalar-group-by
+ │    ├── columns: sum:14
+ │    ├── project
+ │    │    ├── columns: x:13
+ │    │    ├── scan t1
+ │    │    │    └── columns: t1.a:1!null t1.b:2!null t1.x:3 t1.y:4
+ │    │    └── projections
+ │    │         └── t1.x:3 [as=x:13]
+ │    └── aggregations
+ │         └── sum [as=sum:14]
+ │              └── x:13
+ └── projections
+      └── subquery [as=a:15]
+           └── max1-row
+                ├── columns: t2.a:5!null
+                └── project
+                     ├── columns: t2.a:5!null
+                     └── inner-join (cross)
+                          ├── columns: t2.a:5!null t2.b:6!null t2.x:7 t2.y:8 t3.a:9!null t3.b:10!null t3.x:11!null t3.y:12
+                          ├── scan t2
+                          │    └── columns: t2.a:5!null t2.b:6!null t2.x:7 t2.y:8
+                          ├── scan t3
+                          │    └── columns: t3.a:9!null t3.b:10!null t3.x:11 t3.y:12
+                          └── filters
+                               └── sum:14 = t3.x:11
+
+# Regression test for #45631.
+build
+SELECT
+  (SELECT (max(b), unnest) FROM ab WHERE a = unnest)
+FROM
+  ROWS FROM (unnest(ARRAY[1, 2]))
+----
+project
+ ├── columns: "?column?":7
+ ├── project-set
+ │    ├── columns: unnest:1
+ │    ├── values
+ │    │    └── ()
+ │    └── zip
+ │         └── unnest(ARRAY[1,2])
+ └── projections
+      └── subquery [as="?column?":7]
+           └── max1-row
+                ├── columns: "?column?":6
+                └── project
+                     ├── columns: "?column?":6
+                     ├── group-by
+                     │    ├── columns: max:4 unnest:5
+                     │    ├── grouping columns: unnest:5
+                     │    ├── project
+                     │    │    ├── columns: unnest:5 b:3
+                     │    │    ├── select
+                     │    │    │    ├── columns: a:2!null b:3
+                     │    │    │    ├── scan ab
+                     │    │    │    │    └── columns: a:2!null b:3
+                     │    │    │    └── filters
+                     │    │    │         └── a:2 = unnest:1
+                     │    │    └── projections
+                     │    │         └── unnest:1 [as=unnest:5]
+                     │    └── aggregations
+                     │         └── max [as=max:4]
+                     │              └── b:3
+                     └── projections
+                          └── (max:4, unnest:1) [as="?column?":6]
+
+# Regression test for #46196. Don't eliminate the scalar group by, and
+# default to type string.
+build format=show-types
+SELECT max(t0.c0) FROM (VALUES (NULL), (NULL)) t0(c0);
+----
+scalar-group-by
+ ├── columns: max:3(string)
+ ├── project
+ │    ├── columns: column2:2(string)
+ │    ├── values
+ │    │    ├── columns: column1:1(unknown)
+ │    │    ├── (NULL,) [type=tuple{unknown}]
+ │    │    └── (NULL,) [type=tuple{unknown}]
+ │    └── projections
+ │         └── column1:1::STRING [as=column2:2, type=string]
+ └── aggregations
+      └── max [as=max:3, type=string]
+           └── column2:2 [type=string]
+
+build
+SELECT percentile_disc(0.95) WITHIN GROUP (ORDER BY b) FROM abc;
+----
+scalar-group-by
+ ├── columns: percentile_disc:6
+ ├── window partition=() ordering=+2
+ │    ├── columns: a:1!null b:2 c:3 d:4 column5:5!null percentile_disc:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null a:1!null b:2 c:3 d:4
+ │    │    ├── scan abc
+ │    │    │    └── columns: a:1!null b:2 c:3 d:4
+ │    │    └── projections
+ │    │         └── 0.95 [as=column5:5]
+ │    └── windows
+ │         └── percentile-disc [as=percentile_disc:6, frame="range from unbounded to unbounded"]
+ │              ├── column5:5
+ │              └── b:2
+ └── aggregations
+      └── const-agg [as=percentile_disc:6]
+           └── percentile_disc:6
+
+build
+SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY b) FROM abc;
+----
+scalar-group-by
+ ├── columns: percentile_cont:6
+ ├── window partition=() ordering=+2
+ │    ├── columns: a:1!null b:2 c:3 d:4 column5:5!null percentile_cont:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null a:1!null b:2 c:3 d:4
+ │    │    ├── scan abc
+ │    │    │    └── columns: a:1!null b:2 c:3 d:4
+ │    │    └── projections
+ │    │         └── 0.95 [as=column5:5]
+ │    └── windows
+ │         └── percentile-cont [as=percentile_cont:6, frame="range from unbounded to unbounded"]
+ │              ├── column5:5
+ │              └── b:2
+ └── aggregations
+      └── const-agg [as=percentile_cont:6]
+           └── percentile_cont:6
+
+build
+SELECT percentile_disc(ARRAY[0.90, 0.95]::float[]) WITHIN GROUP (ORDER BY b) FROM abc;
+----
+scalar-group-by
+ ├── columns: percentile_disc:6
+ ├── window partition=() ordering=+2
+ │    ├── columns: a:1!null b:2 c:3 d:4 column5:5!null percentile_disc:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null a:1!null b:2 c:3 d:4
+ │    │    ├── scan abc
+ │    │    │    └── columns: a:1!null b:2 c:3 d:4
+ │    │    └── projections
+ │    │         └── ARRAY[0.90,0.95]::FLOAT8[] [as=column5:5]
+ │    └── windows
+ │         └── percentile-disc [as=percentile_disc:6, frame="range from unbounded to unbounded"]
+ │              ├── column5:5
+ │              └── b:2
+ └── aggregations
+      └── const-agg [as=percentile_disc:6]
+           └── percentile_disc:6
+
+build
+SELECT percentile_cont(ARRAY[0.90, 0.95]::float[]) WITHIN GROUP (ORDER BY b) FROM abc;
+----
+scalar-group-by
+ ├── columns: percentile_cont:6
+ ├── window partition=() ordering=+2
+ │    ├── columns: a:1!null b:2 c:3 d:4 column5:5!null percentile_cont:6
+ │    ├── project
+ │    │    ├── columns: column5:5!null a:1!null b:2 c:3 d:4
+ │    │    ├── scan abc
+ │    │    │    └── columns: a:1!null b:2 c:3 d:4
+ │    │    └── projections
+ │    │         └── ARRAY[0.90,0.95]::FLOAT8[] [as=column5:5]
+ │    └── windows
+ │         └── percentile-cont [as=percentile_cont:6, frame="range from unbounded to unbounded"]
+ │              ├── column5:5
+ │              └── b:2
+ └── aggregations
+      └── const-agg [as=percentile_cont:6]
+           └── percentile_cont:6

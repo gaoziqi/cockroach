@@ -19,9 +19,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -47,7 +48,7 @@ func TestClusterFlow(t *testing.T) {
 
 	args := base.TestClusterArgs{ReplicationMode: base.ReplicationManual}
 	tc := serverutils.StartTestCluster(t, 3, args)
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	sumDigitsFn := func(row int) tree.Datum {
 		sum := 0
@@ -64,10 +65,10 @@ func TestClusterFlow(t *testing.T) {
 		sqlutils.ToRowFn(sqlutils.RowIdxFn, sumDigitsFn, sqlutils.RowEnglishFn))
 
 	kvDB := tc.Server(0).DB()
-	desc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+	desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	makeIndexSpan := func(start, end int) execinfrapb.TableReaderSpan {
 		var span roachpb.Span
-		prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(desc, desc.Indexes[0].ID))
+		prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.Indexes[0].ID))
 		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
 		span.EndKey = append(span.EndKey, prefix...)
 		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
@@ -278,7 +279,7 @@ func TestClusterFlow(t *testing.T) {
 	}
 	expected := strings.Join(results, " ")
 	expected = "[" + expected + "]"
-	if rowStr := rows.String([]types.T{*types.String}); rowStr != expected {
+	if rowStr := rows.String([]*types.T{types.String}); rowStr != expected {
 		t.Errorf("Result: %s\n Expected: %s\n", rowStr, expected)
 	}
 }
@@ -325,7 +326,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	tc := serverutils.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	// Set up the following network - a simplification of the one described in
 	// #17097 (the numbers on the streams are the StreamIDs in the spec below):
@@ -368,13 +369,13 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	// value.
 
 	// All our rows have a single integer column.
-	typs := []types.T{*types.Int}
+	typs := []*types.T{types.Int}
 
 	// The left values rows are consecutive values.
 	leftRows := make(sqlbase.EncDatumRows, 20)
 	for i := range leftRows {
 		leftRows[i] = sqlbase.EncDatumRow{
-			sqlbase.DatumToEncDatum(&typs[0], tree.NewDInt(tree.DInt(i))),
+			sqlbase.DatumToEncDatum(typs[0], tree.NewDInt(tree.DInt(i))),
 		}
 	}
 	leftValuesSpec, err := execinfra.GenerateValuesSpec(typs, leftRows, 10 /* rows per chunk */)
@@ -388,7 +389,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	for i := 1; i <= 20; i++ {
 		for j := 1; j <= 4*execinfra.RowChannelBufSize; j++ {
 			rightRows = append(rightRows, sqlbase.EncDatumRow{
-				sqlbase.DatumToEncDatum(&typs[0], tree.NewDInt(tree.DInt(i))),
+				sqlbase.DatumToEncDatum(typs[0], tree.NewDInt(tree.DInt(i))),
 			})
 		}
 	}
@@ -417,9 +418,9 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		0, // maxOffset
 	)
 	txn := kv.NewTxnFromProto(
-		context.TODO(), tc.Server(0).DB(), tc.Server(0).NodeID(),
+		context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),
 		now, kv.RootTxn, &txnProto)
-	leafInputState := txn.GetLeafTxnInputState(context.TODO())
+	leafInputState := txn.GetLeafTxnInputState(context.Background())
 
 	req := execinfrapb.SetupFlowRequest{
 		Version:           execinfra.Version,
@@ -504,7 +505,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stream, err := execinfrapb.NewDistSQLClient(conn).RunSyncFlow(context.TODO())
+	stream, err := execinfrapb.NewDistSQLClient(conn).RunSyncFlow(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +525,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
-		err = decoder.AddMessage(context.TODO(), msg)
+		err = decoder.AddMessage(context.Background(), msg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -558,8 +559,8 @@ func TestDistSQLReadsFillGatewayID(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				UseDatabase: "test",
 				Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
-					EvalKnobs: storagebase.BatchEvalTestingKnobs{
-						TestingEvalFilter: func(filterArgs storagebase.FilterArgs) *roachpb.Error {
+					EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
+						TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 							scanReq, ok := filterArgs.Req.(*roachpb.ScanRequest)
 							if !ok {
 								return nil
@@ -580,7 +581,7 @@ func TestDistSQLReadsFillGatewayID(t *testing.T) {
 				},
 			},
 		})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	db := tc.ServerConn(0)
 	sqlutils.CreateTable(t, db, "t",
@@ -689,7 +690,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 								b.Fatal(err)
 							}
 						}
-						msg := se.FormMessage(context.TODO())
+						msg := se.FormMessage(context.Background())
 						valSpecs[i] = execinfrapb.ValuesCoreSpec{
 							Columns:  msg.Typing,
 							RawBytes: [][]byte{msg.Data.RawBytes},
@@ -732,9 +733,9 @@ func BenchmarkInfrastructure(b *testing.B) {
 						0, // maxOffset
 					)
 					txn := kv.NewTxnFromProto(
-						context.TODO(), tc.Server(0).DB(), tc.Server(0).NodeID(),
+						context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),
 						now, kv.RootTxn, &txnProto)
-					leafInputState := txn.GetLeafTxnInputState(context.TODO())
+					leafInputState := txn.GetLeafTxnInputState(context.Background())
 					for i := range reqs {
 						reqs[i] = execinfrapb.SetupFlowRequest{
 							Version:           execinfra.Version,
@@ -802,13 +803,13 @@ func BenchmarkInfrastructure(b *testing.B) {
 						}
 
 						for i := 1; i < numNodes; i++ {
-							if resp, err := clients[i].SetupFlow(context.TODO(), &reqs[i]); err != nil {
+							if resp, err := clients[i].SetupFlow(context.Background(), &reqs[i]); err != nil {
 								b.Fatal(err)
 							} else if resp.Error != nil {
 								b.Fatal(resp.Error)
 							}
 						}
-						stream, err := clients[0].RunSyncFlow(context.TODO())
+						stream, err := clients[0].RunSyncFlow(context.Background())
 						if err != nil {
 							b.Fatal(err)
 						}
@@ -828,7 +829,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 								}
 								b.Fatal(err)
 							}
-							err = decoder.AddMessage(context.TODO(), msg)
+							err = decoder.AddMessage(context.Background(), msg)
 							if err != nil {
 								b.Fatal(err)
 							}

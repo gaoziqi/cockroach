@@ -19,11 +19,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 )
@@ -340,8 +340,8 @@ func expectNodesDecommissioned(
 			// The user is expecting the node to not be
 			// decommissioned/decommissioning already.
 			switch liveness {
-			case storagepb.NodeLivenessStatus_DECOMMISSIONING,
-				storagepb.NodeLivenessStatus_DECOMMISSIONED:
+			case kvserverpb.NodeLivenessStatus_DECOMMISSIONING,
+				kvserverpb.NodeLivenessStatus_DECOMMISSIONED:
 				fmt.Fprintln(stderr, "warning: node", nodeID, "is already decommissioning or decommissioned")
 			default:
 				// It's always possible to decommission a node that's either live
@@ -350,10 +350,10 @@ func expectNodesDecommissioned(
 		} else {
 			// The user is expecting the node to be recommissionable.
 			switch liveness {
-			case storagepb.NodeLivenessStatus_DECOMMISSIONING,
-				storagepb.NodeLivenessStatus_DECOMMISSIONED:
+			case kvserverpb.NodeLivenessStatus_DECOMMISSIONING,
+				kvserverpb.NodeLivenessStatus_DECOMMISSIONED:
 				// ok.
-			case storagepb.NodeLivenessStatus_LIVE:
+			case kvserverpb.NodeLivenessStatus_LIVE:
 				fmt.Fprintln(stderr, "warning: node", nodeID, "is not decommissioned")
 			default: // dead, unavailable, etc
 				fmt.Fprintln(stderr, "warning: node", nodeID, "is in unexpected state", liveness)
@@ -493,18 +493,55 @@ func runRecommissionNode(cmd *cobra.Command, args []string) error {
 	return printDecommissionStatus(*resp)
 }
 
+var drainNodeCmd = &cobra.Command{
+	Use:   "drain",
+	Short: "drain a node without shutting it down",
+	Long: `
+Prepare a server for shutting down. This stops accepting client
+connections, stops extant connections, and finally pushes range
+leases onto other nodes, subject to various timeout parameters
+configurable via cluster settings.`,
+	Args: cobra.NoArgs,
+	RunE: MaybeDecorateGRPCError(runDrain),
+}
+
+// runNodeDrain calls the Drain RPC without the flag to stop the
+// server process.
+func runDrain(cmd *cobra.Command, args []string) (err error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// At the end, we'll report "ok" if there was no error.
+	defer func() {
+		if err == nil {
+			fmt.Println("ok")
+		}
+	}()
+
+	// Establish a RPC connection.
+	c, finish, err := getAdminClient(ctx, serverCfg)
+	if err != nil {
+		return err
+	}
+	defer finish()
+
+	_, _, err = doDrain(ctx, c)
+	return err
+}
+
 // Sub-commands for node command.
 var nodeCmds = []*cobra.Command{
 	lsNodesCmd,
 	statusNodeCmd,
 	decommissionNodeCmd,
 	recommissionNodeCmd,
+	drainNodeCmd,
 }
 
 var nodeCmd = &cobra.Command{
 	Use:   "node [command]",
-	Short: "list, inspect or remove nodes",
-	Long:  "List, inspect or remove nodes.",
+	Short: "list, inspect, drain or remove nodes",
+	Long:  "List, inspect, drain or remove nodes.",
 	RunE:  usageAndErr,
 }
 

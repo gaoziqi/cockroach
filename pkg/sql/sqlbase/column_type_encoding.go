@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -22,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -143,6 +143,8 @@ func EncodeTableKey(b []byte, val tree.Datum, dir encoding.Direction) ([]byte, e
 			}
 		}
 		return b, nil
+	case *tree.DArray:
+		return encodeArrayKey(b, t, dir)
 	case *tree.DCollatedString:
 		if dir == encoding.Ascending {
 			return encoding.EncodeBytesAscending(b, t.Key), nil
@@ -158,80 +160,23 @@ func EncodeTableKey(b []byte, val tree.Datum, dir encoding.Direction) ([]byte, e
 			return encoding.EncodeVarintAscending(b, int64(t.DInt)), nil
 		}
 		return encoding.EncodeVarintDescending(b, int64(t.DInt)), nil
+	case *tree.DEnum:
+		if dir == encoding.Ascending {
+			return encoding.EncodeBytesAscending(b, t.PhysicalRep), nil
+		}
+		return encoding.EncodeBytesDescending(b, t.PhysicalRep), nil
 	}
 	return nil, errors.Errorf("unable to encode table key: %T", val)
 }
 
 // SkipTableKey skips a value of type valType in key, returning the remainder
 // of the key.
-// TODO(jordan): each type could be optimized here.
-func SkipTableKey(valType *types.T, key []byte, dir IndexDescriptor_Direction) ([]byte, error) {
-	if (dir != IndexDescriptor_ASC) && (dir != IndexDescriptor_DESC) {
-		return nil, errors.AssertionFailedf("invalid direction: %d", log.Safe(dir))
-	}
-	var isNull bool
-	if key, isNull = encoding.DecodeIfNull(key); isNull {
-		return key, nil
-	}
-	var rkey []byte
-	var err error
-	switch valType.Family() {
-	case types.BoolFamily, types.IntFamily, types.DateFamily, types.OidFamily, types.TimeFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeVarintAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeVarintDescending(key)
-		}
-	case types.FloatFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeFloatAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeFloatDescending(key)
-		}
-	case types.BytesFamily, types.StringFamily, types.UuidFamily, types.INetFamily, types.CollatedStringFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeBytesAscending(key, nil)
-		} else {
-			rkey, _, err = encoding.DecodeBytesDescending(key, nil)
-		}
-	case types.DecimalFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeDecimalAscending(key, nil)
-		} else {
-			rkey, _, err = encoding.DecodeDecimalDescending(key, nil)
-		}
-	case types.TimestampFamily, types.TimestampTZFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeTimeAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeTimeDescending(key)
-		}
-	case types.TimeTZFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeTimeTZAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeTimeTZDescending(key)
-		}
-	case types.IntervalFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeDurationAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeDurationDescending(key)
-		}
-	case types.BitFamily:
-		if dir == IndexDescriptor_ASC {
-			rkey, _, err = encoding.DecodeBitArrayAscending(key)
-		} else {
-			rkey, _, err = encoding.DecodeBitArrayDescending(key)
-		}
-	default:
-		// Tuples and arrays aren't indexable types right now, so we don't have cases for them.
-		return key, errors.AssertionFailedf("unsupported type %+v", log.Safe(valType))
-	}
+func SkipTableKey(key []byte) ([]byte, error) {
+	skipLen, err := encoding.PeekLength(key)
 	if err != nil {
-		return key, err
+		return nil, err
 	}
-	return rkey, nil
+	return key[skipLen:], nil
 }
 
 // DecodeTableKey decodes a value encoded by EncodeTableKey.
@@ -249,6 +194,8 @@ func DecodeTableKey(
 	var err error
 
 	switch valType.Family() {
+	case types.ArrayFamily:
+		return decodeArrayKey(a, valType, key, dir)
 	case types.BitFamily:
 		var r bitarray.BitArray
 		if dir == encoding.Ascending {
@@ -305,7 +252,11 @@ func DecodeTableKey(
 		return a.NewDString(tree.DString(r)), rkey, err
 	case types.CollatedStringFamily:
 		var r string
-		rkey, r, err = encoding.DecodeUnsafeStringAscending(key, nil)
+		if dir == encoding.Ascending {
+			rkey, r, err = encoding.DecodeUnsafeStringAscending(key, nil)
+		} else {
+			rkey, r, err = encoding.DecodeUnsafeStringDescending(key, nil)
+		}
 		if err != nil {
 			return nil, nil, err
 		}
@@ -402,6 +353,17 @@ func DecodeTableKey(
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
 		return a.NewDOid(tree.MakeDOid(tree.DInt(i))), rkey, err
+	case types.EnumFamily:
+		var r []byte
+		if dir == encoding.Ascending {
+			rkey, r, err = encoding.DecodeBytesAscending(key, nil)
+		} else {
+			rkey, r, err = encoding.DecodeBytesDescending(key, nil)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		return tree.MakeDEnumFromPhysicalRepresentation(valType, r), rkey, nil
 	default:
 		return nil, nil, errors.Errorf("unable to decode table key: %s", valType)
 	}
@@ -441,6 +403,10 @@ func EncodeTableValue(
 		return encoding.EncodeBytesValue(appendTo, uint32(colID), []byte(*t)), nil
 	case *tree.DDate:
 		return encoding.EncodeIntValue(appendTo, uint32(colID), t.UnixEpochDaysWithOrig()), nil
+	case *tree.DGeography:
+		return encoding.EncodeGeoValue(appendTo, uint32(colID), t.SpatialObject)
+	case *tree.DGeometry:
+		return encoding.EncodeGeoValue(appendTo, uint32(colID), t.SpatialObject)
 	case *tree.DTime:
 		return encoding.EncodeIntValue(appendTo, uint32(colID), int64(*t)), nil
 	case *tree.DTimeTZ:
@@ -473,6 +439,8 @@ func EncodeTableValue(
 		return encoding.EncodeBytesValue(appendTo, uint32(colID), []byte(t.Contents)), nil
 	case *tree.DOid:
 		return encoding.EncodeIntValue(appendTo, uint32(colID), int64(t.DInt)), nil
+	case *tree.DEnum:
+		return encoding.EncodeBytesValue(appendTo, uint32(colID), t.PhysicalRep), nil
 	default:
 		return nil, errors.Errorf("unable to encode table value: %T", t)
 	}
@@ -492,10 +460,10 @@ func DecodeTableValue(a *DatumAlloc, valType *types.T, b []byte) (tree.Datum, []
 	if valType.Family() != types.BoolFamily {
 		b = b[dataOffset:]
 	}
-	return decodeUntaggedDatum(a, valType, b)
+	return DecodeUntaggedDatum(a, valType, b)
 }
 
-// decodeUntaggedDatum is used to decode a Datum whose type is known,
+// DecodeUntaggedDatum is used to decode a Datum whose type is known,
 // and which doesn't have a value tag (either due to it having been
 // consumed already or not having one in the first place).
 //
@@ -503,7 +471,7 @@ func DecodeTableValue(a *DatumAlloc, valType *types.T, b []byte) (tree.Datum, []
 //
 // If t is types.Bool, the value tag must be present, as its value is encoded in
 // the tag directly.
-func decodeUntaggedDatum(a *DatumAlloc, t *types.T, buf []byte) (tree.Datum, []byte, error) {
+func DecodeUntaggedDatum(a *DatumAlloc, t *types.T, buf []byte) (tree.Datum, []byte, error) {
 	switch t.Family() {
 	case types.IntFamily:
 		b, i, err := encoding.DecodeUntaggedIntValue(buf)
@@ -559,6 +527,18 @@ func decodeUntaggedDatum(a *DatumAlloc, t *types.T, buf []byte) (tree.Datum, []b
 			return nil, b, err
 		}
 		return a.NewDDate(tree.MakeDDate(pgdate.MakeCompatibleDateFromDisk(data))), b, nil
+	case types.GeographyFamily:
+		b, data, err := encoding.DecodeUntaggedGeoValue(buf)
+		if err != nil {
+			return nil, b, err
+		}
+		return a.NewDGeography(tree.DGeography{Geography: geo.NewGeography(data)}), b, nil
+	case types.GeometryFamily:
+		b, data, err := encoding.DecodeUntaggedGeoValue(buf)
+		if err != nil {
+			return nil, b, err
+		}
+		return a.NewDGeometry(tree.DGeometry{Geometry: geo.NewGeometry(data)}), b, nil
 	case types.TimeFamily:
 		b, data, err := encoding.DecodeUntaggedIntValue(buf)
 		if err != nil {
@@ -609,35 +589,15 @@ func decodeUntaggedDatum(a *DatumAlloc, t *types.T, buf []byte) (tree.Datum, []b
 		return decodeArray(a, t.ArrayContents(), buf)
 	case types.TupleFamily:
 		return decodeTuple(a, t, buf)
+	case types.EnumFamily:
+		b, data, err := encoding.DecodeUntaggedBytesValue(buf)
+		if err != nil {
+			return nil, b, err
+		}
+		return tree.MakeDEnumFromPhysicalRepresentation(t, data), b, nil
 	default:
 		return nil, buf, errors.Errorf("couldn't decode type %s", t)
 	}
-}
-
-// EncodeDatumKeyAscending encodes a datum using an order-preserving
-// encoding.
-// The encoding is lossy: some datums need composite encoding where
-// the key part only contains part of the datum's information.
-func EncodeDatumKeyAscending(b []byte, d tree.Datum) ([]byte, error) {
-	if values, ok := d.(*tree.DTuple); ok {
-		return EncodeDatumsKeyAscending(b, values.D)
-	}
-	return EncodeTableKey(b, d, encoding.Ascending)
-}
-
-// EncodeDatumsKeyAscending encodes a Datums (tuple) using an
-// order-preserving encoding.
-// The encoding is lossy: some datums need composite encoding where
-// the key part only contains part of the datum's information.
-func EncodeDatumsKeyAscending(b []byte, d tree.Datums) ([]byte, error) {
-	for _, val := range d {
-		var err error
-		b, err = EncodeDatumKeyAscending(b, val)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return b, nil
 }
 
 // MarshalColumnValue produces the value encoding of the given datum,
@@ -695,6 +655,16 @@ func MarshalColumnValue(col *ColumnDescriptor, val tree.Datum) (roachpb.Value, e
 		if v, ok := val.(*tree.DDate); ok {
 			r.SetInt(v.UnixEpochDaysWithOrig())
 			return r, nil
+		}
+	case types.GeographyFamily:
+		if v, ok := val.(*tree.DGeography); ok {
+			err := r.SetGeo(v.SpatialObject)
+			return r, err
+		}
+	case types.GeometryFamily:
+		if v, ok := val.(*tree.DGeometry); ok {
+			err := r.SetGeo(v.SpatialObject)
+			return r, err
 		}
 	case types.TimeFamily:
 		if v, ok := val.(*tree.DTime); ok {
@@ -771,6 +741,11 @@ func MarshalColumnValue(col *ColumnDescriptor, val tree.Datum) (roachpb.Value, e
 			r.SetInt(int64(v.DInt))
 			return r, nil
 		}
+	case types.EnumFamily:
+		if v, ok := val.(*tree.DEnum); ok {
+			r.SetBytes(v.PhysicalRep)
+			return r, nil
+		}
 	default:
 		return r, errors.AssertionFailedf("unsupported column type: %s", col.Type.Family())
 	}
@@ -841,6 +816,18 @@ func UnmarshalColumnValue(a *DatumAlloc, typ *types.T, value roachpb.Value) (tre
 			return nil, err
 		}
 		return a.NewDDate(tree.MakeDDate(pgdate.MakeCompatibleDateFromDisk(v))), nil
+	case types.GeographyFamily:
+		v, err := value.GetGeo()
+		if err != nil {
+			return nil, err
+		}
+		return a.NewDGeography(tree.DGeography{Geography: geo.NewGeography(v)}), nil
+	case types.GeometryFamily:
+		v, err := value.GetGeo()
+		if err != nil {
+			return nil, err
+		}
+		return a.NewDGeometry(tree.DGeometry{Geometry: geo.NewGeometry(v)}), nil
 	case types.TimeFamily:
 		v, err := value.GetInt()
 		if err != nil {
@@ -910,6 +897,7 @@ func UnmarshalColumnValue(a *DatumAlloc, typ *types.T, value roachpb.Value) (tre
 			return nil, err
 		}
 		datum, _, err := decodeArrayNoMarshalColumnValue(a, typ.ArrayContents(), v)
+		// TODO(yuzefovich): do we want to create a new object via DatumAlloc?
 		return datum, err
 	case types.JsonFamily:
 		v, err := value.GetBytes()
@@ -921,6 +909,12 @@ func UnmarshalColumnValue(a *DatumAlloc, typ *types.T, value roachpb.Value) (tre
 			return nil, err
 		}
 		return tree.NewDJSON(jsonDatum), nil
+	case types.EnumFamily:
+		v, err := value.GetBytes()
+		if err != nil {
+			return nil, err
+		}
+		return tree.MakeDEnumFromPhysicalRepresentation(typ, v), nil
 	default:
 		return nil, errors.Errorf("unsupported column type: %s", typ.Family())
 	}
@@ -955,13 +949,75 @@ func decodeTuple(a *DatumAlloc, tupTyp *types.T, b []byte) (tree.Datum, []byte, 
 
 	var datum tree.Datum
 	for i := range tupTyp.TupleContents() {
-		datum, b, err = DecodeTableValue(a, &tupTyp.TupleContents()[i], b)
+		datum, b, err = DecodeTableValue(a, tupTyp.TupleContents()[i], b)
 		if err != nil {
 			return nil, b, err
 		}
 		result.D[i] = datum
 	}
 	return a.NewDTuple(result), b, nil
+}
+
+// encodeArrayKey generates an ordered key encoding of an array.
+// The encoding format for an array [a, b] is as follows:
+// [arrayMarker, enc(a), enc(b), terminator].
+// The terminator is guaranteed to be less than all encoded values,
+// so two arrays with the same prefix but different lengths will sort
+// correctly. The key difference is that NULL values need to be encoded
+// differently, because the standard NULL encoding conflicts with the
+// terminator byte. This NULL value is chosen to be larger than the
+// terminator but less than all existing encoded values.
+func encodeArrayKey(b []byte, array *tree.DArray, dir encoding.Direction) ([]byte, error) {
+	var err error
+	b = encoding.EncodeArrayKeyMarker(b, dir)
+	for _, elem := range array.Array {
+		if elem == tree.DNull {
+			b = encoding.EncodeNullWithinArrayKey(b, dir)
+		} else {
+			b, err = EncodeTableKey(b, elem, dir)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return encoding.EncodeArrayKeyTerminator(b, dir), nil
+}
+
+// decodeArrayKey decodes an array key generated by encodeArrayKey.
+func decodeArrayKey(
+	a *DatumAlloc, t *types.T, buf []byte, dir encoding.Direction,
+) (tree.Datum, []byte, error) {
+	var err error
+	buf, err = encoding.ValidateAndConsumeArrayKeyMarker(buf, dir)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	result := tree.NewDArray(t.ArrayContents())
+
+	for {
+		if len(buf) == 0 {
+			return nil, nil, errors.AssertionFailedf("invalid array encoding (unterminated)")
+		}
+		if encoding.IsArrayKeyDone(buf, dir) {
+			buf = buf[1:]
+			break
+		}
+		var d tree.Datum
+		if encoding.IsNextByteArrayEncodedNull(buf, dir) {
+			d = tree.DNull
+			buf = buf[1:]
+		} else {
+			d, buf, err = DecodeTableKey(a, t.ArrayContents(), buf, dir)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		if err := result.Append(d); err != nil {
+			return nil, nil, err
+		}
+	}
+	return result, buf, nil
 }
 
 // encodeArray produces the value encoding for an array.
@@ -1037,7 +1093,7 @@ func decodeArrayNoMarshalColumnValue(
 			result.HasNulls = true
 		} else {
 			result.HasNonNulls = true
-			val, b, err = decodeUntaggedDatum(a, elementType, b)
+			val, b, err = DecodeUntaggedDatum(a, elementType, b)
 			if err != nil {
 				return nil, b, err
 			}
@@ -1154,9 +1210,13 @@ func datumTypeToArrayElementEncodingType(t *types.T) (encoding.Type, error) {
 		return encoding.Int, nil
 	case types.FloatFamily:
 		return encoding.Float, nil
+	case types.GeometryFamily:
+		return encoding.Geo, nil
+	case types.GeographyFamily:
+		return encoding.Geo, nil
 	case types.DecimalFamily:
 		return encoding.Decimal, nil
-	case types.BytesFamily, types.StringFamily, types.CollatedStringFamily:
+	case types.BytesFamily, types.StringFamily, types.CollatedStringFamily, types.EnumFamily:
 		return encoding.Bytes, nil
 	case types.TimestampFamily, types.TimestampTZFamily:
 		return encoding.Time, nil
@@ -1220,6 +1280,10 @@ func encodeArrayElement(b []byte, d tree.Datum) ([]byte, error) {
 		return encoding.EncodeUntaggedDecimalValue(b, &t.Decimal), nil
 	case *tree.DDate:
 		return encoding.EncodeUntaggedIntValue(b, t.UnixEpochDaysWithOrig()), nil
+	case *tree.DGeography:
+		return encoding.EncodeUntaggedGeoValue(b, t.SpatialObject)
+	case *tree.DGeometry:
+		return encoding.EncodeUntaggedGeoValue(b, t.SpatialObject)
 	case *tree.DTime:
 		return encoding.EncodeUntaggedIntValue(b, int64(*t)), nil
 	case *tree.DTimeTZ:
@@ -1240,6 +1304,8 @@ func encodeArrayElement(b []byte, d tree.Datum) ([]byte, error) {
 		return encoding.EncodeUntaggedBytesValue(b, []byte(t.Contents)), nil
 	case *tree.DOidWrapper:
 		return encodeArrayElement(b, t.Wrapped)
+	case *tree.DEnum:
+		return encoding.EncodeUntaggedBytesValue(b, t.PhysicalRep), nil
 	default:
 		return nil, errors.Errorf("don't know how to encode %s (%T)", d, d)
 	}

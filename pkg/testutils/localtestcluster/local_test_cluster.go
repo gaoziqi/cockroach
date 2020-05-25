@@ -21,9 +21,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -122,7 +122,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		storage.DefaultStorageEngine, roachpb.Attributes{}, 50<<20)
 	ltc.Stopper.AddCloser(ltc.Eng)
 
-	ltc.Stores = kvserver.NewStores(ambient, ltc.Clock, clusterversion.TestingBinaryVersion, clusterversion.TestingBinaryMinSupportedVersion)
+	ltc.Stores = kvserver.NewStores(ambient, ltc.Clock)
 
 	factory := initFactory(cfg.Settings, nodeDesc, ambient.Tracer, ltc.Clock, ltc.Latency, ltc.Stores, ltc.Stopper, ltc.Gossip)
 	if ltc.DBContext == nil {
@@ -130,7 +130,11 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		dbCtx.Stopper = ltc.Stopper
 		ltc.DBContext = &dbCtx
 	}
-	ltc.DBContext.NodeID.Set(context.Background(), nodeID)
+	{
+		var c base.NodeIDContainer
+		c.Set(context.Background(), nodeID)
+		ltc.DBContext.NodeID = base.NewSQLIDContainer(0, &c, true /* exposed */)
+	}
 	ltc.DB = kv.NewDBWithContext(cfg.AmbientCtx, factory, ltc.Clock, *ltc.DBContext)
 	transport := kvserver.NewDummyRaftTransport(cfg.Settings)
 	// By default, disable the replica scanner and split queue, which
@@ -150,7 +154,6 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		cfg.AmbientCtx,
 		cfg.Clock,
 		cfg.DB,
-		[]storage.Engine{ltc.Eng},
 		cfg.Gossip,
 		active,
 		renewal,
@@ -168,11 +171,13 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		/* deterministic */ false,
 	)
 	cfg.Transport = transport
-	cfg.TimestampCachePageSize = tscache.TestSklPageSize
 	ctx := context.TODO()
 
+	if err := kvserver.WriteClusterVersion(ctx, ltc.Eng, clusterversion.TestingClusterVersion); err != nil {
+		t.Fatalf("unable to write cluster version: %s", err)
+	}
 	if err := kvserver.InitEngine(
-		ctx, ltc.Eng, roachpb.StoreIdent{NodeID: nodeID, StoreID: 1}, clusterversion.TestingClusterVersion,
+		ctx, ltc.Eng, roachpb.StoreIdent{NodeID: nodeID, StoreID: 1},
 	); err != nil {
 		t.Fatalf("unable to start local test cluster: %s", err)
 	}
@@ -181,10 +186,11 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	var initialValues []roachpb.KeyValue
 	var splits []roachpb.RKey
 	if !ltc.DontCreateSystemRanges {
-		schema := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig)
+		schema := sqlbase.MakeMetadataSchema(
+			keys.SystemSQLCodec, cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig,
+		)
 		var tableSplits []roachpb.RKey
-		bootstrapVersion := clusterversion.TestingClusterVersion
-		initialValues, tableSplits = schema.GetInitialValues(bootstrapVersion)
+		initialValues, tableSplits = schema.GetInitialValues()
 		splits = append(config.StaticSplits(), tableSplits...)
 		sort.Slice(splits, func(i, j int) bool {
 			return splits[i].Less(splits[j])
@@ -204,7 +210,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	}
 
 	if !ltc.DisableLivenessHeartbeat {
-		cfg.NodeLiveness.StartHeartbeat(ctx, ltc.Stopper, nil /* alive */)
+		cfg.NodeLiveness.StartHeartbeat(ctx, ltc.Stopper, []storage.Engine{ltc.Eng}, nil /* alive */)
 	}
 
 	if err := ltc.Store.Start(ctx, ltc.Stopper); err != nil {

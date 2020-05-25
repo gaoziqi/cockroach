@@ -13,8 +13,9 @@
 package execinfra
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -52,7 +53,7 @@ type FlowCtx struct {
 
 	// nodeID is the ID of the node on which the processors using this FlowCtx
 	// run.
-	NodeID roachpb.NodeID
+	NodeID *base.SQLIDContainer
 
 	// TraceKV is true if KV tracing was requested by the session.
 	TraceKV bool
@@ -69,7 +70,9 @@ type FlowCtx struct {
 // them at runtime to ensure expressions are evaluated with the correct indexed
 // var context.
 func (ctx *FlowCtx) NewEvalCtx() *tree.EvalContext {
-	return ctx.EvalCtx.Copy()
+	evalCopy := ctx.EvalCtx.Copy()
+	evalCopy.DistSQLTypeResolver = &execinfrapb.DistSQLTypeResolver{EvalContext: evalCopy}
+	return evalCopy
 }
 
 // TestingKnobs returns the distsql testing knobs for this flow context.
@@ -80,4 +83,9 @@ func (ctx *FlowCtx) TestingKnobs() TestingKnobs {
 // Stopper returns the stopper for this flowCtx.
 func (ctx *FlowCtx) Stopper() *stop.Stopper {
 	return ctx.Cfg.Stopper
+}
+
+// Codec returns the SQL codec for this flowCtx.
+func (ctx *FlowCtx) Codec() keys.SQLCodec {
+	return ctx.EvalCtx.Codec
 }

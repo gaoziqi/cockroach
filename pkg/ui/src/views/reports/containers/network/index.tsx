@@ -9,7 +9,7 @@
 // licenses/APL.txt.
 
 import { deviation as d3Deviation, mean as d3Mean } from "d3";
-import _ from "lodash";
+import _, { capitalize } from "lodash";
 import moment from "moment";
 import React, { Fragment } from "react";
 import { Helmet } from "react-helmet";
@@ -22,6 +22,7 @@ import { LivenessStatus, NodesSummary, nodesSummarySelector, selectLivenessReque
 import { AdminUIState } from "src/redux/state";
 import { LongToMoment, NanoToMilli } from "src/util/convert";
 import { FixLong } from "src/util/fixLong";
+import { trackFilter, trackCollapseNodes } from "src/util/analytics";
 import { getFilters, localityToString, NodeFilterList, NodeFilterListProps } from "src/views/reports/components/nodeFilterList";
 import Loading from "src/views/shared/components/loading";
 import { Latency } from "./latency";
@@ -96,24 +97,28 @@ export class Network extends React.Component<NetworkProps, INetworkState> {
     props.refreshNodes();
   }
 
-  componentWillMount() {
+  componentDidMount() {
     // Refresh nodes status query when mounting.
     this.refresh();
   }
 
-  componentWillReceiveProps(nextProps: NetworkProps) {
-    if (this.props.location !== nextProps.location) {
-      this.refresh(nextProps);
+  componentDidUpdate(prevProps: NetworkProps) {
+    if (!_.isEqual(this.props.location, prevProps.location)) {
+      this.refresh(this.props);
     }
   }
 
-  onChangeCollapse = (collapsed: boolean) => this.setState({ collapsed });
+  onChangeCollapse = (collapsed: boolean) => {
+    trackCollapseNodes(collapsed);
+    this.setState({ collapsed });
+  }
 
   onChangeFilter = (key: string, value: string) => {
     const { filter } = this.state;
     const newFilter = filter ? filter : {};
     const data = newFilter[key] || [];
     const values = data.indexOf(value) === -1 ? [...data, value] : data.length === 1 ? null : data.filter((m: string|number) => m !== value);
+    trackFilter(capitalize(key), value);
     this.setState({
       filter: {
         ...newFilter,
@@ -125,6 +130,7 @@ export class Network extends React.Component<NetworkProps, INetworkState> {
   deselectFilterByKey = (key: string) => {
     const { filter } = this.state;
     const newFilter = filter ? filter : {};
+    trackFilter(capitalize(key), "deselect all");
     this.setState({
       filter: {
         ...newFilter,
@@ -228,22 +234,30 @@ export class Network extends React.Component<NetworkProps, INetworkState> {
     data.forEach(values => {
       const localities = searchQuery(values.locality).split(",");
       localities.forEach((locality: string) => {
-        const value = locality.match(/^\w+/gi) ? locality.match(/^\w+/gi)[0] : null;
-        if (!sort.some(x => x.id === value)) {
-          const sortValue: NetworkSort = { id: value, filters: [] };
-          data.forEach(item => {
-            const valueLocality = searchQuery(values.locality).split(",");
-            const itemLocality = searchQuery(item.locality);
-            valueLocality.forEach(val => {
-              const itemLocalitySplited = val.match(/^\w+/gi) ? val.match(/^\w+/gi)[0] : null;
-              if (val === "cluster" && value === "cluster") {
-                sortValue.filters = [...sortValue.filters, { name: item.nodeID.toString(), address: item.address }];
-              } else if (itemLocalitySplited === value && !sortValue.filters.reduce((accumulator, vendor) => (accumulator || vendor.name === getValueFromString(value, itemLocality)), false)) {
-                sortValue.filters = [...sortValue.filters, { name: getValueFromString(value, itemLocality), address: item.address }];
-              }
+        if (locality !== "") {
+          const value = locality.match(/^\w+/gi) ? locality.match(/^\w+/gi)[0] : null;
+          if (!sort.some(x => x.id === value)) {
+            const sortValue: NetworkSort = {id: value, filters: []};
+            data.forEach(item => {
+              const valueLocality = searchQuery(values.locality).split(",");
+              const itemLocality = searchQuery(item.locality);
+              valueLocality.forEach(val => {
+                const itemLocalitySplited = val.match(/^\w+/gi) ? val.match(/^\w+/gi)[0] : null;
+                if (val === "cluster" && value === "cluster") {
+                  sortValue.filters = [...sortValue.filters, {
+                    name: item.nodeID.toString(),
+                    address: item.address,
+                  }];
+                } else if (itemLocalitySplited === value && !sortValue.filters.reduce((accumulator, vendor) => (accumulator || vendor.name === getValueFromString(value, itemLocality)), false)) {
+                  sortValue.filters = [...sortValue.filters, {
+                    name: getValueFromString(value, itemLocality),
+                    address: item.address,
+                  }];
+                }
+              });
             });
-          });
-          sort.push(sortValue);
+            sort.push(sortValue);
+          }
         }
       });
     });

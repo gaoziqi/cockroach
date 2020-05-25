@@ -12,6 +12,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -34,11 +35,11 @@ const (
 	changeFrontierProcName   = `changefntr`
 )
 
-var changefeedResultTypes = []types.T{
-	*types.Bytes,  // resolved span
-	*types.String, // topic
-	*types.Bytes,  // key
-	*types.Bytes,  // value
+var changefeedResultTypes = []*types.T{
+	types.Bytes,  // resolved span
+	types.String, // topic
+	types.Bytes,  // key
+	types.Bytes,  // value
 }
 
 // distChangefeedFlow plans and runs a distributed changefeed.
@@ -99,14 +100,17 @@ func distChangefeedFlow(
 	}
 
 	execCfg := phs.ExecCfg()
-	trackedSpans, err := fetchSpansForTargets(ctx, execCfg.DB, details.Targets, spansTS)
+	trackedSpans, err := fetchSpansForTargets(ctx, execCfg.DB, execCfg.Codec, details.Targets, spansTS)
 	if err != nil {
 		return err
 	}
 
 	// Changefeed flows handle transactional consistency themselves.
 	var noTxn *kv.Txn
-	gatewayNodeID := execCfg.NodeID.Get()
+	gatewayNodeID, err := execCfg.NodeID.OptionalNodeIDErr(48274)
+	if err != nil {
+		return err
+	}
 	dsp := phs.DistSQLPlanner()
 	evalCtx := phs.ExtendedEvalContext()
 	planCtx := dsp.NewPlanningCtx(ctx, evalCtx, noTxn)
@@ -211,7 +215,11 @@ func distChangefeedFlow(
 }
 
 func fetchSpansForTargets(
-	ctx context.Context, db *kv.DB, targets jobspb.ChangefeedTargets, ts hlc.Timestamp,
+	ctx context.Context,
+	db *kv.DB,
+	codec keys.SQLCodec,
+	targets jobspb.ChangefeedTargets,
+	ts hlc.Timestamp,
 ) ([]roachpb.Span, error) {
 	var spans []roachpb.Span
 	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -219,11 +227,11 @@ func fetchSpansForTargets(
 		txn.SetFixedTimestamp(ctx, ts)
 		// Note that all targets are currently guaranteed to be tables.
 		for tableID := range targets {
-			tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+			tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, codec, tableID)
 			if err != nil {
 				return err
 			}
-			spans = append(spans, tableDesc.PrimaryIndexSpan())
+			spans = append(spans, tableDesc.PrimaryIndexSpan(codec))
 		}
 		return nil
 	})

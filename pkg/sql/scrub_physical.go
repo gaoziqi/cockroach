@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 var _ checkOperation = &physicalCheckOperation{}
@@ -112,11 +112,12 @@ func (o *physicalCheckOperation) Start(params runParams) error {
 		return err
 	}
 	scan.index = scan.specifiedIndex
-	sb := span.MakeBuilder(o.tableDesc.TableDesc(), o.indexDesc)
-	scan.spans, err = sb.UnconstrainedSpans(false /* forDelete */)
+	sb := span.MakeBuilder(params.ExecCfg().Codec, o.tableDesc.TableDesc(), o.indexDesc)
+	scan.spans, err = sb.UnconstrainedSpans()
 	if err != nil {
 		return err
 	}
+	scan.isFull = true
 
 	planCtx := params.extendedEvalCtx.DistSQLPlanner.NewPlanningCtx(ctx, params.extendedEvalCtx, params.p.txn)
 	physPlan, err := params.extendedEvalCtx.DistSQLPlanner.createScrubPhysicalCheck(
@@ -142,8 +143,11 @@ func (o *physicalCheckOperation) Next(params runParams) (tree.Datums, error) {
 	row := o.run.rows.At(o.run.rowIndex)
 	o.run.rowIndex++
 
-	timestamp := tree.MakeDTimestamp(
+	timestamp, err := tree.MakeDTimestamp(
 		params.extendedEvalCtx.GetStmtTimestamp(), time.Nanosecond)
+	if err != nil {
+		return nil, err
+	}
 
 	details, ok := row[2].(*tree.DJSON)
 	if !ok {

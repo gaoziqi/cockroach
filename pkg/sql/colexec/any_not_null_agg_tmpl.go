@@ -21,27 +21,20 @@ package colexec
 
 import (
 	"time"
+	"unsafe"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	// {{/*
+	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	// */}}
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
-func newAnyNotNullAgg(allocator *Allocator, t coltypes.T) (aggregateFunc, error) {
-	switch t {
-	// {{range .}}
-	case _TYPES_T:
-		return &anyNotNull_TYPEAgg{allocator: allocator}, nil
-		// {{end}}
-	default:
-		return nil, errors.Errorf("unsupported any not null agg type %s", t)
-	}
-}
+// Remove unused warning.
+var _ = execgen.UNSAFEGET
 
 // {{/*
 
@@ -56,24 +49,41 @@ var _ time.Time
 // Dummy import to pull in "duration" package.
 var _ duration.Duration
 
-// _GOTYPESLICE is the template Go type slice variable for this operator. It
-// will be replaced by the Go slice representation for each type in coltypes.T, for
-// example []int64 for coltypes.Int64.
+// _GOTYPESLICE is the template variable.
 type _GOTYPESLICE interface{}
 
-// _TYPES_T is the template type variable for coltypes.T. It will be replaced by
-// coltypes.Foo for each type Foo in the coltypes.T type.
-const _TYPES_T = coltypes.Unhandled
+// _CANONICAL_TYPE_FAMILY is the template variable.
+const _CANONICAL_TYPE_FAMILY = types.UnknownFamily
+
+// _TYPE_WIDTH is the template variable.
+const _TYPE_WIDTH = 0
 
 // */}}
 
+func newAnyNotNullAggAlloc(
+	allocator *colmem.Allocator, t *types.T, allocSize int64,
+) (aggregateFuncAlloc, error) {
+	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
+	// {{range .}}
+	case _CANONICAL_TYPE_FAMILY:
+		switch t.Width() {
+		// {{range .WidthOverloads}}
+		case _TYPE_WIDTH:
+			return &anyNotNull_TYPEAggAlloc{allocator: allocator, allocSize: allocSize}, nil
+			// {{end}}
+		}
+		// {{end}}
+	}
+	return nil, errors.Errorf("unsupported any not null agg type %s", t.Name())
+}
+
 // {{range .}}
+// {{range .WidthOverloads}}
 
 // anyNotNull_TYPEAgg implements the ANY_NOT_NULL aggregate, returning the
 // first non-null value in the input column.
 type anyNotNull_TYPEAgg struct {
-	allocator                   *Allocator
-	done                        bool
+	allocator                   *colmem.Allocator
 	groups                      []bool
 	vec                         coldata.Vec
 	col                         _GOTYPESLICE
@@ -83,17 +93,20 @@ type anyNotNull_TYPEAgg struct {
 	foundNonNullForCurrentGroup bool
 }
 
+var _ aggregateFunc = &anyNotNull_TYPEAgg{}
+
+const sizeOfAnyNotNull_TYPEAgg = int64(unsafe.Sizeof(anyNotNull_TYPEAgg{}))
+
 func (a *anyNotNull_TYPEAgg) Init(groups []bool, vec coldata.Vec) {
 	a.groups = groups
 	a.vec = vec
-	a.col = vec._TemplateType()
+	a.col = vec.TemplateType()
 	a.nulls = vec.Nulls()
 	a.Reset()
 }
 
 func (a *anyNotNull_TYPEAgg) Reset() {
 	a.curIdx = -1
-	a.done = false
 	a.foundNonNullForCurrentGroup = false
 	a.nulls.UnsetNulls()
 }
@@ -110,24 +123,9 @@ func (a *anyNotNull_TYPEAgg) SetOutputIndex(idx int) {
 }
 
 func (a *anyNotNull_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
-	if a.done {
-		return
-	}
 	inputLen := b.Length()
-	if inputLen == 0 {
-		// If we haven't found any non-nulls for this group so far, the output for
-		// this group should be null.
-		if !a.foundNonNullForCurrentGroup {
-			a.nulls.SetNull(a.curIdx)
-		} else {
-			execgen.SET(a.col, a.curIdx, a.curAgg)
-		}
-		a.curIdx++
-		a.done = true
-		return
-	}
 	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
-	col, nulls := vec._TemplateType(), vec.Nulls()
+	col, nulls := vec.TemplateType(), vec.Nulls()
 
 	a.allocator.PerformOperation(
 		[]coldata.Vec{a.vec},
@@ -161,10 +159,41 @@ func (a *anyNotNull_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	)
 }
 
+func (a *anyNotNull_TYPEAgg) Flush() {
+	// If we haven't found any non-nulls for this group so far, the output for
+	// this group should be null.
+	if !a.foundNonNullForCurrentGroup {
+		a.nulls.SetNull(a.curIdx)
+	} else {
+		execgen.SET(a.col, a.curIdx, a.curAgg)
+	}
+	a.curIdx++
+}
+
 func (a *anyNotNull_TYPEAgg) HandleEmptyInputScalar() {
 	a.nulls.SetNull(0)
 }
 
+type anyNotNull_TYPEAggAlloc struct {
+	allocator *colmem.Allocator
+	allocSize int64
+	aggFuncs  []anyNotNull_TYPEAgg
+}
+
+var _ aggregateFuncAlloc = &anyNotNull_TYPEAggAlloc{}
+
+func (a *anyNotNull_TYPEAggAlloc) newAggFunc() aggregateFunc {
+	if len(a.aggFuncs) == 0 {
+		a.allocator.AdjustMemoryUsage(sizeOfAnyNotNull_TYPEAgg * a.allocSize)
+		a.aggFuncs = make([]anyNotNull_TYPEAgg, a.allocSize)
+	}
+	f := &a.aggFuncs[0]
+	f.allocator = a.allocator
+	a.aggFuncs = a.aggFuncs[1:]
+	return f
+}
+
+// {{end}}
 // {{end}}
 
 // {{/*
@@ -184,30 +213,28 @@ func _FIND_ANY_NOT_NULL(a *anyNotNull_TYPEAgg, nulls *coldata.Nulls, i int, _HAS
 			if !a.foundNonNullForCurrentGroup {
 				a.nulls.SetNull(a.curIdx)
 			} else {
+				// {{with .Global}}
 				execgen.SET(a.col, a.curIdx, a.curAgg)
+				// {{end}}
 			}
 		}
 		a.curIdx++
 		a.foundNonNullForCurrentGroup = false
 	}
 	var isNull bool
-	// {{ if .HasNulls }}
+	// {{if .HasNulls}}
 	isNull = nulls.NullAt(i)
-	// {{ else }}
+	// {{else}}
 	isNull = false
-	// {{ end }}
+	// {{end}}
 	if !a.foundNonNullForCurrentGroup && !isNull {
 		// If we haven't seen any non-nulls for the current group yet, and the
 		// current value is non-null, then we can pick the current value to be the
 		// output.
-		// {{ if eq .LTyp.String "Bytes" }}
-		// Bytes type is special - we actually need to copy the value that we're
-		// getting in an "unsafe" way because col might be reused (and the
-		// underlying memory overwritten) on the next batches.
-		a.curAgg = append(a.curAgg[:0], execgen.UNSAFEGET(col, i)...)
-		// {{ else }}
-		a.curAgg = execgen.UNSAFEGET(col, i)
-		// {{ end }}
+		// {{with .Global}}
+		val := execgen.UNSAFEGET(col, i)
+		execgen.COPYVAL(a.curAgg, val)
+		// {{end}}
 		a.foundNonNullForCurrentGroup = true
 	}
 	// {{end}}

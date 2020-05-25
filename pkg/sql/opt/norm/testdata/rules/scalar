@@ -2,6 +2,10 @@ exec-ddl
 CREATE TABLE a (k INT PRIMARY KEY, i INT, f FLOAT, s STRING, j JSON, arr int[])
 ----
 
+exec-ddl
+CREATE TABLE xy (x INT PRIMARY KEY, y INT)
+----
+
 # --------------------------------------------------
 # CommuteVar
 # --------------------------------------------------
@@ -246,6 +250,20 @@ values
  └── (true IN (NULL, NULL, ('201.249.149.90/18' & '97a7:3650:3dd8:d4e9:35fe:6cfb:a714:1c17/61') << 'e22f:2067:2ed2:7b07:b167:206f:f17b:5b7d/82'),)
 
 # --------------------------------------------------
+# EliminateExistsZeroRows
+# --------------------------------------------------
+
+norm expect=EliminateExistsZeroRows
+SELECT EXISTS(SELECT * FROM (VALUES (1)) WHERE false)
+----
+values
+ ├── columns: exists:2!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(2)
+ └── (false,)
+
+# --------------------------------------------------
 # EliminateExistsProject
 # --------------------------------------------------
 norm expect=EliminateExistsProject
@@ -351,6 +369,46 @@ select
                 │    └── limit hint: 1.00
                 └── 1
 
+# Ensure that EliminateExistsGroupBy does not activate for an EnsureDistinctOn.
+norm expect-not=EliminateExistsGroupBy
+SELECT * FROM a WHERE EXISTS(SELECT (SELECT y FROM xy WHERE y=k) FROM a)
+----
+select
+ ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ ├── key: (1)
+ ├── fd: (1)-->(2-6)
+ ├── scan a
+ │    ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-6)
+ └── filters
+      └── exists [subquery]
+           └── limit
+                ├── columns: k:7!null xy.y:14
+                ├── cardinality: [0 - 1]
+                ├── key: ()
+                ├── fd: ()-->(7,14)
+                ├── ensure-distinct-on
+                │    ├── columns: k:7!null xy.y:14
+                │    ├── grouping columns: k:7!null
+                │    ├── error: "more than one row returned by a subquery used as an expression"
+                │    ├── key: (7)
+                │    ├── fd: (7)-->(14)
+                │    ├── limit hint: 1.00
+                │    ├── left-join (hash)
+                │    │    ├── columns: k:7!null xy.y:14
+                │    │    ├── scan a
+                │    │    │    ├── columns: k:7!null
+                │    │    │    └── key: (7)
+                │    │    ├── scan xy
+                │    │    │    └── columns: xy.y:14
+                │    │    └── filters
+                │    │         └── xy.y:14 = k:7 [outer=(7,14), constraints=(/7: (/NULL - ]; /14: (/NULL - ]), fd=(7)==(14), (14)==(7)]
+                │    └── aggregations
+                │         └── const-agg [as=xy.y:14, outer=(14)]
+                │              └── xy.y:14
+                └── 1
+
 # --------------------------------------------------
 # EliminateExistsGroupBy + EliminateExistsProject
 # --------------------------------------------------
@@ -374,6 +432,141 @@ select
                 ├── fd: ()-->(8,10)
                 ├── scan a
                 │    ├── columns: i:8 s:10
+                │    └── limit hint: 1.00
+                └── 1
+
+# --------------------------------------------------
+# IntroduceExistsLimit
+# --------------------------------------------------
+norm expect=IntroduceExistsLimit
+SELECT * FROM a WHERE EXISTS(SELECT i FROM a)
+----
+select
+ ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ ├── key: (1)
+ ├── fd: (1)-->(2-6)
+ ├── scan a
+ │    ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-6)
+ └── filters
+      └── exists [subquery]
+           └── limit
+                ├── columns: i:8
+                ├── cardinality: [0 - 1]
+                ├── key: ()
+                ├── fd: ()-->(8)
+                ├── scan a
+                │    ├── columns: i:8
+                │    └── limit hint: 1.00
+                └── 1
+
+# Don't introduce a limit on correlated subqueries (when HasOuterCols is true).
+norm expect-not=IntroduceExistsLimit
+SELECT * FROM a a1 WHERE EXISTS(SELECT i FROM a a2 where a1.i = a2.i)
+----
+semi-join (hash)
+ ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ ├── key: (1)
+ ├── fd: (1)-->(2-6)
+ ├── scan a1
+ │    ├── columns: a1.k:1!null a1.i:2 a1.f:3 a1.s:4 a1.j:5 a1.arr:6
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-6)
+ ├── scan a2
+ │    └── columns: a2.i:8
+ └── filters
+      └── a1.i:2 = a2.i:8 [outer=(2,8), constraints=(/2: (/NULL - ]; /8: (/NULL - ]), fd=(2)==(8), (8)==(2)]
+
+# Don't introduce a limit when the subquery has one row.
+norm expect-not=IntroduceExistsLimit
+SELECT * FROM a WHERE EXISTS(SELECT * FROM (VALUES (1)))
+----
+select
+ ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ ├── key: (1)
+ ├── fd: (1)-->(2-6)
+ ├── scan a
+ │    ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-6)
+ └── filters
+      └── exists [subquery]
+           └── values
+                ├── columns: column1:7!null
+                ├── cardinality: [1 - 1]
+                ├── key: ()
+                ├── fd: ()-->(7)
+                └── (1,)
+
+# --------------------------------------------------
+# EliminateExistsLimit
+# --------------------------------------------------
+norm expect=EliminateExistsLimit
+SELECT * FROM a a1 WHERE EXISTS(SELECT i FROM a a2 where a1.i = a2.i LIMIT 1)
+----
+semi-join (hash)
+ ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ ├── key: (1)
+ ├── fd: (1)-->(2-6)
+ ├── scan a1
+ │    ├── columns: a1.k:1!null a1.i:2 a1.f:3 a1.s:4 a1.j:5 a1.arr:6
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-6)
+ ├── scan a2
+ │    └── columns: a2.i:8
+ └── filters
+      └── a1.i:2 = a2.i:8 [outer=(2,8), constraints=(/2: (/NULL - ]; /8: (/NULL - ]), fd=(2)==(8), (8)==(2)]
+
+norm expect=EliminateExistsLimit
+SELECT * FROM a a1 WHERE NOT EXISTS(SELECT i FROM a a2 where a1.i = a2.i LIMIT 1)
+----
+anti-join (hash)
+ ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ ├── key: (1)
+ ├── fd: (1)-->(2-6)
+ ├── scan a1
+ │    ├── columns: a1.k:1!null a1.i:2 a1.f:3 a1.s:4 a1.j:5 a1.arr:6
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-6)
+ ├── scan a2
+ │    └── columns: a2.i:8
+ └── filters
+      └── a1.i:2 = a2.i:8 [outer=(2,8), constraints=(/2: (/NULL - ]; /8: (/NULL - ]), fd=(2)==(8), (8)==(2)]
+
+# Don't eliminate a non-positive limit.
+norm expect-not=EliminateExistsLimit
+SELECT * FROM a a1 WHERE EXISTS(SELECT i FROM a a2 where a1.i = a2.i LIMIT 0)
+----
+values
+ ├── columns: k:1!null i:2!null f:3!null s:4!null j:5!null arr:6!null
+ ├── cardinality: [0 - 0]
+ ├── key: ()
+ └── fd: ()-->(1-6)
+
+# Don't eliminate a limit from a non-correlated subquery.
+norm expect-not=EliminateExistsLimit
+SELECT * FROM a WHERE EXISTS(SELECT * FROM a LIMIT 1)
+----
+select
+ ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ ├── key: (1)
+ ├── fd: (1)-->(2-6)
+ ├── scan a
+ │    ├── columns: k:1!null i:2 f:3 s:4 j:5 arr:6
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-6)
+ └── filters
+      └── exists [subquery]
+           └── limit
+                ├── columns: k:7!null i:8 f:9 s:10 j:11 arr:12
+                ├── cardinality: [0 - 1]
+                ├── key: ()
+                ├── fd: ()-->(7-12)
+                ├── scan a
+                │    ├── columns: k:7!null i:8 f:9 s:10 j:11 arr:12
+                │    ├── key: (7)
+                │    ├── fd: (7)-->(8-12)
                 │    └── limit hint: 1.00
                 └── 1
 
@@ -1274,26 +1467,24 @@ SELECT ARRAY(SELECT k FROM a WHERE a.i = b.i ORDER BY a.k) FROM a AS b
 project
  ├── columns: array:14
  ├── group-by
- │    ├── columns: a.k:7 rownum:15!null array_agg:16
- │    ├── grouping columns: rownum:15!null
+ │    ├── columns: b.k:1!null a.k:7 array_agg:15
+ │    ├── grouping columns: b.k:1!null
  │    ├── internal-ordering: +7 opt(8)
- │    ├── key: (15)
- │    ├── fd: (15)-->(7,16)
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(7,15)
  │    ├── sort
- │    │    ├── columns: b.i:2 a.k:7 a.i:8 rownum:15!null
- │    │    ├── key: (7,15)
- │    │    ├── fd: (15)-->(2), (7)-->(8)
+ │    │    ├── columns: b.k:1!null b.i:2 a.k:7 a.i:8
+ │    │    ├── key: (1,7)
+ │    │    ├── fd: (1)-->(2), (7)-->(8)
  │    │    ├── ordering: +7 opt(8) [actual: +7]
  │    │    └── left-join (hash)
- │    │         ├── columns: b.i:2 a.k:7 a.i:8 rownum:15!null
- │    │         ├── key: (7,15)
- │    │         ├── fd: (15)-->(2), (7)-->(8)
- │    │         ├── ordinality
- │    │         │    ├── columns: b.i:2 rownum:15!null
- │    │         │    ├── key: (15)
- │    │         │    ├── fd: (15)-->(2)
- │    │         │    └── scan b
- │    │         │         └── columns: b.i:2
+ │    │         ├── columns: b.k:1!null b.i:2 a.k:7 a.i:8
+ │    │         ├── key: (1,7)
+ │    │         ├── fd: (1)-->(2), (7)-->(8)
+ │    │         ├── scan b
+ │    │         │    ├── columns: b.k:1!null b.i:2
+ │    │         │    ├── key: (1)
+ │    │         │    └── fd: (1)-->(2)
  │    │         ├── scan a
  │    │         │    ├── columns: a.k:7!null a.i:8
  │    │         │    ├── key: (7)
@@ -1301,12 +1492,12 @@ project
  │    │         └── filters
  │    │              └── a.i:8 = b.i:2 [outer=(2,8), constraints=(/2: (/NULL - ]; /8: (/NULL - ]), fd=(2)==(8), (8)==(2)]
  │    └── aggregations
- │         ├── array-agg [as=array_agg:16, outer=(7)]
+ │         ├── array-agg [as=array_agg:15, outer=(7)]
  │         │    └── a.k:7
  │         └── any-not-null-agg [as=a.k:7, outer=(7)]
  │              └── a.k:7
  └── projections
-      └── COALESCE(CASE WHEN a.k:7 IS NOT NULL THEN array_agg:16 END, ARRAY[]) [as=array:14, outer=(7,16)]
+      └── COALESCE(CASE WHEN a.k:7 IS NOT NULL THEN array_agg:15 END, ARRAY[]) [as=array:14, outer=(7,15)]
 
 norm expect=NormalizeArrayFlattenToAgg
 SELECT ARRAY(SELECT generate_series(1, a.k) ORDER BY 1 DESC) FROM a
@@ -1606,3 +1797,153 @@ project
  │    └── filters (true)
  └── projections
       └── array:64 [as=array:66, outer=(64)]
+
+# --------------------------------------------------
+# SimplifySameVarEqualities
+# --------------------------------------------------
+
+norm expect=(SimplifySameVarEqualities,SimplifySelectFilters)
+SELECT k FROM a WHERE k = k
+----
+scan a
+ ├── columns: k:1!null
+ └── key: (1)
+
+norm expect=(SimplifySameVarEqualities,SimplifySelectFilters)
+SELECT k FROM a WHERE k >= k
+----
+scan a
+ ├── columns: k:1!null
+ └── key: (1)
+
+norm expect=(SimplifySameVarEqualities,SimplifySelectFilters)
+SELECT k FROM a WHERE k <= k
+----
+scan a
+ ├── columns: k:1!null
+ └── key: (1)
+
+norm expect=(SimplifySameVarEqualities,SimplifyJoinFilters)
+SELECT a.k FROM a FULL OUTER JOIN xy ON a.k = a.k
+----
+full-join (cross)
+ ├── columns: k:1
+ ├── scan a
+ │    ├── columns: k:1!null
+ │    └── key: (1)
+ ├── scan xy
+ └── filters
+      └── k:1 IS DISTINCT FROM CAST(NULL AS INT8) [outer=(1), constraints=(/1: (/NULL - ]; tight)]
+
+norm expect=(SimplifySameVarEqualities,SimplifyJoinFilters)
+SELECT a.k FROM a FULL OUTER JOIN xy ON a.k >= a.k
+----
+full-join (cross)
+ ├── columns: k:1
+ ├── scan a
+ │    ├── columns: k:1!null
+ │    └── key: (1)
+ ├── scan xy
+ └── filters
+      └── k:1 IS DISTINCT FROM CAST(NULL AS INT8) [outer=(1), constraints=(/1: (/NULL - ]; tight)]
+
+norm expect=(SimplifySameVarEqualities,SimplifyJoinFilters)
+SELECT a.k FROM a FULL OUTER JOIN xy ON a.k <= a.k
+----
+full-join (cross)
+ ├── columns: k:1
+ ├── scan a
+ │    ├── columns: k:1!null
+ │    └── key: (1)
+ ├── scan xy
+ └── filters
+      └── k:1 IS DISTINCT FROM CAST(NULL AS INT8) [outer=(1), constraints=(/1: (/NULL - ]; tight)]
+
+norm expect=SimplifySameVarEqualities
+SELECT k = k FROM a
+----
+project
+ ├── columns: "?column?":7
+ ├── scan a
+ │    ├── columns: k:1!null
+ │    └── key: (1)
+ └── projections
+      └── (k:1 IS DISTINCT FROM CAST(NULL AS INT8)) OR CAST(NULL AS BOOL) [as="?column?":7, outer=(1)]
+
+# --------------------------------------------------
+# SimplifySameVarInequalities
+# --------------------------------------------------
+
+norm expect=(SimplifySameVarInequalities,SimplifySelectFilters)
+SELECT k FROM a WHERE k != k
+----
+values
+ ├── columns: k:1!null
+ ├── cardinality: [0 - 0]
+ ├── key: ()
+ └── fd: ()-->(1)
+
+norm expect=(SimplifySameVarInequalities,SimplifySelectFilters)
+SELECT k FROM a WHERE k > k
+----
+values
+ ├── columns: k:1!null
+ ├── cardinality: [0 - 0]
+ ├── key: ()
+ └── fd: ()-->(1)
+
+norm expect=(SimplifySameVarInequalities,SimplifySelectFilters)
+SELECT k FROM a WHERE k < k
+----
+values
+ ├── columns: k:1!null
+ ├── cardinality: [0 - 0]
+ ├── key: ()
+ └── fd: ()-->(1)
+
+norm expect=(SimplifySameVarInequalities,SimplifyJoinFilters)
+SELECT a.k FROM a FULL OUTER JOIN xy ON a.k != a.k
+----
+full-join (cross)
+ ├── columns: k:1
+ ├── scan a
+ │    ├── columns: k:1!null
+ │    └── key: (1)
+ ├── scan xy
+ └── filters
+      └── false
+
+norm expect=(SimplifySameVarInequalities,SimplifyJoinFilters)
+SELECT a.k FROM a FULL OUTER JOIN xy ON a.k > a.k
+----
+full-join (cross)
+ ├── columns: k:1
+ ├── scan a
+ │    ├── columns: k:1!null
+ │    └── key: (1)
+ ├── scan xy
+ └── filters
+      └── false
+
+norm expect=(SimplifySameVarInequalities,SimplifyJoinFilters)
+SELECT a.k FROM a FULL OUTER JOIN xy ON a.k < a.k
+----
+full-join (cross)
+ ├── columns: k:1
+ ├── scan a
+ │    ├── columns: k:1!null
+ │    └── key: (1)
+ ├── scan xy
+ └── filters
+      └── false
+
+norm expect=SimplifySameVarInequalities
+SELECT k != k FROM a
+----
+project
+ ├── columns: "?column?":7
+ ├── scan a
+ │    ├── columns: k:1!null
+ │    └── key: (1)
+ └── projections
+      └── (k:1 IS NOT DISTINCT FROM CAST(NULL AS INT8)) AND CAST(NULL AS BOOL) [as="?column?":7, outer=(1)]

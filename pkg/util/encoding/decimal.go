@@ -22,7 +22,7 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/apd"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // EncodeDecimalAscending returns the resulting byte slice with the encoded decimal
@@ -624,6 +624,7 @@ func DecodeNonsortingDecimal(buf []byte, tmp []byte) (apd.Decimal, error) {
 // DecodeIntoNonsortingDecimal is like DecodeNonsortingDecimal, but it operates
 // on the passed-in *apd.Decimal instead of producing a new one.
 func DecodeIntoNonsortingDecimal(dec *apd.Decimal, buf []byte, tmp []byte) error {
+	*dec = apd.Decimal{}
 	switch buf[0] {
 	case decimalNaN:
 		dec.Form = apd.NaN

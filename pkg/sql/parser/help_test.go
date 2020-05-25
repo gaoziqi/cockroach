@@ -44,6 +44,12 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER TABLE blah RENAME TO blih ??`, `ALTER TABLE`},
 		{`ALTER TABLE blah SPLIT AT (SELECT 1) ??`, `ALTER TABLE`},
 
+		{`ALTER TYPE ??`, `ALTER TYPE`},
+		{`ALTER TYPE t ??`, `ALTER TYPE`},
+		{`ALTER TYPE t ADD VALUE ??`, `ALTER TYPE`},
+		{`ALTER TYPE t SET ??`, `ALTER TYPE`},
+		{`ALTER TYPE t RENAME ??`, `ALTER TYPE`},
+
 		{`ALTER INDEX foo@bar RENAME ??`, `ALTER INDEX`},
 		{`ALTER INDEX foo@bar RENAME TO blih ??`, `ALTER INDEX`},
 		{`ALTER INDEX foo@bar SPLIT ??`, `ALTER INDEX`},
@@ -124,6 +130,9 @@ func TestContextualHelp(t *testing.T) {
 		{`CREATE TABLE blah AS ??`, `CREATE TABLE`},
 		{`CREATE TABLE blah AS (SELECT 1) ??`, `CREATE TABLE`},
 		{`CREATE TABLE blah AS SELECT 1 ??`, `SELECT`},
+
+		{`CREATE TYPE blah AS ENUM ??`, `CREATE TYPE`},
+		{`DROP TYPE ??`, `DROP TYPE`},
 
 		{`CREATE SCHEMA IF ??`, `CREATE SCHEMA`},
 		{`CREATE SCHEMA IF NOT ??`, `CREATE SCHEMA`},

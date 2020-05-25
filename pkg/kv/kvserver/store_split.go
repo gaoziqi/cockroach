@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )
@@ -56,7 +56,7 @@ func splitPreApply(
 		// We handle this below.
 		rightRepl = nil
 	} else if err != nil {
-		log.Fatal(ctx, errors.Wrap(err, "failed to get RHS replica"))
+		log.Fatalf(ctx, "failed to get RHS replica: %v", err)
 	}
 	// Check to see if we know that the RHS has already been removed from this
 	// store at the replica ID implied by the split.
@@ -113,7 +113,7 @@ func splitPreApply(
 	// Term and Vote). This is the common case.
 	rsl := stateloader.Make(split.RightDesc.RangeID)
 	if err := rsl.SynthesizeRaftState(ctx, readWriter); err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 
 	// The initialMaxClosed is assigned to the RHS replica to ensure that
@@ -149,7 +149,7 @@ func splitPreApply(
 	// the hazard and ensures that no replica on the RHS is created with an
 	// initialMaxClosed that could be violated by a proposal on the RHS's
 	// initial leaseholder. See #44878.
-	initialMaxClosed := r.maxClosed(ctx)
+	initialMaxClosed, _ := r.maxClosed(ctx)
 	rightRepl.mu.Lock()
 	rightRepl.mu.initialMaxClosed = initialMaxClosed
 	rightRepl.mu.Unlock()
@@ -233,7 +233,7 @@ func prepareRightReplicaForSplit(
 	err = rightRepl.loadRaftMuLockedReplicaMuLocked(&split.RightDesc)
 	rightRepl.mu.Unlock()
 	if err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 
 	// Copy the minLeaseProposedTS from the LHS and grab the RHS's lease.
@@ -307,16 +307,6 @@ func (s *Store) SplitRange(
 	// that no pre-split commands are inserted into the wait-queues after we
 	// clear them.
 	leftRepl.concMgr.OnRangeSplit()
-
-	// The rangefeed processor will no longer be provided logical ops for
-	// its entire range, so it needs to be shut down and all registrations
-	// need to retry.
-	// TODO(nvanbenschoten): It should be possible to only reject registrations
-	// that overlap with the new range of the split and keep registrations that
-	// are only interested in keys that are still on the original range running.
-	leftRepl.disconnectRangefeedWithReason(
-		roachpb.RangeFeedRetryError_REASON_RANGE_SPLIT,
-	)
 
 	// Clear the original range's request stats, since they include requests for
 	// spans that are now owned by the new range.

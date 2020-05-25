@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	proto "github.com/gogo/protobuf/proto"
+	"github.com/stretchr/testify/require"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -95,7 +96,7 @@ func TestZoneConfigValidate(t *testing.T) {
 				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
 				GC:            &GCPolicy{TTLSeconds: 1},
-				Constraints: []Constraints{
+				Constraints: []ConstraintsConjunction{
 					{Constraints: []Constraint{{Value: "a", Type: Constraint_DEPRECATED_POSITIVE}}},
 				},
 			},
@@ -106,7 +107,7 @@ func TestZoneConfigValidate(t *testing.T) {
 				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
 				GC:            &GCPolicy{TTLSeconds: 1},
-				Constraints: []Constraints{
+				Constraints: []ConstraintsConjunction{
 					{Constraints: []Constraint{{Value: "a", Type: Constraint_PROHIBITED}}},
 				},
 			},
@@ -117,7 +118,7 @@ func TestZoneConfigValidate(t *testing.T) {
 				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
 				GC:            &GCPolicy{TTLSeconds: 1},
-				Constraints: []Constraints{
+				Constraints: []ConstraintsConjunction{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_PROHIBITED}},
 						NumReplicas: 1,
@@ -131,7 +132,7 @@ func TestZoneConfigValidate(t *testing.T) {
 				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
 				GC:            &GCPolicy{TTLSeconds: 1},
-				Constraints: []Constraints{
+				Constraints: []ConstraintsConjunction{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
 						NumReplicas: 2,
@@ -145,7 +146,7 @@ func TestZoneConfigValidate(t *testing.T) {
 				NumReplicas:   proto.Int32(3),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
 				GC:            &GCPolicy{TTLSeconds: 1},
-				Constraints: []Constraints{
+				Constraints: []ConstraintsConjunction{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
 						NumReplicas: 2,
@@ -159,7 +160,7 @@ func TestZoneConfigValidate(t *testing.T) {
 				NumReplicas:   proto.Int32(1),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
 				GC:            &GCPolicy{TTLSeconds: 1},
-				Constraints: []Constraints{
+				Constraints: []ConstraintsConjunction{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
 						NumReplicas: 0,
@@ -177,7 +178,7 @@ func TestZoneConfigValidate(t *testing.T) {
 				NumReplicas:   proto.Int32(3),
 				RangeMaxBytes: DefaultZoneConfig().RangeMaxBytes,
 				GC:            &GCPolicy{TTLSeconds: 1},
-				Constraints: []Constraints{
+				Constraints: []ConstraintsConjunction{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
 						NumReplicas: 2,
@@ -263,7 +264,7 @@ func TestZoneConfigValidateTandemFields(t *testing.T) {
 		},
 		{
 			ZoneConfig{
-				Constraints: []Constraints{
+				Constraints: []ConstraintsConjunction{
 					{
 						Constraints: []Constraint{{Value: "a", Type: Constraint_REQUIRED}},
 						NumReplicas: 2,
@@ -396,7 +397,7 @@ func TestZoneConfigMarshalYAML(t *testing.T) {
 	}
 
 	testCases := []struct {
-		constraints      []Constraints
+		constraints      []ConstraintsConjunction
 		leasePreferences []LeasePreference
 		expected         string
 	}{
@@ -411,7 +412,7 @@ lease_preferences: []
 `,
 		},
 		{
-			constraints: []Constraints{
+			constraints: []ConstraintsConjunction{
 				{
 					Constraints: []Constraint{
 						{
@@ -432,7 +433,7 @@ lease_preferences: []
 `,
 		},
 		{
-			constraints: []Constraints{
+			constraints: []ConstraintsConjunction{
 				{
 					Constraints: []Constraint{
 						{
@@ -462,7 +463,7 @@ lease_preferences: []
 `,
 		},
 		{
-			constraints: []Constraints{
+			constraints: []ConstraintsConjunction{
 				{
 					NumReplicas: 3,
 					Constraints: []Constraint{
@@ -484,7 +485,7 @@ lease_preferences: []
 `,
 		},
 		{
-			constraints: []Constraints{
+			constraints: []ConstraintsConjunction{
 				{
 					NumReplicas: 3,
 					Constraints: []Constraint{
@@ -515,7 +516,7 @@ lease_preferences: []
 `,
 		},
 		{
-			constraints: []Constraints{
+			constraints: []ConstraintsConjunction{
 				{
 					NumReplicas: 1,
 					Constraints: []Constraint{
@@ -584,7 +585,7 @@ lease_preferences: [[+duck=foo]]
 `,
 		},
 		{
-			constraints: []Constraints{
+			constraints: []ConstraintsConjunction{
 				{
 					Constraints: []Constraint{
 						{
@@ -908,4 +909,13 @@ func tableSpecifier(
 		},
 		Partition: partition,
 	}
+}
+
+// TestDefaultRangeSizesAreSane is a sanity check test to ensure that the values
+// in the default zone configs are what the author intended.
+func TestDefaultRangeSizesAreSane(t *testing.T) {
+	require.Regexp(t, "range_min_bytes:134217728 range_max_bytes:536870912",
+		DefaultSystemZoneConfigRef().String())
+	require.Regexp(t, "range_min_bytes:134217728 range_max_bytes:536870912",
+		DefaultZoneConfigRef().String())
 }

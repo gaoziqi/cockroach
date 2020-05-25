@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -53,8 +54,14 @@ func TestMaybeRefreshStats(t *testing.T) {
 		CREATE VIEW t.vw AS SELECT k, k+1 FROM t.a;`)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
-	descA := sqlbase.GetTableDescriptor(s.DB(), "t", "a")
-	cache := NewTableStatisticsCache(10 /* cacheSize */, s.GossipI().(*gossip.Gossip), kvDB, executor)
+	descA := sqlbase.GetTableDescriptor(s.DB(), keys.SystemSQLCodec, "t", "a")
+	cache := NewTableStatisticsCache(
+		10, /* cacheSize */
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		kvDB,
+		executor,
+		keys.SystemSQLCodec,
+	)
 	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// There should not be any stats yet.
@@ -92,7 +99,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// Ensure that attempt to refresh stats on view does not result in re-
 	// enqueuing the attempt.
 	// TODO(rytaft): Should not enqueue views to begin with.
-	descVW := sqlbase.GetTableDescriptor(s.DB(), "t", "vw")
+	descVW := sqlbase.GetTableDescriptor(s.DB(), keys.SystemSQLCodec, "t", "vw")
 	refresher.maybeRefreshStats(
 		ctx, s.Stopper(), descVW.ID, 0 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
@@ -123,8 +130,14 @@ func TestAverageRefreshTime(t *testing.T) {
 		INSERT INTO t.a VALUES (1);`)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
-	tableID := sqlbase.GetTableDescriptor(s.DB(), "t", "a").ID
-	cache := NewTableStatisticsCache(10 /* cacheSize */, s.GossipI().(*gossip.Gossip), kvDB, executor)
+	tableID := sqlbase.GetTableDescriptor(s.DB(), keys.SystemSQLCodec, "t", "a").ID
+	cache := NewTableStatisticsCache(
+		10, /* cacheSize */
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		kvDB,
+		executor,
+		keys.SystemSQLCodec,
+	)
 	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	checkAverageRefreshTime := func(expected time.Duration) error {
@@ -204,9 +217,12 @@ func TestAverageRefreshTime(t *testing.T) {
 			if err := columnIDsVal.Append(tree.NewDInt(tree.DInt(1))); err != nil {
 				return err
 			}
-			createdAt := tree.MakeDTimestamp(
+			createdAt, err := tree.MakeDTimestamp(
 				timeutil.Now().Add(time.Duration(-1*(i*3+7))*time.Hour), time.Hour,
 			)
+			if err != nil {
+				return err
+			}
 			name := fmt.Sprintf("stat%d", i)
 			if err := insertStat(txn, name, columnIDsVal, createdAt); err != nil {
 				return err
@@ -234,9 +250,12 @@ func TestAverageRefreshTime(t *testing.T) {
 			if err := columnIDsVal.Append(tree.NewDInt(tree.DInt(2))); err != nil {
 				return err
 			}
-			createdAt := tree.MakeDTimestamp(
+			createdAt, err := tree.MakeDTimestamp(
 				timeutil.Now().Add(time.Duration(-1*(i*4+6))*time.Hour), time.Hour,
 			)
+			if err != nil {
+				return err
+			}
 			if err := insertStat(txn, AutoStatsName, columnIDsVal, createdAt); err != nil {
 				return err
 			}
@@ -282,9 +301,12 @@ func TestAverageRefreshTime(t *testing.T) {
 			if err := columnIDsVal.Append(tree.NewDInt(tree.DInt(1))); err != nil {
 				return err
 			}
-			createdAt := tree.MakeDTimestamp(
+			createdAt, err := tree.MakeDTimestamp(
 				timeutil.Now().Add(time.Duration(-1*(i*90+300))*time.Minute), time.Minute,
 			)
+			if err != nil {
+				return err
+			}
 			if err := insertStat(txn, AutoStatsName, columnIDsVal, createdAt); err != nil {
 				return err
 			}
@@ -340,7 +362,13 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 		CREATE TABLE t.a (k INT PRIMARY KEY);`)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
-	cache := NewTableStatisticsCache(10 /* cacheSize */, s.GossipI().(*gossip.Gossip), kvDB, executor)
+	cache := NewTableStatisticsCache(
+		10, /* cacheSize */
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		kvDB,
+		executor,
+		keys.SystemSQLCodec,
+	)
 	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	AutomaticStatisticsClusterMode.Override(&st.SV, true)
@@ -371,7 +399,13 @@ func TestNoRetryOnFailure(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
-	cache := NewTableStatisticsCache(10 /* cacheSize */, s.GossipI().(*gossip.Gossip), kvDB, executor)
+	cache := NewTableStatisticsCache(
+		10, /* cacheSize */
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		kvDB,
+		executor,
+		keys.SystemSQLCodec,
+	)
 	r := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// Try to refresh stats on a table that doesn't exist.

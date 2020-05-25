@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
@@ -88,13 +89,15 @@ func (n *scrubNode) startExec(params runParams) error {
 		// If the tableName provided refers to a view and error will be
 		// returned here.
 		tableDesc, err := params.p.ResolveExistingObjectEx(
-			params.ctx, n.n.Table, true /*required*/, ResolveRequireTableDesc)
+			params.ctx, n.n.Table, true /*required*/, resolver.ResolveRequireTableDesc)
 		if err != nil {
 			return err
 		}
-		if err := n.startScrubTable(
-			params.ctx, params.p, tableDesc, params.p.ResolvedName(n.n.Table),
-		); err != nil {
+		tn, ok := params.p.ResolvedName(n.n.Table).(*tree.TableName)
+		if !ok {
+			return errors.AssertionFailedf("%q was not resolved as a table", n.n.Table)
+		}
+		if err := n.startScrubTable(params.ctx, params.p, tableDesc, tn); err != nil {
 			return err
 		}
 	case tree.ScrubDatabase:
@@ -157,14 +160,14 @@ func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tr
 		return err
 	}
 
-	schemas, err := p.Tables().getSchemasForDatabase(ctx, p.txn, dbDesc.ID)
+	schemas, err := p.Tables().GetSchemasForDatabase(ctx, p.txn, dbDesc.ID)
 	if err != nil {
 		return err
 	}
 
 	var tbNames TableNames
 	for _, schema := range schemas {
-		toAppend, err := GetObjectNames(ctx, p.txn, p, dbDesc, schema, true /*explicitPrefix*/)
+		toAppend, err := resolver.GetObjectNames(ctx, p.txn, p, p.ExecCfg().Codec, dbDesc, schema, true /*explicitPrefix*/)
 		if err != nil {
 			return err
 		}
@@ -173,8 +176,16 @@ func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tr
 
 	for i := range tbNames {
 		tableName := &tbNames[i]
-		objDesc, err := p.LogicalSchemaAccessor().GetObjectDesc(ctx, p.txn, p.ExecCfg().Settings,
-			tableName, p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/))
+		objDesc, err := p.LogicalSchemaAccessor().GetObjectDesc(
+			ctx,
+			p.txn,
+			p.ExecCfg().Settings,
+			p.ExecCfg().Codec,
+			tableName.Catalog(),
+			tableName.Schema(),
+			tableName.Table(),
+			p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/),
+		)
 		if err != nil {
 			return err
 		}
@@ -410,7 +421,7 @@ func createConstraintCheckOperations(
 	tableName *tree.TableName,
 	asOf hlc.Timestamp,
 ) (results []checkOperation, err error) {
-	constraints, err := tableDesc.GetConstraintInfo(ctx, p.txn)
+	constraints, err := tableDesc.GetConstraintInfo(ctx, p.txn, p.ExecCfg().Codec)
 	if err != nil {
 		return nil, err
 	}
@@ -455,7 +466,7 @@ func createConstraintCheckOperations(
 // scrubRunDistSQL run a distSQLPhysicalPlan plan in distSQL. If
 // RowContainer is returned, the caller must close it.
 func scrubRunDistSQL(
-	ctx context.Context, planCtx *PlanningCtx, p *planner, plan *PhysicalPlan, columnTypes []types.T,
+	ctx context.Context, planCtx *PlanningCtx, p *planner, plan *PhysicalPlan, columnTypes []*types.T,
 ) (*rowcontainer.RowContainer, error) {
 	ci := sqlbase.ColTypeInfoFromColTypes(columnTypes)
 	acc := p.extendedEvalCtx.Mon.MakeBoundAccount()
@@ -469,7 +480,7 @@ func scrubRunDistSQL(
 		p.ExecCfg().LeaseHolderCache,
 		p.txn,
 		func(ts hlc.Timestamp) {
-			_ = p.ExecCfg().Clock.Update(ts)
+			p.ExecCfg().Clock.Update(ts)
 		},
 		p.extendedEvalCtx.Tracing,
 	)

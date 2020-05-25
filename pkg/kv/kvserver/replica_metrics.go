@@ -15,7 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"go.etcd.io/etcd/raft"
@@ -27,7 +27,7 @@ type ReplicaMetrics struct {
 	LeaseValid  bool
 	Leaseholder bool
 	LeaseType   roachpb.LeaseType
-	LeaseStatus storagepb.LeaseStatus
+	LeaseStatus kvserverpb.LeaseStatus
 
 	// Quiescent indicates whether the replica believes itself to be quiesced.
 	Quiescent bool
@@ -42,8 +42,8 @@ type ReplicaMetrics struct {
 	Underreplicated bool
 	Overreplicated  bool
 	BehindCount     int64
-	LatchInfoLocal  storagepb.LatchManagerInfo
-	LatchInfoGlobal storagepb.LatchManagerInfo
+	LatchInfoLocal  kvserverpb.LatchManagerInfo
+	LatchInfoGlobal kvserverpb.LatchManagerInfo
 	RaftLogTooLarge bool
 }
 
@@ -58,6 +58,7 @@ func (r *Replica) Metrics(
 	desc := r.mu.state.Desc
 	zone := r.mu.zone
 	raftLogSize := r.mu.raftLogSize
+	raftLogSizeTrusted := r.mu.raftLogSizeTrusted
 	r.mu.RUnlock()
 
 	r.store.unquiescedReplicas.Lock()
@@ -82,6 +83,7 @@ func (r *Replica) Metrics(
 		latchInfoLocal,
 		latchInfoGlobal,
 		raftLogSize,
+		raftLogSizeTrusted,
 	)
 }
 
@@ -94,19 +96,20 @@ func calcReplicaMetrics(
 	clusterNodes int,
 	desc *roachpb.RangeDescriptor,
 	raftStatus *raft.Status,
-	leaseStatus storagepb.LeaseStatus,
+	leaseStatus kvserverpb.LeaseStatus,
 	storeID roachpb.StoreID,
 	quiescent bool,
 	ticking bool,
-	latchInfoLocal storagepb.LatchManagerInfo,
-	latchInfoGlobal storagepb.LatchManagerInfo,
+	latchInfoLocal kvserverpb.LatchManagerInfo,
+	latchInfoGlobal kvserverpb.LatchManagerInfo,
 	raftLogSize int64,
+	raftLogSizeTrusted bool,
 ) ReplicaMetrics {
 	var m ReplicaMetrics
 
 	var leaseOwner bool
 	m.LeaseStatus = leaseStatus
-	if leaseStatus.State == storagepb.LeaseState_VALID {
+	if leaseStatus.State == kvserverpb.LeaseState_VALID {
 		m.LeaseValid = true
 		leaseOwner = leaseStatus.Lease.OwnedBy(storeID)
 		m.LeaseType = leaseStatus.Lease.Type()
@@ -129,7 +132,8 @@ func calcReplicaMetrics(
 	m.LatchInfoGlobal = latchInfoGlobal
 
 	const raftLogTooLargeMultiple = 4
-	m.RaftLogTooLarge = raftLogSize > (raftLogTooLargeMultiple * raftCfg.RaftLogTruncationThreshold)
+	m.RaftLogTooLarge = raftLogSize > (raftLogTooLargeMultiple*raftCfg.RaftLogTruncationThreshold) &&
+		raftLogSizeTrusted
 
 	return m
 }
@@ -239,15 +243,29 @@ func (r *Replica) WritesPerSecond() float64 {
 }
 
 func (r *Replica) needsSplitBySizeRLocked() bool {
-	return r.exceedsMultipleOfSplitSizeRLocked(1)
+	exceeded, _ := r.exceedsMultipleOfSplitSizeRLocked(1)
+	return exceeded
 }
 
 func (r *Replica) needsMergeBySizeRLocked() bool {
 	return r.mu.state.Stats.Total() < *r.mu.zone.RangeMinBytes
 }
 
-func (r *Replica) exceedsMultipleOfSplitSizeRLocked(mult float64) bool {
+// exceedsMultipleOfSplitSizeRLocked returns whether the current size of the
+// range exceeds the max size times mult. If so, the bytes overage is also
+// returned. Note that the max size is determined by either the current maximum
+// size as dictated by the zone config or a previous max size indicating that
+// the max size has changed relatively recently and thus we should not
+// backpressure for being over.
+func (r *Replica) exceedsMultipleOfSplitSizeRLocked(mult float64) (exceeded bool, bytesOver int64) {
 	maxBytes := *r.mu.zone.RangeMaxBytes
+	if r.mu.largestPreviousMaxRangeSizeBytes > maxBytes {
+		maxBytes = r.mu.largestPreviousMaxRangeSizeBytes
+	}
 	size := r.mu.state.Stats.Total()
-	return maxBytes > 0 && float64(size) > float64(maxBytes)*mult
+	maxSize := int64(float64(maxBytes)*mult) + 1
+	if maxBytes <= 0 || size <= maxSize {
+		return false, 0
+	}
+	return true, size - maxSize
 }

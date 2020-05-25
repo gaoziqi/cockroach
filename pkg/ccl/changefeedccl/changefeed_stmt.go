@@ -38,8 +38,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	crdberrors "github.com/cockroachdb/errors"
-	"github.com/pkg/errors"
 )
 
 func init() {
@@ -252,7 +252,10 @@ func changefeedPlanHook(
 		// the CREATE CHANGEFEED statement. To do this, we create a "canary" sink,
 		// which will be immediately closed, only to check for errors.
 		{
-			nodeID := p.ExtendedEvalContext().NodeID
+			nodeID, err := p.ExtendedEvalContext().NodeID.OptionalNodeIDErr(48274)
+			if err != nil {
+				return err
+			}
 			var nilOracle timestampLowerBoundOracle
 			canarySink, err := getSink(
 				ctx, details.SinkURI, nodeID, details.Opts, details.Targets,
@@ -565,6 +568,9 @@ func (b *changefeedResumer) Resume(
 			return nil
 		}
 		if !IsRetryableError(err) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			log.Warningf(ctx, `CHANGEFEED job %d returning with error: %+v`, jobID, err)
 			return err
 		}
@@ -577,6 +583,9 @@ func (b *changefeedResumer) Resume(
 		// been updated by the changeFrontier processor since the flow started.
 		reloadedJob, reloadErr := execCfg.JobRegistry.LoadJob(ctx, jobID)
 		if reloadErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			log.Warningf(ctx, `CHANGEFEED job %d could not reload job progress; `+
 				`continuing from last known high-water of %s: %v`,
 				jobID, progress.GetHighWater(), reloadErr)
@@ -620,4 +629,40 @@ func (b *changefeedResumer) maybeCleanUpProtectedTimestamp(
 		// Log and move on.
 		log.Warningf(ctx, "failed to remove protected timestamp record %v: %v", ptsID, err)
 	}
+}
+
+var _ jobs.PauseRequester = (*changefeedResumer)(nil)
+
+// OnPauseRequest implements jobs.PauseRequester. If this changefeed is being
+// paused, we want to install a protected timestamp at the most recent high
+// watermark if there isn't already one.
+func (b *changefeedResumer) OnPauseRequest(
+	ctx context.Context, planHookState interface{}, txn *kv.Txn, progress *jobspb.Progress,
+) error {
+	details := b.job.Details().(jobspb.ChangefeedDetails)
+	if _, shouldPause := details.Opts[changefeedbase.OptProtectDataFromGCOnPause]; !shouldPause {
+		return nil
+	}
+
+	cp := progress.GetChangefeed()
+
+	// If we already have a protected timestamp record, keep it where it is.
+	if cp.ProtectedTimestampRecord != uuid.Nil {
+		return nil
+	}
+
+	resolved := progress.GetHighWater()
+	if resolved == nil {
+		// This should only happen if the job was created in a version that did not
+		// use protected timestamps but has yet to checkpoint its high water.
+		// Changefeeds from older versions didn't get protected timestamps so it's
+		// fine to not protect this one. In newer versions changefeeds which perform
+		// an initial scan at the statement time (and don't have an initial high
+		// water) will have a protected timestamp.
+		return nil
+	}
+
+	pts := planHookState.(sql.PlanHookState).ExecCfg().ProtectedTimestampProvider
+	return createProtectedTimestampRecord(ctx, pts, txn, *b.job.ID(),
+		details.Targets, *resolved, cp)
 }

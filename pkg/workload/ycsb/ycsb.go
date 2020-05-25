@@ -24,12 +24,11 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
-	"github.com/lib/pq"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -149,32 +148,39 @@ func (g *ycsb) Flags() workload.Flags { return g.flags }
 func (g *ycsb) Hooks() workload.Hooks {
 	return workload.Hooks{
 		Validate: func() error {
+			g.workload = strings.ToUpper(g.workload)
 			switch g.workload {
-			case "A", "a":
+			case "A":
 				g.readFreq = 0.5
 				g.updateFreq = 0.5
 				g.requestDistribution = "zipfian"
-			case "B", "b":
+			case "B":
 				g.readFreq = 0.95
 				g.updateFreq = 0.05
 				g.requestDistribution = "zipfian"
-			case "C", "c":
+			case "C":
 				g.readFreq = 1.0
 				g.requestDistribution = "zipfian"
-			case "D", "d":
+			case "D":
 				g.readFreq = 0.95
 				g.insertFreq = 0.05
 				g.requestDistribution = "latest"
-			case "E", "e":
+			case "E":
 				g.scanFreq = 0.95
 				g.insertFreq = 0.05
 				g.requestDistribution = "zipfian"
-			case "F", "f":
+			case "F":
 				g.readFreq = 0.5
 				g.readModifyWriteFreq = 0.5
 				g.requestDistribution = "zipfian"
 			default:
 				return errors.Errorf("Unknown workload: %q", g.workload)
+			}
+
+			if !g.flags.Lookup(`families`).Changed {
+				// If `--families` was not specified, default its value to the
+				// configuration that we expect to lead to better performance.
+				g.families = preferColumnFamilies(g.workload)
 			}
 
 			if g.recordCount == 0 {
@@ -188,9 +194,81 @@ func (g *ycsb) Hooks() workload.Hooks {
 	}
 }
 
-var usertableColTypes = []coltypes.T{
-	coltypes.Bytes, coltypes.Bytes, coltypes.Bytes, coltypes.Bytes, coltypes.Bytes, coltypes.Bytes,
-	coltypes.Bytes, coltypes.Bytes, coltypes.Bytes, coltypes.Bytes, coltypes.Bytes,
+// preferColumnFamilies returns whether we expect the use of column families to
+// improve performance for a given workload.
+func preferColumnFamilies(workload string) bool {
+	// These determinations were computed on 80da27b (04/04/2020) while running
+	// the ycsb roachtests.
+	//
+	// ycsb/[A-F]/nodes=3 (3x n1-standard-8 VMs):
+	//
+	// | workload | --families=false | --families=true | better with families? |
+	// |----------|-----------------:|----------------:|-----------------------|
+	// | A        |         11,743.5 |        17,760.5 | true                  |
+	// | B        |         35,232.3 |        32,982.2 | false                 |
+	// | C        |         45,454.7 |        44,112.5 | false                 |
+	// | D        |         36,091.0 |        35,615.1 | false                 |
+	// | E        |          5,774.9 |         2,604.8 | false                 |
+	// | F        |          4,933.1 |         8,259.7 | true                  |
+	//
+	// ycsb/[A-F]/nodes=3/cpu=32 (3x n1-standard-32 VMs):
+	//
+	// | workload | --families=false | --families=true | better with families? |
+	// |----------|-----------------:|----------------:|-----------------------|
+	// | A        |         14,144.1 |        27,179.4 | true                  |
+	// | B        |         96,669.6 |       104,567.5 | true                  |
+	// | C        |        137,463.3 |       131,953.7 | false                 |
+	// | D        |        103,188.6 |        95,285.7 | false                 |
+	// | E        |         10,417.5 |         7,913.6 | false                 |
+	// | F        |          5,782.3 |        15,532.1 | true                  |
+	//
+	switch workload {
+	case "A":
+		// Workload A is highly contended. It performs 50% single-row lookups
+		// and 50% single-column updates. Using column families breaks the
+		// contention between all updates to different columns of the same row,
+		// so we use them by default.
+		return true
+	case "B":
+		// Workload B is less contended than Workload A, but still bottlenecks
+		// on contention as concurrency grows. It performs 95% single-row
+		// lookups and 5% single-column updates. Using column families slows
+		// down the single-row lookups but speeds up the updates (see above).
+		// This trade-off favors column families for higher concurrency levels
+		// but does not at lower concurrency levels. We prefer larger YCSB
+		// deployments, so we use column families by default.
+		return true
+	case "C":
+		// Workload C has no contention. It consistent entirely of single-row
+		// lookups. Using column families slows down single-row lookups, so we
+		// do not use them by default.
+		return false
+	case "D":
+		// Workload D has no contention. It performs 95% single-row lookups and
+		// 5% single-row insertion. Using column families slows down single-row
+		// lookups and single-row insertion, so we do not use them by default.
+		return false
+	case "E":
+		// Workload E has moderate contention. It performs 95% multi-row scans
+		// and 5% single-row insertion. Using column families slows down
+		// multi-row scans and single-row insertion, so we do not use them by
+		// default.
+		return false
+	case "F":
+		// Workload F is highly contended. It performs 50% single-row lookups
+		// and 50% single-column updates expressed as multi-statement
+		// read-modify-write transactions. Using column families breaks the
+		// contention between all updates to different columns of the same row,
+		// so we use them by default.
+		return true
+	default:
+		panic(fmt.Sprintf("unexpected workload: %s", workload))
+	}
+}
+
+var usertableTypes = []*types.T{
+	types.Bytes, types.Bytes, types.Bytes, types.Bytes, types.Bytes, types.Bytes,
+	types.Bytes, types.Bytes, types.Bytes, types.Bytes, types.Bytes,
 }
 
 // Tables implements the Generator interface.
@@ -229,7 +307,7 @@ func (g *ycsb) Tables() []workload.Table {
 		}
 		usertable.InitialRows = workload.TypedTuples(
 			g.insertCount,
-			usertableColTypes,
+			usertableTypes,
 			usertableInitialRowsFn,
 		)
 	}
@@ -573,45 +651,21 @@ func (yw *ycsbWorker) readRow(ctx context.Context) error {
 func (yw *ycsbWorker) scanRows(ctx context.Context) error {
 	key := yw.nextReadKey()
 	scanLength := yw.scanLengthGen.Uint64()
-	// We run the SELECT statement in a retry loop to handle retryable errors.
-	// The scan is large enough that it occasionally begins streaming results
-	// back to the client. If it then hits a ReadWithinUncertaintyIntervalError
+	// We run the SELECT statement in a retry loop to handle retryable errors. The
+	// scan is large enough that it occasionally begins streaming results back to
+	// the client, and so if it then hits a ReadWithinUncertaintyIntervalError
 	// then it will return this error even if it is being run as an implicit
 	// transaction.
-	// TODO(nvanbenschoten): replace this with crdb.Execute when we update our
-	// vendored cockroachdb/cockroach-go library. Updating is currently running
-	// into issues because it requires us to update jackc/pgx to v4, which
-	// requires module support.
-	for {
-		err := func() error {
-			res, err := yw.scanStmt.QueryContext(ctx, key, scanLength)
-			if err != nil {
-				return err
-			}
-			defer res.Close()
-			for res.Next() {
-			}
-			return res.Err()
-		}()
-		if err == nil || !errIsRetryable(err) {
+	return crdb.Execute(func() error {
+		res, err := yw.scanStmt.QueryContext(ctx, key, scanLength)
+		if err != nil {
 			return err
 		}
-	}
-}
-
-func errIsRetryable(err error) bool {
-	switch t := err.(type) {
-	case *pq.Error:
-		// We look for either:
-		//  - the standard PG errcode SerializationFailureError:40001 or
-		//  - the Cockroach extension errcode RetriableError:CR000. This extension
-		//    has been removed server-side, but support for it has been left here for
-		//    now to maintain backwards compatibility.
-		return t.Code == "CR000" || t.Code == "40001"
-
-	default:
-		return false
-	}
+		defer res.Close()
+		for res.Next() {
+		}
+		return res.Err()
+	})
 }
 
 func (yw *ycsbWorker) readModifyWriteRow(ctx context.Context) error {
@@ -637,7 +691,7 @@ func (yw *ycsbWorker) readModifyWriteRow(ctx context.Context) error {
 		_, err := tx.StmtContext(ctx, updateStmt).ExecContext(ctx, args[:]...)
 		return err
 	})
-	if err == gosql.ErrNoRows && ctx.Err() != nil {
+	if errors.Is(err, gosql.ErrNoRows) && ctx.Err() != nil {
 		// Sometimes a context cancellation during a transaction can result in
 		// sql.ErrNoRows instead of the appropriate context.DeadlineExceeded. In
 		// this case, we just return ctx.Err(). See

@@ -37,6 +37,17 @@ type FunctionProperties struct {
 	// issue number to link.
 	UnsupportedWithIssue int
 
+	// Undocumented, when set to true, indicates that the built-in function is
+	// hidden from documentation. This is currently used to hide experimental
+	// functionality as it is being developed.
+	Undocumented bool
+
+	// Private, when set to true, indicates the built-in function is not
+	// available for use by user queries. This is currently used by some
+	// aggregates due to issue #10495. Private functions are implicitly
+	// considered undocumented.
+	Private bool
+
 	// NullableArgs is set to true when a function's definition can
 	// handle NULL arguments. When set, the function will be given the
 	// chance to see NULL arguments. When not, the function will
@@ -45,11 +56,6 @@ type FunctionProperties struct {
 	// NOTE: when set, a function should be prepared for any of its arguments to
 	// be NULL and should act accordingly.
 	NullableArgs bool
-
-	// Private, when set to true, indicates the built-in function is not
-	// available for use by user queries. This is currently used by some
-	// aggregates due to issue #10495.
-	Private bool
 
 	// NeedsRepeatedEvaluation is set to true when a function may change
 	// at every row whether or not it is applied to an expression that
@@ -91,6 +97,17 @@ type FunctionProperties struct {
 	// determined without extra context. This is used for formatting builtins
 	// with the FmtParsable directive.
 	AmbiguousReturnType bool
+
+	// IgnoreVolatilityCheck ignores checking the functions overloads against
+	// the Postgres ones at test time.
+	// This should be used with caution.
+	IgnoreVolatilityCheck bool
+}
+
+// ShouldDocument returns whether the built-in function should be included in
+// external-facing documentation.
+func (fp *FunctionProperties) ShouldDocument() bool {
+	return !(fp.Undocumented || fp.Private)
 }
 
 // FunctionClass specifies the class of the builtin function.
@@ -105,6 +122,18 @@ const (
 	WindowClass
 	// GeneratorClass is a builtin generator function.
 	GeneratorClass
+	// SQLClass is a builtin function that executes a SQL statement as a side
+	// effect of the function call.
+	//
+	// For example, AddGeometryColumn is a SQLClass function that executes an
+	// ALTER TABLE ... ADD COLUMN statement to add a geometry column to an
+	// existing table. It returns metadata about the column added.
+	//
+	// All builtin functions of this class should include a definition for
+	// Overload.SQLFn, which returns the SQL statement to be executed. They
+	// should also include a definition for Overload.Fn, which is executed
+	// like a NormalClass function and returns a Datum.
+	SQLClass
 )
 
 // Avoid vet warning about unused enum value.

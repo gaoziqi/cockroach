@@ -39,6 +39,7 @@ const (
 
 // Catalog implements the cat.Catalog interface for testing purposes.
 type Catalog struct {
+	tree.TypeReferenceResolver
 	testSchema Schema
 	counter    int
 }
@@ -495,7 +496,7 @@ func (tv *View) Equals(other cat.Object) bool {
 
 // Name is part of the cat.DataSource interface.
 func (tv *View) Name() tree.Name {
-	return tv.ViewName.TableName
+	return tv.ViewName.ObjectName
 }
 
 // fqName is part of the dataSource interface.
@@ -581,7 +582,7 @@ func (tt *Table) Equals(other cat.Object) bool {
 
 // Name is part of the cat.DataSource interface.
 func (tt *Table) Name() tree.Name {
-	return tt.TabName.TableName
+	return tt.TabName.ObjectName
 }
 
 // fqName is part of the dataSource interface.
@@ -592,11 +593,6 @@ func (tt *Table) fqName() cat.DataSourceName {
 // IsVirtualTable is part of the cat.Table interface.
 func (tt *Table) IsVirtualTable() bool {
 	return tt.IsVirtual
-}
-
-// IsInterleaved is part of the cat.Table interface.
-func (tt *Table) IsInterleaved() bool {
-	return false
 }
 
 // ColumnCount is part of the cat.Table interface.
@@ -859,6 +855,26 @@ func (ti *Index) PartitionByListPrefixes() []tree.Datums {
 	return res
 }
 
+// InterleaveAncestorCount is part of the cat.Index interface.
+func (ti *Index) InterleaveAncestorCount() int {
+	return 0
+}
+
+// InterleaveAncestor is part of the cat.Index interface.
+func (ti *Index) InterleaveAncestor(i int) (table, index cat.StableID, numKeyCols int) {
+	panic("no interleavings")
+}
+
+// InterleavedByCount is part of the cat.Index interface.
+func (ti *Index) InterleavedByCount() int {
+	return 0
+}
+
+// InterleavedBy is part of the cat.Index interface.
+func (ti *Index) InterleavedBy(i int) (table, index cat.StableID) {
+	panic("no interleavings")
+}
+
 // Column implements the cat.Column interface for testing purposes.
 type Column struct {
 	Ordinal      int
@@ -866,7 +882,6 @@ type Column struct {
 	Nullable     bool
 	Name         string
 	Type         *types.T
-	ColType      types.T
 	DefaultExpr  *string
 	ComputedExpr *string
 }
@@ -895,29 +910,29 @@ func (tc *Column) DatumType() *types.T {
 
 // ColTypePrecision is part of the cat.Column interface.
 func (tc *Column) ColTypePrecision() int {
-	if tc.ColType.Family() == types.ArrayFamily {
-		if tc.ColType.ArrayContents().Family() == types.ArrayFamily {
+	if tc.Type.Family() == types.ArrayFamily {
+		if tc.Type.ArrayContents().Family() == types.ArrayFamily {
 			panic(errors.AssertionFailedf("column type should never be a nested array"))
 		}
-		return int(tc.ColType.ArrayContents().Precision())
+		return int(tc.Type.ArrayContents().Precision())
 	}
-	return int(tc.ColType.Precision())
+	return int(tc.Type.Precision())
 }
 
 // ColTypeWidth is part of the cat.Column interface.
 func (tc *Column) ColTypeWidth() int {
-	if tc.ColType.Family() == types.ArrayFamily {
-		if tc.ColType.ArrayContents().Family() == types.ArrayFamily {
+	if tc.Type.Family() == types.ArrayFamily {
+		if tc.Type.ArrayContents().Family() == types.ArrayFamily {
 			panic(errors.AssertionFailedf("column type should never be a nested array"))
 		}
-		return int(tc.ColType.ArrayContents().Width())
+		return int(tc.Type.ArrayContents().Width())
 	}
-	return int(tc.ColType.Width())
+	return int(tc.Type.Width())
 }
 
 // ColTypeStr is part of the cat.Column interface.
 func (tc *Column) ColTypeStr() string {
-	return tc.ColType.SQLString()
+	return tc.Type.SQLString()
 }
 
 // IsHidden is part of the cat.Column interface.
@@ -993,10 +1008,11 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	if ts.js.HistogramColumnType == "" || ts.js.HistogramBuckets == nil {
 		return nil
 	}
-	colType, err := parser.ParseType(ts.js.HistogramColumnType)
+	colTypeRef, err := parser.ParseType(ts.js.HistogramColumnType)
 	if err != nil {
 		panic(err)
 	}
+	colType := tree.MustBeStaticallyKnownType(colTypeRef)
 	histogram := make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
 	for i := range histogram {
 		bucket := &ts.js.HistogramBuckets[i]
@@ -1146,7 +1162,7 @@ func (ts *Sequence) Equals(other cat.Object) bool {
 
 // Name is part of the cat.DataSource interface.
 func (ts *Sequence) Name() tree.Name {
-	return ts.SeqName.TableName
+	return ts.SeqName.ObjectName
 }
 
 // fqName is part of the dataSource interface.

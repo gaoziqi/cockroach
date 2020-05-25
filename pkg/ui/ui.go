@@ -27,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	assetfs "github.com/elazarl/go-bindata-assetfs"
-	"github.com/pkg/errors"
 )
 
 // Asset loads and returns the asset for the given name. It returns an error if
@@ -143,7 +143,7 @@ func Handler(cfg Config) http.Handler {
 		}); err != nil {
 			err = errors.Wrap(err, "templating index.html")
 			http.Error(w, err.Error(), 500)
-			log.Error(r.Context(), err)
+			log.Errorf(r.Context(), "%v", err)
 		}
 	})
 }

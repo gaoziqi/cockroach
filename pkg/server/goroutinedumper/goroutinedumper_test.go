@@ -22,7 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -157,7 +157,7 @@ func TestHeuristic(t *testing.T) {
 				dir: dumpDir,
 			}
 
-			ctx := context.TODO()
+			ctx := context.Background()
 			for _, v := range c.vals {
 				currentTime = baseTime.Add(v.secs * time.Second)
 				numGoroutinesThreshold.Override(&st.SV, v.threshold)
@@ -174,19 +174,6 @@ func TestNewGoroutineDumper(t *testing.T) {
 		assert.EqualError(t, err, "directory to store dumps could not be determined")
 	})
 
-	t.Run("fails because goroutine_dump already exists as a file", func(t *testing.T) {
-		tempDir, dirCleanupFn := testutils.TempDir(t)
-		defer dirCleanupFn()
-		path := filepath.Join(tempDir, "goroutine_dump")
-		emptyFile, err := os.Create(path)
-		assert.NoError(t, err, "failed to create goroutine_dump file")
-		err = emptyFile.Close()
-		assert.NoError(t, err, "failed to close goroutine_dump file")
-
-		_, err = NewGoroutineDumper(tempDir)
-		assert.IsType(t, &os.PathError{}, err)
-	})
-
 	t.Run("succeeds", func(t *testing.T) {
 		tempDir, dirCleanupFn := testutils.TempDir(t)
 		defer dirCleanupFn()
@@ -194,7 +181,7 @@ func TestNewGoroutineDumper(t *testing.T) {
 		assert.NoError(t, err, "unexpected error in NewGoroutineDumper")
 		assert.Equal(t, int64(0), gd.goroutinesThreshold)
 		assert.Equal(t, int64(0), gd.maxGoroutinesDumped)
-		assert.Equal(t, filepath.Join(tempDir, "goroutine_dump"), gd.dir)
+		assert.Equal(t, tempDir, gd.dir)
 	})
 }
 
@@ -296,7 +283,7 @@ func TestGC(t *testing.T) {
 				err = os.Truncate(path, f.size)
 				assert.NoError(t, err, "unexpected error when truncating file %s", path)
 			}
-			ctx := context.TODO()
+			ctx := context.Background()
 			gc(ctx, tempDir, c.sizeLimit)
 			files, err := ioutil.ReadDir(tempDir)
 			assert.NoError(t, err, "unexpected error when listing files in %s", tempDir)

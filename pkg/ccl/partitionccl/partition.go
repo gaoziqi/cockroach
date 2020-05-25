@@ -92,7 +92,7 @@ func valueEncodePartitionTuple(
 		}
 
 		var semaCtx tree.SemaContext
-		typedExpr, err := sqlbase.SanitizeVarFreeExpr(expr, &cols[i].Type, "partition",
+		typedExpr, err := sqlbase.SanitizeVarFreeExpr(expr, cols[i].Type, "partition",
 			&semaCtx, false /* allowImpure */)
 		if err != nil {
 			return nil, err
@@ -271,7 +271,7 @@ func selectPartitionExprs(
 	if err := tableDesc.ForeachNonDropIndex(func(idxDesc *sqlbase.IndexDescriptor) error {
 		genExpr := true
 		return selectPartitionExprsByName(
-			a, tableDesc, idxDesc, &idxDesc.Partitioning, prefixDatums, exprsByPartName, genExpr)
+			a, evalCtx, tableDesc, idxDesc, &idxDesc.Partitioning, prefixDatums, exprsByPartName, genExpr)
 	}); err != nil {
 		return nil, err
 	}
@@ -322,6 +322,7 @@ func selectPartitionExprs(
 // that the requested partitions are all valid).
 func selectPartitionExprsByName(
 	a *sqlbase.DatumAlloc,
+	evalCtx *tree.EvalContext,
 	tableDesc *sqlbase.TableDescriptor,
 	idxDesc *sqlbase.IndexDescriptor,
 	partDesc *sqlbase.PartitioningDescriptor,
@@ -340,7 +341,7 @@ func selectPartitionExprsByName(
 			exprsByPartName[l.Name] = tree.DBoolFalse
 			var fakeDatums tree.Datums
 			if err := selectPartitionExprsByName(
-				a, tableDesc, idxDesc, &l.Subpartitioning, fakeDatums, exprsByPartName, genExpr,
+				a, evalCtx, tableDesc, idxDesc, &l.Subpartitioning, fakeDatums, exprsByPartName, genExpr,
 			); err != nil {
 				return err
 			}
@@ -361,7 +362,7 @@ func selectPartitionExprsByName(
 			if err != nil {
 				return err
 			}
-			colVars[i] = tree.NewTypedOrdinalReference(int(col.ID), &col.Type)
+			colVars[i] = tree.NewTypedOrdinalReference(int(col.ID), col.Type)
 		}
 	}
 
@@ -380,7 +381,7 @@ func selectPartitionExprsByName(
 		for _, l := range partDesc.List {
 			for _, valueEncBuf := range l.Values {
 				t, _, err := sqlbase.DecodePartitionTuple(
-					a, tableDesc, idxDesc, partDesc, valueEncBuf, prefixDatums)
+					a, evalCtx.Codec, tableDesc, idxDesc, partDesc, valueEncBuf, prefixDatums)
 				if err != nil {
 					return err
 				}
@@ -388,9 +389,9 @@ func selectPartitionExprsByName(
 
 				// When len(allDatums) < len(colVars), the missing elements are DEFAULTs, so
 				// we can simply exclude them from the expr.
-				typContents := make([]types.T, len(allDatums))
+				typContents := make([]*types.T, len(allDatums))
 				for i, d := range allDatums {
-					typContents[i] = *d.ResolvedType()
+					typContents[i] = d.ResolvedType()
 				}
 				tupleTyp := types.MakeTuple(typContents)
 				partValueExpr := tree.NewTypedComparisonExpr(tree.EQ,
@@ -414,7 +415,7 @@ func selectPartitionExprsByName(
 					genExpr = false
 				}
 				if err := selectPartitionExprsByName(
-					a, tableDesc, idxDesc, &l.Subpartitioning, allDatums, exprsByPartName, genExpr,
+					a, evalCtx, tableDesc, idxDesc, &l.Subpartitioning, allDatums, exprsByPartName, genExpr,
 				); err != nil {
 					return err
 				}

@@ -13,6 +13,7 @@ import { connect } from "react-redux";
 import { Link } from "react-router-dom";
 import moment from "moment";
 import Long from "long";
+import emptyTracingBackground from "assets/statementsPage/emptyTracingBackground.svg";
 
 import {
   Button,
@@ -20,7 +21,6 @@ import {
   TextTypes,
   Table,
   ColumnsConfig,
-  Anchor,
   DownloadFile,
   DownloadFileRef,
 } from "src/components";
@@ -42,7 +42,9 @@ import IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnos
 import StatementDiagnosticsRequest = cockroach.server.serverpb.StatementDiagnosticsRequest;
 import { getDiagnosticsStatus, sortByCompletedField, sortByRequestedAtField } from "./diagnosticsUtils";
 import { statementDiagnostics } from "src/util/docs";
-import { createStatementDiagnosticsAlertLocalSetting } from "oss/src/redux/alerts";
+import { createStatementDiagnosticsAlertLocalSetting } from "src/redux/alerts";
+import { trackActivateDiagnostics, trackDownloadDiagnosticsBundle } from "src/util/analytics";
+import { Empty } from "src/components/empty";
 
 interface DiagnosticsViewOwnProps {
   statementFingerprint?: string;
@@ -92,20 +94,22 @@ export class DiagnosticsView extends React.Component<DiagnosticsViewProps, Diagn
         if (record.completed) {
           return (
             <div className="crl-statements-diagnostics-view__actions-column">
-              <Button
-                onClick={() => this.getStatementDiagnostics(record.statement_diagnostics_id)}
-                size="small"
-                type="flat"
-                iconPosition="left"
-                icon={() => (
-                  <span
-                    className="crl-statements-diagnostics-view__icon"
-                    dangerouslySetInnerHTML={ trustIcon(DownloadIcon) }
-                  />
-                )}
-              >
-                Download
-              </Button>
+              <a href={`_admin/v1/stmtbundle/${record.statement_diagnostics_id}`}
+                 onClick={() => trackDownloadDiagnosticsBundle(record.statement_fingerprint)}>
+                <Button
+                  size="small"
+                  type="flat"
+                  iconPosition="left"
+                  icon={() => (
+                    <span
+                      className="crl-statements-diagnostics-view__icon"
+                      dangerouslySetInnerHTML={ trustIcon(DownloadIcon) }
+                    />
+                  )}
+                >
+                  Bundle (.zip)
+                </Button>
+              </a>
             </div>
           );
         }
@@ -126,6 +130,7 @@ export class DiagnosticsView extends React.Component<DiagnosticsViewProps, Diagn
   onActivateButtonClick = () => {
     const { activate, statementFingerprint } = this.props;
     activate(statementFingerprint);
+    trackActivateDiagnostics(statementFingerprint);
   }
 
   componentWillUnmount() {
@@ -144,7 +149,7 @@ export class DiagnosticsView extends React.Component<DiagnosticsViewProps, Diagn
 
     if (!hasData) {
       return (
-        <SummaryCard className="summary--card__empty-sate">
+        <SummaryCard className="summary--card__empty-state">
           <EmptyDiagnosticsView {...this.props} />
         </SummaryCard>
       );
@@ -159,13 +164,18 @@ export class DiagnosticsView extends React.Component<DiagnosticsViewProps, Diagn
           >
             Statement diagnostics
           </Text>
-          <Button
-            onClick={this.onActivateButtonClick}
-            disabled={!canRequestDiagnostics}
-            type="secondary"
-          >
-            Activate diagnostics
-          </Button>
+          {
+            canRequestDiagnostics && (
+              <Button
+                onClick={this.onActivateButtonClick}
+                disabled={!canRequestDiagnostics}
+                type="secondary"
+                className="crl-statements-diagnostics-view__activate-button"
+              >
+                Activate diagnostics
+              </Button>
+            )
+          }
         </div>
         <Table
           dataSource={dataSource}
@@ -180,46 +190,26 @@ export class DiagnosticsView extends React.Component<DiagnosticsViewProps, Diagn
   }
 }
 
-export class EmptyDiagnosticsView extends React.Component<DiagnosticsViewProps> {
-
-  onActivateButtonClick = () => {
-    const { activate, statementFingerprint } = this.props;
+export const EmptyDiagnosticsView = ({ activate, statementFingerprint }: DiagnosticsViewProps) => {
+  const onActivateButtonClick = () => {
     activate(statementFingerprint);
-  }
-
-  render() {
-    return (
-      <div className="crl-statements-diagnostics-view">
-        <Text
-          className="crl-statements-diagnostics-view__title"
-          textType={TextTypes.Heading3}
-        >
-          Activate statement diagnostics
-        </Text>
-        <div className="crl-statements-diagnostics-view__content">
-          <main className="crl-statements-diagnostics-view__main">
-            <Text
-              textType={TextTypes.Body}
-            >
-              When you activate statement diagnostics, CockroachDB will wait for the next query that matches
-              this statement fingerprint. A download button will appear on the statement list and detail pages
-              when the query is ready. The statement diagnostic will include EXPLAIN plans,
-              table statistics, and traces. <Anchor href={statementDiagnostics}>Learn more</Anchor>
-            </Text>
-          </main>
-          <footer className="crl-statements-diagnostics-view__footer">
-            <Button
-              type="primary"
-              onClick={this.onActivateButtonClick}
-            >
-              Activate
-            </Button>
-          </footer>
-        </div>
-      </div>
-    );
-  }
-}
+    trackActivateDiagnostics(statementFingerprint);
+  };
+  return (
+    <Empty
+      title="Activate statement diagnostics"
+      description="When you activate statement diagnostics, CockroachDB will wait for the next query that matches
+      this statement fingerprint. A download button will appear on the statement list and detail pages
+      when the query is ready. The statement diagnostic will include EXPLAIN plans,
+      table statistics, and traces."
+      anchor="Learn More"
+      link={statementDiagnostics}
+      label="Activate"
+      onClick={onActivateButtonClick}
+      backgroundImage={emptyTracingBackground}
+    />
+  );
+};
 
 interface MapStateToProps {
   hasData: boolean;

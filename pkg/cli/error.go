@@ -69,7 +69,7 @@ func (f *formattedError) Error() string {
 
 	// Extract the fields.
 	var message, code, hint, detail, location string
-	if pqErr, ok := errors.UnwrapAll(f.err).(*pq.Error); ok {
+	if pqErr := (*pq.Error)(nil); errors.As(f.err, &pqErr) {
 		if pqErr.Severity != "" {
 			severity = pqErr.Severity
 		}
@@ -299,7 +299,8 @@ func MaybeDecorateGRPCError(
 			if reGRPCAuthFailure.MatchString(msg) {
 				return connSecurityHint()
 			}
-			if reGRPCConnFailed.MatchString(msg) {
+			if reGRPCConnFailed.MatchString(msg) /* gRPC 1.21 */ ||
+				status.Code(errors.Cause(err)) == codes.Unavailable /* gRPC 1.27 */ {
 				return connRefused()
 			}
 
@@ -354,11 +355,11 @@ func maybeShoutError(
 }
 
 func checkAndMaybeShout(err error) error {
-	return checkAndMaybeShoutTo(err, log.Shout)
+	return checkAndMaybeShoutTo(err, log.Shoutf)
 }
 
 func checkAndMaybeShoutTo(
-	err error, logger func(context.Context, log.Severity, ...interface{}),
+	err error, logger func(context.Context, log.Severity, string, ...interface{}),
 ) error {
 	if err == nil {
 		return nil
@@ -370,6 +371,6 @@ func checkAndMaybeShoutTo(
 		severity = ec.severity
 		cause = ec.cause
 	}
-	logger(context.Background(), severity, cause)
+	logger(context.Background(), severity, "%v", cause)
 	return err
 }

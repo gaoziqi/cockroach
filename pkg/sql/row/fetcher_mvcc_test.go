@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func slurpUserDataKVs(t testing.TB, e storage.Engine) []roachpb.KeyValue {
@@ -83,8 +83,8 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 		e STRING, f STRING, PRIMARY KEY (e, f)
 	) INTERLEAVE IN PARENT parent (e)`)
 
-	parentDesc := sqlbase.GetImmutableTableDescriptor(kvDB, `d`, `parent`)
-	childDesc := sqlbase.GetImmutableTableDescriptor(kvDB, `d`, `child`)
+	parentDesc := sqlbase.GetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `parent`)
+	childDesc := sqlbase.GetImmutableTableDescriptor(kvDB, keys.SystemSQLCodec, `d`, `child`)
 	var args []row.FetcherTableArgs
 	for _, desc := range []*sqlbase.ImmutableTableDescriptor{parentDesc, childDesc} {
 		colIdxMap := make(map[sqlbase.ColumnID]int)
@@ -95,7 +95,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 			valNeededForCol.Add(colIdx)
 		}
 		args = append(args, row.FetcherTableArgs{
-			Spans:            desc.AllIndexSpans(),
+			Spans:            desc.AllIndexSpans(keys.SystemSQLCodec),
 			Desc:             desc,
 			Index:            &desc.PrimaryIndex,
 			ColIdxMap:        colIdxMap,
@@ -106,6 +106,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 	}
 	var rf row.Fetcher
 	if err := rf.Init(
+		keys.SystemSQLCodec,
 		false, /* reverse */
 		sqlbase.ScanLockingStrength_FOR_NONE,
 		false, /* returnRangeInfo */
@@ -123,7 +124,7 @@ func TestRowFetcherMVCCMetadata(t *testing.T) {
 	kvsToRows := func(kvs []roachpb.KeyValue) []rowWithMVCCMetadata {
 		t.Helper()
 		for _, kv := range kvs {
-			log.Info(ctx, kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
+			log.Infof(ctx, "%v %v %v", kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
 		}
 
 		if err := rf.StartScanFrom(ctx, &row.SpanKVFetcher{KVs: kvs}); err != nil {

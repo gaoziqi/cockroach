@@ -52,8 +52,6 @@ var ReporterInterval = settings.RegisterPublicNonNegativeDurationSetting(
 type Reporter struct {
 	// Contains the list of the stores of the current node
 	localStores *kvserver.Stores
-	// Constraints constructed from the locality information
-	localityConstraints []zonepb.Constraints
 	// The store that is the current meta 1 leaseholder
 	meta1LeaseHolder *kvserver.Store
 	// Latest zone config
@@ -176,10 +174,6 @@ func (stats *Reporter) update(
 		return nil
 	}
 
-	if err := stats.updateLocalityConstraints(); err != nil {
-		log.Errorf(ctx, "unable to update the locality constraints: %s", err)
-	}
-
 	allStores := stats.storePool.GetStores()
 	var getStoresFromGossip StoreResolver = func(
 		r *roachpb.RangeDescriptor,
@@ -201,23 +195,30 @@ func (stats *Reporter) update(
 		return isLiveMap[nodeID].IsLive
 	}
 
+	nodeLocalities := make(map[roachpb.NodeID]roachpb.Locality, len(allStores))
+	for _, storeDesc := range allStores {
+		nodeDesc := storeDesc.Node
+		// Note: We might overwrite the node's localities here. We assume that all
+		// the stores for a node have the same node descriptor.
+		nodeLocalities[nodeDesc.NodeID] = nodeDesc.Locality
+	}
+
 	// Create the visitors that we're going to pass to visitRanges() below.
 	constraintConfVisitor := makeConstraintConformanceVisitor(
-		ctx, stats.latestConfig, getStoresFromGossip, constraintsSaver)
-	localityStatsVisitor := makeLocalityStatsVisitor(
-		ctx, stats.localityConstraints, stats.latestConfig,
-		getStoresFromGossip, isNodeLive, locSaver)
-	statusVisitor := makeReplicationStatsVisitor(
-		ctx, stats.latestConfig, isNodeLive, replStatsSaver)
+		ctx, stats.latestConfig, getStoresFromGossip)
+	localityStatsVisitor := makeCriticalLocalitiesVisitor(
+		ctx, nodeLocalities, stats.latestConfig,
+		getStoresFromGossip, isNodeLive)
+	replicationStatsVisitor := makeReplicationStatsVisitor(ctx, stats.latestConfig, isNodeLive)
 
 	// Iterate through all the ranges.
 	const descriptorReadBatchSize = 10000
 	rangeIter := makeMeta2RangeIter(stats.db, descriptorReadBatchSize)
 	if err := visitRanges(
 		ctx, &rangeIter, stats.latestConfig,
-		&constraintConfVisitor, &localityStatsVisitor, &statusVisitor,
+		&constraintConfVisitor, &localityStatsVisitor, &replicationStatsVisitor,
 	); err != nil {
-		if _, ok := err.(visitorError); ok {
+		if errors.HasType(err, (*visitorError)(nil)) {
 			log.Errorf(ctx, "some reports have not been generated: %s", err)
 		} else {
 			return errors.Wrap(err, "failed to compute constraint conformance report")
@@ -225,22 +226,23 @@ func (stats *Reporter) update(
 	}
 
 	if !constraintConfVisitor.failed() {
-		if err := constraintConfVisitor.report.Save(
-			ctx, timeutil.Now() /* reportTS */, stats.db, stats.executor,
+		if err := constraintsSaver.Save(
+			ctx, constraintConfVisitor.report, timeutil.Now() /* reportTS */, stats.db, stats.executor,
 		); err != nil {
 			return errors.Wrap(err, "failed to save constraint report")
 		}
 	}
 	if !localityStatsVisitor.failed() {
-		if err := localityStatsVisitor.report.Save(
-			ctx, timeutil.Now() /* reportTS */, stats.db, stats.executor,
+		if err := locSaver.Save(
+			ctx, localityStatsVisitor.Report(), timeutil.Now() /* reportTS */, stats.db, stats.executor,
 		); err != nil {
 			return errors.Wrap(err, "failed to save locality report")
 		}
 	}
-	if !localityStatsVisitor.failed() {
-		if err := statusVisitor.report.Save(
-			ctx, timeutil.Now() /* reportTS */, stats.db, stats.executor,
+	if !replicationStatsVisitor.failed() {
+		if err := replStatsSaver.Save(
+			ctx, replicationStatsVisitor.Report(),
+			timeutil.Now() /* reportTS */, stats.db, stats.executor,
 		); err != nil {
 			return errors.Wrap(err, "failed to save range status report")
 		}
@@ -267,26 +269,6 @@ func (stats *Reporter) meta1LeaseHolderStore() *kvserver.Store {
 
 func (stats *Reporter) updateLatestConfig() {
 	stats.latestConfig = stats.meta1LeaseHolder.Gossip().GetSystemConfig()
-}
-
-func (stats *Reporter) updateLocalityConstraints() error {
-	localityConstraintsByName := make(map[string]zonepb.Constraints, 16)
-	for _, sd := range stats.storePool.GetStores() {
-		c := zonepb.Constraints{
-			Constraints: make([]zonepb.Constraint, 0),
-		}
-		for _, t := range sd.Node.Locality.Tiers {
-			c.Constraints = append(
-				c.Constraints,
-				zonepb.Constraint{Type: zonepb.Constraint_REQUIRED, Key: t.Key, Value: t.Value})
-			localityConstraintsByName[c.String()] = c
-		}
-	}
-	stats.localityConstraints = make([]zonepb.Constraints, 0, len(localityConstraintsByName))
-	for _, c := range localityConstraintsByName {
-		stats.localityConstraints = append(stats.localityConstraints, c)
-	}
-	return nil
 }
 
 // nodeChecker checks whether a node is to be considered alive or not.
@@ -449,7 +431,7 @@ func visitAncestors(
 ) (bool, error) {
 	// Check to see if it's a table. If so, inherit from the database.
 	// For all other cases, inherit from the default.
-	descVal := cfg.GetValue(sqlbase.MakeDescMetadataKey(sqlbase.ID(id)))
+	descVal := cfg.GetValue(sqlbase.MakeDescMetadataKey(keys.TODOSQLCodec, sqlbase.ID(id)))
 	if descVal == nil {
 		// Couldn't find a descriptor. This is not expected to happen.
 		// Let's just look at the default zone config.
@@ -508,56 +490,6 @@ func getZoneByID(id uint32, cfg *config.SystemConfig) (*zonepb.ZoneConfig, error
 	return zone, nil
 }
 
-// processRange returns the list of constraints violated by a range. The range
-// is represented by the descriptors of the replicas' stores.
-func processRange(
-	ctx context.Context, storeDescs []roachpb.StoreDescriptor, constraintGroups []zonepb.Constraints,
-) []ConstraintRepr {
-	var res []ConstraintRepr
-	// Evaluate all zone constraints for the stores (i.e. replicas) of the given range.
-	for _, constraintGroup := range constraintGroups {
-		for i, c := range constraintGroup.Constraints {
-			replicasRequiredToMatch := int(constraintGroup.NumReplicas)
-			if replicasRequiredToMatch == 0 {
-				replicasRequiredToMatch = len(storeDescs)
-			}
-			if !constraintSatisfied(c, replicasRequiredToMatch, storeDescs) {
-				res = append(res, MakeConstraintRepr(constraintGroup, i))
-			}
-		}
-	}
-	return res
-}
-
-// constraintSatisfied checks that a range (represented by its replicas' stores)
-// satisfies a constraint.
-func constraintSatisfied(
-	c zonepb.Constraint, replicasRequiredToMatch int, storeDescs []roachpb.StoreDescriptor,
-) bool {
-	passCount := 0
-	for _, storeDesc := range storeDescs {
-		// Consider stores for which we have no information to pass everything.
-		if storeDesc.StoreID == 0 {
-			passCount++
-			continue
-		}
-
-		storeMatches := true
-		match := zonepb.StoreMatchesConstraint(storeDesc, c)
-		if c.Type == zonepb.Constraint_REQUIRED && !match {
-			storeMatches = false
-		}
-		if c.Type == zonepb.Constraint_PROHIBITED && match {
-			storeMatches = false
-		}
-
-		if storeMatches {
-			passCount++
-		}
-	}
-	return replicasRequiredToMatch <= passCount
-}
-
 // StoreResolver is a function resolving a range to a store descriptor for each
 // of the replicas. Empty store descriptors are to be returned when there's no
 // information available for the store.
@@ -579,7 +511,7 @@ type rangeVisitor interface {
 	// to multiple ranges, and so visitSameZone() allows them to efficiently reuse
 	// that state (in particular, not unmarshall ZoneConfigs again).
 	visitNewZone(context.Context, *roachpb.RangeDescriptor) error
-	visitSameZone(context.Context, *roachpb.RangeDescriptor) error
+	visitSameZone(context.Context, *roachpb.RangeDescriptor)
 
 	// failed returns true if an error was encountered by the last visit() call
 	// (and reset( ) wasn't called since).
@@ -597,7 +529,7 @@ type visitorError struct {
 	errs []error
 }
 
-func (e visitorError) Error() string {
+func (e *visitorError) Error() string {
 	s := make([]string, len(e.errs))
 	for i, err := range e.errs {
 		s[i] = fmt.Sprintf("%d: %s", i, err)
@@ -654,7 +586,7 @@ func visitRanges(
 		for i, v := range visitors {
 			var err error
 			if sameZoneAsPrevRange {
-				err = v.visitSameZone(ctx, &rd)
+				v.visitSameZone(ctx, &rd)
 			} else {
 				err = v.visitNewZone(ctx, &rd)
 			}
@@ -671,7 +603,7 @@ func visitRanges(
 		}
 	}
 	if len(visitorErrs) > 0 {
-		return visitorError{errs: visitorErrs}
+		return &visitorError{errs: visitorErrs}
 	}
 	return nil
 }
@@ -799,9 +731,7 @@ func (r *meta2RangeIter) readBatch(ctx context.Context) (retErr error) {
 }
 
 func errIsRetriable(err error) bool {
-	err = errors.UnwrapAll(err)
-	_, retriable := err.(*roachpb.TransactionRetryWithProtoRefreshError)
-	return retriable
+	return errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil))
 }
 
 // handleErr manipulates the iterator's state in response to an error.

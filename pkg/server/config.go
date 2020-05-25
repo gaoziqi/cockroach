@@ -35,9 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/elastic/gosigar"
-	"github.com/pkg/errors"
 )
 
 // Context defaults.
@@ -120,7 +120,8 @@ type Config struct {
 	// LeaseManagerConfig holds configuration values specific to the LeaseManager.
 	LeaseManagerConfig *base.LeaseManagerConfig
 
-	// Unix socket: for postgres only.
+	// SocketFile, if non-empty, sets up a TLS-free local listener using
+	// a unix datagram socket at the specified path.
 	SocketFile string
 
 	// Stores is specified to enable durable key-value storage.
@@ -146,6 +147,11 @@ type Config struct {
 	// JoinList is a list of node addresses that act as bootstrap hosts for
 	// connecting to the gossip network.
 	JoinList base.JoinListType
+
+	// JoinPreferSRVRecords, if set, causes the lookup logic for the
+	// names in JoinList to prefer SRV records from DNS, if available,
+	// to A/AAAA records.
+	JoinPreferSRVRecords bool
 
 	// RetryOptions controls the retry behavior of the server.
 	RetryOptions retry.Options
@@ -206,10 +212,6 @@ type Config struct {
 	// ReadWithinUncertaintyIntervalError.
 	MaxOffset MaxOffsetType
 
-	// TimestampCachePageSize is the size in bytes of the pages in the
-	// timestamp cache held by each store.
-	TimestampCachePageSize uint32
-
 	// ScanInterval determines a duration during which each range should be
 	// visited approximately once by the range scanner. Set to 0 to disable.
 	// Environment Variable: COCKROACH_SCAN_INTERVAL
@@ -257,10 +259,13 @@ type Config struct {
 
 	// ReadyFn is called when the server has started listening on its
 	// sockets.
-	// The argument waitForInit indicates (iff true) that the
-	// server is not bootstrapped yet, will not bootstrap itself and
-	// will be waiting for an `init` command or accept bootstrapping
-	// from a joined node.
+	//
+	// The bool parameter is true if the server is not bootstrapped yet, will not
+	// bootstrap itself and will be waiting for an `init` command or accept
+	// bootstrapping from a joined node.
+	//
+	// This method is invoked from the main start goroutine, so it should not
+	// do nontrivial work.
 	ReadyFn func(waitForInit bool)
 
 	// DelayedBootstrapFn is called if the boostrap process does not complete
@@ -397,7 +402,7 @@ func (cfg *Config) Report(ctx context.Context) {
 	} else {
 		log.Infof(ctx, "system total memory: %s", humanizeutil.IBytes(memSize))
 	}
-	log.Info(ctx, "server configuration:\n", cfg)
+	log.Infof(ctx, "server configuration:\n%s", cfg)
 }
 
 // Engines is a container of engines, allowing convenient closing.
@@ -433,13 +438,13 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 	var cache storage.RocksDBCache
 	var pebbleCache *pebble.Cache
-	if cfg.StorageEngine == enginepb.EngineTypePebble || cfg.StorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
+	if cfg.StorageEngine == enginepb.EngineTypeDefault ||
+		cfg.StorageEngine == enginepb.EngineTypePebble || cfg.StorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
 		details = append(details, fmt.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
 		pebbleCache = pebble.NewCache(cfg.CacheSize)
 		defer pebbleCache.Unref()
 	}
-	if cfg.StorageEngine == enginepb.EngineTypeDefault ||
-		cfg.StorageEngine == enginepb.EngineTypeRocksDB || cfg.StorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
+	if cfg.StorageEngine == enginepb.EngineTypeRocksDB || cfg.StorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
 		details = append(details, fmt.Sprintf("RocksDB cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
 		cache = storage.NewRocksDBCache(cfg.CacheSize)
 		defer cache.Release()
@@ -514,7 +519,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				UseFileRegistry: spec.UseFileRegistry,
 				ExtraOptions:    spec.ExtraOptions,
 			}
-			if cfg.StorageEngine == enginepb.EngineTypePebble {
+			if cfg.StorageEngine == enginepb.EngineTypePebble || cfg.StorageEngine == enginepb.EngineTypeDefault {
 				// TODO(itsbilal): Tune these options, and allow them to be overridden
 				// in the spec (similar to the existing spec.RocksDBOptions and others).
 				pebbleConfig := storage.PebbleConfig{
@@ -524,7 +529,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				pebbleConfig.Opts.Cache = pebbleCache
 				pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
 				eng, err = storage.NewPebble(ctx, pebbleConfig)
-			} else if cfg.StorageEngine == enginepb.EngineTypeRocksDB || cfg.StorageEngine == enginepb.EngineTypeDefault {
+			} else if cfg.StorageEngine == enginepb.EngineTypeRocksDB {
 				rocksDBConfig := storage.RocksDBConfig{
 					StorageConfig:           storageConfig,
 					MaxOpenFiles:            openFileLimitPerStore,
@@ -572,7 +577,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	log.Infof(ctx, "%d storage engine%s initialized",
 		len(engines), util.Pluralize(int64(len(engines))))
 	for _, s := range details {
-		log.Info(ctx, s)
+		log.Infof(ctx, "%v", s)
 	}
 	enginesCopy := engines
 	engines = nil
@@ -581,7 +586,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 // InitNode parses node attributes and initializes the gossip bootstrap
 // resolvers.
-func (cfg *Config) InitNode() error {
+func (cfg *Config) InitNode(ctx context.Context) error {
 	cfg.readEnvironmentVariables()
 
 	// Initialize attributes.
@@ -592,7 +597,7 @@ func (cfg *Config) InitNode() error {
 	cfg.Config.HistogramWindowInterval = cfg.HistogramWindowInterval()
 
 	// Get the gossip bootstrap resolvers.
-	resolvers, err := cfg.parseGossipBootstrapResolvers()
+	resolvers, err := cfg.parseGossipBootstrapResolvers(ctx)
 	if err != nil {
 		return err
 	}
@@ -643,28 +648,38 @@ func (cfg *Config) readEnvironmentVariables() {
 }
 
 // parseGossipBootstrapResolvers parses list of gossip bootstrap resolvers.
-func (cfg *Config) parseGossipBootstrapResolvers() ([]resolver.Resolver, error) {
+func (cfg *Config) parseGossipBootstrapResolvers(ctx context.Context) ([]resolver.Resolver, error) {
 	var bootstrapResolvers []resolver.Resolver
 	for _, address := range cfg.JoinList {
-		srvAddrs, err := resolver.SRV(address)
-		if err != nil {
-			return nil, err
-		}
-
-		// setup resolvers with SRV results if there were any
-		if len(srvAddrs) > 0 {
-			for _, sa := range srvAddrs {
-				resolver, err := resolver.NewResolver(sa)
-				if err != nil {
-					return nil, err
-				}
-				bootstrapResolvers = append(bootstrapResolvers, resolver)
+		if cfg.JoinPreferSRVRecords {
+			// The following code substitutes the entry in --join by the
+			// result of SRV resolution, if suitable SRV records are found
+			// for that name.
+			//
+			// TODO(knz): Delay this lookup. The logic for "regular" resolvers
+			// is delayed until the point the connection is attempted, so that
+			// fresh DNS records are used for a new connection. This makes
+			// it possible to update DNS records without restarting the node.
+			// The SRV logic here does not have this property (yet).
+			srvAddrs, err := resolver.SRV(ctx, address)
+			if err != nil {
+				return nil, err
 			}
 
-			continue
+			if len(srvAddrs) > 0 {
+				for _, sa := range srvAddrs {
+					resolver, err := resolver.NewResolver(sa)
+					if err != nil {
+						return nil, err
+					}
+					bootstrapResolvers = append(bootstrapResolvers, resolver)
+				}
+
+				continue
+			}
 		}
 
-		// otherwise use the address
+		// Otherwise, use the address.
 		resolver, err := resolver.NewResolver(address)
 		if err != nil {
 			return nil, err

@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/errors"
 )
 
 type metaRecord struct {
@@ -55,7 +56,7 @@ func meta2Key(key roachpb.RKey) []byte {
 func TestUpdateRangeAddressing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(context.Background())
 	store, _ := createTestStore(t, testStoreOpts{createSystemRanges: false}, stopper)
 	// When split is false, merging treats the right range as the merged
 	// range. With merging, expNewLeft indicates the addressing keys we
@@ -169,7 +170,7 @@ func TestUpdateRangeAddressing(t *testing.T) {
 				hlc.MaxTimestamp, storage.MVCCScanOptions{})
 			if err != nil {
 				// Wait for the intent to be resolved.
-				if _, ok := err.(*roachpb.WriteIntentError); ok {
+				if errors.HasType(err, (*roachpb.WriteIntentError)(nil)) {
 					return err
 				}
 				t.Fatal(err)

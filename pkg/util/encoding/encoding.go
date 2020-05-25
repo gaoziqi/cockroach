@@ -25,14 +25,16 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -80,6 +82,28 @@ const (
 	bitArrayDataDescTerminator = 0xff
 
 	timeTZMarker = bitArrayDescMarker + 1
+	geoMarker    = timeTZMarker + 1
+
+	// Markers and terminators for key encoding Datum arrays in sorted order.
+	// For the arrayKeyMarker and other types like bytes and bit arrays, it
+	// might be unclear why we have a separate marker for the ascending and
+	// descending cases. This is necessary because the terminators for these
+	// encodings are different depending on the direction the data is encoded
+	// in. In order to safely decode a set of bytes without knowing the direction
+	// of the encoding, we must store this information in the marker. Otherwise,
+	// we would not know what terminator to look for when decoding this format.
+	arrayKeyMarker                    = geoMarker + 1
+	arrayKeyDescendingMarker          = arrayKeyMarker + 1
+	arrayKeyTerminator           byte = 0x00
+	arrayKeyDescendingTerminator byte = 0xFF
+	// We use different null encodings for nulls within key arrays.
+	// Doing this allows for the terminator to be less/greater than
+	// the null value within arrays. These byte values overlap with
+	// encodedNotNull, encodedNotNullDesc, and interleavedSentinel,
+	// but they can only exist within an encoded array key. Because
+	// of the context, they cannot be ambiguous with these other bytes.
+	ascendingNullWithinArrayKey  byte = 0x01
+	descendingNullWithinArrayKey byte = 0xFE
 
 	// IntMin is chosen such that the range of int tags does not overlap the
 	// ascii character set that is frequently used in testing.
@@ -1274,6 +1298,9 @@ const (
 	BitArray     Type = 17
 	BitArrayDesc Type = 18 // BitArray encoded descendingly
 	TimeTZ       Type = 19
+	Geo          Type = 20
+	ArrayKeyAsc  Type = 21 // Array key encoding
+	ArrayKeyDesc Type = 22 // Array key encoded descendingly
 )
 
 // typMap maps an encoded type byte to a decoded Type. It's got 256 slots, one
@@ -1306,6 +1333,10 @@ func slowPeekType(b []byte) Type {
 			return Null
 		case m == encodedNotNull, m == encodedNotNullDesc:
 			return NotNull
+		case m == arrayKeyMarker:
+			return ArrayKeyAsc
+		case m == arrayKeyDescendingMarker:
+			return ArrayKeyDesc
 		case m == bytesMarker:
 			return Bytes
 		case m == bytesDescMarker:
@@ -1318,6 +1349,8 @@ func slowPeekType(b []byte) Type {
 			return Time
 		case m == timeTZMarker:
 			return TimeTZ
+		case m == geoMarker:
+			return Geo
 		case m == byte(Array):
 			return Array
 		case m == byte(True):
@@ -1364,9 +1397,33 @@ func getMultiNonsortingVarintLen(b []byte, num int) (int, error) {
 	return p, nil
 }
 
+// getArrayLength returns the length of a key encoded array. The input
+// must have had the array type marker stripped from the front.
+func getArrayLength(buf []byte, dir Direction) (int, error) {
+	result := 0
+	for {
+		if len(buf) == 0 {
+			return 0, errors.AssertionFailedf("invalid array encoding (unterminated)")
+		}
+		if IsArrayKeyDone(buf, dir) {
+			// Increment to include the terminator byte.
+			result++
+			break
+		}
+		next, err := PeekLength(buf)
+		if err != nil {
+			return 0, err
+		}
+		// Shift buf over by the encoded data amount.
+		buf = buf[next:]
+		result += next
+	}
+	return result, nil
+}
+
 // PeekLength returns the length of the encoded value at the start of b.  Note:
 // if this function succeeds, it's not a guarantee that decoding the value will
-// succeed.
+// succeed. PeekLength is meant to be used on key encoded data only.
 func PeekLength(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, errors.Errorf("empty slice")
@@ -1378,6 +1435,9 @@ func PeekLength(b []byte) (int, error) {
 		// interleavedSentinel also falls into this path. Since it
 		// contains the same byte value as encodedNotNullDesc, it
 		// cannot be included explicitly in the case statement.
+		// ascendingNullWithinArrayKey and descendingNullWithinArrayKey also
+		// contain the same byte values as encodedNotNull and encodedNotNullDesc
+		// respectively.
 		return 1, nil
 	case bitArrayMarker, bitArrayDescMarker:
 		terminator := byte(bitArrayDataTerminator)
@@ -1393,6 +1453,13 @@ func PeekLength(b []byte) (int, error) {
 			return 1 + n + m + 1, err
 		}
 		return 1 + n + m + 1, nil
+	case arrayKeyMarker, arrayKeyDescendingMarker:
+		dir := Ascending
+		if m == arrayKeyDescendingMarker {
+			dir = Descending
+		}
+		length, err := getArrayLength(b[1:], dir)
+		return 1 + length, err
 	case bytesMarker:
 		return getBytesLength(b, ascendingEscapes)
 	case jsonInvertedIndex:
@@ -1505,7 +1572,7 @@ func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bo
 // even if we don't have directions for the child index's columns.
 func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 	var err error
-	switch PeekType(b) {
+	switch typ := PeekType(b); typ {
 	case Null:
 		b, _ = DecodeIfNull(b)
 		return b, "NULL", nil
@@ -1515,6 +1582,46 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 		return b[1:], "False", nil
 	case Array:
 		return b[1:], "Arr", nil
+	case ArrayKeyAsc, ArrayKeyDesc:
+		encDir := Ascending
+		if typ == ArrayKeyDesc {
+			encDir = Descending
+		}
+		var build strings.Builder
+		buf, err := ValidateAndConsumeArrayKeyMarker(b, encDir)
+		if err != nil {
+			return nil, "", err
+		}
+		build.WriteString("ARRAY[")
+		first := true
+		// Use the array key decoding logic, but instead of calling out
+		// to DecodeTableKey, just make a recursive call.
+		for {
+			if len(buf) == 0 {
+				return nil, "", errors.AssertionFailedf("invalid array (unterminated)")
+			}
+			if IsArrayKeyDone(buf, encDir) {
+				buf = buf[1:]
+				break
+			}
+			var next string
+			if IsNextByteArrayEncodedNull(buf, dir) {
+				next = "NULL"
+				buf = buf[1:]
+			} else {
+				buf, next, err = prettyPrintFirstValue(dir, buf)
+				if err != nil {
+					return nil, "", err
+				}
+			}
+			if !first {
+				build.WriteString(",")
+			}
+			build.WriteString(next)
+			first = false
+		}
+		build.WriteString("]")
+		return buf, build.String(), nil
 	case NotNull:
 		// The tag can be either encodedNotNull or encodedNotNullDesc. The
 		// latter can be an interleaved sentinel.
@@ -1920,6 +2027,23 @@ func EncodeUntaggedTimeTZValue(appendTo []byte, t timetz.TimeTZ) []byte {
 	return EncodeNonsortingStdlibVarint(appendTo, int64(t.OffsetSecs))
 }
 
+// EncodeGeoValue encodes a geopb.SpatialObject value with its value tag, appends it to
+// the supplied buffer, and returns the final buffer.
+func EncodeGeoValue(appendTo []byte, colID uint32, so geopb.SpatialObject) ([]byte, error) {
+	appendTo = EncodeValueTag(appendTo, colID, Geo)
+	return EncodeUntaggedGeoValue(appendTo, so)
+}
+
+// EncodeUntaggedGeoValue encodes a geopb.SpatialObject value, appends it to the supplied buffer,
+// and returns the final buffer.
+func EncodeUntaggedGeoValue(appendTo []byte, so geopb.SpatialObject) ([]byte, error) {
+	bytes, err := protoutil.Marshal(&so)
+	if err != nil {
+		return nil, err
+	}
+	return EncodeUntaggedBytesValue(appendTo, bytes), nil
+}
+
 // EncodeDecimalValue encodes an apd.Decimal value with its value tag, appends
 // it to the supplied buffer, and returns the final buffer.
 func EncodeDecimalValue(appendTo []byte, colID uint32, d *apd.Decimal) []byte {
@@ -2187,6 +2311,19 @@ func DecodeDecimalValue(b []byte) (remaining []byte, d apd.Decimal, err error) {
 	return DecodeUntaggedDecimalValue(b)
 }
 
+// DecodeUntaggedGeoValue decodes a value encoded by EncodeUntaggedGeoValue.
+func DecodeUntaggedGeoValue(
+	b []byte,
+) (remaining []byte, spatialObject geopb.SpatialObject, err error) {
+	var data []byte
+	remaining, data, err = DecodeUntaggedBytesValue(b)
+	if err != nil {
+		return b, geopb.SpatialObject{}, err
+	}
+	err = protoutil.Unmarshal(data, &spatialObject)
+	return remaining, spatialObject, err
+}
+
 // DecodeUntaggedDecimalValue decodes a value encoded by EncodeUntaggedDecimalValue.
 func DecodeUntaggedDecimalValue(b []byte) (remaining []byte, d apd.Decimal, err error) {
 	var i uint64
@@ -2356,7 +2493,7 @@ func PeekValueLengthWithOffsetsAndType(b []byte, dataOffset int, typ Type) (leng
 		return dataOffset + n, err
 	case Float:
 		return dataOffset + floatValueEncodedLength, nil
-	case Bytes, Array, JSON:
+	case Bytes, Array, JSON, Geo:
 		_, n, i, err := DecodeNonsortingUvarint(b)
 		return dataOffset + n + int(i), err
 	case BitArray:
@@ -2574,4 +2711,77 @@ func getJSONInvertedIndexKeyLength(buf []byte) (int, error) {
 
 		return len + valLen, nil
 	}
+}
+
+// EncodeArrayKeyMarker adds the array key encoding marker to buf and
+// returns the new buffer.
+func EncodeArrayKeyMarker(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, arrayKeyMarker)
+	case Descending:
+		return append(buf, arrayKeyDescendingMarker)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// EncodeArrayKeyTerminator adds the array key terminator to buf and
+// returns the new buffer.
+func EncodeArrayKeyTerminator(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, arrayKeyTerminator)
+	case Descending:
+		return append(buf, arrayKeyDescendingTerminator)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// EncodeNullWithinArrayKey encodes NULL within a key encoded array.
+func EncodeNullWithinArrayKey(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, ascendingNullWithinArrayKey)
+	case Descending:
+		return append(buf, descendingNullWithinArrayKey)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// IsNextByteArrayEncodedNull returns if the first byte in the input
+// is the NULL encoded byte within an array key.
+func IsNextByteArrayEncodedNull(buf []byte, dir Direction) bool {
+	expected := ascendingNullWithinArrayKey
+	if dir == Descending {
+		expected = descendingNullWithinArrayKey
+	}
+	return buf[0] == expected
+}
+
+// ValidateAndConsumeArrayKeyMarker checks that the marker at the front
+// of buf is valid for an array of the given direction, and consumes it
+// if so. It returns an error if the tag is invalid.
+func ValidateAndConsumeArrayKeyMarker(buf []byte, dir Direction) ([]byte, error) {
+	typ := PeekType(buf)
+	expected := ArrayKeyAsc
+	if dir == Descending {
+		expected = ArrayKeyDesc
+	}
+	if typ != expected {
+		return nil, errors.Newf("invalid type found %s", typ)
+	}
+	return buf[1:], nil
+}
+
+// IsArrayKeyDone returns if the first byte in the input is the array
+// terminator for the input direction.
+func IsArrayKeyDone(buf []byte, dir Direction) bool {
+	expected := arrayKeyTerminator
+	if dir == Descending {
+		expected = arrayKeyDescendingTerminator
+	}
+	return buf[0] == expected
 }

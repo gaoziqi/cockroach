@@ -14,12 +14,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // Inserter abstracts the key/value operations for inserting table rows.
@@ -42,6 +43,7 @@ type Inserter struct {
 func MakeInserter(
 	ctx context.Context,
 	txn *kv.Txn,
+	codec keys.SQLCodec,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	insertCols []sqlbase.ColumnDescriptor,
 	checkFKs checkFKConstraints,
@@ -49,7 +51,7 @@ func MakeInserter(
 	alloc *sqlbase.DatumAlloc,
 ) (Inserter, error) {
 	ri := Inserter{
-		Helper:                newRowHelper(tableDesc, tableDesc.WritableIndexes()),
+		Helper:                newRowHelper(codec, tableDesc, tableDesc.WritableIndexes()),
 		InsertCols:            insertCols,
 		InsertColIDtoRowIndex: ColIDtoRowIndexFromCols(insertCols),
 		marshaled:             make([]roachpb.Value, len(insertCols)),
@@ -63,7 +65,7 @@ func MakeInserter(
 
 	if checkFKs == CheckFKs {
 		var err error
-		if ri.Fks, err = makeFkExistenceCheckHelperForInsert(ctx, txn, tableDesc, fkTables,
+		if ri.Fks, err = makeFkExistenceCheckHelperForInsert(ctx, txn, codec, tableDesc, fkTables,
 			ri.InsertColIDtoRowIndex, alloc); err != nil {
 			return ri, err
 		}

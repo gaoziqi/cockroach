@@ -68,6 +68,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -75,9 +76,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
 
@@ -218,6 +219,8 @@ type Storage interface {
 // During bootstrapping, the bootstrap list contains candidates for
 // entry to the gossip network.
 type Gossip struct {
+	started bool // for assertions
+
 	*server // Embedded gossip RPC server
 
 	Connected     chan struct{}       // Closed upon initial connection
@@ -384,6 +387,13 @@ func NewTestWithLocality(
 	return gossip
 }
 
+// AssertNotStarted fatals if the Gossip instance was already started.
+func (g *Gossip) AssertNotStarted(ctx context.Context) {
+	if g.started {
+		log.Fatalf(ctx, "Gossip instance was already started")
+	}
+}
+
 // GetNodeMetrics returns the gossip node metrics.
 func (g *Gossip) GetNodeMetrics() *Metrics {
 	return g.server.GetNodeMetrics()
@@ -463,7 +473,7 @@ func (g *Gossip) SetStorage(storage Storage) error {
 	// Persist merged addresses.
 	if numAddrs := len(g.bootstrapInfo.Addresses); numAddrs > len(storedBI.Addresses) {
 		if err := g.storage.WriteBootstrapInfo(&g.bootstrapInfo); err != nil {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 		}
 	}
 
@@ -746,12 +756,12 @@ func (g *Gossip) maybeCleanupBootstrapAddressesLocked() {
 		}
 		return nil
 	}, true /* deleteExpired */); err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return
 	}
 
 	if err := g.storage.WriteBootstrapInfo(&g.bootstrapInfo); err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 	}
 }
 
@@ -794,7 +804,7 @@ func (g *Gossip) updateNodeAddress(key string, content roachpb.Value) {
 	ctx := g.AnnotateCtx(context.TODO())
 	var desc roachpb.NodeDescriptor
 	if err := content.GetProto(&desc); err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return
 	}
 	if log.V(1) {
@@ -846,7 +856,7 @@ func (g *Gossip) updateNodeAddress(key string, content roachpb.Value) {
 	added := g.maybeAddBootstrapAddressLocked(desc.Address, desc.NodeID)
 	if added && g.storage != nil {
 		if err := g.storage.WriteBootstrapInfo(&g.bootstrapInfo); err != nil {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 		}
 	}
 }
@@ -861,7 +871,7 @@ func (g *Gossip) updateStoreMap(key string, content roachpb.Value) {
 	ctx := g.AnnotateCtx(context.TODO())
 	var desc roachpb.StoreDescriptor
 	if err := content.GetProto(&desc); err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return
 	}
 
@@ -902,7 +912,7 @@ func (g *Gossip) updateClients() {
 	g.mu.RUnlock()
 
 	if err := g.AddInfo(MakeGossipClientsKey(nodeID), buf.Bytes(), 2*defaultClientsInterval); err != nil {
-		log.Error(g.AnnotateCtx(context.Background()), err)
+		log.Errorf(g.AnnotateCtx(context.Background()), "%v", err)
 	}
 }
 
@@ -1244,6 +1254,8 @@ func (g *Gossip) MaxHops() uint32 {
 // This method starts bootstrap loop, gossip server, and client
 // management in separate goroutines and returns.
 func (g *Gossip) Start(advertAddr net.Addr, resolvers []resolver.Resolver) {
+	g.AssertNotStarted(context.Background())
+	g.started = true
 	g.setResolvers(resolvers)
 	g.server.start(advertAddr) // serve gossip protocol
 	g.bootstrap()              // bootstrap gossip client
@@ -1602,4 +1614,125 @@ func (g *Gossip) findClient(match func(*client) bool) *client {
 		}
 	}
 	return nil
+}
+
+// MakeExposedGossip initializes a DeprecatedGossip instance which exposes a
+// wrapped Gossip instance via Optional(). This is used on SQL servers running
+// inside of a KV server (i.e. single-tenant deployments).
+//
+// Use of Gossip from within the SQL layer is **deprecated**. Please do not
+// introduce new uses of it.
+//
+// See TenantSQLDeprecatedWrapper for details.
+func MakeExposedGossip(g *Gossip) DeprecatedGossip {
+	const exposed = true
+	return DeprecatedGossip{
+		w: errorutil.MakeTenantSQLDeprecatedWrapper(g, exposed),
+	}
+}
+
+// MakeUnexposedGossip initializes a DeprecatedGossip instance for which
+// Optional() does not return the wrapped Gossip instance. This is used on
+// SQL servers not running as part of a KV server, i.e. with multi-tenancy.
+//
+// Use of Gossip from within the SQL layer is **deprecated**. Please do not
+// introduce new uses of it.
+//
+// See TenantSQLDeprecatedWrapper for details.
+//
+// TODO(tbg): once we can start a SQL tenant without gossip, remove this method
+// and rename DeprecatedGossip to OptionalGossip.
+func MakeUnexposedGossip(g *Gossip) DeprecatedGossip {
+	const exposed = false
+	return DeprecatedGossip{
+		w: errorutil.MakeTenantSQLDeprecatedWrapper(g, exposed),
+	}
+}
+
+// DeprecatedGossip is a Gossip instance in a SQL tenant server.
+//
+// Use of Gossip from within the SQL layer is **deprecated**. Please do not
+// introduce new uses of it.
+//
+// See TenantSQLDeprecatedWrapper for details.
+type DeprecatedGossip struct {
+	w errorutil.TenantSQLDeprecatedWrapper
+}
+
+// deprecated trades a Github issue tracking the removal of the call for the
+// wrapped Gossip instance.
+func (dg DeprecatedGossip) deprecated(issueNo int) *Gossip {
+	// NB: some tests use a nil Gossip.
+	g, _ := dg.w.Deprecated(issueNo).(*Gossip)
+	return g
+}
+
+// DeprecatedSystemConfig calls GetSystemConfig on the wrapped Gossip instance.
+//
+// Use of Gossip from within the SQL layer is **deprecated**. Please do not
+// introduce new uses of it.
+func (dg DeprecatedGossip) DeprecatedSystemConfig(issueNo int) *config.SystemConfig {
+	g := dg.deprecated(issueNo)
+	if g == nil {
+		return nil // a few unit tests
+	}
+	return g.GetSystemConfig()
+}
+
+// DeprecatedOracleGossip trims down *gossip.Gossip for use in the Oracle.
+//
+// NB: we're trying to get rid of this dep altogether, see:
+// https://github.com/cockroachdb/cockroach/issues/48432
+type DeprecatedOracleGossip interface {
+	GetNodeDescriptor(roachpb.NodeID) (*roachpb.NodeDescriptor, error)
+	GetNodeIDForStoreID(roachpb.StoreID) (roachpb.NodeID, error)
+}
+
+// DeprecatedOracleGossip returns an DeprecatedOracleGossip (a Gossip for use with the
+// replicaoracle package).
+//
+// Use of Gossip from within the SQL layer is **deprecated**. Please do not
+// introduce new uses of it.
+func (dg DeprecatedGossip) DeprecatedOracleGossip(issueNo int) DeprecatedOracleGossip {
+	return dg.deprecated(issueNo)
+}
+
+// DeprecatedRegisterSystemConfigChannel calls RegisterSystemConfigChannel on
+// the wrapped Gossip instance.
+//
+// Use of Gossip from within the SQL layer is **deprecated**. Please do not
+// introduce new uses of it.
+func (dg DeprecatedGossip) DeprecatedRegisterSystemConfigChannel(issueNo int) <-chan struct{} {
+	g := dg.deprecated(issueNo)
+	return g.RegisterSystemConfigChannel()
+}
+
+// OptionalErr returns the Gossip instance if the wrapper was set up to allow
+// it. Otherwise, it returns an error referring to the optionally passed in
+// issues.
+//
+// Use of Gossip from within the SQL layer is **deprecated**. Please do not
+// introduce new uses of it.
+func (dg DeprecatedGossip) OptionalErr(issueNos ...int) (*Gossip, error) {
+	v, err := dg.w.OptionalErr(issueNos...)
+	if err != nil {
+		return nil, err
+	}
+	// NB: some tests use a nil Gossip.
+	g, _ := v.(*Gossip)
+	return g, nil
+}
+
+// Optional is like OptionalErr, but returns false if Gossip is not exposed.
+//
+// Use of Gossip from within the SQL layer is **deprecated**. Please do not
+// introduce new uses of it.
+func (dg DeprecatedGossip) Optional(issueNos ...int) (*Gossip, bool) {
+	v, ok := dg.w.Optional()
+	if !ok {
+		return nil, false
+	}
+	// NB: some tests use a nil Gossip.
+	g, _ := v.(*Gossip)
+	return g, true
 }

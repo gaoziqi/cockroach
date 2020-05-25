@@ -32,7 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
@@ -51,9 +51,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func getAdminJSONProto(
@@ -123,7 +124,7 @@ func debugURL(s serverutils.TestServerInterface) string {
 func TestAdminDebugExpVar(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	jI, err := getJSON(s, debugURL(s)+"vars")
 	if err != nil {
@@ -143,7 +144,7 @@ func TestAdminDebugExpVar(t *testing.T) {
 func TestAdminDebugMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	jI, err := getJSON(s, debugURL(s)+"metrics")
 	if err != nil {
@@ -163,7 +164,7 @@ func TestAdminDebugMetrics(t *testing.T) {
 func TestAdminDebugPprof(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	body, err := getText(s, debugURL(s)+"pprof/block?debug=1")
 	if err != nil {
@@ -179,7 +180,7 @@ func TestAdminDebugPprof(t *testing.T) {
 func TestAdminDebugTrace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	tc := []struct {
 		segment, search string
@@ -204,7 +205,7 @@ func TestAdminDebugTrace(t *testing.T) {
 func TestAdminDebugRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	expURL := debugURL(s)
 	origURL := expURL + "incorrect"
@@ -222,7 +223,8 @@ func TestAdminDebugRedirect(t *testing.T) {
 	}
 
 	resp, err := client.Get(origURL)
-	if urlError, ok := err.(*url.Error); ok && urlError.Err == redirectAttemptedError {
+	if urlError := (*url.Error)(nil); errors.As(err, &urlError) &&
+		errors.Is(urlError.Err, redirectAttemptedError) {
 		// Ignore the redirectAttemptedError.
 		err = nil
 	}
@@ -244,7 +246,7 @@ func TestAdminDebugRedirect(t *testing.T) {
 func TestAdminAPIDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
 	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
@@ -365,7 +367,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const errPattern = "database.+does not exist"
 	if err := getAdminJSONProto(s, "databases/i_do_not_exist", nil); !testutils.IsError(err, errPattern) {
@@ -376,7 +378,7 @@ func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const fakedb = "system;DROP DATABASE system;"
 	const path = "databases/" + fakedb
@@ -401,7 +403,7 @@ func TestAdminAPINonTableStats(t *testing.T) {
 			NodeCount:    3,
 		},
 		InternalUseStats: &serverpb.TableStatsResponse{
-			RangeCount:   8,
+			RangeCount:   9,
 			ReplicaCount: 12,
 			NodeCount:    3,
 		},
@@ -422,12 +424,11 @@ func TestAdminAPINonTableStats(t *testing.T) {
 	assertExpectedStatsResponse(expectedResponse.InternalUseStats, resp.InternalUseStats)
 }
 
-// TODO(celia): I expect all the ranges listed on the Database page to equal
-// the RangeCount returned from doing a span on [LocalMax, MaxKey). For a cluster
-// with no user data, all the ranges on the Databases page consist of:
+// Verify that for a cluster with no user data, all the ranges on the Databases
+// page consist of:
 // 1) the total ranges listed for the system database
 // 2) the total ranges listed for the Non-Table data
-func TestRangeCount_MissingTwoRanges(t *testing.T) {
+func TestRangeCount(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testCluster := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
@@ -435,18 +436,18 @@ func TestRangeCount_MissingTwoRanges(t *testing.T) {
 
 	// Sum up ranges for non-table parts of the system returned
 	// from the "nontablestats" enpoint.
-	getNonTableRangeCount := func() int64 {
+	getNonTableRangeCount := func() (ts, internal int64) {
 		var resp serverpb.NonTableStatsResponse
 		if err := getAdminJSONProto(s, "nontablestats", &resp); err != nil {
 			t.Fatal(err)
 		}
-		return resp.TimeSeriesStats.RangeCount + resp.InternalUseStats.RangeCount
+		return resp.TimeSeriesStats.RangeCount, resp.InternalUseStats.RangeCount
 	}
 
-	// Sum up ranges from system database tables returned
-	// from the "databases/system/tables/{table}" endpoints.
-	getSystemTableRangeCount := func() int64 {
-		var systemTableRangeCount int64
+	// Return map tablename=>count obtained from the
+	// "databases/system/tables/{table}" endpoints.
+	getSystemTableRangeCount := func() map[string]int64 {
+		m := map[string]int64{}
 		var dbResp serverpb.DatabaseDetailsResponse
 		if err := getAdminJSONProto(s, "databases/system", &dbResp); err != nil {
 			t.Fatal(err)
@@ -457,9 +458,9 @@ func TestRangeCount_MissingTwoRanges(t *testing.T) {
 			if err := getAdminJSONProto(s, path, &tblResp); err != nil {
 				t.Fatal(err)
 			}
-			systemTableRangeCount += tblResp.RangeCount
+			m[tableName] = tblResp.RangeCount
 		}
-		return systemTableRangeCount
+		return m
 	}
 
 	getRangeCountFromFullSpan := func() int64 {
@@ -474,29 +475,56 @@ func TestRangeCount_MissingTwoRanges(t *testing.T) {
 		return stats.RangeCount
 	}
 
-	totalRangeCount := getRangeCountFromFullSpan()
-	nonTableRangeCount := getNonTableRangeCount()
-	systemTableRangeCount := getSystemTableRangeCount()
+	exp := getRangeCountFromFullSpan()
 
-	// expected: expectedRangeCount == nonTableRangeCount+systemTableRangeCount
-	// actual: expectedRangeCount > nonTableRangeCount+systemTableRangeCount
-	if totalRangeCount == nonTableRangeCount+systemTableRangeCount {
-		t.Fail()
+	sysDBMap := getSystemTableRangeCount()
+	{
+		// The tables below sit on the SystemConfigRange. For technical reason,
+		// their range count comes back as zero. Let's just use the descriptor
+		// table to count this range as they're not picked up by the "non-table
+		// data" neither.
+		for _, table := range []string{"descriptor", "settings", "namespace", "zones"} {
+			n, ok := sysDBMap[table]
+			require.True(t, ok, table)
+			require.Zero(t, n, table)
+		}
+
+		sysDBMap["descriptor"] = 1
+
+	}
+	var systemTableRangeCount int64
+	for _, n := range sysDBMap {
+		systemTableRangeCount += n
 	}
 
-	// TODO(celia): We're missing 1 range -- where is it?
-	// TODO(arul): We're missing 2 ranges after moving system.namespace out from
-	//  the gossip range -- where are they?
-	expectedMissingRangeCount := int64(2)
-	assert.Equal(t,
-		totalRangeCount,
-		nonTableRangeCount+systemTableRangeCount+expectedMissingRangeCount)
+	tsCount, internalCount := getNonTableRangeCount()
+
+	act := tsCount + internalCount + systemTableRangeCount
+
+	if !assert.Equal(t,
+		exp,
+		act,
+	) {
+		t.Log("did nonTableDescriptorRangeCount() change?")
+		t.Logf(
+			"claimed numbers:\ntime series = %d\ninternal = %d\nsystemdb = %d (%v)",
+			tsCount, internalCount, systemTableRangeCount, sysDBMap,
+		)
+		db := testCluster.ServerConn(0)
+		defer db.Close()
+
+		runner := sqlutils.MakeSQLRunner(db)
+		s := sqlutils.MatrixToStr(runner.QueryStr(t, `
+select range_id, database_name, table_name, start_pretty, end_pretty from crdb_internal.ranges order by range_id asc`,
+		))
+		t.Logf("actual ranges:\n%s", s)
+	}
 }
 
 func TestAdminAPITableDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const fakename = "i_do_not_exist"
 	const badDBPath = "databases/" + fakename + "/tables/foo"
@@ -515,7 +543,7 @@ func TestAdminAPITableDoesNotExist(t *testing.T) {
 func TestAdminAPITableSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	const fakeTable = "users;DROP DATABASE system;"
 	const path = "databases/system/tables/" + fakeTable
@@ -537,7 +565,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-			defer s.Stopper().Stop(context.TODO())
+			defer s.Stopper().Stop(context.Background())
 			ts := s.(*TestServer)
 
 			escDBName := tree.NameStringP(&tc.dbName)
@@ -672,7 +700,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 func TestAdminAPIZoneDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
 	// Create database and table.
@@ -772,7 +800,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 func TestAdminAPIUsers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Create sample users.
 	query := `
@@ -808,7 +836,7 @@ VALUES ('adminUser', 'abc'), ('bob', 'xyz')`
 func TestAdminAPIEvents(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	setupQueries := []string{
 		"CREATE DATABASE api_test",
@@ -939,7 +967,7 @@ func TestAdminAPISettings(t *testing.T) {
 	defer sc.Close(t)
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Any bool that defaults to true will work here.
 	const settingKey = "sql.metrics.statement_details.enabled"
@@ -1041,7 +1069,7 @@ func TestAdminAPISettings(t *testing.T) {
 func TestAdminAPIUIData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	testutils.RunTrueAndFalse(t, "isAdmin", func(t *testing.T, isAdmin bool) {
 		start := timeutil.Now()
@@ -1147,7 +1175,7 @@ func TestAdminAPIUIData(t *testing.T) {
 func TestAdminAPIUISeparateData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Make a setting for an admin user.
 	if err := postAdminJSONProtoWithAdminOption(s, "uidata",
@@ -1185,7 +1213,7 @@ func TestAdminAPIUISeparateData(t *testing.T) {
 func TestClusterAPI(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	testutils.RunTrueAndFalse(t, "reportingOn", func(t *testing.T, reportingOn bool) {
 		testutils.RunTrueAndFalse(t, "enterpriseOn", func(t *testing.T, enterpriseOn bool) {
@@ -1294,7 +1322,7 @@ func TestAdminAPIJobs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
 	// Get list of existing jobs (migrations). Assumed to all have succeeded.
@@ -1389,7 +1417,7 @@ func TestAdminAPILocations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
 	testLocations := []struct {
@@ -1429,7 +1457,7 @@ func TestAdminAPIQueryPlan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
 	sqlDB.Exec(t, `CREATE DATABASE api_test`)
@@ -1488,7 +1516,7 @@ func TestAdminAPIRangeLogByRangeID(t *testing.T) {
           )`,
 			rangeID, otherRangeID,
 			1, // storeID
-			storagepb.RangeLogEventType_add.String(),
+			kvserverpb.RangeLogEventType_add.String(),
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -1560,7 +1588,7 @@ func TestAdminAPIFullRangeLog(t *testing.T) {
              timestamp, "rangeID", "storeID", "eventType"
            ) VALUES (now(), $1, 1, $2)`,
 			rangeID,
-			storagepb.RangeLogEventType_add.String(),
+			kvserverpb.RangeLogEventType_add.String(),
 		); err != nil {
 			t.Fatal(err)
 		}

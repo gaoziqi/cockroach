@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -87,16 +88,21 @@ func (r schemaChangeGCResumer) Resume(
 	// TODO(pbardea): Wait for no versions.
 	execCfg := p.ExecCfg()
 	if fn := execCfg.GCJobTestingKnobs.RunBeforeResume; fn != nil {
-		fn()
+		if err := fn(r.jobID); err != nil {
+			return err
+		}
 	}
 	details, progress, err := initDetailsAndProgress(ctx, execCfg, r.jobID)
 	if err != nil {
 		return err
 	}
-	zoneCfgFilter, descTableFilter, gossipUpdateC := setupConfigWatchers(execCfg)
+	zoneCfgFilter, gossipUpdateC := setupConfigWatcher(execCfg)
 	tableDropTimes, indexDropTimes := getDropTimes(details)
 
 	allTables := getAllTablesWaitingForGC(details, progress)
+	if len(allTables) == 0 {
+		return nil
+	}
 	expired, earliestDeadline := refreshTables(ctx, execCfg, allTables, tableDropTimes, indexDropTimes, r.jobID, progress)
 	timerDuration := timeutil.Until(earliestDeadline)
 	if expired {
@@ -115,11 +121,25 @@ func (r schemaChangeGCResumer) Resume(
 			if log.V(2) {
 				log.Info(ctx, "received a new system config")
 			}
-			updatedTables := getUpdatedTables(ctx, execCfg.Gossip.GetSystemConfig(), zoneCfgFilter, descTableFilter, details, progress)
-			if log.V(2) {
-				log.Infof(ctx, "updating status for tables %+v", updatedTables)
+			// TODO (lucy): Currently we're calling refreshTables on every zone config
+			// update to any table. We should really be only updating a cached
+			// TTL whenever we get an update on one of the tables/indexes (or the db)
+			// that this job is responsible for, and computing the earliest deadline
+			// from our set of cached TTL values.
+			cfg := execCfg.Gossip.DeprecatedSystemConfig(47150)
+			zoneConfigUpdated := false
+			zoneCfgFilter.ForModified(cfg, func(kv roachpb.KeyValue) {
+				zoneConfigUpdated = true
+			})
+			if !zoneConfigUpdated {
+				log.VEventf(ctx, 2, "no zone config updates, continuing")
+				continue
 			}
-			expired, earliestDeadline = refreshTables(ctx, execCfg, updatedTables, tableDropTimes, indexDropTimes, r.jobID, progress)
+			remainingTables := getAllTablesWaitingForGC(details, progress)
+			if len(remainingTables) == 0 {
+				return nil
+			}
+			expired, earliestDeadline = refreshTables(ctx, execCfg, remainingTables, tableDropTimes, indexDropTimes, r.jobID, progress)
 			timerDuration := time.Until(earliestDeadline)
 			if expired {
 				timerDuration = 0

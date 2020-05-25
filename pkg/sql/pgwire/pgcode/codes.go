@@ -332,9 +332,9 @@ const (
 	// Class 22C - Semantic errors in the structure of a SQL statement.
 
 	// ScalarOperationCannotRunWithoutFullSessionContext signals that an
-	// operator or built-in function was used that requires a full
-	// session contextand thus cannot be run in a background job or away
-	// from the SQL gateway.
+	// operator or built-in function was used that requires a full session
+	// context and thus cannot be run in a background job or away from the SQL
+	// gateway.
 	ScalarOperationCannotRunWithoutFullSessionContext = "22C01"
 
 	// Class 55C - Object Not In Prerequisite State (Cockroach extension)
@@ -344,6 +344,10 @@ const (
 	// the CHANGEFEED will have previously emitted a resolved timestamp which
 	// precedes the hlc timestamp of the relevant DDL transaction.
 	SchemaChangeOccurred = "55C01"
+
+	// NoPrimaryKey signals that a table descriptor is invalid because the table
+	// does not have a primary key.
+	NoPrimaryKey = "55C02"
 
 	// Class 58C - System errors related to CockroachDB node problems.
 

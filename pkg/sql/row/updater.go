@@ -13,6 +13,7 @@ package row
 import (
 	"bytes"
 	"context"
+	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -20,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/unique"
 	"github.com/cockroachdb/errors"
 )
 
@@ -74,6 +76,7 @@ const (
 func MakeUpdater(
 	ctx context.Context,
 	txn *kv.Txn,
+	codec keys.SQLCodec,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	fkTables FkTableMetadata,
 	updateCols []sqlbase.ColumnDescriptor,
@@ -84,7 +87,7 @@ func MakeUpdater(
 	alloc *sqlbase.DatumAlloc,
 ) (Updater, error) {
 	rowUpdater, err := makeUpdaterWithoutCascader(
-		ctx, txn, tableDesc, fkTables, updateCols, requestedCols, updateType, checkFKs, alloc,
+		ctx, txn, codec, tableDesc, fkTables, updateCols, requestedCols, updateType, checkFKs, alloc,
 	)
 	if err != nil {
 		return Updater{}, err
@@ -111,6 +114,7 @@ var returnTruePseudoError error = returnTrue{}
 func makeUpdaterWithoutCascader(
 	ctx context.Context,
 	txn *kv.Txn,
+	codec keys.SQLCodec,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	fkTables FkTableMetadata,
 	updateCols []sqlbase.ColumnDescriptor,
@@ -176,12 +180,12 @@ func makeUpdaterWithoutCascader(
 
 	var deleteOnlyHelper *rowHelper
 	if len(deleteOnlyIndexes) > 0 {
-		rh := newRowHelper(tableDesc, deleteOnlyIndexes)
+		rh := newRowHelper(codec, tableDesc, deleteOnlyIndexes)
 		deleteOnlyHelper = &rh
 	}
 
 	ru := Updater{
-		Helper:                newRowHelper(tableDesc, includeIndexes),
+		Helper:                newRowHelper(codec, tableDesc, includeIndexes),
 		DeleteHelper:          deleteOnlyHelper,
 		UpdateCols:            updateCols,
 		UpdateColIDtoRowIndex: updateColIDtoRowIndex,
@@ -197,14 +201,14 @@ func makeUpdaterWithoutCascader(
 		// them, so request them all.
 		var err error
 		if ru.rd, err = makeRowDeleterWithoutCascader(
-			ctx, txn, tableDesc, fkTables, tableCols, SkipFKs, alloc,
+			ctx, txn, codec, tableDesc, fkTables, tableCols, SkipFKs, alloc,
 		); err != nil {
 			return Updater{}, err
 		}
 		ru.FetchCols = ru.rd.FetchCols
 		ru.FetchColIDtoRowIndex = ColIDtoRowIndexFromCols(ru.FetchCols)
 		if ru.ri, err = MakeInserter(
-			ctx, txn, tableDesc, tableCols, SkipFKs, nil /* fkTables */, alloc,
+			ctx, txn, codec, tableDesc, tableCols, SkipFKs, nil /* fkTables */, alloc,
 		); err != nil {
 			return Updater{}, err
 		}
@@ -279,8 +283,9 @@ func makeUpdaterWithoutCascader(
 		if primaryKeyColChange {
 			updateCols = nil
 		}
-		if ru.Fks, err = makeFkExistenceCheckHelperForUpdate(ctx, txn, tableDesc, fkTables,
-			updateCols, ru.FetchColIDtoRowIndex, alloc); err != nil {
+		if ru.Fks, err = makeFkExistenceCheckHelperForUpdate(
+			ctx, txn, codec, tableDesc, fkTables, updateCols, ru.FetchColIDtoRowIndex, alloc,
+		); err != nil {
 			return Updater{}, err
 		}
 	}
@@ -376,6 +381,7 @@ func (ru *Updater) UpdateRow(
 		// set includeEmpty to false while generating the old
 		// and new index entries.
 		ru.oldIndexEntries[i], err = sqlbase.EncodeSecondaryIndex(
+			ru.Helper.Codec,
 			ru.Helper.TableDesc.TableDesc(),
 			&ru.Helper.Indexes[i],
 			ru.FetchColIDtoRowIndex,
@@ -386,6 +392,7 @@ func (ru *Updater) UpdateRow(
 			return nil, err
 		}
 		ru.newIndexEntries[i], err = sqlbase.EncodeSecondaryIndex(
+			ru.Helper.Codec,
 			ru.Helper.TableDesc.TableDesc(),
 			&ru.Helper.Indexes[i],
 			ru.FetchColIDtoRowIndex,
@@ -394,6 +401,40 @@ func (ru *Updater) UpdateRow(
 		)
 		if err != nil {
 			return nil, err
+		}
+		if ru.Helper.Indexes[i].Type == sqlbase.IndexDescriptor_INVERTED {
+			// Deduplicate the keys we're adding and removing if we're updating an
+			// inverted index. For example, imagine a table with an inverted index on j:
+			//
+			// a | j
+			// --+----------------
+			// 1 | {"foo": "bar"}
+			//
+			// If we update the json value to be {"foo": "bar", "baz": "qux"}, we don't
+			// want to delete the /foo/bar key and re-add it, that would be wasted work.
+			// So, we are going to remove keys from both the new and old index entry
+			// array if they're identical.
+			newIndexEntries := ru.newIndexEntries[i]
+			oldIndexEntries := ru.oldIndexEntries[i]
+			sort.Slice(oldIndexEntries, func(i, j int) bool {
+				return compareIndexEntries(oldIndexEntries[i], oldIndexEntries[j]) < 0
+			})
+			sort.Slice(newIndexEntries, func(i, j int) bool {
+				return compareIndexEntries(newIndexEntries[i], newIndexEntries[j]) < 0
+			})
+			oldLen, newLen := unique.UniquifyAcrossSlices(
+				oldIndexEntries, newIndexEntries,
+				func(l, r int) int {
+					return compareIndexEntries(oldIndexEntries[l], newIndexEntries[r])
+				},
+				func(i, j int) {
+					oldIndexEntries[i] = oldIndexEntries[j]
+				},
+				func(i, j int) {
+					newIndexEntries[i] = newIndexEntries[j]
+				})
+			ru.oldIndexEntries[i] = oldIndexEntries[:oldLen]
+			ru.newIndexEntries[i] = newIndexEntries[:newLen]
 		}
 	}
 
@@ -638,6 +679,15 @@ func (ru *Updater) UpdateRow(
 	}
 
 	return ru.newValues, nil
+}
+
+func compareIndexEntries(left, right sqlbase.IndexEntry) int {
+	cmp := bytes.Compare(left.Key, right.Key)
+	if cmp != 0 {
+		return cmp
+	}
+
+	return bytes.Compare(left.Value.RawBytes, right.Value.RawBytes)
 }
 
 // IsColumnOnlyUpdate returns true if this Updater is only updating column

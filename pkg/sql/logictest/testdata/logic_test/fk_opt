@@ -5,6 +5,9 @@
 statement ok
 SET optimizer_foreign_keys = true
 
+statement ok
+SET experimental_optimizer_foreign_key_cascades = true
+
 # Randomize the use of insert fast path.
 # The let statement will also log the value.
 let $enable_insert_fast_path
@@ -231,17 +234,6 @@ SELECT * FROM parent
 # row via an update, and is disallowed.
 statement error pq: insert on table "parent" violates foreign key constraint "fk_b_ref_parent" on table "child"\nDETAIL: Key \(b\)=\(2\) is still referenced from table "child"\.
 INSERT INTO parent VALUES (2, 2) ON CONFLICT (a) DO UPDATE SET b = parent.b - 1
-
-# This mutation *also* removes that row, but also via an update, introduces a
-# new one, making it acceptable.
-statement ok
-INSERT INTO parent VALUES (2, 2), (1, 3) ON CONFLICT (a) DO UPDATE SET b = parent.b - 1
-
-query II rowsort
-SELECT * FROM parent
-----
-1  2
-2  1
 
 statement ok
 DROP TABLE child
@@ -656,10 +648,10 @@ orders      fk_product_ref_products  FOREIGN KEY      FOREIGN KEY (product) REFE
 orders      primary                  PRIMARY KEY      PRIMARY KEY (id ASC, shipment ASC)                                                    true
 orders      valid_customer           FOREIGN KEY      FOREIGN KEY (customer) REFERENCES customers(id)                                       true
 
-statement error "products_upc_key" is referenced by foreign key from table "delivery"
+statement error pq: index "products_upc_key" is in use as unique constraint
 DROP INDEX products@products_upc_key
 
-statement error "products_upc_key" is referenced by foreign key from table "delivery"
+statement error pq: index "products_upc_key" is in use as unique constraint
 DROP INDEX products@products_upc_key RESTRICT
 
 statement error "products_upc_key" is referenced by foreign key from table "delivery"
@@ -747,7 +739,7 @@ CREATE TABLE grandchild (id INT PRIMARY KEY, parent_id INT REFERENCES child (par
 statement error pgcode 23503 foreign key
 INSERT INTO grandchild VALUES (1, 1)
 
-statement error "child_parent_id_key" is referenced by foreign key from table "grandchild"
+statement error pq: index "child_parent_id_key" is in use as unique constraint
 DROP INDEX child@child_parent_id_key
 
 statement ok
@@ -1072,26 +1064,26 @@ statement ok
 DROP INDEX refers@another_idx
 
 # refers is not visible because it is in the ADD state.
-query T
+query TTT
 SHOW TABLES FROM test
 ----
-bar
-child
-customers
-delivery
-domain_modules
-domains
-foo
-grandchild
-modules
-pairs
-referee
-refpairs
-refpairs_c_between
-refpairs_wrong_order
-tx
-tx_leg
-unindexed
+public  bar                   table
+public  child                 table
+public  customers             table
+public  delivery              table
+public  domain_modules        table
+public  domains               table
+public  foo                   table
+public  grandchild            table
+public  modules               table
+public  pairs                 table
+public  referee               table
+public  refpairs              table
+public  refpairs_c_between    table
+public  refpairs_wrong_order  table
+public  tx                    table
+public  tx_leg                table
+public  unindexed             table
 
 statement ok
 COMMIT
@@ -2722,8 +2714,8 @@ CREATE INDEX child_name_collision_auto_index_fk_id ON child_name_collision (othe
 # Testing the unusual case where an index already exists that has the same name
 # as the index to be auto-generated when adding a fk constraint to an empty
 # table (but the existing index is not on the referencing column), in which
-# case the ALTER TABLE will fail due to the name collision.
-statement error duplicate index name: "child_name_collision_auto_index_fk_id"
+# case the ALTER TABLE will create another name for the index.
+statement ok
 ALTER TABLE child_name_collision ADD CONSTRAINT fk_id FOREIGN KEY (parent_id) references parent_name_collision
 
 subtest auto_add_fk_duplicate_cols_error
@@ -2765,12 +2757,6 @@ INSERT INTO parentid (k, v) VALUES (0, 1); INSERT INTO childid (id) VALUES (2);
 
 statement error column \"id\" does not exist
 BEGIN; ALTER TABLE parentid ADD id INT NOT NULL AS (k + 2) STORED; ALTER TABLE childid ADD CONSTRAINT fk_id FOREIGN KEY (id) REFERENCES parentid (id);
-
-statement ok
-ROLLBACK;
-
-statement error adding a REFERENCES constraint while the column is being added not supported
-BEGIN; ALTER TABLE childid ADD id2 INT UNIQUE NOT NULL DEFAULT 0; ALTER TABLE childid ADD CONSTRAINT fk_id FOREIGN KEY (id2) REFERENCES parentid (k);
 
 statement ok
 ROLLBACK;
@@ -3309,12 +3295,14 @@ ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE
 
 # 'ON DELETE SET DEFAULT', followed by 'ON DELETE CASCADE'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT;
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE CASCADE
 
 statement ok
-insert into t1 values (123); insert into t2 values (123)
+INSERT INTO t1 VALUES (123);
+INSERT INTO t2 VALUES (123)
 
-statement error value \[1\] not found in t1@primary \[a\]
+statement error pq: update on table "t2" violates foreign key constraint "fk1"\nDETAIL: Key \(a\)=\(1\) is not present in table "t1"\.
 DELETE FROM t1 WHERE a = 123
 
 query I
@@ -3327,12 +3315,14 @@ ALTER TABLE t2 DROP CONSTRAINT fk1; ALTER TABLE t2 DROP CONSTRAINT fk2; TRUNCATE
 
 # 'ON DELETE SET DEFAULT', followed by 'ON DELETE SET NULL'
 statement ok
-ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT; ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL
+ALTER TABLE t2 ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET DEFAULT;
+ALTER TABLE t2 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES t1 ON DELETE SET NULL
 
 statement ok
-insert into t1 values (123); insert into t2 values (123)
+INSERT INTO t1 VALUES (123);
+INSERT INTO t2 VALUES (123)
 
-statement error value \[1\] not found in t1@primary \[a\]
+statement error pq: update on table "t2" violates foreign key constraint "fk1"\nDETAIL: Key \(a\)=\(1\) is not present in table "t1"\.
 DELETE FROM t1 WHERE a = 123
 
 query I

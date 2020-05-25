@@ -49,7 +49,7 @@ func testGetDecodedRows(
 	return decodedRows, metas
 }
 
-func testRowStream(tb testing.TB, rng *rand.Rand, types []types.T, records []rowOrMeta) {
+func testRowStream(tb testing.TB, rng *rand.Rand, types []*types.T, records []rowOrMeta) {
 	var se StreamEncoder
 	var sd StreamDecoder
 
@@ -68,17 +68,17 @@ func testRowStream(tb testing.TB, rng *rand.Rand, types []types.T, records []row
 				}
 				numRows++
 			} else {
-				se.AddMetadata(context.TODO(), records[rowIdx].meta)
+				se.AddMetadata(context.Background(), records[rowIdx].meta)
 				numMeta++
 			}
 		}
 		// "Send" a message every now and then and once at the end.
 		final := (rowIdx == len(records))
 		if final || (rowIdx > 0 && rng.Intn(10) == 0) {
-			msg := se.FormMessage(context.TODO())
+			msg := se.FormMessage(context.Background())
 			// Make a copy of the data buffer.
 			msg.Data.RawBytes = append([]byte(nil), msg.Data.RawBytes...)
-			err := sd.AddMessage(context.TODO(), msg)
+			err := sd.AddMessage(context.Background(), msg)
 			if err != nil {
 				tb.Fatal(err)
 			}
@@ -117,8 +117,8 @@ func TestStreamEncodeDecode(t *testing.T) {
 			if rng.Intn(10) != 0 {
 				rows[i].row = make(sqlbase.EncDatumRow, rowLen)
 				for j := range rows[i].row {
-					rows[i].row[j] = sqlbase.DatumToEncDatum(&info[j].Type,
-						sqlbase.RandDatum(rng, &info[j].Type, true))
+					rows[i].row[j] = sqlbase.DatumToEncDatum(info[j].Type,
+						sqlbase.RandDatum(rng, info[j].Type, true))
 				}
 			} else {
 				rows[i].meta.Err = fmt.Errorf("test error %d", i)
@@ -132,8 +132,8 @@ func TestEmptyStreamEncodeDecode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	var se StreamEncoder
 	var sd StreamDecoder
-	msg := se.FormMessage(context.TODO())
-	if err := sd.AddMessage(context.TODO(), msg); err != nil {
+	msg := se.FormMessage(context.Background())
+	if err := sd.AddMessage(context.Background(), msg); err != nil {
 		t.Fatal(err)
 	}
 	if msg.Header == nil {

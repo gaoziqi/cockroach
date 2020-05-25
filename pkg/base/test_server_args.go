@@ -50,6 +50,8 @@ type TestServerArgs struct {
 	SQLAddr string
 	// HTTPAddr (if nonempty) is the HTTP address to use for the test server.
 	HTTPAddr string
+	// DisableTLSForHTTP if set, disables TLS for the HTTP interface.
+	DisableTLSForHTTP bool
 
 	// JoinAddr is the address of a node we are joining.
 	//
@@ -148,10 +150,17 @@ var (
 // DefaultTestStoreSpec that is in-memory.
 // It has a maximum size of 100MiB.
 func DefaultTestTempStorageConfig(st *cluster.Settings) TempStorageConfig {
-	var maxSizeBytes int64 = DefaultInMemTempStorageMaxSizeBytes
+	return DefaultTestTempStorageConfigWithSize(st, DefaultInMemTempStorageMaxSizeBytes)
+}
+
+// DefaultTestTempStorageConfigWithSize is the associated temp storage for
+// DefaultTestStoreSpec that is in-memory with the customized maximum size.
+func DefaultTestTempStorageConfigWithSize(
+	st *cluster.Settings, maxSizeBytes int64,
+) TempStorageConfig {
 	monitor := mon.MakeMonitor(
 		"in-mem temp storage",
-		mon.MemoryResource,
+		mon.DiskResource,
 		nil,             /* curCount */
 		nil,             /* maxHist */
 		1024*1024,       /* increment */

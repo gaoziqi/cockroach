@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -607,9 +608,7 @@ func (c *indexConstraintCtx) makeSpansForExpr(
 		case 1:
 			return c.makeSpansForExpr(offset, (*t)[0].Condition, out)
 		default:
-			// We don't have enough information to know if the spans are "tight".
-			c.makeSpansForAnd(offset, t, out)
-			return false
+			return c.makeSpansForAnd(offset, t, out)
 		}
 
 	case *memo.FiltersItem:
@@ -617,9 +616,7 @@ func (c *indexConstraintCtx) makeSpansForExpr(
 		return c.makeSpansForExpr(offset, t.Condition, out)
 
 	case *memo.AndExpr:
-		// We don't have enough information to know if the spans are "tight".
-		c.makeSpansForAnd(offset, t, out)
-		return false
+		return c.makeSpansForAnd(offset, t, out)
 
 	case *memo.OrExpr:
 		return c.makeSpansForOr(offset, t, out)
@@ -685,17 +682,58 @@ func (c *indexConstraintCtx) makeSpansForExpr(
 }
 
 // makeSpansForAnd calculates spans for an AndOp or FiltersOp.
-func (c *indexConstraintCtx) makeSpansForAnd(offset int, e opt.Expr, out *constraint.Constraint) {
+func (c *indexConstraintCtx) makeSpansForAnd(
+	offset int, e opt.Expr, out *constraint.Constraint,
+) (tight bool) {
+	// We need to handle both FiltersExpr and AndExpr. In FiltersExpr, we already
+	// have a list of conjuncts. But AndExpr is a binary operator so we may have
+	// nested Ands; we collect all the conjuncts in this case.
+	//
+	// Note that the common case is Filters; we only see And when it is part of a
+	// larger filter (e.g. an Or).
+	var filters memo.FiltersExpr
+	if f, ok := e.(*memo.FiltersExpr); ok {
+		filters = *f
+	} else {
+		filters = make(memo.FiltersExpr, 0, 2)
+		var collectConjunctions func(e opt.ScalarExpr)
+		collectConjunctions = func(e opt.ScalarExpr) {
+			if and, ok := e.(*memo.AndExpr); ok {
+				collectConjunctions(and.Left)
+				collectConjunctions(and.Right)
+			} else {
+				filters = append(filters, memo.FiltersItem{Condition: e})
+			}
+		}
+		collectConjunctions(e.(*memo.AndExpr))
+	}
+
+	// tightDeltaMap maps each filter to the relative index column offset at which
+	// we generated tight constraints for that expression (if any).
+	// Note that it is not possible for a given condition to generate tight
+	// constraints at different column offsets.
+	var tightDeltaMap util.FastIntMap
+
 	// TODO(radu): sorting the expressions by the variable index, or pre-building
 	// a map could help here.
-	c.makeSpansForExpr(offset, e.Child(0), out)
+	tight = c.makeSpansForExpr(offset, filters[0].Condition, out)
+	if tight {
+		tightDeltaMap.Set(0, 0)
+	}
 	var exprConstraint constraint.Constraint
-	for i, n := 1, e.ChildCount(); i < n; i++ {
-		c.makeSpansForExpr(offset, e.Child(i), &exprConstraint)
+	for i := 1; i < len(filters); i++ {
+		filterTight := c.makeSpansForExpr(offset, filters[i].Condition, &exprConstraint)
+		if filterTight {
+			tightDeltaMap.Set(i, 0)
+		}
+		tight = tight && filterTight
 		out.IntersectWith(c.evalCtx, &exprConstraint)
 	}
 	if out.IsUnconstrained() {
-		return
+		return tight
+	}
+	if tight {
+		return true
 	}
 
 	// Now we try to refine the result with constraints on suffixes of the index
@@ -707,7 +745,7 @@ func (c *indexConstraintCtx) makeSpansForAnd(offset int, e opt.Expr, out *constr
 		// In each iteration, we try to extend keys with constraints for the offset
 		// that corresponds to where the key ends. We can skip offsets at which no
 		// keys end.
-		// To calculate this, we get the minimum length of any key that doesn't ends
+		// To calculate this, we get the minimum length of any key that doesn't end
 		// at or after the current offset.
 		minLen := len(c.columns)
 		for j := 0; j < out.Spans.Count(); j++ {
@@ -726,34 +764,57 @@ func (c *indexConstraintCtx) makeSpansForAnd(offset int, e opt.Expr, out *constr
 			break
 		}
 
-		c.makeSpansForExpr(offset+delta, e.Child(0), &ofsC)
-		for j, n := 1, e.ChildCount(); j < n; j++ {
-			c.makeSpansForExpr(offset+delta, e.Child(j), &exprConstraint)
+		tight := c.makeSpansForExpr(offset+delta, filters[0].Condition, &ofsC)
+		if tight {
+			tightDeltaMap.Set(0, delta)
+		}
+		for j := 1; j < len(filters); j++ {
+			tight := c.makeSpansForExpr(offset+delta, filters[j].Condition, &exprConstraint)
+			if tight {
+				tightDeltaMap.Set(j, delta)
+			}
 			ofsC.IntersectWith(c.evalCtx, &exprConstraint)
 		}
 		out.Combine(c.evalCtx, &ofsC)
 	}
+
+	// It's hard in the most general case to determine if the constraints are
+	// tight. But we can cover a lot of cases using the following sufficient
+	// condition:
+	//  - let `prefix` be the longest prefix of columns for which all spans have the
+	//    same start and end value (see Constraint.Prefix).
+	//  - every filter must have generated tight spans for a set of columns
+	//    starting at an offset that is at most `prefix`.
+	//
+	// This is because the Combine call above can only keep the constraints tight
+	// if it is "appending" to single-value spans.
+	prefix := out.Prefix(c.evalCtx)
+	for i := range filters {
+		delta, ok := tightDeltaMap.Get(i)
+		if !ok || delta > prefix {
+			return false
+		}
+	}
+	return true
 }
 
 // makeSpansForOr calculates spans for an OrOp.
 func (c *indexConstraintCtx) makeSpansForOr(
 	offset int, e opt.Expr, out *constraint.Constraint,
 ) (tight bool) {
-	c.contradiction(offset, out)
-	tight = true
-	var exprConstraint constraint.Constraint
-	for i, n := 0, e.ChildCount(); i < n; i++ {
-		exprTight := c.makeSpansForExpr(offset, e.Child(i), &exprConstraint)
-		if exprConstraint.IsUnconstrained() {
-			// If we can't generate spans for a disjunct, exit early.
-			c.unconstrained(offset, out)
-			return false
-		}
-		// The OR is "tight" if all the spans are tight.
-		tight = tight && exprTight
-		out.UnionWith(c.evalCtx, &exprConstraint)
+	or := e.(*memo.OrExpr)
+	tightLeft := c.makeSpansForExpr(offset, or.Left, out)
+	if out.IsUnconstrained() {
+		// If spans can't be generated for the left child, exit early.
+		c.unconstrained(offset, out)
+		return false
 	}
-	return tight
+	var rightConstraint constraint.Constraint
+	tightRight := c.makeSpansForExpr(offset, or.Right, &rightConstraint)
+	out.UnionWith(c.evalCtx, &rightConstraint)
+
+	// The OR is "tight" if both constraints were tight.
+	return tightLeft && tightRight
 }
 
 // makeInvertedIndexSpansForJSONExpr is the implementation of
@@ -1061,23 +1122,15 @@ func (c *indexConstraintCtx) getMaxSimplifyPrefix(idxConstraint *constraint.Cons
 //    by getMaxSimplifyPrefix). So `[/1/2 - /1/2]` is contained in the
 //    expression span and we can simplify `@2 = 2` to `true`.
 //
-//    An example where this doesn't work well is with disjunctions:
-//    `@1 <= 1 OR @1 >= 4` has spans `[ - /1], [/1 - ]` but in separation neither
-//    sub-expression is always true inside these spans.
 func (c *indexConstraintCtx) simplifyFilter(
 	scalar opt.ScalarExpr, final *constraint.Constraint, maxSimplifyPrefix int,
 ) opt.ScalarExpr {
-	// Special handling for And, Or, and Range.
+	// Special handling for And, Range.
 	switch t := scalar.(type) {
 	case *memo.AndExpr:
 		left := c.simplifyFilter(t.Left, final, maxSimplifyPrefix)
 		right := c.simplifyFilter(t.Right, final, maxSimplifyPrefix)
 		return c.factory.ConstructAnd(left, right)
-
-	case *memo.OrExpr:
-		left := c.simplifyFilter(t.Left, final, maxSimplifyPrefix)
-		right := c.simplifyFilter(t.Right, final, maxSimplifyPrefix)
-		return c.factory.ConstructOr(left, right)
 
 	case *memo.RangeExpr:
 		return c.factory.ConstructRange(c.simplifyFilter(t.And, final, maxSimplifyPrefix))
@@ -1121,6 +1174,14 @@ func (c *indexConstraintCtx) simplifyFilter(
 		// is no need for a remaining filter for this condition.
 		return memo.TrueSingleton
 	}
+
+	// Special handling for Or.
+	switch t := scalar.(type) {
+	case *memo.OrExpr:
+		left := c.simplifyFilter(t.Left, final, maxSimplifyPrefix)
+		right := c.simplifyFilter(t.Right, final, maxSimplifyPrefix)
+		return c.factory.ConstructOr(left, right)
+	}
 	return scalar
 }
 
@@ -1133,7 +1194,7 @@ func (c *indexConstraintCtx) simplifyFilter(
 //     ..
 //   }
 //   spans, ok := ic.Spans()
-//   remFilterGroup := ic.RemainingFilter()
+//   remFilterGroup := ic.RemainingFilters()
 //   remFilter := o.Optimize(remFilterGroup, &opt.PhysicalProps{})
 type Instance struct {
 	indexConstraintCtx

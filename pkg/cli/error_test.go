@@ -109,7 +109,7 @@ type logger struct {
 	Err      error
 }
 
-func (l *logger) Log(_ context.Context, sev log.Severity, args ...interface{}) {
+func (l *logger) Log(_ context.Context, sev log.Severity, msg string, args ...interface{}) {
 	require.Equal(l.TB, 1, len(args), "expected to log one item")
 	err, ok := args[0].(error)
 	require.True(l.TB, ok, "expected to log an error")
@@ -174,7 +174,7 @@ func TestErrorReporting(t *testing.T) {
 			checked := checkAndMaybeShoutTo(tt.err, got.Log)
 			assert.Equal(t, tt.err, checked, "should return error unchanged")
 			assert.Equal(t, tt.wantSeverity, got.Severity, "wrong severity log")
-			_, gotCLI := got.Err.(*cliError)
+			gotCLI := errors.HasType(got.Err, (*cliError)(nil))
 			if tt.wantCLICause {
 				assert.True(t, gotCLI, "logged cause should be *cliError, got %T", got.Err)
 			} else {

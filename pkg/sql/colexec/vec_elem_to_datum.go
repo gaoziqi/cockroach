@@ -11,11 +11,11 @@
 package colexec
 
 import (
-	"fmt"
 	"math/big"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -25,11 +25,11 @@ import (
 )
 
 // PhysicalTypeColElemToDatum converts an element in a colvec to a datum of
-// semtype ct. The returned Datum is a deep copy of the colvec element. Note
+// type ct. The returned Datum is a deep copy of the colvec element. Note
 // that this function handles nulls as well, so there is no need for a separate
 // null check.
 func PhysicalTypeColElemToDatum(
-	col coldata.Vec, rowIdx int, da sqlbase.DatumAlloc, ct *types.T,
+	col coldata.Vec, rowIdx int, da *sqlbase.DatumAlloc, ct *types.T,
 ) tree.Datum {
 	if col.MaybeHasNulls() {
 		if col.Nulls().NullAt(rowIdx) {
@@ -81,7 +81,7 @@ func PhysicalTypeColElemToDatum(
 		// a copy.
 		id, err := uuid.FromBytes(col.Bytes().Get(rowIdx))
 		if err != nil {
-			execerror.VectorizedInternalPanic(err)
+			colexecerror.InternalError(err)
 		}
 		return da.NewDUuid(tree.DUuid{UUID: id})
 	case types.TimestampFamily:
@@ -91,8 +91,6 @@ func PhysicalTypeColElemToDatum(
 	case types.IntervalFamily:
 		return da.NewDInterval(tree.DInterval{Duration: col.Interval()[rowIdx]})
 	default:
-		execerror.VectorizedInternalPanic(fmt.Sprintf("Unsupported column type %s", ct.String()))
-		// This code is unreachable, but the compiler cannot infer that.
-		return nil
+		return col.Datum().Get(rowIdx).(*coldataext.Datum).Datum
 	}
 }

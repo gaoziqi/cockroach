@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -94,7 +96,7 @@ type avroSchemaField struct {
 	Default    *string        `json:"default"`
 	Metadata   string         `json:"__crdb__,omitempty"`
 
-	typ types.T
+	typ *types.T
 
 	encodeFn func(tree.Datum) (interface{}, error)
 	decodeFn func(interface{}) (tree.Datum, error)
@@ -173,6 +175,30 @@ func columnDescToAvroSchema(colDesc *sqlbase.ColumnDescriptor) (*avroSchemaField
 		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
 			return tree.NewDFloat(tree.DFloat(x.(float64))), nil
 		}
+	case types.GeographyFamily:
+		avroType = avroSchemaBytes
+		schema.encodeFn = func(d tree.Datum) (interface{}, error) {
+			return []byte(d.(*tree.DGeography).EWKB()), nil
+		}
+		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
+			g, err := geo.ParseGeographyFromEWKBRaw(geopb.EWKB(x.([]byte)))
+			if err != nil {
+				return nil, err
+			}
+			return &tree.DGeography{Geography: g}, nil
+		}
+	case types.GeometryFamily:
+		avroType = avroSchemaBytes
+		schema.encodeFn = func(d tree.Datum) (interface{}, error) {
+			return []byte(d.(*tree.DGeometry).EWKB()), nil
+		}
+		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
+			g, err := geo.ParseGeometryFromEWKBRaw(geopb.EWKB(x.([]byte)))
+			if err != nil {
+				return nil, err
+			}
+			return &tree.DGeometry{Geometry: g}, nil
+		}
 	case types.StringFamily:
 		avroType = avroSchemaString
 		schema.encodeFn = func(d tree.Datum) (interface{}, error) {
@@ -241,7 +267,7 @@ func columnDescToAvroSchema(colDesc *sqlbase.ColumnDescriptor) (*avroSchemaField
 			return d.(*tree.DTimestamp).Time, nil
 		}
 		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
-			return tree.MakeDTimestamp(x.(time.Time), time.Microsecond), nil
+			return tree.MakeDTimestamp(x.(time.Time), time.Microsecond)
 		}
 	case types.TimestampTZFamily:
 		avroType = avroLogicalType{
@@ -252,7 +278,7 @@ func columnDescToAvroSchema(colDesc *sqlbase.ColumnDescriptor) (*avroSchemaField
 			return d.(*tree.DTimestampTZ).Time, nil
 		}
 		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
-			return tree.MakeDTimestampTZ(x.(time.Time), time.Microsecond), nil
+			return tree.MakeDTimestampTZ(x.(time.Time), time.Microsecond)
 		}
 	case types.DecimalFamily:
 		if colDesc.Type.Precision() == 0 {
@@ -477,7 +503,7 @@ func (r *avroDataRecord) nativeFromRow(row sqlbase.EncDatumRow) (interface{}, er
 	avroDatums := make(map[string]interface{}, len(row))
 	for fieldIdx, field := range r.Fields {
 		d := row[r.colIdxByFieldIdx[fieldIdx]]
-		if err := d.EnsureDecoded(&field.typ, &r.alloc); err != nil {
+		if err := d.EnsureDecoded(field.typ, &r.alloc); err != nil {
 			return nil, err
 		}
 		var err error
@@ -505,7 +531,7 @@ func (r *avroDataRecord) rowFromNative(native interface{}) (sqlbase.EncDatumRow,
 		if err != nil {
 			return nil, err
 		}
-		row[r.colIdxByFieldIdx[fieldIdx]] = sqlbase.DatumToEncDatum(&field.typ, decoded)
+		row[r.colIdxByFieldIdx[fieldIdx]] = sqlbase.DatumToEncDatum(field.typ, decoded)
 	}
 	return row, nil
 }

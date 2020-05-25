@@ -29,7 +29,7 @@ root                                       ·                      ·
  │              │                          label                  buffer 1
  │              └── values                 ·                      ·
  │                                         size                   2 columns, 2 rows
- └── postquery                             ·                      ·
+ └── fk-check                              ·                      ·
       └── error if rows                    ·                      ·
            └── lookup-join                 ·                      ·
                 │                          table                  parent@primary
@@ -59,8 +59,8 @@ root                                       ·                   ·
  │              │                          label               buffer 1
  │              └── scan                   ·                   ·
  │                                         table               xy@primary
- │                                         spans               ALL
- └── postquery                             ·                   ·
+ │                                         spans               FULL SCAN
+ └── fk-check                              ·                   ·
       └── error if rows                    ·                   ·
            └── hash-join                   ·                   ·
                 │                          type                anti
@@ -71,7 +71,7 @@ root                                       ·                   ·
                 │                          label               buffer 1
                 └── scan                   ·                   ·
 ·                                          table               parent@primary
-·                                          spans               ALL
+·                                          spans               FULL SCAN
 
 statement ok
 CREATE TABLE child_nullable (c INT PRIMARY KEY, p INT REFERENCES parent(p));
@@ -92,7 +92,7 @@ root                                            ·                      ·
  │              │                               label                  buffer 1
  │              └── values                      ·                      ·
  │                                              size                   2 columns, 2 rows
- └── postquery                                  ·                      ·
+ └── fk-check                                   ·                      ·
       └── error if rows                         ·                      ·
            └── lookup-join                      ·                      ·
                 │                               table                  parent@primary
@@ -132,7 +132,7 @@ root                                            ·                      ·
  │              │                               label                  buffer 1
  │              └── values                      ·                      ·
  │                                              size                   4 columns, 2 rows
- └── postquery                                  ·                      ·
+ └── fk-check                                   ·                      ·
       └── error if rows                         ·                      ·
            └── lookup-join                      ·                      ·
                 │                               table                  multi_col_parent@primary
@@ -163,7 +163,7 @@ CREATE TABLE multi_ref_child (
 )
 
 query TTT
-EXPLAIN INSERT INTO multi_ref_child VALUES (1, NULL, NULL, NULL)
+EXPLAIN INSERT INTO multi_ref_child VALUES (1, NULL, NULL, NULL), (2, 3, 4, 5)
 ----
 ·                                               distributed            false
 ·                                               vectorized             false
@@ -175,8 +175,8 @@ root                                            ·                      ·
  │         └── buffer node                      ·                      ·
  │              │                               label                  buffer 1
  │              └── values                      ·                      ·
- │                                              size                   4 columns, 1 row
- ├── postquery                                  ·                      ·
+ │                                              size                   4 columns, 2 rows
+ ├── fk-check                                   ·                      ·
  │    └── error if rows                         ·                      ·
  │         └── lookup-join                      ·                      ·
  │              │                               table                  multi_ref_parent_a@primary
@@ -189,7 +189,7 @@ root                                            ·                      ·
  │                   └── render                 ·                      ·
  │                        └── scan buffer node  ·                      ·
  │                                              label                  buffer 1
- └── postquery                                  ·                      ·
+ └── fk-check                                   ·                      ·
       └── error if rows                         ·                      ·
            └── lookup-join                      ·                      ·
                 │                               table                  multi_ref_parent_bc@primary
@@ -202,6 +202,20 @@ root                                            ·                      ·
                      └── render                 ·                      ·
                           └── scan buffer node  ·                      ·
 ·                                               label                  buffer 1
+
+# FK check can be omitted when we are inserting only NULLs.
+query TTT
+EXPLAIN INSERT INTO multi_ref_child VALUES (1, NULL, NULL, NULL)
+----
+·                 distributed  false
+·                 vectorized   false
+count             ·            ·
+ └── insert       ·            ·
+      │           into         multi_ref_child(k, a, b, c)
+      │           strategy     inserter
+      │           auto commit  ·
+      └── values  ·            ·
+·                 size         4 columns, 1 row
 
 # -- Tests with DELETE --
 
@@ -220,7 +234,7 @@ root                                       ·            ·
  │              └── scan                   ·            ·
  │                                         table        parent@primary
  │                                         spans        /3-/3/#
- ├── postquery                             ·            ·
+ ├── fk-check                              ·            ·
  │    └── error if rows                    ·            ·
  │         └── lookup-join                 ·            ·
  │              │                          table        child@child_auto_index_fk_p_ref_parent
@@ -229,7 +243,7 @@ root                                       ·            ·
  │              └── render                 ·            ·
  │                   └── scan buffer node  ·            ·
  │                                         label        buffer 1
- └── postquery                             ·            ·
+ └── fk-check                              ·            ·
       └── error if rows                    ·            ·
            └── lookup-join                 ·            ·
                 │                          table        child_nullable@child_nullable_auto_index_fk_p_ref_parent
@@ -257,7 +271,7 @@ root                                       ·            ·
  │              └── scan                   ·            ·
  │                                         table        parent@primary
  │                                         spans        /3-/3/#
- ├── postquery                             ·            ·
+ ├── fk-check                              ·            ·
  │    └── error if rows                    ·            ·
  │         └── lookup-join                 ·            ·
  │              │                          table        child@child_auto_index_fk_p_ref_parent
@@ -266,7 +280,7 @@ root                                       ·            ·
  │              └── render                 ·            ·
  │                   └── scan buffer node  ·            ·
  │                                         label        buffer 1
- ├── postquery                             ·            ·
+ ├── fk-check                              ·            ·
  │    └── error if rows                    ·            ·
  │         └── lookup-join                 ·            ·
  │              │                          table        child_nullable@child_nullable_auto_index_fk_p_ref_parent
@@ -275,7 +289,7 @@ root                                       ·            ·
  │              └── render                 ·            ·
  │                   └── scan buffer node  ·            ·
  │                                         label        buffer 1
- └── postquery                             ·            ·
+ └── fk-check                              ·            ·
       └── error if rows                    ·            ·
            └── lookup-join                 ·            ·
                 │                          table        child2@child2_auto_index_fk_p_ref_parent
@@ -311,7 +325,7 @@ root                                  ·            ·
  │              └── scan              ·            ·
  │                                    table        doubleparent@primary
  │                                    spans        /10-/11
- └── postquery                        ·            ·
+ └── fk-check                         ·            ·
       └── error if rows               ·            ·
            └── lookup-join            ·            ·
                 │                     table        doublechild@doublechild_auto_index_fk_p1_ref_doubleparent
@@ -338,20 +352,20 @@ root                                       ·                   ·
  │              └── render                 ·                   ·
  │                   └── scan              ·                   ·
  │                                         table               child@primary
- │                                         spans               ALL
+ │                                         spans               FULL SCAN
  │                                         locking strength    for update
- └── postquery                             ·                   ·
+ └── fk-check                              ·                   ·
       └── error if rows                    ·                   ·
            └── hash-join                   ·                   ·
                 │                          type                anti
-                │                          equality            (column5) = (p)
+                │                          equality            (p_new) = (p)
                 │                          right cols are key  ·
                 ├── render                 ·                   ·
                 │    └── scan buffer node  ·                   ·
                 │                          label               buffer 1
                 └── scan                   ·                   ·
 ·                                          table               parent@primary
-·                                          spans               ALL
+·                                          spans               FULL SCAN
 
 query TTT
 EXPLAIN UPDATE child SET p = 4 WHERE c = 10
@@ -371,12 +385,12 @@ root                                       ·                      ·
  │                                         table                  child@primary
  │                                         spans                  /10-/10/#
  │                                         locking strength       for update
- └── postquery                             ·                      ·
+ └── fk-check                              ·                      ·
       └── error if rows                    ·                      ·
            └── lookup-join                 ·                      ·
                 │                          table                  parent@primary
                 │                          type                   anti
-                │                          equality               (column5) = (p)
+                │                          equality               (p_new) = (p)
                 │                          equality cols are key  ·
                 │                          parallel               ·
                 └── render                 ·                      ·
@@ -399,9 +413,9 @@ root                                                 ·                   ·
  │              └── render                           ·                   ·
  │                   └── scan                        ·                   ·
  │                                                   table               parent@primary
- │                                                   spans               ALL
+ │                                                   spans               FULL SCAN
  │                                                   locking strength    for update
- ├── postquery                                       ·                   ·
+ ├── fk-check                                        ·                   ·
  │    └── error if rows                              ·                   ·
  │         └── render                                ·                   ·
  │              └── hash-join                        ·                   ·
@@ -421,8 +435,8 @@ root                                                 ·                   ·
  │                        │                          order key           p
  │                        └── scan                   ·                   ·
  │                                                   table               child@child_auto_index_fk_p_ref_parent
- │                                                   spans               ALL
- └── postquery                                       ·                   ·
+ │                                                   spans               FULL SCAN
+ └── fk-check                                        ·                   ·
       └── error if rows                              ·                   ·
            └── render                                ·                   ·
                 └── hash-join                        ·                   ·
@@ -442,7 +456,7 @@ root                                                 ·                   ·
                           │                          order key           p
                           └── scan                   ·                   ·
 ·                                                    table               child_nullable@child_nullable_auto_index_fk_p_ref_parent
-·                                                    spans               ALL
+·                                                    spans               FULL SCAN
 
 query TTT
 EXPLAIN UPDATE parent SET p = p+1 WHERE other = 10
@@ -462,7 +476,7 @@ root                                            ·                 ·
  │                                              table             parent@parent_other_key
  │                                              spans             /10-/11
  │                                              locking strength  for update
- ├── postquery                                  ·                 ·
+ ├── fk-check                                   ·                 ·
  │    └── error if rows                         ·                 ·
  │         └── lookup-join                      ·                 ·
  │              │                               table             child@child_auto_index_fk_p_ref_parent
@@ -475,7 +489,7 @@ root                                            ·                 ·
  │                   └── render                 ·                 ·
  │                        └── scan buffer node  ·                 ·
  │                                              label             buffer 1
- └── postquery                                  ·                 ·
+ └── fk-check                                   ·                 ·
       └── error if rows                         ·                 ·
            └── lookup-join                      ·                 ·
                 │                               table             child_nullable@child_nullable_auto_index_fk_p_ref_parent
@@ -508,9 +522,9 @@ root                                                 ·                   ·
  │              └── render                           ·                   ·
  │                   └── scan                        ·                   ·
  │                                                   table               child@primary
- │                                                   spans               ALL
+ │                                                   spans               FULL SCAN
  │                                                   locking strength    for update
- └── postquery                                       ·                   ·
+ └── fk-check                                        ·                   ·
       └── error if rows                              ·                   ·
            └── render                                ·                   ·
                 └── hash-join                        ·                   ·
@@ -530,7 +544,7 @@ root                                                 ·                   ·
                           │                          order key           c
                           └── scan                   ·                   ·
 ·                                                    table               grandchild@grandchild_auto_index_fk_c_ref_child
-·                                                    spans               ALL
+·                                                    spans               FULL SCAN
 
 # This update shouldn't emit checks for c, since it's unchanged.
 query TTT
@@ -549,20 +563,20 @@ root                                       ·                   ·
  │              └── render                 ·                   ·
  │                   └── scan              ·                   ·
  │                                         table               child@primary
- │                                         spans               ALL
+ │                                         spans               FULL SCAN
  │                                         locking strength    for update
- └── postquery                             ·                   ·
+ └── fk-check                              ·                   ·
       └── error if rows                    ·                   ·
            └── hash-join                   ·                   ·
                 │                          type                anti
-                │                          equality            (column5) = (p)
+                │                          equality            (p_new) = (p)
                 │                          right cols are key  ·
                 ├── render                 ·                   ·
                 │    └── scan buffer node  ·                   ·
                 │                          label               buffer 1
                 └── scan                   ·                   ·
 ·                                          table               parent@primary
-·                                          spans               ALL
+·                                          spans               FULL SCAN
 
 query TTT
 EXPLAIN UPDATE child SET p = p
@@ -580,9 +594,9 @@ root                                       ·                   ·
  │              └── render                 ·                   ·
  │                   └── scan              ·                   ·
  │                                         table               child@primary
- │                                         spans               ALL
+ │                                         spans               FULL SCAN
  │                                         locking strength    for update
- └── postquery                             ·                   ·
+ └── fk-check                              ·                   ·
       └── error if rows                    ·                   ·
            └── hash-join                   ·                   ·
                 │                          type                anti
@@ -593,7 +607,7 @@ root                                       ·                   ·
                 │                          label               buffer 1
                 └── scan                   ·                   ·
 ·                                          table               parent@primary
-·                                          spans               ALL
+·                                          spans               FULL SCAN
 
 query TTT
 EXPLAIN UPDATE child SET p = p+1, c = c+1
@@ -611,21 +625,21 @@ root                                                 ·                   ·
  │              └── render                           ·                   ·
  │                   └── scan                        ·                   ·
  │                                                   table               child@primary
- │                                                   spans               ALL
+ │                                                   spans               FULL SCAN
  │                                                   locking strength    for update
- ├── postquery                                       ·                   ·
+ ├── fk-check                                        ·                   ·
  │    └── error if rows                              ·                   ·
  │         └── hash-join                             ·                   ·
  │              │                                    type                anti
- │              │                                    equality            (column5) = (p)
+ │              │                                    equality            (p_new) = (p)
  │              │                                    right cols are key  ·
  │              ├── render                           ·                   ·
  │              │    └── scan buffer node            ·                   ·
  │              │                                    label               buffer 1
  │              └── scan                             ·                   ·
  │                                                   table               parent@primary
- │                                                   spans               ALL
- └── postquery                                       ·                   ·
+ │                                                   spans               FULL SCAN
+ └── fk-check                                        ·                   ·
       └── error if rows                              ·                   ·
            └── render                                ·                   ·
                 └── hash-join                        ·                   ·
@@ -645,7 +659,7 @@ root                                                 ·                   ·
                           │                          order key           c
                           └── scan                   ·                   ·
 ·                                                    table               grandchild@grandchild_auto_index_fk_c_ref_child
-·                                                    spans               ALL
+·                                                    spans               FULL SCAN
 
 # Multiple grandchild tables
 statement ok
@@ -667,20 +681,20 @@ root                                       ·                   ·
  │              └── render                 ·                   ·
  │                   └── scan              ·                   ·
  │                                         table               child@primary
- │                                         spans               ALL
+ │                                         spans               FULL SCAN
  │                                         locking strength    for update
- └── postquery                             ·                   ·
+ └── fk-check                              ·                   ·
       └── error if rows                    ·                   ·
            └── hash-join                   ·                   ·
                 │                          type                anti
-                │                          equality            (column5) = (p)
+                │                          equality            (p_new) = (p)
                 │                          right cols are key  ·
                 ├── render                 ·                   ·
                 │    └── scan buffer node  ·                   ·
                 │                          label               buffer 1
                 └── scan                   ·                   ·
 ·                                          table               parent@primary
-·                                          spans               ALL
+·                                          spans               FULL SCAN
 
 statement ok
 CREATE TABLE self (x INT PRIMARY KEY, y INT NOT NULL REFERENCES self(x))
@@ -701,20 +715,20 @@ root                                       ·                   ·
  │              └── render                 ·                   ·
  │                   └── scan              ·                   ·
  │                                         table               self@primary
- │                                         spans               ALL
+ │                                         spans               FULL SCAN
  │                                         locking strength    for update
- └── postquery                             ·                   ·
+ └── fk-check                              ·                   ·
       └── error if rows                    ·                   ·
            └── hash-join                   ·                   ·
                 │                          type                anti
-                │                          equality            (column5) = (x)
+                │                          equality            (y_new) = (x)
                 │                          right cols are key  ·
                 ├── render                 ·                   ·
                 │    └── scan buffer node  ·                   ·
                 │                          label               buffer 1
                 └── scan                   ·                   ·
 ·                                          table               self@primary
-·                                          spans               ALL
+·                                          spans               FULL SCAN
 
 query TTT
 EXPLAIN UPDATE self SET x = 3
@@ -732,9 +746,9 @@ root                                                 ·                   ·
  │              └── render                           ·                   ·
  │                   └── scan                        ·                   ·
  │                                                   table               self@primary
- │                                                   spans               ALL
+ │                                                   spans               FULL SCAN
  │                                                   locking strength    for update
- └── postquery                                       ·                   ·
+ └── fk-check                                        ·                   ·
       └── error if rows                              ·                   ·
            └── render                                ·                   ·
                 └── hash-join                        ·                   ·
@@ -754,7 +768,7 @@ root                                                 ·                   ·
                           │                          order key           y
                           └── scan                   ·                   ·
 ·                                                    table               self@self_auto_index_fk_y_ref_self
-·                                                    spans               ALL
+·                                                    spans               FULL SCAN
 
 # Tests for the insert fast path.
 statement ok
@@ -853,3 +867,58 @@ count                  ·            ·
 ·                      auto commit  ·
 ·                      FK check     nonunique_idx_parent@nonunique_idx_parent_k2_idx
 ·                      size         3 columns, 1 row
+
+# Regression test for #46397: upserter was looking at the incorrect ordinal for
+# the check because of an extra input column used by the FK check.
+statement ok
+CREATE TABLE t46397_parent(p INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE t46397_child (
+  c INT PRIMARY KEY,
+  p INT DEFAULT 0 REFERENCES t46397_parent (p),
+  CONSTRAINT foo CHECK (c != 1)
+)
+
+statement error failed to satisfy CHECK constraint
+UPSERT INTO t46397_child(c) VALUES (1)
+
+statement error upsert on table "t46397_child" violates foreign key constraint "fk_p_ref_t46397_parent"
+UPSERT INTO t46397_child(c) VALUES (2)
+
+statement ok
+INSERT INTO t46397_parent VALUES (0)
+
+statement ok
+UPSERT INTO t46397_child(c) VALUES (2)
+
+
+# Verify that cascade information shows up in EXPLAIN.
+statement ok
+SET experimental_optimizer_foreign_key_cascades = true
+
+statement ok
+CREATE TABLE cascadeparent (p INT PRIMARY KEY);
+CREATE TABLE cascadechild (
+  c INT PRIMARY KEY,
+  p INT NOT NULL REFERENCES cascadeparent(p) ON DELETE CASCADE
+)
+
+query TTTTT
+EXPLAIN (VERBOSE) DELETE FROM cascadeparent WHERE p > 1
+----
+·                           distributed  false                   ·    ·
+·                           vectorized   false                   ·    ·
+root                        ·            ·                       ()   ·
+ ├── count                  ·            ·                       ()   ·
+ │    └── delete            ·            ·                       ()   ·
+ │         │                from         cascadeparent           ·    ·
+ │         │                strategy     deleter                 ·    ·
+ │         └── buffer node  ·            ·                       (p)  ·
+ │              │           label        buffer 1                ·    ·
+ │              └── scan    ·            ·                       (p)  ·
+ │                          table        cascadeparent@primary   ·    ·
+ │                          spans        /2-                     ·    ·
+ └── fk-cascade             ·            ·                       ·    ·
+·                           fk           fk_p_ref_cascadeparent  ·    ·
+·                           input        buffer 1                ·    ·

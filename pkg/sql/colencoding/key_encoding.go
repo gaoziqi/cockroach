@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -27,18 +28,19 @@ import (
 
 // DecodeIndexKeyToCols decodes an index key into the idx'th position of the
 // provided slices of colexec.Vecs. The input index key must already have its
-// first table id / index id prefix removed. If matches is false, the key is
-// from a different table, and the returned remainingKey indicates a
+// tenant id and first table id / index id prefix removed. If matches is false,
+// the key is from a different table, and the returned remainingKey indicates a
 // "seek prefix": the next key that might be part of the table being searched
-// for. The input key will also be mutated if matches is false.
-// See the analog in sqlbase/index_encoding.go.
+// for. The input key will also be mutated if matches is false. See the analog
+// in sqlbase/index_encoding.go.
 func DecodeIndexKeyToCols(
+	da *sqlbase.DatumAlloc,
 	vecs []coldata.Vec,
 	idx int,
 	desc *sqlbase.ImmutableTableDescriptor,
 	index *sqlbase.IndexDescriptor,
 	indexColIdx []int,
-	types []types.T,
+	types []*types.T,
 	colDirs []sqlbase.IndexDescriptor_Direction,
 	key roachpb.Key,
 ) (remainingKey roachpb.Key, matches bool, foundNull bool, _ error) {
@@ -53,7 +55,7 @@ func DecodeIndexKeyToCols(
 			// Our input key had its first table id / index id chopped off, so
 			// don't try to decode those for the first ancestor.
 			if i != 0 {
-				key, decodedTableID, decodedIndexID, err = sqlbase.DecodeTableIDIndexID(key)
+				key, decodedTableID, decodedIndexID, err = sqlbase.DecodePartialTableIDIndexID(key)
 				if err != nil {
 					return nil, false, false, err
 				}
@@ -61,7 +63,7 @@ func DecodeIndexKeyToCols(
 					// We don't match. Return a key with the table ID / index ID we're
 					// searching for, so the caller knows what to seek to.
 					curPos := len(origKey) - len(key)
-					key = sqlbase.EncodeTableIDIndexID(origKey[:curPos], ancestor.TableID, ancestor.IndexID)
+					key = sqlbase.EncodePartialTableIDIndexID(origKey[:curPos], ancestor.TableID, ancestor.IndexID)
 					return key, false, false, nil
 				}
 			}
@@ -70,8 +72,10 @@ func DecodeIndexKeyToCols(
 			// We don't care about whether this call to DecodeKeyVals found a null or not, because
 			// it is a interleaving ancestor.
 			var isNull bool
-			key, isNull, err = DecodeKeyValsToCols(vecs, idx, indexColIdx[:length], types[:length], colDirs[:length],
-				nil /* unseen */, key)
+			key, isNull, err = DecodeKeyValsToCols(
+				da, vecs, idx, indexColIdx[:length], types[:length],
+				colDirs[:length], nil /* unseen */, key,
+			)
 			if err != nil {
 				return nil, false, false, err
 			}
@@ -90,7 +94,7 @@ func DecodeIndexKeyToCols(
 			}
 		}
 
-		key, decodedTableID, decodedIndexID, err = sqlbase.DecodeTableIDIndexID(key)
+		key, decodedTableID, decodedIndexID, err = sqlbase.DecodePartialTableIDIndexID(key)
 		if err != nil {
 			return nil, false, false, err
 		}
@@ -98,13 +102,15 @@ func DecodeIndexKeyToCols(
 			// We don't match. Return a key with the table ID / index ID we're
 			// searching for, so the caller knows what to seek to.
 			curPos := len(origKey) - len(key)
-			key = sqlbase.EncodeTableIDIndexID(origKey[:curPos], desc.ID, index.ID)
+			key = sqlbase.EncodePartialTableIDIndexID(origKey[:curPos], desc.ID, index.ID)
 			return key, false, false, nil
 		}
 	}
 
 	var isNull bool
-	key, isNull, err = DecodeKeyValsToCols(vecs, idx, indexColIdx, types, colDirs, nil /* unseen */, key)
+	key, isNull, err = DecodeKeyValsToCols(
+		da, vecs, idx, indexColIdx, types, colDirs, nil /* unseen */, key,
+	)
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -132,10 +138,11 @@ func DecodeIndexKeyToCols(
 // See the analog in sqlbase/index_encoding.go.
 // DecodeKeyValsToCols additionally returns whether a NULL was encountered when decoding.
 func DecodeKeyValsToCols(
+	da *sqlbase.DatumAlloc,
 	vecs []coldata.Vec,
 	idx int,
 	indexColIdx []int,
-	types []types.T,
+	types []*types.T,
 	directions []sqlbase.IndexDescriptor_Direction,
 	unseen *util.FastIntSet,
 	key []byte,
@@ -150,13 +157,13 @@ func DecodeKeyValsToCols(
 		i := indexColIdx[j]
 		if i == -1 {
 			// Don't need the coldata - skip it.
-			key, err = sqlbase.SkipTableKey(&types[j], key, enc)
+			key, err = sqlbase.SkipTableKey(key)
 		} else {
 			if unseen != nil {
 				unseen.Remove(i)
 			}
 			var isNull bool
-			key, isNull, err = decodeTableKeyToCol(vecs[i], idx, &types[j], key, enc)
+			key, isNull, err = decodeTableKeyToCol(da, vecs[i], idx, types[j], key, enc)
 			foundNull = isNull || foundNull
 		}
 		if err != nil {
@@ -171,7 +178,12 @@ func DecodeKeyValsToCols(
 // See the analog, DecodeTableKey, in sqlbase/column_type_encoding.go.
 // decodeTableKeyToCol also returns whether or not the decoded value was NULL.
 func decodeTableKeyToCol(
-	vec coldata.Vec, idx int, valType *types.T, key []byte, dir sqlbase.IndexDescriptor_Direction,
+	da *sqlbase.DatumAlloc,
+	vec coldata.Vec,
+	idx int,
+	valType *types.T,
+	key []byte,
+	dir sqlbase.IndexDescriptor_Direction,
 ) ([]byte, bool, error) {
 	if (dir != sqlbase.IndexDescriptor_ASC) && (dir != sqlbase.IndexDescriptor_DESC) {
 		return nil, false, errors.AssertionFailedf("invalid direction: %d", log.Safe(dir))
@@ -181,6 +193,11 @@ func decodeTableKeyToCol(
 		vec.Nulls().SetNull(idx)
 		return key, true, nil
 	}
+	// We might have read a NULL value in the interleaved child table which
+	// would update the nulls vector, so we need to explicitly unset the null
+	// value here.
+	vec.Nulls().UnsetNull(idx)
+
 	var rkey []byte
 	var err error
 	switch valType.Family() {
@@ -192,7 +209,7 @@ func decodeTableKeyToCol(
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
 		vec.Bool()[idx] = i != 0
-	case types.IntFamily:
+	case types.IntFamily, types.DateFamily, types.OidFamily:
 		var i int64
 		if dir == sqlbase.IndexDescriptor_ASC {
 			rkey, i, err = encoding.DecodeVarintAscending(key)
@@ -231,14 +248,6 @@ func decodeTableKeyToCol(
 			rkey, r, err = encoding.DecodeBytesDescending(key, nil)
 		}
 		vec.Bytes().Set(idx, r)
-	case types.DateFamily, types.OidFamily:
-		var t int64
-		if dir == sqlbase.IndexDescriptor_ASC {
-			rkey, t, err = encoding.DecodeVarintAscending(key)
-		} else {
-			rkey, t, err = encoding.DecodeVarintDescending(key)
-		}
-		vec.Int64()[idx] = t
 	case types.TimestampFamily, types.TimestampTZFamily:
 		var t time.Time
 		if dir == sqlbase.IndexDescriptor_ASC {
@@ -256,17 +265,25 @@ func decodeTableKeyToCol(
 		}
 		vec.Interval()[idx] = d
 	default:
-		return rkey, false, errors.AssertionFailedf("unsupported type %+v", log.Safe(valType))
+		var d tree.Datum
+		encDir := encoding.Ascending
+		if dir == sqlbase.IndexDescriptor_DESC {
+			encDir = encoding.Descending
+		}
+		d, rkey, err = sqlbase.DecodeTableKey(da, valType, key, encDir)
+		vec.Datum().Set(idx, d)
 	}
 	return rkey, false, err
 }
 
 // UnmarshalColumnValueToCol decodes the value from a roachpb.Value using the
 // type expected by the column, writing into the input Vec at the given row
-// idx. An error is returned if the value's type does
-// not match the column's type.
+// idx. An error is returned if the value's type does not match the column's
+// type.
 // See the analog, UnmarshalColumnValue, in sqlbase/column_type_encoding.go
-func UnmarshalColumnValueToCol(vec coldata.Vec, idx int, typ *types.T, value roachpb.Value) error {
+func UnmarshalColumnValueToCol(
+	da *sqlbase.DatumAlloc, vec coldata.Vec, idx int, typ *types.T, value roachpb.Value,
+) error {
 	if value.RawBytes == nil {
 		vec.Nulls().SetNull(idx)
 	}
@@ -312,8 +329,14 @@ func UnmarshalColumnValueToCol(vec coldata.Vec, idx int, typ *types.T, value roa
 		var v duration.Duration
 		v, err = value.GetDuration()
 		vec.Interval()[idx] = v
+	// Types backed by tree.Datums.
 	default:
-		return errors.AssertionFailedf("unsupported column type: %s", log.Safe(typ.Family()))
+		var d tree.Datum
+		d, err = sqlbase.UnmarshalColumnValue(da, typ, value)
+		if err != nil {
+			return err
+		}
+		vec.Datum().Set(idx, d)
 	}
 	return err
 }

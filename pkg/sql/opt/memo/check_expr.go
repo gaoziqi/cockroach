@@ -130,7 +130,7 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 			}
 		}
 
-	case *DistinctOnExpr, *UpsertDistinctOnExpr:
+	case *DistinctOnExpr, *EnsureDistinctOnExpr, *UpsertDistinctOnExpr, *EnsureUpsertDistinctOnExpr:
 		checkErrorOnDup(e.(RelExpr))
 
 		// Check that aggregates can be only FirstAgg or ConstAgg.
@@ -214,13 +214,15 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 			right := e.Child(1).(RelExpr)
 			// The left side cannot depend on the right side columns.
 			if left.Relational().OuterCols.Intersects(right.Relational().OutputCols) {
-				panic(errors.AssertionFailedf("%s left side has outer cols in right side", e.Op()))
+				panic(errors.AssertionFailedf(
+					"%s left side has outer cols in right side", log.Safe(e.Op()),
+				))
 			}
 
 			// The reverse is allowed but only for apply variants.
 			if !opt.IsJoinApplyOp(e) {
 				if right.Relational().OuterCols.Intersects(left.Relational().OutputCols) {
-					panic(errors.AssertionFailedf("%s is correlated", e.Op()))
+					panic(errors.AssertionFailedf("%s is correlated", log.Safe(e.Op())))
 				}
 			}
 			checkFilters(*e.Child(2).(*FiltersExpr))
@@ -229,6 +231,11 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 
 	// Check orderings within operators.
 	checkExprOrdering(e)
+
+	// Check for overlapping column IDs in child relational expressions.
+	if opt.IsRelationalOp(e) {
+		checkOutputCols(e)
+	}
 }
 
 func (m *Memo) checkColListLen(colList opt.ColList, expectedLen int, listName string) {
@@ -287,8 +294,39 @@ func checkFilters(filters FiltersExpr) {
 }
 
 func checkErrorOnDup(e RelExpr) {
-	// Only UpsertDistinctOn should set the ErrorOnDup field to true.
-	if e.Op() != opt.UpsertDistinctOnOp && e.Private().(*GroupingPrivate).ErrorOnDup {
-		panic(errors.AssertionFailedf("%s should never set ErrorOnDup to true", log.Safe(e.Op())))
+	// Only EnsureDistinctOn and EnsureUpsertDistinctOn should set the ErrorOnDup
+	// field to a value.
+	if e.Op() != opt.EnsureDistinctOnOp &&
+		e.Op() != opt.EnsureUpsertDistinctOnOp &&
+		e.Private().(*GroupingPrivate).ErrorOnDup != "" {
+		panic(errors.AssertionFailedf(
+			"%s should never set ErrorOnDup to a non-empty string", log.Safe(e.Op())))
+	}
+	if (e.Op() == opt.EnsureDistinctOnOp ||
+		e.Op() == opt.EnsureUpsertDistinctOnOp) &&
+		e.Private().(*GroupingPrivate).ErrorOnDup == "" {
+		panic(errors.AssertionFailedf(
+			"%s should never leave ErrorOnDup as an empty string", log.Safe(e.Op())))
+	}
+}
+
+func checkOutputCols(e opt.Expr) {
+	set := opt.ColSet{}
+
+	for i := 0; i < e.ChildCount(); i++ {
+		rel, ok := e.Child(i).(RelExpr)
+		if !ok {
+			continue
+		}
+
+		// The output columns of child expressions cannot overlap.
+		cols := rel.Relational().OutputCols
+		if set.Intersects(cols) {
+			panic(errors.AssertionFailedf(
+				"%s RelExpr children have intersecting columns", log.Safe(e.Op()),
+			))
+		}
+
+		set.UnionWith(cols)
 	}
 }

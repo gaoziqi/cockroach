@@ -21,50 +21,66 @@ package colexec
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
+// {{/*
+
+// _START_WIDTH is the template variable.
+const _START_WIDTH = 0
+
+// _LENGTH_WIDTH is the template variable.
+const _LENGTH_WIDTH = 0
+
+// */}}
+
 func newSubstringOperator(
-	allocator *Allocator, columnTypes []types.T, argumentCols []int, outputIdx int, input Operator,
-) Operator {
-	startType := typeconv.FromColumnType(&columnTypes[argumentCols[1]])
-	lengthType := typeconv.FromColumnType(&columnTypes[argumentCols[2]])
+	allocator *colmem.Allocator,
+	typs []*types.T,
+	argumentCols []int,
+	outputIdx int,
+	input colexecbase.Operator,
+) colexecbase.Operator {
+	startType := typs[argumentCols[1]]
+	lengthType := typs[argumentCols[2]]
 	base := substringFunctionBase{
 		OneInputNode: NewOneInputNode(input),
 		allocator:    allocator,
 		argumentCols: argumentCols,
 		outputIdx:    outputIdx,
 	}
-	switch startType {
-	// {{range $startType, $lengthTypes := .}}
-	case _StartType_T:
-		switch lengthType {
-		// {{range $lengthType := $lengthTypes}}
-		case _LengthType_T:
-			return &substring_StartType_LengthTypeOperator{base}
-		// {{end}}
-		default:
-			execerror.VectorizedInternalPanic(errors.Errorf("unsupported length argument type %s", lengthType))
-			// This code is unreachable, but the compiler cannot infer that.
-			return nil
-		}
-	// {{end}}
-	default:
-		execerror.VectorizedInternalPanic(errors.Errorf("unsupported start argument type %s", startType))
-		// This code is unreachable, but the compiler cannot infer that.
-		return nil
+	if startType.Family() != types.IntFamily {
+		colexecerror.InternalError(fmt.Sprintf("non-int start argument type %s", startType))
 	}
+	if lengthType.Family() != types.IntFamily {
+		colexecerror.InternalError(fmt.Sprintf("non-int length argument type %s", lengthType))
+	}
+	switch startType.Width() {
+	// {{range $startWidth, $lengthWidths := .}}
+	case _START_WIDTH:
+		switch lengthType.Width() {
+		// {{range $lengthWidth := $lengthWidths}}
+		case _LENGTH_WIDTH:
+			return &substring_StartType_LengthTypeOperator{base}
+			// {{end}}
+		}
+		// {{end}}
+	}
+	colexecerror.InternalError(errors.Errorf("unsupported substring argument types: %s %s", startType, lengthType))
+	// This code is unreachable, but the compiler cannot infer that.
+	return nil
 }
 
 type substringFunctionBase struct {
 	OneInputNode
-	allocator    *Allocator
+	allocator    *colmem.Allocator
 	argumentCols []int
 	outputIdx    int
 }
@@ -73,14 +89,14 @@ func (s *substringFunctionBase) Init() {
 	s.input.Init()
 }
 
-// {{range $startType, $lengthTypes := .}}
-// {{range $lengthType := $lengthTypes}}
+// {{range $startWidth, $lengthWidths := .}}
+// {{range $lengthWidth := $lengthWidths}}
 
 type substring_StartType_LengthTypeOperator struct {
 	substringFunctionBase
 }
 
-var _ Operator = &substring_StartType_LengthTypeOperator{}
+var _ colexecbase.Operator = &substring_StartType_LengthTypeOperator{}
 
 func (s *substring_StartType_LengthTypeOperator) Next(ctx context.Context) coldata.Batch {
 	batch := s.input.Next(ctx)
@@ -88,13 +104,17 @@ func (s *substring_StartType_LengthTypeOperator) Next(ctx context.Context) colda
 	if n == 0 {
 		return coldata.ZeroBatch
 	}
-	s.allocator.MaybeAddColumn(batch, coltypes.Bytes, s.outputIdx)
 
 	sel := batch.Selection()
 	runeVec := batch.ColVec(s.argumentCols[0]).Bytes()
 	startVec := batch.ColVec(s.argumentCols[1])._StartType()
 	lengthVec := batch.ColVec(s.argumentCols[2])._LengthType()
 	outputVec := batch.ColVec(s.outputIdx)
+	if outputVec.MaybeHasNulls() {
+		// We need to make sure that there are no left over null values in the
+		// output vector.
+		outputVec.Nulls().UnsetNulls()
+	}
 	outputCol := outputVec.Bytes()
 	s.allocator.PerformOperation(
 		[]coldata.Vec{outputVec},
@@ -124,7 +144,7 @@ func (s *substring_StartType_LengthTypeOperator) Next(ctx context.Context) colda
 				start := int(startVec[rowIdx]) - 1
 				length := int(lengthVec[rowIdx])
 				if length < 0 {
-					execerror.NonVectorizedPanic(errors.Errorf("negative substring length %d not allowed", length))
+					colexecerror.ExpectedError(errors.Errorf("negative substring length %d not allowed", length))
 				}
 
 				end := start + length

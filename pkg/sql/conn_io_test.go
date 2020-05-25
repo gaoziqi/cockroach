@@ -17,40 +17,42 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func assertStmt(t *testing.T, cmd Command, exp string) {
+	t.Helper()
 	stmt, ok := cmd.(ExecStmt)
 	if !ok {
-		t.Fatalf("%s: expected ExecStmt, got %T", testutils.Caller(1), cmd)
+		t.Fatalf("expected ExecStmt, got %T", cmd)
 	}
 	if stmt.AST.String() != exp {
-		t.Fatalf("%s: expected statement %s, got %s", testutils.Caller(1), exp, stmt)
+		t.Fatalf("expected statement %s, got %s", exp, stmt)
 	}
 }
 
 func assertPrepareStmt(t *testing.T, cmd Command, expName string) {
+	t.Helper()
 	ps, ok := cmd.(PrepareStmt)
 	if !ok {
-		t.Fatalf("%s: expected PrepareStmt, got %T", testutils.Caller(1), cmd)
+		t.Fatalf("expected PrepareStmt, got %T", cmd)
 	}
 	if ps.Name != expName {
-		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, ps.Name)
+		t.Fatalf("expected name %s, got %s", expName, ps.Name)
 	}
 }
 
 func mustPush(ctx context.Context, t *testing.T, buf *StmtBuf, cmd Command) {
+	t.Helper()
 	if err := buf.Push(ctx, cmd); err != nil {
-		t.Fatalf("%s: %s", testutils.Caller(1), err)
+		t.Fatalf("%s", err)
 	}
 }
 
 func TestStmtBuf(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	s1, err := parser.ParseOne("SELECT 1")
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +140,7 @@ func TestStmtBuf(t *testing.T) {
 func TestStmtBufSignal(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	buf := NewStmtBuf()
 	s1, err := parser.ParseOne("SELECT 1")
 	if err != nil {
@@ -162,7 +164,7 @@ func TestStmtBufSignal(t *testing.T) {
 func TestStmtBufLtrim(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	buf := NewStmtBuf()
 	for i := 0; i < 5; i++ {
 		stmt, err := parser.ParseOne(
@@ -190,7 +192,7 @@ func TestStmtBufLtrim(t *testing.T) {
 func TestStmtBufClose(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	buf := NewStmtBuf()
 	stmt, err := parser.ParseOne("SELECT 1")
 	if err != nil {
@@ -227,7 +229,7 @@ func TestStmtBufPreparedStmt(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	buf := NewStmtBuf()
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	s1, err := parser.ParseOne("SELECT 1")
 	if err != nil {
@@ -270,7 +272,7 @@ func TestStmtBufBatching(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	buf := NewStmtBuf()
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	s1, err := parser.ParseOne("SELECT 1")
 	if err != nil {

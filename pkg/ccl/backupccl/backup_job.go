@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/covering"
@@ -139,13 +140,19 @@ func splitAndFilterSpans(
 }
 
 // clusterNodeCount returns the approximate number of nodes in the cluster.
-func clusterNodeCount(g *gossip.Gossip) int {
+func clusterNodeCount(gw gossip.DeprecatedGossip) (int, error) {
+	g, err := gw.OptionalErr(47970)
+	if err != nil {
+		return 0, err
+	}
 	var nodes int
-	_ = g.IterateInfos(gossip.KeyNodeIDPrefix, func(_ string, _ gossip.Info) error {
-		nodes++
-		return nil
-	})
-	return nodes
+	_ = g.IterateInfos(
+		gossip.KeyNodeIDPrefix, func(_ string, _ gossip.Info) error {
+			nodes++
+			return nil
+		},
+	)
+	return nodes, nil
 }
 
 type spanAndTime struct {
@@ -163,14 +170,13 @@ type spanAndTime struct {
 func backup(
 	ctx context.Context,
 	db *kv.DB,
-	gossip *gossip.Gossip,
+	numClusterNodes int,
 	settings *cluster.Settings,
 	defaultStore cloud.ExternalStorage,
 	storageByLocalityKV map[string]*roachpb.ExternalStorage,
 	job *jobs.Job,
 	backupManifest *BackupManifest,
 	checkpointDesc *BackupManifest,
-	resultsCh chan<- tree.Datums,
 	makeExternalStorage cloud.ExternalStorageFactory,
 	encryption *roachpb.FileEncryptionOptions,
 ) (RowCount, error) {
@@ -265,7 +271,7 @@ func backup(
 	// TODO(dan): Make this limiting per node.
 	//
 	// TODO(dan): See if there's some better solution than rate-limiting #14798.
-	maxConcurrentExports := clusterNodeCount(gossip) * int(kvserver.ExportRequestsLimit.Get(&settings.SV)) * 10
+	maxConcurrentExports := numClusterNodes * int(kvserver.ExportRequestsLimit.Get(&settings.SV)) * 10
 	exportsSem := make(chan struct{}, maxConcurrentExports)
 
 	g := ctxgroup.WithContext(ctx)
@@ -441,10 +447,7 @@ func (b *backupResumer) releaseProtectedTimestamp(
 }
 
 type backupResumer struct {
-	job                 *jobs.Job
-	settings            *cluster.Settings
-	res                 RowCount
-	makeExternalStorage cloud.ExternalStorageFactory
+	job *jobs.Job
 
 	testingKnobs struct {
 		ignoreProtectedTimestamps bool
@@ -457,7 +460,6 @@ func (b *backupResumer) Resume(
 ) error {
 	details := b.job.Details().(jobspb.BackupDetails)
 	p := phs.(sql.PlanHookState)
-	b.makeExternalStorage = p.ExecCfg().DistSQLSrv.ExternalStorage
 
 	ptsID := details.ProtectedTimestampRecord
 	if ptsID != nil && !b.testingKnobs.ignoreProtectedTimestamps {
@@ -487,7 +489,7 @@ func (b *backupResumer) Resume(
 	if err != nil {
 		return errors.Wrapf(err, "export configuration")
 	}
-	defaultStore, err := b.makeExternalStorage(ctx, defaultConf)
+	defaultStore, err := p.ExecCfg().DistSQLSrv.ExternalStorage(ctx, defaultConf)
 	if err != nil {
 		return errors.Wrapf(err, "make storage")
 	}
@@ -519,39 +521,34 @@ func (b *backupResumer) Resume(
 		// implementations.
 		log.Warningf(ctx, "unable to load backup checkpoint while resuming job %d: %v", *b.job.ID(), err)
 	}
+
+	numClusterNodes, err := clusterNodeCount(p.ExecCfg().Gossip)
+	if err != nil {
+		return err
+	}
+
 	res, err := backup(
 		ctx,
 		p.ExecCfg().DB,
-		p.ExecCfg().Gossip,
+		numClusterNodes,
 		p.ExecCfg().Settings,
 		defaultStore,
 		storageByLocalityKV,
 		b.job,
 		&backupManifest,
 		checkpointDesc,
-		resultsCh,
-		b.makeExternalStorage,
+		p.ExecCfg().DistSQLSrv.ExternalStorage,
 		details.Encryption,
 	)
 	if err != nil {
 		return err
 	}
-	b.res = res
 
 	err = b.clearStats(ctx, p.ExecCfg().DB)
 	if err != nil {
 		log.Warningf(ctx, "unable to clear stats from job payload: %+v", err)
 	}
-	b.deleteCheckpoint(ctx)
-
-	resultsCh <- tree.Datums{
-		tree.NewDInt(tree.DInt(*b.job.ID())),
-		tree.NewDString(string(jobs.StatusSucceeded)),
-		tree.NewDFloat(tree.DFloat(1.0)),
-		tree.NewDInt(tree.DInt(b.res.Rows)),
-		tree.NewDInt(tree.DInt(b.res.IndexEntries)),
-		tree.NewDInt(tree.DInt(b.res.DataSize)),
-	}
+	b.deleteCheckpoint(ctx, p.ExecCfg())
 
 	if ptsID != nil && !b.testingKnobs.ignoreProtectedTimestamps {
 		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -560,6 +557,39 @@ func (b *backupResumer) Resume(
 			log.Errorf(ctx, "failed to release protected timestamp: %v", err)
 		}
 	}
+
+	resultsCh <- tree.Datums{
+		tree.NewDInt(tree.DInt(*b.job.ID())),
+		tree.NewDString(string(jobs.StatusSucceeded)),
+		tree.NewDFloat(tree.DFloat(1.0)),
+		tree.NewDInt(tree.DInt(res.Rows)),
+		tree.NewDInt(tree.DInt(res.IndexEntries)),
+		tree.NewDInt(tree.DInt(res.DataSize)),
+	}
+
+	// Collect telemetry.
+	{
+		telemetry.Count("backup.total.succeeded")
+		const mb = 1 << 20
+		sizeMb := res.DataSize / mb
+		sec := int64(timeutil.Since(timeutil.FromUnixMicros(b.job.Payload().StartedMicros)).Seconds())
+		var mbps int64
+		if sec > 0 {
+			mbps = mb / sec
+		}
+		if details.StartTime.IsEmpty() {
+			telemetry.CountBucketed("backup.duration-sec.full-succeeded", sec)
+			telemetry.CountBucketed("backup.size-mb.full", sizeMb)
+			telemetry.CountBucketed("backup.speed-mbps.full.total", mbps)
+			telemetry.CountBucketed("backup.speed-mbps.full.per-node", mbps/int64(numClusterNodes))
+		} else {
+			telemetry.CountBucketed("backup.duration-sec.inc-succeeded", sec)
+			telemetry.CountBucketed("backup.size-mb.inc", sizeMb)
+			telemetry.CountBucketed("backup.speed-mbps.inc.total", mbps)
+			telemetry.CountBucketed("backup.speed-mbps.inc.per-node", mbps/int64(numClusterNodes))
+		}
+	}
+
 	return nil
 }
 
@@ -583,14 +613,18 @@ func (b *backupResumer) clearStats(ctx context.Context, DB *kv.DB) error {
 
 // OnFailOrCancel is part of the jobs.Resumer interface.
 func (b *backupResumer) OnFailOrCancel(ctx context.Context, phs interface{}) error {
+	telemetry.Count("backup.total.failed")
+	telemetry.CountBucketed("backup.duration-sec.failed",
+		int64(timeutil.Since(timeutil.FromUnixMicros(b.job.Payload().StartedMicros)).Seconds()))
+
 	cfg := phs.(sql.PlanHookState).ExecCfg()
-	b.deleteCheckpoint(ctx)
+	b.deleteCheckpoint(ctx, cfg)
 	return cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		return b.releaseProtectedTimestamp(ctx, txn, cfg.ProtectedTimestampProvider)
 	})
 }
 
-func (b *backupResumer) deleteCheckpoint(ctx context.Context) {
+func (b *backupResumer) deleteCheckpoint(ctx context.Context, cfg *sql.ExecutorConfig) {
 	// Attempt to delete BACKUP-CHECKPOINT.
 	if err := func() error {
 		details := b.job.Details().(jobspb.BackupDetails)
@@ -600,7 +634,7 @@ func (b *backupResumer) deleteCheckpoint(ctx context.Context) {
 		if err != nil {
 			return err
 		}
-		exportStore, err := b.makeExternalStorage(ctx, conf)
+		exportStore, err := cfg.DistSQLSrv.ExternalStorage(ctx, conf)
 		if err != nil {
 			return err
 		}
@@ -615,10 +649,9 @@ var _ jobs.Resumer = &backupResumer{}
 func init() {
 	jobs.RegisterConstructor(
 		jobspb.TypeBackup,
-		func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
+		func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 			return &backupResumer{
-				job:      job,
-				settings: settings,
+				job: job,
 			}
 		},
 	)

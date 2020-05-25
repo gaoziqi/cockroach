@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -24,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func subzoneExists(cfg *zonepb.ZoneConfig, index uint32, partition string) bool {
@@ -48,8 +49,9 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		GCJob: &sql.GCJobTestingKnobs{
-			RunBeforeResume: func() {
+			RunBeforeResume: func(_ int64) error {
 				<-asyncNotification
+				return nil
 			},
 		},
 	}
@@ -65,12 +67,12 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 		PARTITION p1 VALUES IN (1),
 		PARTITION p2 VALUES IN (2)
 	)`)
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	indexDesc, _, err := tableDesc.FindIndexByName("i")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(indexDesc.ID)
+	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, indexDesc.ID)
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 
 	// Set zone configs on the primary index, secondary index, and one partition
@@ -112,7 +114,7 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 			t.Fatalf(`zone config for %s still exists`, target)
 		}
 	}
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "kv")
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
 	if _, _, err := tableDesc.FindIndexByName("i"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
@@ -120,7 +122,7 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 
 	// Wait for index drop to complete so zone configs are updated.
 	testutils.SucceedsSoon(t, func() error {
-		if kvs, err := kvDB.Scan(context.TODO(), indexSpan.Key, indexSpan.EndKey, 0); err != nil {
+		if kvs, err := kvDB.Scan(context.Background(), indexSpan.Key, indexSpan.EndKey, 0); err != nil {
 			return err
 		} else if l := 0; len(kvs) != l {
 			return errors.Errorf("expected %d key value pairs, but got %d", l, len(kvs))

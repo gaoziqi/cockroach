@@ -19,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -26,12 +28,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 type dropDatabaseNode struct {
-	n      *tree.DropDatabase
-	dbDesc *sqlbase.DatabaseDescriptor
-	td     []toDelete
+	n               *tree.DropDatabase
+	dbDesc          *sqlbase.DatabaseDescriptor
+	td              []toDelete
+	schemasToDelete []string
 }
 
 // DropDatabase drops a database.
@@ -65,15 +69,17 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 		return nil, err
 	}
 
-	schemas, err := p.Tables().getSchemasForDatabase(ctx, p.txn, dbDesc.ID)
+	schemas, err := p.Tables().GetSchemasForDatabase(ctx, p.txn, dbDesc.ID)
 	if err != nil {
 		return nil, err
 	}
 
 	var tbNames TableNames
+	schemasToDelete := make([]string, 0, len(schemas))
 	for _, schema := range schemas {
-		toAppend, err := GetObjectNames(
-			ctx, p.txn, p, dbDesc, schema, true, /*explicitPrefix*/
+		schemasToDelete = append(schemasToDelete, schema)
+		toAppend, err := resolver.GetObjectNames(
+			ctx, p.txn, p, p.ExecCfg().Codec, dbDesc, schema, true, /*explicitPrefix*/
 		)
 		if err != nil {
 			return nil, err
@@ -98,13 +104,39 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 	}
 
 	td := make([]toDelete, 0, len(tbNames))
-	for i := range tbNames {
-		tbDesc, err := p.prepareDrop(ctx, &tbNames[i], false /*required*/, ResolveAnyDescType)
+	for i, tbName := range tbNames {
+		found, desc, err := p.LookupObject(
+			ctx,
+			tree.ObjectLookupFlags{
+				CommonLookupFlags: tree.CommonLookupFlags{Required: true},
+				RequireMutable:    true,
+				IncludeOffline:    true,
+			},
+			tbName.Catalog(),
+			tbName.Schema(),
+			tbName.Table(),
+		)
 		if err != nil {
 			return nil, err
 		}
-		if tbDesc == nil {
+		if !found {
 			continue
+		}
+		tbDesc, ok := desc.(*sqlbase.MutableTableDescriptor)
+		if !ok {
+			return nil, errors.AssertionFailedf(
+				"descriptor for %q is not MutableTableDescriptor",
+				tbName.String(),
+			)
+		}
+		if tbDesc.State == sqlbase.TableDescriptor_OFFLINE {
+			return nil, pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+				"cannot drop a database with OFFLINE tables, ensure %s is"+
+					" dropped or made public before dropping database %s",
+				tbName.String(), tree.AsString((*tree.Name)(&dbDesc.Name)))
+		}
+		if err := p.prepareDropWithTableDesc(ctx, tbDesc); err != nil {
+			return nil, err
 		}
 		// Recursively check permissions on all dependent views, since some may
 		// be in different databases.
@@ -120,7 +152,8 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 	if err != nil {
 		return nil, err
 	}
-	return &dropDatabaseNode{n: n, dbDesc: dbDesc, td: td}, nil
+
+	return &dropDatabaseNode{n: n, dbDesc: dbDesc, td: td, schemasToDelete: schemasToDelete}, nil
 }
 
 func (n *dropDatabaseNode) startExec(params runParams) error {
@@ -167,7 +200,7 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		tbNameStrings = append(tbNameStrings, toDel.tn.FQString())
 	}
 
-	descKey := sqlbase.MakeDescMetadataKey(n.dbDesc.ID)
+	descKey := sqlbase.MakeDescMetadataKey(p.ExecCfg().Codec, n.dbDesc.ID)
 
 	b := &kv.Batch{}
 	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
@@ -175,8 +208,20 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	}
 	b.Del(descKey)
 
+	for _, schemaToDelete := range n.schemasToDelete {
+		if err := sqlbase.RemoveSchemaNamespaceEntry(
+			ctx,
+			p.txn,
+			p.ExecCfg().Codec,
+			n.dbDesc.ID,
+			schemaToDelete,
+		); err != nil {
+			return err
+		}
+	}
+
 	err := sqlbase.RemoveDatabaseNamespaceEntry(
-		ctx, p.txn, n.dbDesc.Name, p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
+		ctx, p.txn, p.ExecCfg().Codec, n.dbDesc.Name, p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
 	)
 	if err != nil {
 		return err
@@ -193,7 +238,7 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		b.DelRange(zoneKeyPrefix, zoneKeyPrefix.PrefixEnd(), false /* returnKeys */)
 	}
 
-	p.Tables().addUncommittedDatabase(n.dbDesc.Name, n.dbDesc.ID, dbDropped)
+	p.Tables().AddUncommittedDatabase(n.dbDesc.Name, n.dbDesc.ID, descs.DBDropped)
 
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
@@ -210,7 +255,7 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		p.txn,
 		EventLogDropDatabase,
 		int32(n.dbDesc.ID),
-		int32(params.extendedEvalCtx.NodeID),
+		int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 		struct {
 			DatabaseName         string
 			Statement            string
@@ -252,7 +297,7 @@ func (p *planner) accumulateDependentTables(
 ) error {
 	for _, ref := range desc.DependedOnBy {
 		dependentTables[ref.ID] = true
-		dependentDesc, err := p.Tables().getMutableTableVersionByID(ctx, ref.ID, p.txn)
+		dependentDesc, err := p.Tables().GetMutableTableVersionByID(ctx, ref.ID, p.txn)
 		if err != nil {
 			return err
 		}

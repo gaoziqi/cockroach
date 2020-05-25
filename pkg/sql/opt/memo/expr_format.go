@@ -192,12 +192,17 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		FormatPrivate(f, e.Private(), required)
 		f.Buffer.WriteByte(')')
 
+	case *GeoLookupJoinExpr:
+		fmt.Fprintf(f.Buffer, "%v (geo-lookup", t.JoinType)
+		FormatPrivate(f, e.Private(), required)
+		f.Buffer.WriteByte(')')
+
 	case *ZigzagJoinExpr:
 		fmt.Fprintf(f.Buffer, "%v (zigzag", opt.InnerJoinOp)
 		FormatPrivate(f, e.Private(), required)
 		f.Buffer.WriteByte(')')
 
-	case *ScanExpr, *VirtualScanExpr, *IndexJoinExpr, *ShowTraceForSessionExpr,
+	case *ScanExpr, *IndexJoinExpr, *ShowTraceForSessionExpr,
 		*InsertExpr, *UpdateExpr, *UpsertExpr, *DeleteExpr, *SequenceSelectExpr,
 		*WindowExpr, *OpaqueRelExpr, *OpaqueMutationExpr, *OpaqueDDLExpr,
 		*AlterTableSplitExpr, *AlterTableUnsplitExpr, *AlterTableUnsplitAllExpr,
@@ -285,7 +290,8 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 	switch t := e.(type) {
 	// Special-case handling for GroupBy private; print grouping columns
 	// and internal ordering in addition to full set of columns.
-	case *GroupByExpr, *ScalarGroupByExpr, *DistinctOnExpr, *UpsertDistinctOnExpr:
+	case *GroupByExpr, *ScalarGroupByExpr, *DistinctOnExpr, *EnsureDistinctOnExpr,
+		*UpsertDistinctOnExpr, *EnsureUpsertDistinctOnExpr:
 		private := e.Private().(*GroupingPrivate)
 		if !f.HasFlags(ExprFmtHideColumns) && !private.GroupingCols.Empty() {
 			f.formatColList(e, tp, "grouping columns:", opt.ColSetToList(private.GroupingCols))
@@ -293,8 +299,8 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		if !f.HasFlags(ExprFmtHidePhysProps) && !private.Ordering.Any() {
 			tp.Childf("internal-ordering: %s", private.Ordering)
 		}
-		if !f.HasFlags(ExprFmtHideMiscProps) && private.ErrorOnDup {
-			tp.Childf("error-on-dup")
+		if !f.HasFlags(ExprFmtHideMiscProps) && private.ErrorOnDup != "" {
+			tp.Childf("error: \"%s\"", private.ErrorOnDup)
 		}
 
 	case *LimitExpr:
@@ -326,10 +332,10 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		if t.IsCanonical() {
 			// For the canonical scan, show the expressions attached to the TableMeta.
 			tab := md.TableMeta(t.Table)
-			if len(tab.Constraints) > 0 {
+			if tab.Constraints != nil {
 				c := tp.Childf("check constraint expressions")
-				for i := 0; i < len(tab.Constraints); i++ {
-					f.formatExpr(tab.Constraints[i], c)
+				for i := 0; i < tab.Constraints.ChildCount(); i++ {
+					f.formatExpr(tab.Constraints.Child(i), c)
 				}
 			}
 			if len(tab.ComputedCols) > 0 {
@@ -422,6 +428,12 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			tp.Childf("lookup columns are key")
 		}
 
+	case *GeoLookupJoinExpr:
+		if !t.Flags.Empty() {
+			tp.Childf("flags: %s", t.Flags.String())
+		}
+		tp.Childf("geo-relationship: %v", t.GeoRelationshipType)
+
 	case *ZigzagJoinExpr:
 		if !f.HasFlags(ExprFmtHideColumns) {
 			tp.Childf("eq columns: %v = %v", t.LeftEqCols, t.RightEqCols)
@@ -496,6 +508,15 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			f.formatMutationCommon(tp, &t.MutationPrivate)
 		}
 
+	case *WithExpr:
+		if t.Mtr.Set {
+			if t.Mtr.Materialize {
+				tp.Child("materialized")
+			} else {
+				tp.Child("not-materialized")
+			}
+		}
+
 	case *WithScanExpr:
 		if !f.HasFlags(ExprFmtHideColumns) {
 			child := tp.Child("mapping:")
@@ -544,9 +565,9 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		// ExplainPlan is the default, don't show it.
 		m := ""
 		if t.Options.Mode != tree.ExplainPlan {
-			m, _ = tree.ExplainModeName(t.Options.Mode)
+			m = strings.ToLower(t.Options.Mode.String())
 		}
-		if t.Options.Flags.Contains(tree.ExplainFlagVerbose) {
+		if t.Options.Flags[tree.ExplainFlagVerbose] {
 			if m != "" {
 				m += ", "
 			}
@@ -926,7 +947,7 @@ func (f *ExprFmtCtx) formatScalarPrivate(scalar opt.ScalarExpr) {
 		//
 		// TODO(radu): maybe flip these if we are deleting from the parent (i.e.
 		// FKOutbound=false)?
-		fmt.Fprintf(f.Buffer, ": %s(", origin.Alias.TableName)
+		fmt.Fprintf(f.Buffer, ": %s(", origin.Alias.ObjectName)
 		for i := 0; i < fk.ColumnCount(); i++ {
 			if i > 0 {
 				f.Buffer.WriteByte(',')
@@ -934,7 +955,7 @@ func (f *ExprFmtCtx) formatScalarPrivate(scalar opt.ScalarExpr) {
 			col := origin.Table.Column(fk.OriginColumnOrdinal(origin.Table, i))
 			f.Buffer.WriteString(string(col.ColName()))
 		}
-		fmt.Fprintf(f.Buffer, ") -> %s(", referenced.Alias.TableName)
+		fmt.Fprintf(f.Buffer, ") -> %s(", referenced.Alias.ObjectName)
 		for i := 0; i < fk.ColumnCount(); i++ {
 			if i > 0 {
 				f.Buffer.WriteByte(',')
@@ -1038,6 +1059,12 @@ func (f *ExprFmtCtx) formatMutationCommon(tp treeprinter.Node, p *MutationPrivat
 	}
 	if p.FKFallback {
 		tp.Childf("fk-fallback")
+	}
+	if len(p.FKCascades) > 0 {
+		c := tp.Childf("cascades")
+		for i := range p.FKCascades {
+			c.Child(p.FKCascades[i].FKName)
+		}
 	}
 }
 
@@ -1147,9 +1174,6 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 			f.Buffer.WriteString(",rev")
 		}
 
-	case *VirtualScanPrivate:
-		fmt.Fprintf(f.Buffer, " %s", tableAlias(f, t.Table))
-
 	case *SequenceSelectPrivate:
 		seq := f.Memo.metadata.Sequence(t.Sequence)
 		fmt.Fprintf(f.Buffer, " %s", seq.Name())
@@ -1179,6 +1203,10 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 		} else {
 			fmt.Fprintf(f.Buffer, " %s@%s", tab.Name(), tab.Index(t.Index).Name())
 		}
+
+	case *GeoLookupJoinPrivate:
+		tab := f.Memo.metadata.Table(t.Table)
+		fmt.Fprintf(f.Buffer, " %s@%s", tab.Name(), tab.Index(t.Index).Name())
 
 	case *ValuesPrivate:
 		fmt.Fprintf(f.Buffer, " id=v%d", t.ID)

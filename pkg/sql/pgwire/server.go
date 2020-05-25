@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -65,12 +65,12 @@ var connResultsBufferSize = settings.RegisterPublicByteSizeSetting(
 )
 
 var logConnAuth = settings.RegisterPublicBoolSetting(
-	"server.auth_log.sql_connections.enabled",
+	sql.ConnAuditingClusterSettingName,
 	"if set, log SQL client connect and disconnect events (note: may hinder performance on loaded nodes)",
 	false)
 
 var logSessionAuth = settings.RegisterPublicBoolSetting(
-	"server.auth_log.sql_sessions.enabled",
+	sql.AuthAuditingClusterSettingName,
 	"if set, log SQL session login/disconnection events (note: may hinder performance on loaded nodes)",
 	false)
 
@@ -317,8 +317,13 @@ func (s *Server) Metrics() (res []interface{}) {
 // The RFC on drain modes has more information regarding the specifics of
 // what will happen to connections in different states:
 // https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/20160425_drain_modes.md
-func (s *Server) Drain(drainWait time.Duration) error {
-	return s.drainImpl(drainWait, cancelMaxWait)
+//
+// The reporter callback, if non-nil, is called on a best effort basis
+// to report work that needed to be done and which may or may not have
+// been done by the time this call returns. See the explanation in
+// pkg/server/drain.go for details.
+func (s *Server) Drain(drainWait time.Duration, reporter func(int, string)) error {
+	return s.drainImpl(drainWait, cancelMaxWait, reporter)
 }
 
 // Undrain switches the server back to the normal mode of operation in which
@@ -339,7 +344,21 @@ func (s *Server) setDrainingLocked(drain bool) bool {
 	return true
 }
 
-func (s *Server) drainImpl(drainWait time.Duration, cancelWait time.Duration) error {
+// drainImpl drains the SQL clients.
+//
+// The drainWait duration is used to wait on clients to
+// self-disconnect after their session has been canceled. The
+// cancelWait is used to wait after the drainWait timer has expired
+// and there are still clients connected, and their context.Context is
+// canceled.
+//
+// The reporter callback, if non-nil, is called on a best effort basis
+// to report work that needed to be done and which may or may not have
+// been done by the time this call returns. See the explanation in
+// pkg/server/drain.go for details.
+func (s *Server) drainImpl(
+	drainWait time.Duration, cancelWait time.Duration, reporter func(int, string),
+) error {
 	// This anonymous function returns a copy of s.mu.connCancelMap if there are
 	// any active connections to cancel. We will only attempt to cancel
 	// connections that were active at the moment the draining switch happened.
@@ -365,6 +384,10 @@ func (s *Server) drainImpl(drainWait time.Duration, cancelWait time.Duration) er
 	}()
 	if len(connCancelMap) == 0 {
 		return nil
+	}
+	if reporter != nil {
+		// Report progress to the Drain RPC.
+		reporter(len(connCancelMap), "SQL clients")
 	}
 
 	// Spin off a goroutine that waits for all connections to signal that they
@@ -468,9 +491,6 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	connStart := timeutil.Now()
 	if s.connLogEnabled() {
 		s.execCfg.AuthLogger.Logf(ctx, "received connection")
-		telemetry.Inc(sqltelemetry.LoggedConnections)
-	} else {
-		telemetry.Inc(sqltelemetry.UnloggedConnections)
 	}
 	defer func() {
 		// The duration of the session is logged at the end so that the
@@ -489,6 +509,17 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 	version, buf, err := s.readVersion(conn)
 	if err != nil {
 		return err
+	}
+
+	if version == versionCancel {
+		// The cancel message is rather peculiar: it is sent without
+		// authentication, always over an unencrypted channel.
+		//
+		// Since we don't support this, close the door in the client's
+		// face. Make a note of that use in telemetry.
+		telemetry.Inc(sqltelemetry.CancelRequestCounter)
+		_ = conn.Close()
+		return nil
 	}
 
 	// If the server is shutting down, terminate the connection early.
@@ -515,14 +546,6 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, socketType Socket
 
 	// What does the client want to do?
 	switch version {
-	case versionCancel:
-		// If the client is really issuing a cancel request, close the door
-		// in their face (we don't support it yet). Make a note of that use
-		// in telemetry.
-		telemetry.Inc(sqltelemetry.CancelRequestCounter)
-		_ = conn.Close()
-		return nil
-
 	case version30:
 		// Normal SQL connection. Proceed normally below.
 
@@ -646,7 +669,7 @@ func parseClientProvidedSessionParameters(
 	if _, ok := args.SessionDefaults["database"]; !ok {
 		// CockroachDB-specific behavior: if no database is specified,
 		// default to "defaultdb". In PostgreSQL this would be "postgres".
-		args.SessionDefaults["database"] = sessiondata.DefaultDatabaseName
+		args.SessionDefaults["database"] = sqlbase.DefaultDatabaseName
 	}
 
 	return args, nil
@@ -802,5 +825,5 @@ func (s *Server) sendErr(ctx context.Context, conn net.Conn, err error) error {
 }
 
 func newAdminShutdownErr(msg string) error {
-	return pgerror.Newf(pgcode.AdminShutdown, msg)
+	return pgerror.New(pgcode.AdminShutdown, msg)
 }

@@ -78,7 +78,7 @@ func (b *Builder) buildWindow(outScope *scope, inScope *scope) {
 	// relation. Build a projection that produces those values to go underneath
 	// the window functions.
 	// TODO(justin): this is unfortunate in common cases where the arguments are
-	// constant, since we'll be projecting an extra column in every row.  It
+	// constant, since we'll be projecting an extra column in every row. It
 	// would be good if the windower supported being specified with constant
 	// values.
 	for i := range inScope.windows {
@@ -525,7 +525,7 @@ func (b *Builder) replaceDefaultReturn(
 func (b *Builder) overrideDefaultNullValue(agg aggregateInfo) (opt.ScalarExpr, bool) {
 	switch agg.def.Name {
 	case "count", "count_rows":
-		return b.factory.ConstructConst(tree.NewDInt(0)), true
+		return b.factory.ConstructConst(tree.NewDInt(0), types.Int), true
 	default:
 		return nil, false
 	}

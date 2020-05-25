@@ -43,6 +43,10 @@ func ParseAndRequireString(t *types.T, s string, ctx ParseTimeContext) (Datum, e
 			return nil, err
 		}
 		return ParseDIntervalWithTypeMetadata(s, itm)
+	case types.GeographyFamily:
+		return ParseDGeography(s)
+	case types.GeometryFamily:
+		return ParseDGeometry(s)
 	case types.JsonFamily:
 		return ParseDJSON(s)
 	case types.OidFamily:
@@ -60,6 +64,8 @@ func ParseAndRequireString(t *types.T, s string, ctx ParseTimeContext) (Datum, e
 		return ParseDTimestampTZ(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))
 	case types.UuidFamily:
 		return ParseDUuidFromString(s)
+	case types.EnumFamily:
+		return MakeDEnumFromLogicalRepresentation(t, s)
 	default:
 		return nil, errors.AssertionFailedf("unknown type %s (%T)", t, t)
 	}

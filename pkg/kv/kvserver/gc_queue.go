@@ -22,14 +22,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -344,7 +344,7 @@ func makeGCQueueScoreImpl(
 	r.FinalScore = r.FuzzFactor * (valScore + r.IntentScore)
 
 	if probablyLargeAbortSpan(ms) && !r.ShouldQueue &&
-		(r.LikelyLastGC == 0 || r.LikelyLastGC > storagebase.TxnCleanupThreshold) {
+		(r.LikelyLastGC == 0 || r.LikelyLastGC > kvserverbase.TxnCleanupThreshold) {
 		r.ShouldQueue = true
 		r.FinalScore++
 	}
@@ -380,7 +380,7 @@ func (r *replicaGCer) send(ctx context.Context, req roachpb.GCRequest) error {
 	ba.Add(&req)
 
 	if _, pErr := r.repl.Send(ctx, ba); pErr != nil {
-		log.VErrEvent(ctx, 2, pErr.String())
+		log.VErrEventf(ctx, 2, "%v", pErr.String())
 		return pErr.GoError()
 	}
 	return nil
@@ -472,7 +472,7 @@ func (gcq *gcQueue) process(ctx context.Context, repl *Replica, sysCfg *config.S
 							gcq.store.metrics.GCResolveSuccess.Inc(int64(len(intents)))
 						}
 					})
-			if errors.Cause(err) == stop.ErrThrottled {
+			if errors.Is(err, stop.ErrThrottled) {
 				log.Eventf(ctx, "processing txn %s: %s; skipping for future GC", txn.ID.Short(), err)
 				return nil
 			}

@@ -39,7 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -59,8 +59,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -92,10 +92,6 @@ const (
 	// omittedKeyStr is the string returned in place of a key when keys aren't
 	// permitted in responses.
 	omittedKeyStr = "omitted (due to the 'server.remote_debugging.mode' setting)"
-
-	// goroutineDir is the directory name where the goroutinedumper stores
-	// goroutine dumps.
-	goroutinesDir = "goroutine_dump"
 )
 
 var (
@@ -143,8 +139,19 @@ type statusServer struct {
 	stopper                  *stop.Stopper
 	sessionRegistry          *sql.SessionRegistry
 	si                       systemInfoOnce
-	stmtDiagnosticsRequester sql.StmtDiagnosticsRequester
+	stmtDiagnosticsRequester StmtDiagnosticsRequester
 	internalExecutor         *sql.InternalExecutor
+}
+
+// StmtDiagnosticsRequester is the interface into *stmtdiagnostics.Registry
+// used by AdminUI endpoints.
+type StmtDiagnosticsRequester interface {
+
+	// InsertRequest adds an entry to system.statement_diagnostics_requests for
+	// tracing a query with the given fingerprint. Once this returns, calling
+	// shouldCollectDiagnostics() on the current node will return true for the given
+	// fingerprint.
+	InsertRequest(ctx context.Context, fprint string) error
 }
 
 // newStatusServer allocates and returns a statusServer.
@@ -183,6 +190,14 @@ func newStatusServer(
 	}
 
 	return server
+}
+
+// setStmtDiagnosticsRequester is used to provide a StmtDiagnosticsRequester to
+// the status server. This cannot be done at construction time because the
+// implementation of StmtDiagnosticsRequester depends on an executor which in
+// turn depends on the statusServer.
+func (s *statusServer) setStmtDiagnosticsRequester(sr StmtDiagnosticsRequester) {
+	s.stmtDiagnosticsRequester = sr
 }
 
 // RegisterService registers the GRPC service.
@@ -344,7 +359,7 @@ func (s *statusServer) Allocator(
 				func(desc roachpb.RangeDescriptor) (bool, error) {
 					rep, err := store.GetReplica(desc.RangeID)
 					if err != nil {
-						if _, skip := err.(*roachpb.RangeNotFoundError); skip {
+						if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
 							return true, nil // continue
 						}
 						return true, err
@@ -699,11 +714,14 @@ func (s *statusServer) GetFiles(
 	//TODO(ridwanmsharif): Serve logfiles so debug-zip can fetch them
 	// intead of reading indididual entries.
 	case serverpb.FileType_HEAP: // Requesting for saved Heap Profiles.
-		dir = filepath.Join(s.admin.server.cfg.HeapProfileDirName, base.HeapProfileDir)
+		dir = s.admin.server.cfg.HeapProfileDirName
 	case serverpb.FileType_GOROUTINES: // Requesting for saved Goroutine dumps.
-		dir = filepath.Join(s.admin.server.cfg.GoroutineDumpDirName, goroutinesDir)
+		dir = s.admin.server.cfg.GoroutineDumpDirName
 	default:
 		return nil, grpcstatus.Errorf(codes.InvalidArgument, "unknown file type: %s", req.Type)
+	}
+	if dir == "" {
+		return nil, grpcstatus.Errorf(codes.Unimplemented, "dump directory not configured: %s", req.Type)
 	}
 	var resp serverpb.GetFilesResponse
 	for _, pattern := range req.Patterns {
@@ -1020,7 +1038,7 @@ func (s *statusServer) Nodes(
 	b := &kv.Batch{}
 	b.Scan(startKey, endKey)
 	if err := s.db.Run(ctx, b); err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 	rows := b.Results[0].Rows
@@ -1030,7 +1048,7 @@ func (s *statusServer) Nodes(
 	}
 	for i, row := range rows {
 		if err := row.ValueProto(&resp.Nodes[i]); err != nil {
-			log.Error(ctx, err)
+			log.Errorf(ctx, "%v", err)
 			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 		}
 	}
@@ -1056,7 +1074,7 @@ func (s *statusServer) nodesStatusWithLiveness(
 	for _, node := range nodes.Nodes {
 		nodeID := node.Desc.NodeID
 		livenessStatus := statusMap[nodeID]
-		if livenessStatus == storagepb.NodeLivenessStatus_DECOMMISSIONED {
+		if livenessStatus == kvserverpb.NodeLivenessStatus_DECOMMISSIONED {
 			// Skip over removed nodes.
 			continue
 		}
@@ -1071,7 +1089,7 @@ func (s *statusServer) nodesStatusWithLiveness(
 // nodeStatusWithLiveness combines a NodeStatus with a NodeLivenessStatus.
 type nodeStatusWithLiveness struct {
 	statuspb.NodeStatus
-	livenessStatus storagepb.NodeLivenessStatus
+	livenessStatus kvserverpb.NodeLivenessStatus
 }
 
 // handleNodeStatus handles GET requests for a single node's status.
@@ -1089,14 +1107,14 @@ func (s *statusServer) Node(
 	b := &kv.Batch{}
 	b.Get(key)
 	if err := s.db.Run(ctx, b); err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 
 	var nodeStatus statuspb.NodeStatus
 	if err := b.Results[0].Rows[0].ValueProto(&nodeStatus); err != nil {
 		err = errors.Errorf("could not unmarshal NodeStatus from %s: %s", key, err)
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 	}
 	return &nodeStatus, nil
@@ -1221,7 +1239,7 @@ func (s *statusServer) handleVars(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(httputil.ContentTypeHeader, httputil.PlaintextContentType)
 	err := s.metricSource.PrintAsText(w)
 	if err != nil {
-		log.Error(r.Context(), err)
+		log.Errorf(r.Context(), "%v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 	telemetry.Inc(telemetryPrometheusVars)
@@ -1345,10 +1363,10 @@ func (s *statusServer) Ranges(
 			// Use IterateRangeDescriptors to read from the engine only
 			// because it's already exported.
 			err := kvserver.IterateRangeDescriptors(ctx, store.Engine(),
-				func(desc roachpb.RangeDescriptor) (bool, error) {
+				func(desc roachpb.RangeDescriptor) (done bool, _ error) {
 					rep, err := store.GetReplica(desc.RangeID)
-					if _, skip := err.(*roachpb.RangeNotFoundError); skip {
-						return true, nil // continue
+					if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+						return false, nil // continue
 					}
 					if err != nil {
 						return true, err
@@ -2023,7 +2041,7 @@ func (s *statusServer) JobRegistryStatus(
 	resp := &serverpb.JobRegistryStatusResponse{
 		NodeID: remoteNodeID,
 	}
-	for _, jID := range s.admin.server.jobRegistry.CurrentlyRunningJobs() {
+	for _, jID := range s.admin.server.sqlServer.jobRegistry.CurrentlyRunningJobs() {
 		job := serverpb.JobRegistryStatusResponse_Job{
 			Id: jID,
 		}
@@ -2043,7 +2061,7 @@ func (s *statusServer) JobStatus(
 
 	ctx = s.AnnotateCtx(propagateGatewayMetadata(ctx))
 
-	j, err := s.admin.server.jobRegistry.LoadJob(ctx, req.JobId)
+	j, err := s.admin.server.sqlServer.jobRegistry.LoadJob(ctx, req.JobId)
 	if err != nil {
 		return nil, err
 	}

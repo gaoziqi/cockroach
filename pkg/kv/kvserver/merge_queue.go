@@ -19,14 +19,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -125,7 +125,7 @@ func newMergeQueue(store *Store, db *kv.DB, gossip *gossip.Gossip) *mergeQueue {
 
 func (mq *mergeQueue) enabled() bool {
 	st := mq.store.ClusterSettings()
-	return storagebase.MergeQueueEnabled.Get(&st.SV)
+	return kvserverbase.MergeQueueEnabled.Get(&st.SV)
 }
 
 func (mq *mergeQueue) shouldQueue(
@@ -245,7 +245,9 @@ func (mq *mergeQueue) process(
 	// in a situation where we keep merging ranges that would be split soon after
 	// by a small increase in load.
 	conservativeLoadBasedSplitThreshold := 0.5 * lhsRepl.SplitByLoadQPSThreshold()
-	if ok, _ := shouldSplitRange(mergedDesc, mergedStats, lhsRepl.GetMaxBytes(), sysCfg); ok || mergedQPS >= conservativeLoadBasedSplitThreshold {
+	shouldSplit, _ := shouldSplitRange(mergedDesc, mergedStats,
+		lhsRepl.GetMaxBytes(), lhsRepl.shouldBackpressureWrites(), sysCfg)
+	if shouldSplit || mergedQPS >= conservativeLoadBasedSplitThreshold {
 		log.VEventf(ctx, 2,
 			"skipping merge to avoid thrashing: merged range %s may split "+
 				"(estimated size, estimated QPS: %d, %v)",
@@ -324,23 +326,21 @@ func (mq *mergeQueue) process(
 	_, pErr := lhsRepl.AdminMerge(ctx, roachpb.AdminMergeRequest{
 		RequestHeader: roachpb.RequestHeader{Key: lhsRepl.Desc().StartKey.AsRawKey()},
 	}, reason)
-	switch err := pErr.GoError(); err.(type) {
-	case nil:
-	case *roachpb.ConditionFailedError:
+	if err := pErr.GoError(); errors.HasType(err, (*roachpb.ConditionFailedError)(nil)) {
 		// ConditionFailedErrors are an expected outcome for range merge
 		// attempts because merges can race with other descriptor modifications.
 		// On seeing a ConditionFailedError, don't return an error and enqueue
 		// this replica again in case it still needs to be merged.
 		log.Infof(ctx, "merge saw concurrent descriptor modification; maybe retrying")
 		mq.MaybeAddAsync(ctx, lhsRepl, now)
-	default:
+	} else if err != nil {
 		// While range merges are unstable, be extra cautious and mark every error
 		// as purgatory-worthy.
 		return rangeMergePurgatoryError{err}
 	}
 	if testingAggressiveConsistencyChecks {
 		if err := mq.store.consistencyQueue.process(ctx, lhsRepl, sysCfg); err != nil {
-			log.Warning(ctx, err)
+			log.Warningf(ctx, "%v", err)
 		}
 	}
 	return nil

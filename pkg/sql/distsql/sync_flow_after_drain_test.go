@@ -31,7 +31,7 @@ import (
 func TestSyncFlowAfterDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	// We'll create a server just so that we can extract its distsql ServerConfig,
 	// so we can use it for a manually-built DistSQL Server below. Otherwise, too
 	// much work to create that ServerConfig by hand.
@@ -40,7 +40,8 @@ func TestSyncFlowAfterDrain(t *testing.T) {
 	cfg := s.DistSQLServer().(*ServerImpl).ServerConfig
 
 	distSQLSrv := NewServer(ctx, cfg)
-	distSQLSrv.flowRegistry.Drain(time.Duration(0) /* flowDrainWait */, time.Duration(0) /* minFlowDrainWait */)
+	distSQLSrv.flowRegistry.Drain(
+		time.Duration(0) /* flowDrainWait */, time.Duration(0) /* minFlowDrainWait */, nil /* reporter */)
 
 	// We create some flow; it doesn't matter what.
 	req := execinfrapb.SetupFlowRequest{Version: execinfra.Version}
@@ -67,7 +68,7 @@ func TestSyncFlowAfterDrain(t *testing.T) {
 		},
 	}
 
-	types := make([]types.T, 0)
+	types := make([]*types.T, 0)
 	rb := distsqlutils.NewRowBuffer(types, nil /* rows */, distsqlutils.RowBufferArgs{})
 	ctx, flow, err := distSQLSrv.SetupSyncFlow(ctx, &distSQLSrv.memMonitor, &req, rb)
 	if err != nil {
