@@ -208,20 +208,20 @@ func importPlanHook(
 		return nil, nil, nil, false, errors.Errorf("IMPORT requires a cluster fully upgraded to version >= 19.2")
 	}
 
-	filesFn, err := p.TypeAsStringArray(importStmt.Files, "IMPORT")
+	filesFn, err := p.TypeAsStringArray(ctx, importStmt.Files, "IMPORT")
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
 
 	var createFileFn func() (string, error)
 	if !importStmt.Bundle && !importStmt.Into && importStmt.CreateDefs == nil {
-		createFileFn, err = p.TypeAsString(importStmt.CreateFile, "IMPORT")
+		createFileFn, err = p.TypeAsString(ctx, importStmt.CreateFile, "IMPORT")
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
 	}
 
-	optsFn, err := p.TypeAsStringOpts(importStmt.Options, importOptionExpectValues)
+	optsFn, err := p.TypeAsStringOpts(ctx, importStmt.Options, importOptionExpectValues)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -282,7 +282,7 @@ func importPlanHook(
 			//  UnresolvedObjectNames here, rather than TableNames.
 			// We have a target table, so it might specify a DB in its name.
 			un := table.ToUnresolvedObjectName()
-			found, prefix, descI, err := tree.ResolveTarget(ctx,
+			found, prefix, dbDescI, err := tree.ResolveTarget(ctx,
 				un, p, p.SessionData().Database, p.SessionData().SearchPath)
 			if err != nil {
 				return pgerror.Wrap(err, pgcode.UndefinedTable,
@@ -295,7 +295,7 @@ func importPlanHook(
 				return pgerror.Newf(pgcode.UndefinedObject,
 					"database does not exist: %q", table)
 			}
-			dbDesc := descI.(*sqlbase.DatabaseDescriptor)
+			dbDesc := dbDescI.(*sqlbase.ImmutableDatabaseDescriptor)
 			// If this is a non-INTO import that will thus be making a new table, we
 			// need the CREATE priv in the target DB.
 			if !importStmt.Into {
@@ -303,7 +303,7 @@ func importPlanHook(
 					return err
 				}
 			}
-			parentID = dbDesc.ID
+			parentID = dbDesc.GetID()
 		} else {
 			// No target table means we're importing whatever we find into the session
 			// database, so it must exist.
@@ -319,7 +319,7 @@ func importPlanHook(
 					return err
 				}
 			}
-			parentID = dbDesc.ID
+			parentID = dbDesc.GetID()
 		}
 
 		format := roachpb.IOFileFormat{}
@@ -672,9 +672,8 @@ func importPlanHook(
 						)
 					}
 				}
-
 				tbl, err := MakeSimpleTableDescriptor(
-					ctx, p.ExecCfg().Settings, create, parentID, defaultCSVTableID, NoFKs, walltime)
+					ctx, p.SemaCtx(), p.ExecCfg().Settings, create, parentID, defaultCSVTableID, NoFKs, walltime)
 				if err != nil {
 					return err
 				}
@@ -855,12 +854,14 @@ func prepareNewTableDescsForIngestion(
 	ctx context.Context,
 	txn *kv.Txn,
 	p sql.PlanHookState,
-	tables []jobspb.ImportDetails_Table,
+	importTables []jobspb.ImportDetails_Table,
 	parentID sqlbase.ID,
 ) ([]*sqlbase.TableDescriptor, error) {
 	var tableDescs []*sqlbase.TableDescriptor
-	for _, i := range tables {
-		if err := backupccl.CheckTableExists(ctx, txn, p.ExecCfg().Codec, parentID, i.Desc.Name); err != nil {
+	for _, i := range importTables {
+		// TODO (rohany): Use keys.PublicSchemaID for now, revisit this once we
+		//  support user defined schemas.
+		if err := backupccl.CheckObjectExists(ctx, txn, p.ExecCfg().Codec, parentID, keys.PublicSchemaID, i.Desc.Name); err != nil {
 			return nil, err
 		}
 		tableDescs = append(tableDescs, i.Desc)
@@ -870,15 +871,15 @@ func prepareNewTableDescsForIngestion(
 	// restoring. We do this last because we want to avoid calling
 	// GenerateUniqueDescID if there's any kind of error above.
 	// Reserving a table ID now means we can avoid the rekey work during restore.
-	tableRewrites := make(backupccl.TableRewriteMap)
-	seqVals := make(map[sqlbase.ID]int64, len(tables))
-	for _, tableDesc := range tables {
+	tableRewrites := make(backupccl.DescRewriteMap)
+	seqVals := make(map[sqlbase.ID]int64, len(importTables))
+	for _, tableDesc := range importTables {
 		id, err := catalogkv.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
 		if err != nil {
 			return nil, err
 		}
-		tableRewrites[tableDesc.Desc.ID] = &jobspb.RestoreDetails_TableRewrite{
-			TableID:  id,
+		tableRewrites[tableDesc.Desc.ID] = &jobspb.RestoreDetails_DescriptorRewrite{
+			ID:       id,
 			ParentID: parentID,
 		}
 		seqVals[id] = tableDesc.SeqVal
@@ -888,16 +889,18 @@ func prepareNewTableDescsForIngestion(
 		return nil, err
 	}
 
+	tables := make([]sqlbase.TableDescriptorInterface, len(tableDescs))
 	for i := range tableDescs {
 		tableDescs[i].State = sqlbase.TableDescriptor_OFFLINE
 		tableDescs[i].OfflineReason = "importing"
-
+		tables[i] = sqlbase.NewMutableCreatedTableDescriptor(*tableDescs[i])
 	}
 
 	var seqValKVs []roachpb.KeyValue
-	for i := range tableDescs {
-		if v, ok := seqVals[tableDescs[i].ID]; ok && v != 0 {
-			key, val, err := sql.MakeSequenceKeyVal(p.ExecCfg().Codec, tableDescs[i], v, false)
+	for i := range tables {
+		tableDesc := tables[i].TableDesc()
+		if v, ok := seqVals[tables[i].GetID()]; ok && v != 0 {
+			key, val, err := sql.MakeSequenceKeyVal(p.ExecCfg().Codec, tableDesc, v, false)
 			if err != nil {
 				return nil, err
 			}
@@ -910,8 +913,8 @@ func prepareNewTableDescsForIngestion(
 	// Write the new TableDescriptors and flip the namespace entries over to
 	// them. After this call, any queries on a table will be served by the newly
 	// imported data.
-	if err := backupccl.WriteTableDescs(ctx, txn, nil /* databases */, tableDescs, tree.RequestedDescriptors, p.ExecCfg().Settings, seqValKVs); err != nil {
-		return nil, errors.Wrapf(err, "creating tables")
+	if err := backupccl.WriteDescriptors(ctx, txn, nil /* databases */, tables, nil, tree.RequestedDescriptors, p.ExecCfg().Settings, seqValKVs); err != nil {
+		return nil, errors.Wrapf(err, "creating importTables")
 	}
 
 	return tableDescs, nil
@@ -926,7 +929,7 @@ func prepareExistingTableDescForIngestion(
 	}
 
 	// TODO(dt): Ensure no other schema changes can start during ingest.
-	importing := *desc
+	importing := sqlbase.NewMutableExistingTableDescriptor(*desc)
 	importing.Version++
 	// Take the table offline for import.
 	// TODO(dt): audit everywhere we get table descs (leases or otherwise) to
@@ -949,13 +952,13 @@ func prepareExistingTableDescForIngestion(
 	}
 	err = txn.CPut(ctx,
 		sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.ID),
-		sqlbase.WrapDescriptor(&importing),
+		importing.DescriptorProto(),
 		existingDesc)
 	if err != nil {
 		return nil, errors.Wrap(err, "another operation is currently operating on the table")
 	}
 
-	return &importing, nil
+	return importing.TableDesc(), nil
 	// NB: we need to wait for the schema change to show up before it is safe
 	// to ingest, but rather than do that here, we'll wait for this schema
 	// change in the job's Resume hook, before running the ingest phase. That
@@ -1185,7 +1188,7 @@ func (r *importResumer) publishTables(ctx context.Context, execCfg *sql.Executor
 		}
 		b := txn.NewBatch()
 		for _, tbl := range details.Tables {
-			tableDesc := *tbl.Desc
+			tableDesc := sqlbase.NewMutableExistingTableDescriptor(*tbl.Desc)
 			tableDesc.Version++
 			tableDesc.State = sqlbase.TableDescriptor_PUBLIC
 
@@ -1225,7 +1228,7 @@ func (r *importResumer) publishTables(ctx context.Context, execCfg *sql.Executor
 			}
 			b.CPut(
 				sqlbase.MakeDescMetadataKey(execCfg.Codec, tableDesc.ID),
-				sqlbase.WrapDescriptor(&tableDesc),
+				tableDesc.DescriptorProto(),
 				existingDesc)
 		}
 		if err := txn.Run(ctx, b); err != nil {
@@ -1339,7 +1342,7 @@ func (r *importResumer) dropTables(
 	dropTime := int64(1)
 	tablesToGC := make([]sqlbase.ID, 0, len(details.Tables))
 	for _, tbl := range details.Tables {
-		tableDesc := *tbl.Desc
+		tableDesc := sqlbase.NewMutableExistingTableDescriptor(*tbl.Desc)
 		tableDesc.Version++
 		if tbl.IsNew {
 			tableDesc.State = sqlbase.TableDescriptor_DROP
@@ -1368,7 +1371,7 @@ func (r *importResumer) dropTables(
 		}
 		b.CPut(
 			sqlbase.MakeDescMetadataKey(execCfg.Codec, tableDesc.ID),
-			sqlbase.WrapDescriptor(&tableDesc),
+			tableDesc.DescriptorProto(),
 			existingDesc)
 	}
 

@@ -20,34 +20,12 @@
 package colexec
 
 import (
-	"bytes"
-	"math"
-
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
-	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-// Remove unused warning.
-var _ = execgen.UNSAFEGET
-
 // {{/*
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
-
-// Dummy import to pull in "typeconv" package.
-var _ = typeconv.DatumVecCanonicalTypeFamily
 
 // _LEFT_CANONICAL_TYPE_FAMILY is the template variable.
 const _LEFT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
@@ -60,9 +38,6 @@ const _RIGHT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
 
 // _RIGHT_TYPE_WIDTH is the template variable.
 const _RIGHT_TYPE_WIDTH = 0
-
-// Dummy import to pull in "coldataext" package.
-var _ coldataext.Datum
 
 // _ASSIGN_NE is the template equality function for assigning the first input
 // to the result of the the second input != the third input.
@@ -239,8 +214,8 @@ func _CHECK_COL_FUNCTION_TEMPLATE(_PROBING_AGAINST_ITSELF bool, _DELETING_PROBE_
 	// {{$deletingProbeMode := .DeletingProbeMode}}
 	// {{with .Global}}
 	// In order to inline the templated code of overloads, we need to have a
-	// `decimalScratch` local variable of type `decimalOverloadScratch`.
-	decimalScratch := ht.decimalScratch
+	// `_overloadHelper` local variable of type `overloadHelper`.
+	_overloadHelper := ht.overloadHelper
 	switch probeVec.CanonicalTypeFamily() {
 	// {{range .LeftFamilies}}
 	case _LEFT_CANONICAL_TYPE_FAMILY:

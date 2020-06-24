@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2/google"
@@ -62,7 +63,7 @@ func storeFromURI(
 		t.Fatal(err)
 	}
 	// Setup a sink for the given args.
-	s, err := MakeExternalStorage(ctx, conf, base.ExternalIOConfig{}, testSettings, clientFactory)
+	s, err := MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, testSettings, clientFactory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,11 +71,11 @@ func storeFromURI(
 }
 
 func testExportStore(t *testing.T, storeURI string, skipSingleFile bool) {
-	testExportStoreWithExternalIOConfig(t, base.ExternalIOConfig{}, storeURI, skipSingleFile)
+	testExportStoreWithExternalIOConfig(t, base.ExternalIODirConfig{}, storeURI, skipSingleFile)
 }
 
 func testExportStoreWithExternalIOConfig(
-	t *testing.T, ioConf base.ExternalIOConfig, storeURI string, skipSingleFile bool,
+	t *testing.T, ioConf base.ExternalIODirConfig, storeURI string, skipSingleFile bool,
 ) {
 	ctx := context.Background()
 
@@ -125,9 +126,8 @@ func testExportStoreWithExternalIOConfig(
 			if !bytes.Equal(res, payload) {
 				t.Fatalf("got %v expected %v", res, payload)
 			}
-			if err := s.Delete(ctx, name); err != nil {
-				t.Fatal(err)
-			}
+
+			require.NoError(t, s.Delete(ctx, name))
 		}
 	})
 
@@ -160,9 +160,7 @@ func testExportStoreWithExternalIOConfig(
 		if !bytes.Equal(content, testingContent) {
 			t.Fatalf("wrong content")
 		}
-		if err := s.Delete(ctx, testingFilename); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, s.Delete(ctx, testingFilename))
 	})
 	if skipSingleFile {
 		return
@@ -188,9 +186,7 @@ func testExportStoreWithExternalIOConfig(
 		if !bytes.Equal(content, []byte("aaa")) {
 			t.Fatalf("wrong content")
 		}
-		if err := s.Delete(ctx, testingFilename); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, s.Delete(ctx, testingFilename))
 	})
 	t.Run("write-single-file-by-uri", func(t *testing.T) {
 		const testingFilename = "B"
@@ -214,9 +210,40 @@ func testExportStoreWithExternalIOConfig(
 		if !bytes.Equal(content, []byte("bbb")) {
 			t.Fatalf("wrong content")
 		}
-		if err := s.Delete(ctx, testingFilename); err != nil {
+
+		require.NoError(t, s.Delete(ctx, testingFilename))
+	})
+	// This test ensures that the ReadFile method of the ExternalStorage interface
+	// raises a sentinel error indicating that a requested bucket/key/file/object
+	// (based on the storage system) could not be found.
+	t.Run("file-does-not-exist", func(t *testing.T) {
+		const testingFilename = "A"
+		if err := s.WriteFile(ctx, testingFilename, bytes.NewReader([]byte("aaa"))); err != nil {
 			t.Fatal(err)
 		}
+		singleFile := storeFromURI(ctx, t, storeURI, clientFactory)
+		defer singleFile.Close()
+
+		// Read a valid file.
+		res, err := singleFile.ReadFile(ctx, testingFilename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Close()
+		content, err := ioutil.ReadAll(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Verify the result contains what we wrote.
+		if !bytes.Equal(content, []byte("aaa")) {
+			t.Fatalf("wrong content")
+		}
+
+		// Attempt to read a file which does not exist.
+		_, err = singleFile.ReadFile(ctx, "file_does_not_exist")
+		require.Error(t, err)
+		require.True(t, errors.Is(err, ErrFileDoesNotExist), "Expected a file does not exist error but returned %s")
+		require.NoError(t, s.Delete(ctx, testingFilename))
 	})
 }
 
@@ -476,7 +503,7 @@ func TestWorkloadStorage(t *testing.T) {
 
 	{
 		s, err := ExternalStorageFromURI(
-			ctx, bankURL().String(), base.ExternalIOConfig{},
+			ctx, bankURL().String(), base.ExternalIODirConfig{},
 			settings, blobs.TestEmptyBlobClientFactory,
 		)
 		require.NoError(t, err)
@@ -496,7 +523,7 @@ func TestWorkloadStorage(t *testing.T) {
 		params := map[string]string{
 			`row-start`: `1`, `row-end`: `3`, `payload-bytes`: `14`, `batch-size`: `1`}
 		s, err := ExternalStorageFromURI(
-			ctx, bankURL(params).String(), base.ExternalIOConfig{},
+			ctx, bankURL(params).String(), base.ExternalIODirConfig{},
 			settings, blobs.TestEmptyBlobClientFactory,
 		)
 		require.NoError(t, err)
@@ -511,32 +538,32 @@ func TestWorkloadStorage(t *testing.T) {
 	}
 
 	_, err := ExternalStorageFromURI(
-		ctx, `workload:///nope`, base.ExternalIOConfig{},
+		ctx, `workload:///nope`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `path must be of the form /<format>/<generator>/<table>: /nope`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///fmt/bank/bank?version=`, base.ExternalIOConfig{},
+		ctx, `workload:///fmt/bank/bank?version=`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `unsupported format: fmt`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///csv/nope/nope?version=`, base.ExternalIOConfig{},
+		ctx, `workload:///csv/nope/nope?version=`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `unknown generator: nope`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///csv/bank/bank`, base.ExternalIOConfig{},
+		ctx, `workload:///csv/bank/bank`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `parameter version is required`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///csv/bank/bank?version=`, base.ExternalIOConfig{},
+		ctx, `workload:///csv/bank/bank?version=`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `expected bank version "" but got "1.0.0"`)
 	_, err = ExternalStorageFromURI(
-		ctx, `workload:///csv/bank/bank?version=nope`, base.ExternalIOConfig{},
+		ctx, `workload:///csv/bank/bank?version=nope`, base.ExternalIODirConfig{},
 		settings, blobs.TestEmptyBlobClientFactory,
 	)
 	require.EqualError(t, err, `expected bank version "nope" but got "1.0.0"`)

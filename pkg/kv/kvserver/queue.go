@@ -65,12 +65,13 @@ func defaultProcessTimeoutFunc(cs *cluster.Settings, _ replicaInQueue) time.Dura
 	return queueGuaranteedProcessingTimeBudget.Get(&cs.SV)
 }
 
-// The queues which send snapshots while processing should have a timeout which
+// The queues which traverse through the data in the range (i.e. send a snapshot
+// or calculate a range checksum) while processing should have a timeout which
 // is a function of the size of the range and the maximum allowed rate of data
 // transfer that adheres to a minimum timeout specified in a cluster setting.
 //
 // The parameter controls which rate to use.
-func makeQueueSnapshotTimeoutFunc(rateSetting *settings.ByteSizeSetting) queueProcessTimeoutFunc {
+func makeRateLimitedTimeoutFunc(rateSetting *settings.ByteSizeSetting) queueProcessTimeoutFunc {
 	return func(cs *cluster.Settings, r replicaInQueue) time.Duration {
 		minimumTimeout := queueGuaranteedProcessingTimeBudget.Get(&cs.SV)
 		// NB: In production code this will type assertion will always succeed.
@@ -84,7 +85,7 @@ func makeQueueSnapshotTimeoutFunc(rateSetting *settings.ByteSizeSetting) queuePr
 		stats := repl.GetMVCCStats()
 		totalBytes := stats.KeyBytes + stats.ValBytes + stats.IntentBytes + stats.SysBytes
 		estimatedDuration := time.Duration(totalBytes/snapshotRate) * time.Second
-		timeout := estimatedDuration * permittedSnapshotSlowdown
+		timeout := estimatedDuration * permittedRangeScanSlowdown
 		if timeout < minimumTimeout {
 			timeout = minimumTimeout
 		}
@@ -92,10 +93,10 @@ func makeQueueSnapshotTimeoutFunc(rateSetting *settings.ByteSizeSetting) queuePr
 	}
 }
 
-// permittedSnapshotSlowdown is the factor of the above the estimated duration
-// for a snapshot given the configured snapshot rate which we use to configure
-// the snapshot's timeout.
-const permittedSnapshotSlowdown = 10
+// permittedRangeScanSlowdown is the factor of the above the estimated duration
+// for a range scan given the configured rate which we use to configure
+// the operations's timeout.
+const permittedRangeScanSlowdown = 10
 
 // a purgatoryError indicates a replica processing failure which indicates
 // the replica can be placed into purgatory for faster retries when the
@@ -628,7 +629,7 @@ func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.
 		repl.maybeInitializeRaftGroup(ctx)
 	}
 
-	if cfg != nil && bq.requiresSplit(cfg, repl) {
+	if cfg != nil && bq.requiresSplit(ctx, cfg, repl) {
 		// Range needs to be split due to zone configs, but queue does
 		// not accept unsplit ranges.
 		if log.V(1) {
@@ -661,12 +662,14 @@ func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.
 	}
 }
 
-func (bq *baseQueue) requiresSplit(cfg *config.SystemConfig, repl replicaInQueue) bool {
+func (bq *baseQueue) requiresSplit(
+	ctx context.Context, cfg *config.SystemConfig, repl replicaInQueue,
+) bool {
 	if bq.acceptsUnsplitRanges {
 		return false
 	}
 	desc := repl.Desc()
-	return cfg.NeedsSplit(desc.StartKey, desc.EndKey)
+	return cfg.NeedsSplit(ctx, desc.StartKey, desc.EndKey)
 }
 
 // addInternal adds the replica the queue with specified priority. If
@@ -900,7 +903,7 @@ func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) er
 		}
 	}
 
-	if cfg != nil && bq.requiresSplit(cfg, repl) {
+	if cfg != nil && bq.requiresSplit(ctx, cfg, repl) {
 		// Range needs to be split due to zone configs, but queue does
 		// not accept unsplit ranges.
 		log.VEventf(ctx, 3, "split needed; skipping")

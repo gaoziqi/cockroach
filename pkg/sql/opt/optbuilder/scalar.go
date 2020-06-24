@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -27,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
 )
 
@@ -133,11 +135,6 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructCollate(in, t.Locale)
 
 	case *tree.ArrayFlatten:
-		if b.AllowUnsupportedExpr {
-			out = b.factory.ConstructUnsupportedExpr(t)
-			break
-		}
-
 		s := t.Subquery.(*subquery)
 
 		inCol := s.cols[0].id
@@ -426,11 +423,7 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructConstVal(t, t.ResolvedType())
 
 	default:
-		if b.AllowUnsupportedExpr {
-			out = b.factory.ConstructUnsupportedExpr(scalar)
-		} else {
-			panic(unimplemented.Newf(fmt.Sprintf("optbuilder.%T", scalar), "not yet implemented: scalar expression: %T", scalar))
-		}
+		panic(unimplemented.Newf(fmt.Sprintf("optbuilder.%T", scalar), "not yet implemented: scalar expression: %T", scalar))
 	}
 
 	return b.finishBuildScalar(scalar, out, inScope, outScope, outCol)
@@ -507,6 +500,22 @@ func (b *Builder) buildFunction(
 
 	if isGenerator(def) {
 		return b.finishBuildGeneratorFunction(f, out, inScope, outScope, outCol)
+	}
+
+	// Add a dependency on sequences that are used as a string argument.
+	if b.trackViewDeps {
+		name, err := sequence.GetSequenceFromFunc(f)
+		if err != nil {
+			panic(err)
+		}
+		if name != nil {
+			tn := tree.MakeUnqualifiedTableName(tree.Name(*name))
+			ds, _ := b.resolveDataSource(&tn, privilege.SELECT)
+
+			b.viewDeps = append(b.viewDeps, opt.ViewDep{
+				DataSource: ds,
+			})
+		}
 	}
 
 	return b.finishBuildScalar(f, out, inScope, outScope, outCol)

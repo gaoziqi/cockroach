@@ -57,12 +57,6 @@ type FunctionProperties struct {
 	// be NULL and should act accordingly.
 	NullableArgs bool
 
-	// NeedsRepeatedEvaluation is set to true when a function may change
-	// at every row whether or not it is applied to an expression that
-	// contains row-dependent variables. Used e.g. by `random` and
-	// aggregate functions.
-	NeedsRepeatedEvaluation bool
-
 	// Impure is set to true when a function potentially returns a
 	// different value when called in the same statement with the same
 	// parameters. e.g.: random(), clock_timestamp(). Some functions
@@ -71,15 +65,15 @@ type FunctionProperties struct {
 	// as impure.
 	Impure bool
 
-	// DistsqlBlacklist is set to true when a function depends on
+	// DistsqlBlocklist is set to true when a function depends on
 	// members of the EvalContext that are not marshaled by DistSQL
 	// (e.g. planner). Currently used for DistSQL to determine if
 	// expressions can be evaluated on a different node without sending
 	// over the EvalContext.
 	//
 	// TODO(andrei): Get rid of the planner from the EvalContext and then we can
-	// get rid of this blacklist.
-	DistsqlBlacklist bool
+	// get rid of this blocklist.
+	DistsqlBlocklist bool
 
 	// Class is the kind of built-in function (normal/aggregate/window/etc.)
 	Class FunctionClass
@@ -102,6 +96,13 @@ type FunctionProperties struct {
 	// the Postgres ones at test time.
 	// This should be used with caution.
 	IgnoreVolatilityCheck bool
+
+	// HasSequenceArguments is true if the builtin function takes in a sequence
+	// name (string) and can be used in a scalar expression.
+	// TODO(richardjcai): When implicit casting is supported, these builtins
+	// should take RegClass as the arg type for the sequence name instead of
+	// string, we will add a dependency on all RegClass types used in a view.
+	HasSequenceArguments bool
 }
 
 // ShouldDocument returns whether the built-in function should be included in

@@ -1,3 +1,4 @@
+# LogicTest: !3node-tenant(49854)
 query T
 SHOW DATABASES
 ----
@@ -26,6 +27,7 @@ public  replication_stats                table
 public  reports_meta                     table
 public  role_members                     table
 public  role_options                     table
+public  scheduled_jobs                   table
 public  settings                         table
 public  statement_bundle_chunks          table
 public  statement_diagnostics            table
@@ -68,6 +70,7 @@ SELECT id FROM system.descriptor
 34
 35
 36
+37
 50
 51
 52
@@ -137,11 +140,13 @@ lastUpdated  TIMESTAMP  false  NULL  ·  {}         false
 query TTBTTTB
 SHOW COLUMNS FROM system.jobs
 ----
-id        INT8       false  unique_rowid()     ·  {primary,jobs_status_created_idx}  false
-status    STRING     false  NULL               ·  {jobs_status_created_idx}          false
-created   TIMESTAMP  false  now():::TIMESTAMP  ·  {jobs_status_created_idx}          false
-payload   BYTES      false  NULL               ·  {}                                 false
-progress  BYTES      true   NULL               ·  {}                                 false
+id               INT8       false  unique_rowid()     ·  {primary,jobs_status_created_idx,jobs_created_by_type_created_by_id_idx}  false
+status           STRING     false  NULL               ·  {jobs_status_created_idx,jobs_created_by_type_created_by_id_idx}          false
+created          TIMESTAMP  false  now():::TIMESTAMP  ·  {jobs_status_created_idx}                                                 false
+payload          BYTES      false  NULL               ·  {}                                                                        false
+progress         BYTES      true   NULL               ·  {}                                                                        false
+created_by_type  STRING     true   NULL               ·  {jobs_created_by_type_created_by_id_idx}                                  false
+created_by_id    INT8       true   NULL               ·  {jobs_created_by_type_created_by_id_idx}                                  false
 
 query TTBTTTB
 SHOW COLUMNS FROM system.settings
@@ -328,6 +333,16 @@ system  public  role_options                     root    GRANT
 system  public  role_options                     root    INSERT
 system  public  role_options                     root    SELECT
 system  public  role_options                     root    UPDATE
+system  public  scheduled_jobs                   admin   DELETE
+system  public  scheduled_jobs                   admin   GRANT
+system  public  scheduled_jobs                   admin   INSERT
+system  public  scheduled_jobs                   admin   SELECT
+system  public  scheduled_jobs                   admin   UPDATE
+system  public  scheduled_jobs                   root    DELETE
+system  public  scheduled_jobs                   root    GRANT
+system  public  scheduled_jobs                   root    INSERT
+system  public  scheduled_jobs                   root    SELECT
+system  public  scheduled_jobs                   root    UPDATE
 system  public  settings                         admin   DELETE
 system  public  settings                         admin   GRANT
 system  public  settings                         admin   INSERT

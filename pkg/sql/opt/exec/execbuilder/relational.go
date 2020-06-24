@@ -489,6 +489,11 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		locking = forUpdateLocking
 	}
 
+	// TODO(rytaft): Add support for inverted constraints.
+	if scan.InvertedConstraint != nil {
+		return execPlan{}, errors.Errorf("Geospatial constrained scans are not yet supported")
+	}
+
 	root, err := b.factory.ConstructScan(
 		tab,
 		tab.Index(scan.Index),
@@ -1333,10 +1338,6 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 
 	tab := md.Table(join.Table)
 	idx := tab.Index(join.Index)
-	var eqCols opt.ColSet
-	for i := range join.KeyCols {
-		eqCols.Add(join.Table.ColumnID(idx.Column(i).Ordinal))
-	}
 
 	res.root, err = b.factory.ConstructLookupJoin(
 		joinOpToJoinType(join.JoinType),

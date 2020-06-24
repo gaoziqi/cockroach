@@ -185,7 +185,8 @@ type T struct {
 // UserDefinedTypeMetadata contains metadata needed for runtime
 // operations on user defined types. The metadata must be read only.
 type UserDefinedTypeMetadata struct {
-	Name UserDefinedTypeName
+	// Name is the resolved name of this type.
+	Name *UserDefinedTypeName
 
 	// enumData is non-nil iff the metadata is for an ENUM type.
 	EnumData *EnumMetadata
@@ -212,13 +213,40 @@ func (e *EnumMetadata) debugString() string {
 	)
 }
 
-// UserDefinedTypeName is an interface for the types package to manipulate
-// qualified type names from higher level packages for name display.
-type UserDefinedTypeName interface {
-	// Basename returns the unqualified name of the type.
-	Basename() string
-	// FQName returns the fully qualified name of the type.
-	FQName() string
+// UserDefinedTypeName is a struct representing a qualified user defined
+// type name. We redefine a common struct from higher level packages. We
+// do so because proto will panic if any members of a proto struct are
+// private. Rather than expose private members of higher level packages,
+// we define a separate type here to be safe.
+type UserDefinedTypeName struct {
+	Catalog string
+	Schema  string
+	Name    string
+}
+
+// MakeUserDefinedTypeName creates a user defined type name.
+func MakeUserDefinedTypeName(catalog, schema, name string) *UserDefinedTypeName {
+	return &UserDefinedTypeName{
+		Catalog: catalog,
+		Schema:  schema,
+		Name:    name,
+	}
+}
+
+// Basename returns the unqualified name.
+func (u UserDefinedTypeName) Basename() string {
+	return u.Name
+}
+
+// FQName returns the fully qualified name.
+func (u UserDefinedTypeName) FQName() string {
+	var sb strings.Builder
+	// Note that cross-database type references are disabled, so we only
+	// format the qualified name with the schema.
+	sb.WriteString(u.Schema)
+	sb.WriteString(".")
+	sb.WriteString(u.Name)
+	return sb.String()
 }
 
 // Convenience list of pre-constructed types. Caller code can use any of these
@@ -814,6 +842,10 @@ func MakeTimeTZ(precision int32) *T {
 // MakeGeometry constructs a new instance of a GEOMETRY type (oid = T_geometry)
 // that has the given shape and SRID.
 func MakeGeometry(shape geopb.Shape, srid geopb.SRID) *T {
+	// Negative values are promoted to 0.
+	if srid < 0 {
+		srid = 0
+	}
 	return &T{InternalType: InternalType{
 		Family: GeometryFamily,
 		Oid:    oidext.T_geometry,
@@ -827,6 +859,10 @@ func MakeGeometry(shape geopb.Shape, srid geopb.SRID) *T {
 
 // MakeGeography constructs a new instance of a geography-related type.
 func MakeGeography(shape geopb.Shape, srid geopb.SRID) *T {
+	// Negative values are promoted to 0.
+	if srid < 0 {
+		srid = 0
+	}
 	return &T{InternalType: InternalType{
 		Family: GeographyFamily,
 		Oid:    oidext.T_geography,
@@ -946,24 +982,35 @@ func MakeTimestampTZ(precision int32) *T {
 
 // MakeEnum constructs a new instance of an EnumFamily type with the given
 // stable type ID. Note that it does not hydrate cached fields on the type.
-func MakeEnum(typeID uint32) *T {
+func MakeEnum(typeID, arrayTypeID uint32) *T {
 	return &T{InternalType: InternalType{
-		Family:       EnumFamily,
-		Oid:          StableTypeIDToOID(typeID),
-		StableTypeID: typeID,
-		Locale:       &emptyLocale,
+		Family: EnumFamily,
+		Oid:    StableTypeIDToOID(typeID),
+		Locale: &emptyLocale,
+		UDTMetadata: &PersistentUserDefinedTypeMetadata{
+			StableTypeID:      typeID,
+			StableArrayTypeID: arrayTypeID,
+		},
 	}}
 }
 
 // MakeArray constructs a new instance of an ArrayFamily type with the given
 // element type (which may itself be an ArrayFamily type).
 func MakeArray(typ *T) *T {
-	return &T{InternalType: InternalType{
+	arr := &T{InternalType: InternalType{
 		Family:        ArrayFamily,
 		Oid:           calcArrayOid(typ),
 		ArrayContents: typ,
 		Locale:        &emptyLocale,
 	}}
+	if typ.UserDefined() {
+		// If the element type is user defined, then the array type is user
+		// defined as well, with a stable ID equal to the element's array type ID.
+		arr.InternalType.UDTMetadata = &PersistentUserDefinedTypeMetadata{
+			StableTypeID: typ.StableArrayTypeID(),
+		}
+	}
+	return arr
 }
 
 // MakeTuple constructs a new instance of a TupleFamily type with the given
@@ -1132,12 +1179,59 @@ func (t *T) TupleLabels() []string {
 // StableTypeID returns the stable ID of the TypeDescriptor that backs this
 // type. This function only returns non-zero data for user defined types.
 func (t *T) StableTypeID() uint32 {
-	return t.InternalType.StableTypeID
+	return t.InternalType.UDTMetadata.StableTypeID
+}
+
+// StableArrayTypeID returns the stable ID of the TypeDescriptor that backs
+// the implicit array type for the type. This function only returns non-zero
+// data for user defined types that aren't array types.
+func (t *T) StableArrayTypeID() uint32 {
+	return t.InternalType.UDTMetadata.StableArrayTypeID
 }
 
 // UserDefined returns whether or not t is a user defined type.
 func (t *T) UserDefined() bool {
-	return t.Family() == EnumFamily
+	return t.InternalType.UDTMetadata != nil
+}
+
+var familyNames = map[Family]string{
+	AnyFamily:            "any",
+	ArrayFamily:          "array",
+	BitFamily:            "bit",
+	BoolFamily:           "bool",
+	BytesFamily:          "bytes",
+	CollatedStringFamily: "collatedstring",
+	DateFamily:           "date",
+	DecimalFamily:        "decimal",
+	EnumFamily:           "enum",
+	FloatFamily:          "float",
+	GeographyFamily:      "geography",
+	GeometryFamily:       "geometry",
+	INetFamily:           "inet",
+	IntFamily:            "int",
+	IntervalFamily:       "interval",
+	JsonFamily:           "jsonb",
+	OidFamily:            "oid",
+	StringFamily:         "string",
+	TimeFamily:           "time",
+	TimestampFamily:      "timestamp",
+	TimestampTZFamily:    "timestamptz",
+	TimeTZFamily:         "timetz",
+	TupleFamily:          "tuple",
+	UnknownFamily:        "unknown",
+	UuidFamily:           "uuid",
+}
+
+// Name returns a user-friendly word indicating the family type.
+//
+// TODO(radu): investigate whether anything breaks if we use
+// enumvalue_customname and use String() instead.
+func (f Family) Name() string {
+	ret, ok := familyNames[f]
+	if !ok {
+		panic(errors.AssertionFailedf("unexpected Family: %d", f))
+	}
+	return ret
 }
 
 // Name returns a single word description of the type that describes it
@@ -1147,9 +1241,10 @@ func (t *T) UserDefined() bool {
 //
 // TODO(andyk): Should these be changed to be the same as SQLStandardName?
 func (t *T) Name() string {
-	switch t.Family() {
+	switch fam := t.Family(); fam {
 	case AnyFamily:
 		return "anyelement"
+
 	case ArrayFamily:
 		switch t.Oid() {
 		case oid.T_oidvector:
@@ -1158,19 +1253,13 @@ func (t *T) Name() string {
 			return "int2vector"
 		}
 		return t.ArrayContents().Name() + "[]"
+
 	case BitFamily:
 		if t.Oid() == oid.T_varbit {
 			return "varbit"
 		}
 		return "bit"
-	case BoolFamily:
-		return "bool"
-	case BytesFamily:
-		return "bytes"
-	case DateFamily:
-		return "date"
-	case DecimalFamily:
-		return "decimal"
+
 	case FloatFamily:
 		switch t.Width() {
 		case 64:
@@ -1180,12 +1269,7 @@ func (t *T) Name() string {
 		default:
 			panic(errors.AssertionFailedf("programming error: unknown float width: %d", t.Width()))
 		}
-	case GeographyFamily:
-		return "geography"
-	case GeometryFamily:
-		return "geometry"
-	case INetFamily:
-		return "inet"
+
 	case IntFamily:
 		switch t.Width() {
 		case 64:
@@ -1197,12 +1281,10 @@ func (t *T) Name() string {
 		default:
 			panic(errors.AssertionFailedf("programming error: unknown int width: %d", t.Width()))
 		}
-	case IntervalFamily:
-		return "interval"
-	case JsonFamily:
-		return "jsonb"
+
 	case OidFamily:
 		return t.SQLStandardName()
+
 	case StringFamily, CollatedStringFamily:
 		switch t.Oid() {
 		case oid.T_text:
@@ -1218,21 +1300,11 @@ func (t *T) Name() string {
 			return "name"
 		}
 		panic(errors.AssertionFailedf("unexpected OID: %d", t.Oid()))
-	case TimeFamily:
-		return "time"
-	case TimestampFamily:
-		return "timestamp"
-	case TimestampTZFamily:
-		return "timestamptz"
-	case TimeTZFamily:
-		return "timetz"
+
 	case TupleFamily:
 		// Tuple types are currently anonymous, with no name.
 		return ""
-	case UnknownFamily:
-		return "unknown"
-	case UuidFamily:
-		return "uuid"
+
 	case EnumFamily:
 		if t.Oid() == oid.T_anyenum {
 			return "anyenum"
@@ -1242,8 +1314,9 @@ func (t *T) Name() string {
 			return "unknown_enum"
 		}
 		return t.TypeMeta.Name.Basename()
+
 	default:
-		panic(errors.AssertionFailedf("unexpected Family: %s", t.Family()))
+		return fam.Name()
 	}
 }
 
@@ -1646,6 +1719,45 @@ func (t *T) Equivalent(other *T) bool {
 	return true
 }
 
+// EquivalentOrNull is the same as Equivalent, except it returns true if:
+// * `t` is Unknown (i.e., NULL) and `other` is not a tuple,
+// * `t` is a tuple with all non-Unknown elements matching the types in `other`.
+func (t *T) EquivalentOrNull(other *T) bool {
+	// Check normal equivalency first, then check for Null
+	normalEquivalency := t.Equivalent(other)
+	if normalEquivalency {
+		return true
+	}
+
+	switch t.Family() {
+	case UnknownFamily:
+		return other.Family() != TupleFamily
+
+	case TupleFamily:
+		if other.Family() != TupleFamily {
+			return false
+		}
+		// If either tuple is the wildcard tuple, it's equivalent to any other
+		// tuple type. This allows overloads to specify that they take an arbitrary
+		// tuple type.
+		if IsWildcardTupleType(t) || IsWildcardTupleType(other) {
+			return true
+		}
+		if len(t.TupleContents()) != len(other.TupleContents()) {
+			return false
+		}
+		for i := range t.TupleContents() {
+			if !t.TupleContents()[i].EquivalentOrNull(other.TupleContents()[i]) {
+				return false
+			}
+		}
+		return true
+
+	default:
+		return normalEquivalency
+	}
+}
+
 // Identical returns true if every field in this ColumnType is exactly the same
 // as every corresponding field in the given ColumnType. Identical performs a
 // deep comparison, traversing any Tuple or Array contents.
@@ -1747,7 +1859,16 @@ func (t *InternalType) Identical(other *InternalType) bool {
 			return false
 		}
 	}
-	if t.StableTypeID != other.StableTypeID {
+	if t.UDTMetadata != nil && other.UDTMetadata != nil {
+		if t.UDTMetadata.StableTypeID != other.UDTMetadata.StableTypeID {
+			return false
+		}
+		if t.UDTMetadata.StableArrayTypeID != other.UDTMetadata.StableArrayTypeID {
+			return false
+		}
+	} else if t.UDTMetadata != nil {
+		return false
+	} else if other.UDTMetadata != nil {
 		return false
 	}
 	return t.Oid == other.Oid
@@ -2116,6 +2237,19 @@ func (t *T) String() string {
 // DebugString returns a detailed dump of the type protobuf struct, suitable for
 // debugging scenarios.
 func (t *T) DebugString() string {
+	if t.Family() == ArrayFamily && t.ArrayContents().UserDefined() {
+		// In the case that this type is an array that contains a user defined
+		// type, the introspection that protobuf performs to generate a string
+		// representation will panic if the UserDefinedTypeMetadata field of the
+		// type is populated. It seems to not understand that fields in the element
+		// T could be not generated by proto, and panics trying to operate on the
+		// TypeMeta field of the T. To get around this, we just deep copy the T and
+		// zero out the type metadata to placate proto. See the following issue for
+		// details: https://github.com/gogo/protobuf/issues/693.
+		internalTypeCopy := protoutil.Clone(&t.InternalType).(*InternalType)
+		internalTypeCopy.ArrayContents.TypeMeta = UserDefinedTypeMetadata{}
+		return internalTypeCopy.String()
+	}
 	return t.InternalType.String()
 }
 
@@ -2149,22 +2283,22 @@ func (t *T) IsAmbiguous() bool {
 
 // EnumGetIdxOfPhysical returns the index within the TypeMeta's slice of
 // enum physical representations that matches the input byte slice.
-func (t *T) EnumGetIdxOfPhysical(phys []byte) int {
+func (t *T) EnumGetIdxOfPhysical(phys []byte) (int, error) {
 	t.ensureHydratedEnum()
 	// TODO (rohany): We can either use a map or just binary search here
 	//  since the physical representations are sorted.
 	reps := t.TypeMeta.EnumData.PhysicalRepresentations
 	for i := range reps {
 		if bytes.Equal(phys, reps[i]) {
-			return i
+			return i, nil
 		}
 	}
-	err := errors.AssertionFailedf(
+	err := errors.Newf(
 		"could not find %v in enum representation %s",
 		phys,
 		t.TypeMeta.EnumData.debugString(),
 	)
-	panic(err)
+	return 0, err
 }
 
 // EnumGetIdxOfLogical returns the index within the TypeMeta's slice of

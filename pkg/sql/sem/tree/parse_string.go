@@ -12,6 +12,7 @@ package tree
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -51,8 +52,17 @@ func ParseAndRequireString(t *types.T, s string, ctx ParseTimeContext) (Datum, e
 		return ParseDJSON(s)
 	case types.OidFamily:
 		i, err := ParseDInt(s)
-		return NewDOid(*i), err
+		if err != nil {
+			return nil, err
+		}
+		return NewDOid(*i), nil
 	case types.StringFamily:
+		// If the string type specifies a limit we truncate to that limit:
+		//   'hello'::CHAR(2) -> 'he'
+		// This is true of all the string type variants.
+		if t.Width() > 0 {
+			s = util.TruncateString(s, int(t.Width()))
+		}
 		return NewDString(s), nil
 	case types.TimeFamily:
 		return ParseDTime(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision()))

@@ -25,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/sequence"
 	"github.com/cockroachdb/errors"
 )
 
@@ -350,9 +350,11 @@ func removeSequenceOwnerIfExists(
 		return errors.AssertionFailedf("couldn't find reference from column to this sequence")
 	}
 	col.OwnsSequenceIds = append(col.OwnsSequenceIds[:refIdx], col.OwnsSequenceIds[refIdx+1:]...)
-	// TODO (lucy): Have more consistent/informative names for dependent jobs.
 	if err := p.writeSchemaChange(
-		ctx, tableDesc, sqlbase.InvalidMutationID, "removing sequence owner",
+		ctx, tableDesc, sqlbase.InvalidMutationID,
+		fmt.Sprintf("removing sequence owner %s(%d) for sequence %d",
+			tableDesc.Name, tableDesc.ID, sequenceID,
+		),
 	); err != nil {
 		return err
 	}
@@ -392,9 +394,10 @@ func addSequenceOwner(
 
 	opts.SequenceOwner.OwnerColumnID = col.ID
 	opts.SequenceOwner.OwnerTableID = tableDesc.GetID()
-	// TODO (lucy): Have more consistent/informative names for dependent jobs.
 	return p.writeSchemaChange(
-		ctx, tableDesc, sqlbase.InvalidMutationID, "adding sequence owner",
+		ctx, tableDesc, sqlbase.InvalidMutationID, fmt.Sprintf(
+			"adding sequence owner %s(%d) for sequence %d",
+			tableDesc.Name, tableDesc.ID, sequenceID),
 	)
 }
 
@@ -410,7 +413,7 @@ func maybeAddSequenceDependencies(
 	expr tree.TypedExpr,
 	backrefs map[sqlbase.ID]*sqlbase.MutableTableDescriptor,
 ) ([]*MutableTableDescriptor, error) {
-	seqNames, err := getUsedSequenceNames(expr)
+	seqNames, err := sequence.GetUsedSequenceNames(expr)
 	if err != nil {
 		return nil, err
 	}
@@ -547,37 +550,4 @@ func (p *planner) removeSequenceDependencies(
 	// Remove the reference from the column descriptor to the sequence descriptor.
 	col.UsesSequenceIds = []sqlbase.ID{}
 	return nil
-}
-
-// getUsedSequenceNames returns the name of the sequence passed to
-// a call to nextval in the given expression, or nil if there is
-// no call to nextval.
-// e.g. nextval('foo') => "foo"; <some other expression> => nil
-func getUsedSequenceNames(defaultExpr tree.TypedExpr) ([]string, error) {
-	searchPath := sessiondata.SearchPath{}
-	var names []string
-	_, err := tree.SimpleVisit(
-		defaultExpr,
-		func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-			switch t := expr.(type) {
-			case *tree.FuncExpr:
-				def, err := t.Func.Resolve(searchPath)
-				if err != nil {
-					return false, expr, err
-				}
-				if def.Name == "nextval" {
-					arg := t.Exprs[0]
-					switch a := arg.(type) {
-					case *tree.DString:
-						names = append(names, string(*a))
-					}
-				}
-			}
-			return true, expr, nil
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	return names, nil
 }

@@ -151,10 +151,10 @@ func runTestImport(t *testing.T, batchSizeValue int64) {
 				return encoding.EncodeStringAscending(append([]byte{}, prefix...), fmt.Sprintf("k%d", i))
 			}
 
-			if err := kvDB.AdminSplit(ctx, key(split1), key(split1), hlc.MaxTimestamp /* expirationTime */); err != nil {
+			if err := kvDB.AdminSplit(ctx, key(split1), hlc.MaxTimestamp /* expirationTime */); err != nil {
 				t.Fatal(err)
 			}
-			if err := kvDB.AdminSplit(ctx, key(split2), key(split2), hlc.MaxTimestamp /* expirationTime */); err != nil {
+			if err := kvDB.AdminSplit(ctx, key(split2), hlc.MaxTimestamp /* expirationTime */); err != nil {
 				t.Fatal(err)
 			}
 
@@ -172,9 +172,7 @@ func runTestImport(t *testing.T, batchSizeValue int64) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := mockCache.InsertRangeDescriptors(ctx, *r); err != nil {
-				t.Fatal(err)
-			}
+			mockCache.InsertRangeDescriptors(ctx, *r)
 
 			ts := hlc.Timestamp{WallTime: 100}
 			b, err := bulk.MakeBulkAdder(
@@ -321,7 +319,7 @@ func TestAddBigSpanningSSTWithSplits(t *testing.T) {
 					late = getMem()
 				}
 				return &roachpb.RangeKeyMismatchError{
-					MismatchedRange: &roachpb.RangeDescriptor{EndKey: roachpb.RKey(splits[i])},
+					MismatchedRange: roachpb.RangeDescriptor{EndKey: roachpb.RKey(splits[i])},
 				}
 			}
 		}

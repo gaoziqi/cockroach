@@ -13,16 +13,14 @@ package log
 import (
 	"context"
 	"fmt"
-	"runtime/debug"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/stacktrace"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	raven "github.com/getsentry/raven-go"
+	"github.com/cockroachdb/sentry-go"
 )
 
 // The call stack here is usually:
@@ -102,27 +100,42 @@ func RecoverAndReportNonfatalPanic(ctx context.Context, sv *settings.Values) {
 	}
 }
 
-// Safe constructs a SafeMessager.
-var Safe = errors.Safe
-
 // ReportPanic reports a panic has occurred on the real stderr.
 func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth int) {
+	// Announce the panic has occurred to all places. The purpose
+	// of this call is double:
+	// - it ensures there's a notice on the terminal, in case
+	//   logging would only go to file otherwise;
+	// - it places a timestamp in front of the panic object,
+	//   in case the various configuration options make
+	//   the Go runtime solely responsible for printing
+	//   out the panic object to the log file.
+	//   (The go runtime doesn't time stamp its output.)
 	Shout(ctx, Severity_ERROR, "a panic has occurred!")
 
-	if mainLog.stderrRedirected() {
-		// We do not use Shout() to print the panic details here, because
-		// if stderr is not redirected (e.g. when logging to file is
-		// disabled) Shout() would copy its argument to stderr
-		// unconditionally, and we don't want that: Go's runtime system
-		// already unconditonally copies the panic details to stderr.
-		// Instead, we copy manually the details to stderr, only when stderr
-		// is redirected to a file otherwise.
-		fmt.Fprintf(OrigStderr, "%v\n\n%s\n", r, debug.Stack())
+	if stderrLog.redirectInternalStderrWrites {
+		// If we decided that the internal stderr writes performed by the
+		// Go runtime are going to our file, that's also where the panic
+		// details will go automatically when the runtime processes the
+		// uncaught panic.
+		// This means the panic details won't get copied to
+		// the process' external stderr stream automatically
+		// any more.
+		// Now, if the user asked that fatal errors be copied
+		// to the external stderr as well, we'll take that
+		// as an indication they also want to see panic details
+		// there. Do it here.
+		if LoggingToStderr(Severity_FATAL) {
+			stderrLog.printPanicToExternalStderr(ctx, depth+1, r)
+		}
 	} else {
-		// If stderr is not redirected, then Go's runtime will only print
-		// out the panic details to the original stderr, and we'll miss a copy
-		// in the log file. Produce it here.
-		mainLog.printPanicToFile(r)
+		// If we are not redirecting internal stderr writes, then the
+		// details printed by the Go runtime won't automatically reach our
+		// log file and instead go to the process' external stderr.
+		//
+		// However, we actually want to persist these details. So print
+		// them in the log file ourselves.
+		stderrLog.printPanicToFile(ctx, depth+1, r)
 	}
 
 	sendCrashReport(ctx, sv, PanicAsError(depth+1, r), ReportTypePanic)
@@ -140,10 +153,27 @@ func PanicAsError(depth int, r interface{}) error {
 	return errors.NewWithDepthf(depth+1, "panic: %v", r)
 }
 
+// Crash reporting URL.
+//
+// This uses a Sentry proxy run by Cockroach Labs. The proxy
+// abstracts the actual Sentry submission project ID and
+// submission key.
+//
+// Non-release builds wishing to use Sentry reports
+// are invited to use the following URL instead:
+//
+//   https://ignored@errors.cockroachdb.com/sentrydev/v2/1111
+//
+// This can be set via e.g. the env var COCKROACH_CRASH_REPORTS.
+// Note that the special number "1111" is important as it
+// needs to be matched exactly by the CRL proxy.
+//
+// TODO(knz): We could envision auto-selecting this alternate URL
+// when detecting a non-release build.
 var crashReportURL = func() string {
 	var defaultURL string
 	if build.SeemsOfficial() {
-		defaultURL = "https://ignored:ignored@errors.cockroachdb.com/sentry"
+		defaultURL = "https://ignored@errors.cockroachdb.com/api/sentry/v2/1111"
 	}
 	return envutil.EnvOrDefaultString("COCKROACH_CRASH_REPORTS", defaultURL)
 }()
@@ -156,23 +186,31 @@ func SetupCrashReporter(ctx context.Context, cmd string) {
 	if crashReportURL == "" {
 		return
 	}
-	if err := raven.SetDSN(crashReportURL); err != nil {
-		panic(errors.Wrap(err, "failed to setup crash reporting"))
-	}
-	crashReportingActive = true
 
 	if cmd == "start" {
 		cmd = "server"
 	}
 	info := build.GetInfo()
-	raven.SetRelease(info.Tag)
-	raven.SetEnvironment(crashReportEnv)
-	raven.SetTagsContext(map[string]string{
-		"cmd":          cmd,
-		"platform":     info.Platform,
-		"distribution": info.Distribution,
-		"rev":          info.Revision,
-		"goversion":    info.GoVersion,
+
+	if err := sentry.Init(sentry.ClientOptions{
+		Dsn:         crashReportURL,
+		Environment: crashReportEnv,
+		Release:     info.Tag,
+		Dist:        info.Distribution,
+	}); err != nil {
+		panic(errors.Wrap(err, "failed to setup crash reporting"))
+	}
+
+	crashReportingActive = true
+
+	sentry.ConfigureScope(func(scope *sentry.Scope) {
+		scope.SetTags(map[string]string{
+			"cmd":          cmd,
+			"platform":     info.Platform,
+			"distribution": info.Distribution,
+			"rev":          info.Revision,
+			"goversion":    info.GoVersion,
+		})
 	})
 }
 
@@ -220,8 +258,8 @@ func sendCrashReport(
 		return
 	}
 
-	errMsg, packetDetails, extraDetails := errors.BuildSentryReport(err)
-	SendReport(ctx, errMsg, crashReportType, extraDetails, packetDetails...)
+	errEvent, extraDetails := errors.BuildSentryReport(err)
+	SendReport(ctx, crashReportType, errEvent, extraDetails)
 }
 
 // ShouldSendReport returns true iff SendReport() should be called.
@@ -242,47 +280,43 @@ func ShouldSendReport(sv *settings.Values) bool {
 // cluster did indeed crash or not.
 func SendReport(
 	ctx context.Context,
-	errMsg string,
 	crashReportType ReportType,
+	event *sentry.Event,
 	extraDetails map[string]interface{},
-	details ...stacktrace.ReportableObject,
 ) {
-	packet := raven.NewPacket(errMsg, details...)
-
 	for extraKey, extraValue := range extraDetails {
-		packet.Extra[extraKey] = extraValue
+		event.Extra[extraKey] = extraValue
 	}
 
 	if !ReportSensitiveDetails {
 		// Avoid leaking the machine's hostname by injecting the literal "<redacted>".
 		// Otherwise, raven.Client.Capture will see an empty ServerName field and
 		// automatically fill in the machine's hostname.
-		packet.ServerName = "<redacted>"
+		event.ServerName = "<redacted>"
 	}
-	tags := map[string]string{
-		"uptime": uptimeTag(timeutil.Now()),
-	}
+
+	event.Tags["uptime"] = uptimeTag(timeutil.Now())
 
 	switch crashReportType {
 	case ReportTypePanic:
-		tags["report_type"] = "panic"
+		event.Tags["report_type"] = "panic"
 	case ReportTypeError:
-		tags["report_type"] = "error"
+		event.Tags["report_type"] = "error"
 	}
 
 	for _, f := range tagFns {
 		v := f.value(ctx)
 		if v != "" {
-			tags[f.key] = maybeTruncate(v)
+			event.Tags[f.key] = maybeTruncate(v)
 		}
 	}
 
-	eventID, ch := raven.DefaultClient.Capture(packet, tags)
-	select {
-	case <-ch:
-		Shoutf(ctx, Severity_ERROR, "Reported as error %v", eventID)
-	case <-time.After(10 * time.Second):
-		Shout(ctx, Severity_ERROR, "Time out trying to submit crash report")
+	res := sentry.CaptureEvent(event)
+	if res != nil {
+		Shoutf(ctx, Severity_ERROR, "Queued as error %v", string(*res))
+	}
+	if !sentry.Flush(10 * time.Second) {
+		Shout(ctx, Severity_ERROR, "Timeout trying to submit crash report")
 	}
 }
 
@@ -296,11 +330,11 @@ func SendReport(
 func ReportOrPanic(
 	ctx context.Context, sv *settings.Values, format string, reportables ...interface{},
 ) {
+	err := errors.Newf(format, reportables...)
 	if !build.IsRelease() || (sv != nil && PanicOnAssertions.Get(sv)) {
-		panic(fmt.Sprintf(format, reportables...))
+		panic(err)
 	}
-	Warningf(ctx, format, reportables...)
-	err := errors.Newf("internal error: "+format, reportables...)
+	Warningf(ctx, "%v", err)
 	sendCrashReport(ctx, sv, err, ReportTypeError)
 }
 

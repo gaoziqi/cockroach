@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
@@ -101,11 +102,8 @@ type sqlServerOptionalArgs struct {
 	distSender *kvcoord.DistSender
 	// statusServer gives access to the Status service.
 	statusServer serverpb.OptionalStatusServer
-	// Narrowed down version of *NodeLiveness.
-	nodeLiveness interface {
-		jobs.NodeLiveness                    // jobs uses this
-		IsLive(roachpb.NodeID) (bool, error) // DistSQLPlanner wants this
-	}
+	// Narrowed down version of *NodeLiveness. Used by jobs and DistSQLPlanner
+	nodeLiveness sqlbase.OptionalNodeLiveness
 	// Gossip is relied upon by distSQLCfg (execinfra.ServerConfig), the executor
 	// config, the DistSQL planner, the table statistics cache, the statements
 	// diagnostics registry, and the lease manager.
@@ -129,7 +127,9 @@ type sqlServerOptionalArgs struct {
 type sqlServerArgs struct {
 	sqlServerOptionalArgs
 
-	*Config
+	*SQLConfig
+	*BaseConfig
+
 	stopper *stop.Stopper
 
 	// SQL uses the clock to assign timestamps to transactions, among many
@@ -139,9 +139,6 @@ type sqlServerArgs struct {
 	// DistSQLCfg holds on to this to check for node CPU utilization in
 	// samplerProcessor.
 	runtime execinfra.RuntimeStats
-
-	// The tenant that the SQL server runs on the behalf of.
-	tenantID roachpb.TenantID
 
 	// SQL uses KV, both for non-DistSQL and DistSQL execution.
 	db *kv.DB
@@ -161,7 +158,8 @@ type sqlServerArgs struct {
 	// The protected timestamps KV subsystem depends on this, so we pass a
 	// pointer to an empty struct in this configuration, which newSQLServer
 	// fills.
-	jobRegistry *jobs.Registry
+	circularJobRegistry *jobs.Registry
+	jobAdoptionStopFile string
 
 	// The executorConfig uses the provider.
 	protectedtsProvider protectedts.Provider
@@ -169,15 +167,7 @@ type sqlServerArgs struct {
 
 func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	execCfg := &sql.ExecutorConfig{}
-	codec := keys.MakeSQLCodec(cfg.tenantID)
-
-	var jobAdoptionStopFile string
-	for _, spec := range cfg.Stores.Specs {
-		if !spec.InMemory && spec.Path != "" {
-			jobAdoptionStopFile = filepath.Join(spec.Path, jobs.PreventAdoptionFile)
-			break
-		}
-	}
+	codec := keys.MakeSQLCodec(cfg.SQLConfig.TenantID)
 
 	// Create blob service for inter-node file sharing.
 	blobService, err := blobs.NewBlobService(cfg.Settings.ExternalIODir)
@@ -186,12 +176,12 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	}
 	blobspb.RegisterBlobServer(cfg.grpcServer, blobService)
 
-	jobRegistry := cfg.jobRegistry
+	jobRegistry := cfg.circularJobRegistry
 
 	{
-		regLiveness := jobs.NodeLiveness(cfg.nodeLiveness)
+		regLiveness := cfg.nodeLiveness
 		if testingLiveness := cfg.TestingKnobs.RegistryLiveness; testingLiveness != nil {
-			regLiveness = testingLiveness.(*jobs.FakeNodeLiveness)
+			regLiveness = sqlbase.MakeOptionalNodeLiveness(testingLiveness.(*jobs.FakeNodeLiveness))
 		}
 		*jobRegistry = *jobs.MakeRegistry(
 			cfg.AmbientCtx,
@@ -208,7 +198,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 				// in sql/jobs/registry.go on planHookMaker.
 				return sql.NewInternalPlanner(opName, nil, user, &sql.MemoryMetrics{}, execCfg)
 			},
-			jobAdoptionStopFile,
+			cfg.jobAdoptionStopFile,
 		)
 	}
 	cfg.registry.AddMetricStruct(jobRegistry.MetricsStruct())
@@ -249,7 +239,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		math.MaxInt64, /* noteworthy */
 		cfg.Settings,
 	)
-	rootSQLMemoryMonitor.Start(context.Background(), nil, mon.MakeStandaloneBudget(cfg.SQLMemoryPoolSize))
+	rootSQLMemoryMonitor.Start(context.Background(), nil, mon.MakeStandaloneBudget(cfg.MemoryPoolSize))
 
 	// bulkMemoryMonitor is the parent to all child SQL monitors tracking bulk
 	// operations (IMPORT, index backfill). It is itself a child of the
@@ -262,7 +252,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 
 	// Set up the DistSQL temp engine.
 
-	useStoreSpec := cfg.Stores.Specs[cfg.TempStorageConfig.SpecIdx]
+	useStoreSpec := cfg.TempStorageConfig.Spec
 	tempEngine, tempFS, err := storage.NewTempEngine(ctx, cfg.StorageEngine, cfg.TempStorageConfig, useStoreSpec)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating temp storage")
@@ -271,17 +261,17 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	// Remove temporary directory linked to tempEngine after closing
 	// tempEngine.
 	cfg.stopper.AddCloser(stop.CloserFn(func() {
-		firstStore := cfg.Stores.Specs[cfg.TempStorageConfig.SpecIdx]
+		useStore := cfg.TempStorageConfig.Spec
 		var err error
-		if firstStore.InMemory {
-			// First store is in-memory so we remove the temp
+		if useStore.InMemory {
+			// Used store is in-memory so we remove the temp
 			// directory directly since there is no record file.
 			err = os.RemoveAll(cfg.TempStorageConfig.Path)
 		} else {
 			// If record file exists, we invoke CleanupTempDirs to
 			// also remove the record after the temp directory is
 			// removed.
-			recordPath := filepath.Join(firstStore.Path, TempDirsRecordFilename)
+			recordPath := filepath.Join(useStore.Path, TempDirsRecordFilename)
 			err = storage.CleanupTempDirs(recordPath)
 		}
 		if err != nil {
@@ -368,6 +358,17 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 		NodeID:    cfg.nodeIDContainer,
 	}
 
+	var isLive func(roachpb.NodeID) (bool, error)
+	if nl, ok := cfg.nodeLiveness.Optional(47900); ok {
+		isLive = nl.IsLive
+	} else {
+		// We're on a SQL tenant, so this is the only node DistSQL will ever
+		// schedule on - always returning true is fine.
+		isLive = func(roachpb.NodeID) (bool, error) {
+			return true, nil
+		}
+	}
+
 	*execCfg = sql.ExecutorConfig{
 		Settings:                cfg.Settings,
 		NodeInfo:                nodeInfo,
@@ -397,19 +398,18 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 			ctx,
 			execinfra.Version,
 			cfg.Settings,
-			// The node descriptor will be set later, once it is initialized.
-			roachpb.NodeDescriptor{},
+			roachpb.NodeID(cfg.nodeIDContainer.SQLInstanceID()),
 			cfg.rpcContext,
 			distSQLServer,
 			cfg.distSender,
 			cfg.gossip,
 			cfg.stopper,
-			cfg.nodeLiveness,
+			isLive,
 			cfg.nodeDialer,
 		),
 
 		TableStatsCache: stats.NewTableStatisticsCache(
-			cfg.SQLTableStatCacheSize,
+			cfg.TableStatCacheSize,
 			cfg.gossip,
 			cfg.db,
 			cfg.circularInternalExecutor,
@@ -440,7 +440,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 
 		// AuditLogger syncs to disk for the same reason as AuthLogger.
 		AuditLogger: log.NewSecondaryLogger(
-			loggerCtx, cfg.SQLAuditLogDirName, "sql-audit",
+			loggerCtx, cfg.AuditLogDirName, "sql-audit",
 			true /*enableGc*/, true /*forceSyncWrites*/, true, /* enableMsgCount */
 		),
 
@@ -449,7 +449,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 			true /*enableGc*/, false /*forceSyncWrites*/, true, /* enableMsgCount */
 		),
 
-		QueryCache:                 querycache.New(cfg.SQLQueryCacheSize),
+		QueryCache:                 querycache.New(cfg.QueryCacheSize),
 		ProtectedTimestampProvider: cfg.protectedtsProvider,
 	}
 
@@ -479,6 +479,9 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	if pgwireKnobs := cfg.TestingKnobs.PGWireTestingKnobs; pgwireKnobs != nil {
 		execCfg.PGWireTestingKnobs = pgwireKnobs.(*sql.PGWireTestingKnobs)
 	}
+	if tenantKnobs := cfg.TestingKnobs.TenantTestingKnobs; tenantKnobs != nil {
+		execCfg.TenantTestingKnobs = tenantKnobs.(*sql.TenantTestingKnobs)
+	}
 
 	statsRefresher := stats.MakeRefresher(
 		cfg.Settings,
@@ -493,7 +496,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*sqlServer, error) {
 	sqlMemMetrics := sql.MakeMemMetrics("sql", cfg.HistogramWindowInterval())
 	pgServer := pgwire.MakeServer(
 		cfg.AmbientCtx,
-		cfg.Config.Config,
+		cfg.Config,
 		cfg.Settings,
 		sqlMemMetrics,
 		&rootSQLMemoryMonitor,

@@ -56,8 +56,18 @@ func TestRegistryCancelation(t *testing.T) {
 	mClock := hlc.NewManualClock(hlc.UnixNano())
 	clock := hlc.NewClock(mClock.UnixNano, time.Nanosecond)
 	registry := MakeRegistry(
-		log.AmbientContext{}, stopper, clock, nodeLiveness, db, nil /* ex */, base.TestingIDContainer, cluster.NoSettings,
-		histogramWindowInterval, FakePHS, "")
+		log.AmbientContext{},
+		stopper,
+		clock,
+		sqlbase.MakeOptionalNodeLiveness(nodeLiveness),
+		db,
+		nil, /* ex */
+		base.TestingIDContainer,
+		cluster.NoSettings,
+		histogramWindowInterval,
+		FakePHS,
+		"",
+	)
 
 	const cancelInterval = time.Nanosecond
 	const adoptInterval = time.Duration(math.MaxInt64)
@@ -208,12 +218,13 @@ func TestRegistryGC(t *testing.T) {
 	muchEarlier := ts.Add(-2 * time.Hour)
 
 	setMutations := func(mutations []sqlbase.DescriptorMutation) sqlbase.ID {
-		desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
+		desc := sqlbase.TestingGetMutableExistingTableDescriptor(
+			kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
 		desc.Mutations = mutations
 		if err := kvDB.Put(
 			context.Background(),
 			sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID()),
-			sqlbase.WrapDescriptor(desc),
+			desc.DescriptorProto(),
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -221,12 +232,13 @@ func TestRegistryGC(t *testing.T) {
 	}
 
 	setGCMutations := func(gcMutations []sqlbase.TableDescriptor_GCDescriptorMutation) sqlbase.ID {
-		desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
+		desc := sqlbase.TestingGetMutableExistingTableDescriptor(
+			kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
 		desc.GCMutations = gcMutations
 		if err := kvDB.Put(
 			context.Background(),
 			sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID()),
-			sqlbase.WrapDescriptor(desc),
+			desc.DescriptorProto(),
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -234,7 +246,8 @@ func TestRegistryGC(t *testing.T) {
 	}
 
 	setDropJob := func(shouldDrop bool) sqlbase.ID {
-		desc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
+		desc := sqlbase.TestingGetMutableExistingTableDescriptor(
+			kvDB, keys.SystemSQLCodec, "t", "to_be_mutated")
 		if shouldDrop {
 			desc.DropJobID = 123
 		} else {
@@ -244,7 +257,7 @@ func TestRegistryGC(t *testing.T) {
 		if err := kvDB.Put(
 			context.Background(),
 			sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID()),
-			sqlbase.WrapDescriptor(desc),
+			desc.DescriptorProto(),
 		); err != nil {
 			t.Fatal(err)
 		}

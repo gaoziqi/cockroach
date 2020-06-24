@@ -57,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/gcjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -78,10 +79,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	raven "github.com/getsentry/raven-go"
+	"github.com/cockroachdb/sentry-go"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/opentracing/opentracing-go"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 var (
@@ -168,10 +170,57 @@ type Server struct {
 
 	sqlServer *sqlServer
 
+	// Created in NewServer but initialized (made usable) in `(*Server).Start`.
+	externalStorageBuilder *externalStorageBuilder
+
 	// The following fields are populated at start time, i.e. in `(*Server).Start`.
 
 	startTime time.Time
 	engines   Engines
+}
+
+// externalStorageBuilder is a wrapper around the ExternalStorage factory
+// methods. It allows us to separate the creation and initialization of the
+// builder between NewServer() and Start() respectively.
+// TODO(adityamaru): Consider moving this to pkg/storage/cloud at a future
+// stage of the ongoing refactor.
+type externalStorageBuilder struct {
+	conf              base.ExternalIODirConfig
+	settings          *cluster.Settings
+	blobClientFactory blobs.BlobClientFactory
+	engine            storage.Engine
+	initCalled        bool
+}
+
+func (e *externalStorageBuilder) init(
+	conf base.ExternalIODirConfig,
+	settings *cluster.Settings,
+	blobClientFactory blobs.BlobClientFactory,
+	engine storage.Engine,
+) {
+	e.conf = conf
+	e.settings = settings
+	e.blobClientFactory = blobClientFactory
+	e.engine = engine
+	e.initCalled = true
+}
+
+func (e *externalStorageBuilder) makeExternalStorage(
+	ctx context.Context, dest roachpb.ExternalStorage,
+) (cloud.ExternalStorage, error) {
+	if !e.initCalled {
+		return nil, errors.New("cannot create external storage before init")
+	}
+	return cloud.MakeExternalStorage(ctx, dest, e.conf, e.settings, e.blobClientFactory)
+}
+
+func (e *externalStorageBuilder) makeExternalStorageFromURI(
+	ctx context.Context, uri string,
+) (cloud.ExternalStorage, error) {
+	if !e.initCalled {
+		return nil, errors.New("cannot create external storage before init")
+	}
+	return cloud.ExternalStorageFromURI(ctx, uri, e.conf, e.settings, e.blobClientFactory)
 }
 
 // NewServer creates a Server from a server.Config.
@@ -252,13 +301,22 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	var rpcContext *rpc.Context
 	if knobs := cfg.TestingKnobs.Server; knobs != nil {
 		serverKnobs := knobs.(*TestingKnobs)
-		rpcContext = rpc.NewContextWithTestingKnobs(
-			cfg.AmbientCtx, cfg.Config, clock, stopper, cfg.Settings,
-			serverKnobs.ContextTestingKnobs,
-		)
+		rpcContext = rpc.NewContext(rpc.ContextOptions{
+			AmbientCtx: cfg.AmbientCtx,
+			Config:     cfg.Config,
+			Clock:      clock,
+			Stopper:    stopper,
+			Settings:   cfg.Settings,
+			Knobs:      serverKnobs.ContextTestingKnobs,
+		})
 	} else {
-		rpcContext = rpc.NewContext(cfg.AmbientCtx, cfg.Config, clock, stopper,
-			cfg.Settings)
+		rpcContext = rpc.NewContext(rpc.ContextOptions{
+			AmbientCtx: cfg.AmbientCtx,
+			Config:     cfg.Config,
+			Clock:      clock,
+			Stopper:    stopper,
+			Settings:   cfg.Settings,
+		})
 	}
 	rpcContext.HeartbeatCB = func() {
 		if err := rpcContext.RemoteClocks.VerifyClockOffset(ctx); err != nil {
@@ -306,15 +364,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	retryOpts.Closer = stopper.ShouldQuiesce()
 	distSenderCfg := kvcoord.DistSenderConfig{
-		AmbientCtx:      cfg.AmbientCtx,
-		Settings:        st,
-		Clock:           clock,
-		RPCContext:      rpcContext,
-		RPCRetryOptions: &retryOpts,
-		TestingKnobs:    clientTestingKnobs,
-		NodeDialer:      nodeDialer,
+		AmbientCtx:         cfg.AmbientCtx,
+		Settings:           st,
+		Clock:              clock,
+		NodeDescs:          g,
+		RPCContext:         rpcContext,
+		RPCRetryOptions:    &retryOpts,
+		NodeDialer:         nodeDialer,
+		FirstRangeProvider: g,
+		TestingKnobs:       clientTestingKnobs,
 	}
-	distSender := kvcoord.NewDistSender(distSenderCfg, g)
+	distSender := kvcoord.NewDistSender(distSenderCfg)
 	registry.AddMetricStruct(distSender.Metrics())
 
 	txnMetrics := kvcoord.MakeTxnMetrics(cfg.HistogramWindowInterval())
@@ -378,26 +438,15 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	internalExecutor := &sql.InternalExecutor{}
 	jobRegistry := &jobs.Registry{} // ditto
 
-	// This function defines how ExternalStorage objects are created.
-	externalStorage := func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.ExternalStorage, error) {
-		return cloud.MakeExternalStorage(
-			ctx, dest, cfg.ExternalIOConfig, st,
-			blobs.NewBlobClientFactory(
-				nodeIDContainer.Get(),
-				nodeDialer,
-				st.ExternalIODir,
-			),
-		)
+	// Create an ExternalStorageBuilder. This is only usable after Start() where
+	// we initialize all the configuration params.
+	externalStorageBuilder := &externalStorageBuilder{}
+	externalStorage := func(ctx context.Context, dest roachpb.ExternalStorage) (cloud.
+		ExternalStorage, error) {
+		return externalStorageBuilder.makeExternalStorage(ctx, dest)
 	}
 	externalStorageFromURI := func(ctx context.Context, uri string) (cloud.ExternalStorage, error) {
-		return cloud.ExternalStorageFromURI(
-			ctx, uri, cfg.ExternalIOConfig, st,
-			blobs.NewBlobClientFactory(
-				nodeIDContainer.Get(),
-				nodeDialer,
-				st.ExternalIODir,
-			),
-		)
+		return externalStorageBuilder.makeExternalStorageFromURI(ctx, uri)
 	}
 
 	protectedtsProvider, err := ptprovider.New(ptprovider.Config{
@@ -520,12 +569,20 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		gw.RegisterService(grpcServer.Server)
 	}
 
+	var jobAdoptionStopFile string
+	for _, spec := range cfg.Stores.Specs {
+		if !spec.InMemory && spec.Path != "" {
+			jobAdoptionStopFile = filepath.Join(spec.Path, jobs.PreventAdoptionFile)
+			break
+		}
+	}
+
 	sqlServer, err := newSQLServer(ctx, sqlServerArgs{
 		sqlServerOptionalArgs: sqlServerOptionalArgs{
 			rpcContext:             rpcContext,
 			distSender:             distSender,
 			statusServer:           serverpb.MakeOptionalStatusServer(sStatus),
-			nodeLiveness:           nodeLiveness,
+			nodeLiveness:           sqlbase.MakeOptionalNodeLiveness(nodeLiveness),
 			gossip:                 gossip.MakeExposedGossip(g),
 			nodeDialer:             nodeDialer,
 			grpcServer:             grpcServer.Server,
@@ -535,16 +592,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			externalStorageFromURI: externalStorageFromURI,
 			isMeta1Leaseholder:     node.stores.IsMeta1Leaseholder,
 		},
-		Config:                   &cfg, // NB: s.cfg has a populated AmbientContext.
+		SQLConfig:                &cfg.SQLConfig,
+		BaseConfig:               &cfg.BaseConfig,
 		stopper:                  stopper,
 		clock:                    clock,
 		runtime:                  runtimeSampler,
-		tenantID:                 roachpb.SystemTenantID,
 		db:                       db,
 		registry:                 registry,
 		sessionRegistry:          sessionRegistry,
 		circularInternalExecutor: internalExecutor,
-		jobRegistry:              jobRegistry,
+		circularJobRegistry:      jobRegistry,
+		jobAdoptionStopFile:      jobAdoptionStopFile,
 		protectedtsProvider:      protectedtsProvider,
 	})
 	if err != nil {
@@ -555,35 +613,36 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	node.InitLogger(sqlServer.execCfg)
 
 	*lateBoundServer = Server{
-		nodeIDContainer:       nodeIDContainer,
-		cfg:                   cfg,
-		st:                    st,
-		clock:                 clock,
-		rpcContext:            rpcContext,
-		grpc:                  grpcServer,
-		gossip:                g,
-		nodeDialer:            nodeDialer,
-		nodeLiveness:          nodeLiveness,
-		storePool:             storePool,
-		tcsFactory:            tcsFactory,
-		distSender:            distSender,
-		db:                    db,
-		node:                  node,
-		registry:              registry,
-		recorder:              recorder,
-		runtime:               runtimeSampler,
-		admin:                 sAdmin,
-		status:                sStatus,
-		authentication:        sAuth,
-		tsDB:                  tsDB,
-		tsServer:              &sTS,
-		raftTransport:         raftTransport,
-		stopper:               stopper,
-		debug:                 debugServer,
-		replicationReporter:   replicationReporter,
-		protectedtsProvider:   protectedtsProvider,
-		protectedtsReconciler: protectedtsReconciler,
-		sqlServer:             sqlServer,
+		nodeIDContainer:        nodeIDContainer,
+		cfg:                    cfg,
+		st:                     st,
+		clock:                  clock,
+		rpcContext:             rpcContext,
+		grpc:                   grpcServer,
+		gossip:                 g,
+		nodeDialer:             nodeDialer,
+		nodeLiveness:           nodeLiveness,
+		storePool:              storePool,
+		tcsFactory:             tcsFactory,
+		distSender:             distSender,
+		db:                     db,
+		node:                   node,
+		registry:               registry,
+		recorder:               recorder,
+		runtime:                runtimeSampler,
+		admin:                  sAdmin,
+		status:                 sStatus,
+		authentication:         sAuth,
+		tsDB:                   tsDB,
+		tsServer:               &sTS,
+		raftTransport:          raftTransport,
+		stopper:                stopper,
+		debug:                  debugServer,
+		replicationReporter:    replicationReporter,
+		protectedtsProvider:    protectedtsProvider,
+		protectedtsReconciler:  protectedtsReconciler,
+		sqlServer:              sqlServer,
+		externalStorageBuilder: externalStorageBuilder,
 	}
 	return lateBoundServer, err
 }
@@ -985,6 +1044,13 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.stopper.AddCloser(&s.engines)
 
+	// Initialize the external storage builders configuration params now that the
+	// engines have been created. The object can be used to create ExternalStorage
+	// objects hereafter.
+	s.externalStorageBuilder.init(s.cfg.ExternalIODirConfig, s.st,
+		blobs.NewBlobClientFactory(s.nodeIDContainer.Get(),
+			s.nodeDialer, s.st.ExternalIODir), nil)
+
 	bootstrapVersion := s.cfg.Settings.Version.BinaryVersion()
 	if knobs := s.cfg.TestingKnobs.Server; knobs != nil {
 		if ov := knobs.(*TestingKnobs).BootstrapVersionOverride; ov != (roachpb.Version{}) {
@@ -1107,13 +1173,6 @@ func (s *Server) Start(ctx context.Context) error {
 			<-knobs.PauseAfterGettingRPCAddress
 		}
 	}
-
-	// Enable the debug endpoints first to provide an earlier window into what's
-	// going on with the node in advance of exporting node functionality.
-	//
-	// TODO(marc): when cookie-based authentication exists, apply it to all web
-	// endpoints.
-	s.mux.Handle(debug.Endpoint, s.debug)
 
 	// Initialize grpc-gateway mux and context in order to get the /health
 	// endpoint working even before the node has fully initialized.
@@ -1360,7 +1419,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.cfg.NodeAttributes,
 		s.cfg.Locality,
 		s.cfg.LocalityAddresses,
-		s.sqlServer.execCfg.DistSQLPlanner.SetNodeDesc,
+		s.sqlServer.execCfg.DistSQLPlanner.SetNodeInfo,
 	); err != nil {
 		return err
 	}
@@ -1380,24 +1439,26 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.refreshSettings()
 
-	raven.SetTagsContext(map[string]string{
-		"cluster":     s.ClusterID().String(),
-		"node":        s.NodeID().String(),
-		"server_id":   fmt.Sprintf("%s-%s", s.ClusterID().Short(), s.NodeID()),
-		"engine_type": s.cfg.StorageEngine.String(),
+	sentry.ConfigureScope(func(scope *sentry.Scope) {
+		scope.SetTags(map[string]string{
+			"cluster":     s.ClusterID().String(),
+			"node":        s.NodeID().String(),
+			"server_id":   fmt.Sprintf("%s-%s", s.ClusterID().Short(), s.NodeID()),
+			"engine_type": s.cfg.StorageEngine.String(),
+		})
 	})
 
 	// We can now add the node registry.
 	s.recorder.AddNode(s.registry, s.node.Descriptor, s.node.startedAt, s.cfg.AdvertiseAddr, s.cfg.HTTPAdvertiseAddr, s.cfg.SQLAdvertiseAddr)
 
 	// Begin recording runtime statistics.
-	if err := s.startSampleEnvironment(ctx, DefaultMetricsSampleInterval); err != nil {
+	if err := s.startSampleEnvironment(ctx, base.DefaultMetricsSampleInterval); err != nil {
 		return err
 	}
 
 	// Begin recording time series data collected by the status monitor.
 	s.tsDB.PollSource(
-		s.cfg.AmbientCtx, s.recorder, DefaultMetricsSampleInterval, ts.Resolution10s, s.stopper,
+		s.cfg.AmbientCtx, s.recorder, base.DefaultMetricsSampleInterval, ts.Resolution10s, s.stopper,
 	)
 
 	var graphiteOnce sync.Once
@@ -1455,7 +1516,7 @@ func (s *Server) Start(ctx context.Context) error {
 	})
 
 	// Begin recording status summaries.
-	s.node.startWriteNodeStatus(DefaultMetricsSampleInterval)
+	s.node.startWriteNodeStatus(base.DefaultMetricsSampleInterval)
 
 	// Start the protected timestamp subsystem.
 	if err := s.protectedtsProvider.Start(ctx, s.stopper); err != nil {
@@ -1510,8 +1571,35 @@ func (s *Server) Start(ctx context.Context) error {
 	// The /login endpoint is, by definition, available pre-authentication.
 	s.mux.Handle(loginPath, gwMux)
 	s.mux.Handle(logoutPath, authHandler)
+
 	// The /_status/vars endpoint is not authenticated either. Useful for monitoring.
 	s.mux.Handle(statusVars, http.HandlerFunc(s.status.handleVars))
+
+	// Register debugging endpoints.
+	var debugHandler http.Handler = s.debug
+	if s.cfg.RequireWebSession() {
+		// TODO(bdarnell): Refactor our authentication stack.
+		// authenticationMux guarantees that we have a non-empty user
+		// session, but our machinery for verifying the roles of a user
+		// lives on adminServer and is tied to GRPC metadata.
+		debugHandler = newAuthenticationMux(s.authentication, http.HandlerFunc(
+			func(w http.ResponseWriter, req *http.Request) {
+				md := forwardAuthenticationMetadata(req.Context(), req)
+				authCtx := metadata.NewIncomingContext(req.Context(), md)
+				_, err := s.admin.requireAdminUser(authCtx)
+				if errors.Is(err, errInsufficientPrivilege) {
+					http.Error(w, "admin privilege required", http.StatusUnauthorized)
+					return
+				} else if err != nil {
+					log.Infof(authCtx, "web session error: %s", err)
+					http.Error(w, "error checking authentication", http.StatusInternalServerError)
+					return
+				}
+				s.debug.ServeHTTP(w, req)
+			}))
+	}
+	s.mux.Handle(debug.Endpoint, debugHandler)
+
 	log.Event(ctx, "added http endpoints")
 
 	// Attempt to upgrade cluster version.
@@ -1556,6 +1644,10 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.debug.RegisterEngines(s.cfg.Stores.Specs, s.engines); err != nil {
 		return errors.Wrapf(err, "failed to register engines with debug server")
 	}
+
+	// Start scheduled jobs daemon.
+	jobs.StartJobSchedulerDaemon(
+		ctx, s.stopper, &s.st.SV, jobs.ProdJobSchedulerEnv, s.db, s.sqlServer.internalExecutor)
 
 	log.Event(ctx, "server ready")
 	return nil

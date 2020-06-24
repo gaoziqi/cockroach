@@ -971,7 +971,7 @@ func (d *DDecimal) Compare(ctx *EvalContext, other Datum) int {
 	case *DDecimal:
 		v = &t.Decimal
 	case *DInt:
-		v.SetFinite(int64(*t), 0)
+		v.SetInt64(int64(*t))
 	case *DFloat:
 		if _, err := v.SetFloat64(float64(*t)); err != nil {
 			panic(errors.NewAssertionErrorWithWrappedErrf(err, "decimal compare, unexpected error"))
@@ -1427,6 +1427,9 @@ func (d *DBytes) Format(ctx *FmtCtx) {
 	} else {
 		withQuotes := !f.HasFlags(FmtFlags(lex.EncBareStrings))
 		if withQuotes {
+			if f.HasFlags(fmtFormatByteLiterals) {
+				ctx.WriteByte('b')
+			}
 			ctx.WriteByte('\'')
 		}
 		ctx.WriteString("\\x")
@@ -2977,6 +2980,8 @@ func AsJSON(d Datum, loc *time.Location) (json.JSON, error) {
 		return json.FromString(string(*t)), nil
 	case *DCollatedString:
 		return json.FromString(t.Contents), nil
+	case *DEnum:
+		return json.FromString(t.LogicalRep), nil
 	case *DJSON:
 		return t.JSON, nil
 	case *DArray:
@@ -3781,17 +3786,36 @@ func (d *DEnum) Size() uintptr {
 		unsafe.Sizeof(d.LogicalRep)
 }
 
-// MakeDEnumFromPhysicalRepresentation creates a DEnum of the input type
-// and the input physical representation.
-func MakeDEnumFromPhysicalRepresentation(typ *types.T, rep []byte) *DEnum {
+// GetEnumComponentsFromPhysicalRep returns the physical and logical components
+// for an enum of the requested type. It returns an error if it cannot find a
+// matching physical representation.
+func GetEnumComponentsFromPhysicalRep(typ *types.T, rep []byte) ([]byte, string, error) {
+	idx, err := typ.EnumGetIdxOfPhysical(rep)
+	if err != nil {
+		return nil, "", err
+	}
+	meta := typ.TypeMeta.EnumData
 	// Take a pointer into the enum metadata rather than holding on
 	// to a pointer to the input bytes.
-	idx := typ.EnumGetIdxOfPhysical(rep)
+	return meta.PhysicalRepresentations[idx], meta.LogicalRepresentations[idx], nil
+}
+
+// MakeDEnumFromPhysicalRepresentation creates a DEnum of the input type
+// and the input physical representation.
+func MakeDEnumFromPhysicalRepresentation(typ *types.T, rep []byte) (*DEnum, error) {
+	// Return a nice error if the input requested type is types.AnyEnum.
+	if typ.Oid() == oid.T_anyenum {
+		return nil, errors.New("cannot create enum of unspecified type")
+	}
+	phys, log, err := GetEnumComponentsFromPhysicalRep(typ, rep)
+	if err != nil {
+		return nil, err
+	}
 	return &DEnum{
 		EnumTyp:     typ,
-		PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[idx],
-		LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[idx],
-	}
+		PhysicalRep: phys,
+		LogicalRep:  log,
+	}, nil
 }
 
 // MakeDEnumFromLogicalRepresentation creates a DEnum of the input type
@@ -3815,10 +3839,39 @@ func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (*DEnum, error
 	}, nil
 }
 
+// MakeAllDEnumsInType generates a slice of all values in an enum.
+// TODO (rohany): In the future, take an option of whether to include
+//  non-writeable enum values or not.
+func MakeAllDEnumsInType(typ *types.T) []Datum {
+	result := make([]Datum, len(typ.TypeMeta.EnumData.LogicalRepresentations))
+	for i := 0; i < len(result); i++ {
+		result[i] = &DEnum{
+			EnumTyp:     typ,
+			PhysicalRep: typ.TypeMeta.EnumData.PhysicalRepresentations[i],
+			LogicalRep:  typ.TypeMeta.EnumData.LogicalRepresentations[i],
+		}
+	}
+	return result
+}
+
 // Format implements the NodeFormatter interface.
 func (d *DEnum) Format(ctx *FmtCtx) {
-	s := DString(d.LogicalRep)
-	s.Format(ctx)
+	if ctx.HasFlags(fmtStaticallyFormatUserDefinedTypes) {
+		s := DBytes(d.PhysicalRep)
+		// We use the fmtFormatByteLiterals flag here so that the bytes
+		// get formatted as byte literals. Consider an enum of type t with physical
+		// representation \x80. If we don't format this as a bytes literal then
+		// it gets emitted as '\x80':::t. '\x80' is scanned as a string, and we try
+		// to find a logical representation matching '\x80', which won't exist.
+		// Instead, we want to emit b'\x80'::: so that '\x80' is scanned as bytes,
+		// triggering the logic to cast the bytes \x80 to t.
+		ctx.WithFlags(ctx.flags|fmtFormatByteLiterals, func() {
+			s.Format(ctx)
+		})
+	} else {
+		s := DString(d.LogicalRep)
+		s.Format(ctx)
+	}
 }
 
 func (d *DEnum) String() string {
@@ -3844,54 +3897,82 @@ func (d *DEnum) Compare(ctx *EvalContext, other Datum) int {
 
 // Prev implements the Datum interface.
 func (d *DEnum) Prev(ctx *EvalContext) (Datum, bool) {
-	idx := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	idx, err := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if err != nil {
+		panic(err)
+	}
 	if idx == 0 {
 		return nil, false
 	}
-	return MakeDEnumFromPhysicalRepresentation(
-		d.EnumTyp,
-		d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations[idx-1],
-	), true
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	return &DEnum{
+		EnumTyp:     d.EnumTyp,
+		PhysicalRep: enumData.PhysicalRepresentations[idx-1],
+		LogicalRep:  enumData.LogicalRepresentations[idx-1],
+	}, true
 }
 
 // Next implements the Datum interface.
 func (d *DEnum) Next(ctx *EvalContext) (Datum, bool) {
-	idx := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
-	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
-	if idx == len(physReps)-1 {
+	idx, err := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if err != nil {
+		panic(err)
+	}
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	if idx == len(enumData.PhysicalRepresentations)-1 {
 		return nil, false
 	}
-	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[idx+1]), true
+	return &DEnum{
+		EnumTyp:     d.EnumTyp,
+		PhysicalRep: enumData.PhysicalRepresentations[idx+1],
+		LogicalRep:  enumData.LogicalRepresentations[idx+1],
+	}, true
 }
 
 // Max implements the Datum interface.
 func (d *DEnum) Max(ctx *EvalContext) (Datum, bool) {
-	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
-	if len(physReps) == 0 {
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	if len(enumData.PhysicalRepresentations) == 0 {
 		return nil, false
 	}
-	idx := len(physReps) - 1
-	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[idx]), true
+	idx := len(enumData.PhysicalRepresentations) - 1
+	return &DEnum{
+		EnumTyp:     d.EnumTyp,
+		PhysicalRep: enumData.PhysicalRepresentations[idx],
+		LogicalRep:  enumData.LogicalRepresentations[idx],
+	}, true
 }
 
 // Min implements the Datum interface.
 func (d *DEnum) Min(ctx *EvalContext) (Datum, bool) {
-	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
-	if len(physReps) == 0 {
+	enumData := d.EnumTyp.TypeMeta.EnumData
+	if len(enumData.PhysicalRepresentations) == 0 {
 		return nil, false
 	}
-	return MakeDEnumFromPhysicalRepresentation(d.EnumTyp, physReps[0]), true
+	return &DEnum{
+		EnumTyp:     d.EnumTyp,
+		PhysicalRep: enumData.PhysicalRepresentations[0],
+		LogicalRep:  enumData.LogicalRepresentations[0],
+	}, true
 }
 
 // IsMax implements the Datum interface.
 func (d *DEnum) IsMax(_ *EvalContext) bool {
 	physReps := d.EnumTyp.TypeMeta.EnumData.PhysicalRepresentations
-	return d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep) == len(physReps)-1
+	idx, err := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if err != nil {
+		panic(err)
+	}
+	return idx == len(physReps)-1
 }
 
 // IsMin implements the Datum interface.
 func (d *DEnum) IsMin(_ *EvalContext) bool {
-	return d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep) == 0
+	idx, err := d.EnumTyp.EnumGetIdxOfPhysical(d.PhysicalRep)
+	if err != nil {
+		panic(err)
+	}
+	return idx == 0
 }
 
 // AmbiguousFormat implements the Datum interface.

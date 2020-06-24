@@ -1133,14 +1133,13 @@ func TestIngestDelayLimit(t *testing.T) {
 		stats Stats
 	}{
 		{0, Stats{}},
-		{0, Stats{L0FileCount: 19}},
-		{0, Stats{L0FileCount: 20}},
-		{ramp, Stats{L0FileCount: 21}},
-		{ramp * 2, Stats{L0FileCount: 22}},
-		{max, Stats{L0FileCount: 55}},
-		{0, Stats{PendingCompactionBytesEstimate: (2 << 30) - 1}},
-		{max, Stats{L0FileCount: 25, PendingCompactionBytesEstimate: 80 << 30}},
-		{max, Stats{L0FileCount: 35, PendingCompactionBytesEstimate: 20 << 30}},
+		{0, Stats{L0FileCount: 19, L0SublevelCount: -1}},
+		{0, Stats{L0FileCount: 20, L0SublevelCount: -1}},
+		{ramp, Stats{L0FileCount: 21, L0SublevelCount: -1}},
+		{ramp * 2, Stats{L0FileCount: 22, L0SublevelCount: -1}},
+		{ramp * 2, Stats{L0FileCount: 22, L0SublevelCount: 22}},
+		{ramp * 2, Stats{L0FileCount: 55, L0SublevelCount: 22}},
+		{max, Stats{L0FileCount: 55, L0SublevelCount: -1}},
 	} {
 		require.Equal(t, tc.exp, calculatePreIngestDelay(s, &tc.stats))
 	}
@@ -1318,11 +1317,13 @@ func TestEngineFS(t *testing.T) {
 	}
 }
 
-// These FS implementations are not in-memory.
-var engineRealFSImpls = []struct {
+type engineImpl struct {
 	name   string
 	create func(*testing.T, string) Engine
-}{
+}
+
+// These FS implementations are not in-memory.
+var engineRealFSImpls = []engineImpl{
 	{"rocksdb", func(t *testing.T, dir string) Engine {
 		db, err := NewRocksDB(
 			RocksDBConfig{
@@ -1375,9 +1376,9 @@ func TestEngineFSFileNotFoundError(t *testing.T) {
 				t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
 			}
 
-			// Verify RemoveDirAndFiles returns os.ErrNotExist if dir does not exist.
-			if err := db.RemoveDirAndFiles("/non/existent/file"); !os.IsNotExist(err) {
-				t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
+			// Verify RemoveAll returns nil if path does not exist.
+			if err := db.RemoveAll("/non/existent/file"); err != nil {
+				t.Fatalf("expected nil, but got %v (%T)", err, err)
 			}
 
 			fname := filepath.Join(dir, "random.file")
@@ -1416,6 +1417,88 @@ func TestEngineFSFileNotFoundError(t *testing.T) {
 			if err := db.Remove(fname); !os.IsNotExist(err) {
 				t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
 			}
+		})
+	}
+}
+
+func TestFS(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var engineImpls []engineImpl
+	engineImpls = append(engineImpls, engineRealFSImpls...)
+	engineImpls = append(engineImpls,
+		engineImpl{
+			name: "rocksdb_mem",
+			create: func(_ *testing.T, _ string) Engine {
+				return createTestRocksDBEngine()
+			},
+		},
+		engineImpl{
+			name: "pebble_mem",
+			create: func(_ *testing.T, _ string) Engine {
+				return createTestPebbleEngine()
+			},
+		})
+
+	for _, impl := range engineImpls {
+		t.Run(impl.name, func(t *testing.T) {
+			dir, cleanupDir := testutils.TempDir(t)
+			defer cleanupDir()
+			fs := impl.create(t, dir)
+			defer fs.Close()
+
+			path := func(rel string) string {
+				return filepath.Join(dir, rel)
+			}
+			expectLS := func(dir string, want []string) {
+				t.Helper()
+
+				got, err := fs.List(dir)
+				require.NoError(t, err)
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("fs.List(%q) = %#v, want %#v", dir, got, want)
+				}
+			}
+
+			// Create a/ and assert that it's empty.
+			require.NoError(t, fs.MkdirAll(path("a")))
+			expectLS(path("a"), []string{})
+			if _, err := fs.Stat(path("a/b/c")); !os.IsNotExist(err) {
+				t.Fatal(`fs.Stat("a/b/c") should not exist`)
+			}
+
+			// Create a/b/ and a/b/c/ in a single MkdirAll call.
+			// Then ensure that a duplicate call returns a nil error.
+			require.NoError(t, fs.MkdirAll(path("a/b/c")))
+			require.NoError(t, fs.MkdirAll(path("a/b/c")))
+			expectLS(path("a"), []string{"b"})
+			expectLS(path("a/b"), []string{"c"})
+			expectLS(path("a/b/c"), []string{})
+			_, err := fs.Stat(path("a/b/c"))
+			require.NoError(t, err)
+
+			// Create a file at a/b/c/foo.
+			f, err := fs.Create(path("a/b/c/foo"))
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			expectLS(path("a/b/c"), []string{"foo"})
+
+			// Create a file at a/b/c/bar.
+			f, err = fs.Create(path("a/b/c/bar"))
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			expectLS(path("a/b/c"), []string{"bar", "foo"})
+			_, err = fs.Stat(path("a/b/c/bar"))
+			require.NoError(t, err)
+
+			// RemoveAll a file.
+			require.NoError(t, fs.RemoveAll(path("a/b/c/bar")))
+			expectLS(path("a/b/c"), []string{"foo"})
+
+			// RemoveAll a directory that contains subdirectories and
+			// descendant files.
+			require.NoError(t, fs.RemoveAll(path("a/b")))
+			expectLS(path("a"), []string{})
 		})
 	}
 }

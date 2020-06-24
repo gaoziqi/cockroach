@@ -221,19 +221,17 @@ func TestTxnCoordSenderCondenseLockSpans(t *testing.T) {
 		return resp, nil
 	}
 	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-	ds := NewDistSender(
-		DistSenderConfig{
-			AmbientCtx: ambient,
-			Clock:      s.Clock,
-			RPCContext: s.Cfg.RPCContext,
-			TestingKnobs: ClientTestingKnobs{
-				TransportFactory: adaptSimpleTransport(sendFn),
-			},
-			RangeDescriptorDB: descDB,
-			Settings:          cluster.MakeTestingClusterSettings(),
+	ds := NewDistSender(DistSenderConfig{
+		AmbientCtx: ambient,
+		Clock:      s.Clock,
+		NodeDescs:  s.Gossip,
+		RPCContext: s.Cfg.RPCContext,
+		TestingKnobs: ClientTestingKnobs{
+			TransportFactory: adaptSimpleTransport(sendFn),
 		},
-		s.Gossip,
-	)
+		RangeDescriptorDB: descDB,
+		Settings:          cluster.MakeTestingClusterSettings(),
+	})
 	tsf := NewTxnCoordSenderFactory(
 		TxnCoordSenderFactoryConfig{
 			AmbientCtx: ambient,
@@ -294,7 +292,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 	keyA := roachpb.Key("a")
 	keyC := roachpb.Key("c")
 	splitKey := roachpb.Key("b")
-	if err := s.DB.AdminSplit(ctx, splitKey /* spanKey */, splitKey /* splitKey */, hlc.MaxTimestamp /* expirationTimestamp */); err != nil {
+	if err := s.DB.AdminSplit(ctx, splitKey /* splitKey */, hlc.MaxTimestamp /* expirationTimestamp */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1133,7 +1131,7 @@ func TestTxnAbortCount(t *testing.T) {
 
 	value := []byte("value")
 
-	intentionalErrText := "intentional error to cause abort"
+	const intentionalErrText = "intentional error to cause abort"
 	// Test aborted transaction.
 	if err := s.DB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		key := []byte("key-abort")

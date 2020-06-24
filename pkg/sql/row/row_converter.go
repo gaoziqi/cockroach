@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -265,11 +266,12 @@ func NewDatumRowConverter(
 	}
 
 	var txCtx transform.ExprTransformContext
+	semaCtx := tree.MakeSemaContext()
 	// We do not currently support DEFAULT expressions on target or non-target
 	// columns. All non-target columns must be nullable and will be set to NULL
 	// during import. We do however support DEFAULT on hidden columns (which is
 	// only the default _rowid one). This allows those expressions to run.
-	cols, defaultExprs, err := sqlbase.ProcessDefaultColumns(targetColDescriptors, immutDesc, &txCtx, c.EvalCtx)
+	cols, defaultExprs, err := sqlbase.ProcessDefaultColumns(ctx, targetColDescriptors, immutDesc, &txCtx, c.EvalCtx, &semaCtx)
 	if err != nil {
 		return nil, errors.Wrap(err, "process default columns")
 	}
@@ -280,8 +282,6 @@ func NewDatumRowConverter(
 		evalCtx.Codec,
 		immutDesc,
 		cols,
-		SkipFKs,
-		nil, /* fkTables */
 		&sqlbase.DatumAlloc{},
 	)
 	if err != nil {
@@ -373,6 +373,9 @@ func (c *DatumRowConverter) Row(ctx context.Context, sourceID int32, rowIndex in
 	if err != nil {
 		return errors.Wrap(err, "generate insert row")
 	}
+	// TODO(mgartner): Add partial index IDs to ignoreIndexes that we should
+	// not delete entries from.
+	var ignoreIndexes util.FastIntSet
 	if err := c.ri.InsertRow(
 		ctx,
 		KVInserter(func(kv roachpb.KeyValue) {
@@ -380,8 +383,8 @@ func (c *DatumRowConverter) Row(ctx context.Context, sourceID int32, rowIndex in
 			c.KvBatch.KVs = append(c.KvBatch.KVs, kv)
 		}),
 		insertRow,
-		true, /* ignoreConflicts */
-		SkipFKs,
+		ignoreIndexes,
+		true,  /* ignoreConflicts */
 		false, /* traceKV */
 	); err != nil {
 		return errors.Wrap(err, "insert row")

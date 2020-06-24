@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -58,7 +59,7 @@ func GetObjectNames(
 	txn *kv.Txn,
 	sc SchemaResolver,
 	codec keys.SQLCodec,
-	dbDesc *sqlbase.DatabaseDescriptor,
+	dbDesc sqlbase.DatabaseDescriptorInterface,
 	scName string,
 	explicitPrefix bool,
 ) (res tree.TableNames, err error) {
@@ -144,13 +145,16 @@ func ResolveExistingObject(
 		return nil, prefix, nil
 	}
 
-	obj := descI.(catalog.ObjectDescriptor)
+	obj := descI.(catalog.Descriptor)
 	switch lookupFlags.DesiredObjectKind {
 	case tree.TypeObject:
 		if obj.TypeDesc() == nil {
 			return nil, prefix, sqlbase.NewUndefinedTypeError(&resolvedTn)
 		}
-		return obj.TypeDesc(), prefix, nil
+		if lookupFlags.RequireMutable {
+			return obj.(*sqlbase.MutableTypeDescriptor), prefix, nil
+		}
+		return obj.(*sqlbase.ImmutableTypeDescriptor), prefix, nil
 	case tree.TableObject:
 		if obj.TableDesc() == nil {
 			return nil, prefix, sqlbase.NewUndefinedRelationError(&resolvedTn)
@@ -195,7 +199,7 @@ func ResolveExistingObject(
 // prefix for the input object.
 func ResolveTargetObject(
 	ctx context.Context, sc SchemaResolver, un *tree.UnresolvedObjectName,
-) (*sqlbase.DatabaseDescriptor, tree.ObjectNamePrefix, error) {
+) (*sqlbase.ImmutableDatabaseDescriptor, tree.ObjectNamePrefix, error) {
 	found, prefix, descI, err := tree.ResolveTarget(ctx, un, sc, sc.CurrentDatabase(), sc.CurrentSearchPath())
 	if err != nil {
 		return nil, prefix, err
@@ -214,7 +218,7 @@ func ResolveTargetObject(
 		return nil, prefix, pgerror.Newf(pgcode.InvalidName,
 			"schema cannot be modified: %q", tree.ErrString(&prefix))
 	}
-	return descI.(*sqlbase.DatabaseDescriptor), prefix, nil
+	return descI.(*sqlbase.ImmutableDatabaseDescriptor), prefix, nil
 }
 
 // ResolveRequiredType can be passed to the ResolveExistingTableObject function to
@@ -267,6 +271,61 @@ func ResolveSchemaNameByID(
 		return schema, nil
 	}
 	return "", errors.Newf("unable to resolve schema id %d for db %d", schemaID, dbID)
+}
+
+// ResolveTypeDescByID resolves a TypeDescriptor and fully qualified name
+// from an ID.
+// TODO (rohany): Once we start to cache type descriptors, this needs to
+//  look into the set of leased copies.
+// TODO (rohany): Once we lease types, this should be pushed down into the
+//  leased object collection.
+func ResolveTypeDescByID(
+	ctx context.Context,
+	txn *kv.Txn,
+	codec keys.SQLCodec,
+	id sqlbase.ID,
+	lookupFlags tree.ObjectLookupFlags,
+) (*tree.TypeName, sqlbase.TypeDescriptorInterface, error) {
+	desc, err := catalogkv.GetDescriptorByID(ctx, txn, codec, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if desc == nil {
+		if lookupFlags.Required {
+			return nil, nil, pgerror.Newf(
+				pgcode.UndefinedObject, "type with ID %d does not exist", id)
+		}
+		return nil, nil, nil
+	}
+	if desc.TypeDesc() == nil {
+		return nil, nil, errors.AssertionFailedf("%s was not a type descriptor", desc)
+	}
+	// Get the parent database and schema names to create a fully qualified
+	// name for the type.
+	// TODO (SQLSchema): As we add leasing for all descriptors, these calls
+	//  should look into those leased copies, rather than do raw reads.
+	typDesc := desc.(*sqlbase.ImmutableTypeDescriptor)
+	db, err := sqlbase.GetDatabaseDescFromID(ctx, txn, codec, typDesc.ParentID)
+	if err != nil {
+		return nil, nil, err
+	}
+	schemaName, err := ResolveSchemaNameByID(ctx, txn, codec, typDesc.ParentID, typDesc.ParentSchemaID)
+	if err != nil {
+		return nil, nil, err
+	}
+	name := tree.MakeNewQualifiedTypeName(db.GetName(), schemaName, typDesc.GetName())
+	var ret sqlbase.TypeDescriptorInterface
+	if lookupFlags.RequireMutable {
+		// TODO(ajwerner): Figure this out later when we construct this inside of
+		// the name resolution. This really shouldn't be happening here. Instead we
+		// should be taking a SchemaResolver and resolving through it which should
+		// be able to hit a descs.Collection and determine whether this is a new
+		// type or not.
+		desc = sqlbase.NewMutableExistingTypeDescriptor(*typDesc.TypeDesc())
+	} else {
+		ret = typDesc
+	}
+	return &name, ret, nil
 }
 
 // GetForDatabase looks up and returns all available

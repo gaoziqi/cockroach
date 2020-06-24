@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -111,6 +112,40 @@ func makeInputConverter(
 	kvCh chan row.KVBatch,
 ) (inputConverter, error) {
 
+	// installTypeMetadata is a closure that performs the work of installing
+	// type metadata in all of the tables being imported.
+	installTypeMetadata := func(evalCtx *tree.EvalContext) error {
+		for _, table := range spec.Tables {
+			var colTypes []*types.T
+			for _, col := range table.Desc.Columns {
+				colTypes = append(colTypes, col.Type)
+			}
+			if err := execinfrapb.HydrateTypeSlice(evalCtx, colTypes); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if evalCtx.Txn != nil {
+		// If we have a transaction, then use it.
+		if err := installTypeMetadata(evalCtx); err != nil {
+			return nil, err
+		}
+	} else if evalCtx.DB != nil {
+		// Otherwise, open up a new transaction to hydrate type metadata.
+		// We only perform this logic if evalCtx.DB != nil because there are
+		// some tests that pass an evalCtx with a nil DB to this function.
+		// TODO (rohany): Once we lease type descriptors, this should instead
+		//  look into the leased set using the DistSQLTypeResolver.
+		if err := evalCtx.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			evalCtx.Txn = txn
+			return installTypeMetadata(evalCtx)
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	var singleTable *sqlbase.TableDescriptor
 	var singleTableTargetCols tree.NameList
 	if len(spec.Tables) == 1 {
@@ -144,11 +179,13 @@ func makeInputConverter(
 			singleTable, singleTableTargetCols, evalCtx), nil
 	case roachpb.IOFileFormat_MysqlOutfile:
 		return newMysqloutfileReader(
-			spec.Format.MysqlOut, kvCh, spec.WalltimeNanos, int(spec.ReaderParallelism), singleTable, evalCtx)
+			spec.Format.MysqlOut, kvCh, spec.WalltimeNanos,
+			int(spec.ReaderParallelism), singleTable, evalCtx)
 	case roachpb.IOFileFormat_Mysqldump:
 		return newMysqldumpReader(ctx, kvCh, spec.Tables, evalCtx)
 	case roachpb.IOFileFormat_PgCopy:
-		return newPgCopyReader(ctx, kvCh, spec.Format.PgCopy, singleTable, evalCtx)
+		return newPgCopyReader(spec.Format.PgCopy, kvCh, spec.WalltimeNanos,
+			int(spec.ReaderParallelism), singleTable, evalCtx)
 	case roachpb.IOFileFormat_PgDump:
 		return newPgDumpReader(ctx, kvCh, spec.Format.PgDump, spec.Tables, evalCtx)
 	case roachpb.IOFileFormat_Avro:

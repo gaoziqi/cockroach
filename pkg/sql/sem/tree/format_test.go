@@ -11,6 +11,7 @@
 package tree_test
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"path/filepath"
@@ -185,11 +186,11 @@ func TestFormatExpr(t *testing.T) {
 		{`interval '3s'`, tree.FmtShowTypes,
 			`('00:00:03')[interval]`},
 		{`date '2003-01-01'`, tree.FmtShowTypes,
-			`('2003-01-01')[date]`},
+			`(('2003-01-01')[string]::DATE)[date]`},
 		{`timestamp '2003-01-01 00:00:00'`, tree.FmtShowTypes,
-			`('2003-01-01 00:00:00+00:00')[timestamp]`},
+			`(('2003-01-01 00:00:00')[string]::TIMESTAMP)[timestamp]`},
 		{`timestamptz '2003-01-01 00:00:00+03'`, tree.FmtShowTypes,
-			`('2003-01-01 00:00:00+03:00')[timestamptz]`},
+			`(('2003-01-01 00:00:00+03')[string]::TIMESTAMPTZ)[timestamptz]`},
 		{`greatest(unique_rowid(), 12)`, tree.FmtShowTypes,
 			`(greatest((unique_rowid())[int], (12)[int]))[int]`},
 
@@ -237,19 +238,19 @@ func TestFormatExpr(t *testing.T) {
 		{`now() + interval '3s'`, tree.FmtParsable,
 			`now():::TIMESTAMPTZ + '00:00:03':::INTERVAL`},
 		{`current_date() - date '2003-01-01'`, tree.FmtSimple,
-			`current_date() - '2003-01-01'`},
+			`current_date() - '2003-01-01'::DATE`},
 		{`current_date() - date '2003-01-01'`, tree.FmtParsable,
-			`current_date() - '2003-01-01':::DATE`},
+			`current_date() - '2003-01-01':::STRING::DATE`},
 		{`now() - timestamp '2003-01-01'`, tree.FmtSimple,
-			`now() - '2003-01-01 00:00:00+00:00'`},
+			`now() - '2003-01-01'::TIMESTAMP`},
 		{`now() - timestamp '2003-01-01'`, tree.FmtParsable,
-			`now():::TIMESTAMPTZ - '2003-01-01 00:00:00+00:00':::TIMESTAMP`},
+			`now():::TIMESTAMPTZ - '2003-01-01':::STRING::TIMESTAMP`},
 		{`'+Inf':::DECIMAL + '-Inf':::DECIMAL + 'NaN':::DECIMAL`, tree.FmtParsable,
 			`('Infinity':::DECIMAL + '-Infinity':::DECIMAL) + 'NaN':::DECIMAL`},
 		{`'+Inf':::FLOAT8 + '-Inf':::FLOAT8 + 'NaN':::FLOAT8`, tree.FmtParsable,
 			`('+Inf':::FLOAT8 + '-Inf':::FLOAT8) + 'NaN':::FLOAT8`},
 		{`'12:00:00':::TIME`, tree.FmtParsable,
-			`'12:00:00':::TIME`},
+			`'12:00:00':::STRING::TIME`},
 		{`'63616665-6630-3064-6465-616462656562':::UUID`, tree.FmtParsable,
 			`'63616665-6630-3064-6465-616462656562':::UUID`},
 
@@ -260,14 +261,15 @@ func TestFormatExpr(t *testing.T) {
 			`(_, COALESCE(_, _), ARRAY[_])`},
 	}
 
+	ctx := context.Background()
 	for i, test := range testData {
 		t.Run(fmt.Sprintf("%d %s", i, test.expr), func(t *testing.T) {
 			expr, err := parser.ParseExpr(test.expr)
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx := tree.MakeSemaContext()
-			typeChecked, err := tree.TypeCheck(expr, &ctx, types.Any)
+			semaContext := tree.MakeSemaContext()
+			typeChecked, err := tree.TypeCheck(ctx, expr, &semaContext, types.Any)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -323,10 +325,11 @@ func TestFormatExpr2(t *testing.T) {
 		// Ensure that nulls get properly type annotated when printed in an
 	}
 
+	ctx := context.Background()
 	for i, test := range testData {
 		t.Run(fmt.Sprintf("%d %s", i, test.expr), func(t *testing.T) {
-			ctx := tree.MakeSemaContext()
-			typeChecked, err := tree.TypeCheck(test.expr, &ctx, types.Any)
+			semaCtx := tree.MakeSemaContext()
+			typeChecked, err := tree.TypeCheck(ctx, test.expr, &semaCtx, types.Any)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -375,6 +378,7 @@ func TestFormatPgwireText(t *testing.T) {
 
 		{`ARRAY[e'\U00002001☃']`, `{ ☃}`},
 	}
+	ctx := context.Background()
 	var evalCtx tree.EvalContext
 	for i, test := range testData {
 		t.Run(fmt.Sprintf("%d %s", i, test.expr), func(t *testing.T) {
@@ -382,8 +386,8 @@ func TestFormatPgwireText(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx := tree.MakeSemaContext()
-			typeChecked, err := tree.TypeCheck(expr, &ctx, types.Any)
+			semaCtx := tree.MakeSemaContext()
+			typeChecked, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -309,7 +309,6 @@ func (p *planner) dropTableImpl(
 		if viewDesc.Dropped() {
 			continue
 		}
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
 		cascadedViews, err := p.dropViewImpl(ctx, viewDesc, queueJob, "dropping dependent view", tree.DropCascade)
 		if err != nil {
 			return droppedViews, err
@@ -351,15 +350,6 @@ func (p *planner) initiateDropTable(
 	// TODO(bram): If interleaved and ON DELETE CASCADE, we will be able to use
 	// this faster mechanism.
 	if tableDesc.IsTable() && !tableDesc.IsInterleaved() {
-		// Get the zone config applying to this table in order to
-		// ensure there is a GC TTL.
-		_, _, _, err := GetZoneConfigInTxn(
-			ctx, p.txn, uint32(tableDesc.ID), &sqlbase.IndexDescriptor{}, "", false, /* getInheritedDefault */
-		)
-		if err != nil {
-			return err
-		}
-
 		tableDesc.DropTime = timeutil.Now().UnixNano()
 	}
 
@@ -389,7 +379,7 @@ func (p *planner) initiateDropTable(
 		parentSchemaID := tableDesc.GetParentSchemaID()
 
 		// Queue up name for draining.
-		nameDetails := sqlbase.TableDescriptor_NameInfo{
+		nameDetails := sqlbase.NameInfo{
 			ParentID:       tableDesc.ParentID,
 			ParentSchemaID: parentSchemaID,
 			Name:           tableDesc.Name}
@@ -573,9 +563,11 @@ func (p *planner) removeInterleaveBackReference(
 		}
 	}
 	if t != tableDesc {
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
 		return p.writeSchemaChange(
-			ctx, t, sqlbase.InvalidMutationID, "removing reference for interleaved table",
+			ctx, t, sqlbase.InvalidMutationID,
+			fmt.Sprintf("removing reference for interleaved table %s(%d)",
+				t.Name, t.ID,
+			),
 		)
 	}
 	return nil

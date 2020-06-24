@@ -807,7 +807,7 @@ func (r *testRunner) runTest(
 			// We really shouldn't get here unless the test code somehow managed
 			// to deadlock without blocking on anything remote - since we killed
 			// everything.
-			msg := "test timed out and afterwards failed to respond to cancelation"
+			const msg = "test timed out and afterwards failed to respond to cancelation"
 			t.l.PrintfCtx(ctx, msg)
 			r.collectClusterLogs(ctx, c, t.l)
 			// We return an error here because the test goroutine is still running, so
@@ -1142,7 +1142,7 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	// (see runVersionUpgrade). The same is true for adding a new key to this
 	// map.
 	verMap := map[string]string{
-		"20.2": "20.1.0",
+		"20.2": "20.1.2",
 		"20.1": "19.2.7",
 		"19.2": "19.1.5",
 		"19.1": "2.1.9",

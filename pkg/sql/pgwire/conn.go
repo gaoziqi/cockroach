@@ -524,6 +524,7 @@ func (c *conn) processCommandsAsync(
 		var retErr error
 		var connHandler sql.ConnectionHandler
 		var authOK bool
+		var connCloseAuthHandler func()
 		defer func() {
 			// Release resources, if we still own them.
 			if reservedOwned {
@@ -562,12 +563,15 @@ func (c *conn) processCommandsAsync(
 			if !authOK {
 				ac.AuthFail(retErr)
 			}
+			if connCloseAuthHandler != nil {
+				connCloseAuthHandler()
+			}
 			// Inform the connection goroutine of success or failure.
 			retCh <- retErr
 		}()
 
 		// Authenticate the connection.
-		if retErr = c.handleAuthentication(
+		if connCloseAuthHandler, retErr = c.handleAuthentication(
 			ctx, ac, authOpt, sqlServer.GetExecutorConfig(),
 		); retErr != nil {
 			// Auth failed or some other error.
@@ -1107,7 +1111,7 @@ func (c *conn) bufferRow(
 	row tree.Datums,
 	formatCodes []pgwirebase.FormatCode,
 	conv sessiondata.DataConversionConfig,
-	oids []oid.Oid,
+	types []*types.T,
 ) {
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgDataRow)
 	c.msgBuilder.putInt16(int16(len(row)))
@@ -1118,9 +1122,9 @@ func (c *conn) bufferRow(
 		}
 		switch fmtCode {
 		case pgwirebase.FormatText:
-			c.msgBuilder.writeTextDatum(ctx, col, conv)
+			c.msgBuilder.writeTextDatum(ctx, col, conv, types[i])
 		case pgwirebase.FormatBinary:
-			c.msgBuilder.writeBinaryDatum(ctx, col, conv.Location, oids[i])
+			c.msgBuilder.writeBinaryDatum(ctx, col, conv.Location, types[i])
 		default:
 			c.msgBuilder.setError(errors.Errorf("unsupported format code %s", fmtCode))
 		}

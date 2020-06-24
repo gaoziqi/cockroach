@@ -10,8 +10,10 @@ package backupccl
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"io/ioutil"
+	"net/http"
 	"net/url"
 	"path"
 	"sort"
@@ -46,6 +48,8 @@ const (
 	BackupManifestCheckpointName = "BACKUP-CHECKPOINT"
 	// BackupFormatDescriptorTrackingVersion added tracking of complete DBs.
 	BackupFormatDescriptorTrackingVersion uint32 = 1
+	// ZipType is the format of a GZipped compressed file.
+	ZipType = "application/x-gzip"
 )
 
 // BackupFileDescriptors is an alias on which to implement sort's interface.
@@ -99,11 +103,38 @@ func readBackupManifestFromStore(
 func containsManifest(ctx context.Context, exportStore cloud.ExternalStorage) (bool, error) {
 	r, err := exportStore.ReadFile(ctx, BackupManifestName)
 	if err != nil {
-		//nolint:returnerrcheck
-		return false, nil /* TODO(dt): only silence non-exists errors */
+		if errors.Is(err, cloud.ErrFileDoesNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
 	r.Close()
 	return true, nil
+}
+
+// compressData compresses data buffer and returns compressed
+// bytes (i.e. gzip format).
+func compressData(descBuf []byte) ([]byte, error) {
+	gzipBuf := bytes.NewBuffer([]byte{})
+	gz := gzip.NewWriter(gzipBuf)
+	if _, err := gz.Write(descBuf); err != nil {
+		return nil, err
+	}
+	if err := gz.Close(); err != nil {
+		return nil, err
+	}
+	return gzipBuf.Bytes(), nil
+}
+
+// DecompressData decompresses gzip data buffer and
+// returns decompressed bytes.
+func DecompressData(descBytes []byte) ([]byte, error) {
+	r, err := gzip.NewReader(bytes.NewBuffer(descBytes))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return ioutil.ReadAll(r)
 }
 
 // readBackupManifest reads and unmarshals a BackupManifest from filename in
@@ -127,6 +158,14 @@ func readBackupManifest(
 		descBytes, err = storageccl.DecryptFile(descBytes, encryption.Key)
 		if err != nil {
 			return BackupManifest{}, err
+		}
+	}
+	fileType := http.DetectContentType(descBytes)
+	if fileType == ZipType {
+		descBytes, err = DecompressData(descBytes)
+		if err != nil {
+			return BackupManifest{}, errors.Wrap(
+				err, "decompressing backup manifest")
 		}
 	}
 	var backupManifest BackupManifest
@@ -178,6 +217,14 @@ func readBackupPartitionDescriptor(
 			return BackupPartitionDescriptor{}, err
 		}
 	}
+	fileType := http.DetectContentType(descBytes)
+	if fileType == ZipType {
+		descBytes, err = DecompressData(descBytes)
+		if err != nil {
+			return BackupPartitionDescriptor{}, errors.Wrap(
+				err, "decompressing backup partition descriptor")
+		}
+	}
 	var backupManifest BackupPartitionDescriptor
 	if err := protoutil.Unmarshal(descBytes, &backupManifest); err != nil {
 		return BackupPartitionDescriptor{}, err
@@ -199,12 +246,18 @@ func writeBackupManifest(
 	if err != nil {
 		return err
 	}
+	descBuf, err = compressData(descBuf)
+	if err != nil {
+		return errors.Wrap(err, "compressing backup manifest")
+	}
+
 	if encryption != nil {
 		descBuf, err = storageccl.EncryptFile(descBuf, encryption.Key)
 		if err != nil {
 			return err
 		}
 	}
+
 	return exportStore.WriteFile(ctx, filename, bytes.NewReader(descBuf))
 }
 
@@ -221,6 +274,10 @@ func writeBackupPartitionDescriptor(
 	descBuf, err := protoutil.Marshal(desc)
 	if err != nil {
 		return err
+	}
+	descBuf, err = compressData(descBuf)
+	if err != nil {
+		return errors.Wrap(err, "compressing backup partition descriptor")
 	}
 	if encryption != nil {
 		descBuf, err = storageccl.EncryptFile(descBuf, encryption.Key)
@@ -540,6 +597,12 @@ func loadSQLDescsFromBackupsAtTime(
 				continue
 			}
 		}
+		if t := desc.GetType(); t != nil {
+			// We apply the same filter for types as well.
+			if byID[t.ParentID] == nil {
+				continue
+			}
+		}
 		allDescs = append(allDescs, *desc)
 	}
 	return allDescs, lastBackupManifest
@@ -606,28 +669,30 @@ func VerifyUsableExportTarget(
 	readable string,
 	encryption *roachpb.FileEncryptionOptions,
 ) error {
-	if r, err := exportStore.ReadFile(ctx, BackupManifestName); err == nil {
-		// TODO(dt): If we audit exactly what not-exists error each ExternalStorage
-		// returns (and then wrap/tag them), we could narrow this check.
+	r, err := exportStore.ReadFile(ctx, BackupManifestName)
+	if err == nil {
 		r.Close()
 		return pgerror.Newf(pgcode.FileAlreadyExists,
 			"%s already contains a %s file",
 			readable, BackupManifestName)
 	}
-	if r, err := exportStore.ReadFile(ctx, BackupManifestName); err == nil {
-		// TODO(dt): If we audit exactly what not-exists error each ExternalStorage
-		// returns (and then wrap/tag them), we could narrow this check.
-		r.Close()
-		return pgerror.Newf(pgcode.FileAlreadyExists,
-			"%s already contains a %s file",
-			readable, BackupManifestName)
+
+	if !errors.Is(err, cloud.ErrFileDoesNotExist) {
+		return errors.Wrapf(err, "%s returned an unexpected error when checking for the existence of %s file", readable, BackupManifestName)
 	}
-	if r, err := exportStore.ReadFile(ctx, BackupManifestCheckpointName); err == nil {
+
+	r, err = exportStore.ReadFile(ctx, BackupManifestCheckpointName)
+	if err == nil {
 		r.Close()
 		return pgerror.Newf(pgcode.FileAlreadyExists,
 			"%s already contains a %s file (is another operation already in progress?)",
 			readable, BackupManifestCheckpointName)
 	}
+
+	if !errors.Is(err, cloud.ErrFileDoesNotExist) {
+		return errors.Wrapf(err, "%s returned an unexpected error when checking for the existence of %s file", readable, BackupManifestCheckpointName)
+	}
+
 	if err := writeBackupManifest(
 		ctx, settings, exportStore, BackupManifestCheckpointName, encryption, &BackupManifest{},
 	); err != nil {

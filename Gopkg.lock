@@ -188,11 +188,14 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:82298f2aa48be0c275272f8cada5e78e2100cefd032bf13ef84a9d26c1a80d92"
+  digest = "1:d1b7be8b46e3825e9f616cd5b2e44f03eb2e3174379cd6d1a64ea0a0d9ad124b"
   name = "github.com/andy-kimball/arenaskl"
-  packages = ["."]
+  packages = [
+    ".",
+    "internal/fastrand",
+  ]
   pruneopts = "UT"
-  revision = "4b42aa066e46a6900c75bf45abd9f0dbfb704c46"
+  revision = "f701008588b9f33126c0bc1c2a47587f2aafbbef"
 
 [[projects]]
   digest = "1:66b3310cf22cdc96c35ef84ede4f7b9b370971c4025f394c89a2638729653b11"
@@ -336,14 +339,6 @@
   version = "v2.1.1"
 
 [[projects]]
-  digest = "1:fed1f537c2f1269fe475a8556c393fe466641682d73ef8fd0491cd3aa1e47bad"
-  name = "github.com/certifi/gocertifi"
-  packages = ["."]
-  pruneopts = "UT"
-  revision = "deb3ae2ef2610fde3330947281941c562861188b"
-  version = "2018.01.18"
-
-[[projects]]
   digest = "1:848ef40f818e59905140552cc49ff3dc1a15f955e4b56d1c5c2cc4b54dbadf0c"
   name = "github.com/client9/misspell"
   packages = [
@@ -407,8 +402,8 @@
   revision = "aca09668cb243672cb82f3cbeec73b3871e13cc9"
 
 [[projects]]
-  branch = "v1.2.4-cockroach20.1"
-  digest = "1:9d93287c86a1c5466b903c1c452e5cd395161ad78477b252fd953b53d1fc589c"
+  branch = "master"
+  digest = "1:9fc3ba4d5c7c301cd27944239be4cc8449be51546787e71442d7be9303d8d9dd"
   name = "github.com/cockroachdb/errors"
   packages = [
     ".",
@@ -431,7 +426,7 @@
     "withstack",
   ]
   pruneopts = "UT"
-  revision = "32a264b562e5b80d53e2d08f017cde819321e4fb"
+  revision = "489491acc69206e6ed276646bc0d6215400c0d48"
 
 [[projects]]
   digest = "1:a44e537b3e080ff297315d166956dba9607f070644a89be78b59af6c54876b64"
@@ -466,7 +461,7 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:97861b3ed61a01d0ec2513e9e42e2cdb62e0ad16662a752df2c1073ecd7eb61e"
+  digest = "1:158af58ed3ac10574091780ef2e44c83cd5d2f0af58b33b6762abda2cd8b1d04"
   name = "github.com/cockroachdb/pebble"
   packages = [
     ".",
@@ -477,6 +472,7 @@
     "internal/bytealloc",
     "internal/cache",
     "internal/crc",
+    "internal/fastrand",
     "internal/humanize",
     "internal/intern",
     "internal/invariants",
@@ -492,7 +488,15 @@
     "vfs",
   ]
   pruneopts = "UT"
-  revision = "af0d71572c7bd24deb066d09eee646b6cb7460a4"
+  revision = "bc7bb07c0a288fd644d6a9d85575b0c3532dba9c"
+
+[[projects]]
+  branch = "master"
+  digest = "1:7704ad50ebd76fee729a8e20830b987eae6d7a01590a88f43806868fd8f90ccb"
+  name = "github.com/cockroachdb/redact"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "cd282804bbd3cd122cf2f406a0707084bfb6a4bf"
 
 [[projects]]
   branch = "master"
@@ -501,6 +505,14 @@
   packages = ["."]
   pruneopts = "UT"
   revision = "e91bb28baf9de4a530d3ae7f041953b23dcce9be"
+
+[[projects]]
+  digest = "1:6db0e7e7c412aa14043b3e19417e58b0564588a687dd9c7557b2ca334a0325f8"
+  name = "github.com/cockroachdb/sentry-go"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "3a03c57765edff71fbf662474edb271744ca966c"
+  version = "v0.6.1-cockroachdb"
 
 [[projects]]
   branch = "master"
@@ -533,6 +545,21 @@
   pruneopts = "UT"
   revision = "20f5889cbdc3c73dbd2862796665e7c465ade7d1"
   version = "v1.0.8"
+
+[[projects]]
+  branch = "master"
+  digest = "1:6c25d97f154e54290d708120e6bc72da4e8628e1467c53d8f723f1594043901d"
+  name = "github.com/dave/dst"
+  packages = [
+    ".",
+    "decorator",
+    "decorator/resolver",
+    "decorator/resolver/gopackages",
+    "decorator/resolver/gotypes",
+    "dstutil",
+  ]
+  pruneopts = "UT"
+  revision = "ce1c8af3ca7fccd4405ec0594a8b68d40370dda0"
 
 [[projects]]
   digest = "1:ffe9824d294da03b391f44e1ae8281281b4afc1bdaa9588c9097785e3af10cec"
@@ -694,15 +721,6 @@
   packages = ["."]
   pruneopts = "UT"
   revision = "600d898af40aa09a7a93ecb9265d87b0504b6f03"
-
-[[projects]]
-  branch = "master"
-  digest = "1:da009be490724f12d2625817b738405854412728031d8997672643e8593791be"
-  name = "github.com/getsentry/raven-go"
-  packages = ["."]
-  pruneopts = "UT"
-  revision = "221b2b44fb33f84ed3ea13f3aed62ff48c85636b"
-  source = "https://github.com/cockroachdb/raven-go"
 
 [[projects]]
   branch = "master"
@@ -873,7 +891,7 @@
   revision = "23def4e6c14b4da8ac2ed8007337bc5eb5007998"
 
 [[projects]]
-  digest = "1:59a826b72bb40d1f541f1438cfdfcea63948327478b82c72fc1349b33ddff7ca"
+  digest = "1:7852a48216dd9d7b8f09af45e5641a04fbe1947126081b546fe92ddd5e02256a"
   name = "github.com/golang/protobuf"
   packages = [
     "descriptor",
@@ -888,8 +906,8 @@
     "ptypes/wrappers",
   ]
   pruneopts = "UT"
-  revision = "6c66de79d66478d166c7ea05f5d2ccaf016fbd6b"
-  version = "v1.4.1"
+  revision = "d04d7b157bb510b1e0c10132224b616ac0e26b17"
+  version = "v1.4.2"
 
 [[projects]]
   branch = "master"
@@ -1609,7 +1627,7 @@
   version = "v1.4.0"
 
 [[projects]]
-  digest = "1:c8fafded0eb90c84e4ef05b9e1ff2a5c8fb2aaf5009ba11b91f6bed2ef680aae"
+  digest = "1:e63ce7984c727b81ca8c62b7567633b27b8453d0026c4be6a4a79d6a9e3d88e2"
   name = "github.com/twpayne/go-geom"
   packages = [
     ".",
@@ -1630,8 +1648,8 @@
     "xy/orientation",
   ]
   pruneopts = "UT"
-  revision = "078e8ab21d838b07c627dc1d704f1f80688b1b90"
-  version = "v1.1.0"
+  revision = "d92d6156612774e9012faa0183f766c73f6fda19"
+  version = "v1.3.0"
 
 [[projects]]
   digest = "1:43e0db2b113d1aee4bb68745598c135511976a44fb380ebd701cd0c14a77c303"
@@ -2140,6 +2158,7 @@
     "github.com/apache/arrow/go/arrow/memory",
     "github.com/armon/circbuf",
     "github.com/aws/aws-sdk-go/aws",
+    "github.com/aws/aws-sdk-go/aws/awserr",
     "github.com/aws/aws-sdk-go/aws/credentials",
     "github.com/aws/aws-sdk-go/aws/session",
     "github.com/aws/aws-sdk-go/service/s3",
@@ -2161,16 +2180,22 @@
     "github.com/cockroachdb/errors/testutils",
     "github.com/cockroachdb/gostdlib/cmd/gofmt",
     "github.com/cockroachdb/gostdlib/x/tools/cmd/goimports",
+    "github.com/cockroachdb/gostdlib/x/tools/imports",
     "github.com/cockroachdb/logtags",
     "github.com/cockroachdb/pebble",
     "github.com/cockroachdb/pebble/bloom",
     "github.com/cockroachdb/pebble/sstable",
     "github.com/cockroachdb/pebble/tool",
     "github.com/cockroachdb/pebble/vfs",
+    "github.com/cockroachdb/redact",
     "github.com/cockroachdb/returncheck",
+    "github.com/cockroachdb/sentry-go",
     "github.com/cockroachdb/stress",
     "github.com/cockroachdb/ttycolor",
     "github.com/codahale/hdrhistogram",
+    "github.com/dave/dst",
+    "github.com/dave/dst/decorator",
+    "github.com/dave/dst/dstutil",
     "github.com/docker/distribution/reference",
     "github.com/docker/docker/api/types",
     "github.com/docker/docker/api/types/container",
@@ -2186,7 +2211,6 @@
     "github.com/elastic/gosigar",
     "github.com/elazarl/go-bindata-assetfs",
     "github.com/facebookgo/clock",
-    "github.com/getsentry/raven-go",
     "github.com/ghemawat/stream",
     "github.com/go-sql-driver/mysql",
     "github.com/gogo/protobuf/jsonpb",
@@ -2274,6 +2298,7 @@
     "github.com/twpayne/go-geom/encoding/geojson",
     "github.com/twpayne/go-geom/encoding/kml",
     "github.com/twpayne/go-geom/encoding/wkb",
+    "github.com/twpayne/go-geom/encoding/wkbcommon",
     "github.com/twpayne/go-geom/encoding/wkbhex",
     "github.com/twpayne/go-geom/encoding/wkt",
     "github.com/twpayne/go-geom/xy/lineintersector",

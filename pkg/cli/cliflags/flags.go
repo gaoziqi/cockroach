@@ -571,26 +571,27 @@ write its process ID to the specified file.`,
 	}
 
 	Socket = FlagInfo{
-		Name:   "socket",
-		EnvVar: "COCKROACH_SOCKET",
-		Description: `
-Accept client connections using a Unix domain socket with the
-given name.
-
-Note: for compatibility with PostgreSQL clients and drivers,
-ensure that the socket name has the form "/path/to/.s.PGSQL.NNNN",
-where NNNN is a number. PostgreSQL clients only take a port
-number and directory as input and construct the socket name
-programmatically.
-
-To use, for example: psql -h /path/to -p NNNN ...
-`,
+		Name:        "socket",
+		EnvVar:      "COCKROACH_SOCKET",
+		Description: `Deprecated in favor of --socket-dir.`,
 	}
 
 	SocketDir = FlagInfo{
-		Name:        "socket-dir",
-		EnvVar:      "COCKROACH_SOCKET_DIR",
-		Description: `Deprecated in favor of --socket-dir.`,
+		Name:   "socket-dir",
+		EnvVar: "COCKROACH_SOCKET_DIR",
+		Description: `
+Accept client connections using a Unix domain socket created
+in the specified directory.
+
+Note: for compatibility with PostgreSQL clients and drivers,
+the generated socket name has the form "/path/to/.s.PGSQL.NNNN",
+where NNNN is the port number configured via --listen-addr.
+
+PostgreSQL clients only take a port number and directory as input
+and construct the socket name programmatically.
+
+To use, for example: psql -h /path/to -p NNNN ...
+`,
 	}
 
 	ClientInsecure = FlagInfo{
@@ -616,10 +617,10 @@ a public network without combining it with --listen-addr.`,
 		Description: `Disable use of HTTP when accessing external data.`,
 	}
 
-	ExtenralIODisableImplicitCredentials = FlagInfo{
+	ExternalIODisableImplicitCredentials = FlagInfo{
 		Name: "external-io-disable-implicit-credentials",
 		Description: `
-Disable use of implicit credentials when accessing external data.  
+Disable use of implicit credentials when accessing external data.
 Instead, require the user to always specify access keys.`,
 	}
 
@@ -884,6 +885,11 @@ prefix for range local keys. The hex format takes an encoded MVCCKey.`,
 Exclusive end key and format as [<format>:]<key>. Supported formats: raw, hex,
 human, rangeID. The raw format supports escaped text. For example, "raw:\x01k"
 is the prefix for range local keys. The hex format takes an encoded MVCCKey.`}
+
+	Limit = FlagInfo{
+		Name:        "limit",
+		Description: `Maximum number of keys to return.`,
+	}
 
 	Values = FlagInfo{
 		Name:        "values",
@@ -1165,5 +1171,15 @@ The default is to include all nodes.`,
 List of nodes to exclude. Can be specified as a comma-delimited
 list of node IDs or ranges of node IDs, for example: 5,10-20,23.
 The default is to not exclude any node.`,
+	}
+
+	ZipRedactLogs = FlagInfo{
+		Name: "redact-logs",
+		Description: `
+Redact text that may contain confidential data or PII from retrieved
+log entries. Note that this flag only operates on log entries;
+other items retrieved by the zip command may still consider
+confidential data or PII.
+`,
 	}
 )

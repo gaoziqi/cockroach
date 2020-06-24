@@ -100,8 +100,13 @@ func createTestStorePool(
 	mc := hlc.NewManualClock(123)
 	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
 	st := cluster.MakeTestingClusterSettings()
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, clock, stopper, st)
+	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		AmbientCtx: log.AmbientContext{Tracer: st.Tracer},
+		Config:     &base.Config{Insecure: true},
+		Clock:      clock,
+		Stopper:    stopper,
+		Settings:   st,
+	})
 	server := rpc.NewServer(rpcContext) // never started
 	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	mnl := newMockNodeLiveness(defaultNodeStatus)
@@ -150,7 +155,6 @@ func verifyStoreList(
 	sp *StorePool,
 	constraints []zonepb.ConstraintsConjunction,
 	storeIDs roachpb.StoreIDSlice, // optional
-	rangeID roachpb.RangeID,
 	filter storeFilter,
 	expected []int,
 	expectedAliveStoreCount int,
@@ -160,9 +164,9 @@ func verifyStoreList(
 	var aliveStoreCount int
 	var throttled throttledStoreReasons
 	if storeIDs == nil {
-		sl, aliveStoreCount, throttled = sp.getStoreList(rangeID, filter)
+		sl, aliveStoreCount, throttled = sp.getStoreList(filter)
 	} else {
-		sl, aliveStoreCount, throttled = sp.getStoreListFromIDs(storeIDs, rangeID, filter)
+		sl, aliveStoreCount, throttled = sp.getStoreListFromIDs(storeIDs, filter)
 	}
 	throttledStoreCount := len(throttled)
 	sl = sl.filter(constraints)
@@ -207,7 +211,7 @@ func TestStorePoolGetStoreList(t *testing.T) {
 	}
 	required := []string{"ssd", "dc"}
 	// Nothing yet.
-	sl, _, _ := sp.getStoreList(roachpb.RangeID(0), storeFilterNone)
+	sl, _, _ := sp.getStoreList(storeFilterNone)
 	sl = sl.filter(constraints)
 	if len(sl.stores) != 0 {
 		t.Errorf("expected no stores, instead %+v", sl.stores)
@@ -249,8 +253,6 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		Attrs:   roachpb.Attributes{Attrs: required},
 	}
 
-	const rangeID = roachpb.RangeID(1)
-
 	// Gossip and mark all alive initially.
 	sg.GossipStores([]*roachpb.StoreDescriptor{
 		&matchingStore,
@@ -277,7 +279,6 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		sp,
 		constraints,
 		nil, /* storeIDs */
-		rangeID,
 		storeFilterNone,
 		[]int{
 			int(matchingStore.StoreID),
@@ -295,7 +296,6 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		sp,
 		constraints,
 		nil, /* storeIDs */
-		rangeID,
 		storeFilterThrottled,
 		[]int{
 			int(matchingStore.StoreID),
@@ -319,7 +319,6 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		sp,
 		constraints,
 		limitToStoreIDs,
-		rangeID,
 		storeFilterNone,
 		[]int{
 			int(matchingStore.StoreID),
@@ -337,7 +336,6 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		sp,
 		constraints,
 		limitToStoreIDs,
-		rangeID,
 		storeFilterThrottled,
 		[]int{
 			int(matchingStore.StoreID),
@@ -702,7 +700,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 		mnl.setNodeStatus(roachpb.NodeID(i), kvserverpb.NodeLivenessStatus_LIVE)
 	}
 
-	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(0, replicas)
+	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(replicas)
 	if len(liveReplicas) != 5 {
 		t.Fatalf("expected five live replicas, found %d (%v)", len(liveReplicas), liveReplicas)
 	}
@@ -713,7 +711,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 	mnl.setNodeStatus(4, kvserverpb.NodeLivenessStatus_DEAD)
 	mnl.setNodeStatus(5, kvserverpb.NodeLivenessStatus_DEAD)
 
-	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(0, replicas)
+	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(replicas)
 	if a, e := liveReplicas, replicas[:3]; !reflect.DeepEqual(a, e) {
 		t.Fatalf("expected live replicas %+v; got %+v", e, a)
 	}
@@ -724,7 +722,7 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 	// Mark node 4 as merely unavailable.
 	mnl.setNodeStatus(4, kvserverpb.NodeLivenessStatus_UNAVAILABLE)
 
-	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(0, replicas)
+	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(replicas)
 	if a, e := liveReplicas, replicas[:3]; !reflect.DeepEqual(a, e) {
 		t.Fatalf("expected live replicas %+v; got %+v", e, a)
 	}
@@ -748,12 +746,12 @@ func TestStorePoolDefaultState(t *testing.T) {
 		kvserverpb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.Background())
 
-	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(0, []roachpb.ReplicaDescriptor{{StoreID: 1}})
+	liveReplicas, deadReplicas := sp.liveAndDeadReplicas([]roachpb.ReplicaDescriptor{{StoreID: 1}})
 	if len(liveReplicas) != 0 || len(deadReplicas) != 0 {
 		t.Errorf("expected 0 live and 0 dead replicas; got %v and %v", liveReplicas, deadReplicas)
 	}
 
-	sl, alive, throttled := sp.getStoreList(roachpb.RangeID(0), storeFilterNone)
+	sl, alive, throttled := sp.getStoreList(storeFilterNone)
 	if len(sl.stores) > 0 {
 		t.Errorf("expected no live stores; got list of %v", sl)
 	}
@@ -939,7 +937,7 @@ func TestStorePoolDecommissioningReplicas(t *testing.T) {
 		mnl.setNodeStatus(roachpb.NodeID(i), kvserverpb.NodeLivenessStatus_LIVE)
 	}
 
-	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(0, replicas)
+	liveReplicas, deadReplicas := sp.liveAndDeadReplicas(replicas)
 	if len(liveReplicas) != 5 {
 		t.Fatalf("expected five live replicas, found %d (%v)", len(liveReplicas), liveReplicas)
 	}
@@ -951,7 +949,7 @@ func TestStorePoolDecommissioningReplicas(t *testing.T) {
 	// Mark node 5 as dead.
 	mnl.setNodeStatus(5, kvserverpb.NodeLivenessStatus_DEAD)
 
-	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(0, replicas)
+	liveReplicas, deadReplicas = sp.liveAndDeadReplicas(replicas)
 	// Decommissioning replicas are considered live.
 	if a, e := liveReplicas, replicas[:4]; !reflect.DeepEqual(a, e) {
 		t.Fatalf("expected live replicas %+v; got %+v", e, a)
@@ -960,7 +958,7 @@ func TestStorePoolDecommissioningReplicas(t *testing.T) {
 		t.Fatalf("expected dead replicas %+v; got %+v", e, a)
 	}
 
-	decommissioningReplicas := sp.decommissioningReplicas(0, replicas)
+	decommissioningReplicas := sp.decommissioningReplicas(replicas)
 	if a, e := decommissioningReplicas, replicas[3:4]; !reflect.DeepEqual(a, e) {
 		t.Fatalf("expected decommissioning replicas %+v; got %+v", e, a)
 	}

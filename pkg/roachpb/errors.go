@@ -342,21 +342,6 @@ func (e *LeaseRejectedError) message(_ *Error) string {
 
 var _ ErrorDetailInterface = &LeaseRejectedError{}
 
-// NewSendError creates a SendError.
-func NewSendError(msg string) *SendError {
-	return &SendError{Message: msg}
-}
-
-func (s SendError) Error() string {
-	return s.message(nil)
-}
-
-func (s *SendError) message(_ *Error) string {
-	return "failed to send RPC: " + s.Message
-}
-
-var _ ErrorDetailInterface = &SendError{}
-
 // NewRangeNotFoundError initializes a new RangeNotFoundError for the given RangeID and, optionally,
 // a StoreID.
 func NewRangeNotFoundError(rangeID RangeID, storeID StoreID) *RangeNotFoundError {
@@ -382,15 +367,18 @@ var _ ErrorDetailInterface = &RangeNotFoundError{}
 
 // NewRangeKeyMismatchError initializes a new RangeKeyMismatchError.
 func NewRangeKeyMismatchError(start, end Key, desc *RangeDescriptor) *RangeKeyMismatchError {
-	if desc != nil && !desc.IsInitialized() {
-		// We must never send uninitialized ranges back to the client (nil
-		// is fine) guard against regressions of #6027.
+	if desc == nil {
+		panic("NewRangeKeyMismatchError with nil descriptor")
+	}
+	if !desc.IsInitialized() {
+		// We must never send uninitialized ranges back to the client guard against
+		// regressions of #6027.
 		panic(fmt.Sprintf("descriptor is not initialized: %+v", desc))
 	}
 	return &RangeKeyMismatchError{
 		RequestStartKey: start,
 		RequestEndKey:   end,
-		MismatchedRange: desc,
+		MismatchedRange: *desc,
 	}
 }
 
@@ -399,11 +387,8 @@ func (e *RangeKeyMismatchError) Error() string {
 }
 
 func (e *RangeKeyMismatchError) message(_ *Error) string {
-	if e.MismatchedRange != nil {
-		return fmt.Sprintf("key range %s-%s outside of bounds of range %s-%s",
-			e.RequestStartKey, e.RequestEndKey, e.MismatchedRange.StartKey, e.MismatchedRange.EndKey)
-	}
-	return fmt.Sprintf("key range %s-%s could not be located within a range on store", e.RequestStartKey, e.RequestEndKey)
+	return fmt.Sprintf("key range %s-%s outside of bounds of range %s-%s",
+		e.RequestStartKey, e.RequestEndKey, e.MismatchedRange.StartKey, e.MismatchedRange.EndKey)
 }
 
 var _ ErrorDetailInterface = &RangeKeyMismatchError{}

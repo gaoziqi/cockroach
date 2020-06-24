@@ -110,7 +110,7 @@ func TestPutHttp(t *testing.T) {
 		srv, files, cleanup := makeServer()
 		defer cleanup()
 		testExportStore(t, srv.String(), false)
-		if expected, actual := 13, files(); expected != actual {
+		if expected, actual := 14, files(); expected != actual {
 			t.Fatalf("expected %d files to be written to single http store, got %d", expected, actual)
 		}
 	})
@@ -149,7 +149,7 @@ func TestPutHttp(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		s, err := MakeExternalStorage(ctx, conf, base.ExternalIOConfig{},
+		s, err := MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{},
 			testSettings, blobs.TestEmptyBlobClientFactory)
 		if err != nil {
 			t.Fatal(err)
@@ -288,7 +288,7 @@ func TestHttpGetWithCancelledContext(t *testing.T) {
 }
 
 func TestCanDisableHttp(t *testing.T) {
-	conf := base.ExternalIOConfig{
+	conf := base.ExternalIODirConfig{
 		DisableHTTP: true,
 	}
 	s, err := MakeExternalStorage(
@@ -320,7 +320,7 @@ func TestExternalStorageCanUseHTTPProxy(t *testing.T) {
 	conf, err := ExternalStorageConfFromURI("http://my-server")
 	require.NoError(t, err)
 	s, err := MakeExternalStorage(
-		context.Background(), conf, base.ExternalIOConfig{}, testSettings, nil)
+		context.Background(), conf, base.ExternalIODirConfig{}, testSettings, nil)
 	require.NoError(t, err)
 	stream, err := s.ReadFile(context.Background(), "file")
 	require.NoError(t, err)

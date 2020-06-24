@@ -17,6 +17,7 @@ import (
 )
 
 var pgxReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
+var supportedTag = "v4.6.0"
 
 // This test runs pgx's full test suite against a single cockroach node.
 
@@ -58,6 +59,7 @@ func registerPgx(r *testRegistry) {
 			t.Fatal(err)
 		}
 		c.l.Printf("Latest jackc/pgx release is %s.", latestTag)
+		c.l.Printf("Supported release is %s.", supportedTag)
 
 		t.Status("installing go-junit-report")
 		if err := repeatRunE(
@@ -66,15 +68,15 @@ func registerPgx(r *testRegistry) {
 			t.Fatal(err)
 		}
 
-		t.Status("checking blacklist")
-		blacklistName, expectedFailures, ignorelistName, ignorelist := pgxBlacklists.getLists(version)
+		t.Status("checking blocklist")
+		blocklistName, expectedFailures, ignorelistName, ignorelist := pgxBlocklists.getLists(version)
 		if expectedFailures == nil {
-			t.Fatalf("No pgx blacklist defined for cockroach version %s", version)
+			t.Fatalf("No pgx blocklist defined for cockroach version %s", version)
 		}
-		status := fmt.Sprintf("Running cockroach version %s, using blacklist %s", version, blacklistName)
+		status := fmt.Sprintf("Running cockroach version %s, using blocklist %s", version, blocklistName)
 		if ignorelist != nil {
-			status = fmt.Sprintf("Running cockroach version %s, using blacklist %s, using ignorelist %s",
-				version, blacklistName, ignorelistName)
+			status = fmt.Sprintf("Running cockroach version %s, using blocklist %s, using ignorelist %s",
+				version, blocklistName, ignorelistName)
 		}
 		c.l.Printf("%s", status)
 
@@ -109,7 +111,7 @@ func registerPgx(r *testRegistry) {
 		results := newORMTestsResults()
 		results.parseJUnitXML(t, expectedFailures, ignorelist, xmlResults)
 		results.summarizeAll(
-			t, "pgx", blacklistName, expectedFailures, version, latestTag,
+			t, "pgx", blocklistName, expectedFailures, version, supportedTag,
 		)
 	}
 

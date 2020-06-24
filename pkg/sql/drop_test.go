@@ -126,9 +126,8 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	if err := kvDB.GetProto(ctx, dbDescKey, desc); err != nil {
 		t.Fatal(err)
 	}
-	dbDesc := desc.GetDatabase()
-
-	tbNameKey := sqlbase.NewPublicTableKey(dbDesc.ID, "kv").Key(keys.SystemSQLCodec)
+	dbDesc := sqlbase.NewImmutableDatabaseDescriptor(*desc.GetDatabase())
+	tbNameKey := sqlbase.NewPublicTableKey(dbDesc.GetID(), "kv").Key(keys.SystemSQLCodec)
 	gr, err := kvDB.Get(ctx, tbNameKey)
 	if err != nil {
 		t.Fatal(err)
@@ -152,14 +151,14 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, tbDesc.ID, buf); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, dbDesc.ID, buf); err != nil {
+	if _, err := sqlDB.Exec(`INSERT INTO system.zones VALUES ($1, $2)`, dbDesc.GetID(), buf); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := zoneExists(sqlDB, &cfg, tbDesc.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := zoneExists(sqlDB, &cfg, dbDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, dbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,11 +187,11 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 		t.Fatalf("table descriptor key still exists after database is dropped")
 	}
 
-	if err := descExists(sqlDB, false, dbDesc.ID); err != nil {
+	if err := descExists(sqlDB, false, dbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 	// Database zone config is removed once all table data and zone configs are removed.
-	if err := zoneExists(sqlDB, &cfg, dbDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &cfg, dbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -209,7 +208,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	// There are no more namespace entries referencing this database as its
 	// parent.
-	namespaceQuery := fmt.Sprintf(`SELECT * FROM system.namespace WHERE "parentID"  = %d`, dbDesc.ID)
+	namespaceQuery := fmt.Sprintf(`SELECT * FROM system.namespace WHERE "parentID"  = %d`, dbDesc.GetID())
 	sqlRun.CheckQueryResults(t, namespaceQuery, [][]string{})
 
 	// Job still running, waiting for GC.
@@ -309,9 +308,9 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	if err := kvDB.GetProto(ctx, dbDescKey, desc); err != nil {
 		t.Fatal(err)
 	}
-	dbDesc := desc.GetDatabase()
+	dbDesc := sqlbase.NewImmutableDatabaseDescriptor(*desc.GetDatabase())
 
-	tKey := sqlbase.NewPublicTableKey(dbDesc.ID, "kv")
+	tKey := sqlbase.NewPublicTableKey(dbDesc.GetID(), "kv")
 	gr, err := kvDB.Get(ctx, tKey.Key(keys.SystemSQLCodec))
 	if err != nil {
 		t.Fatal(err)
@@ -326,7 +325,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	}
 	tbDesc := desc.Table(ts)
 
-	t2Key := sqlbase.NewPublicTableKey(dbDesc.ID, "kv2")
+	t2Key := sqlbase.NewPublicTableKey(dbDesc.GetID(), "kv2")
 	gr2, err := kvDB.Get(ctx, t2Key.Key(keys.SystemSQLCodec))
 	if err != nil {
 		t.Fatal(err)
@@ -346,7 +345,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	tests.CheckKeyCount(t, kvDB, tableSpan, 6)
 	tests.CheckKeyCount(t, kvDB, table2Span, 6)
 
-	if _, err := sqltestutils.AddDefaultZoneConfig(sqlDB, dbDesc.ID); err != nil {
+	if _, err := sqltestutils.AddDefaultZoneConfig(sqlDB, dbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -395,7 +394,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	tests.CheckKeyCount(t, kvDB, table2Span, 6)
 
 	def := zonepb.DefaultZoneConfig()
-	if err := zoneExists(sqlDB, &def, dbDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, &def, dbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -412,7 +411,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tb2Desc.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, dbDesc.ID); err != nil {
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, dbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -438,7 +437,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	}
 
 	// Database zone config is removed once all table data and zone configs are removed.
-	if err := zoneExists(sqlDB, nil, dbDesc.ID); err != nil {
+	if err := zoneExists(sqlDB, nil, dbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -918,13 +917,15 @@ func TestDropTableDeleteData(t *testing.T) {
 	}
 }
 
-func writeTableDesc(ctx context.Context, db *kv.DB, tableDesc *sqlbase.TableDescriptor) error {
+func writeTableDesc(
+	ctx context.Context, db *kv.DB, tableDesc *sqlbase.MutableTableDescriptor,
+) error {
 	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		if err := txn.SetSystemConfigTrigger(); err != nil {
 			return err
 		}
 		tableDesc.ModificationTime = txn.CommitTimestamp()
-		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), sqlbase.WrapDescriptor(tableDesc))
+		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), tableDesc.DescriptorProto())
 	})
 }
 
@@ -959,7 +960,7 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	sqlutils.CreateTable(t, sqlDBRaw, "t", "a INT", numRows, sqlutils.ToRowFn(sqlutils.RowIdxFn))
 
 	// Give the table an old format version.
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	tableDesc := sqlbase.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	tableDesc.FormatVersion = sqlbase.FamilyFormatVersion
 	tableDesc.Version++
 	if err := writeTableDesc(ctx, kvDB, tableDesc); err != nil {
@@ -974,7 +975,7 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	// Simulate a migration upgrading the table descriptor's format version after
 	// the table has been dropped but before the truncation has occurred.
 	var err error
-	tableDesc, err = sqlbase.GetTableDescFromID(ctx, kvDB.NewTxn(ctx, ""), keys.SystemSQLCodec, tableDesc.ID)
+	tableDesc, err = sqlbase.GetMutableTableDescFromID(ctx, kvDB.NewTxn(ctx, ""), keys.SystemSQLCodec, tableDesc.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1396,4 +1397,93 @@ WHERE
 	_, err = txn.Exec("DROP INDEX foo@j_idx")
 	require.Truef(t, isRetryableErr(err), "drop index error: %v", err)
 	require.NoError(t, txn.Rollback())
+}
+
+// TestDropDatabaseWithForeignKeys tests that databases containing tables with
+// foreign key relationships can be dropped and GC'ed. This is a regression test
+// for #50344, which is a bug ultimately caused by the fact that when we remove
+// foreign keys as part of DROP DATABASE CASCADE, we create schema change jobs
+// as part of updating the referenced tables. Those jobs, when running, will
+// detect that the table is in a dropped state and queue an extraneous GC job.
+// We test that those GC jobs don't interfere with the main GC job for the
+// entire database.
+func TestDropDatabaseWithForeignKeys(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := tests.CreateTestServerParams()
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
+
+	_, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.parent(k INT PRIMARY KEY);
+CREATE TABLE t.child(k INT PRIMARY KEY REFERENCES t.parent);
+`)
+	require.NoError(t, err)
+
+	dbNameKey := sqlbase.NewDatabaseKey("t").Key(keys.SystemSQLCodec)
+	r, err := kvDB.Get(ctx, dbNameKey)
+	require.NoError(t, err)
+	require.True(t, r.Exists())
+	dbID := sqlbase.ID(r.ValueInt())
+
+	parentNameKey := sqlbase.NewPublicTableKey(dbID, "parent").Key(keys.SystemSQLCodec)
+	r, err = kvDB.Get(ctx, parentNameKey)
+	require.NoError(t, err)
+	require.True(t, r.Exists())
+	parentID := sqlbase.ID(r.ValueInt())
+
+	parentDescKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, parentID)
+	desc := &sqlbase.Descriptor{}
+	ts, err := kvDB.GetProtoTs(ctx, parentDescKey, desc)
+	require.NoError(t, err)
+	parentDesc := desc.Table(ts)
+
+	childNameKey := sqlbase.NewPublicTableKey(dbID, "child").Key(keys.SystemSQLCodec)
+	r, err = kvDB.Get(ctx, childNameKey)
+	require.NoError(t, err)
+	require.True(t, r.Exists())
+	childID := sqlbase.ID(r.ValueInt())
+
+	childDescKey := sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, childID)
+	desc = &sqlbase.Descriptor{}
+	ts, err = kvDB.GetProtoTs(ctx, childDescKey, desc)
+	require.NoError(t, err)
+	childDesc := desc.Table(ts)
+
+	_, err = sqlDB.Exec(`DROP DATABASE t CASCADE;`)
+	require.NoError(t, err)
+
+	// Push a new zone config for the table with TTL=0 so the data is
+	// deleted immediately.
+	_, err = sqltestutils.AddImmediateGCZoneConfig(sqlDB, dbID)
+	require.NoError(t, err)
+
+	// Ensure the main GC job for the whole database succeeds.
+	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+	testutils.SucceedsSoon(t, func() error {
+		var count int
+		sqlRun.QueryRow(t, `SELECT count(*) FROM [SHOW JOBS] WHERE description = 'GC for DROP DATABASE t CASCADE' AND status = 'succeeded'`).Scan(&count)
+		if count != 1 {
+			return errors.Newf("expected 1 result, got %d", count)
+		}
+		return nil
+	})
+	// Ensure the extra GC job that also gets queued succeeds. Currently this job
+	// has a nonsensical description due to the fact that the original job queued
+	// for updating the referenced table has an empty description.
+	testutils.SucceedsSoon(t, func() error {
+		var count int
+		sqlRun.QueryRow(t, `SELECT count(*) FROM [SHOW JOBS] WHERE description = 'GC for ' AND status = 'succeeded'`).Scan(&count)
+		if count != 1 {
+			return errors.Newf("expected 1 result, got %d", count)
+		}
+		return nil
+	})
+
+	// Check that the data was cleaned up.
+	tests.CheckKeyCount(t, kvDB, parentDesc.TableSpan(keys.SystemSQLCodec), 0)
+	tests.CheckKeyCount(t, kvDB, childDesc.TableSpan(keys.SystemSQLCodec), 0)
 }

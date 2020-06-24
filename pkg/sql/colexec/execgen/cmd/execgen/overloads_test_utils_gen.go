@@ -43,11 +43,11 @@ import (
 func {{template "opName" .}}(a {{.Left.GoType}}, b {{.Right.GoType}}) {{.Right.RetGoType}} {
 	var r {{.Right.RetGoType}}
 	// In order to inline the templated code of overloads, we need to have a
-	// "decimalScratch" local variable of type "decimalOverloadScratch".
-	var decimalScratch decimalOverloadScratch
+	// "_overloadHelper" local variable of type "overloadHelper".
+	var _overloadHelper overloadHelper
 	// However, the scratch is not used in all of the functions, so we add this
 	// to go around "unused" error.
-	_ = decimalScratch
+	_ = _overloadHelper
 	{{(.Right.Assign "r" "a" "b" "" "" "")}}
 	return r
 }
@@ -59,7 +59,7 @@ func {{template "opName" .}}(a {{.Left.GoType}}, b {{.Right.GoType}}) {{.Right.R
 // genOverloadsTestUtils creates a file that has a function for each binary and
 // comparison overload supported by the vectorized engine. This is so that we
 // can more easily test each overload.
-func genOverloadsTestUtils(wr io.Writer) error {
+func genOverloadsTestUtils(_ string, wr io.Writer) error {
 	tmpl, err := template.New("overloads_test_utils").Parse(overloadsTestUtilsTemplate)
 	if err != nil {
 		return err

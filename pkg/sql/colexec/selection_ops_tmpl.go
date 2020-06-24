@@ -20,47 +20,20 @@
 package colexec
 
 import (
-	"bytes"
 	"context"
-	"math"
-	"time"
 
-	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
-// Remove unused warning.
-var _ = execgen.UNSAFEGET
-
 // {{/*
 // Declarations to make the template compile properly.
-
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "apd" package.
-var _ apd.Decimal
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
-
-// Dummy import to pull in "time" package.
-var _ time.Time
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
 
 // _LEFT_CANONICAL_TYPE_FAMILY is the template variable.
 const _LEFT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
@@ -73,9 +46,6 @@ const _RIGHT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
 
 // _RIGHT_TYPE_WIDTH is the template variable.
 const _RIGHT_TYPE_WIDTH = 0
-
-// Dummy import to pull in "coldataext" package.
-var _ coldataext.Datum
 
 // _ASSIGN_CMP is the template function for assigning the result of comparing
 // the second input to the third input into the first input.
@@ -189,7 +159,7 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 type selConstOpBase struct {
 	OneInputNode
 	colIdx         int
-	decimalScratch decimalOverloadScratch
+	overloadHelper overloadHelper
 }
 
 // selOpBase contains all of the fields for non-constant binary selections.
@@ -197,7 +167,7 @@ type selOpBase struct {
 	OneInputNode
 	col1Idx        int
 	col2Idx        int
-	decimalScratch decimalOverloadScratch
+	overloadHelper overloadHelper
 }
 
 // {{define "selConstOp"}}
@@ -208,11 +178,11 @@ type _OP_CONST_NAME struct {
 
 func (p *_OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
 	// In order to inline the templated code of overloads, we need to have a
-	// `decimalScratch` local variable of type `decimalOverloadScratch`.
-	decimalScratch := p.decimalScratch
+	// `_overloadHelper` local variable of type `overloadHelper`.
+	_overloadHelper := p.overloadHelper
 	// However, the scratch is not used in all of the selection operators, so
 	// we add this to go around "unused" error.
-	_ = decimalScratch
+	_ = _overloadHelper
 	var isNull bool
 	for {
 		batch := p.input.Next(ctx)
@@ -250,11 +220,11 @@ type _OP_NAME struct {
 
 func (p *_OP_NAME) Next(ctx context.Context) coldata.Batch {
 	// In order to inline the templated code of overloads, we need to have a
-	// `decimalScratch` local variable of type `decimalOverloadScratch`.
-	decimalScratch := p.decimalScratch
+	// `_overloadHelper` local variable of type `overloadHelper`.
+	_overloadHelper := p.overloadHelper
 	// However, the scratch is not used in all of the selection operators, so
 	// we add this to go around "unused" error.
-	_ = decimalScratch
+	_ = _overloadHelper
 	var isNull bool
 	for {
 		batch := p.input.Next(ctx)
@@ -312,14 +282,16 @@ func GetSelectionConstOperator(
 	input colexecbase.Operator,
 	colIdx int,
 	constArg tree.Datum,
+	overloadHelper overloadHelper,
 ) (colexecbase.Operator, error) {
 	c, err := getDatumToPhysicalFn(constType)(constArg)
 	if err != nil {
 		return nil, err
 	}
 	selConstOpBase := selConstOpBase{
-		OneInputNode: NewOneInputNode(input),
-		colIdx:       colIdx,
+		OneInputNode:   NewOneInputNode(input),
+		colIdx:         colIdx,
+		overloadHelper: overloadHelper,
 	}
 	switch cmpOp {
 	// {{range .CmpOps}}
@@ -359,11 +331,13 @@ func GetSelectionOperator(
 	input colexecbase.Operator,
 	col1Idx int,
 	col2Idx int,
+	overloadHelper overloadHelper,
 ) (colexecbase.Operator, error) {
 	selOpBase := selOpBase{
-		OneInputNode: NewOneInputNode(input),
-		col1Idx:      col1Idx,
-		col2Idx:      col2Idx,
+		OneInputNode:   NewOneInputNode(input),
+		col1Idx:        col1Idx,
+		col2Idx:        col2Idx,
+		overloadHelper: overloadHelper,
 	}
 	switch cmpOp {
 	// {{range .CmpOps}}

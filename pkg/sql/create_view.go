@@ -36,7 +36,7 @@ type createViewNode struct {
 	ifNotExists bool
 	replace     bool
 	temporary   bool
-	dbDesc      *sqlbase.DatabaseDescriptor
+	dbDesc      *sqlbase.ImmutableDatabaseDescriptor
 	columns     sqlbase.ResultColumns
 
 	// planDeps tracks which tables and views the view being created
@@ -78,7 +78,7 @@ func (n *createViewNode) startExec(params runParams) error {
 
 	var replacingDesc *sqlbase.MutableTableDescriptor
 
-	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.ID, isTemporary, viewName)
+	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), isTemporary, viewName)
 	if err != nil {
 		switch {
 		case !sqlbase.IsRelationAlreadyExistsError(err):
@@ -134,9 +134,10 @@ func (n *createViewNode) startExec(params runParams) error {
 			return err
 		}
 		desc, err := makeViewTableDesc(
+			params.ctx,
 			viewName,
 			n.viewQuery,
-			n.dbDesc.ID,
+			n.dbDesc.GetID(),
 			schemaID,
 			id,
 			n.columns,
@@ -185,12 +186,13 @@ func (n *createViewNode) startExec(params runParams) error {
 			dep.ID = newDesc.ID
 			backRefMutable.DependedOnBy = append(backRefMutable.DependedOnBy, dep)
 		}
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
 		if err := params.p.writeSchemaChange(
 			params.ctx,
 			backRefMutable,
 			sqlbase.InvalidMutationID,
-			fmt.Sprintf("updating view reference %q", n.viewName),
+			fmt.Sprintf("updating view reference %q in table %s(%d)", n.viewName,
+				updated.desc.Name, updated.desc.ID,
+			),
 		); err != nil {
 			return err
 		}
@@ -202,7 +204,7 @@ func (n *createViewNode) startExec(params runParams) error {
 
 	// Log Create View event. This is an auditable log event and is
 	// recorded in the same transaction as the table descriptor update.
-	tn := tree.MakeTableNameWithSchema(tree.Name(n.dbDesc.Name), schemaName, n.viewName)
+	tn := tree.MakeTableNameWithSchema(tree.Name(n.dbDesc.GetName()), schemaName, n.viewName)
 	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
 		params.ctx,
 		params.p.txn,
@@ -233,6 +235,7 @@ func (n *createViewNode) Close(ctx context.Context)  {}
 // doesn't matter if reads/writes use a cached descriptor that doesn't
 // include the back-references.
 func makeViewTableDesc(
+	ctx context.Context,
 	viewName string,
 	viewQuery string,
 	parentID sqlbase.ID,
@@ -245,7 +248,7 @@ func makeViewTableDesc(
 	evalCtx *tree.EvalContext,
 	temporary bool,
 ) (sqlbase.MutableTableDescriptor, error) {
-	desc := InitTableDescriptor(
+	desc := sqlbase.InitTableDescriptor(
 		id,
 		parentID,
 		schemaID,
@@ -255,7 +258,7 @@ func makeViewTableDesc(
 		temporary,
 	)
 	desc.ViewQuery = viewQuery
-	if err := addResultColumns(semaCtx, evalCtx, &desc, resultColumns); err != nil {
+	if err := addResultColumns(ctx, semaCtx, evalCtx, &desc, resultColumns); err != nil {
 		return sqlbase.MutableTableDescriptor{}, err
 	}
 	return desc, nil
@@ -277,7 +280,7 @@ func (p *planner) replaceViewDesc(
 	// Reset the columns to add the new result columns onto.
 	toReplace.Columns = make([]sqlbase.ColumnDescriptor, 0, len(n.columns))
 	toReplace.NextColumnID = 0
-	if err := addResultColumns(&p.semaCtx, p.EvalContext(), toReplace, n.columns); err != nil {
+	if err := addResultColumns(ctx, &p.semaCtx, p.EvalContext(), toReplace, n.columns); err != nil {
 		return nil, err
 	}
 
@@ -310,7 +313,9 @@ func (p *planner) replaceViewDesc(
 				ctx,
 				desc,
 				sqlbase.InvalidMutationID,
-				fmt.Sprintf("updating view reference %q", n.viewName),
+				fmt.Sprintf("removing view reference for %q from %s(%d)", n.viewName,
+					desc.Name, desc.ID,
+				),
 			); err != nil {
 				return nil, err
 			}
@@ -337,6 +342,7 @@ func (p *planner) replaceViewDesc(
 // addResultColumns adds the resultColumns as actual column
 // descriptors onto desc.
 func addResultColumns(
+	ctx context.Context,
 	semaCtx *tree.SemaContext,
 	evalCtx *tree.EvalContext,
 	desc *sqlbase.MutableTableDescriptor,
@@ -346,7 +352,7 @@ func addResultColumns(
 		columnTableDef := tree.ColumnTableDef{Name: tree.Name(colRes.Name), Type: colRes.Typ}
 		// The new types in the CREATE VIEW column specs never use
 		// SERIAL so we need not process SERIAL types here.
-		col, _, _, err := sqlbase.MakeColumnDefDescs(&columnTableDef, semaCtx, evalCtx)
+		col, _, _, err := sqlbase.MakeColumnDefDescs(ctx, &columnTableDef, semaCtx, evalCtx)
 		if err != nil {
 			return err
 		}

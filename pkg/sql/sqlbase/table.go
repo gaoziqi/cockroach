@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/text/language"
@@ -32,6 +33,7 @@ import (
 // type and contains no variable expressions. It returns the type-checked and
 // constant-folded expression.
 func SanitizeVarFreeExpr(
+	ctx context.Context,
 	expr tree.Expr,
 	expectedType *types.T,
 	context string,
@@ -55,7 +57,7 @@ func SanitizeVarFreeExpr(
 	}
 	semaCtx.Properties.Require(context, flags)
 
-	typedExpr, err := tree.TypeCheck(expr, semaCtx, expectedType)
+	typedExpr, err := tree.TypeCheck(ctx, expr, semaCtx, expectedType)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +132,7 @@ func ValidateColumnDefType(t *types.T) error {
 // The DEFAULT expression is returned in TypedExpr form for analysis (e.g. recording
 // sequence dependencies).
 func MakeColumnDefDescs(
-	d *tree.ColumnTableDef, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext,
+	ctx context.Context, d *tree.ColumnTableDef, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext,
 ) (*ColumnDescriptor, *IndexDescriptor, tree.TypedExpr, error) {
 	if d.IsSerial {
 		// To the reader of this code: if control arrives here, this means
@@ -157,7 +159,7 @@ func MakeColumnDefDescs(
 	}
 
 	// Validate and assign column type.
-	resType, err := tree.ResolveType(d.Type, semaCtx.GetTypeResolver())
+	resType, err := tree.ResolveType(ctx, d.Type, semaCtx.GetTypeResolver())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -172,7 +174,7 @@ func MakeColumnDefDescs(
 		// and does not contain invalid functions.
 		var err error
 		if typedExpr, err = SanitizeVarFreeExpr(
-			d.DefaultExpr.Expr, resType, "DEFAULT", semaCtx, true, /* allowImpure */
+			ctx, d.DefaultExpr.Expr, resType, "DEFAULT", semaCtx, true, /* allowImpure */
 		); err != nil {
 			return nil, nil, nil, err
 		}
@@ -201,7 +203,7 @@ func MakeColumnDefDescs(
 				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
 			}
 		} else {
-			buckets, err := EvalShardBucketCount(semaCtx, evalCtx, d.PrimaryKey.ShardBuckets)
+			buckets, err := EvalShardBucketCount(ctx, semaCtx, evalCtx, d.PrimaryKey.ShardBuckets)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -229,11 +231,11 @@ func MakeColumnDefDescs(
 // EvalShardBucketCount evaluates and checks the integer argument to a `USING HASH WITH
 // BUCKET_COUNT` index creation query.
 func EvalShardBucketCount(
-	semaCtx *tree.SemaContext, evalCtx *tree.EvalContext, shardBuckets tree.Expr,
+	ctx context.Context, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext, shardBuckets tree.Expr,
 ) (int32, error) {
 	const invalidBucketCountMsg = `BUCKET_COUNT must be an integer greater than 1`
 	typedExpr, err := SanitizeVarFreeExpr(
-		shardBuckets, types.Int, "BUCKET_COUNT", semaCtx, true, /* allowImpure */
+		ctx, shardBuckets, types.Int, "BUCKET_COUNT", semaCtx, true, /* allowImpure */
 	)
 	if err != nil {
 		return 0, err
@@ -578,6 +580,9 @@ func FindFKOriginIndexInTxn(
 // ConditionFailedError on mismatch. We don't directly use CPut with protos
 // because the marshaling is not guaranteed to be stable and also because it's
 // sensitive to things like missing vs default values of fields.
+//
+// TODO(ajwerner): Make this take a TableDescriptorInterface and probably add
+// an equality method on that interface or something like that.
 func ConditionalGetTableDescFromTxn(
 	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, expectation *TableDescriptor,
 ) (*roachpb.Value, error) {
@@ -595,7 +600,7 @@ func ConditionalGetTableDescFromTxn(
 		}
 		existing.Table(existingKV.Value.Timestamp)
 	}
-	wrapped := WrapDescriptor(expectation)
+	wrapped := wrapDescriptor(expectation)
 	if !existing.Equal(wrapped) {
 		return nil, &roachpb.ConditionFailedError{ActualValue: existingKV.Value}
 	}
@@ -642,4 +647,45 @@ func HasAddingTableError(err error) bool {
 // inactiveTableError.
 func HasInactiveTableError(err error) bool {
 	return errors.HasType(err, (*inactiveTableError)(nil))
+}
+
+// InitTableDescriptor returns a blank TableDescriptor.
+func InitTableDescriptor(
+	id, parentID, parentSchemaID ID,
+	name string,
+	creationTime hlc.Timestamp,
+	privileges *PrivilegeDescriptor,
+	temporary bool,
+) MutableTableDescriptor {
+	return MutableTableDescriptor{TableDescriptor: TableDescriptor{
+		ID:                      id,
+		Name:                    name,
+		ParentID:                parentID,
+		UnexposedParentSchemaID: parentSchemaID,
+		FormatVersion:           InterleavedFormatVersion,
+		Version:                 1,
+		ModificationTime:        creationTime,
+		Privileges:              privileges,
+		CreateAsOfTime:          creationTime,
+		Temporary:               temporary,
+	}}
+}
+
+// NewMutableTableDescriptorAsReplacement creates a new MutableTableDescriptor
+// as a replacement of an existing table. This is utilized with truncate.
+//
+// The passed readTimestamp is serialized into the descriptor's ReplacementOf
+// field for debugging purposes. The passed id will be the ID of the newly
+// returned replacement.
+func NewMutableTableDescriptorAsReplacement(
+	id ID, replacementOf *MutableTableDescriptor, readTimestamp hlc.Timestamp,
+) *MutableTableDescriptor {
+	replacement := &MutableTableDescriptor{TableDescriptor: replacementOf.TableDescriptor}
+	replacement.ID = id
+	replacement.Version = 1
+	replacement.ReplacementOf = TableDescriptor_Replacement{
+		ID:   replacementOf.ID,
+		Time: readTimestamp,
+	}
+	return replacement
 }

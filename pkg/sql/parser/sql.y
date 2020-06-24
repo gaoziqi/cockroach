@@ -647,8 +647,10 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 // NOT_LA exists so that productions such as NOT LIKE can be given the same
 // precedence as LIKE; otherwise they'd effectively have the same precedence as
 // NOT, at least with respect to their left-hand subexpression. WITH_LA is
-// needed to make the grammar LALR(1).
-%token NOT_LA WITH_LA AS_LA
+// needed to make the grammar LALR(1). GENERATED_ALWAYS is needed to support
+// the Postgres syntax for computed columns along with our family related
+// extensions (CREATE FAMILY/CREATE FAMILY family_name).
+%token NOT_LA WITH_LA AS_LA GENERATED_ALWAYS
 
 %union {
   id    int32
@@ -760,6 +762,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %type <tree.Statement> drop_view_stmt
 %type <tree.Statement> drop_sequence_stmt
 
+%type <tree.Statement> analyze_stmt
 %type <tree.Statement> explain_stmt
 %type <tree.Statement> prepare_stmt
 %type <tree.Statement> preparable_stmt
@@ -885,7 +888,7 @@ func (u *sqlSymUnion) alterTypeAddValuePlacement() *tree.AlterTypeAddValuePlacem
 %type <str> schema_name
 %type <*tree.UnresolvedName> table_pattern complex_table_pattern
 %type <*tree.UnresolvedName> column_path prefixed_column_path column_path_with_star
-%type <tree.TableExpr> insert_target create_stats_target
+%type <tree.TableExpr> insert_target create_stats_target analyze_target
 
 %type <*tree.TableIndexName> table_index_name
 %type <tree.TableIndexNames> table_index_name_list
@@ -1167,7 +1170,8 @@ stmt_block:
 
 stmt:
   HELPTOKEN { return helpWith(sqllex, "") }
-| preparable_stmt  // help texts in sub-rule
+| preparable_stmt   // help texts in sub-rule
+| analyze_stmt      // EXTEND WITH HELP: ANALYZE
 | copy_from_stmt
 | comment_stmt
 | execute_stmt      // EXTEND WITH HELP: EXECUTE
@@ -2783,7 +2787,6 @@ drop_database_stmt:
 // %Help: DROP TYPE - remove a type
 // %Category: DDL
 // %Text: DROP TYPE [IF EXISTS] <type_name> [, ...] [CASCASE | RESTRICT]
-// %SeeAlso: WEBDOCS/drop-type.html
 drop_type_stmt:
   DROP TYPE type_name_list opt_drop_behavior
   {
@@ -2840,6 +2843,34 @@ table_name_list:
   {
     name := $3.unresolvedObjectName().ToTableName()
     $$.val = append($1.tableNames(), name)
+  }
+
+// %Help: ANALYZE - collect table statistics
+// %Category: Misc
+// %Text:
+// ANALYZE <tablename>
+//
+// %SeeAlso: CREATE STATISTICS
+analyze_stmt:
+  ANALYZE analyze_target
+  {
+    $$.val = &tree.Analyze{
+      Table: $2.tblExpr(),
+    }
+  }
+| ANALYZE error // SHOW HELP: ANALYZE
+| ANALYSE analyze_target
+  {
+    $$.val = &tree.Analyze{
+      Table: $2.tblExpr(),
+    }
+  }
+| ANALYSE error // SHOW HELP: ANALYZE
+
+analyze_target:
+  table_name
+  {
+    $$.val = $1.unresolvedObjectName()
   }
 
 // %Help: EXPLAIN - show the logical plan of a query
@@ -4987,7 +5018,7 @@ col_qualification_elem:
 // GENERATED ALWAYS is a noise word for compatibility with Postgres.
 generated_as:
   AS {}
-//  GENERATED ALWAYS AS {}
+| GENERATED_ALWAYS ALWAYS AS {}
 
 
 index_def:
@@ -5594,7 +5625,6 @@ opt_view_recursive:
 // %Help: CREATE TYPE -- create a type
 // %Category: DDL
 // %Text: CREATE TYPE <type_name> AS ENUM (...)
-// %SeeAlso: WEBDOCS/create-type.html
 create_type_stmt:
   // Enum types.
   CREATE TYPE type_name AS ENUM '(' opt_enum_val_list ')'
@@ -7669,13 +7699,21 @@ const_geo:
   {
     $$.val = types.MakeGeography($3.geoFigure(), 0)
   }
-| GEOMETRY '(' geo_shape ',' iconst32 ')'
+| GEOMETRY '(' geo_shape ',' signed_iconst ')'
   {
-    $$.val = types.MakeGeometry($3.geoFigure(), geopb.SRID($5.int32()))
+    val, err := $5.numVal().AsInt32()
+    if err != nil {
+      return setErr(sqllex, err)
+    }
+    $$.val = types.MakeGeometry($3.geoFigure(), geopb.SRID(val))
   }
-| GEOGRAPHY '(' geo_shape ',' iconst32 ')'
+| GEOGRAPHY '(' geo_shape ',' signed_iconst ')'
   {
-    $$.val = types.MakeGeography($3.geoFigure(), geopb.SRID($5.int32()))
+    val, err := $5.numVal().AsInt32()
+    if err != nil {
+      return setErr(sqllex, err)
+    }
+    $$.val = types.MakeGeography($3.geoFigure(), geopb.SRID(val))
   }
 
 // We have a separate const_typename to allow defaulting fixed-length types

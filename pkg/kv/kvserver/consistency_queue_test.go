@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -144,7 +145,7 @@ func TestCheckConsistencyReplay(t *testing.T) {
 		defer state.Unlock()
 		if ba.IsSingleComputeChecksumRequest() && !state.forcedRetry {
 			state.forcedRetry = true
-			return roachpb.NewError(roachpb.NewSendError("injected failure"))
+			return roachpb.NewError(errors.New(magicMultiTestContextKVTransportError))
 		}
 		return nil
 	}
@@ -164,6 +165,9 @@ func TestCheckConsistencyReplay(t *testing.T) {
 	if _, err := kv.SendWrapped(ctx, mtc.Store(0).TestSender(), &checkArgs); err != nil {
 		t.Fatal(err)
 	}
+	// Check that the request was evaluated twice (first time when forcedRetry was
+	// set, and a 2nd time such that kv.SendWrapped() returned success).
+	require.True(t, state.forcedRetry)
 
 	state.Lock()
 	defer state.Unlock()
@@ -364,8 +368,12 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	assert.Contains(t, resp.Result[0].Detail, `stats`)
 
 	// A death rattle should have been written on s2 (store index 1).
-	b, err := ioutil.ReadFile(base.PreventedStartupFile(mtc.stores[1].Engine().GetAuxiliaryDir()))
+	eng := mtc.stores[1].Engine()
+	f, err := eng.Open(base.PreventedStartupFile(eng.GetAuxiliaryDir()))
 	require.NoError(t, err)
+	b, err := ioutil.ReadAll(f)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
 	require.NotEmpty(t, b)
 }
 
@@ -451,7 +459,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 		// Split off a range so that we get away from the timeseries writes, which
 		// pollute the stats with ContainsEstimates=true. Note that the split clears
 		// the right hand side (which is what we operate on) from that flag.
-		if err := db0.AdminSplit(ctx, key, key, hlc.MaxTimestamp /* expirationTime */); err != nil {
+		if err := db0.AdminSplit(ctx, key, hlc.MaxTimestamp /* expirationTime */); err != nil {
 			t.Fatal(err)
 		}
 

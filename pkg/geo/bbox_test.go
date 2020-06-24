@@ -24,8 +24,11 @@ func TestBoundingBoxFromGeom(t *testing.T) {
 		g        geom.T
 		expected *geopb.BoundingBox
 	}{
+		{geom.NewPointFlat(geom.XY, []float64{-15, -20}), &geopb.BoundingBox{MinX: -15, MaxX: -15, MinY: -20, MaxY: -20}},
+		{geom.NewPointFlat(geom.XY, []float64{0, 0}), &geopb.BoundingBox{MinX: 0, MaxX: 0, MinY: 0, MaxY: 0}},
 		{testGeomPoint, &geopb.BoundingBox{MinX: 1, MaxX: 1, MinY: 2, MaxY: 2}},
 		{testGeomLineString, &geopb.BoundingBox{MinX: 1, MaxX: 2, MinY: 1, MaxY: 2}},
+		{geom.NewLineStringFlat(geom.XY, []float64{-15, -20, -30, -40}), &geopb.BoundingBox{MinX: -30, MaxX: -15, MinY: -40, MaxY: -20}},
 		{testGeomPolygon, &geopb.BoundingBox{MinX: 1, MaxX: 2, MinY: 1, MaxY: 2}},
 		{testGeomMultiPoint, &geopb.BoundingBox{MinX: 1, MaxX: 2, MinY: 1, MaxY: 2}},
 		{testGeomMultiLineString, &geopb.BoundingBox{MinX: 1, MaxX: 4, MinY: 1, MaxY: 4}},
@@ -44,8 +47,7 @@ func TestBoundingBoxFromGeom(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("%#v", tc.g), func(t *testing.T) {
-			bbox, err := BoundingBoxFromGeom(tc.g)
-			require.NoError(t, err)
+			bbox := boundingBoxFromGeom(tc.g)
 			require.Equal(t, tc.expected, bbox)
 		})
 	}

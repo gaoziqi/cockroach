@@ -26,6 +26,7 @@ import (
 	"strings"
 	"testing"
 	"text/tabwriter"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -118,12 +119,6 @@ type Flags struct {
 	// MemoFormat controls the output detail of memo command directives.
 	MemoFormat xform.FmtFlags
 
-	// AllowUnsupportedExpr if set: when building a scalar, the optbuilder takes
-	// any TypedExpr node that it doesn't recognize and wraps that expression in
-	// an UnsupportedExpr node. This is temporary; it is used for interfacing with
-	// the old planning code.
-	AllowUnsupportedExpr bool
-
 	// FullyQualifyNames if set: when building a query, the optbuilder fully
 	// qualifies all column names before adding them to the metadata. This flag
 	// allows us to test that name resolution works correctly, and avoids
@@ -193,24 +188,32 @@ type Flags struct {
 
 	// CascadeLevels limits the depth of recursive cascades for build-cascades.
 	CascadeLevels int
+
+	// NoStableFolds controls whether constant folding for normalization includes
+	// stable operators.
+	NoStableFolds bool
 }
 
 // New constructs a new instance of the OptTester for the given SQL statement.
 // Metadata used by the SQL query is accessed via the catalog.
 func New(catalog cat.Catalog, sql string) *OptTester {
+	ctx := context.Background()
 	ot := &OptTester{
 		catalog: catalog,
 		sql:     sql,
-		ctx:     context.Background(),
+		ctx:     ctx,
 		semaCtx: tree.MakeSemaContext(),
 		evalCtx: tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
+	// To allow opttester tests to use now(), we hardcode a preset transaction
+	// time. May 10, 2017 is a historic day: the release date of CockroachDB 1.0.
+	ot.evalCtx.TxnTimestamp = time.Date(2017, 05, 10, 13, 0, 0, 0, time.UTC)
 
 	// Set any OptTester-wide session flags here.
 
+	ot.evalCtx.SessionData.User = "opttester"
+	ot.evalCtx.SessionData.Database = "defaultdb"
 	ot.evalCtx.SessionData.ZigzagJoinEnabled = true
-	ot.evalCtx.SessionData.OptimizerFKChecks = true
-	ot.evalCtx.SessionData.OptimizerFKCascades = true
 	ot.evalCtx.SessionData.OptimizerUseHistograms = true
 	ot.evalCtx.SessionData.OptimizerUseMultiColStats = true
 	ot.evalCtx.SessionData.ReorderJoinsLimit = opt.DefaultJoinOrderLimit
@@ -314,7 +317,8 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    See formatFlags for all flags. Multiple flags can be specified; each flag
 //    modifies the existing set of the flags.
 //
-//  - allow-unsupported: wrap unsupported expressions in UnsupportedOp.
+//  - no-stable-folds: disallows constant folding for stable operators; only
+//                     used with "norm".
 //
 //  - fully-qualify-names: fully qualify all column names in the test output.
 //
@@ -404,7 +408,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			}
 			pgerr := pgerror.Flatten(err)
 			text := strings.TrimSpace(pgerr.Error())
-			if pgerr.Code != pgcode.Uncategorized {
+			if pgcode.MakeCode(pgerr.Code) != pgcode.Uncategorized {
 				// Output Postgres error code if it's available.
 				return fmt.Sprintf("error (%s): %s\n", pgerr.Code, text)
 			}
@@ -421,7 +425,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			}
 			pgerr := pgerror.Flatten(err)
 			text := strings.TrimSpace(pgerr.Error())
-			if pgerr.Code != pgcode.Uncategorized {
+			if pgcode.MakeCode(pgerr.Code) != pgcode.Uncategorized {
 				// Output Postgres error code if it's available.
 				return fmt.Sprintf("error (%s): %s\n", pgerr.Code, text)
 			}
@@ -657,13 +661,13 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 			}
 		}
 
-	case "allow-unsupported":
-		f.AllowUnsupportedExpr = true
-
 	case "fully-qualify-names":
 		f.FullyQualifyNames = true
 		// Hiding qualifications defeats the purpose.
 		f.ExprFormat &= ^memo.ExprFmtHideQualifications
+
+	case "no-stable-folds":
+		f.NoStableFolds = true
 
 	case "disable":
 		if len(arg.Vals) == 0 {
@@ -810,6 +814,9 @@ func (ot *OptTester) OptNorm() (opt.Expr, error) {
 		ot.seenRules.Add(int(ruleName))
 		return true
 	})
+	if !ot.Flags.NoStableFolds {
+		o.Factory().FoldingControl().AllowStableFolds()
+	}
 	return ot.optimizeExpr(o)
 }
 
@@ -825,6 +832,7 @@ func (ot *OptTester) Optimize() (opt.Expr, error) {
 		ot.seenRules.Add(int(ruleName))
 		return true
 	})
+	o.Factory().FoldingControl().AllowStableFolds()
 	return ot.optimizeExpr(o)
 }
 
@@ -1412,7 +1420,6 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 	}
 	ot.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
 	b := optbuilder.New(ot.ctx, &ot.semaCtx, &ot.evalCtx, ot.catalog, factory, stmt.AST)
-	b.AllowUnsupportedExpr = ot.Flags.AllowUnsupportedExpr
 	return b.Build()
 }
 

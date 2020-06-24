@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -169,16 +170,19 @@ func (d *deleteNode) BatchedNext(params runParams) (bool, error) {
 // result rows are needed, saves it in the result row container
 func (d *deleteNode) processSourceRow(params runParams, sourceVals tree.Datums) error {
 	// Queue the deletion in the KV batch.
-	if err := d.run.td.row(params.ctx, sourceVals, d.run.traceKV); err != nil {
+	// TODO(mgartner): Add partial index IDs to ignoreIndexes that we should
+	// not delete entries from.
+	var ignoreIndexes util.FastIntSet
+	if err := d.run.td.row(params.ctx, sourceVals, ignoreIndexes, d.run.traceKV); err != nil {
 		return err
 	}
 
 	// If result rows need to be accumulated, do it.
 	if d.run.rows != nil {
 		// The new values can include all columns, the construction of the
-		// values has used publicAndNonPublicColumns so the values may
-		// contain additional columns for every newly dropped column not
-		// visible. We do not want them to be available for RETURNING.
+		// values has used execinfra.ScanVisibilityPublicAndNotPublic so the
+		// values may contain additional columns for every newly dropped column
+		// not visible. We do not want them to be available for RETURNING.
 		//
 		// d.run.rows.NumCols() is guaranteed to only contain the requested
 		// public columns.

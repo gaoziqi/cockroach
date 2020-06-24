@@ -137,7 +137,7 @@ func (db *verifyFormatDB) exec(ctx context.Context, sql string) error {
 		if err != nil {
 			if pqerr := (*pq.Error)(nil); errors.As(err, &pqerr) {
 				// Output Postgres error code if it's available.
-				if pqerr.Code == pgcode.CrashShutdown {
+				if pgcode.MakeCode(string(pqerr.Code)) == pgcode.CrashShutdown {
 					return &crasher{
 						sql:    sql,
 						err:    err,
@@ -288,7 +288,14 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 		switch ft := nb.builtin.Types.(type) {
 		case tree.ArgTypes:
 			for _, arg := range ft {
-				args = append(args, r.GenerateRandomArg(arg.Typ))
+				// CollatedString's default has no Locale, and so GenerateRandomArg will panic
+				// on RandDatumWithNilChance. Copy the typ and fake a locale.
+				typ := *arg.Typ
+				if typ.Locale() == "" && typ.Family() == types.CollatedStringFamily {
+					locale := "en_US"
+					typ.InternalType.Locale = &locale
+				}
+				args = append(args, r.GenerateRandomArg(&typ))
 			}
 		case tree.HomogeneousType:
 			for i := r.Intn(5); i > 0; i-- {
@@ -419,7 +426,6 @@ var ignoredErrorPatterns = []string{
 	"overflow",
 	"requested length too large",
 	"division by zero",
-	"zero modulus",
 	"is out of range",
 
 	// Type checking
@@ -561,7 +567,6 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 func TestRandomDatumRoundtrip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	sema := tree.MakeSemaContext()
 	eval := tree.MakeTestingEvalContext(nil)
 
 	var smither *sqlsmith.Smither
@@ -599,6 +604,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		}
 		serializedGen := tree.Serialize(generated)
 
+		sema := tree.MakeSemaContext()
 		// We don't care about errors below because they are often
 		// caused by sqlsmith generating bogus queries. We're just
 		// looking for datums that don't match.
@@ -606,7 +612,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		typed1, err := parsed1.TypeCheck(&sema, typ)
+		typed1, err := parsed1.TypeCheck(ctx, &sema, typ)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
@@ -620,7 +626,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		typed2, err := parsed2.TypeCheck(&sema, typ)
+		typed2, err := parsed2.TypeCheck(ctx, &sema, typ)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}

@@ -1047,8 +1047,9 @@ func TestJobLifecycle(t *testing.T) {
 
 		t.Run("non-nil error marks job as failed", func(t *testing.T) {
 			job, exp := createDefaultJob()
-			exp.Error = "boom"
-			if err := job.Failed(ctx, errors.New(exp.Error)); err != nil {
+			boom := errors.New("boom")
+			exp.Error = boom.Error()
+			if err := job.Failed(ctx, boom); err != nil {
 				t.Fatal(err)
 			}
 			if err := exp.verify(job.ID(), jobs.StatusFailed); err != nil {
@@ -1093,11 +1094,11 @@ func TestJobLifecycle(t *testing.T) {
 		if err := exp.verify(job.ID(), jobs.StatusPaused); err != nil {
 			t.Fatal(err)
 		}
-		if err := registry.Resume(ctx, nil, *job.ID()); err != nil {
+		if err := registry.Unpause(ctx, nil, *job.ID()); err != nil {
 			t.Fatal(err)
 		}
 		// Resume the job again to ensure that the resumption is idempotent.
-		if err := registry.Resume(ctx, nil, *job.ID()); err != nil {
+		if err := registry.Unpause(ctx, nil, *job.ID()); err != nil {
 			t.Fatal(err)
 		}
 		if err := exp.verify(job.ID(), jobs.StatusRunning); err != nil {
@@ -1171,7 +1172,7 @@ func TestJobLifecycle(t *testing.T) {
 			if err := registry.CancelRequested(ctx, nil, *job.ID()); err != nil {
 				t.Fatal(err)
 			}
-			if err := registry.Resume(ctx, nil, *job.ID()); !testutils.IsError(err, "cannot be resumed") {
+			if err := registry.Unpause(ctx, nil, *job.ID()); !testutils.IsError(err, "cannot be resumed") {
 				t.Errorf("got unexpected status '%v'", err)
 			}
 		}
@@ -1182,7 +1183,7 @@ func TestJobLifecycle(t *testing.T) {
 				t.Fatal(err)
 			}
 			expectedErr := fmt.Sprintf("job with status %s cannot be resumed", jobs.StatusSucceeded)
-			if err := registry.Resume(ctx, nil, *job.ID()); !testutils.IsError(err, expectedErr) {
+			if err := registry.Unpause(ctx, nil, *job.ID()); !testutils.IsError(err, expectedErr) {
 				t.Errorf("expected '%s', but got '%v'", expectedErr, err)
 			}
 		}
@@ -2091,10 +2092,11 @@ func TestStartableJob(t *testing.T) {
 	}
 	t.Run("Start called more than once", func(t *testing.T) {
 		sj := createStartableJob(t)
-		_, err := sj.Start(ctx)
+		errCh, err := sj.Start(ctx)
 		require.NoError(t, err)
 		_, err = sj.Start(ctx)
 		require.Regexp(t, `StartableJob \d+ cannot be started more than once`, err)
+		require.NoError(t, <-errCh)
 	})
 	t.Run("Start called with active txn", func(t *testing.T) {
 		txn := db.NewTxn(ctx, "test")

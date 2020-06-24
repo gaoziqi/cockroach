@@ -168,9 +168,10 @@ func TestOldBitColumnMetadata(t *testing.T) {
 	// so disable leases on tables.
 	defer lease.TestingDisableTableLeases()()
 
+	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	defer s.Stopper().Stop(ctx)
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -182,7 +183,8 @@ CREATE TABLE t.test (k INT);
 	// We now want to create a pre-2.1 table descriptor with an
 	// old-style bit column. We're going to edit the table descriptor
 	// manually, without going through SQL.
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := sqlbase.TestingGetMutableExistingTableDescriptor(
+		kvDB, keys.SystemSQLCodec, "t", "test")
 	for i := range tableDesc.Columns {
 		if tableDesc.Columns[i].Name == "k" {
 			tableDesc.Columns[i].Type.InternalType.VisibleType = 4 // Pre-2.1 BIT.
@@ -203,7 +205,7 @@ CREATE TABLE t.test (k INT);
 		t.Fatal(err)
 	}
 	colDef := alterCmd.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
-	col, _, _, err := sqlbase.MakeColumnDefDescs(colDef, nil, nil)
+	col, _, _, err := sqlbase.MakeColumnDefDescs(ctx, colDef, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +220,7 @@ CREATE TABLE t.test (k INT);
 		if err := txn.SetSystemConfigTrigger(); err != nil {
 			return err
 		}
-		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), sqlbase.WrapDescriptor(tableDesc))
+		return txn.Put(ctx, sqlbase.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), tableDesc.DescriptorProto())
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +277,7 @@ SELECT column_name, character_maximum_length, numeric_precision, numeric_precisi
 	}
 
 	// And verify that this has re-set the fields.
-	tableDesc = sqlbase.GetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc = sqlbase.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	found := false
 	for i := range tableDesc.Columns {
 		col := &tableDesc.Columns[i]
@@ -407,7 +409,7 @@ VALUES ($1, 'StatusRunning', repeat('a', $2)::BYTES, repeat('a', $2)::BYTES)`, i
 			t.Fatalf("Expected \"%s\" to consume too much memory, found no error", statement)
 		}
 		if pErr := (*pq.Error)(nil); !(errors.As(err, &pErr) &&
-			pErr.Code == pgcode.OutOfMemory) {
+			pgcode.MakeCode(string(pErr.Code)) == pgcode.OutOfMemory) {
 			t.Fatalf("Expected \"%s\" to consume too much memory, found unexpected error %+v", statement, pErr)
 		}
 	})

@@ -66,10 +66,10 @@ func TestNoLinkForbidden(t *testing.T) {
 		[]string{
 			"github.com/cockroachdb/cockroach/pkg/testutils", // meant for testing code only
 		},
-		// Raven (Sentry) and the errors library use go/build to determine
+		// Sentry and the errors library use go/build to determine
 		// the list of source directories (used to strip the source prefix
 		// in stack trace reports).
-		"github.com/cockroachdb/cockroach/vendor/github.com/getsentry/raven-go",
+		"github.com/cockroachdb/cockroach/vendor/github.com/cockroachdb/sentry-go",
 		"github.com/cockroachdb/cockroach/vendor/github.com/cockroachdb/errors/withstack",
 	)
 }
@@ -155,8 +155,8 @@ func TestSQLMemoryPoolFlagValue(t *testing.T) {
 		if err := f.Parse(args); err != nil {
 			t.Fatal(err)
 		}
-		if c.expected != serverCfg.SQLMemoryPoolSize {
-			t.Errorf("expected %d, but got %d", c.expected, serverCfg.SQLMemoryPoolSize)
+		if c.expected != serverCfg.MemoryPoolSize {
+			t.Errorf("expected %d, but got %d", c.expected, serverCfg.MemoryPoolSize)
 		}
 	}
 
@@ -174,8 +174,8 @@ func TestSQLMemoryPoolFlagValue(t *testing.T) {
 		}
 		expectedLow := (maxMem * 28) / 100
 		expectedHigh := (maxMem * 32) / 100
-		if serverCfg.SQLMemoryPoolSize < expectedLow || serverCfg.SQLMemoryPoolSize > expectedHigh {
-			t.Errorf("expected %d-%d, but got %d", expectedLow, expectedHigh, serverCfg.SQLMemoryPoolSize)
+		if serverCfg.MemoryPoolSize < expectedLow || serverCfg.MemoryPoolSize > expectedHigh {
+			t.Errorf("expected %d-%d, but got %d", expectedLow, expectedHigh, serverCfg.MemoryPoolSize)
 		}
 	}
 }

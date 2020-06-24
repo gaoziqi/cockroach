@@ -16,6 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -105,6 +107,18 @@ func (n *renameTableNode) startExec(params runParams) error {
 		return err
 	}
 
+	isNewSchemaTemp, _, err := temporarySchemaSessionID(newTn.Schema())
+	if err != nil {
+		return err
+	}
+
+	if newTn.ExplicitSchema && !isNewSchemaTemp && tableDesc.Temporary {
+		return pgerror.New(
+			pgcode.FeatureNotSupported,
+			"cannot convert a temporary table to a persistent table during renames",
+		)
+	}
+
 	// oldTn and newTn are already normalized, so we can compare directly here.
 	if oldTn.Catalog() == newTn.Catalog() &&
 		oldTn.Schema() == newTn.Schema() &&
@@ -114,10 +128,10 @@ func (n *renameTableNode) startExec(params runParams) error {
 	}
 
 	tableDesc.SetName(newTn.Table())
-	tableDesc.ParentID = targetDbDesc.ID
+	tableDesc.ParentID = targetDbDesc.GetID()
 
-	newTbKey := sqlbase.MakePublicTableNameKey(ctx, params.ExecCfg().Settings,
-		targetDbDesc.ID, newTn.Table()).Key(p.ExecCfg().Codec)
+	newTbKey := sqlbase.MakeObjectNameKey(ctx, params.ExecCfg().Settings,
+		targetDbDesc.GetID(), tableDesc.GetParentSchemaID(), newTn.Table()).Key(p.ExecCfg().Codec)
 
 	if err := tableDesc.Validate(ctx, p.txn, p.ExecCfg().Codec); err != nil {
 		return err
@@ -126,8 +140,8 @@ func (n *renameTableNode) startExec(params runParams) error {
 	descID := tableDesc.GetID()
 	parentSchemaID := tableDesc.GetParentSchemaID()
 
-	renameDetails := sqlbase.TableDescriptor_NameInfo{
-		ParentID:       prevDbDesc.ID,
+	renameDetails := sqlbase.NameInfo{
+		ParentID:       prevDbDesc.GetID(),
 		ParentSchemaID: parentSchemaID,
 		Name:           oldTn.Table()}
 	tableDesc.DrainingNames = append(tableDesc.DrainingNames, renameDetails)
@@ -145,13 +159,13 @@ func (n *renameTableNode) startExec(params runParams) error {
 		log.VEventf(ctx, 2, "CPut %s -> %d", newTbKey, descID)
 	}
 	err = catalogkv.WriteDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(),
-		p.EvalContext().Settings, b, p.ExecCfg().Codec, descID, tableDesc.TableDesc())
+		p.EvalContext().Settings, b, p.ExecCfg().Codec, descID, tableDesc)
 	if err != nil {
 		return err
 	}
 
 	exists, id, err := sqlbase.LookupPublicTableID(
-		params.ctx, params.p.txn, p.ExecCfg().Codec, targetDbDesc.ID, newTn.Table(),
+		params.ctx, params.p.txn, p.ExecCfg().Codec, targetDbDesc.GetID(), newTn.Table(),
 	)
 	if err == nil && exists {
 		// Try and see what kind of object we collided with.
@@ -159,7 +173,7 @@ func (n *renameTableNode) startExec(params runParams) error {
 		if err != nil {
 			return err
 		}
-		return makeObjectAlreadyExistsError(desc, newTn.Table())
+		return sqlbase.MakeObjectAlreadyExistsError(desc.DescriptorProto(), newTn.Table())
 	} else if err != nil {
 		return err
 	}

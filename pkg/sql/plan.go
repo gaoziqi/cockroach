@@ -290,13 +290,6 @@ type planTop struct {
 	mem     *memo.Memo
 	catalog *optCatalog
 
-	// deps, if non-nil, collects the table/view dependencies for this query.
-	// Any planNode constructors that resolves a table name or reference in the query
-	// to a descriptor must register this descriptor into planDeps.
-	// This is (currently) used by CREATE VIEW.
-	// TODO(knz): Remove this in favor of a better encapsulated mechanism.
-	deps planDependencies
-
 	// auditEvents becomes non-nil if any of the descriptors used by
 	// current statement is causing an auditing event. See exec_log.go.
 	auditEvents []auditEvent
@@ -317,6 +310,33 @@ type planTop struct {
 	distSQLDiagrams []execinfrapb.FlowDiagram
 }
 
+// planMaybePhysical is a utility struct representing a plan. It can currently
+// use either planNode or DistSQL spec representation, but eventually will be
+// replaced by the latter representation directly.
+type planMaybePhysical struct {
+	planNode planNode
+	// physPlan (when non-nil) contains the physical plan that has not yet
+	// been finalized.
+	physPlan *PhysicalPlan
+}
+
+func (p planMaybePhysical) isPhysicalPlan() bool {
+	return p.physPlan != nil
+}
+
+func (p planMaybePhysical) planColumns() sqlbase.ResultColumns {
+	if p.isPhysicalPlan() {
+		return p.physPlan.ResultColumns
+	}
+	return planColumns(p.planNode)
+}
+
+func (p planMaybePhysical) Close(ctx context.Context) {
+	if p.planNode != nil {
+		p.planNode.Close(ctx)
+	}
+}
+
 // planComponents groups together the various components of the entire query
 // plan.
 type planComponents struct {
@@ -324,7 +344,7 @@ type planComponents struct {
 	subqueryPlans []subquery
 
 	// plan for the main query.
-	main planNode
+	main planMaybePhysical
 
 	// cascades contains metadata for all cascades.
 	cascades []cascadeMetadata
@@ -338,42 +358,42 @@ type cascadeMetadata struct {
 	exec.Cascade
 	// plan for the cascade. This plan is not populated upfront; it is created
 	// only when it needs to run, after the main query (and previous cascades).
-	plan planNode
+	plan planMaybePhysical
 }
 
 // checkPlan is a query tree that is executed after the main one. It can only
 // return an error (for example, foreign key violation).
 type checkPlan struct {
-	plan planNode
+	plan planMaybePhysical
 }
 
 // close calls Close on all plan trees.
 func (p *planComponents) close(ctx context.Context) {
-	if p.main != nil {
+	if p.main.planNode != nil {
 		p.main.Close(ctx)
-		p.main = nil
+		p.main.planNode = nil
 	}
 
 	for i := range p.subqueryPlans {
 		// Once a subquery plan has been evaluated, it already closes its
 		// plan.
-		if p.subqueryPlans[i].plan != nil {
+		if p.subqueryPlans[i].plan.planNode != nil {
 			p.subqueryPlans[i].plan.Close(ctx)
-			p.subqueryPlans[i].plan = nil
+			p.subqueryPlans[i].plan.planNode = nil
 		}
 	}
 
 	for i := range p.cascades {
-		if p.cascades[i].plan != nil {
+		if p.cascades[i].plan.planNode != nil {
 			p.cascades[i].plan.Close(ctx)
-			p.cascades[i].plan = nil
+			p.cascades[i].plan.planNode = nil
 		}
 	}
 
 	for i := range p.checkPlans {
-		if p.checkPlans[i].plan != nil {
+		if p.checkPlans[i].plan.planNode != nil {
 			p.checkPlans[i].plan.Close(ctx)
-			p.checkPlans[i].plan = nil
+			p.checkPlans[i].plan.planNode = nil
 		}
 	}
 }
@@ -387,7 +407,9 @@ func (p *planTop) init(stmt *Statement, appStats *appStats) {
 
 // close ensures that the plan's resources have been deallocated.
 func (p *planTop) close(ctx context.Context) {
-	if p.main != nil {
+	if p.main.planNode != nil {
+		// TODO(yuzefovich): update this once we support creating table reader
+		// specs directly in the optimizer (see #47474).
 		p.instrumentation.savePlanInfo(ctx, p)
 	}
 	p.planComponents.close(ctx)
@@ -502,6 +524,10 @@ const (
 
 	// planFlagIsDDL marks that the plan contains DDL.
 	planFlagIsDDL
+
+	// planFlagVectorized is set if the plan is executed via the vectorized
+	// engine.
+	planFlagVectorized
 )
 
 func (pf planFlags) IsSet(flag planFlags) bool {
@@ -536,6 +562,7 @@ func (pi *planInstrumentation) savePlanInfo(ctx context.Context, curPlan *planTo
 	if pi.appStats != nil && pi.appStats.shouldSaveLogicalPlanDescription(
 		curPlan.stmt,
 		curPlan.flags.IsSet(planFlagDistributed),
+		curPlan.flags.IsSet(planFlagVectorized),
 		curPlan.flags.IsSet(planFlagImplicitTxn),
 		curPlan.execErr,
 	) {

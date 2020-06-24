@@ -332,7 +332,7 @@ func (ex *connExecutor) execStmtInOpenState(
 			}
 			typeHints = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
 			for i, t := range s.Types {
-				resolved, err := tree.ResolveType(t, ex.planner.semaCtx.GetTypeResolver())
+				resolved, err := tree.ResolveType(ctx, t, ex.planner.semaCtx.GetTypeResolver())
 				if err != nil {
 					return makeErrEvent(err)
 				}
@@ -373,7 +373,7 @@ func (ex *connExecutor) execStmtInOpenState(
 			return makeErrEvent(err)
 		}
 		var err error
-		pinfo, err = fillInPlaceholders(ps, name, s.Params, ex.sessionData.SearchPath)
+		pinfo, err = fillInPlaceholders(ctx, ps, name, s.Params, ex.sessionData.SearchPath)
 		if err != nil {
 			return makeErrEvent(err)
 		}
@@ -395,7 +395,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	// don't return any event unless an error happens.
 
 	if os.ImplicitTxn.Get() {
-		asOfTs, err := p.isAsOf(stmt.AST)
+		asOfTs, err := p.isAsOf(ctx, stmt.AST)
 		if err != nil {
 			return makeErrEvent(err)
 		}
@@ -409,7 +409,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		// the transaction's timestamp. This is useful for running AOST statements
 		// using the InternalExecutor inside an external transaction; one might want
 		// to do that to force p.avoidCachedDescriptors to be set below.
-		ts, err := p.isAsOf(stmt.AST)
+		ts, err := p.isAsOf(ctx, stmt.AST)
 		if err != nil {
 			return makeErrEvent(err)
 		}
@@ -749,7 +749,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	var cols sqlbase.ResultColumns
 	if stmt.AST.StatementType() == tree.Rows {
-		cols = planColumns(planner.curPlan.main)
+		cols = planner.curPlan.main.planColumns()
 	}
 	if err := ex.initStatementResult(ctx, res, stmt, cols); err != nil {
 		res.SetError(err)
@@ -757,9 +757,9 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	}
 
 	ex.sessionTracing.TracePlanCheckStart(ctx)
-	distributePlan := willDistributePlan(
+	distributePlan := getPlanDistribution(
 		ctx, planner.execCfg.NodeID, ex.sessionData.DistSQLMode, planner.curPlan.main,
-	)
+	).WillDistribute()
 	ex.sessionTracing.TracePlanCheckEnd(ctx, nil, distributePlan)
 
 	if ex.server.cfg.TestingKnobs.BeforeExecute != nil {
@@ -775,6 +775,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		panic(fmt.Sprintf("query %d not in registry", stmt.queryID))
 	}
 	queryMeta.phase = executing
+	// TODO(yuzefovich): introduce ternary PlanDistribution into queryMeta.
 	queryMeta.isDistributed = distributePlan
 	progAtomic := &queryMeta.progressAtomic
 	ex.mu.Unlock()
@@ -861,13 +862,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	defer recv.Release()
 
 	evalCtx := planner.ExtendedEvalContext()
-	var planCtx *PlanningCtx
-	if distribute {
-		planCtx = ex.server.cfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, planner.txn)
-	} else {
-		planCtx = ex.server.cfg.DistSQLPlanner.newLocalPlanningCtx(ctx, evalCtx)
-	}
-	planCtx.isLocal = !distribute
+	planCtx := ex.server.cfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, planner.txn, distribute)
 	planCtx.planner = planner
 	planCtx.stmtType = recv.stmtType
 	if planner.collectBundle {
@@ -948,7 +943,7 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
 	p := &ex.planner
 	ex.resetPlanner(ctx, p, nil /* txn */, now)
-	ts, err := p.EvalAsOfTimestamp(s.Modes.AsOf)
+	ts, err := p.EvalAsOfTimestamp(ctx, s.Modes.AsOf)
 	if err != nil {
 		return 0, time.Time{}, nil, err
 	}

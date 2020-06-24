@@ -236,8 +236,11 @@ type Server struct {
 	cfg *ExecutorConfig
 
 	// sqlStats tracks per-application statistics for all applications on each
-	// node.
-	sqlStats      sqlStats
+	// node. Newly collected statistics flow into sqlStats.
+	sqlStats sqlStats
+	// reportedStats is a pool of stats that is held for reporting, and is
+	// cleared on a lower interval than sqlStats. Stats from sqlStats flow
+	// into reported stats when sqlStats is cleared.
 	reportedStats sqlStats
 
 	reCache *tree.RegexpCache
@@ -337,22 +340,21 @@ func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
 	// continually allocating space for the SQL stats. Additionally, spawn
 	// a loop to clear the reported stats at the same large interval just
 	// in case the telemetry worker fails.
-	s.PeriodicallyClearSQLStats(ctx, stopper, maxSQLStatReset, &s.sqlStats)
-	s.PeriodicallyClearSQLStats(ctx, stopper, maxSQLStatReset, &s.reportedStats)
+	s.PeriodicallyClearSQLStats(ctx, stopper, MaxSQLStatReset, &s.sqlStats, s.ResetSQLStats)
+	s.PeriodicallyClearSQLStats(ctx, stopper, MaxSQLStatReset, &s.reportedStats, s.ResetReportedStats)
 	// Start a second loop to clear SQL stats at the requested interval.
-	s.PeriodicallyClearSQLStats(ctx, stopper, sqlStatReset, &s.sqlStats)
+	s.PeriodicallyClearSQLStats(ctx, stopper, SQLStatReset, &s.sqlStats, s.ResetSQLStats)
 }
 
 // ResetSQLStats resets the executor's collected sql statistics.
 func (s *Server) ResetSQLStats(ctx context.Context) {
 	// Dump the SQL stats into the reported stats before clearing the SQL stats.
-	s.reportedStats.Add(&s.sqlStats)
-	s.sqlStats.resetStats(ctx)
+	s.sqlStats.resetAndMaybeDumpStats(ctx, &s.reportedStats)
 }
 
 // ResetReportedStats resets the executor's collected reported stats.
 func (s *Server) ResetReportedStats(ctx context.Context) {
-	s.reportedStats.resetStats(ctx)
+	s.reportedStats.resetAndMaybeDumpStats(ctx, nil /* target */)
 }
 
 // GetScrubbedStmtStats returns the statement statistics by app, with the
@@ -701,7 +703,9 @@ func (s *Server) newConnExecutorWithTxn(
 	return ex
 }
 
-var sqlStatReset = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
+// SQLStatReset is the cluster setting that controls at what interval SQL
+// statement statistics should be reset.
+var SQLStatReset = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
 	"diagnostics.sql_stat_reset.interval",
 	"interval controlling how often SQL statement statistics should "+
 		"be reset (should be less than diagnostics.forced_sql_stat_reset.interval). It has a max value of 24H.",
@@ -709,7 +713,9 @@ var sqlStatReset = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
 	time.Hour*24,
 )
 
-var maxSQLStatReset = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
+// MaxSQLStatReset is the cluster setting that controls at what interval SQL
+// statement statistics must be flushed within.
+var MaxSQLStatReset = settings.RegisterPublicNonNegativeDurationSettingWithMaximum(
 	"diagnostics.forced_sql_stat_reset.interval",
 	"interval after which SQL statement statistics are refreshed even "+
 		"if not collected (should be more than diagnostics.sql_stat_reset.interval). It has a max value of 24H.",
@@ -718,9 +724,16 @@ var maxSQLStatReset = settings.RegisterPublicNonNegativeDurationSettingWithMaxim
 )
 
 // PeriodicallyClearSQLStats spawns a loop to reset stats based on the setting
-// of a given duration settings variable.
+// of a given duration settings variable. We take in a function to actually do
+// the resetting, as some stats have extra work that needs to be performed
+// during the reset. For example, the SQL stats need to dump into the parent
+// stats before clearing data fully.
 func (s *Server) PeriodicallyClearSQLStats(
-	ctx context.Context, stopper *stop.Stopper, setting *settings.DurationSetting, stats *sqlStats,
+	ctx context.Context,
+	stopper *stop.Stopper,
+	setting *settings.DurationSetting,
+	stats *sqlStats,
+	reset func(ctx context.Context),
 ) {
 	stopper.RunWorker(ctx, func(ctx context.Context) {
 		var timer timeutil.Timer
@@ -732,7 +745,7 @@ func (s *Server) PeriodicallyClearSQLStats(
 			next := last.Add(setting.Get(&s.cfg.Settings.SV))
 			wait := next.Sub(timeutil.Now())
 			if wait < 0 {
-				stats.resetStats(ctx)
+				reset(ctx)
 			} else {
 				timer.Reset(wait)
 				select {
@@ -758,32 +771,30 @@ const (
 
 func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{}) {
 	if recovered != nil {
-		// A warning header guaranteed to go to stderr. This is unanonymized.
-		var cutStmt string
-		var stmt string
+		panicErr := log.PanicAsError(1, recovered)
+
+		// If there's a statement currently being executed, we'll report
+		// on it.
 		if ex.curStmt != nil {
-			stmt = ex.curStmt.String()
-			cutStmt = stmt
-		}
-		if len(cutStmt) > panicLogOutputCutoffChars {
-			cutStmt = cutStmt[:panicLogOutputCutoffChars] + " [...]"
+			// A warning header guaranteed to go to stderr.
+			log.Shoutf(ctx, log.Severity_ERROR,
+				"a SQL panic has occurred while executing the following statement:\n%s",
+				// For the log message, the statement is not anonymized.
+				truncateStatementStringForTelemetry(ex.curStmt.String()))
+
+			// Embed the statement in the error object for the telemetry
+			// report below. The statement gets anonymized.
+			panicErr = WithAnonymizedStatement(panicErr, ex.curStmt)
 		}
 
-		log.Shoutf(ctx, log.Severity_ERROR,
-			"a SQL panic has occurred while executing %q: %s", cutStmt, recovered)
+		// Report the panic to telemetry in any case.
+		log.ReportPanic(ctx, &ex.server.cfg.Settings.SV, panicErr, 1 /* depth */)
 
+		// Close the executor before propagating the panic further.
 		ex.close(ctx, panicClose)
 
-		safeErr := AnonymizeStatementsForReporting("executing", stmt, recovered)
-
-		log.ReportPanic(ctx, &ex.server.cfg.Settings.SV, safeErr, 1 /* depth */)
-
-		// Propagate the (sanitized) panic further.
-		// NOTE(andrei): It used to be that we sanitized the panic and then a higher
-		// layer was in charge of doing the log.ReportPanic() call. Now that the
-		// call is above, it's unclear whether we should propagate the original
-		// panic or safeErr. I'm propagating safeErr to be on the safe side.
-		panic(safeErr)
+		// Propagate - this may be meant to stop the process.
+		panic(panicErr)
 	}
 	// Closing is not cancelable.
 	closeCtx := logtags.WithTags(context.Background(), logtags.FromContext(ctx))
@@ -1530,7 +1541,22 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		panic(fmt.Sprintf("unexpected advance code: %s", advInfo.code))
 	}
 
-	return ex.updateTxnRewindPosMaybe(ctx, cmd, pos, advInfo)
+	if err := ex.updateTxnRewindPosMaybe(ctx, cmd, pos, advInfo); err != nil {
+		return err
+	}
+
+	if rewindCapability, canRewind := ex.getRewindTxnCapability(); !canRewind {
+		// Trim statements that cannot be retried to reclaim memory.
+		ex.stmtBuf.ltrim(ctx, pos)
+	} else {
+		rewindCapability.close()
+	}
+
+	if ex.server.cfg.TestingKnobs.AfterExecCmd != nil {
+		ex.server.cfg.TestingKnobs.AfterExecCmd(ctx, cmd, ex.stmtBuf)
+	}
+
+	return nil
 }
 
 func (ex *connExecutor) idleConn() bool {
@@ -1952,6 +1978,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			ReCache:            ex.server.reCache,
 			InternalExecutor:   &ie,
 			DB:                 ex.server.cfg.DB,
+			TypeResolver:       p,
 		},
 		SessionMutator:    ex.dataMutator,
 		VirtualSchemas:    ex.server.cfg.VirtualSchemas,
@@ -2085,9 +2112,8 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		if res.Err() != nil {
 			err := errorutil.UnexpectedWithIssueErrorf(
 				26687,
-				"programming error: non-error event "+
-					advInfo.txnEvent.String()+ //the event is included like this so that it doesn't get sanitized
-					" generated even though res.Err() has been set to: %s",
+				"programming error: non-error event %s generated even though res.Err() has been set to: %s",
+				errors.Safe(advInfo.txnEvent.String()),
 				res.Err())
 			log.Errorf(ex.Ctx(), "%v", err)
 			errorutil.SendReport(ex.Ctx(), &ex.server.cfg.Settings.SV, err)

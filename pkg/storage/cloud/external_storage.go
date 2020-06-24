@@ -88,6 +88,11 @@ var redactedQueryParams = map[string]struct{}{
 // ErrListingUnsupported is a marker for indicating listing is unsupported.
 var ErrListingUnsupported = errors.New("listing is not supported")
 
+// ErrFileDoesNotExist is a sentinel error for indicating that a specified
+// bucket/object/key/file (depending on storage terminology) does not exist.
+// This error is raised by the ReadFile method.
+var ErrFileDoesNotExist = errors.New("external_storage: file doesn't exist")
+
 // ExternalStorageFactory describes a factory function for ExternalStorage.
 type ExternalStorageFactory func(ctx context.Context, dest roachpb.ExternalStorage) (ExternalStorage, error)
 
@@ -113,6 +118,8 @@ type ExternalStorage interface {
 	Conf() roachpb.ExternalStorage
 
 	// ReadFile should return a Reader for requested name.
+	// ErrFileDoesNotExist is raised if `basename` cannot be located in storage.
+	// This can be leveraged for an existence check.
 	ReadFile(ctx context.Context, basename string) (io.ReadCloser, error)
 
 	// WriteFile should write the content to requested name.
@@ -230,7 +237,7 @@ func ExternalStorageConfFromURI(path string) (roachpb.ExternalStorage, error) {
 func ExternalStorageFromURI(
 	ctx context.Context,
 	uri string,
-	externalConfig base.ExternalIOConfig,
+	externalConfig base.ExternalIODirConfig,
 	settings *cluster.Settings,
 	blobClientFactory blobs.BlobClientFactory,
 ) (ExternalStorage, error) {
@@ -279,7 +286,7 @@ func SanitizeExternalStorageURI(path string, extraParams []string) (string, erro
 func MakeExternalStorage(
 	ctx context.Context,
 	dest roachpb.ExternalStorage,
-	conf base.ExternalIOConfig,
+	conf base.ExternalIODirConfig,
 	settings *cluster.Settings,
 	blobClientFactory blobs.BlobClientFactory,
 ) (ExternalStorage, error) {
@@ -352,8 +359,7 @@ var (
 // fails. It knows about specific kinds of errors that need longer retry
 // delays than normal.
 func delayedRetry(ctx context.Context, fn func() error) error {
-	const maxAttempts = 3
-	return retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), maxAttempts, func() error {
+	return retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), maxDelayedRetryAttempts, func() error {
 		err := fn()
 		if err == nil {
 			return nil
@@ -403,6 +409,9 @@ func isResumableHTTPError(err error) bool {
 		sysutil.IsErrConnectionReset(err) ||
 		sysutil.IsErrConnectionRefused(err)
 }
+
+// Maximum number of times the delayedRetry method will re-run the provided function.
+const maxDelayedRetryAttempts = 3
 
 // Maximum number of times we can attempt to retry reading from external storage,
 // without making any progress.

@@ -322,7 +322,7 @@ func TestBaseQueueSamePriorityFIFO(t *testing.T) {
 	for _, repl := range repls {
 		added, err := bq.testingAdd(ctx, repl, 0.0)
 		if err != nil {
-			t.Fatal(errors.Wrap(err, repl.String()))
+			t.Fatalf("%s: %v", repl, err)
 		}
 		if !added {
 			t.Fatalf("%v not added", repl)
@@ -510,9 +510,13 @@ func TestNeedsSystemConfig(t *testing.T) {
 
 	// Use a gossip instance that won't have the system config available in it.
 	// bqNeedsSysCfg will not add the replica or process it without a system config.
-	rpcContext := rpc.NewContext(
-		tc.store.cfg.AmbientCtx, &base.Config{Insecure: true}, tc.store.cfg.Clock, stopper,
-		cluster.MakeTestingClusterSettings())
+	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		AmbientCtx: tc.store.cfg.AmbientCtx,
+		Config:     &base.Config{Insecure: true},
+		Clock:      tc.store.cfg.Clock,
+		Stopper:    stopper,
+		Settings:   cluster.MakeTestingClusterSettings(),
+	})
 	emptyGossip := gossip.NewTest(
 		tc.gossip.NodeID.Get(), rpcContext, rpc.NewServer(rpcContext), stopper, tc.store.Registry(), zonepb.DefaultZoneConfigRef())
 	bqNeedsSysCfg := makeTestBaseQueue("test", testQueue, tc.store, emptyGossip, queueConfig{
@@ -629,11 +633,11 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 		return nil
 	})
 	neverSplitsDesc := neverSplits.Desc()
-	if sysCfg.NeedsSplit(neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
+	if sysCfg.NeedsSplit(ctx, neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
 		t.Fatal("System config says range needs to be split")
 	}
 	willSplitDesc := willSplit.Desc()
-	if sysCfg.NeedsSplit(willSplitDesc.StartKey, willSplitDesc.EndKey) {
+	if sysCfg.NeedsSplit(ctx, willSplitDesc.StartKey, willSplitDesc.EndKey) {
 		t.Fatal("System config says range needs to be split")
 	}
 
@@ -665,11 +669,11 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 
 	// Check our config.
 	neverSplitsDesc = neverSplits.Desc()
-	if sysCfg.NeedsSplit(neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
+	if sysCfg.NeedsSplit(ctx, neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
 		t.Fatal("System config says range needs to be split")
 	}
 	willSplitDesc = willSplit.Desc()
-	if !sysCfg.NeedsSplit(willSplitDesc.StartKey, willSplitDesc.EndKey) {
+	if !sysCfg.NeedsSplit(ctx, willSplitDesc.StartKey, willSplitDesc.EndKey) {
 		t.Fatal("System config says range does not need to be split")
 	}
 
@@ -897,11 +901,11 @@ func (r mvccStatsReplicaInQueue) GetMVCCStats() enginepb.MVCCStats {
 	return enginepb.MVCCStats{ValBytes: r.size}
 }
 
-func TestQueueSnapshotTimeoutFunc(t *testing.T) {
+func TestQueueRateLimitedTimeoutFunc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	type testCase struct {
 		guaranteedProcessingTime time.Duration
-		snapshotRate             int64 // bytes/s
+		rateLimit                int64 // bytes/s
 		replicaSize              int64 // bytes
 		expectedTimeout          time.Duration
 	}
@@ -909,8 +913,8 @@ func TestQueueSnapshotTimeoutFunc(t *testing.T) {
 		return fmt.Sprintf("%+v", tc), func(t *testing.T) {
 			st := cluster.MakeTestingClusterSettings()
 			queueGuaranteedProcessingTimeBudget.Override(&st.SV, tc.guaranteedProcessingTime)
-			recoverySnapshotRate.Override(&st.SV, tc.snapshotRate)
-			tf := makeQueueSnapshotTimeoutFunc(recoverySnapshotRate)
+			recoverySnapshotRate.Override(&st.SV, tc.rateLimit)
+			tf := makeRateLimitedTimeoutFunc(recoverySnapshotRate)
 			repl := mvccStatsReplicaInQueue{
 				size: tc.replicaSize,
 			}
@@ -920,27 +924,27 @@ func TestQueueSnapshotTimeoutFunc(t *testing.T) {
 	for _, tc := range []testCase{
 		{
 			guaranteedProcessingTime: time.Minute,
-			snapshotRate:             1 << 30,
+			rateLimit:                1 << 30,
 			replicaSize:              1 << 20,
 			expectedTimeout:          time.Minute,
 		},
 		{
 			guaranteedProcessingTime: time.Minute,
-			snapshotRate:             1 << 20,
+			rateLimit:                1 << 20,
 			replicaSize:              100 << 20,
-			expectedTimeout:          100 * time.Second * permittedSnapshotSlowdown,
+			expectedTimeout:          100 * time.Second * permittedRangeScanSlowdown,
 		},
 		{
 			guaranteedProcessingTime: time.Hour,
-			snapshotRate:             1 << 20,
+			rateLimit:                1 << 20,
 			replicaSize:              100 << 20,
 			expectedTimeout:          time.Hour,
 		},
 		{
 			guaranteedProcessingTime: time.Minute,
-			snapshotRate:             1 << 10,
+			rateLimit:                1 << 10,
 			replicaSize:              100 << 20,
-			expectedTimeout:          100 * (1 << 10) * time.Second * permittedSnapshotSlowdown,
+			expectedTimeout:          100 * (1 << 10) * time.Second * permittedRangeScanSlowdown,
 		},
 	} {
 		t.Run(makeTest(tc))

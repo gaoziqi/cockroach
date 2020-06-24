@@ -424,7 +424,7 @@ func (s *scope) resolveCTE(name *tree.TableName) *cteSource {
 // order to produce the desired type.
 func (s *scope) resolveType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 	expr = s.walkExprTree(expr)
-	texpr, err := tree.TypeCheck(expr, s.builder.semaCtx, desired)
+	texpr, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, desired)
 	if err != nil {
 		panic(err)
 	}
@@ -443,7 +443,7 @@ func (s *scope) resolveType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 // desired type.
 func (s *scope) resolveAndRequireType(expr tree.Expr, desired *types.T) tree.TypedExpr {
 	expr = s.walkExprTree(expr)
-	texpr, err := tree.TypeCheckAndRequire(expr, s.builder.semaCtx, desired, s.context.String())
+	texpr, err := tree.TypeCheckAndRequire(s.builder.ctx, expr, s.builder.semaCtx, desired, s.context.String())
 	if err != nil {
 		panic(err)
 	}
@@ -574,8 +574,14 @@ func findExistingColInList(
 // findExistingCol finds the given expression among the bound variables in this
 // scope. Returns nil if the expression is not found (or an expression is found
 // but it has side-effects and allowSideEffects is false).
+// If a column is found and we are tracking view dependencies, we add the column
+// to the view dependencies since it means this column is being referenced.
 func (s *scope) findExistingCol(expr tree.TypedExpr, allowSideEffects bool) *scopeColumn {
-	return findExistingColInList(expr, s.cols, allowSideEffects)
+	col := findExistingColInList(expr, s.cols, allowSideEffects)
+	if col != nil {
+		s.builder.trackReferencedColumnForViews(col)
+	}
+	return col
 }
 
 // startAggFunc is called when the builder starts building an aggregate
@@ -921,11 +927,6 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		}
 
 	case *tree.ArrayFlatten:
-		if s.builder.AllowUnsupportedExpr {
-			// TODO(rytaft): Temporary fix for #24171 and #24170.
-			break
-		}
-
 		if sub, ok := t.Subquery.(*tree.Subquery); ok {
 			// Copy the ArrayFlatten expression so that the tree isn't mutated.
 			copy := *t
@@ -936,11 +937,6 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		}
 
 	case *tree.ComparisonExpr:
-		if s.builder.AllowUnsupportedExpr {
-			// TODO(rytaft): Temporary fix for #24171 and #24170.
-			break
-		}
-
 		switch t.Operator {
 		case tree.In, tree.NotIn, tree.Any, tree.Some, tree.All:
 			if sub, ok := t.Right.(*tree.Subquery); ok {
@@ -954,11 +950,6 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		}
 
 	case *tree.Subquery:
-		if s.builder.AllowUnsupportedExpr {
-			// TODO(rytaft): Temporary fix for #24171, #24170 and #24225.
-			return false, expr
-		}
-
 		if t.Exists {
 			expr = s.replaceSubquery(
 				t, true /* wrapInTuple */, -1 /* desiredNumColumns */, noExtraColsAllowed,
@@ -997,7 +988,7 @@ func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf 
 		tree.RejectAggregates|tree.RejectWindowApplications|tree.RejectNestedGenerators)
 
 	expr := f.Walk(s)
-	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
 	if err != nil {
 		panic(err)
 	}
@@ -1097,14 +1088,14 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 			defer func() { s.builder.semaCtx.Properties.Restore(oldProps) }()
 
 			s.builder.semaCtx.Properties.Require("FILTER", tree.RejectSpecial)
-			_, err := tree.TypeCheck(expr.(*tree.FuncExpr).Filter, s.builder.semaCtx, types.Any)
+			_, err := tree.TypeCheck(s.builder.ctx, expr.(*tree.FuncExpr).Filter, s.builder.semaCtx, types.Any)
 			if err != nil {
 				panic(err)
 			}
 		}()
 	}
 
-	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
 	if err != nil {
 		panic(err)
 	}
@@ -1176,7 +1167,7 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 
 	expr := fCopy.Walk(s)
 
-	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
 	if err != nil {
 		panic(err)
 	}
@@ -1260,7 +1251,7 @@ func (s *scope) replaceSQLFn(f *tree.FuncExpr, def *tree.FunctionDefinition) tre
 	s.builder.semaCtx.Properties.Require("SQL function", tree.RejectSpecial)
 
 	expr := f.Walk(s)
-	typedFunc, err := tree.TypeCheck(expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
 	if err != nil {
 		panic(err)
 	}
@@ -1399,7 +1390,8 @@ func (s *scope) replaceCount(
 			}
 			// We call TypeCheck to fill in FuncExpr internals. This is a fixed
 			// expression; we should not hit an error here.
-			if _, err := e.TypeCheck(&tree.SemaContext{}, types.Any); err != nil {
+			semaCtx := tree.MakeSemaContext()
+			if _, err := e.TypeCheck(s.builder.ctx, &semaCtx, types.Any); err != nil {
 				panic(err)
 			}
 			newDef, err := e.Func.Resolve(s.builder.semaCtx.SearchPath)

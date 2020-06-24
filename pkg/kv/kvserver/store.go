@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -1450,12 +1449,16 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 				// range which has processed a raft command to remove itself (which is
 				// possible prior to 19.2 or if the DisableEagerReplicaRemoval is
 				// enabled) and has not yet been removed by the replica gc queue.
-				// We treat both cases the same way.
-				//
-				// TODO(ajwerner): Remove this migration in 20.2. It exists in 20.1 to
-				// find and remove any pre-emptive snapshots which may have been sent by
-				// a 19.1 or older node to this node while it was running 19.2.
-				return false /* done */, removePreemptiveSnapshot(ctx, s, &desc)
+				// We treat both cases the same way. These should no longer exist in
+				// 20.2 or after as there was a migration in 20.1 to remove them and
+				// no pre-emptive snapshot should have been sent since 19.2 was
+				// finalized.
+				return false /* done */, errors.AssertionFailedf(
+					"found RangeDescriptor for range %d at generation %d which does not"+
+						" contain this store %d",
+					log.Safe(desc.RangeID),
+					log.Safe(desc.Generation),
+					log.Safe(s.StoreID()))
 			}
 
 			rep, err := newReplica(ctx, &desc, s, replicaDesc.ReplicaID)
@@ -2456,7 +2459,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 // is returned.
 func (s *Store) checkpoint(ctx context.Context, tag string) (string, error) {
 	checkpointBase := filepath.Join(s.engine.GetAuxiliaryDir(), "checkpoints")
-	_ = os.MkdirAll(checkpointBase, 0700)
+	_ = s.engine.MkdirAll(checkpointBase)
 
 	checkpointDir := filepath.Join(checkpointBase, tag)
 	if err := s.engine.CreateCheckpoint(checkpointDir); err != nil {
@@ -2497,7 +2500,7 @@ func (s *Store) ComputeMetrics(ctx context.Context, tick int) error {
 
 	sstables := s.engine.GetSSTables()
 	s.metrics.RdbNumSSTables.Update(int64(sstables.Len()))
-	readAmp := sstables.ReadAmplification()
+	readAmp := sstables.ReadAmplification(int(stats.L0SublevelCount))
 	s.metrics.RdbReadAmplification.Update(int64(readAmp))
 	s.metrics.RdbPendingCompaction.Update(stats.PendingCompactionBytesEstimate)
 	// Log this metric infrequently (with current configurations,
@@ -2590,7 +2593,7 @@ func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracing.Rec
 // power an admin debug endpoint.
 func (s *Store) ManuallyEnqueue(
 	ctx context.Context, queueName string, repl *Replica, skipShouldQueue bool,
-) (tracing.Recording, string, error) {
+) (recording tracing.Recording, processError error, enqueueError error) {
 	ctx = repl.AnnotateCtx(ctx)
 
 	var queue queueImpl
@@ -2602,12 +2605,12 @@ func (s *Store) ManuallyEnqueue(
 		}
 	}
 	if queue == nil {
-		return nil, "", errors.Errorf("unknown queue type %q", queueName)
+		return nil, nil, errors.Errorf("unknown queue type %q", queueName)
 	}
 
 	sysCfg := s.cfg.Gossip.GetSystemConfig()
 	if sysCfg == nil {
-		return nil, "", errors.New("cannot run queue without a valid system config; make sure the cluster " +
+		return nil, nil, errors.New("cannot run queue without a valid system config; make sure the cluster " +
 			"has been initialized and all nodes connected to it")
 	}
 
@@ -2616,10 +2619,10 @@ func (s *Store) ManuallyEnqueue(
 	if needsLease {
 		hasLease, pErr := repl.getLeaseForGossip(ctx)
 		if pErr != nil {
-			return nil, "", pErr.GoError()
+			return nil, nil, pErr.GoError()
 		}
 		if !hasLease {
-			return nil, fmt.Sprintf("replica %v does not have the range lease", repl), nil
+			return nil, errors.Newf("replica %v does not have the range lease", repl), nil
 		}
 	}
 
@@ -2632,16 +2635,13 @@ func (s *Store) ManuallyEnqueue(
 		shouldQueue, priority := queue.shouldQueue(ctx, s.cfg.Clock.Now(), repl, sysCfg)
 		log.Eventf(ctx, "shouldQueue=%v, priority=%f", shouldQueue, priority)
 		if !shouldQueue {
-			return collect(), "", nil
+			return collect(), nil, nil
 		}
 	}
 
 	log.Eventf(ctx, "running %s.process", queueName)
-	err := queue.process(ctx, repl, sysCfg)
-	if err != nil {
-		return collect(), err.Error(), nil
-	}
-	return collect(), "", nil
+	processErr := queue.process(ctx, repl, sysCfg)
+	return collect(), processErr, nil
 }
 
 // GetClusterVersion reads the the cluster version from the store-local version

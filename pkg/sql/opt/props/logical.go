@@ -31,13 +31,13 @@ const (
 	// field is populated.
 	InterestingOrderings
 
-	// UnfilteredCols is set when the Relational.Rule.UnfilteredCols field is
-	// populated.
-	UnfilteredCols
-
 	// HasHoistableSubquery is set when the Scalar.Rule.HasHoistableSubquery
 	// is populated.
 	HasHoistableSubquery
+
+	// UnfilteredCols is set when the Relational.Rule.UnfilteredCols field is
+	// populated.
+	UnfilteredCols
 
 	// JoinSize is set when the Relational.Rule.JoinSize field is populated.
 	JoinSize
@@ -86,6 +86,9 @@ type Shared struct {
 	// property makes detection fast and easy so that the hoister doesn't waste
 	// time searching subtrees that don't contain subqueries.
 	HasCorrelatedSubquery bool
+
+	// VolatilitySet contains the set of volatilities contained in the expression.
+	VolatilitySet VolatilitySet
 
 	// CanHaveSideEffects is true if the expression modifies state outside its
 	// own scope, or if depends upon state that may change across evaluations. An
@@ -331,15 +334,16 @@ type Relational struct {
 		// been set.
 		InterestingOrderings opt.OrderingSet
 
-		// UnfilteredCols is the set of output columns that have values for every
-		// row in their owner table. Rows may be duplicated, but no rows can be
-		// missing. For example, an unconstrained, unlimited Scan operator can
-		// add all of its output columns to this property, but a Select operator
-		// cannot add any columns, as it may have filtered rows.
+		// UnfilteredCols is the set of all columns for which rows from their base
+		// table are guaranteed not to have been filtered. Rows may be duplicated,
+		// but no rows can be missing. Even columns which are not output columns are
+		// included as long as table rows are guaranteed not filtered. For example,
+		// an unconstrained, unlimited Scan operator can add all columns from its
+		// table to this property, but a Select operator cannot add any columns, as
+		// it may have filtered rows.
 		//
-		// UnfilteredCols is lazily populated by the SimplifyLeftJoinWithFilters
-		// and SimplifyRightJoinWithFilters rules. It is only valid once the
-		// Rule.Available.UnfilteredCols bit has been set.
+		// UnfilteredCols is lazily populated by GetJoinMultiplicityFromInputs. It
+		// is only valid once the Rule.Available.UnfilteredCols bit has been set.
 		UnfilteredCols opt.ColSet
 
 		// JoinSize is the number of relations being *inner* joined underneath

@@ -184,6 +184,9 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			if n.canParallelize() && (len(n.spans) > 1 || n.maxResults > 1) {
 				v.observer.attr(name, "parallel", "")
 			}
+			if n.index.IsPartial() {
+				v.observer.attr(name, "partial index", "")
+			}
 			if n.hardLimit > 0 && isFilterTrue(n.filter) {
 				v.observer.attr(name, "limit", fmt.Sprintf("%d", n.hardLimit))
 			}
@@ -455,7 +458,7 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 						}
 					}
 					buf.WriteByte(')')
-					if agg.filterRenderIdx != noRenderIdx {
+					if agg.filterRenderIdx != tree.NoColumnIdx {
 						fmt.Fprintf(&buf, " FILTER (WHERE %s)", inputCols[agg.filterRenderIdx].Name)
 					}
 				}
@@ -660,10 +663,24 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		}
 
 	case *explainDistSQLNode:
-		n.plan.main = v.visit(n.plan.main)
+		// We check whether planNode is nil because the plan might be
+		// represented physically. We don't yet have a walker over such
+		// representation, so we simply short-circuit.
+		// TODO(yuzefovich): implement that walker and use it here.
+		if n.plan.main.planNode == nil {
+			return
+		}
+		n.plan.main.planNode = v.visit(n.plan.main.planNode)
 
 	case *explainVecNode:
-		n.plan = v.visit(n.plan)
+		// We check whether planNode is nil because the plan might be
+		// represented physically. We don't yet have a walker over such
+		// representation, so we simply short-circuit.
+		// TODO(yuzefovich): implement that walker and use it here.
+		if n.plan.planNode == nil {
+			return
+		}
+		n.plan.planNode = v.visit(n.plan.planNode)
 
 	case *ordinalityNode:
 		n.source = v.visit(n.source)
@@ -684,7 +701,14 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 		n.plan = v.visit(n.plan)
 
 	case *explainPlanNode:
-		n.plan.main = v.visit(n.plan.main)
+		// We check whether planNode is nil because the plan might be
+		// represented physically. We don't yet have a walker over such
+		// representation, so we simply short-circuit.
+		// TODO(yuzefovich): implement that walker and use it here.
+		if n.plan.main.planNode == nil {
+			return
+		}
+		n.plan.main.planNode = v.visit(n.plan.main.planNode)
 
 	case *cancelQueriesNode:
 		n.rows = v.visit(n.rows)

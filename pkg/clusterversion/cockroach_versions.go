@@ -64,6 +64,9 @@ const (
 	VersionGeospatialType
 	VersionEnums
 	VersionRangefeedLeases
+	VersionAlterColumnTypeGeneral
+	VersionAlterSystemJobsAddCreatedByColumns
+	VersionAddScheduledJobsTable
 
 	// Add new versions here (step one of two).
 )
@@ -492,6 +495,22 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Key:     VersionRangefeedLeases,
 		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 4},
 	},
+	{
+		// VersionAlterColumnTypeGeneral enables the use of alter column type for
+		// conversions that require the column data to be rewritten.
+		Key:     VersionAlterColumnTypeGeneral,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 5},
+	},
+	{
+		// VersionAlterSystemJobsTable is a version which modified system.jobs table.
+		Key:     VersionAlterSystemJobsAddCreatedByColumns,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 6},
+	},
+	{
+		// VersionAddScheduledJobsTable is a version which adds system.scheduled_jobs table.
+		Key:     VersionAddScheduledJobsTable,
+		Version: roachpb.Version{Major: 20, Minor: 1, Unstable: 7},
+	},
 
 	// Add new versions here (step two of two).
 
@@ -511,7 +530,7 @@ var (
 	// to HEAD; if we were to set binaryMinSupportedVersion to Version19_2,
 	// that wouldn't work since you'd have to go through the final 19.2 binary
 	// before going to HEAD.
-	binaryMinSupportedVersion = VersionByKey(VersionStart19_2)
+	binaryMinSupportedVersion = VersionByKey(Version20_1)
 
 	// binaryVersion is the version of this binary.
 	//

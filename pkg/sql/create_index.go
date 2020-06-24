@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -94,14 +95,15 @@ func (p *planner) setupFamilyAndConstraintForShard(
 		inuseNames[k] = struct{}{}
 	}
 
-	ckName, err := generateMaybeDuplicateNameForCheckConstraint(tableDesc, ckDef.Expr)
+	ckBuilder := schemaexpr.NewCheckConstraintBuilder(ctx, p.tableName, tableDesc, &p.semaCtx)
+	ckName, err := ckBuilder.DefaultName(ckDef.Expr)
 	if err != nil {
 		return err
 	}
+
 	// Avoid creating duplicate check constraints.
 	if _, ok := inuseNames[ckName]; !ok {
-		ck, err := MakeCheckConstraint(ctx, tableDesc, ckDef, inuseNames,
-			&p.semaCtx, p.tableName)
+		ck, err := ckBuilder.Build(ckDef)
 		if err != nil {
 			return err
 		}
@@ -200,9 +202,20 @@ func MakeIndexDescriptor(
 		telemetry.Inc(sqltelemetry.HashShardedIndexCounter)
 	}
 
-	// TODO(mgartner): remove this once partial indexes are fully supported.
-	if n.Predicate != nil && !params.SessionData().PartialIndexes {
-		return nil, unimplemented.NewWithIssue(9683, "partial indexes are not supported")
+	if n.Predicate != nil {
+		// TODO(mgartner): remove this once partial indexes are fully supported.
+		if !params.SessionData().PartialIndexes {
+			return nil, unimplemented.NewWithIssue(9683, "partial indexes are not supported")
+		}
+
+		idxValidator := schemaexpr.NewIndexPredicateValidator(params.ctx, n.Table, tableDesc, &params.p.semaCtx)
+		expr, err := idxValidator.Validate(n.Predicate)
+		if err != nil {
+			return nil, err
+		}
+
+		// Store the serialized predicate expression in the IndexDescriptor.
+		indexDesc.Predicate = tree.Serialize(expr)
 	}
 
 	if err := indexDesc.FillColumns(n.Columns); err != nil {
@@ -262,7 +275,7 @@ func setupShardedIndex(
 	for _, c := range *columns {
 		colNames = append(colNames, string(c.Column))
 	}
-	buckets, err := sqlbase.EvalShardBucketCount(semaCtx, evalCtx, bucketsExpr)
+	buckets, err := sqlbase.EvalShardBucketCount(ctx, semaCtx, evalCtx, bucketsExpr)
 	if err != nil {
 		return nil, false, err
 	}

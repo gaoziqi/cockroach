@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -88,24 +87,33 @@ type tableAndIndex struct {
 // spansForAllTableIndexes returns non-overlapping spans for every index and
 // table passed in. They would normally overlap if any of them are interleaved.
 func spansForAllTableIndexes(
-	codec keys.SQLCodec, tables []*sqlbase.TableDescriptor, revs []BackupManifest_DescriptorRevision,
+	codec keys.SQLCodec,
+	tables []sqlbase.TableDescriptorInterface,
+	revs []BackupManifest_DescriptorRevision,
 ) []roachpb.Span {
 
 	added := make(map[tableAndIndex]bool, len(tables))
 	sstIntervalTree := interval.NewTree(interval.ExclusiveOverlapper)
 	for _, table := range tables {
-		for _, index := range table.AllNonDropIndexes() {
-			if err := sstIntervalTree.Insert(intervalSpan(table.IndexSpan(codec, index.ID)), false); err != nil {
+		tableDesc := table.TableDesc()
+		for _, index := range tableDesc.AllNonDropIndexes() {
+			if err := sstIntervalTree.Insert(intervalSpan(tableDesc.IndexSpan(codec, index.ID)), false); err != nil {
 				panic(errors.NewAssertionErrorWithWrappedErrf(err, "IndexSpan"))
 			}
-			added[tableAndIndex{tableID: table.ID, indexID: index.ID}] = true
+			added[tableAndIndex{tableID: table.GetID(), indexID: index.ID}] = true
 		}
 	}
 	// If there are desc revisions, ensure that we also add any index spans
 	// in them that we didn't already get above e.g. indexes or tables that are
 	// not in latest because they were dropped during the time window in question.
 	for _, rev := range revs {
-		if tbl := rev.Desc.Table(hlc.Timestamp{}); tbl != nil {
+		// If the table was dropped during the last interval, it will have
+		// at least 2 revisions, and the first one should have the table in a PUBLIC
+		// state. We want (and do) ignore tables that have been dropped for the
+		// entire interval. DROPPED tables should never later become PUBLIC.
+		// TODO(pbardea): Consider and test the interaction between revision_history
+		// backups and OFFLINE tables.
+		if tbl := rev.Desc.Table(hlc.Timestamp{}); tbl != nil && tbl.State != sqlbase.TableDescriptor_DROP {
 			for _, idx := range tbl.AllNonDropIndexes() {
 				key := tableAndIndex{tableID: tbl.ID, indexID: idx.ID}
 				if !added[key] {
@@ -257,22 +265,22 @@ func backupJobDescription(
 
 // backupPlanHook implements PlanHookFn.
 func backupPlanHook(
-	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
+	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
 ) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
 	backupStmt, ok := stmt.(*tree.Backup)
 	if !ok {
 		return nil, nil, nil, false, nil
 	}
 
-	toFn, err := p.TypeAsStringArray(tree.Exprs(backupStmt.To), "BACKUP")
+	toFn, err := p.TypeAsStringArray(ctx, tree.Exprs(backupStmt.To), "BACKUP")
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	incrementalFromFn, err := p.TypeAsStringArray(backupStmt.IncrementalFrom, "BACKUP")
+	incrementalFromFn, err := p.TypeAsStringArray(ctx, backupStmt.IncrementalFrom, "BACKUP")
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	optsFn, err := p.TypeAsStringOpts(backupStmt.Options, backupOptionExpectValues)
+	optsFn, err := p.TypeAsStringOpts(ctx, backupStmt.Options, backupOptionExpectValues)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -322,7 +330,7 @@ func backupPlanHook(
 		endTime := p.ExecCfg().Clock.Now()
 		if backupStmt.AsOf.Expr != nil {
 			var err error
-			if endTime, err = p.EvalAsOfTimestamp(backupStmt.AsOf); err != nil {
+			if endTime, err = p.EvalAsOfTimestamp(ctx, backupStmt.AsOf); err != nil {
 				return err
 			}
 		}
@@ -344,25 +352,22 @@ func backupPlanHook(
 
 		statsCache := p.ExecCfg().TableStatsCache
 		tableStatistics := make([]*stats.TableStatisticProto, 0)
-		var tables []*sqlbase.TableDescriptor
+		var tables []sqlbase.TableDescriptorInterface
 		for _, desc := range targetDescs {
 			if dbDesc := desc.GetDatabase(); dbDesc != nil {
-				if err := p.CheckPrivilege(ctx, dbDesc, privilege.SELECT); err != nil {
+				db := sqlbase.NewImmutableDatabaseDescriptor(*dbDesc)
+				if err := p.CheckPrivilege(ctx, db, privilege.SELECT); err != nil {
 					return err
 				}
 			}
 			if tableDesc := desc.Table(hlc.Timestamp{}); tableDesc != nil {
-				if err := p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
+				// TODO(ajwerner): This construction of a wrapper is unfortunate and should
+				// go away in this PR.
+				table := sqlbase.NewImmutableTableDescriptor(*tableDesc)
+				if err := p.CheckPrivilege(ctx, table, privilege.SELECT); err != nil {
 					return err
 				}
-				tables = append(tables, tableDesc)
-
-				// If the table has any user defined types, error out.
-				for _, col := range tableDesc.Columns {
-					if col.Type.UserDefined() {
-						return unimplemented.NewWithIssue(48689, "user defined types in backup")
-					}
-				}
+				tables = append(tables, table)
 
 				// Collect all the table stats for this table.
 				tableStatisticsAcc, err := statsCache.GetTableStats(ctx, tableDesc.GetID())

@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -514,7 +515,7 @@ func (c *cliState) handleDemo(cmd []string, nextState, errState cliStateEnum) cl
 
 	switch cmd[0] {
 	case "shutdown":
-		if err := demoCtx.transientCluster.DrainNode(roachpb.NodeID(nodeID)); err != nil {
+		if err := demoCtx.transientCluster.DrainAndShutdown(roachpb.NodeID(nodeID)); err != nil {
 			return c.internalServerError(errState, err)
 		}
 		fmt.Printf("node %d has been shutdown\n", nodeID)
@@ -1570,8 +1571,8 @@ func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 			hint = ""
 		}
 		// In any case report that there was an error while parsing.
-		err := errors.New(message)
-		err = pgerror.WithCandidateCode(err, code)
+		err := errors.Newf("%s", message)
+		err = pgerror.WithCandidateCode(err, pgcode.MakeCode(code))
 		if hint != "" {
 			err = errors.WithHint(err, hint)
 		}

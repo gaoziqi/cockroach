@@ -90,13 +90,14 @@ func newSplitQueue(store *Store, db *kv.DB, gossip *gossip.Gossip) *splitQueue {
 }
 
 func shouldSplitRange(
+	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	ms enginepb.MVCCStats,
 	maxBytes int64,
 	shouldBackpressureWrites bool,
 	sysCfg *config.SystemConfig,
 ) (shouldQ bool, priority float64) {
-	if sysCfg.NeedsSplit(desc.StartKey, desc.EndKey) {
+	if sysCfg.NeedsSplit(ctx, desc.StartKey, desc.EndKey) {
 		// Set priority to 1 in the event the range is split by zone configs.
 		priority = 1
 		shouldQ = true
@@ -135,7 +136,7 @@ func shouldSplitRange(
 func (sq *splitQueue) shouldQueue(
 	ctx context.Context, now hlc.Timestamp, repl *Replica, sysCfg *config.SystemConfig,
 ) (shouldQ bool, priority float64) {
-	shouldQ, priority = shouldSplitRange(repl.Desc(), repl.GetMVCCStats(),
+	shouldQ, priority = shouldSplitRange(ctx, repl.Desc(), repl.GetMVCCStats(),
 		repl.GetMaxBytes(), repl.shouldBackpressureWrites(), sysCfg)
 
 	if !shouldQ && repl.SplitByLoadEnabled() {
@@ -176,7 +177,7 @@ func (sq *splitQueue) processAttempt(
 ) error {
 	desc := r.Desc()
 	// First handle the case of splitting due to zone config maps.
-	if splitKey := sysCfg.ComputeSplitKey(desc.StartKey, desc.EndKey); splitKey != nil {
+	if splitKey := sysCfg.ComputeSplitKey(ctx, desc.StartKey, desc.EndKey); splitKey != nil {
 		if _, err := r.adminSplitWithDescriptor(
 			ctx,
 			roachpb.AdminSplitRequest{
@@ -223,13 +224,26 @@ func (sq *splitQueue) processAttempt(
 			batchHandledQPS,
 			raftAppliedQPS,
 		)
+		// Add a small delay (default of 5m) to any subsequent attempt to merge
+		// this range split away. While the merge queue does takes into account
+		// load to avoids merging ranges that would be immediately re-split due
+		// to load-based splitting, it doesn't take into account historical
+		// load. So this small delay is the only thing that prevents split
+		// points created due to load from being immediately merged away after
+		// load is stopped, which can be a problem for benchmarks where data is
+		// first imported and then the workload begins after a small delay.
+		var expTime hlc.Timestamp
+		if expDelay := SplitByLoadMergeDelay.Get(&sq.store.cfg.Settings.SV); expDelay > 0 {
+			expTime = sq.store.Clock().Now().Add(expDelay.Nanoseconds(), 0)
+		}
 		if _, pErr := r.adminSplitWithDescriptor(
 			ctx,
 			roachpb.AdminSplitRequest{
 				RequestHeader: roachpb.RequestHeader{
 					Key: splitByLoadKey,
 				},
-				SplitKey: splitByLoadKey,
+				SplitKey:       splitByLoadKey,
+				ExpirationTime: expTime,
 			},
 			desc,
 			false, /* delayable */

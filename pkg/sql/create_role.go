@@ -62,7 +62,10 @@ func (p *planner) CreateRoleNode(
 		return nil, err
 	}
 
-	roleOptions, err := kvOptions.ToRoleOptions(p.TypeAsStringOrNull, opName)
+	asStringOrNull := func(e tree.Expr, op string) (func() (bool, string, error), error) {
+		return p.TypeAsStringOrNull(ctx, e, op)
+	}
+	roleOptions, err := kvOptions.ToRoleOptions(asStringOrNull, opName)
 
 	// Using CREATE ROLE syntax enables NOLOGIN by default.
 	if isRole && !roleOptions.Contains(roleoption.LOGIN) &&
@@ -79,7 +82,7 @@ func (p *planner) CreateRoleNode(
 		return nil, err
 	}
 
-	ua, err := p.getUserAuthInfo(nameE, opName)
+	ua, err := p.getUserAuthInfo(ctx, nameE, opName)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +117,7 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 			return err
 		}
 
-		if len(hashedPassword) > 0 && params.extendedEvalCtx.ExecCfg.RPCContext.Insecure {
+		if len(hashedPassword) > 0 && params.extendedEvalCtx.ExecCfg.RPCContext.Config.Insecure {
 			// We disallow setting a non-empty password in insecure mode
 			// because insecure means an observer may have MITM'ed the change
 			// and learned the password.
@@ -232,7 +235,7 @@ const usernameHelp = "Usernames are case insensitive, must start with a letter, 
 
 var usernameRE = regexp.MustCompile(`^[\p{Ll}0-9_][---\p{Ll}0-9_.]*$`)
 
-var blacklistedUsernames = map[string]struct{}{
+var blocklistedUsernames = map[string]struct{}{
 	security.NodeUser: {},
 }
 
@@ -240,19 +243,19 @@ var blacklistedUsernames = map[string]struct{}{
 // it validates according to the usernameRE regular expression.
 // It rejects reserved user names.
 func NormalizeAndValidateUsername(username string) (string, error) {
-	username, err := NormalizeAndValidateUsernameNoBlacklist(username)
+	username, err := NormalizeAndValidateUsernameNoBlocklist(username)
 	if err != nil {
 		return "", err
 	}
-	if _, ok := blacklistedUsernames[username]; ok {
+	if _, ok := blocklistedUsernames[username]; ok {
 		return "", pgerror.Newf(pgcode.ReservedName, "username %q reserved", username)
 	}
 	return username, nil
 }
 
-// NormalizeAndValidateUsernameNoBlacklist case folds the specified username and verifies
+// NormalizeAndValidateUsernameNoBlocklist case folds the specified username and verifies
 // it validates according to the usernameRE regular expression.
-func NormalizeAndValidateUsernameNoBlacklist(username string) (string, error) {
+func NormalizeAndValidateUsernameNoBlocklist(username string) (string, error) {
 	username = tree.Name(username).Normalize()
 	if !usernameRE.MatchString(username) {
 		return "", errors.WithHint(pgerror.Newf(pgcode.InvalidName, "username %q invalid", username), usernameHelp)
@@ -269,8 +272,10 @@ type userNameInfo struct {
 	name func() (string, error)
 }
 
-func (p *planner) getUserAuthInfo(nameE tree.Expr, ctx string) (userNameInfo, error) {
-	name, err := p.TypeAsString(nameE, ctx)
+func (p *planner) getUserAuthInfo(
+	ctx context.Context, nameE tree.Expr, context string,
+) (userNameInfo, error) {
+	name, err := p.TypeAsString(ctx, nameE, context)
 	if err != nil {
 		return userNameInfo{}, err
 	}

@@ -230,6 +230,22 @@ func (n *FiltersExpr) Deduplicate() {
 	*n = dedup
 }
 
+// RemoveFiltersItem returns a new list that is a copy of the given list, except
+// that it does not contain the given FiltersItem. If the list contains the item
+// multiple times, then only the first instance is removed. If the list does not
+// contain the item, then the method panics.
+func (n FiltersExpr) RemoveFiltersItem(search *FiltersItem) FiltersExpr {
+	newFilters := make(FiltersExpr, len(n)-1)
+	for i := range n {
+		if search == &n[i] {
+			copy(newFilters, n[:i])
+			copy(newFilters[i:], n[i+1:])
+			return newFilters
+		}
+	}
+	panic(errors.AssertionFailedf("item to remove is not in the list: %v", search))
+}
+
 // RemoveCommonFilters removes the filters found in other from n.
 func (n *FiltersExpr) RemoveCommonFilters(other FiltersExpr) {
 	// TODO(ridwanmsharif): Faster intersection using a map
@@ -421,6 +437,18 @@ func (jf JoinFlags) String() string {
 	return b.String()
 }
 
+func (ij *InnerJoinExpr) initUnexportedFields(mem *Memo) {
+	initJoinMultiplicity(ij)
+}
+
+func (lj *LeftJoinExpr) initUnexportedFields(mem *Memo) {
+	initJoinMultiplicity(lj)
+}
+
+func (fj *FullJoinExpr) initUnexportedFields(mem *Memo) {
+	initJoinMultiplicity(fj)
+}
+
 func (lj *LookupJoinExpr) initUnexportedFields(mem *Memo) {
 	// lookupProps are initialized as necessary by the logical props builder.
 }
@@ -432,6 +460,42 @@ func (gj *GeoLookupJoinExpr) initUnexportedFields(mem *Memo) {
 func (zj *ZigzagJoinExpr) initUnexportedFields(mem *Memo) {
 	// leftProps and rightProps are initialized as necessary by the logical props
 	// builder.
+}
+
+// joinWithMultiplicity allows join operators for which JoinMultiplicity is
+// supported (currently InnerJoin, LeftJoin, and FullJoin) to be treated
+// polymorphically.
+type joinWithMultiplicity interface {
+	setMultiplicity(props.JoinMultiplicity)
+	getMultiplicity() props.JoinMultiplicity
+}
+
+var _ joinWithMultiplicity = &InnerJoinExpr{}
+var _ joinWithMultiplicity = &LeftJoinExpr{}
+var _ joinWithMultiplicity = &FullJoinExpr{}
+
+func (ij *InnerJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
+	ij.multiplicity = multiplicity
+}
+
+func (ij *InnerJoinExpr) getMultiplicity() props.JoinMultiplicity {
+	return ij.multiplicity
+}
+
+func (lj *LeftJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
+	lj.multiplicity = multiplicity
+}
+
+func (lj *LeftJoinExpr) getMultiplicity() props.JoinMultiplicity {
+	return lj.multiplicity
+}
+
+func (fj *FullJoinExpr) setMultiplicity(multiplicity props.JoinMultiplicity) {
+	fj.multiplicity = multiplicity
+}
+
+func (fj *FullJoinExpr) getMultiplicity() props.JoinMultiplicity {
+	return fj.multiplicity
 }
 
 // WindowFrame denotes the definition of a window frame for an individual
@@ -583,7 +647,7 @@ func (prj *ProjectExpr) initUnexportedFields(mem *Memo) {
 			//
 			// We only add the FD if composite types are not involved.
 			//
-			// TODO(radu): add a whitelist of expressions/operators that are ok, like
+			// TODO(radu): add a allowlist of expressions/operators that are ok, like
 			// arithmetic.
 			composite := false
 			for i, ok := from.Next(0); ok; i, ok = from.Next(i + 1) {

@@ -384,6 +384,45 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`experimental_distsql_planning`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`experimental_distsql_planning`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			mode, ok := sessiondata.ExperimentalDistSQLPlanningModeFromString(s)
+			if !ok {
+				return newVarValueError(`experimental_distsql_planning`, s,
+					"off", "on", "always")
+			}
+			m.SetExperimentalDistSQLPlanning(mode)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return evalCtx.SessionData.ExperimentalDistSQLPlanningMode.String()
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return sessiondata.ExperimentalDistSQLPlanningMode(experimentalDistSQLPlanningClusterMode.Get(sv)).String()
+		},
+	},
+
+	// CockroachDB extension.
+	`experimental_enable_enums`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_enums`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parseBoolVar(`experimental_enable_enums`, s)
+			if err != nil {
+				return err
+			}
+			m.SetEnumsEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.EnumsEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(enumsEnabledClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
 	`enable_zigzag_join`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_zigzag_join`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
@@ -501,44 +540,6 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return "on"
-		},
-	},
-
-	// CockroachDB extension.
-	`optimizer_foreign_keys`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_foreign_keys`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("optimizer_foreign_keys", s)
-			if err != nil {
-				return err
-			}
-			m.SetOptimizerFKChecks(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.OptimizerFKChecks)
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(optDrivenFKChecksClusterMode.Get(sv))
-		},
-	},
-
-	// CockroachDB extension.
-	`experimental_optimizer_foreign_key_cascades`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`experimental_optimizer_foreign_key_cascades`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := parseBoolVar("experimental_optimizer_foreign_key_cascades", s)
-			if err != nil {
-				return err
-			}
-			m.SetOptimizerFKCascades(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.OptimizerFKCascades)
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(optDrivenFKCascadesClusterMode.Get(sv))
 		},
 	},
 
@@ -1047,6 +1048,25 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(hashShardedIndexesEnabledClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`enable_experimental_alter_column_type_general`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_experimental_alter_column_type_general`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parseBoolVar("enable_experimental_alter_column_type_general", s)
+			if err != nil {
+				return err
+			}
+			m.SetAlterColumnTypeGeneral(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.AlterColumnTypeGeneralEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(experimentalAlterColumnTypeGeneralMode.Get(sv))
 		},
 	},
 }

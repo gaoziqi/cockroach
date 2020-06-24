@@ -337,12 +337,17 @@ func TestParse(t *testing.T) {
 
 		{`CREATE STATISTICS a ON col1 FROM t`},
 		{`EXPLAIN CREATE STATISTICS a ON col1 FROM t`},
+		{`CREATE STATISTICS a FROM t`},
+		{`CREATE STATISTICS a FROM [53]`},
 		{`CREATE STATISTICS a ON col1, col2 FROM t`},
 		{`CREATE STATISTICS a ON col1 FROM d.t`},
 		{`CREATE STATISTICS a ON col1 FROM t`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.9`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
 		{`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS THROTTLING 0.1 AS OF SYSTEM TIME '2016-01-01'`},
+
+		{`ANALYZE t`},
+		{`ANALYZE db.sc.t`},
 
 		{`CREATE TYPE a AS ENUM ()`},
 		{`CREATE TYPE a AS ENUM ('a')`},
@@ -516,6 +521,7 @@ func TestParse(t *testing.T) {
 		{`SHOW EXPERIMENTAL_REPLICA TRACE FOR SESSION`},
 		{`EXPLAIN SHOW EXPERIMENTAL_REPLICA TRACE FOR SESSION`},
 		{`SHOW STATISTICS FOR TABLE t`},
+		{`SHOW STATISTICS USING JSON FOR TABLE t`},
 		{`EXPLAIN SHOW STATISTICS FOR TABLE t`},
 		{`SHOW STATISTICS FOR TABLE d.t`},
 		{`SHOW HISTOGRAM 123`},
@@ -1582,6 +1588,8 @@ func TestParse2(t *testing.T) {
 		{`CREATE STATISTICS a ON col1 FROM t AS OF SYSTEM TIME '2016-01-01'`,
 			`CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '2016-01-01'`},
 
+		{`ANALYSE t`, `ANALYZE t`},
+
 		{`SELECT TIMESTAMP WITHOUT TIME ZONE 'foo'`, `SELECT TIMESTAMP 'foo'`},
 		{`SELECT CAST('foo' AS TIMESTAMP WITHOUT TIME ZONE)`, `SELECT CAST('foo' AS TIMESTAMP)`},
 		{`SELECT CAST(1 AS "timestamp")`, `SELECT CAST(1 AS TIMESTAMP)`},
@@ -2328,6 +2336,7 @@ $function$`,
 			`CREATE TABLE a (b INT8, c STRING, FOREIGN KEY (b, c) REFERENCES other (x, y) MATCH SIMPLE ON DELETE CASCADE ON UPDATE SET NULL)`,
 			`CREATE TABLE a (b INT8, c STRING, FOREIGN KEY (b, c) REFERENCES other (x, y) ON DELETE CASCADE ON UPDATE SET NULL)`,
 		},
+		{`CREATE TABLE a (b INT8 GENERATED ALWAYS AS (a + b) STORED)`, `CREATE TABLE a (b INT8 AS (a + b) STORED)`},
 
 		{`ALTER TABLE a ALTER b DROP STORED`, `ALTER TABLE a ALTER COLUMN b DROP STORED`},
 		{`ALTER TABLE a ADD b INT8`, `ALTER TABLE a ADD COLUMN b INT8`},
@@ -2931,6 +2940,22 @@ CREATE STATISTICS a ON col1 FROM t WITH OPTIONS AS OF SYSTEM TIME '-1s' THROTTLI
                                                                                                               ^`,
 		},
 		{
+			`ANALYZE`,
+			`at or near "EOF": syntax error
+DETAIL: source SQL:
+ANALYZE
+       ^
+HINT: try \h ANALYZE`,
+		},
+		{
+			`ANALYSE`,
+			`at or near "EOF": syntax error
+DETAIL: source SQL:
+ANALYSE
+       ^
+HINT: try \h ANALYZE`,
+		},
+		{
 			`ALTER PARTITION p OF TABLE tbl@idx CONFIGURE ZONE USING num_replicas = 1`,
 			`at or near "idx": syntax error: index name should not be specified in ALTER PARTITION ... OF TABLE
 DETAIL: source SQL:
@@ -3415,7 +3440,7 @@ func TestUnimplementedSyntax(t *testing.T) {
 					t.Errorf("%s: expected %q in telemetry keys, got %+v", d.sql, exp, tkeys)
 				}
 
-				exp2 := fmt.Sprintf("issues/%d", d.issue)
+				exp2 := fmt.Sprintf("issue/%d", d.issue)
 				found = false
 				hints := errors.GetAllHints(err)
 				for _, h := range hints {

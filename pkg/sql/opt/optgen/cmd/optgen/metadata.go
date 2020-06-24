@@ -226,6 +226,7 @@ func newMetadata(compiled *lang.CompiledExpr, pkg string) *metadata {
 		"RelPropsPtr":         {fullName: "props.Relational", isPointer: true, usePointerIntern: true},
 		"ScalarProps":         {fullName: "props.Scalar"},
 		"FuncDepSet":          {fullName: "props.FuncDepSet"},
+		"JoinMultiplicity":    {fullName: "props.JoinMultiplicity"},
 		"OpaqueMetadata":      {fullName: "opt.OpaqueMetadata", isInterface: true},
 		"JobCommand":          {fullName: "tree.JobCommand", passByVal: true},
 		"IndexOrdinal":        {fullName: "cat.IndexOrdinal", passByVal: true},
@@ -233,6 +234,7 @@ func newMetadata(compiled *lang.CompiledExpr, pkg string) *metadata {
 		"LockingItem":         {fullName: "tree.LockingItem", isPointer: true},
 		"MaterializeClause":   {fullName: "tree.MaterializeClause", passByVal: true},
 		"GeoRelationshipType": {fullName: "geoindex.RelationshipType", passByVal: true},
+		"SpanExpression":      {fullName: "invertedexpr.SpanExpression", isPointer: true, usePointerIntern: true},
 	}
 
 	// Add types of generated op and private structs.

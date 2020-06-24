@@ -67,6 +67,7 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	// A Locking option is a side-effect (we don't want to elide this scan).
 	if scan.Locking != nil {
 		rel.CanHaveSideEffects = true
+		rel.VolatilitySet.AddVolatile()
 	}
 
 	// Output Columns
@@ -911,6 +912,7 @@ func (b *logicalPropsBuilder) buildLimitProps(limit *LimitExpr, rel *props.Relat
 	// Negative limits can trigger a runtime error.
 	if constLimit < 0 || !haveConstLimit {
 		rel.CanHaveSideEffects = true
+		rel.VolatilitySet.AddImmutable()
 	}
 
 	// Output Columns
@@ -1370,6 +1372,9 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared) {
 	case *DivExpr:
 		// Division by zero error is possible, unless the right-hand side is a
 		// non-zero constant.
+		//
+		// TODO(radu): this case should be removed (Div should be covered by the
+		// binary operator logic below).
 		var nonZero bool
 		if c, ok := t.Right.(*ConstExpr); ok {
 			switch v := c.Value.(type) {
@@ -1383,6 +1388,7 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared) {
 		}
 		if !nonZero {
 			shared.CanHaveSideEffects = true
+			shared.VolatilitySet.AddImmutable()
 		}
 
 	case *SubqueryExpr, *ExistsExpr, *AnyExpr, *ArrayFlattenExpr:
@@ -1399,11 +1405,48 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared) {
 			// Impure functions can return different value on each call.
 			shared.CanHaveSideEffects = true
 		}
+		shared.VolatilitySet.Add(t.Overload.Volatility)
+
+	case *CastExpr:
+		from, to := t.Input.DataType(), t.Typ
+		volatility, ok := tree.LookupCastVolatility(from, to)
+		if !ok {
+			panic(errors.AssertionFailedf("no volatility for cast %s::%s", from, to))
+		}
+		shared.VolatilitySet.Add(volatility)
 
 	default:
-		if opt.IsMutationOp(e) {
+		if opt.IsUnaryOp(e) {
+			inputType := e.Child(0).(opt.ScalarExpr).DataType()
+			o, ok := FindUnaryOverload(e.Op(), inputType)
+			if !ok {
+				panic(errors.AssertionFailedf("unary overload not found (%s, %s)", e.Op(), inputType))
+			}
+			shared.VolatilitySet.Add(o.Volatility)
+		} else if opt.IsComparisonOp(e) {
+			leftType := e.Child(0).(opt.ScalarExpr).DataType()
+			rightType := e.Child(1).(opt.ScalarExpr).DataType()
+			o, _, _, ok := FindComparisonOverload(e.Op(), leftType, rightType)
+			if !ok {
+				panic(errors.AssertionFailedf(
+					"comparison overload not found (%s, %s, %s)", e.Op(), leftType, rightType,
+				))
+			}
+			shared.VolatilitySet.Add(o.Volatility)
+		} else if opt.IsBinaryOp(e) {
+			leftType := e.Child(0).(opt.ScalarExpr).DataType()
+			rightType := e.Child(1).(opt.ScalarExpr).DataType()
+			o, ok := FindBinaryOverload(e.Op(), leftType, rightType)
+			if !ok {
+				panic(errors.AssertionFailedf(
+					"binary overload not found (%s, %s, %s)", e.Op(), leftType, rightType,
+				))
+			}
+			shared.VolatilitySet.Add(o.Volatility)
+		} else if opt.IsMutationOp(e) {
 			shared.CanHaveSideEffects = true
 			shared.CanMutate = true
+			shared.VolatilitySet.AddVolatile()
 		}
 	}
 
@@ -1426,6 +1469,7 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared) {
 			if cached.HasPlaceholder {
 				shared.HasPlaceholder = true
 			}
+			shared.VolatilitySet.UnionWith(cached.VolatilitySet)
 			if cached.CanHaveSideEffects {
 				shared.CanHaveSideEffects = true
 			}
@@ -2016,7 +2060,31 @@ func (h *joinPropsHelper) cardinality() props.Cardinality {
 
 	// Outer joins return minimum number of rows, depending on type.
 	switch h.joinType {
+	case opt.InnerJoinOp, opt.InnerJoinApplyOp:
+		if joinWithMult, isJoinWithMult := h.join.(joinWithMultiplicity); isJoinWithMult {
+			multiplicity := joinWithMult.getMultiplicity()
+			if multiplicity.JoinDoesNotDuplicateLeftRows() && innerJoinCard.Max > left.Max {
+				// If left rows aren't duplicated, the max join cardinality is at most the
+				// max left cardinality.
+				innerJoinCard.Max = left.Max
+			}
+			if multiplicity.JoinDoesNotDuplicateRightRows() && innerJoinCard.Max > right.Max {
+				// If right rows aren't duplicated, the max join cardinality is at most
+				// the max right cardinality.
+				innerJoinCard.Max = right.Max
+			}
+		}
+		return innerJoinCard
+
 	case opt.LeftJoinOp, opt.LeftJoinApplyOp:
+		if joinWithMult, isJoinWithMult := h.join.(joinWithMultiplicity); isJoinWithMult {
+			// If left rows aren't duplicated, the max join cardinality is at most the
+			// max left cardinality.
+			multiplicity := joinWithMult.getMultiplicity()
+			if multiplicity.JoinDoesNotDuplicateLeftRows() && innerJoinCard.Max > left.Max {
+				innerJoinCard.Max = left.Max
+			}
+		}
 		return innerJoinCard.AtLeast(left)
 
 	case opt.RightJoinOp:
@@ -2037,10 +2105,20 @@ func (h *joinPropsHelper) cardinality() props.Cardinality {
 		// We could get left.Max + right.Max rows (if the filter doesn't match
 		// anything). We use Add here because it handles overflow.
 		c.Max = left.Add(right).Max
+
+		if joinWithMult, isJoinWithMult := h.join.(joinWithMultiplicity); isJoinWithMult {
+			multiplicity := joinWithMult.getMultiplicity()
+			if multiplicity.JoinDoesNotDuplicateLeftRows() &&
+				multiplicity.JoinDoesNotDuplicateRightRows() && innerJoinCard.Max > c.Max {
+				// If neither left rows nor right rows are duplicated, the join max
+				// cardinality is at most the sum of the left and right maxes.
+				innerJoinCard.Max = c.Max
+			}
+		}
 		return innerJoinCard.AtLeast(c)
 
 	default:
-		return innerJoinCard
+		panic(errors.AssertionFailedf("unexpected operator: %v", h.joinType))
 	}
 }
 

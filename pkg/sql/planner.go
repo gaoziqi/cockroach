@@ -197,6 +197,12 @@ type planner struct {
 	noticeSender noticeSender
 
 	queryCacheSession querycache.Session
+
+	// contextDatabaseID is the ID of a database. It is set during some name
+	// resolution processes to disallow cross database references. In particular,
+	// the type resolution steps will disallow resolution of types that have a
+	// parentID != contextDatabaseID when it is set.
+	contextDatabaseID sqlbase.ID
 }
 
 func (ctx *extendedEvalContext) setSessionID(sessionID ClusterWideID) {
@@ -299,6 +305,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	p.extendedEvalCtx.NodeID = execCfg.NodeID
 	p.extendedEvalCtx.Locality = execCfg.Locality
+	p.extendedEvalCtx.TypeResolver = p
 
 	p.sessionDataMutator = dataMutator
 	p.autoCommit = false
@@ -371,6 +378,11 @@ func (p *planner) LogicalSchemaAccessor() catalog.Accessor {
 	return p.extendedEvalCtx.schemaAccessors.logical
 }
 
+// SemaCtx provides access to the planner's SemaCtx.
+func (p *planner) SemaCtx() *tree.SemaContext {
+	return &p.semaCtx
+}
+
 // Note: if the context will be modified, use ExtendedEvalContextCopy instead.
 func (p *planner) ExtendedEvalContext() *extendedEvalContext {
 	return &p.extendedEvalCtx
@@ -432,7 +444,7 @@ func (p *planner) ParseType(sql string) (*types.T, error) {
 	if err != nil {
 		return nil, err
 	}
-	return tree.ResolveType(ref, p.semaCtx.GetTypeResolver())
+	return tree.ResolveType(context.TODO(), ref, p.semaCtx.GetTypeResolver())
 }
 
 // ParseQualifiedTableName implements the tree.EvalDatabase interface.
@@ -455,7 +467,9 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 
 // LookupTableByID looks up a table, by the given descriptor ID. Based on the
 // CommonLookupFlags, it could use or skip the Collection cache. See
-// Collection.GetTableVersionByID for how it's used.
+// Collection.getTableVersionByID for how it's used.
+// TODO (SQLSchema): This should call into the set of SchemaAccessors instead
+//  of having its own logic for lookups.
 func (p *planner) LookupTableByID(
 	ctx context.Context, tableID sqlbase.ID,
 ) (catalog.TableEntry, error) {
@@ -470,6 +484,11 @@ func (p *planner) LookupTableByID(
 		}
 		return catalog.TableEntry{}, err
 	}
+	// TODO (rohany): This shouldn't be needed once the descs.Collection always
+	//  returns descriptors with hydrated types.
+	if err := p.maybeHydrateTypesInDescriptor(ctx, table); err != nil {
+		return catalog.TableEntry{}, err
+	}
 	return catalog.TableEntry{Desc: table}, nil
 }
 
@@ -477,8 +496,10 @@ func (p *planner) LookupTableByID(
 // string and returns a function that can be called to get the string value
 // during (planNode).Start.
 // To also allow NULLs to be returned, use TypeAsStringOrNull() instead.
-func (p *planner) TypeAsString(e tree.Expr, op string) (func() (string, error), error) {
-	typedE, err := tree.TypeCheckAndRequire(e, &p.semaCtx, types.String, op)
+func (p *planner) TypeAsString(
+	ctx context.Context, e tree.Expr, op string,
+) (func() (string, error), error) {
+	typedE, err := tree.TypeCheckAndRequire(ctx, e, &p.semaCtx, types.String, op)
 	if err != nil {
 		return nil, err
 	}
@@ -496,8 +517,10 @@ func (p *planner) TypeAsString(e tree.Expr, op string) (func() (string, error), 
 }
 
 // TypeAsStringOrNull is like TypeAsString but allows NULLs.
-func (p *planner) TypeAsStringOrNull(e tree.Expr, op string) (func() (bool, string, error), error) {
-	typedE, err := tree.TypeCheckAndRequire(e, &p.semaCtx, types.String, op)
+func (p *planner) TypeAsStringOrNull(
+	ctx context.Context, e tree.Expr, op string,
+) (func() (bool, string, error), error) {
+	typedE, err := tree.TypeCheckAndRequire(ctx, e, &p.semaCtx, types.String, op)
 	if err != nil {
 		return nil, err
 	}
@@ -571,7 +594,7 @@ func evalStringOptions(
 // typecheck as strings, and returns a function that can be called to
 // get the string value during (planNode).Start.
 func (p *planner) TypeAsStringOpts(
-	opts tree.KVOptions, optValidate map[string]KVStringOptValidate,
+	ctx context.Context, opts tree.KVOptions, optValidate map[string]KVStringOptValidate,
 ) (func() (map[string]string, error), error) {
 	typed := make(map[string]tree.TypedExpr, len(opts))
 	for _, opt := range opts {
@@ -591,7 +614,7 @@ func (p *planner) TypeAsStringOpts(
 		if validate == KVStringOptRequireNoValue {
 			return nil, errors.Errorf("option %q does not take a value", k)
 		}
-		r, err := tree.TypeCheckAndRequire(opt.Value, &p.semaCtx, types.String, k)
+		r, err := tree.TypeCheckAndRequire(ctx, opt.Value, &p.semaCtx, types.String, k)
 		if err != nil {
 			return nil, err
 		}
@@ -622,10 +645,12 @@ func (p *planner) TypeAsStringOpts(
 // TypeAsStringArray enforces (not hints) that the given expressions all typecheck as
 // strings and returns a function that can be called to get the string values
 // during (planNode).Start.
-func (p *planner) TypeAsStringArray(exprs tree.Exprs, op string) (func() ([]string, error), error) {
+func (p *planner) TypeAsStringArray(
+	ctx context.Context, exprs tree.Exprs, op string,
+) (func() ([]string, error), error) {
 	typedExprs := make([]tree.TypedExpr, len(exprs))
 	for i := range exprs {
-		typedE, err := tree.TypeCheckAndRequire(exprs[i], &p.semaCtx, types.String, op)
+		typedE, err := tree.TypeCheckAndRequire(ctx, exprs[i], &p.semaCtx, types.String, op)
 		if err != nil {
 			return nil, err
 		}

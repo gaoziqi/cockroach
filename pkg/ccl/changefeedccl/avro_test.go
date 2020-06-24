@@ -48,8 +48,9 @@ func parseTableDesc(createTableStmt string) (*sqlbase.TableDescriptor, error) {
 	st := cluster.MakeTestingClusterSettings()
 	const parentID = sqlbase.ID(keys.MaxReservedDescID + 1)
 	const tableID = sqlbase.ID(keys.MaxReservedDescID + 2)
+	semaCtx := tree.MakeSemaContext()
 	mutDesc, err := importccl.MakeSimpleTableDescriptor(
-		ctx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
+		ctx, &semaCtx, st, createTable, parentID, tableID, importccl.NoFKs, hlc.UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +58,8 @@ func parseTableDesc(createTableStmt string) (*sqlbase.TableDescriptor, error) {
 }
 
 func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.EncDatumRow, error) {
-	semaCtx := &tree.SemaContext{}
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
 	evalCtx := &tree.EvalContext{}
 
 	valuesStmt, err := parser.ParseOne(values)
@@ -79,13 +81,13 @@ func parseValues(tableDesc *sqlbase.TableDescriptor, values string) ([]sqlbase.E
 		for colIdx, expr := range rowTuple {
 			col := &tableDesc.Columns[colIdx]
 			typedExpr, err := sqlbase.SanitizeVarFreeExpr(
-				expr, col.Type, "avro", semaCtx, false /* allowImpure */)
+				ctx, expr, col.Type, "avro", &semaCtx, false /* allowImpure */)
 			if err != nil {
 				return nil, err
 			}
 			datum, err := typedExpr.Eval(evalCtx)
 			if err != nil {
-				return nil, errors.Wrap(err, typedExpr.String())
+				return nil, errors.Wrapf(err, "evaluating %s", typedExpr)
 			}
 			row = append(row, sqlbase.DatumToEncDatum(col.Type, datum))
 		}
@@ -125,7 +127,9 @@ func avroFieldMetadataToColDesc(metadata string) (*sqlbase.ColumnDescriptor, err
 		return nil, err
 	}
 	def := parsed.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
-	col, _, _, err := sqlbase.MakeColumnDefDescs(def, &tree.SemaContext{}, &tree.EvalContext{})
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
+	col, _, _, err := sqlbase.MakeColumnDefDescs(ctx, def, &semaCtx, &tree.EvalContext{})
 	return col, err
 }
 

@@ -48,7 +48,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -69,6 +68,9 @@ var (
 		"input value must be <= %d (maximum Unicode code point)", utf8.MaxRune)
 	errStringTooLarge = pgerror.Newf(pgcode.ProgramLimitExceeded,
 		"requested length too large, exceeds %s", humanizeutil.IBytes(maxAllocatedStringSize))
+	// SequenceNameArg represents the name of sequence (string) arguments in
+	// builtin functions.
+	SequenceNameArg = "sequence_name"
 )
 
 const maxAllocatedStringSize = 128 * 1024 * 1024
@@ -1697,8 +1699,7 @@ CockroachDB supports the following flags:
 
 	"random": makeBuiltin(
 		tree.FunctionProperties{
-			Impure:                  true,
-			NeedsRepeatedEvaluation: true,
+			Impure: true,
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{},
@@ -1735,12 +1736,13 @@ CockroachDB supports the following flags:
 
 	"nextval": makeBuiltin(
 		tree.FunctionProperties{
-			Category:         categorySequences,
-			DistsqlBlacklist: true,
-			Impure:           true,
+			Category:             categorySequences,
+			DistsqlBlocklist:     true,
+			Impure:               true,
+			HasSequenceArguments: true,
 		},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"sequence_name", types.String}},
+			Types:      tree.ArgTypes{{SequenceNameArg, types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
@@ -1761,12 +1763,13 @@ CockroachDB supports the following flags:
 
 	"currval": makeBuiltin(
 		tree.FunctionProperties{
-			Category:         categorySequences,
-			DistsqlBlacklist: true,
-			Impure:           true,
+			Category:             categorySequences,
+			DistsqlBlocklist:     true,
+			Impure:               true,
+			HasSequenceArguments: true,
 		},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"sequence_name", types.String}},
+			Types:      tree.ArgTypes{{SequenceNameArg, types.String}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
@@ -1809,12 +1812,13 @@ CockroachDB supports the following flags:
 	// See https://github.com/cockroachdb/cockroach/issues/21564
 	"setval": makeBuiltin(
 		tree.FunctionProperties{
-			Category:         categorySequences,
-			DistsqlBlacklist: true,
-			Impure:           true,
+			Category:             categorySequences,
+			DistsqlBlocklist:     true,
+			Impure:               true,
+			HasSequenceArguments: true,
 		},
 		tree.Overload{
-			Types:      tree.ArgTypes{{"sequence_name", types.String}, {"value", types.Int}},
+			Types:      tree.ArgTypes{{SequenceNameArg, types.String}, {"value", types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
@@ -1836,7 +1840,7 @@ CockroachDB supports the following flags:
 		},
 		tree.Overload{
 			Types: tree.ArgTypes{
-				{"sequence_name", types.String}, {"value", types.Int}, {"is_called", types.Bool},
+				{SequenceNameArg, types.String}, {"value", types.Int}, {"is_called", types.Bool},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
@@ -2929,11 +2933,19 @@ may increase either contention or retry errors, or both.`,
 				case args[0] == tree.DNull:
 					right := args[1].(*tree.DEnum)
 					typ = right.ResolvedType()
-					bottom, top = 0, typ.EnumGetIdxOfPhysical(right.PhysicalRep)
+					idx, err := typ.EnumGetIdxOfPhysical(right.PhysicalRep)
+					if err != nil {
+						return nil, err
+					}
+					bottom, top = 0, idx
 				case args[1] == tree.DNull:
 					left := args[0].(*tree.DEnum)
 					typ = left.ResolvedType()
-					bottom, top = typ.EnumGetIdxOfPhysical(left.PhysicalRep), len(typ.TypeMeta.EnumData.PhysicalRepresentations)-1
+					idx, err := typ.EnumGetIdxOfPhysical(left.PhysicalRep)
+					if err != nil {
+						return nil, err
+					}
+					bottom, top = idx, len(typ.TypeMeta.EnumData.PhysicalRepresentations)-1
 				default:
 					left, right := args[0].(*tree.DEnum), args[1].(*tree.DEnum)
 					if !left.ResolvedType().Equivalent(right.ResolvedType()) {
@@ -2945,7 +2957,15 @@ may increase either contention or retry errors, or both.`,
 						)
 					}
 					typ = left.ResolvedType()
-					bottom, top = typ.EnumGetIdxOfPhysical(left.PhysicalRep), typ.EnumGetIdxOfPhysical(right.PhysicalRep)
+					var err error
+					bottom, err = typ.EnumGetIdxOfPhysical(left.PhysicalRep)
+					if err != nil {
+						return nil, err
+					}
+					top, err = typ.EnumGetIdxOfPhysical(right.PhysicalRep)
+					if err != nil {
+						return nil, err
+					}
 				}
 				arr := tree.NewDArray(typ)
 				for i := bottom; i <= top; i++ {
@@ -2960,7 +2980,7 @@ may increase either contention or retry errors, or both.`,
 				}
 				return arr, nil
 			},
-			Info:       "Returns all values of the input enum in an ordered array between the two arguments.",
+			Info:       "Returns all values of the input enum in an ordered array between the two arguments (inclusive).",
 			Volatility: tree.VolatilityStable,
 		},
 	),
@@ -3008,7 +3028,7 @@ may increase either contention or retry errors, or both.`,
 	"current_schema": makeBuiltin(
 		tree.FunctionProperties{
 			Category:         categorySystemInfo,
-			DistsqlBlacklist: true,
+			DistsqlBlocklist: true,
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{},
@@ -3045,7 +3065,7 @@ may increase either contention or retry errors, or both.`,
 	"current_schemas": makeBuiltin(
 		tree.FunctionProperties{
 			Category:         categorySystemInfo,
-			DistsqlBlacklist: true,
+			DistsqlBlocklist: true,
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{{"include_pg_catalog", types.Bool}},
@@ -3266,32 +3286,86 @@ may increase either contention or retry errors, or both.`,
 				indexID := int(tree.MustBeDInt(args[1]))
 				rowDatums, ok := tree.AsDTuple(args[2])
 				if !ok {
-					return nil, pgerror.Newf(pgcode.DatatypeMismatch, "expected tuple argument for row_tuple, found %s", args[2])
+					return nil, pgerror.Newf(
+						pgcode.DatatypeMismatch,
+						"expected tuple argument for row_tuple, found %s",
+						args[2],
+					)
 				}
 
+				// Get the referenced table and index.
 				tableDesc, err := sqlbase.GetTableDescFromID(ctx.Context, ctx.Txn, ctx.Codec, sqlbase.ID(tableID))
 				if err != nil {
 					return nil, err
 				}
-
-				if len(rowDatums.D) != len(tableDesc.Columns) {
-					return nil, pgerror.Newf(pgcode.Syntax, "number of values provided must equal number of columns in table")
+				indexDesc, err := tableDesc.FindIndexByID(sqlbase.IndexID(indexID))
+				if err != nil {
+					return nil, err
 				}
-				// Check that all the input datums have types that line up with the columns.
+
+				// Collect the index columns. If the index is a non-unique secondary
+				// index, it might have some extra key columns.
+				indexColIDs := indexDesc.ColumnIDs
+				if indexDesc.ID != tableDesc.PrimaryIndex.ID && !indexDesc.Unique {
+					indexColIDs = append(indexColIDs, indexDesc.ExtraColumnIDs...)
+				}
+
+				// Ensure that the input tuple length equals the number of index cols.
+				if len(rowDatums.D) != len(indexColIDs) {
+					err := errors.Newf(
+						"number of values must equal number of columns in index %q",
+						indexDesc.Name,
+					)
+					// If the index has some extra key columns, then output an error
+					// message with some extra information to explain the subtlety.
+					if indexDesc.ID != tableDesc.PrimaryIndex.ID && !indexDesc.Unique && len(indexDesc.ExtraColumnIDs) > 0 {
+						var extraColNames []string
+						for _, id := range indexDesc.ExtraColumnIDs {
+							col, colErr := tableDesc.FindColumnByID(id)
+							if colErr != nil {
+								return nil, errors.CombineErrors(err, colErr)
+							}
+							extraColNames = append(extraColNames, col.Name)
+						}
+						var allColNames []string
+						for _, id := range indexColIDs {
+							col, colErr := tableDesc.FindColumnByID(id)
+							if colErr != nil {
+								return nil, errors.CombineErrors(err, colErr)
+							}
+							allColNames = append(allColNames, col.Name)
+						}
+						return nil, errors.WithHintf(
+							err,
+							"columns %v are implicitly part of index %q's key, include columns %v in this order",
+							extraColNames,
+							indexDesc.Name,
+							allColNames,
+						)
+					}
+					return nil, err
+				}
+
+				// Check that the input datums are typed as the index columns types.
 				var datums tree.Datums
 				for i, d := range rowDatums.D {
-					// We try to perform a cast here rather than a typecheck because the individual datums
-					// already have a fixed type, and not information is known at typechecking time for those
-					// datums to line up with the column types of the input table. Instead we try to cast the
-					// parsed datums into the types of the table's columns.
+					// We perform a cast here rather than a type check because datums
+					// already have a fixed type, and not enough information is known at
+					// typechecking time to ensure that the datums are typed with the
+					// types of the index columns. So, try to cast the input datums to
+					// the types of the index columns here.
 					var newDatum tree.Datum
+					col, err := tableDesc.FindColumnByID(indexColIDs[i])
+					if err != nil {
+						return nil, err
+					}
 					if d.ResolvedType() == types.Unknown {
-						if !tableDesc.Columns[i].Nullable {
+						if !col.Nullable {
 							return nil, pgerror.Newf(pgcode.NotNullViolation, "NULL provided as a value for a non-nullable column")
 						}
 						newDatum = tree.DNull
 					} else {
-						expectedTyp := tableDesc.Columns[i].DatumType()
+						expectedTyp := col.DatumType()
 						newDatum, err = tree.PerformCast(ctx, d, expectedTyp)
 						if err != nil {
 							return nil, errors.WithHint(err, "try to explicitly cast each value to the corresponding column type")
@@ -3300,36 +3374,19 @@ may increase either contention or retry errors, or both.`,
 					datums = append(datums, newDatum)
 				}
 
-				indexDesc, err := tableDesc.FindIndexByID(sqlbase.IndexID(indexID))
-				if err != nil {
-					return nil, err
-				}
-
-				// Create a column id to row index map. In this case, each column ID just maps to the i'th ordinal.
+				// Create a column id to row index map. In this case, each column ID
+				// just maps to the i'th ordinal.
 				colMap := make(map[sqlbase.ColumnID]int)
-				for i := range tableDesc.Columns {
-					colMap[tableDesc.Columns[i].ID] = i
+				for i, id := range indexColIDs {
+					colMap[id] = i
 				}
-
-				if indexDesc.ID == tableDesc.PrimaryIndex.ID {
-					keyPrefix := sqlbase.MakeIndexKeyPrefix(ctx.Codec, tableDesc, indexDesc.ID)
-					res, _, err := sqlbase.EncodeIndexKey(tableDesc, indexDesc, colMap, datums, keyPrefix)
-					if err != nil {
-						return nil, err
-					}
-					return tree.NewDBytes(tree.DBytes(res)), err
-				}
-				// We have a secondary index.
-				res, err := sqlbase.EncodeSecondaryIndex(ctx.Codec, tableDesc, indexDesc, colMap, datums, true /* includeEmpty */)
+				// Finally, encode the index key using the provided datums.
+				keyPrefix := sqlbase.MakeIndexKeyPrefix(ctx.Codec, tableDesc, indexDesc.ID)
+				res, _, err := sqlbase.EncodePartialIndexKey(tableDesc, indexDesc, len(datums), colMap, datums, keyPrefix)
 				if err != nil {
 					return nil, err
 				}
-				// If EncodeSecondaryIndex returns more than one element then we have an inverted index,
-				// which this command does not support right now.
-				if indexDesc.Type == sqlbase.IndexDescriptor_INVERTED {
-					return nil, unimplemented.NewWithIssue(41232, "inverted indexes not supported right now")
-				}
-				return tree.NewDBytes(tree.DBytes(res[0].Key)), err
+				return tree.NewDBytes(tree.DBytes(res)), err
 			},
 			Info:       "Generate the key for a row on a particular table and index.",
 			Volatility: tree.VolatilityStable,
@@ -3352,7 +3409,7 @@ may increase either contention or retry errors, or both.`,
 				if errCode == "" {
 					return nil, errors.Newf("%s", msg)
 				}
-				return nil, pgerror.Newf(errCode, "%s", msg)
+				return nil, pgerror.Newf(pgcode.MakeCode(errCode), "%s", msg)
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
 			Volatility: tree.VolatilityVolatile,
@@ -3440,7 +3497,7 @@ may increase either contention or retry errors, or both.`,
 					return nil, err
 				}
 				msg := string(*args[0].(*tree.DString))
-				log.Fatal(ctx.Ctx(), msg)
+				log.Fatalf(ctx.Ctx(), "force_log_fatal(): %s", msg)
 				return nil, nil
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
@@ -3786,7 +3843,7 @@ may increase either contention or retry errors, or both.`,
 	"crdb_internal.is_admin": makeBuiltin(
 		tree.FunctionProperties{
 			Category:         categorySystemInfo,
-			DistsqlBlacklist: true,
+			DistsqlBlocklist: true,
 		},
 		tree.Overload{
 			Types:      tree.ArgTypes{},
@@ -4907,7 +4964,7 @@ func hashBuiltin(newHash func() hash.Hash, info string) builtinDefinition {
 				return tree.NewDString(fmt.Sprintf("%x", h.Sum(nil))), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 		tree.Overload{
 			Types:      tree.VariadicType{VarType: types.Bytes},
@@ -4920,7 +4977,7 @@ func hashBuiltin(newHash func() hash.Hash, info string) builtinDefinition {
 				return tree.NewDString(fmt.Sprintf("%x", h.Sum(nil))), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 	)
 }
@@ -4938,7 +4995,7 @@ func hash32Builtin(newHash func() hash.Hash32, info string) builtinDefinition {
 				return tree.NewDInt(tree.DInt(h.Sum32())), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 		tree.Overload{
 			Types:      tree.VariadicType{VarType: types.Bytes},
@@ -4951,7 +5008,7 @@ func hash32Builtin(newHash func() hash.Hash32, info string) builtinDefinition {
 				return tree.NewDInt(tree.DInt(h.Sum32())), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 	)
 }
@@ -4969,7 +5026,7 @@ func hash64Builtin(newHash func() hash.Hash64, info string) builtinDefinition {
 				return tree.NewDInt(tree.DInt(h.Sum64())), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 		tree.Overload{
 			Types:      tree.VariadicType{VarType: types.Bytes},
@@ -4982,7 +5039,7 @@ func hash64Builtin(newHash func() hash.Hash64, info string) builtinDefinition {
 				return tree.NewDInt(tree.DInt(h.Sum64())), nil
 			},
 			Info:       info,
-			Volatility: tree.VolatilityImmutable,
+			Volatility: tree.VolatilityLeakProof,
 		},
 	)
 }
@@ -5344,12 +5401,17 @@ func extractTimeSpanFromTimestampTZ(
 		return ret, nil
 	}
 
-	// time.Time's Year(), Month(), Day(), ISOWeek(), etc. all deal in terms
-	// of UTC, rather than as the timezone.
-	// Remedy this by assuming that the timezone is UTC (to prevent confusion)
-	// and offsetting time when using extractTimeSpanFromTimestamp.
-	pretendTime := fromTime.In(time.UTC).Add(time.Duration(offsetSecs) * time.Second)
-	return extractTimeSpanFromTimestamp(ctx, pretendTime, timeSpan)
+	switch timeSpan {
+	case "epoch":
+		return extractTimeSpanFromTimestamp(ctx, fromTime, timeSpan)
+	default:
+		// time.Time's Year(), Month(), Day(), ISOWeek(), etc. all deal in terms
+		// of UTC, rather than as the timezone.
+		// Remedy this by assuming that the timezone is UTC (to prevent confusion)
+		// and offsetting time when using extractTimeSpanFromTimestamp.
+		pretendTime := fromTime.In(time.UTC).Add(time.Duration(offsetSecs) * time.Second)
+		return extractTimeSpanFromTimestamp(ctx, pretendTime, timeSpan)
+	}
 }
 
 func extractTimeSpanFromInterval(

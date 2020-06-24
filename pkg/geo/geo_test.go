@@ -16,9 +16,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
-	"github.com/cockroachdb/cockroach/pkg/geo/geos"
-	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/datadriven"
 	"github.com/golang/geo/s2"
 	"github.com/stretchr/testify/require"
 	"github.com/twpayne/go-geom"
@@ -421,49 +418,56 @@ func TestGeographyAsS2(t *testing.T) {
 			g, err := ParseGeography(tc.wkt)
 			require.NoError(t, err)
 
-			shapes, err := g.AsS2()
+			shapes, err := g.AsS2(EmptyBehaviorError)
 			require.NoError(t, err)
 
 			require.Equal(t, tc.expected, shapes)
 		})
 	}
-}
 
-func TestClipEWKBByRect(t *testing.T) {
-	defer leaktest.AfterTest(t)()
+	// Test when things are empty.
+	emptyTestCases := []struct {
+		wkt          string
+		expectedOmit []s2.Region
+	}{
+		{
+			"GEOMETRYCOLLECTION ( LINESTRING EMPTY, MULTIPOINT((1.0 5.0), (3.0 4.0)) )",
+			[]s2.Region{
+				s2.PointFromLatLng(s2.LatLngFromDegrees(5.0, 1.0)),
+				s2.PointFromLatLng(s2.LatLngFromDegrees(4.0, 3.0)),
+			},
+		},
+		{
+			"GEOMETRYCOLLECTION EMPTY",
+			nil,
+		},
+		{
+			"MULTILINESTRING (EMPTY, (1.0 2.0, 3.0 4.0))",
+			[]s2.Region{
+				s2.PolylineFromLatLngs([]s2.LatLng{
+					s2.LatLngFromDegrees(2.0, 1.0),
+					s2.LatLngFromDegrees(4.0, 3.0),
+				}),
+			},
+		},
+		{
+			"MULTILINESTRING (EMPTY, EMPTY)",
+			nil,
+		},
+	}
 
-	var g *Geometry
-	var err error
-	datadriven.RunTest(t, "testdata/clip", func(t *testing.T, d *datadriven.TestData) string {
-		switch d.Cmd {
-		case "geometry":
-			g, err = ParseGeometry(d.Input)
-			if err != nil {
-				return err.Error()
-			}
-			return ""
-		case "clip":
-			var xMin, yMin, xMax, yMax int
-			d.ScanArgs(t, "xmin", &xMin)
-			d.ScanArgs(t, "ymin", &yMin)
-			d.ScanArgs(t, "xmax", &xMax)
-			d.ScanArgs(t, "ymax", &yMax)
-			ewkb, err := geos.ClipEWKBByRect(
-				g.EWKB(), float64(xMin), float64(yMin), float64(xMax), float64(yMax))
-			if err != nil {
-				return err.Error()
-			}
-			// TODO(sumeer):
-			// - add WKB to WKT and print exact output
-			// - expand test with more inputs
-			return fmt.Sprintf(
-				"%d => %d (srid: %d)",
-				len(g.EWKB()),
-				len(ewkb),
-				g.SRID(),
-			)
-		default:
-			return fmt.Sprintf("unknown command: %s", d.Cmd)
-		}
-	})
+	for _, tc := range emptyTestCases {
+		t.Run(tc.wkt, func(t *testing.T) {
+			g, err := ParseGeography(tc.wkt)
+			require.NoError(t, err)
+
+			_, err = g.AsS2(EmptyBehaviorError)
+			require.Error(t, err)
+			require.True(t, IsEmptyGeometryError(err))
+
+			shapes, err := g.AsS2(EmptyBehaviorOmit)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedOmit, shapes)
+		})
+	}
 }

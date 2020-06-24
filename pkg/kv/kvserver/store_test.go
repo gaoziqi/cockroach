@@ -43,7 +43,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -170,7 +169,7 @@ func (db *testSender) Send(
 	}
 	repl := db.store.LookupReplica(rs.Key)
 	if repl == nil || !repl.Desc().ContainsKeyRange(rs.Key, rs.EndKey) {
-		return nil, roachpb.NewError(roachpb.NewRangeKeyMismatchError(rs.Key.AsRawKey(), rs.EndKey.AsRawKey(), nil))
+		panic(fmt.Sprintf("didn't find right replica for key: %s", rs.Key))
 	}
 	ba.RangeID = repl.RangeID
 	repDesc, err := repl.GetReplicaDescriptor()
@@ -207,9 +206,13 @@ func createTestStoreWithoutStart(
 	// Setup fake zone config handler.
 	config.TestingSetupZoneConfigHook(stopper)
 
-	rpcContext := rpc.NewContext(
-		cfg.AmbientCtx, &base.Config{Insecure: true}, cfg.Clock,
-		stopper, cfg.Settings)
+	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		AmbientCtx: cfg.AmbientCtx,
+		Config:     &base.Config{Insecure: true},
+		Clock:      cfg.Clock,
+		Stopper:    stopper,
+		Settings:   cfg.Settings,
+	})
 	server := rpc.NewServer(rpcContext) // never started
 	cfg.Gossip = gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), cfg.DefaultZoneConfig)
 	cfg.StorePool = NewTestStorePool(*cfg)
@@ -1476,8 +1479,12 @@ func TestStoreSetRangesMaxBytes(t *testing.T) {
 	}
 
 	// Set zone configs.
-	config.TestingSetZoneConfig(baseID, zonepb.ZoneConfig{RangeMaxBytes: proto.Int64(1 << 20)})
-	config.TestingSetZoneConfig(baseID+2, zonepb.ZoneConfig{RangeMaxBytes: proto.Int64(2 << 20)})
+	config.TestingSetZoneConfig(
+		config.SystemTenantObjectID(baseID), zonepb.ZoneConfig{RangeMaxBytes: proto.Int64(1 << 20)},
+	)
+	config.TestingSetZoneConfig(
+		config.SystemTenantObjectID(baseID+2), zonepb.ZoneConfig{RangeMaxBytes: proto.Int64(2 << 20)},
+	)
 
 	// Despite faking the zone configs, we still need to have a system config
 	// entry so that the store picks up the new zone configs. This new system
@@ -3186,105 +3193,6 @@ func TestSnapshotRateLimit(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestPreemptiveSnapshotsAreRemoved exercises a migration in 20.1 to remove any
-// data on disk for a Replica which holds a descriptor in its state that does
-// not contain the store. Prior to 20.1 such Replica state could exist on disk
-// in two scenario both generally due to a rapid upgrade from 19.1 to 19.2.
-//
-// See the comment on removePreemptiveSnapshot().
-//
-// TODO(ajwerner): remove this in 20.2 with removePreemptiveSnapshot().
-func TestPreemptiveSnapshotsAreRemoved(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	// Create a store with a preemptive snapshot sitting in its engine before it's
-	// started. Ensure that the preemptive snapshots are removed and the replicas
-	// for those ranges are not created.
-	//
-	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	config := TestStoreConfig(hlc.NewClock(hlc.UnixNano, base.DefaultMaxClockOffset))
-	s := createTestStoreWithoutStart(t, stopper, testStoreOpts{}, &config)
-	tablePrefix := keys.SystemSQLCodec.TablePrefix(42)
-	tablePrefixEnd := tablePrefix.PrefixEnd()
-	const rangeID = 42
-
-	desc := roachpb.NewRangeDescriptor(
-		rangeID,
-		roachpb.RKey(tablePrefix),
-		roachpb.RKey(tablePrefixEnd),
-		roachpb.MakeReplicaDescriptors([]roachpb.ReplicaDescriptor{
-			{
-				NodeID:    2,
-				StoreID:   2,
-				ReplicaID: 2,
-			},
-		}),
-	)
-	const replicatedOnly, seekEnd = false, false
-	it := rditer.NewReplicaDataIterator(desc, s.Engine(), replicatedOnly, seekEnd)
-	defer it.Close()
-	lease := roachpb.Lease{
-		Start: s.Clock().Now(),
-	}
-	state := kvserverpb.ReplicaState{
-		Desc:        desc,
-		Lease:       &lease,
-		GCThreshold: &hlc.Timestamp{},
-		TruncatedState: &roachpb.RaftTruncatedState{
-			Term:  1,
-			Index: 11,
-		},
-		Stats: &enginepb.MVCCStats{ContainsEstimates: 1},
-	}
-	// Write some data into the range and then write the range descriptor and
-	// state.
-	func() {
-		b := s.engine.NewBatch()
-		defer b.Close()
-		stl := stateloader.Make(rangeID)
-		const N = 100
-		for i := 0; i < N; i++ {
-			const colID = 1
-			prefix := tablePrefix[0:len(tablePrefix):len(tablePrefix)]
-			k := roachpb.Key(encoding.EncodeIntValue(prefix, colID, int64(i)))
-			require.NoError(t, storage.MVCCBlindPutProto(ctx, b, state.Stats,
-				k, s.Clock().Now(), desc, nil))
-		}
-		require.NoError(t, storage.MVCCBlindPutProto(ctx, b, state.Stats,
-			keys.RangeDescriptorKey(desc.StartKey), hlc.Timestamp{}, desc, nil))
-		_, err := stl.Save(ctx, b, state, stateloader.TruncatedStateUnreplicated)
-		require.NoError(t, err)
-		require.NoError(t, b.Commit(true /* sync */))
-	}()
-
-	// Start the store.
-	require.NoError(t, s.Start(ctx, stopper))
-
-	// Ensure that the data for the preemptive snapshot has been removed.
-	snap := s.engine.NewSnapshot()
-	defer snap.Close()
-	it = rditer.NewReplicaDataIterator(desc, snap, replicatedOnly, seekEnd)
-	defer it.Close()
-	// The only key for the range we should find is the tombstone.
-	tombstoneKey := keys.RangeTombstoneKey(rangeID)
-	var foundTombstoneKey bool
-	for ; ; it.Next() {
-		ok, err := it.Valid()
-		require.NoError(t, err)
-		if !ok {
-			break
-		}
-		// There should not be any data other than the tombstone key.
-		if k := it.UnsafeKey(); k.Equal(storage.MVCCKey{Key: tombstoneKey}) {
-			foundTombstoneKey = true
-		} else {
-			t.Fatalf("found data in the range which should have been removed: %v", k)
-		}
-	}
-	require.True(t, foundTombstoneKey)
 }
 
 func BenchmarkStoreGetReplica(b *testing.B) {

@@ -17,9 +17,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/errors"
 )
 
 // This file provides reference implementations of the schema accessor
@@ -42,8 +43,6 @@ func NewLogicalAccessor(
 type LogicalSchemaAccessor struct {
 	catalog.Accessor
 	vs catalog.VirtualSchemas
-	// Used to avoid allocations.
-	tn tree.TableName
 }
 
 var _ catalog.Accessor = &LogicalSchemaAccessor{}
@@ -65,17 +64,16 @@ func (l *LogicalSchemaAccessor) GetObjectNames(
 	ctx context.Context,
 	txn *kv.Txn,
 	codec keys.SQLCodec,
-	dbDesc *sqlbase.DatabaseDescriptor,
+	dbDesc sqlbase.DatabaseDescriptorInterface,
 	scName string,
 	flags tree.DatabaseListFlags,
 ) (tree.TableNames, error) {
-
 	if entry, ok := l.vs.GetVirtualSchema(scName); ok {
 		names := make(tree.TableNames, 0, entry.NumTables())
 		desc := entry.Desc().TableDesc()
 		entry.VisitTables(func(table catalog.VirtualObject) {
 			name := tree.MakeTableNameWithSchema(
-				tree.Name(dbDesc.Name), tree.Name(desc.Name), tree.Name(table.Desc().TableDesc().Name))
+				tree.Name(dbDesc.GetName()), tree.Name(desc.Name), tree.Name(table.Desc().TableDesc().Name))
 			name.ExplicitCatalog = flags.ExplicitPrefix
 			name.ExplicitSchema = flags.ExplicitPrefix
 			names = append(names, name)
@@ -95,44 +93,35 @@ func (l *LogicalSchemaAccessor) GetObjectDesc(
 	codec keys.SQLCodec,
 	db, schema, object string,
 	flags tree.ObjectLookupFlags,
-) (catalog.ObjectDescriptor, error) {
-	switch flags.DesiredObjectKind {
-	case tree.TypeObject:
-		// TODO(ajwerner): Change this function if we ever expose non-table objects
-		// underneath virtual schemas. For now we assume that the only objects
-		// ever handed back from GetObjectByName are tables. Instead we fallthrough
-		// to the underlying physical accessor.
-		return l.Accessor.GetObjectDesc(ctx, txn, settings, codec, db, schema, object, flags)
-	case tree.TableObject:
-		l.tn = tree.MakeTableNameWithSchema(tree.Name(db), tree.Name(schema), tree.Name(object))
-		if scEntry, ok := l.vs.GetVirtualSchema(schema); ok {
-			table, err := scEntry.GetObjectByName(object)
-			if err != nil {
-				return nil, err
-			}
-			if table == nil {
-				if flags.Required {
-					return nil, sqlbase.NewUndefinedRelationError(&l.tn)
-				}
-				return nil, nil
-			}
-			desc := table.Desc().TableDesc()
-			if desc == nil {
-				// This can only happen if we have a non-table object stored on a
-				// virtual schema. For now we'll return an assertion error.
-				return nil, errors.AssertionFailedf(
-					"non-table object of type %T returned from virtual schema for %v",
-					table.Desc(), l.tn)
-			}
-			if flags.RequireMutable {
-				return sqlbase.NewMutableExistingTableDescriptor(*desc), nil
-			}
-			return sqlbase.NewImmutableTableDescriptor(*desc), nil
+) (catalog.Descriptor, error) {
+	if scEntry, ok := l.vs.GetVirtualSchema(schema); ok {
+		desc, err := scEntry.GetObjectByName(object, flags)
+		if err != nil {
+			return nil, err
 		}
+		if desc == nil {
+			if flags.Required {
+				obj := tree.NewQualifiedObjectName(db, schema, object, flags.DesiredObjectKind)
+				return nil, sqlbase.NewUndefinedObjectError(obj, flags.DesiredObjectKind)
+			}
+			return nil, nil
+		}
+		if flags.RequireMutable {
+			return nil, newMutableAccessToVirtualSchemaError(scEntry, object)
+		}
+		return desc.Desc(), nil
+	}
+	// Fallthrough.
+	return l.Accessor.GetObjectDesc(ctx, txn, settings, codec, db, schema, object, flags)
+}
 
-		// Fallthrough.
-		return l.Accessor.GetObjectDesc(ctx, txn, settings, codec, db, schema, object, flags)
+func newMutableAccessToVirtualSchemaError(entry catalog.VirtualSchema, object string) error {
+	switch entry.Desc().GetName() {
+	case "pg_catalog":
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"%s is a system catalog", tree.ErrNameString(object))
 	default:
-		return nil, errors.AssertionFailedf("unknown desired object kind %d", flags.DesiredObjectKind)
+		return pgerror.Newf(pgcode.WrongObjectType,
+			"%s is a virtual object and cannot be modified", tree.ErrNameString(object))
 	}
 }

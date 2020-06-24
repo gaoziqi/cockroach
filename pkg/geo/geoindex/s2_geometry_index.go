@@ -156,7 +156,7 @@ func (s *s2GeometryIndex) convertToGeomTAndTryClip(g *geo.Geometry) (geom.T, boo
 		}
 		gt = nil
 		if clippedEWKB != nil {
-			g, err = geo.ParseGeometryFromEWKBRaw(clippedEWKB)
+			g, err = geo.ParseGeometryFromEWKBUnsafe(clippedEWKB)
 			if err != nil {
 				return nil, false, err
 			}
@@ -319,7 +319,7 @@ func (s *s2GeometryIndex) s2RegionsFromPlanarGeom(geomRepr geom.T) []s2.Region {
 	return regions
 }
 
-func (s *s2GeometryIndex) testingInnerCovering(g *geo.Geometry) s2.CellUnion {
+func (s *s2GeometryIndex) TestingInnerCovering(g *geo.Geometry) s2.CellUnion {
 	gt, _, err := s.convertToGeomTAndTryClip(g)
 	if err != nil || gt == nil {
 		return nil

@@ -109,7 +109,7 @@ func checkStatsForTable(
 	// returned stats match the expected values.
 	statsList, err := sc.GetTableStats(ctx, tableID)
 	if err != nil {
-		return errors.Errorf(err.Error())
+		return errors.Wrap(err, "retrieving stats")
 	}
 	if !checkStats(statsList, expected) {
 		return errors.Errorf("for lookup of key %d, expected stats %s, got %s", tableID, expected, statsList)
@@ -270,6 +270,7 @@ func TestCacheUserDefinedTypes(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	if _, err := sqlDB.Exec(`
+SET experimental_enable_enums=true;
 CREATE DATABASE t;
 USE t;
 CREATE TYPE t AS ENUM ('hello');

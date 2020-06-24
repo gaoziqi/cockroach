@@ -508,14 +508,14 @@ func (t *TeeEngine) Remove(filename string) error {
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
-// RemoveDirAndFiles implements the Engine interface.
-func (t *TeeEngine) RemoveDirAndFiles(dir string) error {
-	err := t.eng1.RemoveDirAndFiles(dir)
+// RemoveAll implements the Engine interface.
+func (t *TeeEngine) RemoveAll(dir string) error {
+	err := t.eng1.RemoveAll(dir)
 	dir2, ok := t.remapPath(dir)
 	if !ok {
 		return err
 	}
-	err2 := t.eng2.RemoveDirAndFiles(dir2)
+	err2 := t.eng2.RemoveAll(dir2)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
@@ -578,6 +578,23 @@ func (t *TeeEngine) List(name string) ([]string, error) {
 	}
 	// TODO(sbhola): compare the slices.
 	return list1, nil
+}
+
+// Stat implements the FS interface.
+func (t *TeeEngine) Stat(name string) (os.FileInfo, error) {
+	info1, err := t.eng1.Stat(name)
+	name2, ok := t.remapPath(name)
+	if !ok {
+		return info1, err
+	}
+	info2, err2 := t.eng2.Stat(name2)
+	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
+		return nil, err
+	}
+	if info1.Size() != info2.Size() {
+		log.Fatalf(t.ctx, "mismatching file sizes from stat: %d != %d", info1.Size(), info2.Size())
+	}
+	return info1, err
 }
 
 // CreateCheckpoint implements the Engine interface.

@@ -13,7 +13,6 @@ package cloud
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"net/url"
 	"path"
@@ -65,7 +64,7 @@ func (g *gcsStorage) Conf() roachpb.ExternalStorage {
 
 func makeGCSStorage(
 	ctx context.Context,
-	ioConf base.ExternalIOConfig,
+	ioConf base.ExternalIODirConfig,
 	conf *roachpb.ExternalStorage_GCS,
 	settings *cluster.Settings,
 ) (ExternalStorage, error) {
@@ -107,7 +106,7 @@ func makeGCSStorage(
 		}
 		decodedKey, err := base64.StdEncoding.DecodeString(conf.Credentials)
 		if err != nil {
-			return nil, errors.Wrap(err, fmt.Sprintf("decoding value of %s", CredentialsParam))
+			return nil, errors.Wrapf(err, "decoding value of %s", CredentialsParam)
 		}
 		source, err := google.JWTConfigFromJSON(decodedKey, scope)
 		if err != nil {
@@ -183,7 +182,6 @@ func (r *resumingGoogleStorageReader) openStream() error {
 
 func (r *resumingGoogleStorageReader) Read(p []byte) (int, error) {
 	var lastErr error
-
 	for retries := 0; lastErr == nil; retries++ {
 		if r.data == nil {
 			lastErr = r.openStream()
@@ -203,7 +201,7 @@ func (r *resumingGoogleStorageReader) Read(p []byte) (int, error) {
 		}
 
 		if isResumableHTTPError(lastErr) {
-			if retries > maxNoProgressReads {
+			if retries >= maxNoProgressReads {
 				return 0, errors.Wrap(lastErr, "multiple Read calls return no data")
 			}
 			log.Errorf(r.ctx, "GCS:Retry: error %s", lastErr)
@@ -230,6 +228,13 @@ func (g *gcsStorage) ReadFile(ctx context.Context, basename string) (io.ReadClos
 		object: path.Join(g.prefix, basename),
 	}
 	if err := reader.openStream(); err != nil {
+		// The Google SDK has a specialized ErrBucketDoesNotExist error, but
+		// the code path from this method first triggers an ErrObjectNotExist in
+		// both scenarios - when a Bucket does not exist or an Object does not
+		// exist.
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			return nil, errors.Wrapf(ErrFileDoesNotExist, "gcs object does not exist: %s", err.Error())
+		}
 		return nil, err
 	}
 	return reader, nil

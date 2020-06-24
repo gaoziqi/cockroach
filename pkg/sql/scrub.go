@@ -160,7 +160,7 @@ func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tr
 		return err
 	}
 
-	schemas, err := p.Tables().GetSchemasForDatabase(ctx, p.txn, dbDesc.ID)
+	schemas, err := p.Tables().GetSchemasForDatabase(ctx, p.txn, dbDesc.GetID())
 	if err != nil {
 		return err
 	}
@@ -207,7 +207,7 @@ func (n *scrubNode) startScrubTable(
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	tableName *tree.TableName,
 ) error {
-	ts, hasTS, err := p.getTimestamp(n.n.AsOf)
+	ts, hasTS, err := p.getTimestamp(ctx, n.n.AsOf)
 	if err != nil {
 		return err
 	}

@@ -48,7 +48,7 @@ func showBackupPlanHook(
 		return nil, nil, nil, false, err
 	}
 
-	toFn, err := p.TypeAsString(backup.Path, "SHOW BACKUP")
+	toFn, err := p.TypeAsString(ctx, backup.Path, "SHOW BACKUP")
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -57,7 +57,7 @@ func showBackupPlanHook(
 		backupOptEncPassphrase:  sql.KVStringOptRequireValue,
 		backupOptWithPrivileges: sql.KVStringOptRequireNoValue,
 	}
-	optsFn, err := p.TypeAsStringOpts(backup.Options, expected)
+	optsFn, err := p.TypeAsStringOpts(ctx, backup.Options, expected)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -191,9 +191,9 @@ func backupShowerDefault(
 			for _, manifest := range manifests {
 				descs := make(map[sqlbase.ID]string)
 				for _, descriptor := range manifest.Descriptors {
-					if database := descriptor.GetDatabase(); database != nil {
-						if _, ok := descs[database.ID]; !ok {
-							descs[database.ID] = database.Name
+					if descriptor.GetDatabase() != nil {
+						if _, ok := descs[descriptor.GetID()]; !ok {
+							descs[descriptor.GetID()] = descriptor.GetName()
 						}
 					}
 				}
@@ -241,7 +241,8 @@ func backupShowerDefault(
 								FKDisplayMode:  sql.OmitMissingFKClausesFromCreate,
 								IgnoreComments: true,
 							}
-							schema, err := p.ShowCreate(ctx, dbName, manifest.Descriptors, table, displayOptions)
+							schema, err := p.ShowCreate(ctx, dbName, manifest.Descriptors,
+								sqlbase.NewImmutableTableDescriptor(*table), displayOptions)
 							if err != nil {
 								continue
 							}

@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"go/constant"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -32,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -46,7 +46,7 @@ import (
 
 type createTableNode struct {
 	n          *tree.CreateTable
-	dbDesc     *sqlbase.DatabaseDescriptor
+	dbDesc     *sqlbase.ImmutableDatabaseDescriptor
 	sourcePlan planNode
 
 	run createTableRun
@@ -203,7 +203,7 @@ func getTableCreateParams(
 			return nil, 0, err
 		}
 		// Still return data in this case.
-		return tKey, schemaID, makeObjectAlreadyExistsError(desc, tableName)
+		return tKey, schemaID, sqlbase.MakeObjectAlreadyExistsError(desc.DescriptorProto(), tableName)
 	} else if err != nil {
 		return nil, 0, err
 	}
@@ -214,7 +214,7 @@ func (n *createTableNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("table"))
 	isTemporary := n.n.Temporary
 
-	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.ID, isTemporary, n.n.Table.Table())
+	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), isTemporary, n.n.Table.Table())
 	if err != nil {
 		if sqlbase.IsRelationAlreadyExistsError(err) && n.n.IfNotExists {
 			return nil
@@ -270,7 +270,7 @@ func (n *createTableNode) startExec(params runParams) error {
 	// If a new system table is being created (which should only be doable by
 	// an internal user account), make sure it gets the correct privileges.
 	privs := n.dbDesc.GetPrivileges()
-	if n.dbDesc.ID == keys.SystemDatabaseID {
+	if n.dbDesc.GetID() == keys.SystemDatabaseID {
 		privs = sqlbase.NewDefaultPrivilegeDescriptor()
 	}
 
@@ -289,7 +289,7 @@ func (n *createTableNode) startExec(params runParams) error {
 		}
 
 		desc, err = makeTableDescIfAs(params,
-			n.n, n.dbDesc.ID, schemaID, id, creationTime, asCols, privs, params.p.EvalContext(), isTemporary)
+			n.n, n.dbDesc.GetID(), schemaID, id, creationTime, asCols, privs, params.p.EvalContext(), isTemporary)
 		if err != nil {
 			return err
 		}
@@ -301,7 +301,7 @@ func (n *createTableNode) startExec(params runParams) error {
 		}
 	} else {
 		affected = make(map[sqlbase.ID]*sqlbase.MutableTableDescriptor)
-		desc, err = makeTableDesc(params, n.n, n.dbDesc.ID, schemaID, id, creationTime, privs, affected, isTemporary)
+		desc, err = makeTableDesc(params, n.n, n.dbDesc.GetID(), schemaID, id, creationTime, privs, affected, isTemporary)
 		if err != nil {
 			return err
 		}
@@ -335,9 +335,11 @@ func (n *createTableNode) startExec(params runParams) error {
 	}
 
 	for _, updated := range affected {
-		// TODO (lucy): Have more consistent/informative names for dependent jobs.
 		if err := params.p.writeSchemaChange(
-			params.ctx, updated, sqlbase.InvalidMutationID, "updating referenced table",
+			params.ctx, updated, sqlbase.InvalidMutationID,
+			fmt.Sprintf("updating referenced FK table %s(%d) for table %s(%d)",
+				updated.Name, updated.ID, desc.Name, desc.ID,
+			),
 		); err != nil {
 			return err
 		}
@@ -393,8 +395,6 @@ func (n *createTableNode) startExec(params runParams) error {
 				params.ExecCfg().Codec,
 				sqlbase.NewImmutableTableDescriptor(*desc.TableDesc()),
 				desc.Columns,
-				row.SkipFKs,
-				nil, /* fkTables */
 				params.p.alloc)
 			if err != nil {
 				return err
@@ -469,7 +469,10 @@ func (n *createTableNode) startExec(params runParams) error {
 					}
 				}
 
-				if err := tw.row(params.ctx, rowBuffer, params.extendedEvalCtx.Tracing.KVTracingEnabled()); err != nil {
+				// TODO(mgartner): Add partial index IDs to ignoreIndexes that we should
+				// not add entries to.
+				var ignoreIndexes util.FastIntSet
+				if err := tw.row(params.ctx, rowBuffer, ignoreIndexes, params.extendedEvalCtx.Tracing.KVTracingEnabled()); err != nil {
 					return err
 				}
 			}
@@ -520,11 +523,11 @@ func qualifyFKColErrorWithDB(
 	if err != nil {
 		return tree.ErrString(tree.NewUnresolvedName(tbl.Name, col))
 	}
-	schema, err := resolver.ResolveSchemaNameByID(ctx, txn, codec, db.ID, tbl.GetParentSchemaID())
+	schema, err := resolver.ResolveSchemaNameByID(ctx, txn, codec, db.GetID(), tbl.GetParentSchemaID())
 	if err != nil {
 		return tree.ErrString(tree.NewUnresolvedName(tbl.Name, col))
 	}
-	return tree.ErrString(tree.NewUnresolvedName(db.Name, schema, tbl.Name, col))
+	return tree.ErrString(tree.NewUnresolvedName(db.GetName(), schema, tbl.Name, col))
 }
 
 // FKTableState is the state of the referencing table resolveFK() is called on.
@@ -557,10 +560,10 @@ func (p *planner) MaybeUpgradeDependentOldForeignKeyVersionTables(
 			return err
 		}
 		if didUpgrade {
-			// TODO (lucy): Have more consistent/informative names for dependent jobs.
 			err := p.writeSchemaChange(
 				ctx, sqlbase.NewMutableExistingTableDescriptor(*tbl), sqlbase.InvalidMutationID,
-				"updating foreign key references on table",
+				fmt.Sprintf("updating foreign key references on table %s(%d)",
+					tbl.Name, tbl.ID),
 			)
 			if err != nil {
 				return err
@@ -1010,9 +1013,12 @@ func (p *planner) finalizeInterleave(
 	ancestorIndex.InterleavedBy = append(ancestorIndex.InterleavedBy,
 		sqlbase.ForeignKeyReference{Table: desc.ID, Index: index.ID})
 
-	// TODO (lucy): Have more consistent/informative names for dependent jobs.
 	if err := p.writeSchemaChange(
-		ctx, ancestorTable, sqlbase.InvalidMutationID, "updating ancestor table",
+		ctx, ancestorTable, sqlbase.InvalidMutationID,
+		fmt.Sprintf(
+			"updating ancestor table %s(%d) for table %s(%d)",
+			ancestorTable.Name, ancestorTable.ID, desc.Name, desc.ID,
+		),
 	); err != nil {
 		return err
 	}
@@ -1062,28 +1068,6 @@ var CreatePartitioningCCL = func(
 		"creating or manipulating partitions requires a CCL binary"))
 }
 
-// InitTableDescriptor returns a blank TableDescriptor.
-func InitTableDescriptor(
-	id, parentID, parentSchemaID sqlbase.ID,
-	name string,
-	creationTime hlc.Timestamp,
-	privileges *sqlbase.PrivilegeDescriptor,
-	temporary bool,
-) sqlbase.MutableTableDescriptor {
-	return *sqlbase.NewMutableCreatedTableDescriptor(sqlbase.TableDescriptor{
-		ID:                      id,
-		Name:                    name,
-		ParentID:                parentID,
-		UnexposedParentSchemaID: parentSchemaID,
-		FormatVersion:           sqlbase.InterleavedFormatVersion,
-		Version:                 1,
-		ModificationTime:        creationTime,
-		Privileges:              privileges,
-		CreateAsOfTime:          creationTime,
-		Temporary:               temporary,
-	})
-}
-
 func getFinalSourceQuery(source *tree.Select, evalCtx *tree.EvalContext) string {
 	// Ensure that all the table names pretty-print as fully qualified, so we
 	// store that in the table descriptor.
@@ -1094,7 +1078,7 @@ func getFinalSourceQuery(source *tree.Select, evalCtx *tree.EvalContext) string 
 	// We use tree.FormatNode merely as a traversal method; its output buffer is
 	// discarded immediately after the traversal because it is not needed
 	// further.
-	f := tree.NewFmtCtx(tree.FmtParsable)
+	f := tree.NewFmtCtx(tree.FmtSerializable)
 	f.SetReformatTableNames(
 		func(_ *tree.FmtCtx, tn *tree.TableName) {
 			// Persist the database prefix expansion.
@@ -1110,7 +1094,7 @@ func getFinalSourceQuery(source *tree.Select, evalCtx *tree.EvalContext) string 
 	f.Close()
 
 	// Substitute placeholders with their values.
-	ctx := tree.NewFmtCtx(tree.FmtParsable)
+	ctx := tree.NewFmtCtx(tree.FmtSerializable)
 	ctx.SetPlaceholderFormat(func(ctx *tree.FmtCtx, placeholder *tree.Placeholder) {
 		d, err := placeholder.Eval(evalCtx)
 		if err != nil {
@@ -1176,33 +1160,6 @@ func makeTableDescIfAs(
 	return desc, err
 }
 
-func dequalifyColumnRefs(
-	ctx context.Context, source *sqlbase.DataSourceInfo, expr tree.Expr,
-) (tree.Expr, error) {
-	resolver := sqlbase.ColumnResolver{Source: source}
-	return tree.SimpleVisit(
-		expr,
-		func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-			if vBase, ok := expr.(tree.VarName); ok {
-				v, err := vBase.NormalizeVarName()
-				if err != nil {
-					return false, nil, err
-				}
-				if c, ok := v.(*tree.ColumnItem); ok {
-					_, err := c.Resolve(ctx, &resolver)
-					if err != nil {
-						return false, nil, err
-					}
-					colIdx := resolver.ResolverState.ColIdx
-					col := source.SourceColumns[colIdx]
-					return false, &tree.ColumnItem{ColumnName: tree.Name(col.Name)}, nil
-				}
-			}
-			return true, expr, err
-		},
-	)
-}
-
 // MakeTableDesc creates a table descriptor from a CreateTable statement.
 //
 // txn and vt can be nil if the table to be created does not contain references
@@ -1247,11 +1204,11 @@ func MakeTableDesc(
 	// been populated.
 	columnDefaultExprs := make([]tree.TypedExpr, len(n.Defs))
 
-	desc := InitTableDescriptor(
+	desc := sqlbase.InitTableDescriptor(
 		id, parentID, parentSchemaID, n.Table.Table(), creationTime, privileges, temporary,
 	)
 
-	if err := checkStorageParameters(semaCtx, n.StorageParams, storageParamExpectedTypes); err != nil {
+	if err := checkStorageParameters(ctx, semaCtx, n.StorageParams, storageParamExpectedTypes); err != nil {
 		return desc, err
 	}
 
@@ -1271,7 +1228,7 @@ func MakeTableDesc(
 			// MakeTableDesc is called sometimes with a nil SemaCtx (for example
 			// during bootstrapping). In order to not panic, pass a nil TypeResolver
 			// when attempting to resolve the columns type.
-			defType, err := tree.ResolveType(d.Type, semaCtx.GetTypeResolver())
+			defType, err := tree.ResolveType(ctx, d.Type, semaCtx.GetTypeResolver())
 			if err != nil {
 				return sqlbase.MutableTableDescriptor{}, err
 			}
@@ -1315,7 +1272,7 @@ func MakeTableDesc(
 				if n.Interleave != nil {
 					return desc, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
 				}
-				buckets, err := sqlbase.EvalShardBucketCount(semaCtx, evalCtx, d.PrimaryKey.ShardBuckets)
+				buckets, err := sqlbase.EvalShardBucketCount(ctx, semaCtx, evalCtx, d.PrimaryKey.ShardBuckets)
 				if err != nil {
 					return desc, err
 				}
@@ -1335,7 +1292,7 @@ func MakeTableDesc(
 				n.Defs = append(n.Defs, checkConstraint)
 				columnDefaultExprs = append(columnDefaultExprs, nil)
 			}
-			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, semaCtx, evalCtx)
+			col, idx, expr, err := sqlbase.MakeColumnDefDescs(ctx, d, semaCtx, evalCtx)
 			if err != nil {
 				return desc, err
 			}
@@ -1381,7 +1338,7 @@ func MakeTableDesc(
 				return desc, err
 			}
 
-			expr, err = dequalifyColumnRefs(ctx, sourceInfo, expr)
+			expr, err = schemaexpr.DequalifyColumnRefs(ctx, sourceInfo, expr)
 			if err != nil {
 				return desc, err
 			}
@@ -1409,7 +1366,7 @@ func MakeTableDesc(
 			return err
 		}
 		if newColumn {
-			buckets, err := sqlbase.EvalShardBucketCount(semaCtx, evalCtx, d.Sharded.ShardBuckets)
+			buckets, err := sqlbase.EvalShardBucketCount(ctx, semaCtx, evalCtx, d.Sharded.ShardBuckets)
 			if err != nil {
 				return err
 			}
@@ -1422,6 +1379,7 @@ func MakeTableDesc(
 		}
 		return nil
 	}
+	idxValidator := schemaexpr.NewIndexPredicateValidator(ctx, n.Table, &desc, semaCtx)
 	for _, def := range n.Defs {
 		switch d := def.(type) {
 		case *tree.ColumnTableDef, *tree.LikeTableDef:
@@ -1466,9 +1424,19 @@ func MakeTableDesc(
 				}
 				idx.Partitioning = partitioning
 			}
-			// TODO(mgartner): remove this once partial indexes are fully supported.
-			if d.Predicate != nil && !sessionData.PartialIndexes {
-				return desc, unimplemented.NewWithIssue(9683, "partial indexes are not supported")
+			if d.Predicate != nil {
+				// TODO(mgartner): remove this once partial indexes are fully supported.
+				if !sessionData.PartialIndexes {
+					return desc, unimplemented.NewWithIssue(9683, "partial indexes are not supported")
+				}
+
+				expr, err := idxValidator.Validate(d.Predicate)
+				if err != nil {
+					return desc, err
+				}
+
+				// Store the serialized predicate expression in the IndexDescriptor.
+				idx.Predicate = tree.Serialize(expr)
 			}
 
 			if err := desc.AddIndex(idx, false); err != nil {
@@ -1502,9 +1470,19 @@ func MakeTableDesc(
 				}
 				idx.Partitioning = partitioning
 			}
-			// TODO(mgartner): remove this once partial indexes are fully supported.
-			if d.Predicate != nil && !sessionData.PartialIndexes {
-				return desc, unimplemented.NewWithIssue(9683, "partial indexes are not supported")
+			if d.Predicate != nil {
+				// TODO(mgartner): remove this once partial indexes are fully supported.
+				if !sessionData.PartialIndexes {
+					return desc, unimplemented.NewWithIssue(9683, "partial indexes are not supported")
+				}
+
+				expr, err := idxValidator.Validate(d.Predicate)
+				if err != nil {
+					return desc, err
+				}
+
+				// Store the serialized predicate expression in the IndexDescriptor.
+				idx.Predicate = tree.Serialize(expr)
 			}
 			if err := desc.AddIndex(idx, d.PrimaryKey); err != nil {
 				return desc, err
@@ -1661,7 +1639,7 @@ func MakeTableDesc(
 		newTableName:   &n.Table,
 	}
 
-	generatedNames := map[string]struct{}{}
+	ckBuilder := schemaexpr.NewCheckConstraintBuilder(ctx, n.Table, &desc, semaCtx)
 	for _, def := range n.Defs {
 		switch d := def.(type) {
 		case *tree.ColumnTableDef:
@@ -1671,7 +1649,7 @@ func MakeTableDesc(
 			// Pass, handled above.
 
 		case *tree.CheckConstraintTableDef:
-			ck, err := MakeCheckConstraint(ctx, &desc, d, generatedNames, semaCtx, n.Table)
+			ck, err := ckBuilder.Build(d)
 			if err != nil {
 				return desc, err
 			}
@@ -1691,11 +1669,12 @@ func MakeTableDesc(
 
 	// Now that we have all the other columns set up, we can validate
 	// any computed columns.
+	computedColValidator := schemaexpr.NewComputedColumnValidator(ctx, &desc, semaCtx)
 	for _, def := range n.Defs {
 		switch d := def.(type) {
 		case *tree.ColumnTableDef:
 			if d.IsComputed() {
-				if err := validateComputedColumn(&desc, d, semaCtx); err != nil {
+				if err := computedColValidator.Validate(d); err != nil {
 					return desc, err
 				}
 			}
@@ -1732,7 +1711,10 @@ func MakeTableDesc(
 }
 
 func checkStorageParameters(
-	semaCtx *tree.SemaContext, params tree.StorageParams, expectedTypes map[string]storageParamType,
+	ctx context.Context,
+	semaCtx *tree.SemaContext,
+	params tree.StorageParams,
+	expectedTypes map[string]storageParamType,
 ) error {
 	for _, sp := range params {
 		k := string(sp.Key)
@@ -1754,7 +1736,7 @@ func checkStorageParameters(
 			return unimplemented.NewWithIssuef(43299, "storage parameter %q", k)
 		}
 
-		_, err := tree.TypeCheckAndRequire(sp.Value, semaCtx, expectedType, k)
+		_, err := tree.TypeCheckAndRequire(ctx, sp.Value, semaCtx, expectedType, k)
 		if err != nil {
 			return err
 		}
@@ -1817,7 +1799,7 @@ func makeTableDesc(
 				seqName,
 				temporary,
 				seqOpts,
-				"creating sequence",
+				fmt.Sprintf("creating sequence %s for new table %s", seqName, n.Table.Table()),
 			); err != nil {
 				return ret, err
 			}
@@ -1832,7 +1814,7 @@ func makeTableDesc(
 	// it needs to pull in descriptors from FK depended-on tables
 	// and interleaved parents using their current state in KV.
 	// See the comment at the start of MakeTableDesc() and resolveFK().
-	params.p.runWithOptions(resolveFlags{skipCache: true}, func() {
+	params.p.runWithOptions(resolveFlags{skipCache: true, contextDatabaseID: parentID}, func() {
 		ret, err = MakeTableDesc(
 			params.ctx,
 			params.p.txn,
@@ -1987,56 +1969,6 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 	return newDefs, nil
 }
 
-func makeObjectAlreadyExistsError(collidingObject sqlbase.DescriptorProto, name string) error {
-	switch collidingObject.(type) {
-	case *TableDescriptor:
-		return sqlbase.NewRelationAlreadyExistsError(name)
-	case *TypeDescriptor:
-		return sqlbase.NewTypeAlreadyExistsError(name)
-	case *DatabaseDescriptor:
-		return sqlbase.NewDatabaseAlreadyExistsError(name)
-	}
-	return nil
-}
-
-// dummyColumnItem is used in MakeCheckConstraint to construct an expression
-// that can be both type-checked and examined for variable expressions.
-type dummyColumnItem struct {
-	typ *types.T
-	// name is only used for error-reporting.
-	name tree.Name
-}
-
-// String implements the Stringer interface.
-func (d *dummyColumnItem) String() string {
-	return tree.AsString(d)
-}
-
-// Format implements the NodeFormatter interface.
-func (d *dummyColumnItem) Format(ctx *tree.FmtCtx) {
-	d.name.Format(ctx)
-}
-
-// Walk implements the Expr interface.
-func (d *dummyColumnItem) Walk(_ tree.Visitor) tree.Expr {
-	return d
-}
-
-// TypeCheck implements the Expr interface.
-func (d *dummyColumnItem) TypeCheck(_ *tree.SemaContext, desired *types.T) (tree.TypedExpr, error) {
-	return d, nil
-}
-
-// Eval implements the TypedExpr interface.
-func (*dummyColumnItem) Eval(_ *tree.EvalContext) (tree.Datum, error) {
-	panic("dummyColumnItem.Eval() is undefined")
-}
-
-// ResolvedType implements the TypedExpr interface.
-func (d *dummyColumnItem) ResolvedType() *types.T {
-	return d.typ
-}
-
 // makeShardColumnDesc returns a new column descriptor for a hidden computed shard column
 // based on all the `colNames`.
 func makeShardColumnDesc(colNames []string, buckets int) (*sqlbase.ColumnDescriptor, error) {
@@ -2115,54 +2047,6 @@ func makeHashShardComputeExpr(colNames []string, buckets int) *string {
 	return &str
 }
 
-// generateMaybeDuplicateNameForCheckConstraint generates a name, the given check
-// constraint expression, which may already be taken by another object in the table
-// descriptor.
-func generateMaybeDuplicateNameForCheckConstraint(
-	desc *MutableTableDescriptor, expr tree.Expr,
-) (string, error) {
-	var nameBuf bytes.Buffer
-	nameBuf.WriteString("check")
-
-	if err := iterColDescriptorsInExpr(desc, expr, func(c *sqlbase.ColumnDescriptor) error {
-		nameBuf.WriteByte('_')
-		nameBuf.WriteString(c.Name)
-		return nil
-	}); err != nil {
-		return "", err
-	}
-	return nameBuf.String(), nil
-}
-
-// generateNameForCheckConstraint generates a unique name for the given check constraint.
-func generateNameForCheckConstraint(
-	desc *MutableTableDescriptor, expr tree.Expr, inuseNames map[string]struct{},
-) (string, error) {
-
-	name, err := generateMaybeDuplicateNameForCheckConstraint(desc, expr)
-	if err != nil {
-		return "", err
-	}
-	// If generated name isn't unique, attempt to add a number to the end to
-	// get a unique name.
-	if _, ok := inuseNames[name]; ok {
-		i := 1
-		for {
-			appended := fmt.Sprintf("%s%d", name, i)
-			if _, ok := inuseNames[appended]; !ok {
-				name = appended
-				break
-			}
-			i++
-		}
-	}
-	if inuseNames != nil {
-		inuseNames[name] = struct{}{}
-	}
-
-	return name, nil
-}
-
 func makeShardCheckConstraintDef(
 	desc *MutableTableDescriptor, buckets int, shardCol *sqlbase.ColumnDescriptor,
 ) (*tree.CheckConstraintTableDef, error) {
@@ -2183,205 +2067,6 @@ func makeShardCheckConstraintDef(
 			Right: values,
 		},
 		Hidden: true,
-	}, nil
-}
-
-func iterColDescriptorsInExpr(
-	desc *sqlbase.MutableTableDescriptor, rootExpr tree.Expr, f func(*sqlbase.ColumnDescriptor) error,
-) error {
-	_, err := tree.SimpleVisit(rootExpr, func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-		vBase, ok := expr.(tree.VarName)
-		if !ok {
-			// Not a VarName, don't do anything to this node.
-			return true, expr, nil
-		}
-
-		v, err := vBase.NormalizeVarName()
-		if err != nil {
-			return false, nil, err
-		}
-
-		c, ok := v.(*tree.ColumnItem)
-		if !ok {
-			return true, expr, nil
-		}
-
-		col, dropped, err := desc.FindColumnByName(c.ColumnName)
-		if err != nil || dropped {
-			return false, nil, pgerror.Newf(pgcode.InvalidTableDefinition,
-				"column %q not found, referenced in %q",
-				c.ColumnName, rootExpr)
-		}
-
-		if err := f(col); err != nil {
-			return false, nil, err
-		}
-		return false, expr, err
-	})
-
-	return err
-}
-
-// validateComputedColumn checks that a computed column satisfies a number of
-// validity constraints, for instance, that it typechecks.
-func validateComputedColumn(
-	desc *sqlbase.MutableTableDescriptor, d *tree.ColumnTableDef, semaCtx *tree.SemaContext,
-) error {
-	if d.HasDefaultExpr() {
-		return pgerror.New(
-			pgcode.InvalidTableDefinition,
-			"computed columns cannot have default values",
-		)
-	}
-
-	dependencies := make(map[sqlbase.ColumnID]struct{})
-	// First, check that no column in the expression is a computed column.
-	if err := iterColDescriptorsInExpr(desc, d.Computed.Expr, func(c *sqlbase.ColumnDescriptor) error {
-		if c.IsComputed() {
-			return pgerror.New(pgcode.InvalidTableDefinition,
-				"computed columns cannot reference other computed columns")
-		}
-		dependencies[c.ID] = struct{}{}
-
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	// TODO(justin,bram): allow depending on columns like this. We disallow it
-	// for now because cascading changes must hook into the computed column
-	// update path.
-	for i := range desc.OutboundFKs {
-		fk := &desc.OutboundFKs[i]
-		for _, id := range fk.OriginColumnIDs {
-			if _, ok := dependencies[id]; !ok {
-				// We don't depend on this column.
-				continue
-			}
-			for _, action := range []sqlbase.ForeignKeyReference_Action{
-				fk.OnDelete,
-				fk.OnUpdate,
-			} {
-				switch action {
-				case sqlbase.ForeignKeyReference_CASCADE,
-					sqlbase.ForeignKeyReference_SET_NULL,
-					sqlbase.ForeignKeyReference_SET_DEFAULT:
-					return pgerror.New(pgcode.InvalidTableDefinition,
-						"computed columns cannot reference non-restricted FK columns")
-				}
-			}
-		}
-	}
-
-	// Replace column references with typed dummies to allow typechecking.
-	replacedExpr, _, err := replaceVars(desc, d.Computed.Expr)
-	if err != nil {
-		return err
-	}
-
-	defType, err := tree.ResolveType(d.Type, semaCtx.GetTypeResolver())
-	if err != nil {
-		return err
-	}
-	if _, err := sqlbase.SanitizeVarFreeExpr(
-		replacedExpr, defType, "computed column", semaCtx, false, /* allowImpure */
-	); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// replaceVars replaces the occurrences of column names in an expression with
-// dummies containing their type, so that they may be typechecked. It returns
-// this new expression tree alongside a set containing the ColumnID of each
-// column seen in the expression.
-func replaceVars(
-	desc *sqlbase.MutableTableDescriptor, expr tree.Expr,
-) (tree.Expr, map[sqlbase.ColumnID]struct{}, error) {
-	colIDs := make(map[sqlbase.ColumnID]struct{})
-	newExpr, err := tree.SimpleVisit(expr, func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
-		vBase, ok := expr.(tree.VarName)
-		if !ok {
-			// Not a VarName, don't do anything to this node.
-			return true, expr, nil
-		}
-
-		v, err := vBase.NormalizeVarName()
-		if err != nil {
-			return false, nil, err
-		}
-
-		c, ok := v.(*tree.ColumnItem)
-		if !ok {
-			return true, expr, nil
-		}
-
-		col, dropped, err := desc.FindColumnByName(c.ColumnName)
-		if err != nil || dropped {
-			return false, nil, fmt.Errorf("column %q not found for constraint %q",
-				c.ColumnName, expr.String())
-		}
-		colIDs[col.ID] = struct{}{}
-		// Convert to a dummy node of the correct type.
-		return false, &dummyColumnItem{typ: col.Type, name: c.ColumnName}, nil
-	})
-	return newExpr, colIDs, err
-}
-
-// MakeCheckConstraint makes a descriptor representation of a check from a def.
-func MakeCheckConstraint(
-	ctx context.Context,
-	desc *sqlbase.MutableTableDescriptor,
-	d *tree.CheckConstraintTableDef,
-	inuseNames map[string]struct{},
-	semaCtx *tree.SemaContext,
-	tableName tree.TableName,
-) (*sqlbase.TableDescriptor_CheckConstraint, error) {
-	name := string(d.Name)
-
-	if name == "" {
-		var err error
-		name, err = generateNameForCheckConstraint(desc, d.Expr, inuseNames)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	expr, colIDsUsed, err := replaceVars(desc, d.Expr)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := sqlbase.SanitizeVarFreeExpr(
-		expr, types.Bool, "CHECK", semaCtx, true, /* allowImpure */
-	); err != nil {
-		return nil, err
-	}
-
-	colIDs := make([]sqlbase.ColumnID, 0, len(colIDsUsed))
-	for colID := range colIDsUsed {
-		colIDs = append(colIDs, colID)
-	}
-	sort.Sort(sqlbase.ColumnIDs(colIDs))
-
-	sourceInfo := sqlbase.NewSourceInfoForSingleTable(
-		tableName, sqlbase.ResultColumnsFromColDescs(
-			desc.GetID(),
-			desc.TableDesc().AllNonDropColumns(),
-		),
-	)
-
-	expr, err = dequalifyColumnRefs(ctx, sourceInfo, d.Expr)
-	if err != nil {
-		return nil, err
-	}
-
-	return &sqlbase.TableDescriptor_CheckConstraint{
-		Expr:      tree.Serialize(expr),
-		Name:      name,
-		ColumnIDs: colIDs,
-		Hidden:    d.Hidden,
 	}, nil
 }
 

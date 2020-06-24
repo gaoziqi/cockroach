@@ -352,6 +352,19 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 					f.formatExpr(tab.ComputedCols[col], c.Child(f.ColumnString(col)))
 				}
 			}
+			if tab.PartialIndexPredicates != nil {
+				c := tp.Child("partial index predicates")
+				indexOrds := make([]cat.IndexOrdinal, 0, len(tab.PartialIndexPredicates))
+				for ord := range tab.PartialIndexPredicates {
+					indexOrds = append(indexOrds, ord)
+				}
+				sort.Ints(indexOrds)
+				for _, ord := range indexOrds {
+					name := string(tab.Table.Index(ord).Name())
+					f.Buffer.Reset()
+					f.formatScalarWithLabel(name, tab.PartialIndexPredicates[ord], c)
+				}
+			}
 		}
 		if c := t.Constraint; c != nil {
 			if c.IsContradiction() {
@@ -364,6 +377,16 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 					n.Child(c.Spans.Get(i).String())
 				}
 			}
+		}
+		if ic := t.InvertedConstraint; ic != nil {
+			idx := md.Table(t.Table).Index(t.Index)
+			var b strings.Builder
+			for i := 0; i < idx.KeyColumnCount(); i++ {
+				b.WriteRune('/')
+				b.WriteString(fmt.Sprintf("%d", t.Table.ColumnID(idx.Column(i).Ordinal)))
+			}
+			n := tp.Childf("inverted constraint: %s", b.String())
+			ic.Format(n)
 		}
 		if t.HardLimit.IsSet() {
 			tp.Childf("limit: %s", t.HardLimit)
@@ -467,6 +490,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			}
 			f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
 			f.formatColList(e, tp, "check columns:", t.CheckCols)
+			f.formatColList(e, tp, "partial index pred columns:", t.IndexPredicateCols)
 			f.formatMutationCommon(tp, &t.MutationPrivate)
 		}
 
@@ -552,8 +576,15 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			if dep.SpecificIndex {
 				fmt.Fprintf(f.Buffer, "@%s", dep.DataSource.(cat.Table).Index(dep.Index).Name())
 			}
-			if !dep.ColumnOrdinals.Empty() {
-				fmt.Fprintf(f.Buffer, " [columns: %s]", dep.ColumnOrdinals)
+			colNames, isTable := dep.GetColumnNames()
+			if len(colNames) > 0 {
+				fmt.Fprintf(f.Buffer, " [columns:")
+				for _, colName := range colNames {
+					fmt.Fprintf(f.Buffer, " %s", colName)
+				}
+				fmt.Fprintf(f.Buffer, "]")
+			} else if isTable {
+				fmt.Fprintf(f.Buffer, " [no columns]")
 			}
 			n.Child(f.Buffer.String())
 		}
@@ -604,6 +635,13 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			}
 		}
 
+		if join, ok := e.(joinWithMultiplicity); ok {
+			mult := join.getMultiplicity()
+			if s := mult.String(); s != "" {
+				tp.Childf("multiplicity: %s", s)
+			}
+		}
+
 		f.Buffer.Reset()
 		writeFlag := func(name string) {
 			if f.Buffer.Len() != 0 {
@@ -612,6 +650,9 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			f.Buffer.WriteString(name)
 		}
 
+		if !relational.VolatilitySet.IsLeakProof() {
+			writeFlag(relational.VolatilitySet.String())
+		}
 		if relational.CanHaveSideEffects {
 			writeFlag("side-effects")
 		}
@@ -686,6 +727,9 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		if r.JoinSize > 1 {
 			tp.Childf("join-size: %d", r.JoinSize)
 		}
+		if !r.UnfilteredCols.Empty() {
+			tp.Childf("unfiltered-cols: %s", r.UnfilteredCols.String())
+		}
 		if withUses := relational.Shared.Rule.WithUses; len(withUses) > 0 {
 			n := tp.Childf("cte-uses")
 			ids := make([]opt.WithID, 0, len(withUses))
@@ -716,6 +760,17 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 }
 
 func (f *ExprFmtCtx) formatScalar(scalar opt.ScalarExpr, tp treeprinter.Node) {
+	f.formatScalarWithLabel("", scalar, tp)
+}
+
+func (f *ExprFmtCtx) formatScalarWithLabel(
+	label string, scalar opt.ScalarExpr, tp treeprinter.Node,
+) {
+	f.Buffer.Reset()
+	if label != "" {
+		f.Buffer.WriteString(label)
+		f.Buffer.WriteString(": ")
+	}
 	switch scalar.Op() {
 	case opt.ProjectionsOp, opt.AggregationsOp, opt.FKChecksOp, opt.KVOptionsOp:
 		// Omit empty lists (except filters).
@@ -731,7 +786,6 @@ func (f *ExprFmtCtx) formatScalar(scalar opt.ScalarExpr, tp treeprinter.Node) {
 		}
 
 	case opt.IfErrOp:
-		f.Buffer.Reset()
 		fmt.Fprintf(f.Buffer, "%v", scalar.Op())
 		f.FormatScalarProps(scalar)
 
@@ -748,7 +802,6 @@ func (f *ExprFmtCtx) formatScalar(scalar opt.ScalarExpr, tp treeprinter.Node) {
 		return
 
 	case opt.AggFilterOp:
-		f.Buffer.Reset()
 		fmt.Fprintf(f.Buffer, "%v", scalar.Op())
 		f.FormatScalarProps(scalar)
 		tp = tp.Child(f.Buffer.String())
@@ -815,7 +868,6 @@ func (f *ExprFmtCtx) formatScalar(scalar opt.ScalarExpr, tp treeprinter.Node) {
 	}
 
 	var intercepted bool
-	f.Buffer.Reset()
 	if f.HasFlags(ExprFmtHideScalars) && ScalarFmtInterceptor != nil {
 		if str := ScalarFmtInterceptor(f, scalar); str != "" {
 			f.Buffer.WriteString(str)
@@ -867,6 +919,9 @@ func (f *ExprFmtCtx) scalarPropsStrings(scalar opt.ScalarExpr) []string {
 		if !f.HasFlags(ExprFmtHideMiscProps) {
 			if !scalarProps.OuterCols.Empty() {
 				emitProp("outer=%s", scalarProps.OuterCols)
+			}
+			if !scalarProps.VolatilitySet.IsLeakProof() {
+				emitProp(scalarProps.VolatilitySet.String())
 			}
 			if scalarProps.CanHaveSideEffects {
 				emitProp("side-effects")
@@ -1057,9 +1112,6 @@ func (f *ExprFmtCtx) formatMutationCommon(tp treeprinter.Node, p *MutationPrivat
 	if p.WithID != 0 {
 		tp.Childf("input binding: &%d", p.WithID)
 	}
-	if p.FKFallback {
-		tp.Childf("fk-fallback")
-	}
 	if len(p.FKCascades) > 0 {
 		c := tp.Childf("cascades")
 		for i := range p.FKCascades {
@@ -1172,6 +1224,9 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 		}
 		if ScanIsReverseFn(f.Memo.Metadata(), t, &physProps.Ordering) {
 			f.Buffer.WriteString(",rev")
+		}
+		if _, ok := tab.Index(t.Index).Predicate(); ok {
+			f.Buffer.WriteString(",partial")
 		}
 
 	case *SequenceSelectPrivate:

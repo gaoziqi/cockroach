@@ -15,7 +15,10 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -81,52 +84,44 @@ type DistSQLTypeResolver struct {
 }
 
 // ResolveType implements tree.ResolvableTypeReference.
-func (tr *DistSQLTypeResolver) ResolveType(name *tree.UnresolvedObjectName) (*types.T, error) {
+func (tr *DistSQLTypeResolver) ResolveType(
+	context.Context, *tree.UnresolvedObjectName,
+) (*types.T, error) {
 	return nil, errors.AssertionFailedf("cannot resolve types in DistSQL by name")
 }
 
+func makeTypeLookupFunc(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec,
+) sqlbase.TypeLookupFunc {
+	return func(id sqlbase.ID) (*tree.TypeName, sqlbase.TypeDescriptorInterface, error) {
+		return resolver.ResolveTypeDescByID(ctx, txn, codec, id, tree.ObjectLookupFlags{})
+	}
+}
+
 // ResolveTypeByID implements tree.ResolvableTypeReference.
-func (tr *DistSQLTypeResolver) ResolveTypeByID(id uint32) (*types.T, error) {
+func (tr *DistSQLTypeResolver) ResolveTypeByID(ctx context.Context, id uint32) (*types.T, error) {
 	// TODO (rohany): This should eventually look into the set of cached type
 	//  descriptors before attempting to access it here.
-	typDesc, err := sqlbase.GetTypeDescFromID(
-		tr.EvalContext.Context,
-		tr.EvalContext.Txn,
-		tr.EvalContext.Codec,
-		sqlbase.ID(id),
-	)
+	lookup := makeTypeLookupFunc(ctx, tr.EvalContext.Txn, tr.EvalContext.Codec)
+	name, typDesc, err := lookup(sqlbase.ID(id))
 	if err != nil {
 		return nil, err
 	}
-	var typ *types.T
-	switch t := typDesc.Kind; t {
-	case sqlbase.TypeDescriptor_ENUM:
-		typ = types.MakeEnum(id)
-	default:
-		return nil, errors.AssertionFailedf("unknown type kind %s", t)
-	}
-	if err := typDesc.HydrateTypeInfo(typ); err != nil {
-		return nil, err
-	}
-	return typ, nil
+	return typDesc.MakeTypesT(name, lookup)
 }
 
 // HydrateTypeSlice hydrates all user defined types in an input slice of types.
 func HydrateTypeSlice(evalCtx *tree.EvalContext, typs []*types.T) error {
+	// TODO (rohany): This should eventually look into the set of cached type
+	//  descriptors before attempting to access it here.
+	lookup := makeTypeLookupFunc(evalCtx.Context, evalCtx.Txn, evalCtx.Codec)
 	for _, t := range typs {
 		if t.UserDefined() {
-			// TODO (rohany): This should eventually look into the set of cached type
-			//  descriptors before attempting to access it here.
-			typDesc, err := sqlbase.GetTypeDescFromID(
-				evalCtx.Context,
-				evalCtx.Txn,
-				evalCtx.Codec,
-				sqlbase.ID(t.StableTypeID()),
-			)
+			name, typDesc, err := lookup(sqlbase.ID(t.StableTypeID()))
 			if err != nil {
 				return err
 			}
-			if err := typDesc.HydrateTypeInfo(t); err != nil {
+			if err := typDesc.HydrateTypeInfoWithName(t, name, lookup); err != nil {
 				return err
 			}
 		}
@@ -138,7 +133,7 @@ func HydrateTypeSlice(evalCtx *tree.EvalContext, typs []*types.T) error {
 // IndexedVar formatting function needs to be added on. It replaces placeholders
 // with their values.
 func ExprFmtCtxBase(evalCtx *tree.EvalContext) *tree.FmtCtx {
-	fmtCtx := tree.NewFmtCtx(tree.FmtDistSQLSerialization)
+	fmtCtx := tree.NewFmtCtx(tree.FmtCheckEquivalence)
 	fmtCtx.SetPlaceholderFormat(
 		func(fmtCtx *tree.FmtCtx, p *tree.Placeholder) {
 			d, err := p.Eval(evalCtx)
@@ -165,8 +160,9 @@ type Expression struct {
 	// (@1, @2, @3 ..) used for "input" variables.
 	Expr string
 
-	// LocalExpr is an unserialized field that's used to pass expressions to local
-	// flows without serializing/deserializing them.
+	// LocalExpr is an unserialized field that's used to pass expressions to
+	// the gateway node without serializing/deserializing them. It is always
+	// set in non-test setup.
 	LocalExpr tree.TypedExpr
 }
 
@@ -177,13 +173,13 @@ func (e *Expression) Empty() bool {
 
 // String implements the Stringer interface.
 func (e Expression) String() string {
-	if e.LocalExpr != nil {
-		ctx := tree.NewFmtCtx(tree.FmtDistSQLSerialization)
-		ctx.FormatNode(e.LocalExpr)
-		return ctx.CloseAndGetString()
-	}
 	if e.Expr != "" {
 		return e.Expr
+	}
+	if e.LocalExpr != nil {
+		ctx := tree.NewFmtCtx(tree.FmtCheckEquivalence)
+		ctx.FormatNode(e.LocalExpr)
+		return ctx.CloseAndGetString()
 	}
 	return "none"
 }
@@ -384,9 +380,23 @@ func LocalMetaToRemoteProducerMeta(
 type MetadataSource interface {
 	// DrainMeta returns all the metadata produced by the processor or operator.
 	// It will be called exactly once, usually, when the processor or operator
-	// has finished doing its computations.
+	// has finished doing its computations. This is a signal that the output
+	// requires no more rows to be returned.
 	// Implementers can choose what to do on subsequent calls (if such occur).
 	// TODO(yuzefovich): modify the contract to require returning nil on all
 	// calls after the first one.
 	DrainMeta(context.Context) []ProducerMetadata
+}
+
+// MetadataSources is a slice of MetadataSource.
+type MetadataSources []MetadataSource
+
+// DrainMeta calls DrainMeta on all MetadataSources and returns a single slice
+// with all the accumulated metadata.
+func (s MetadataSources) DrainMeta(ctx context.Context) []ProducerMetadata {
+	var result []ProducerMetadata
+	for _, src := range s {
+		result = append(result, src.DrainMeta(ctx)...)
+	}
+	return result
 }

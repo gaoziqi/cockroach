@@ -11,20 +11,26 @@
 package geogfn
 
 import (
+	"math"
+
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geographiclib"
 	"github.com/cockroachdb/errors"
+	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
 	"github.com/twpayne/go-geom"
 )
 
 // Area returns the area of a given Geography.
 func Area(g *geo.Geography, useSphereOrSpheroid UseSphereOrSpheroid) (float64, error) {
-	regions, err := g.AsS2()
+	regions, err := g.AsS2(geo.EmptyBehaviorOmit)
 	if err != nil {
 		return 0, err
 	}
-	spheroid := geographiclib.WGS84Spheroid
+	spheroid, err := g.Spheroid()
+	if err != nil {
+		return 0, err
+	}
 
 	var totalArea float64
 	for _, region := range regions {
@@ -63,7 +69,15 @@ func Perimeter(g *geo.Geography, useSphereOrSpheroid UseSphereOrSpheroid) (float
 	default:
 		return 0, nil
 	}
-	return length(geo.S2RegionsFromGeom(gt), useSphereOrSpheroid)
+	regions, err := geo.S2RegionsFromGeom(gt, geo.EmptyBehaviorOmit)
+	if err != nil {
+		return 0, err
+	}
+	spheroid, err := g.Spheroid()
+	if err != nil {
+		return 0, err
+	}
+	return length(regions, spheroid, useSphereOrSpheroid)
 }
 
 // Length returns length of a given Geography.
@@ -79,14 +93,73 @@ func Length(g *geo.Geography, useSphereOrSpheroid UseSphereOrSpheroid) (float64,
 	default:
 		return 0, nil
 	}
-	return length(geo.S2RegionsFromGeom(gt), useSphereOrSpheroid)
+	regions, err := geo.S2RegionsFromGeom(gt, geo.EmptyBehaviorOmit)
+	if err != nil {
+		return 0, err
+	}
+	spheroid, err := g.Spheroid()
+	if err != nil {
+		return 0, err
+	}
+	return length(regions, spheroid, useSphereOrSpheroid)
+}
+
+// Project returns calculate a projected point given a source point, a distance and a azimuth.
+func Project(g *geo.Geography, distance float64, azimuth s1.Angle) (*geo.Geography, error) {
+	geomT, err := g.AsGeomT()
+	if err != nil {
+		return nil, err
+	}
+
+	point, ok := geomT.(*geom.Point)
+	if !ok {
+		return nil, errors.Newf("ST_Project(geography) is only valid for point inputs")
+	}
+
+	spheroid, err := g.Spheroid()
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize distance to be positive.
+	if distance < 0.0 {
+		distance = -distance
+		azimuth += math.Pi
+	}
+
+	// Normalize azimuth
+	azimuth = azimuth.Normalized()
+
+	// Check the distance validity.
+	if distance > (math.Pi * spheroid.Radius) {
+		return nil, errors.Newf("distance must not be greater than %f", math.Pi*spheroid.Radius)
+	}
+
+	// Convert to ta geodetic point.
+	x := point.X()
+	y := point.Y()
+
+	projected := spheroid.Project(
+		s2.LatLngFromDegrees(x, y),
+		distance,
+		azimuth,
+	)
+
+	ret := geom.NewPointFlat(
+		geom.XY,
+		[]float64{
+			float64(projected.Lng.Normalized()) * 180.0 / math.Pi,
+			normalizeLatitude(float64(projected.Lat)) * 180.0 / math.Pi,
+		},
+	).SetSRID(point.SRID())
+	return geo.NewGeographyFromGeom(ret)
 }
 
 // length returns the sum of the lengtsh and perimeters in the shapes of the Geography.
 // In OGC parlance, length returns both LineString lengths _and_ Polygon perimeters.
-func length(regions []s2.Region, useSphereOrSpheroid UseSphereOrSpheroid) (float64, error) {
-	spheroid := geographiclib.WGS84Spheroid
-
+func length(
+	regions []s2.Region, spheroid *geographiclib.Spheroid, useSphereOrSpheroid UseSphereOrSpheroid,
+) (float64, error) {
 	var totalLength float64
 	for _, region := range regions {
 		switch region := region.(type) {
@@ -119,4 +192,33 @@ func length(regions []s2.Region, useSphereOrSpheroid UseSphereOrSpheroid) (float
 		totalLength *= spheroid.SphereRadius
 	}
 	return totalLength, nil
+}
+
+// normalizeLatitude convert a latitude to the range of -Pi/2, Pi/2.
+func normalizeLatitude(lat float64) float64 {
+	if lat > 2.0*math.Pi {
+		lat = math.Remainder(lat, 2.0*math.Pi)
+	}
+
+	if lat < -2.0*math.Pi {
+		lat = math.Remainder(lat, -2.0*math.Pi)
+	}
+
+	if lat > math.Pi {
+		lat = math.Pi - lat
+	}
+
+	if lat < -1.0*math.Pi {
+		lat = -1.0*math.Pi - lat
+	}
+
+	if lat > math.Pi*2 {
+		lat = math.Pi - lat
+	}
+
+	if lat < -1.0*math.Pi*2 {
+		lat = -1.0*math.Pi - lat
+	}
+
+	return lat
 }

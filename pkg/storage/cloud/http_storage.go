@@ -241,7 +241,7 @@ func (r *resumingHTTPReader) Read(p []byte) (n int, err error) {
 		// Resume download if the http server supports this.
 		if r.canResume && isResumableHTTPError(err) {
 			log.Errorf(r.ctx, "HTTP:Retry: error %s", err)
-			if retries > maxNoProgressReads {
+			if retries >= maxNoProgressReads {
 				err = errors.Wrap(err, "multiple Read calls return no data")
 				return
 			}
@@ -346,11 +346,15 @@ func (h *httpStorage) req(
 
 	switch resp.StatusCode {
 	case 200, 201, 204, 206:
-		// Pass.
+	// Pass.
 	default:
 		body, _ := ioutil.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		return nil, errors.Errorf("error response from server: %s %q", resp.Status, body)
+		err := errors.Errorf("error response from server: %s %q", resp.Status, body)
+		if err != nil && resp.StatusCode == 404 {
+			err = errors.Wrapf(ErrFileDoesNotExist, "http storage file does not exist: %s", err.Error())
+		}
+		return nil, err
 	}
 	return resp, nil
 }

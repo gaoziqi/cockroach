@@ -22,7 +22,6 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -84,7 +83,9 @@ func TestNumericConstantVerifyAndResolveAvailableTypes(t *testing.T) {
 
 		// Make sure it can be resolved as each of those types.
 		for _, availType := range avail {
-			if res, err := c.ResolveAsType(&tree.SemaContext{}, availType); err != nil {
+			ctx := context.Background()
+			semaCtx := tree.MakeSemaContext()
+			if res, err := c.ResolveAsType(ctx, &semaCtx, availType); err != nil {
 				t.Errorf("%d: expected resolving %v as available type %s would succeed, found %v",
 					i, c.ExactString(), availType, err)
 			} else {
@@ -184,7 +185,8 @@ func TestStringConstantVerifyAvailableTypes(t *testing.T) {
 				continue
 			}
 
-			if _, err := test.c.ResolveAsType(&tree.SemaContext{}, availType); err != nil {
+			semaCtx := tree.MakeSemaContext()
+			if _, err := test.c.ResolveAsType(context.Background(), &semaCtx, availType); err != nil {
 				if !strings.Contains(err.Error(), "could not parse") {
 					// Parsing errors are permitted for this test, as proper tree.StrVal parsing
 					// is tested in TestStringConstantTypeResolution. Any other error should
@@ -380,6 +382,8 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 		},
 	}
 
+	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	defer evalCtx.Stop(context.Background())
 	for i, test := range testCases {
 		parseableCount := 0
 
@@ -393,7 +397,12 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 				continue
 			}
 
-			res, err := test.c.ResolveAsType(&tree.SemaContext{}, availType)
+			semaCtx := tree.MakeSemaContext()
+			typedExpr, err := test.c.ResolveAsType(context.Background(), &semaCtx, availType)
+			var res tree.Datum
+			if err == nil {
+				res, err = typedExpr.Eval(evalCtx)
+			}
 			if err != nil {
 				if !strings.Contains(err.Error(), "could not parse") && !strings.Contains(err.Error(), "parsing") {
 					// Parsing errors are permitted for this test, but the number of correctly
@@ -411,8 +420,6 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 					i, availType, test.c, res)
 			} else {
 				expectedDatum := parseFuncs[availType](t, test.c.RawString())
-				evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-				defer evalCtx.Stop(context.Background())
 				if res.Compare(evalCtx, expectedDatum) != 0 {
 					t.Errorf("%d: type %s expected to be resolved from the tree.StrVal %v to tree.Datum %v"+
 						", found %v",
@@ -427,180 +434,4 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 				i, expCount, test.c, parseableCount)
 		}
 	}
-}
-
-type constantLiteralFoldingTestCase struct {
-	expr     string
-	expected string
-}
-
-func testConstantLiteralFolding(t *testing.T, testData []constantLiteralFoldingTestCase) {
-	for _, d := range testData {
-		expr, err := parser.ParseExpr(d.expr)
-		if err != nil {
-			t.Fatalf("%s: %v", d.expr, err)
-		}
-		rOrig := expr.String()
-		r, err := tree.FoldConstantLiterals(expr)
-		if err != nil {
-			t.Fatalf("%s: %v", d.expr, err)
-		}
-		if s := r.String(); d.expected != s {
-			t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
-		}
-		// Folding again should be a no-op.
-		r2, err := tree.FoldConstantLiterals(r)
-		if err != nil {
-			t.Fatalf("%s: %v", d.expr, err)
-		}
-		if s := r2.String(); d.expected != s {
-			t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
-		}
-		// The original expression should be unchanged.
-		if rStr := expr.String(); rOrig != rStr {
-			t.Fatalf("Original expression `%s` changed to `%s`", rOrig, rStr)
-		}
-	}
-}
-
-func TestFoldNumericConstants(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	testConstantLiteralFolding(t, []constantLiteralFoldingTestCase{
-		// Unary ops.
-		{`+1`, `1`},
-		{`+1.2`, `1.2`},
-		{`-1`, `-1`},
-		{`-1.2`, `-1.2`},
-		// Unary ops (int only).
-		{`~1`, `-2`},
-		{`~1.2`, `~1.2`},
-		// Binary ops.
-		{`1 + 1`, `2`},
-		{`1.2 + 2.3`, `3.5`},
-		{`1 + 2.3`, `3.3`},
-		{`2 - 1`, `1`},
-		{`1.2 - 2.3`, `-1.1`},
-		{`1 - 2.3`, `-1.3`},
-		{`2 * 1`, `2`},
-		{`1.2 * 2.3`, `2.76`},
-		{`1 * 2.3`, `2.3`},
-		{`123456789.987654321 * 987654321`, `1.21933e+17`},
-		{`9 / 4`, `2.25`},
-		{`9.7 / 4`, `2.425`},
-		{`4.72 / 2.36`, `2`},
-		{`0 / 0`, `0 / 0`}, // Will be caught during evaluation.
-		{`1 / 0`, `1 / 0`}, // Will be caught during evaluation.
-		// Binary ops (int only).
-		{`9 // 2`, `4`},
-		{`-5 // 3`, `-1`},
-		{`100 // 17`, `5`},
-		{`100.43 // 17.82`, `100.43 // 17.82`}, // Constant folding won't fold numeric modulo.
-		{`0 // 0`, `0 // 0`},                   // Will be caught during evaluation.
-		{`1 // 0`, `1 // 0`},                   // Will be caught during evaluation.
-		{`9 % 2`, `1`},
-		{`100 % 17`, `15`},
-		{`100.43 % 17.82`, `100.43 % 17.82`}, // Constant folding won't fold numeric modulo.
-		{`1 & 3`, `1`},
-		{`1.3 & 3.2`, `1.3 & 3.2`}, // Will be caught during type checking.
-		{`1 | 2`, `3`},
-		{`1.3 | 2.8`, `1.3 | 2.8`}, // Will be caught during type checking.
-		{`1 # 3`, `2`},
-		{`1.3 # 3.9`, `1.3 # 3.9`}, // Will be caught during type checking.
-		{`2 ^ 3`, `2 ^ 3`},         // Constant folding won't fold power.
-		{`1.3 ^ 3.9`, `1.3 ^ 3.9`},
-		// Shift ops (int only).
-		{`1 << 2`, `1 << 2`},
-		{`1 << -2`, `1 << -2`}, // Should be caught during evaluation.
-		{`1 << 9999999999999999999999999999`, `1 << 9999999999999999999999999999`}, // Will be caught during type checking.
-		{`1.2 << 2.4`, `1.2 << 2.4`}, // Will be caught during type checking.
-		{`4 >> 2`, `4 >> 2`},
-		{`4.1 >> 2.9`, `4.1 >> 2.9`}, // Will be caught during type checking.
-		// Comparison ops.
-		{`4 = 2`, `false`},
-		{`4 = 4.0`, `true`},
-		{`4.0 = 4`, `true`},
-		{`4.9 = 4`, `false`},
-		{`4.9 = 4.9`, `true`},
-		{`4 != 2`, `true`},
-		{`4 != 4.0`, `false`},
-		{`4.0 != 4`, `false`},
-		{`4.9 != 4`, `true`},
-		{`4.9 != 4.9`, `false`},
-		{`4 < 2`, `false`},
-		{`4 < 4.0`, `false`},
-		{`4.0 < 4`, `false`},
-		{`4.9 < 4`, `false`},
-		{`4.9 < 4.9`, `false`},
-		{`4 <= 2`, `false`},
-		{`4 <= 4.0`, `true`},
-		{`4.0 <= 4`, `true`},
-		{`4.9 <= 4`, `false`},
-		{`4.9 <= 4.9`, `true`},
-		{`4 > 2`, `true`},
-		{`4 > 4.0`, `false`},
-		{`4.0 > 4`, `false`},
-		{`4.9 > 4`, `true`},
-		{`4.9 > 4.9`, `false`},
-		{`4 >= 2`, `true`},
-		{`4 >= 4.0`, `true`},
-		{`4.0 >= 4`, `true`},
-		{`4.9 >= 4`, `true`},
-		{`4.9 >= 4.9`, `true`},
-		// With parentheses.
-		{`(4)`, `4`},
-		{`(((4)))`, `4`},
-		{`(((9 / 3) * (1 / 3)))`, `1`},
-		{`(((9 / 3) % (1 / 3)))`, `((3 % 0.333333))`},
-		{`(1.0) << ((2) + 3 / (1/9))`, `1.0 << 29`},
-		// With non-constants.
-		{`a + 5 * b`, `a + (5 * b)`},
-		{`a + 5 + b + 7`, `((a + 5) + b) + 7`},
-		{`a + 5 * 2`, `a + 10`},
-		{`a * b + 5 / 2`, `(a * b) + 2.5`},
-		{`a - b * 5 - 3`, `(a - (b * 5)) - 3`},
-		{`a - b + 5 * 3`, `(a - b) + 15`},
-	})
-}
-
-func TestFoldStringConstants(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	testConstantLiteralFolding(t, []constantLiteralFoldingTestCase{
-		// Binary ops.
-		{`'string' || 'string'`, `'stringstring'`},
-		{`'string' || b'bytes'`, `b'stringbytes'`},
-		{`b'bytes' || b'bytes'`, `b'bytesbytes'`},
-		{`'a' || 'b' || 'c'`, `'abc'`},
-		{`'\' || (b'0a' || b'\x0a')`, `b'\\0a\n'`},
-		// Comparison ops.
-		{`'string' = 'string'`, `true`},
-		{`'string' = b'bytes'`, `false`},
-		{`'value' = b'value'`, `true`},
-		{`b'bytes' = b'bytes'`, `true`},
-		{`'string' != 'string'`, `false`},
-		{`'string' != b'bytes'`, `true`},
-		{`'value' != b'value'`, `false`},
-		{`b'bytes' != b'bytes'`, `false`},
-		{`'string' < 'string'`, `false`},
-		{`'string' < b'bytes'`, `false`},
-		{`'value' < b'value'`, `false`},
-		{`b'bytes' < b'bytes'`, `false`},
-		{`'string' <= 'string'`, `true`},
-		{`'string' <= b'bytes'`, `false`},
-		{`'value' <= b'value'`, `true`},
-		{`b'bytes' <= b'bytes'`, `true`},
-		{`'string' > 'string'`, `false`},
-		{`'string' > b'bytes'`, `true`},
-		{`'value' > b'value'`, `false`},
-		{`b'bytes' > b'bytes'`, `false`},
-		{`'string' >= 'string'`, `true`},
-		{`'string' >= b'bytes'`, `true`},
-		{`'value' >= b'value'`, `true`},
-		{`b'bytes' >= b'bytes'`, `true`},
-		// With parentheses.
-		{`('string') || (b'bytes')`, `b'stringbytes'`},
-		{`('a') || (('b') || ('c'))`, `'abc'`},
-		// With non-constants.
-		{`a > 'str' || b`, `a > ('str' || b)`},
-		{`a > 'str' || 'ing'`, `a > 'string'`},
-	})
 }

@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"os"
 	"reflect"
 	"regexp"
 	"sort"
@@ -56,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -75,6 +75,7 @@ import (
 	"go.etcd.io/etcd/raft/raftpb"
 	"go.etcd.io/etcd/raft/tracker"
 	"golang.org/x/net/trace"
+	"golang.org/x/time/rate"
 )
 
 // allSpans is a SpanSet that covers *everything* for use in tests that don't
@@ -215,8 +216,13 @@ func (tc *testContext) StartWithStoreConfigAndVersion(
 	// Setup fake zone config handler.
 	config.TestingSetupZoneConfigHook(stopper)
 	if tc.gossip == nil {
-		rpcContext := rpc.NewContext(
-			cfg.AmbientCtx, &base.Config{Insecure: true}, cfg.Clock, stopper, cfg.Settings)
+		rpcContext := rpc.NewContext(rpc.ContextOptions{
+			AmbientCtx: cfg.AmbientCtx,
+			Config:     &base.Config{Insecure: true},
+			Clock:      cfg.Clock,
+			Stopper:    stopper,
+			Settings:   cfg.Settings,
+		})
 		server := rpc.NewServer(rpcContext) // never started
 		tc.gossip = gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), cfg.DefaultZoneConfig)
 	}
@@ -935,7 +941,7 @@ func TestReplicaRangeBoundsChecking(t *testing.T) {
 	if mismatchErr, ok := pErr.GetDetail().(*roachpb.RangeKeyMismatchError); !ok {
 		t.Errorf("expected range key mismatch error: %s", pErr)
 	} else {
-		if mismatchedDesc := mismatchErr.MismatchedRange; mismatchedDesc == nil || mismatchedDesc.RangeID != firstRepl.RangeID {
+		if mismatchedDesc := mismatchErr.MismatchedRange; mismatchedDesc.RangeID != firstRepl.RangeID {
 			t.Errorf("expected mismatched range to be %d, found %v", firstRepl.RangeID, mismatchedDesc)
 		}
 		if suggestedDesc := mismatchErr.SuggestedRange; suggestedDesc == nil || suggestedDesc.RangeID != newRepl.RangeID {
@@ -6327,7 +6333,7 @@ func TestReplicaCorruption(t *testing.T) {
 	}
 
 	// Should have laid down marker file to prevent startup.
-	_, err := os.Stat(base.PreventedStartupFile(tc.engine.GetAuxiliaryDir()))
+	_, err := tc.engine.Stat(base.PreventedStartupFile(tc.engine.GetAuxiliaryDir()))
 	require.NoError(t, err)
 
 	// Should have triggered fatal error.
@@ -8989,7 +8995,7 @@ func TestErrorInRaftApplicationClearsIntents(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	splitKey := roachpb.Key("b")
-	if err := kvDB.AdminSplit(context.Background(), splitKey, splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := kvDB.AdminSplit(context.Background(), splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -9616,7 +9622,7 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 		// Regression test for #31870.
 		snap := tc.engine.NewSnapshot()
 		defer snap.Close()
-		res, err := tc.repl.sha512(context.Background(), *tc.repl.Desc(), tc.engine, nil /* diff */, roachpb.ChecksumMode_CHECK_FULL)
+		res, err := tc.repl.sha512(context.Background(), *tc.repl.Desc(), tc.engine, nil /* diff */, roachpb.ChecksumMode_CHECK_FULL, limit.NewLimiter(rate.Inf))
 		if err != nil {
 			return hlc.Timestamp{}, err
 		}
@@ -12085,7 +12091,7 @@ func TestProposalNotAcknowledgedOrReproposedAfterApplication(t *testing.T) {
 
 	stopper.Quiesce(ctx)
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
-		regexp.MustCompile("net/trace"))
+		regexp.MustCompile("net/trace"), log.WithFlattenedSensitiveData)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -12187,7 +12193,7 @@ func TestLaterReproposalsDoNotReuseContext(t *testing.T) {
 	// Check and see if the trace package logged an error.
 	log.Flush()
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
-		regexp.MustCompile("net/trace"))
+		regexp.MustCompile("net/trace"), log.WithFlattenedSensitiveData)
 	if err != nil {
 		t.Fatal(err)
 	}

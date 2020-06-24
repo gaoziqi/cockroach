@@ -20,12 +20,9 @@
 package colexec
 
 import (
-	"bytes"
 	"context"
-	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
@@ -33,30 +30,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
-// Remove unused warning.
-var _ = execgen.UNSAFEGET
-
 // {{/*
 // Declarations to make the template compile properly.
-
-// Dummy import to pull in "bytes" package.
-var _ bytes.Buffer
-
-// Dummy import to pull in "tree" package.
-var _ tree.Datum
-
-// Dummy import to pull in "math" package.
-var _ = math.MaxInt64
-
-// Dummy import to pull in "duration" package.
-var _ duration.Duration
-
-// Dummy import to pull in "coldataext" package.
-var _ coldataext.Datum
 
 // _LEFT_CANONICAL_TYPE_FAMILY is the template variable.
 const _LEFT_CANONICAL_TYPE_FAMILY = types.UnknownFamily
@@ -106,7 +84,7 @@ type projConstOpBase struct {
 	allocator      *colmem.Allocator
 	colIdx         int
 	outputIdx      int
-	decimalScratch decimalOverloadScratch
+	overloadHelper overloadHelper
 }
 
 // projOpBase contains all of the fields for non-constant projections.
@@ -116,7 +94,7 @@ type projOpBase struct {
 	col1Idx        int
 	col2Idx        int
 	outputIdx      int
-	decimalScratch decimalOverloadScratch
+	overloadHelper overloadHelper
 }
 
 // {{define "projOp"}}
@@ -127,11 +105,11 @@ type _OP_NAME struct {
 
 func (p _OP_NAME) Next(ctx context.Context) coldata.Batch {
 	// In order to inline the templated code of overloads, we need to have a
-	// `decimalScratch` local variable of type `decimalOverloadScratch`.
-	decimalScratch := p.decimalScratch
+	// `_overloadHelper` local variable of type `overloadHelper`.
+	_overloadHelper := p.overloadHelper
 	// However, the scratch is not used in all of the projection operators, so
 	// we add this to go around "unused" error.
-	_ = decimalScratch
+	_ = _overloadHelper
 	batch := p.input.Next(ctx)
 	n := batch.Length()
 	if n == 0 {
@@ -268,14 +246,16 @@ func GetProjectionOperator(
 	col1Idx int,
 	col2Idx int,
 	outputIdx int,
+	overloadHelper overloadHelper,
 ) (colexecbase.Operator, error) {
 	input = newVectorTypeEnforcer(allocator, input, outputType, outputIdx)
 	projOpBase := projOpBase{
-		OneInputNode: NewOneInputNode(input),
-		allocator:    allocator,
-		col1Idx:      col1Idx,
-		col2Idx:      col2Idx,
-		outputIdx:    outputIdx,
+		OneInputNode:   NewOneInputNode(input),
+		allocator:      allocator,
+		col1Idx:        col1Idx,
+		col2Idx:        col2Idx,
+		outputIdx:      outputIdx,
+		overloadHelper: overloadHelper,
 	}
 
 	switch op.(type) {

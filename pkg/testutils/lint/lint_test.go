@@ -141,7 +141,7 @@ func TestLint(t *testing.T) {
 		var names []string
 		for _, name := range builtins.AllBuiltinNames {
 			switch name {
-			case "extract", "trim", "overlay", "position", "substring":
+			case "extract", "trim", "overlay", "position", "substring", "st_x", "st_y":
 				// Exempt special forms: EXTRACT(... FROM ...), etc.
 			default:
 				names = append(names, strings.ToUpper(name))
@@ -816,7 +816,7 @@ func TestLint(t *testing.T) {
 			"git",
 			"grep",
 			"-nE",
-			`\.Clone\([^)]`,
+			`proto\.Clone\([^)]`,
 			"--",
 			"*.go",
 			":!util/protoutil/clone_test.go",
@@ -1069,6 +1069,7 @@ func TestLint(t *testing.T) {
 
 		ignoredRules := []string{
 			"licence",
+			"mitre",   // PostGIS commands spell these as mitre.
 			"analyse", // required by SQL grammar
 		}
 
@@ -1077,6 +1078,8 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`.*\.lock`),
 			stream.GrepNot(`^storage\/rocksdb_error_dict\.go$`),
 			stream.GrepNot(`^workload/tpcds/tpcds.go$`),
+			stream.GrepNot(`^geo/geoprojbase/projections.go$`),
+			stream.GrepNot(`^sql/logictest/testdata/logic_test/pg_extension$`),
 			stream.Map(func(s string) string {
 				return filepath.Join(pkgDir, s)
 			}),
@@ -1288,7 +1291,7 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`cockroach/pkg/testutils/lint: log$`),
 			stream.GrepNot(`cockroach/pkg/util/sysutil: syscall$`),
 			stream.GrepNot(`cockroach/pkg/util/log: github\.com/pkg/errors$`),
-			stream.GrepNot(`cockroach/pkg/(base|security|util/(log|randutil|stop)): log$`),
+			stream.GrepNot(`cockroach/pkg/(base|release|security|util/(log|randutil|stop)): log$`),
 			stream.GrepNot(`cockroach/pkg/(server/serverpb|ts/tspb): github\.com/golang/protobuf/proto$`),
 
 			stream.GrepNot(`cockroach/pkg/util/uuid: github\.com/satori/go\.uuid$`),
@@ -1445,11 +1448,14 @@ func TestLint(t *testing.T) {
 				// even if it might not be used again.
 				stream.GrepNot(`pkg/sql/parser/sql.go:.*this value of sqlDollar is never used`),
 				// Generated file containing many unused postgres error codes.
-				stream.GrepNot(`pkg/sql/pgwire/pgcode/codes.go:.* const .* is unused`),
+				stream.GrepNot(`pkg/sql/pgwire/pgcode/codes.go:.* var .* is unused`),
 				// The methods in exprgen.customFuncs are used via reflection.
 				stream.GrepNot(`pkg/sql/opt/optgen/exprgen/custom_funcs.go:.* func .* is unused`),
 				// Using deprecated method to COPY.
 				stream.GrepNot(`pkg/cli/nodelocal.go:.* stmt.Exec is deprecated: .*`),
+				// Cause is a method used by pkg/cockroachdb/errors (through an unnamed
+				// interface).
+				stream.GrepNot(`pkg/.*.go:.* func .*\.Cause is unused`),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -1480,6 +1486,11 @@ func TestLint(t *testing.T) {
 			":!sql/colexecbase/colexecerror/error.go",
 			":!sql/colexec/execpb/stats.pb.go",
 			":!sql/colflow/vectorized_panic_propagation_test.go",
+			// This exception is because execgen itself uses panics during code
+			// generation - not at execution time. The (glob,exclude) directive
+			// (see git help gitglossary) makes * behave like a normal, single dir
+			// glob, and exclude is the synonym of !.
+			":(glob,exclude)sql/colexec/execgen/*.go",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -1702,6 +1713,10 @@ func TestLint(t *testing.T) {
 			"WarningfDepth",
 			"Wrapf",
 			"WrapWithDepthf",
+			"redact.Fprint",
+			"redact.Fprintf",
+			"redact.Sprint",
+			"redact.Sprintf",
 		}, ",")
 
 		filters := []stream.Filter{
@@ -1756,6 +1771,14 @@ func TestLint(t *testing.T) {
 			// own redact code.
 			stream.GrepNot(`pkg/util/log/crash_reporting\.go:.*invalid direct cast on error object`),
 			stream.GrepNot(`pkg/util/log/crash_reporting\.go:.*invalid direct comparison of error object`),
+			// The logging package translates log.Fatal calls into errors.
+			// We can't use the regular exception mechanism via functions.go
+			// because addStructured takes its positional argument as []interface{},
+			// instead of ...interface{}.
+			stream.GrepNot(`pkg/util/log/structured\.go:\d+:\d+: addStructured\(\): format argument is not a constant expression`),
+			// roachtest is not collecting redactable logs so we don't care
+			// about printf hygiene there as much.
+			stream.GrepNot(`pkg/cmd/roachtest/log\.go:.*format argument is not a constant expression`),
 		}
 
 		roachlint, err := exec.LookPath("roachvet")

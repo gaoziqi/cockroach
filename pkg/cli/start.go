@@ -301,7 +301,7 @@ func initMutexProfile() {
 }
 
 var cacheSizeValue = newBytesOrPercentageValue(&serverCfg.CacheSize, memoryPercentResolver)
-var sqlSizeValue = newBytesOrPercentageValue(&serverCfg.SQLMemoryPoolSize, memoryPercentResolver)
+var sqlSizeValue = newBytesOrPercentageValue(&serverCfg.MemoryPoolSize, memoryPercentResolver)
 var diskTempStorageSizeValue = newBytesOrPercentageValue(nil /* v */, nil /* percentResolver */)
 
 func initExternalIODir(ctx context.Context, firstStore base.StoreSpec) (string, error) {
@@ -319,15 +319,11 @@ func initExternalIODir(ctx context.Context, firstStore base.StoreSpec) (string, 
 }
 
 func initTempStorageConfig(
-	ctx context.Context,
-	st *cluster.Settings,
-	stopper *stop.Stopper,
-	firstStore base.StoreSpec,
-	specIdx int,
+	ctx context.Context, st *cluster.Settings, stopper *stop.Stopper, useStore base.StoreSpec,
 ) (base.TempStorageConfig, error) {
 	var recordPath string
-	if !firstStore.InMemory {
-		recordPath = filepath.Join(firstStore.Path, server.TempDirsRecordFilename)
+	if !useStore.InMemory {
+		recordPath = filepath.Join(useStore.Path, server.TempDirsRecordFilename)
 	}
 
 	var err error
@@ -343,8 +339,8 @@ func initTempStorageConfig(
 	// The temp store size can depend on the location of the first regular store
 	// (if it's expressed as a percentage), so we resolve that flag here.
 	var tempStorePercentageResolver percentResolverFunc
-	if !firstStore.InMemory {
-		dir := firstStore.Path
+	if !useStore.InMemory {
+		dir := useStore.Path
 		// Create the store dir, if it doesn't exist. The dir is required to exist
 		// by diskPercentResolverFactory.
 		if err = os.MkdirAll(dir, 0755); err != nil {
@@ -367,7 +363,7 @@ func initTempStorageConfig(
 		// The default temp storage size is different when the temp
 		// storage is in memory (which occurs when no temp directory
 		// is specified and the first store is in memory).
-		if startCtx.tempDir == "" && firstStore.InMemory {
+		if startCtx.tempDir == "" && useStore.InMemory {
 			tempStorageMaxSizeBytes = base.DefaultInMemTempStorageMaxSizeBytes
 		} else {
 			tempStorageMaxSizeBytes = base.DefaultTempStorageMaxSizeBytes
@@ -379,17 +375,16 @@ func initTempStorageConfig(
 	tempStorageConfig := base.TempStorageConfigFromEnv(
 		ctx,
 		st,
-		firstStore,
+		useStore,
 		startCtx.tempDir,
 		tempStorageMaxSizeBytes,
-		specIdx,
 	)
 
 	// Set temp directory to first store's path if the temp storage is not
 	// in memory.
 	tempDir := startCtx.tempDir
 	if tempDir == "" && !tempStorageConfig.InMemory {
-		tempDir = firstStore.Path
+		tempDir = useStore.Path
 	}
 	// Create the temporary subdirectory for the temp engine.
 	if tempStorageConfig.Path, err = storage.CreateTempDir(tempDir, server.TempDirPrefix, stopper); err != nil {
@@ -583,8 +578,10 @@ func runStart(cmd *cobra.Command, args []string, disableReplication bool) error 
 			specIdx = i
 		}
 	}
-	useStore := serverCfg.Stores.Specs[specIdx]
-	if serverCfg.TempStorageConfig, err = initTempStorageConfig(ctx, serverCfg.Settings, stopper, useStore, specIdx); err != nil {
+
+	if serverCfg.TempStorageConfig, err = initTempStorageConfig(
+		ctx, serverCfg.Settings, stopper, serverCfg.Stores.Specs[specIdx],
+	); err != nil {
 		return err
 	}
 
@@ -693,11 +690,11 @@ If problems persist, please see %s.`
 
 	// Set up the Geospatial library.
 	// We need to make sure this happens before any queries involving geospatial data is executed.
-	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, demoCtx.geoLibsDir)
+	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, startCtx.geoLibsDir)
 	if err != nil {
 		log.Infof(ctx, "could not initialize GEOS - geospatial functions may not be available: %v", err)
 	} else {
-		log.Infof(ctx, "GEOS initialized at %s", loc)
+		log.Infof(ctx, "GEOS loaded from directory %s", loc)
 	}
 
 	// Beyond this point, the configuration is set and the server is
@@ -763,11 +760,11 @@ If problems persist, please see %s.`
 			// Attempt to start the server.
 			if err := s.Start(ctx); err != nil {
 				if le := (*server.ListenError)(nil); errors.As(err, &le) {
-					const errorPrefix = "consider changing the port via --"
+					const errorPrefix = "consider changing the port via --%s"
 					if le.Addr == serverCfg.Addr {
-						err = errors.Wrap(err, errorPrefix+cliflags.ListenAddr.Name)
+						err = errors.Wrapf(err, errorPrefix, cliflags.ListenAddr.Name)
 					} else if le.Addr == serverCfg.HTTPAddr {
-						err = errors.Wrap(err, errorPrefix+cliflags.ListenHTTPAddr.Name)
+						err = errors.Wrapf(err, errorPrefix, cliflags.ListenHTTPAddr.Name)
 					}
 				}
 
@@ -824,8 +821,8 @@ If problems persist, please see %s.`
 				fmt.Fprintf(tw, "socket:\t%s\n", serverCfg.SocketFile)
 			}
 			fmt.Fprintf(tw, "logs:\t%s\n", flag.Lookup("log-dir").Value)
-			if serverCfg.SQLAuditLogDirName.IsSet() {
-				fmt.Fprintf(tw, "SQL audit logs:\t%s\n", serverCfg.SQLAuditLogDirName)
+			if serverCfg.AuditLogDirName.IsSet() {
+				fmt.Fprintf(tw, "SQL audit logs:\t%s\n", serverCfg.AuditLogDirName)
 			}
 			if serverCfg.Attrs != "" {
 				fmt.Fprintf(tw, "attrs:\t%s\n", serverCfg.Attrs)
@@ -1155,7 +1152,7 @@ func maybeWarnMemorySizes(ctx context.Context) {
 
 	// Check that the total suggested "max" memory is well below the available memory.
 	if maxMemory, err := status.GetTotalMemory(ctx); err == nil {
-		requestedMem := serverCfg.CacheSize + serverCfg.SQLMemoryPoolSize
+		requestedMem := serverCfg.CacheSize + serverCfg.MemoryPoolSize
 		maxRecommendedMem := int64(.75 * float64(maxMemory))
 		if requestedMem > maxRecommendedMem {
 			log.Shoutf(ctx, log.Severity_WARNING,
@@ -1226,11 +1223,6 @@ func setupAndInitializeLoggingAndProfiling(
 			return nil, err
 		}
 
-		// NB: this message is a crutch until #33458 is addressed. Without it,
-		// the calls to log.Shout below can be the first use of logging, hitting
-		// the bug described in the issue.
-		log.Infof(ctx, "logging to directory %s", logDir)
-
 		// Start the log file GC daemon to remove files that make the log
 		// directory too large.
 		log.StartGCDaemon(ctx)
@@ -1244,6 +1236,14 @@ func setupAndInitializeLoggingAndProfiling(
 				stopper.AddCloser(storage.InitRocksDBLogger(ctx))
 			}
 		}()
+	}
+
+	// Initialize the redirection of stderr and log redaction.  Note,
+	// this function must be called even if there is no log directory
+	// configured, to verify whether the combination of requested flags
+	// is valid.
+	if _, err := log.SetupRedactionAndStderrRedirects(); err != nil {
+		return nil, err
 	}
 
 	// We want to be careful to still produce useful debug dumps if the
@@ -1262,7 +1262,7 @@ func setupAndInitializeLoggingAndProfiling(
 			" and --log-dir not specified, you may want to specify --log-dir to disambiguate.")
 	}
 
-	if auditLogDir := serverCfg.SQLAuditLogDirName.String(); auditLogDir != "" && auditLogDir != outputDirectory {
+	if auditLogDir := serverCfg.AuditLogDirName.String(); auditLogDir != "" && auditLogDir != outputDirectory {
 		// Make sure the path for the audit log exists, if it's a different path than
 		// the main log.
 		if err := os.MkdirAll(auditLogDir, 0755); err != nil {
@@ -1333,13 +1333,13 @@ func getClientGRPCConn(
 	// as that of nodes in the cluster.
 	clock := hlc.NewClock(hlc.UnixNano, 0)
 	stopper := stop.NewStopper()
-	rpcContext := rpc.NewContext(
-		log.AmbientContext{Tracer: cfg.Settings.Tracer},
-		cfg.Config,
-		clock,
-		stopper,
-		cfg.Settings,
-	)
+	rpcContext := rpc.NewContext(rpc.ContextOptions{
+		AmbientCtx: log.AmbientContext{Tracer: cfg.Settings.Tracer},
+		Config:     cfg.Config,
+		Clock:      clock,
+		Stopper:    stopper,
+		Settings:   cfg.Settings,
+	})
 	addr, err := addrWithDefaultHost(cfg.AdvertiseAddr)
 	if err != nil {
 		stopper.Stop(ctx)
